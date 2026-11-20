@@ -1329,6 +1329,9 @@ impl DnfPackageManager {
         ) {
             args.push("--cacheonly".to_owned());
         }
+        if matches!(query, RepositoryQuery::Upgrades) {
+            args.push("--setopt=*.skip_if_unavailable=false".to_owned());
+        }
         if matches!(
             query,
             RepositoryQuery::InstalledSizes(_)
@@ -3117,7 +3120,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn native_advisory_command_refuses_unavailable_repository() {
+    async fn native_advisory_and_update_queries_refuse_unavailable_repository() {
         let fixture = tempfile::tempdir().unwrap();
         let root = fixture.path();
         std::fs::create_dir(root.join("repos")).unwrap();
@@ -3156,6 +3159,12 @@ mod tests {
         strict.args(super::super::dnf_advisory::query_args(false));
         let error = DnfPackageManager::query_output(strict).await.unwrap_err();
         assert!(error.to_string().contains("DNF query failed"), "{error:#}");
+
+        let mut upgrades = configure();
+        upgrades.args(DnfPackageManager::repository_query_args(RepositoryQuery::Upgrades).unwrap());
+        let error = DnfPackageManager::query_output(upgrades).await.unwrap_err();
+        assert!(error.to_string().contains("DNF query failed"), "{error:#}");
+
         let path = root.to_owned();
         fixture.close().unwrap();
         assert!(!path.exists());
@@ -3163,13 +3172,19 @@ mod tests {
 
     #[test]
     fn update_queries_never_refresh_repository_metadata() {
-        for query in [
-            RepositoryQuery::Installed,
-            RepositoryQuery::Upgrades,
-            RepositoryQuery::Unneeded,
+        for (query, require_repository_metadata) in [
+            (RepositoryQuery::Installed, false),
+            (RepositoryQuery::Upgrades, true),
+            (RepositoryQuery::Unneeded, false),
         ] {
             let args = DnfPackageManager::repository_query_args(query).unwrap();
             assert!(args.iter().any(|arg| arg == "--cacheonly"), "{args:?}");
+            assert_eq!(
+                args.iter()
+                    .any(|arg| arg == "--setopt=*.skip_if_unavailable=false"),
+                require_repository_metadata,
+                "{args:?}"
+            );
         }
     }
 
