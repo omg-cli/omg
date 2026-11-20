@@ -9951,7 +9951,10 @@ mod tests {
         }
         const MODE: &str = "OMG_AUR_REVIEW_PTY_MODE";
         if let Ok(mode) = std::env::var(MODE) {
-            let history = matches!(mode.as_str(), "history" | "history-accept-failing-build");
+            let history = matches!(
+                mode.as_str(),
+                "history" | "history-accept-failing-build" | "history-accept-rebuilt-archive"
+            );
             let directory = if history {
                 anyhow::ensure!(
                     std::env::var("OMG_AUR_NATIVE_FIXTURE").as_deref() == Ok("isolated-container"),
@@ -9995,7 +9998,7 @@ mod tests {
                         "{error:#}"
                     );
                     println!("REVIEW_DECLINED");
-                } else {
+                } else if mode == "history-accept-failing-build" {
                     assert!(
                         error
                             .to_string()
@@ -10005,6 +10008,31 @@ mod tests {
                     let log = std::fs::read_to_string(client.build_log_path("demo"))?;
                     assert!(log.contains("intentional-history-fixture-failure"), "{log}");
                     println!("HISTORY_BUILD_FAILED");
+                } else {
+                    assert!(
+                        error.chain().any(|cause| {
+                            cause.to_string().lines().next()
+                                == Some("Privilege elevation not supported in development mode.")
+                        }),
+                        "rebuilt archive must reach the installation boundary: {error:#}"
+                    );
+                    let audit =
+                        std::fs::read_to_string(paths::data_dir().join("audit/audit.jsonl"))?;
+                    let entries = audit
+                        .lines()
+                        .map(serde_json::from_str::<crate::core::security::audit::AuditEntry>)
+                        .collect::<std::result::Result<Vec<_>, _>>()?;
+                    assert!(
+                        entries.iter().any(|entry| {
+                            entry
+                                .description
+                                .starts_with("Package operation aur_paired_build: succeeded;")
+                                && entry.resource.contains("outputs=demo")
+                                && entry.resource.contains("result=exact-match")
+                        }),
+                        "the historical archive must reproduce exactly: {entries:?}"
+                    );
+                    println!("HISTORY_ARCHIVE_VERIFIED");
                 }
             } else if mode == "authorize" {
                 let client = AurClient {
@@ -10060,7 +10088,12 @@ if [ "$#" -ge 4 ] && [ "$1" = -C ]; then
         exit 0
     fi
     if [ "$#" -eq 5 ] && [ "$3" = checkout ] && [ "$4" = --detach ] && [ "$5" = "$sha" ]; then
-        printf 'pkgname=demo\\npkgver=1\\npkgrel=1\\narch=(any)\\npackage() { printf "intentional-history-fixture-failure\\\\n" >&2; return 1; }\\n' > "$2/PKGBUILD"
+        printf 'pkgname=demo\\npkgver=1\\npkgrel=1\\narch=(any)\\n' > "$2/PKGBUILD"
+        if [ "${OMG_AUR_REVIEW_PTY_MODE:-}" = history-accept-rebuilt-archive ]; then
+            printf 'pkgdesc="Inert historical release fixture"\\nlicense=(MIT)\\npackage() { install -Dm644 /dev/null "$pkgdir/usr/share/demo/empty"; }\\n' >> "$2/PKGBUILD"
+        else
+            printf 'package() { printf "intentional-history-fixture-failure\\\\n" >&2; return 1; }\\n' >> "$2/PKGBUILD"
+        fi
         printf 'pkgbase = demo\\npkgver = 1\\npkgrel = 1\\narch = any\\npkgname = demo\\n' > "$2/.SRCINFO"
         exit 0
     fi
@@ -10112,7 +10145,17 @@ pid, fd = pty.fork()
 if pid == 0:
     os.environ['OMG_AUR_REVIEW_PTY_MODE'] = mode
     os.environ['PATH'] = fixture + ':/usr/bin:/bin'
+    if mode == 'history-accept-rebuilt-archive':
+        os.environ['CARGO_PRIMARY_PACKAGE'] = '1'
+        os.environ['OMG_DATA_DIR'] = fixture
+        os.environ['OMG_SOCKET_PATH'] = os.path.join(fixture, 'absent.sock')
     os.execv(executable, [executable, '--exact', test_name, '--nocapture'])
+approval = {
+    'hardened': (b'n\n', b'REVIEW_DECLINED'),
+    'history': (b'n\n', b'REVIEW_DECLINED'),
+    'history-accept-failing-build': (b'y\n', b'HISTORY_BUILD_FAILED'),
+    'history-accept-rebuilt-archive': (b'y\n', b'HISTORY_ARCHIVE_VERIFIED'),
+}.get(mode)
 output = bytearray()
 sent = False
 deadline = time.monotonic() + 45
@@ -10130,8 +10173,8 @@ try:
             output.extend(chunk)
             if len(output) > 1024 * 1024:
                 raise RuntimeError('review output exceeded limit')
-            if mode in ('hardened', 'history', 'history-accept-failing-build') and not sent and b'Build demo from this PKGBUILD?' in output:
-                os.write(fd, b'y\n' if mode == 'history-accept-failing-build' else b'n\n')
+            if approval and not sent and b'Build demo from this PKGBUILD?' in output:
+                os.write(fd, approval[0])
                 sent = True
         done, child_status = os.waitpid(pid, os.WNOHANG)
         if done:
@@ -10151,12 +10194,10 @@ try:
             break
     else:
         raise RuntimeError('review child timed out')
-    expected = (b'REVIEW_DECLINED' if mode in ('hardened', 'history') else
-                b'HISTORY_BUILD_FAILED' if mode == 'history-accept-failing-build' else b'REVIEW_ACCEPTED')
-    prompt_required = mode in ('hardened', 'history', 'history-accept-failing-build')
+    expected = approval[1] if approval else b'REVIEW_ACCEPTED'
     if (os.waitstatus_to_exitcode(status) != 0 or expected not in output or
-            (prompt_required and not sent) or
-            (mode == 'history-accept-failing-build' and b'REVIEW_DECLINED' in output)):
+            (approval and not sent) or
+            (expected != b'REVIEW_DECLINED' and b'REVIEW_DECLINED' in output)):
         raise RuntimeError('review child failed or did not show the expected prompt')
 finally:
     if status is None:
@@ -10168,7 +10209,11 @@ finally:
 "#;
         let mut modes = vec!["git-contract", "standard", "hardened", "authorize"];
         if std::env::var("OMG_AUR_HISTORY_FIXTURE").as_deref() == Ok("1") {
-            modes.extend(["history", "history-accept-failing-build"]);
+            modes.extend([
+                "history",
+                "history-accept-failing-build",
+                "history-accept-rebuilt-archive",
+            ]);
         }
         for mode in modes {
             let output = std::process::Command::new("python3")
