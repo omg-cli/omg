@@ -408,19 +408,45 @@ esac
     #[tokio::test]
     async fn install_publishes_exact_version_and_activates_it() -> Result<()> {
         let temp = tempfile::tempdir()?;
+        let versions_dir = temp.path().join("versions/pi");
         let npm = fake_npm(temp.path(), "0.83.0", true)?;
         let node = managed_node(temp.path(), &npm)?;
-        let manager = PiManager::with_paths(temp.path().join("versions/pi"), npm);
+        let manager = PiManager::with_paths(versions_dir.clone(), npm);
         manager.install("0.83.0").await?;
         assert_eq!(manager.current_version().as_deref(), Some("0.83.0"));
+        assert_eq!(manager.list_installed()?, vec!["0.83.0"]);
+        assert!(
+            versions_dir
+                .join("current/bin/pi")
+                .canonicalize()?
+                .is_file()
+        );
         assert_eq!(
             fs::read_to_string(temp.path().join("phases"))?,
             "install\nci\naudit\n"
         );
         let arguments = fs::read_to_string(temp.path().join("npm-args"))?;
-        assert!(!arguments.lines().any(|line| line == "--global"));
-        assert!(arguments.contains("--package-lock-only"));
-        assert!(arguments.contains("--ignore-scripts"));
+        assert!(
+            arguments
+                .lines()
+                .any(|argument| argument == "--ignore-scripts")
+        );
+        assert!(!arguments.lines().any(|argument| argument == "--global"));
+        assert!(
+            arguments
+                .lines()
+                .any(|argument| argument == "--package-lock-only")
+        );
+        assert!(
+            arguments
+                .lines()
+                .any(|argument| argument == "--registry=https://registry.npmjs.org/")
+        );
+        assert!(
+            arguments
+                .lines()
+                .any(|argument| argument == "@earendil-works/pi-coding-agent@0.83.0")
+        );
         assert!(
             fs::read_to_string(manager.versions_dir.join("current/bin/pi"))?
                 .contains(&shell_path(&node.canonicalize()?)?)
