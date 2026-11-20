@@ -101,15 +101,19 @@ fn os_release_field(content: &str, key: &str) -> String {
         .unwrap_or_default()
 }
 
-/// Detect the hex.pm Ubuntu release for this host.
-fn ubuntu_release(arch: &str) -> Result<&'static str> {
-    let releases = if arch == "arm64" {
+fn compatible_ubuntu_builds(arch: &str) -> &'static [&'static str] {
+    if arch == "arm64" {
         &UBUNTU_BUILD_RELEASES[1..]
     } else {
         UBUNTU_BUILD_RELEASES
-    };
+    }
+}
+
+/// Detect the hex.pm Ubuntu release for this host.
+fn ubuntu_release(arch: &str) -> Result<&'static str> {
     match std::env::var(UBUNTU_RELEASE_OVERRIDE_ENV) {
         Ok(pinned) if !pinned.trim().is_empty() => {
+            let releases = compatible_ubuntu_builds(arch);
             return releases
                 .iter()
                 .copied()
@@ -127,9 +131,14 @@ fn ubuntu_release(arch: &str) -> Result<&'static str> {
         _ => {}
     }
     let content = fs::read_to_string("/etc/os-release").unwrap_or_default();
+    ubuntu_release_from_os(&content, arch)
+}
+
+fn ubuntu_release_from_os(content: &str, arch: &str) -> Result<&'static str> {
+    let releases = compatible_ubuntu_builds(arch);
     let mapped = map_os_release(
-        &os_release_field(&content, "ID"),
-        &os_release_field(&content, "VERSION_ID"),
+        &os_release_field(content, "ID"),
+        &os_release_field(content, "VERSION_ID"),
     );
     anyhow::ensure!(
         releases.contains(&mapped),
@@ -143,10 +152,12 @@ fn ubuntu_release(arch: &str) -> Result<&'static str> {
 fn index_url() -> Result<String> {
     let (arch, _) = host_arch_tokens()?;
     match std::env::consts::OS {
-        "linux" => Ok(format!(
-            "https://builds.hex.pm/builds/otp/{arch}/ubuntu-{}/builds.txt",
-            ubuntu_release(arch)?
-        )),
+        "linux" => {
+            let release = ubuntu_release(arch)?;
+            Ok(format!(
+                "https://builds.hex.pm/builds/otp/{arch}/ubuntu-{release}/builds.txt"
+            ))
+        }
         "macos" => Ok(format!(
             "https://raw.githubusercontent.com/erlef/otp_builds/refs/heads/main/builds/{arch}-apple-darwin.csv"
         )),
@@ -165,10 +176,12 @@ fn tarball_url(version: &str) -> Result<String> {
     let (arch, _) = host_arch_tokens()?;
     let upstream = upstream_version(version);
     match std::env::consts::OS {
-        "linux" => Ok(format!(
-            "https://builds.hex.pm/builds/otp/{arch}/ubuntu-{}/OTP-{upstream}.tar.gz",
-            ubuntu_release(arch)?
-        )),
+        "linux" => {
+            let release = ubuntu_release(arch)?;
+            Ok(format!(
+                "https://builds.hex.pm/builds/otp/{arch}/ubuntu-{release}/OTP-{upstream}.tar.gz"
+            ))
+        }
         "macos" => Ok(format!(
             "https://github.com/erlef/otp_builds/releases/download/OTP-{upstream}/otp-{arch}-apple-darwin.tar.gz"
         )),
@@ -707,6 +720,18 @@ mod tests {
         assert_eq!(map_os_release("debian", "10"), "18.04");
         assert_eq!(map_os_release("fedora", "42"), "24.04");
         assert_eq!(map_os_release("", ""), "24.04");
+        let legacy_debian = "ID=debian\nVERSION_ID=\"10\"\n";
+        assert_eq!(
+            ubuntu_release_from_os(legacy_debian, "amd64").unwrap(),
+            "18.04"
+        );
+        let error = ubuntu_release_from_os(legacy_debian, "arm64")
+            .expect_err("Debian 10 maps to a build that Hex never published for arm64");
+        assert!(
+            error
+                .to_string()
+                .contains("No Hex Erlang/OTP build for Ubuntu 18.04 on arm64")
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -717,17 +742,18 @@ mod tests {
         if crate::core::testing::run_isolated_test(NAME) {
             return;
         }
+        let (arch, _) = host_arch_tokens().expect("supported Linux coverage architecture");
         for release in ["20.04", "22.04", "24.04", "26.04"] {
             temp_env::with_var(UBUNTU_RELEASE_OVERRIDE_ENV, Some(release), || {
-                assert!(
-                    index_url()
-                        .unwrap()
-                        .ends_with(&format!("/ubuntu-{release}/builds.txt"))
+                assert_eq!(
+                    index_url().expect("supported release resolves a publisher index"),
+                    format!("https://builds.hex.pm/builds/otp/{arch}/ubuntu-{release}/builds.txt")
                 );
-                assert!(
-                    tarball_url("28.2.0")
-                        .unwrap()
-                        .ends_with(&format!("/ubuntu-{release}/OTP-28.2.tar.gz"))
+                assert_eq!(
+                    tarball_url("28.2.0").expect("supported release resolves a publisher archive"),
+                    format!(
+                        "https://builds.hex.pm/builds/otp/{arch}/ubuntu-{release}/OTP-28.2.tar.gz"
+                    )
                 );
             });
         }

@@ -1021,6 +1021,14 @@ mod tests {
         )
         .unwrap();
         assert!(smoke_swift(dir.path(), "6.1").is_err());
+        fs::write(
+            &binary,
+            "#!/bin/sh\nprintf 'Swift version 6.1.2 (release)\\n'\nprintf 'fixture failed\\n' >&2\nexit 7\n",
+        )
+        .expect("write a Swift fixture that reports a version before failing");
+        let error = smoke_swift(dir.path(), "6.1.2")
+            .expect_err("a failed smoke command cannot establish the installed version");
+        assert_eq!(error.to_string(), "Swift smoke test failed: fixture failed");
     }
 
     #[test]
