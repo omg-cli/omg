@@ -4,7 +4,7 @@ import argparse
 import ast
 import bisect
 from collections import Counter
-from dataclasses import asdict, dataclass, fields, is_dataclass
+from dataclasses import asdict, dataclass, field, fields, is_dataclass
 import hashlib
 import json
 import difflib
@@ -3137,6 +3137,7 @@ class CompiledOwnerSourceIndex:
     name_counts: Counter
     source_names: frozenset | None
     declaration_ends: dict | None = None
+    line_extents: dict = field(default_factory=dict, repr=False, compare=False)
 
 
 def index_compiled_owner_sources(owners, files, work, source_names=None, *, index_declaration_ends=False):
@@ -3178,6 +3179,27 @@ def index_compiled_owner_sources(owners, files, work, source_names=None, *, inde
     _construct_charge(work, sum(len(rows) for rows in inventories.values()))
     return CompiledOwnerSourceIndex(owners, files, len(owners), len(files),
         {name: tuple(rows) for name, rows in inventories.items()}, names, source_names, declaration_ends)
+
+
+def compiled_owners_in_range(index, name, first, last, work, include_symbol=''):
+    """Prefilter raw region scans and keep complete inventories of named copies."""
+    if name not in index.line_extents:
+        owners = index.inventories.get(name, ())
+        _construct_charge(work, sum(2 * len(owner['regions']) + 1 for owner in owners))
+        index.line_extents[name] = tuple(
+            (min((r[0] for r in owner['regions']), default=0),
+             max((r[2] for r in owner['regions']), default=0), owner) for owner in owners)
+    ranges = index.line_extents[name]
+    _construct_charge(work, len(ranges))
+    candidates = []
+    for start, stop, owner in ranges:
+        if start <= last and first <= stop:
+            candidates.append(owner)
+        elif include_symbol:
+            _construct_charge(work, len(owner['name']))
+            if include_symbol in owner['name']:
+                candidates.append(owner)
+    return tuple(candidates)
 
 
 def qualified_function_completion(sides, work):
@@ -13637,7 +13659,7 @@ def retained_aur_archive_capture(name, sides, indexes, work):
         tail_start = line + 2 + len(inspect)
         lines = (line + 1, *range(tail_start, end[0]))
         positions = {selected: ordinal for ordinal, selected in enumerate(lines)}
-        owners = index.inventories.get(name, ())
+        owners = compiled_owners_in_range(index, name, lines[0], lines[-1], work, '18authorize_archives')
         _construct_charge(work, sum(len(owner['regions']) * (len(lines).bit_length() + 1)
                                    + len(owner['name']) + 1 for owner in owners))
         copies = {}; affected = set()
@@ -14423,7 +14445,8 @@ def compiled_tokio_test_fixture(name, inventory, index, declaration, work,
     scope = _boolean_module(code, {'start': first})
     if scope is None or scope[:2] != ([module[-1]], [module[-1]]):
         return None
-    owners = index.inventories.get(name, ())
+    start, stop = code.region(first, end)[0::2]
+    owners = compiled_owners_in_range(index, name, start, stop, work, declaration)
     _construct_charge(work, sum(len(owner['name']) + len(owner['regions']) + 1 for owner in owners))
     roots = [(owner, shape) for owner in owners
              if (shape := plain_rust_function_symbol(owner['name'])) is not None
@@ -14537,7 +14560,7 @@ def retained_node_retry_fixtures(name, sides, indexes, work):
             start, stop = code.region(function['opening'], function['end'])[0::2]
             content = source[start:stop - 1]
             _construct_charge(work, sum(len(line) + 1 for line in content))
-            owners = index.inventories[name]
+            owners = compiled_owners_in_range(index, name, start, stop, work)
             _construct_charge(work, sum(len(owner['regions']) for owner in owners))
             touching = [owner for owner in owners if owner is not root and owner is not body
                         and any(r[0] <= stop and start <= r[2] for r in owner['regions'])]
@@ -14591,7 +14614,13 @@ _PACMAN_CHILD_FIXTURE_DIGESTS = {
 }
 
 
-def retired_pacman_child_fixture(name, line, inventory, counts, indexes, head_constructs, head_names, work):
+def retained_native_check_symbols(index, work):
+    _construct_charge(work, sum(len(symbol) + 1 for symbol in index.name_counts))
+    return tuple(symbol for symbol in index.name_counts if 'native_check' in symbol)
+
+
+def retired_pacman_child_fixture(name, line, inventory, counts, indexes, head_constructs, head_names, work,
+                                 native_check_symbols=None):
     """Retire the removed pacman subprocess tests without subtracting baseline rows."""
     if inventory is None or head_constructs is None or 'bounded_native_check' in head_names:
         return None
@@ -14615,12 +14644,14 @@ def retired_pacman_child_fixture(name, line, inventory, counts, indexes, head_co
         return None
     function, root, body, _ = fixture
     start, _, stop, _ = code.region(function['first'], function['end'])
-    observed = base.inventories.get(name, ())
+    observed = compiled_owners_in_range(base, name, start, stop, work)
     _construct_charge(work, sum(len(owner['regions']) + 1 for owner in observed) + stop - start + 1)
     touching = [owner for owner in observed if any(r[0] <= stop and start <= r[2] for r in owner['regions'])]
-    _construct_charge(work, sum(len(symbol) + 1 for symbol in head.name_counts))
+    if native_check_symbols is None:
+        native_check_symbols = retained_native_check_symbols(head, work)
+    _construct_charge(work, sum(len(symbol) + 1 for symbol in native_check_symbols))
     if (len(touching) != 2 or {id(owner) for owner in touching} != {id(root), id(body)}
-            or any(declaration in symbol or 'bounded_native_check' in symbol for symbol in head.name_counts)):
+            or any(declaration in symbol or 'bounded_native_check' in symbol for symbol in native_check_symbols)):
         return None
     regions = root['regions'] + body['regions']
     _construct_charge(work, len(regions))
@@ -15395,7 +15426,8 @@ def retained_aur_hook_rendering(name, sides, indexes, work, *, include_map=False
         root_slots = [code.region(token, token) for token in (code.pairs[call] + 2, function_end)]
         inner_bounds = code.region(opening, closing)
         inner_markers = [code.region(token, token) for token in (opening, closing)]
-        owners = index.inventories.get(name, ())
+        function_range = code.region(root_rows[0]['first'], function_end)[0::2]
+        owners = compiled_owners_in_range(index, name, *function_range, work, function_name)
         _construct_charge(work, sum(len(owner['name']) + len(owner['regions']) + 1 for owner in owners))
         roots = [(owner, shape) for owner in owners
                  if (shape := plain_rust_function_symbol(owner['name'])) is not None
@@ -15424,7 +15456,6 @@ def retained_aur_hook_rendering(name, sides, indexes, work, *, include_map=False
                 r for r in owner['regions'] if any(r[0] <= n <= r[2] for n in lookup)])}
             if len(map_owners) != 2 * len(roots) or len(lookup_owners) != len(roots):
                 return None
-        function_range = code.region(root_rows[0]['first'], code.pairs[function])[0::2]
         for root, shape in roots:
             span = source_owner_span(root, name, index.files, source)
             if (index.name_counts[root['name']] != 1 or span is None
@@ -15589,7 +15620,7 @@ def retained_aur_lifecycle_worker(name, sides, indexes, work, *, package_base=Fa
         diagnostic_role = ('', '', '' if modern else 's_')
         roles = ((), ('',), ('', ''), diagnostic_role) if package_base else ((), ('',), ('', ''))
         copies = {}
-        owners = index.inventories.get(name, ())
+        owners = compiled_owners_in_range(index, name, lines[0], lines[-1], work, declaration)
         _construct_charge(work, sum(len(lines).bit_length() * len(owner['regions']) + len(owner['name'])
                                    for owner in owners))
         for owner in owners:
@@ -15716,7 +15747,8 @@ def retained_aur_index_search(name, sides, indexes, work, *, info=False):
             selected = (call, *range(first, first + returns[0]), end + 1)
         positions = {line: offset for offset, line in enumerate(selected)}
         roles = ((), ('',), ('', '')) if info else ((), ('',), ('', ''), ('', '', ''))
-        owners = index.inventories.get(name, ())
+        owner_name = f'9AurClient{len(declaration)}{declaration}'
+        owners = compiled_owners_in_range(index, name, selected[0], selected[-1], work, owner_name)
         _construct_charge(work, sum(len(owner['name']) + len(selected).bit_length() * len(owner['regions'])
                                    for owner in owners))
         copies = {}
@@ -15724,7 +15756,7 @@ def retained_aur_index_search(name, sides, indexes, work, *, info=False):
             symbol = owner['name']
             raw = [r for r in owner['regions'] if (at := bisect.bisect_left(selected, r[0])) < len(selected)
                    and selected[at] <= r[2]]
-            shape = nominal_method_path(symbol) if f'9AurClient{len(declaration)}{declaration}' in symbol else None
+            shape = nominal_method_path(symbol) if owner_name in symbol else None
             qualified = (shape is not None and shape.kind == 'M' and shape.namespace == _AUR_CLIENT_NAMESPACE
                          and shape.self_type == ('type', _AUR_CLIENT_NAMESPACE, ('AurClient', ''))
                          and shape.method == (declaration, ''))
@@ -16347,6 +16379,7 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
                 declaration_roles[coordinates] = proof,role
             retired_declaration_receipts.append(proof)
             return True
+        native_check_symbols = None
         def retained_statement_lines(block):
             key = tuple(block['base_range']), tuple(block.get('retained_statements', ()))
             if key not in retained_statement_rows:
@@ -16541,8 +16574,11 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
                                     continue
                         if (proof is None and name == 'src/package_managers/pacman_db/db.rs'
                                 and inventories is not None and bs[name]['expansions'] == hs[name]['expansions'] == []):
+                            indexes = source_owner_indexes()
+                            if native_check_symbols is None:
+                                native_check_symbols = retained_native_check_symbols(indexes[1], construct_work)
                             retired = retired_pacman_child_fixture(name, line, inventories[0], before,
-                                source_owner_indexes(), head_construct_inventory(), head_fn_names, construct_work)
+                                indexes, head_construct_inventory(), head_fn_names, construct_work, native_check_symbols)
                             if retired is not None and not anchored.keys() & set(retired['base_lines']):
                                 moved_source_lines.update(retired['base_lines'])
                                 retirement_receipts.append(retired)

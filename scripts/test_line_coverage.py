@@ -1028,12 +1028,14 @@ class PacmanFixtureCoverageTests(unittest.TestCase):
         owners = [dict(name=name, filenames=list(files), count=1, regions=rows) for name, rows in (
             ('_R' + symbol, [[4, 11, 4, opening - 1, 1, 0, 0, 0], close]),
             ('_RNC' + symbol + '0Bb_', [entry, awaited]))]
-        for fault in (None, 'live-helper', 'surviving-body', 'incomplete-evidence', 'different-fixture'):
+        for fault in (None, 'live-helper', 'live-compiled-helper', 'surviving-body',
+                      'incomplete-evidence', 'different-fixture'):
             with self.subTest(fault=fault):
                 work = [coverage.SOURCE_CONSTRUCT_WORK_CAPACITY]
                 inventory = coverage._construct_inventory(source, work)
                 base = coverage.index_compiled_owner_sources(owners, files, work, {filename})
-                head = coverage.index_compiled_owner_sources([], files, work, {filename})
+                head_owners = [dict(owners[0], name='bounded_native_check')] if fault == 'live-compiled-helper' else []
+                head = coverage.index_compiled_owner_sources(head_owners, files, work, {filename})
                 fixture = next(row for row in inventory[1] if declaration in row['header'])
                 declarations = {'bounded_native_check'} if fault == 'live-helper' else set()
                 body_hashes = {fixture['body']} if fault == 'surviving-body' else set()
@@ -1043,6 +1045,11 @@ class PacmanFixtureCoverageTests(unittest.TestCase):
                     proof = coverage.retired_pacman_child_fixture(filename, 5, inventory, counts,
                                                                   (base, head), (body_hashes, set()),
                                                                   declarations, work)
+                    symbols = coverage.retained_native_check_symbols(head, work)
+                    cached = coverage.retired_pacman_child_fixture(filename, 5, inventory, counts,
+                                                                   (base, head), (body_hashes, set()),
+                                                                   declarations, work, symbols)
+                self.assertEqual(proof, cached)
                 if fault is None:
                     self.assertIsNotNone(proof)
                     self.assertEqual(proof['base_lines'], [4, 5, 6])
@@ -1052,6 +1059,21 @@ class PacmanFixtureCoverageTests(unittest.TestCase):
 
 
 class CompiledPlainParentFilesTests(unittest.TestCase):
+    def test_owner_extent_lookup_keeps_overlaps_and_out_of_range_named_copies(self):
+        path = '/archive/src/example.rs'
+        name = 'src/example.rs'
+        owners = [
+            dict(name='overlap', filenames=[path], regions=[[1, 1, 10, 5, 1, 0, 0, 0]]),
+            dict(name='disjoint', filenames=[path], regions=[[11, 1, 12, 5, 1, 0, 0, 0]]),
+            dict(name='requested_method', filenames=[path], regions=[[20, 1, 21, 5, 1, 0, 0, 0]]),
+            dict(name='foreign', filenames=['/archive/src/other.rs'], regions=[[1, 1, 50, 5, 1, 0, 0, 0]]),
+        ]
+        work = [coverage.SOURCE_CONSTRUCT_WORK_CAPACITY]
+        index = coverage.index_compiled_owner_sources(owners, {path: name}, work, {name})
+        selected = coverage.compiled_owners_in_range(index, name, 5, 10, work, 'requested')
+        self.assertEqual(selected, (owners[0], owners[2]))
+        self.assertEqual(coverage.compiled_owners_in_range(index, name, 11, 12, work), (owners[1],))
+
     def test_lookup_preserves_literal_scopes_and_conservative_opaque_owners(self):
         scope = '7omg_lib3pkg5tests'
         owners = [dict(name=name, filenames=paths) for name, paths in (
