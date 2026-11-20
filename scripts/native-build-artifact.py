@@ -148,10 +148,14 @@ def api(path, limit=1024 * 1024, *, include_status=False, timeout=90):
     command = ['gh', 'api', path]
     if include_status:
         command.append('--include')
-    with tempfile.TemporaryFile() as output:
+    with tempfile.TemporaryFile() as output, tempfile.TemporaryFile() as diagnostic:
         try:
-            subprocess.run(command, stdout=output, check=True, timeout=timeout)
+            subprocess.run(command, stdout=output, stderr=diagnostic, check=True, timeout=timeout)
         except subprocess.CalledProcessError as error:
+            diagnostic.seek(0)
+            error.stderr = diagnostic.read(4097)
+            if error.stderr:
+                print(error.stderr[:4096].decode(errors='replace').rstrip(), file=sys.stderr)
             if include_status:
                 require(output.tell() <= limit, 'GitHub response exceeds limit')
                 output.seek(0)
@@ -184,11 +188,18 @@ def request_body(path, body_limit, timeout, kind):
             data = api(path, body_limit + MAX_HTTP_HEADERS, include_status=True, timeout=min(remaining, 90))
         except (subprocess.TimeoutExpired, subprocess.CalledProcessError) as error:
             if isinstance(error, subprocess.CalledProcessError):
-                if not error.output or not error.output.startswith(b'HTTP/'):
-                    raise
-                status, _, retry_after = http_response(error.output, body_limit)
+                status, retry_after = None, False
+                if error.output:
+                    if not error.output.startswith(b'HTTP/'):
+                        raise
+                    status, _, retry_after = http_response(error.output, body_limit)
+                incomplete_metadata = (
+                    kind == 'metadata' and error.returncode == 1
+                    and (error.stderr or b'').strip() == b'unexpected end of JSON input'
+                    and (status is None or 200 <= status < 300)
+                )
                 # Leave rate limits and server-directed delays as explicit failures.
-                if status not in (502, 503, 504) or retry_after:
+                if retry_after or (status not in (502, 503, 504) and not incomplete_metadata):
                     raise
             delay = 2 ** attempt
             if attempt == 2 or deadline - time.monotonic() <= delay:

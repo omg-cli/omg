@@ -3403,10 +3403,9 @@ omarchy-pkg-drop imv mpv-mpris
         }
 
         let owner = private_directory();
-        std::fs::write(
-            owner.path().join("policy.toml"),
-            "require_pgp = 'not-a-boolean'\n",
-        )?;
+        let policy = "require_pgp = 'not-a-boolean'\n";
+        std::fs::write(owner.path().join("policy.toml"), policy)
+            .expect("write invalid policy fixture");
         let runtime = OmarchyRuntime {
             root: owner.path().to_path_buf(),
             migration_state: owner.path().join("markers"),

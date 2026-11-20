@@ -65,7 +65,7 @@ class NativeBuildAdmission(unittest.TestCase):
                                            (200, b'{"id":42}')])
         elapsed = iter((30, 20, 1))
 
-        def request(argv, *, stdout, check, timeout):
+        def request(argv, *, stdout, check, timeout, stderr=None):
             timeouts.append(timeout)
             clock[0] += next(elapsed)
             return response(argv, stdout=stdout, check=check, timeout=timeout)
@@ -83,7 +83,7 @@ class NativeBuildAdmission(unittest.TestCase):
             clock = [0.0]
             response = self.metadata_response([(503, b'{}'), (200, b'{"id":42}')])
 
-            def request(argv, *, stdout, check, timeout):
+            def request(argv, *, stdout, check, timeout, stderr=None):
                 clock[0] += elapsed
                 if failure is subprocess.TimeoutExpired:
                     raise subprocess.TimeoutExpired(argv, timeout)
@@ -102,7 +102,7 @@ class NativeBuildAdmission(unittest.TestCase):
     def metadata_response(responses):
         responses = iter(responses)
 
-        def request(argv, *, stdout, check, timeout):
+        def request(argv, *, stdout, check, timeout, stderr=None):
             response = next(responses)
             if isinstance(response, subprocess.TimeoutExpired):
                 stdout.write(b'partial response, never reusable')
@@ -131,6 +131,39 @@ class NativeBuildAdmission(unittest.TestCase):
                 self.assertEqual(actual, {'id': 42})
                 self.assertEqual(request.call_count, 2)
                 sleep.assert_called_once_with(1)
+
+    def test_truncated_github_metadata_retries_without_using_the_partial_response(self):
+        path = 'repos/omg-cli/omg/actions/runs/10/attempts/2/jobs?per_page=100'
+        for header, status, expected_calls in [
+            (b'', None, 2),
+            (b'HTTP/2.0 200\r\nContent-Type: application/json\r\n\r\n', 200, 2),
+            (b'HTTP/2.0 403\r\nRetry-After: 10\r\n\r\n', 403, 1),
+        ]:
+            with self.subTest(status=status):
+                response = self.metadata_response([(200, b'{"total_count":0,"jobs":[]}')])
+                first = True
+
+                def run(argv, *, stdout, check, timeout, stderr=None):
+                    nonlocal first
+                    if not first:
+                        return response(argv, stdout=stdout, check=check, timeout=timeout)
+                    first = False
+                    stdout.write(header)
+                    diagnostic = b'unexpected end of JSON input\n'
+                    if stderr is not None:
+                        stderr.write(diagnostic)
+                    raise subprocess.CalledProcessError(1, argv, stderr=diagnostic)
+
+                with patch.object(BUILD.subprocess, 'run', side_effect=run) as request, \
+                        patch.object(BUILD.time, 'sleep') as sleep:
+                    if expected_calls == 1:
+                        with self.assertRaises(subprocess.CalledProcessError):
+                            BUILD.api_json(path)
+                        sleep.assert_not_called()
+                    else:
+                        self.assertEqual(BUILD.api_json(path), {'total_count': 0, 'jobs': []})
+                        sleep.assert_called_once_with(1)
+                    self.assertEqual(request.call_count, expected_calls)
 
     def test_metadata_timeouts_and_gateway_failures_share_three_attempt_budget(self):
         path = 'repos/omg-cli/omg/actions/workflows/ci.yml'
@@ -183,7 +216,7 @@ class NativeBuildAdmission(unittest.TestCase):
         path = 'repos/omg-cli/omg/actions/workflows/ci.yml'
         for data in (b'', b'HTTP/2.0 200 OK\nContent-Type: application/json\r\n\r\n{}',
                      b'HTTP/2.0 503 Unavailable\nRetry-After: 60\r\n\r\n{}'):
-            def failed_process(argv, *, stdout, check, timeout):
+            def failed_process(argv, *, stdout, check, timeout, stderr=None):
                 stdout.write(data)
                 raise subprocess.CalledProcessError(1, argv)
 

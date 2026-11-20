@@ -490,6 +490,7 @@ jobs:
                   return 1
                 fi
                 if [[ "$test_name" == config::settings::tests::hardened_aur_settings_refuse_incompatible_build_options ||
+                      "$test_name" == cli::packages::update::omarchy::tests::media_launcher_cleanup_reports_a_matching_launcher_it_cannot_remove ||
                       "$test_name" == runtimes::npm::admission_tests::banned_transitive_dependency_stops_npm_before_materialization ||
                       "$test_name" == runtimes::npm::admission_tests::retained_npm_admission_refuses_policy_changes_before_publication ]]; then
                   grep -F "[omg-unprivileged-fixture]" "$log" | grep -F "parent_uid=0"
@@ -518,6 +519,7 @@ jobs:
                 package_managers::aur::client::tests::native_isolated_fixture_builds_reviewed_source_without_installing
                 package_managers::aur::client::tests::native_isolated_history_requires_hardened_review
                 config::settings::tests::hardened_aur_settings_refuse_incompatible_build_options
+                cli::packages::update::omarchy::tests::media_launcher_cleanup_reports_a_matching_launcher_it_cannot_remove
                 runtimes::npm::admission_tests::banned_transitive_dependency_stops_npm_before_materialization
                 runtimes::npm::admission_tests::retained_npm_admission_refuses_policy_changes_before_publication
                 package_managers::aur::client::tests::final_install_rechecks_current_hardened_profile_before_elevation

@@ -180,6 +180,58 @@ printf '%s %s\\n' "$first" "$second"
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout.strip(), expected)
 
+    def test_fedora_retries_only_an_unchanged_transaction_after_advisory_drift(self):
+        source = Path(__file__).with_name('benchmark-qemu.sh').read_text()
+        begin = source.index('if [[ "$distro" == fedora ]]; then\n  rpm -qa')
+        end = source.index('\ninstalled\n"$bin" info tree', begin)
+        install = source[begin:end]
+        fixture = r'''
+set -euo pipefail
+distro=fedora
+native_bin=/fixture/omg
+attempt=0
+installed() { [[ -f installed ]]; }
+rpm() {
+  printf 'existing|0|1|1.fc44|x86_64\n'
+  if [[ -f unexpected ]]; then printf 'unexpected|0|1|1.fc44|x86_64\n'; fi
+}
+python3() {
+  if [[ "$*" == *--deny-only* ]]; then return 0; fi
+  attempt=$((attempt + 1))
+  printf '%s\n' "$attempt" > attempts
+  if (( attempt == 1 )); then
+    case "$SCENARIO" in
+      stable) touch installed; return 0 ;;
+      ordinary-error) printf 'Error: admission policy changed\r\n'; return 1 ;;
+      mutated) touch unexpected ;;
+    esac
+    printf 'Error: Package advisory evidence changed; review this transaction again\r\n'
+    return 1
+  fi
+  [[ "$*" == *--require-review* ]] || return 98
+  case "$SCENARIO" in
+    recovered) touch installed ;;
+    persistent)
+      printf 'Error: Package advisory evidence changed; review this transaction again\r\n'
+      return 1 ;;
+    *) return 99 ;;
+  esac
+}
+'''
+        for scenario, expected_code, expected_attempts in [
+            ('stable', 0, 1), ('recovered', 0, 2), ('persistent', 1, 2),
+            ('ordinary-error', 1, 1), ('mutated', 1, 1),
+        ]:
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                (root / 'evidence').mkdir()
+                result = subprocess.run(['bash', '-c', fixture + install], cwd=root,
+                                        env=dict(os.environ, SCENARIO=scenario),
+                                        capture_output=True, text=True, timeout=5)
+                self.assertEqual(result.returncode, expected_code, result.stderr)
+                self.assertEqual((root / 'attempts').read_text(), f'{expected_attempts}\n')
+                self.assertEqual((root / 'installed').exists(), expected_code == 0)
+
     def _run_fedora_makecache(self, attempts, copy_fail=False):
         source = (Path(__file__).resolve().parent / 'benchmark-qemu.sh').read_text()
         case_begin = source.index('case "$distro" in\n  arch) arch_system_upgrade')

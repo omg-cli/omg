@@ -1263,7 +1263,25 @@ if [[ "$distro" == fedora ]]; then
   cmp evidence/native-advisory-denial-before.tsv evidence/native-advisory-denial-after.tsv
   if installed >/dev/null 2>&1; then echo 'denied advisory risk changed tree state' >&2; exit 1; fi
 fi
-python3 "$HOME/qemu-runtime-advisory-oracle.py" --native --accept-only --timeout 600 -- sudo -n "$native_bin" install --yes tree
+install_review=(python3 "$HOME/qemu-runtime-advisory-oracle.py" --native --accept-only --timeout 600)
+if [[ "$distro" == fedora ]]; then
+  accepted_status=0
+  first_review=evidence/native-advisory-first-review.log
+  "${install_review[@]}" -- sudo -n "$native_bin" install --yes tree > "$first_review" 2>&1 || accepted_status=$?
+  cat "$first_review"
+  if (( accepted_status != 0 )); then
+    if (( accepted_status != 1 )) ||
+       ! grep -Eq $'^Error: Package advisory evidence changed; review this transaction again\r?$' "$first_review"; then
+      exit "$accepted_status"
+    fi
+    rpm -qa --qf '%{NAME}|%{EPOCHNUM}|%{VERSION}|%{RELEASE}|%{ARCH}\n' | LC_ALL=C sort > evidence/native-advisory-drift-after.tsv
+    cmp evidence/native-advisory-denial-before.tsv evidence/native-advisory-drift-after.tsv
+    if installed >/dev/null 2>&1; then echo 'advisory drift changed tree state' >&2; exit 1; fi
+    "${install_review[@]}" --require-review -- sudo -n "$native_bin" install --yes tree
+  fi
+else
+  "${install_review[@]}" -- sudo -n "$native_bin" install --yes tree
+fi
 installed
 "$bin" info tree > evidence/omg-info.txt
 "${native[@]}" > evidence/native-info.txt
