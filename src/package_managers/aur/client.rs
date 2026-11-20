@@ -518,6 +518,12 @@ impl ReviewedSource {
             .with_context(|| format!("Unreviewed AUR input: {}", review_path(path)))?;
         Ok(std::str::from_utf8(bytes)?)
     }
+
+    fn recomputes_version(&self) -> Result<bool> {
+        Ok(self.text(Path::new("PKGBUILD"))?.lines().any(|line| {
+            line.trim_start().starts_with("pkgver()") || line.trim_start().starts_with("pkgver ()")
+        }))
+    }
 }
 
 fn encode_symlink_manifest(target: &Path) -> Vec<u8> {
@@ -697,6 +703,29 @@ fn native_build_command() -> Result<Command> {
             "setsid",
         )?)
         .args(["-w", "makepkg"]);
+    Ok(command)
+}
+
+fn chroot_build_command(
+    secure_makepkg: bool,
+    resolve_program: impl Fn(&str) -> Result<PathBuf>,
+) -> Result<Command> {
+    let mut command = Command::new(resolve_program("setsid")?);
+    command.args(["-w", "--"]).stdin(Stdio::null());
+    if let Ok(pkgctl) = resolve_program("pkgctl") {
+        command.arg(pkgctl).arg("build");
+        if secure_makepkg {
+            command.arg("--clean");
+        }
+    } else if let Ok(makechrootpkg) = resolve_program("makechrootpkg") {
+        command
+            .arg(makechrootpkg)
+            .args(["-r", "/var/lib/archbuild", "--"]);
+    } else {
+        anyhow::bail!(
+            "Chroot build requires devtools (pkgctl/makechrootpkg). Install devtools or choose bubblewrap/native."
+        );
+    }
     Ok(command)
 }
 
@@ -1168,7 +1197,7 @@ struct BuildProcess {
 
 impl BuildProcess {
     fn terminate(&mut self) -> Result<()> {
-        // Stop the launcher first: native setsid may not have established the
+        // Stop the launcher first: setsid may not have established the
         // session yet. Once killed, it cannot create descendants after killpg.
         let launcher_result = self.child.as_mut().map_or(Ok(()), |child| {
             child
@@ -2039,6 +2068,22 @@ impl AurClient {
         )
     }
 
+    fn check_rebuilt_rollback_version(
+        package: &str,
+        version: &str,
+        installed: Option<&Version>,
+    ) -> Result<()> {
+        let rebuilt = crate::package_managers::types::parse_version(version)
+            .context("Historical AUR rebuild reported an invalid package version")?;
+        if let Some(installed) = installed {
+            anyhow::ensure!(
+                crate::package_managers::types::compare_versions(&rebuilt, installed).is_lt(),
+                "Historical AUR recipe for {package} rebuilt as {rebuilt}, which is not older than installed {installed}"
+            );
+        }
+        Ok(())
+    }
+
     /// Rebuild `package` at historical `version` from the AUR repository's
     /// git history and install the resulting archive.
     ///
@@ -2047,8 +2092,18 @@ impl AurClient {
     /// commit whose `.SRCINFO` recorded the old version. The clone is fully
     /// isolated under `_rollback/` so the user's cached checkout is never
     /// touched, and no build-cache key is written (this is not the latest
-    /// build).
-    pub async fn downgrade_from_history(&self, package: &str, version: &str) -> Result<()> {
+    /// build). Returns the version installed from the reviewed archive.
+    pub async fn downgrade_from_history(&self, package: &str, version: &str) -> Result<String> {
+        self.rebuild_from_history_with_install(package, version, Self::install_built_packages)
+            .await
+    }
+
+    async fn rebuild_from_history_with_install(
+        &self,
+        package: &str,
+        version: &str,
+        install: impl AsyncFn(&[BuiltPackages], Option<&crate::core::sudoloop::SudoLoop>) -> Result<()>,
+    ) -> Result<String> {
         crate::core::security::validate_package_name(package)?;
         crate::core::security::validate_version(version)?;
         require_unprivileged_builder(package, crate::core::is_root())?;
@@ -2126,7 +2181,22 @@ impl AurClient {
             return Err(AurError::PackageArchiveNotFound(package.to_string()).into());
         };
 
-        crate::cli::modern_ui::print_info(&format!("Installing {package} {version}"));
+        // makepkg can rewrite PKGBUILD after pkgver() and records the checkout
+        // path in .BUILDINFO. Restore verified inputs at the same path so the
+        // independent build can reproduce the archive with private outputs.
+        if reviewed_digest.recomputes_version()? && reviewed_digest.verify(&pkg_dir).is_err() {
+            let checkout = Self::begin_rollback_worktree(&work, &base)?;
+            super::history::checkout_version(&url, checkout.path(), &base, version).await?;
+            reviewed_digest.verify(checkout.path())?;
+            rustix::fs::renameat_with(
+                rustix::fs::CWD,
+                checkout.path(),
+                rustix::fs::CWD,
+                &pkg_dir,
+                rustix::fs::RenameFlags::EXCHANGE,
+            )
+            .context("Failed to restore the reviewed checkout for the independent AUR build")?;
+        }
         let archives = self
             .authorize_with_paired_build(
                 &[archive],
@@ -2134,13 +2204,29 @@ impl AurClient {
                 &base,
                 &[package.to_owned()],
                 &[package.to_owned()],
-                false,
+                true,
                 &pkg_dir,
                 &env,
             )
             .await?;
-        Self::install_built_packages(std::slice::from_ref(&archives), sudoloop.as_ref()).await?;
-        crate::cli::modern_ui::print_success(&format!("Installed {package} {version}"));
+        let archive = archives
+            .archives
+            .first()
+            .context("Rollback build produced no archive")?;
+        let rebuilt = Self::cached_archive_identity(Path::new(&archive.handoff()))?
+            .context("Reviewed rollback archive lacks package identity")?
+            .version;
+        if rebuilt != version {
+            let installed = pacman_db::read_local_package(package)?;
+            let installed_version = installed.as_ref().map(|record| &record.version);
+            Self::check_rebuilt_rollback_version(package, &rebuilt, installed_version)?;
+            crate::cli::modern_ui::print_info(&format!(
+                "Historical recipe for {package} {version} built version {rebuilt}"
+            ));
+        }
+        crate::cli::modern_ui::print_info(&format!("Installing {package} {rebuilt}"));
+        install(std::slice::from_ref(&archives), sudoloop.as_ref()).await?;
+        crate::cli::modern_ui::print_success(&format!("Installed {package} {rebuilt}"));
         // Use async cleanup on success and report failures. The owner also
         // attempts cleanup on error/cancellation; logs remain outside this tree.
         if let Err(error) = tokio::fs::remove_dir_all(&repo_dir).await {
@@ -2149,7 +2235,7 @@ impl AurClient {
                 repo_dir.display()
             );
         }
-        Ok(())
+        Ok(rebuilt)
     }
 
     pub async fn install(&self, package: &str) -> Result<()> {
@@ -2821,14 +2907,9 @@ impl AurClient {
                 && !paths.is_empty(),
             "AUR output set/base does not match reviewed source"
         );
-        let pkgbuild = source.text(Path::new("PKGBUILD"))?;
         // VCS recipes intentionally calculate pkgver during build. A changed
         // version still cannot change output names/base or approved root hooks.
-        let dynamic_version = fresh
-            && pkgbuild.lines().any(|line| {
-                line.trim_start().starts_with("pkgver()")
-                    || line.trim_start().starts_with("pkgver ()")
-            });
+        let dynamic_version = source.recomputes_version()? && fresh;
         let architecture_metadata = alpm_srcinfo::SourceInfoV1::from_string(srcinfo);
         paths
             .iter()
@@ -3947,6 +4028,22 @@ impl AurClient {
         env: &MakepkgEnv,
         package: &str,
     ) -> Result<std::process::ExitStatus> {
+        self.run_chroot_build_with(
+            pkg_dir,
+            env,
+            package,
+            crate::core::privilege::root_controlled_program_path,
+        )
+        .await
+    }
+
+    async fn run_chroot_build_with(
+        &self,
+        pkg_dir: &Path,
+        env: &MakepkgEnv,
+        package: &str,
+        resolve_program: impl Fn(&str) -> Result<PathBuf>,
+    ) -> Result<std::process::ExitStatus> {
         anyhow::ensure!(
             self.settings.aur.allow_unsafe_builds,
             "Chroot devtools execute AUR recipe code on the host before isolation. Use bubblewrap, or explicitly enable aur.allow_unsafe_builds to accept host code execution."
@@ -3958,26 +4055,7 @@ impl AurClient {
             self.settings.aur.allow_network,
             "Chroot devtools cannot enforce offline builds; choose bubblewrap or explicitly enable aur.allow_network"
         );
-        let mut cmd = if let Ok(pkgctl) =
-            crate::core::privilege::root_controlled_program_path("pkgctl")
-        {
-            let mut cmd = Command::new(pkgctl);
-            cmd.arg("build");
-            if self.settings.aur.secure_makepkg {
-                cmd.arg("--clean");
-            }
-            cmd
-        } else if let Ok(makechrootpkg) =
-            crate::core::privilege::root_controlled_program_path("makechrootpkg")
-        {
-            let mut cmd = Command::new(makechrootpkg);
-            cmd.args(["-r", "/var/lib/archbuild"]).arg("--");
-            cmd
-        } else {
-            anyhow::bail!(
-                "Chroot build requires devtools (pkgctl/makechrootpkg). Install devtools or choose bubblewrap/native."
-            );
-        };
+        let mut cmd = chroot_build_command(self.settings.aur.secure_makepkg, resolve_program)?;
 
         let (build_user, build_home) = build_identity();
         configure_build_environment(&mut cmd, &build_home, &build_user);
@@ -3988,13 +4066,12 @@ impl AurClient {
             .env("MAKEFLAGS", &env.makeflags)
             .env("PKGDEST", &env.pkgdest)
             .env("SRCDEST", &env.srcdest)
-            .env("BUILDDIR", &env.builddir)
-            .stdin(Stdio::null());
+            .env("BUILDDIR", &env.builddir);
         for (key, value) in &env.extra_env {
             cmd.env(key, value);
         }
 
-        self.run_logged_build_command(&mut cmd, package, BuildIsolation::ProcessGroup)
+        self.run_logged_build_command(&mut cmd, package, BuildIsolation::NativeSession)
             .await
             .context("Failed to run chroot build")
     }
@@ -4066,7 +4143,7 @@ impl AurClient {
             BuildIsolation::NativeSession => {
                 // A group leader makes util-linux setsid fork, losing the PID
                 // tracked below. Inherit our group so setsid execs in-place;
-                // makepkg then owns a detached session whose PGID is child.id().
+                // the build then owns a detached session whose PGID is child.id().
                 let parent_group = nix::unistd::getpgrp().as_raw();
                 // Zero can denote a group outside our PID namespace. Passing
                 // it to setpgid creates a child group instead of inheriting it.
@@ -5786,6 +5863,22 @@ mod tests {
     }
 
     #[test]
+    fn historical_rebuild_version_must_predate_the_installed_package() -> Result<()> {
+        let installed = crate::package_managers::types::parse_version("2:3-1")
+            .expect("fixture package version");
+        let validate =
+            |version| AurClient::check_rebuilt_rollback_version("demo", version, Some(&installed));
+        validate("2:2-1")?;
+        for version in ["2:3-1", "2:3-2", "3:1-1"] {
+            let error = validate(version).expect_err("a rollback must not reinstall or upgrade");
+            assert!(error.to_string().contains("not older than installed"));
+        }
+        AurClient::check_rebuilt_rollback_version("demo", "2-1", None)?;
+        assert!(validate("2\0").is_err());
+        Ok(())
+    }
+
+    #[test]
     fn reviewed_source_and_fresh_archive_share_one_authorization_boundary() -> Result<()> {
         let directory = tempfile::tempdir()?;
         std::fs::write(
@@ -5857,6 +5950,58 @@ mod tests {
                 .as_std()
                 .get_args()
                 .any(|argument| argument == "--no-new-privs")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn chroot_launchers_detach_before_starting_devtools() -> Result<()> {
+        for (helper, arguments) in [
+            (
+                "pkgctl",
+                vec!["-w", "--", "/usr/bin/pkgctl", "build", "--clean"],
+            ),
+            (
+                "makechrootpkg",
+                vec![
+                    "-w",
+                    "--",
+                    "/usr/bin/makechrootpkg",
+                    "-r",
+                    "/var/lib/archbuild",
+                    "--",
+                ],
+            ),
+        ] {
+            let command = chroot_build_command(true, |name| {
+                anyhow::ensure!(
+                    name == "setsid" || name == helper,
+                    "unavailable fixture tool"
+                );
+                Ok(Path::new("/usr/bin").join(name))
+            })?;
+            let command = command.as_std();
+            assert_eq!(command.get_program(), "/usr/bin/setsid");
+            assert!(
+                command
+                    .get_args()
+                    .eq(arguments.into_iter().map(std::ffi::OsStr::new))
+            );
+        }
+        let unavailable = chroot_build_command(true, |name| {
+            assert_eq!(name, "setsid");
+            anyhow::bail!("session launcher unavailable")
+        });
+        assert!(unavailable.is_err());
+        let unavailable = chroot_build_command(false, |name| {
+            anyhow::ensure!(name == "setsid", "devtools unavailable in fixture");
+            Ok(PathBuf::from("/usr/bin/setsid"))
+        })
+        .expect_err("chroot builds require a devtools launcher");
+        assert!(
+            unavailable
+                .to_string()
+                .contains("Chroot build requires devtools")
         );
         Ok(())
     }
@@ -8154,6 +8299,27 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn reviewed_chroot_launch_waits_for_the_detached_helper() -> Result<()> {
+        let state = tempfile::tempdir()?;
+        let mut client = AurClient::new()?;
+        client.build_dir = state.path().join("build");
+        client.settings.aur.allow_network = true;
+        client.settings.aur.allow_unsafe_builds = true;
+        let env = client.makepkg_env(state.path()).await?;
+        let status = client
+            .run_chroot_build_with(state.path(), &env, "demo", |program| {
+                if program == "pkgctl" {
+                    return crate::core::privilege::root_controlled_program_path("true");
+                }
+                assert_eq!(program, "setsid");
+                crate::core::privilege::root_controlled_program_path(program)
+            })
+            .await?;
+        assert!(status.success());
+        Ok(())
+    }
+
     #[test]
     fn install_hook_review_fails_closed_and_preserves_long_lines() {
         let mut source = ReviewedSource {
@@ -10265,6 +10431,143 @@ finally:
             );
             assert!(output.status.success(), "{diagnostic}");
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires the disposable, network-isolated Arch coverage container"]
+    async fn native_isolated_dynamic_history_pairs_reviewed_source() -> Result<()> {
+        const CASE: &str = "package_managers::aur::client::tests::native_isolated_dynamic_history_pairs_reviewed_source";
+        const CHILD: &str = "OMG_AUR_DYNAMIC_HISTORY_FIXTURE_DIR";
+        anyhow::ensure!(
+            std::env::var("OMG_AUR_NATIVE_FIXTURE").as_deref() == Ok("isolated-container")
+                && !crate::core::is_root(),
+            "dynamic history fixture requires the unprivileged isolated container"
+        );
+        if let Some(fixture) = std::env::var_os(CHILD) {
+            let mut settings = Settings::default();
+            settings.aur.security_profile = AurSecurityProfile::Hardened;
+            let client = AurClient {
+                build_dir: PathBuf::from(fixture).join("build"),
+                settings,
+                package_base_locks: Arc::new(dashmap::DashMap::new()),
+            };
+            let rebuilt = client
+                .rebuild_from_history_with_install("demo", "1-1", async |batches, _| {
+                    assert_eq!(batches.len(), 1);
+                    assert_eq!(batches[0].len(), 1);
+                    Ok(())
+                })
+                .await?;
+            assert_eq!(rebuilt, "2-1");
+            println!("HISTORY_DYNAMIC_VERSION_VERIFIED");
+            return Ok(());
+        }
+
+        let fixture = tempfile::tempdir_in(paths::cache_dir())?;
+        let repo = fixture.path().join("source");
+        std::fs::create_dir(&repo)?;
+        let pkgbuild = "pkgname=demo\npkgver=1\npkgrel=1\narch=(any)\npkgdesc='Historical release fixture'\nlicense=(MIT)\npkgver() { echo 2; }\npackage() { install -Dm644 /dev/null \"$pkgdir/usr/share/demo/empty\"; }\n";
+        let srcinfo =
+            "pkgbase = demo\n\tpkgver = 1\n\tpkgrel = 1\n\tarch = any\n\npkgname = demo\n";
+        std::fs::write(repo.join("PKGBUILD"), pkgbuild)?;
+        std::fs::write(repo.join(".SRCINFO"), srcinfo)?;
+        let git = crate::core::privilege::root_controlled_program_path("git")?;
+        let run_git = |args: &[&str]| -> Result<()> {
+            let output = std::process::Command::new(&git)
+                .current_dir(&repo)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .args(args)
+                .output()?;
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::ensure!(
+                output.status.success(),
+                "fixture git {args:?} failed: {stderr}"
+            );
+            Ok(())
+        };
+        run_git(&["init", "--quiet", "--template="])?;
+        run_git(&["add", "--", "PKGBUILD", ".SRCINFO"])?;
+        run_git(&[
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "--quiet",
+            "--message",
+            "Historical package fixture",
+        ])?;
+        let git_config_path = fixture.path().join("gitconfig");
+        let git_config = format!(
+            "[url \"file://{}\"]\n\tinsteadOf = https://aur.archlinux.org/demo.git\n",
+            repo.display(),
+        );
+        std::fs::write(&git_config_path, git_config)?;
+
+        let terminal_driver = r"
+import errno, os, pty, select, signal, sys, time
+
+pid, fd = pty.fork()
+if pid == 0:
+    os.execv(sys.argv[1], sys.argv[1:])
+
+output = bytearray()
+approved = False
+reaped = False
+deadline = time.monotonic() + 25
+try:
+    while time.monotonic() < deadline:
+        if not select.select([fd], [], [], 0.1)[0]:
+            continue
+        try:
+            data = os.read(fd, 4096)
+        except OSError as error:
+            if error.errno != errno.EIO:
+                raise
+            break
+        if not data:
+            break
+        output.extend(data)
+        if len(output) > 1024 * 1024:
+            raise RuntimeError('dynamic history fixture output exceeded limit')
+        if not approved and b'Build demo from this PKGBUILD?' in output:
+            os.write(fd, b'y\n')
+            approved = True
+    else:
+        raise RuntimeError('dynamic history review timed out')
+    _, status = os.waitpid(pid, 0)
+    reaped = True
+    if (os.waitstatus_to_exitcode(status) != 0 or not approved
+            or b'Installing demo 2-1' not in output
+            or b'HISTORY_DYNAMIC_VERSION_VERIFIED' not in output):
+        raise RuntimeError('dynamic history review did not reach the approved install boundary')
+finally:
+    if not reaped:
+        os.kill(pid, signal.SIGKILL)
+        os.waitpid(pid, 0)
+    os.close(fd)
+    sys.stdout.buffer.write(output)
+";
+        let output = std::process::Command::new("python3")
+            .args(["-c", terminal_driver])
+            .arg(std::env::current_exe()?)
+            .args(["--exact", CASE, "--include-ignored", "--nocapture"])
+            .env(CHILD, fixture.path())
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", git_config_path)
+            .env("CARGO_PRIMARY_PACKAGE", "1")
+            .env("OMG_DATA_DIR", fixture.path())
+            .env("OMG_SOCKET_PATH", fixture.path().join("absent.sock"))
+            .output()?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::ensure!(
+            output.status.success(),
+            "dynamic history fixture failed:\n{stdout}\n{stderr}"
+        );
+        println!("{stdout}");
         Ok(())
     }
 

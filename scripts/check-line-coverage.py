@@ -18467,10 +18467,11 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
                             obligation_receipts.append(proof)
                             continue
                 raise ValueError(f'Ambiguous unchanged source correspondence: {name}; '
-                                 'Retained covered line requires a complete compiled-copy inventory')
+                                 'Retained covered line requires a complete compiled-copy inventory '
+                                 f'for {declaration!r} (base={len(previous)}, head={len(current)})')
             if frozenset(map(id, current)) not in closed[1]:
                 raise ValueError(f'Ambiguous unchanged source correspondence: {name}; '
-                                 'Retained covered line requires a closed compiled-owner layout')
+                                 f'Retained covered line requires a closed compiled-owner layout for {declaration!r}')
         for prefix, group in base_groups.items():
             target = head_groups.get(prefix)
             if target is not None and len(group[2]) == len(target[2]):

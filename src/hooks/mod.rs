@@ -285,28 +285,9 @@ fn hook_env_output(shell: &str, cwd: &Path) -> Result<String> {
     Ok(output)
 }
 
-/// Detect version files for the shell hook, degrading gracefully when the
-/// current directory contains a malformed pin.
-///
-/// Ancestor directories are already isolated inside `detect_versions`, but a
-/// pin in the start directory itself is a hard error there. Running this on
-/// every shell prompt would make one bad `.nvmrc`/`package.json` turn every
-/// prompt into a failing `omg hook-env` while PATH silently resets to the
-/// user's base PATH. Instead: skip the bad pin, warn once per process (same
-/// pattern as the deprecation notice in `config/settings.rs`), and keep the
-/// rest of the environment working.
+/// Continue applying valid pins when a shell prompt encounters a bad pin.
 fn detect_versions_for_hook(cwd: &Path) -> HashMap<String, String> {
-    match detect_versions(cwd) {
-        Ok(versions) => versions,
-        Err(error) => {
-            use std::sync::atomic::{AtomicBool, Ordering};
-            static WARNED: AtomicBool = AtomicBool::new(false);
-            if !WARNED.swap(true, Ordering::Relaxed) {
-                tracing::warn!("Ignoring invalid runtime pin in current directory: {error:#}");
-            }
-            HashMap::new()
-        }
-    }
+    detect_version_pins(cwd, &mise_environment(), PinPolicy::ShellHook).unwrap_or_default()
 }
 
 fn parse_tool_versions_file(
@@ -433,17 +414,34 @@ fn try_parse_version_file(
 
 /// Detect version files in directory and parents
 pub fn detect_versions(start: &Path) -> Result<HashMap<String, String>> {
-    let selection = std::env::var("MISE_ENV")
+    detect_versions_with_env(start, &mise_environment())
+}
+
+fn mise_environment() -> HashMap<String, String> {
+    std::env::var("MISE_ENV")
         .ok()
         .map(|value| ("MISE_ENV".to_owned(), value))
         .into_iter()
-        .collect();
-    detect_versions_with_env(start, &selection)
+        .collect()
 }
 
 fn detect_versions_with_env(
     start: &Path,
     selection: &HashMap<String, String>,
+) -> Result<HashMap<String, String>> {
+    detect_version_pins(start, selection, PinPolicy::Explicit)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PinPolicy {
+    Explicit,
+    ShellHook,
+}
+
+fn detect_version_pins(
+    start: &Path,
+    selection: &HashMap<String, String>,
+    policy: PinPolicy,
 ) -> Result<HashMap<String, String>> {
     let mut mise_documents_read = 0;
     let mut versions = HashMap::new();
@@ -451,6 +449,7 @@ fn detect_versions_with_env(
     let mut is_start_directory = true;
 
     while let Some(dir) = current {
+        let reject_bad_pin = is_start_directory && policy == PinPolicy::Explicit;
         for (filename, runtime) in VERSION_FILES {
             if versions.contains_key(*runtime) {
                 continue;
@@ -463,11 +462,11 @@ fn detect_versions_with_env(
                     try_parse_version_file(filename, &file_path, runtime, &dir, &mut versions)
                 {
                     versions = previous_versions;
-                    if is_start_directory {
+                    if reject_bad_pin {
                         return Err(error);
                     }
                     tracing::warn!(
-                        "Ignoring invalid ancestor runtime pin {}: {error:#}",
+                        "Ignoring invalid runtime pin {}: {error:#}",
                         file_path.display()
                     );
                 }
@@ -480,19 +479,23 @@ fn detect_versions_with_env(
         match crate::config::mise_config::load_directory(&dir, selection) {
             Ok(documents) => {
                 mise_documents_read += documents.len();
-                anyhow::ensure!(
-                    mise_documents_read <= crate::config::mise_config::MAX_CONFIG_FILES,
-                    "Too many mise configuration files"
-                );
+                if mise_documents_read > crate::config::mise_config::MAX_CONFIG_FILES {
+                    if policy == PinPolicy::Explicit {
+                        anyhow::bail!("Too many mise configuration files");
+                    }
+                    tracing::warn!(
+                        "Stopped scanning runtime pins after reaching the mise configuration limit"
+                    );
+                    break;
+                }
                 for (runtime, version) in crate::config::mise_tools::native_pins(&documents) {
                     versions.entry(runtime).or_insert(version);
                 }
             }
-            Err(error) if is_start_directory => return Err(error),
-            Err(error) => tracing::warn!(
-                "Ignoring invalid ancestor mise pins in {}: {error:#}",
-                dir.display()
-            ),
+            Err(error) if reject_bad_pin => return Err(error),
+            Err(error) => {
+                tracing::warn!("Ignoring invalid mise pins in {}: {error:#}", dir.display());
+            }
         }
 
         current = dir.parent().map(std::path::Path::to_path_buf);
@@ -926,8 +929,6 @@ _omg_reset_path() {
 _omg_hook() {
   setopt localoptions localtraps
   trap -- '' SIGINT
-  eval "${_OMG_ENV_RESTORE:-}"
-  unset _OMG_ENV_RESTORE
   _omg_reset_path
   eval "$(\command omg hook-env -s zsh)"
   _omg_refresh_cache
@@ -1077,8 +1078,6 @@ _omg_hook() {
   local previous_int_trap
   previous_int_trap=$(trap -p SIGINT)
   trap -- '' SIGINT
-  eval "${_OMG_ENV_RESTORE:-}"
-  unset _OMG_ENV_RESTORE
   _omg_reset_path
   eval "$(\command omg hook-env -s bash)"
   if [[ -n "$previous_int_trap" ]]; then
@@ -1171,10 +1170,6 @@ if status is-interactive; and not set -q _OMG_NOTICE_STARTED
 end
 
 function _omg_hook --on-variable PWD --on-event fish_prompt
-  if set -q _OMG_ENV_RESTORE
-    eval $_OMG_ENV_RESTORE
-    set -e _OMG_ENV_RESTORE
-  end
   set -l _omg_base $PATH
   for _omg_owned in $_OMG_PATH_ADDITIONS
     set -l index (contains -i -- $_omg_owned $_omg_base)
@@ -1304,6 +1299,8 @@ mod tests {
         let project = directory.path().join("project");
         fs::create_dir(&project)?;
         fs::write(project.join(".python-version"), "3.12.0\n")?;
+        fs::write(project.join("package.json"), "{")?;
+        assert!(detect_versions(&project).is_err());
         for dirname in ["normal", r"backslash\\pair", r"backslash\'apostrophe"] {
             let data = directory.path().join(dirname);
             let selected = data.join("versions/python/3.12.0/bin");
@@ -2232,6 +2229,21 @@ path = "hostile"
     }
 
     #[test]
+    fn printed_hooks_use_only_the_generated_environment_restore() {
+        const TEST: &str = "hooks::tests::printed_hooks_use_only_the_generated_environment_restore";
+        for shell in ["bash", "zsh", "fish"] {
+            let Some(output) = emitted_hook_output(shell, TEST) else {
+                return;
+            };
+            assert!(output.contains(&format!("command omg hook-env -s {shell}")));
+            assert!(
+                !output.contains("_OMG_ENV_RESTORE"),
+                "{shell} hook must not interpret a caller-provided restore variable"
+            );
+        }
+    }
+
+    #[test]
     fn zsh_hook_registers_completions_on_load() {
         assert!(
             ZSH_HOOK.contains("fpath=(\"$HOME/.oh-my-zsh/completions\" \"$HOME/.zfunc\" $fpath)")
@@ -2295,6 +2307,42 @@ path = "hostile"
         hook_env("fish").expect("malformed cwd pin must not fail hook-env");
         // No PATH additions are emitted, so the generated hook leaves PATH
         // at the user's base PATH — the environment keeps working.
+    }
+
+    #[test]
+    fn shell_hook_keeps_dedicated_pins_when_a_mise_layer_is_invalid() -> Result<()> {
+        let directory = tempdir()?;
+        fs::write(directory.path().join(".go-version"), "1.26.0\n")?;
+        fs::write(directory.path().join("mise.toml"), "[tools")?;
+        assert!(detect_versions(directory.path()).is_err());
+        let pins = detect_versions_for_hook(directory.path());
+        assert_eq!(pins.get("go").map(String::as_str), Some("1.26.0"));
+        Ok(())
+    }
+
+    #[test]
+    fn shell_hook_keeps_detected_pins_at_the_mise_file_limit() -> Result<()> {
+        let directory = tempdir()?;
+        let fragments = directory.path().join(".config/mise/conf.d");
+        fs::create_dir_all(&fragments)?;
+        for index in 0..crate::config::mise_config::MAX_CONFIG_FILES {
+            fs::write(fragments.join(format!("{index}.toml")), "[tools]\n")?;
+        }
+        let project = directory.path().join("project");
+        fs::create_dir(&project)?;
+        fs::write(project.join("mise.toml"), "[tools]\n")?;
+        fs::write(project.join(".go-version"), "1.26.0\n")?;
+
+        let error =
+            detect_versions(&project).expect_err("explicit queries enforce the global file limit");
+        assert!(
+            error
+                .to_string()
+                .contains("Too many mise configuration files")
+        );
+        let pins = detect_versions_for_hook(&project);
+        assert_eq!(pins.get("go").map(String::as_str), Some("1.26.0"));
+        Ok(())
     }
 
     #[test]
