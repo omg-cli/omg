@@ -273,6 +273,29 @@ class CompiledMethodParentFilesTests(unittest.TestCase):
                     coverage.compiled_method_parent_files(owners, {}, [budget])
 
 
+class ConstructTokenDigestTests(unittest.TestCase):
+    def test_compact_ranges_preserve_the_original_tuple_fingerprints(self):
+        import hashlib
+
+        words = ['fn', 'name', '(', ')', '{', '"a\\nb"', "'", 'λ', ';', '}'] * 30
+        work = [10_000]
+        digest = coverage.construct_token_digests(words, work)
+        for start in (0, 4, 7, 274, 299):
+            for end in (start, min(start + 10, len(words) - 1), len(words) - 1):
+                with self.subTest(start=start, end=end):
+                    original = repr(tuple(words[start:end + 1])).encode()
+                    self.assertEqual(digest(start, end), hashlib.sha256(original).hexdigest())
+
+    def test_charges_before_serializing_input_and_before_hashing_a_range(self):
+        with self.assertRaisesRegex(ValueError, 'work bound exceeded'):
+            coverage.construct_token_digests(['private'] * 256, [0])
+        work = [10_000]
+        digest = coverage.construct_token_digests(['fn', 'name', '(', ')'] * 64, work)
+        work[0] = 0
+        with self.assertRaisesRegex(ValueError, 'work bound exceeded'):
+            digest(0, 3)
+
+
 class CompiledPlainParentFilesTests(unittest.TestCase):
     def test_lookup_preserves_literal_scopes_and_conservative_opaque_owners(self):
         scope = '7omg_lib3pkg5tests'

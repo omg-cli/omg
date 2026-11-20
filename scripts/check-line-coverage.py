@@ -7190,6 +7190,40 @@ def _construct_ancestors(code, index, work):
     return result
 
 
+def construct_token_digests(words, work):
+    """Keep the tuple fingerprint while serializing each token once per file."""
+    if len(words) < 256:
+        def digest_small(first, last):
+            _construct_charge(work, last - first + 1)
+            return hashlib.sha256(repr(tuple(words[first:last + 1])).encode()).hexdigest()
+        return digest_small
+
+    offsets = []
+    serialized = bytearray()
+    for word in words:
+        # Each repr has fixed per-token work and a native scan of its contents.
+        _construct_charge(work, 1 + len(word) // 16)
+        offsets.append(len(serialized))
+        serialized.extend(repr(word).encode())
+        serialized.extend(b', ')
+    offsets.append(len(serialized))
+    data = memoryview(serialized)
+
+    def digest(first, last):
+        if not 0 <= first <= last < len(words):
+            raise ValueError('Invalid source construct token range')
+        start, end = offsets[first], offsets[last + 1] - 2
+        # SHA-256 compresses 64-byte blocks. The fixed charge includes the
+        # framing, padding and Python calls before OpenSSL reads the slice.
+        _construct_charge(work, (end - start) // 64 + 5)
+        fingerprint = hashlib.sha256(b'(')
+        fingerprint.update(data[start:end])
+        fingerprint.update(b',)' if first == last else b')')
+        return fingerprint.hexdigest()
+
+    return digest
+
+
 def _construct_inventory(source, work):
     _construct_charge(work, len(source) + 1)
     code = _boolean_source(source)
@@ -7208,9 +7242,7 @@ def _construct_inventory(source, work):
         at = bisect.bisect_left(rows, index)
         return rows[at - 1] + 1 if at else (parent + 1 if parent is not None else 0)
 
-    def digest(first, last):
-        _construct_charge(work, last - first + 1)
-        return hashlib.sha256(repr(tuple(code.words[first:last + 1])).encode()).hexdigest()
+    digest = construct_token_digests(code.words, work)
     def index_statement(row, first, last):
         _construct_charge(work, last - first + 1)
         for line in range(first, last + 1):
