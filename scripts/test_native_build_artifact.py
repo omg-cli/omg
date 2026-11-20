@@ -58,6 +58,31 @@ def bundle(provenance, payload, extra=None):
 
 
 class NativeBuildAdmission(unittest.TestCase):
+    def test_inconsistent_artifact_snapshot_requests_fresh_complete_metadata(self):
+        url = 'repos/omg-cli/omg/actions/runs/10/artifacts?per_page=100'
+        artifact = {'name': 'native-release-arch-1', 'id': 45}
+        complete = {'total_count': 1, 'artifacts': [artifact]}
+        for incomplete in ({'total_count': 1, 'artifacts': []},
+                           {'total_count': 0, 'artifacts': [artifact]}):
+            with self.subTest(incomplete=incomplete), \
+                    patch.object(BUILD, 'api_json', side_effect=[incomplete, complete]) as lookup, \
+                    patch.object(BUILD.time, 'sleep') as sleep:
+                self.assertEqual(BUILD.read_native_artifact_listing('omg-cli/omg', 10), complete)
+                self.assertEqual([call.args for call in lookup.call_args_list], [(url,), (url,)])
+                sleep.assert_called_once_with(1)
+
+    def test_artifact_listing_rejects_malformed_or_unresolved_metadata(self):
+        for listing, requests in (({'total_count': 101, 'artifacts': []}, 1),
+                                  ({'total_count': True, 'artifacts': []}, 1),
+                                  ({'total_count': 1, 'artifacts': [None]}, 1),
+                                  ({'total_count': 1, 'artifacts': []}, 3)):
+            with self.subTest(listing=listing), patch.object(BUILD, 'api_json', return_value=listing) as lookup, \
+                    patch.object(BUILD.time, 'sleep') as sleep:
+                with self.assertRaisesRegex(ValueError, 'artifact list'):
+                    BUILD.read_native_artifact_listing('omg-cli/omg', 10)
+                self.assertEqual(lookup.call_count, requests)
+                self.assertEqual(sleep.call_count, requests - 1)
+
     def test_metadata_attempts_share_the_original_wall_clock_deadline(self):
         clock = [0.0]
         timeouts = []

@@ -331,12 +331,27 @@ def native_lookup_context(root, context, event, *, allow_manual=False):
     return repository, head, event_name, expected_run
 
 
+def read_native_artifact_listing(repository, run_id, *, deadline=None):
+    path = f'repos/{repository}/actions/runs/{run_id}/artifacts?per_page=100'
+    for attempt in range(3):
+        listing = api_json(path)
+        require(isinstance(listing, dict)
+                and type(listing.get('total_count')) is int and 0 <= listing['total_count'] <= 100
+                and isinstance(listing.get('artifacts'), list) and len(listing['artifacts']) <= 100
+                and all(isinstance(row, dict) for row in listing['artifacts']),
+                'invalid or excessive producer artifact list')
+        if len(listing['artifacts']) == listing['total_count']:
+            return listing
+        delay = 2 ** attempt
+        if attempt == 2 or (deadline is not None and time.monotonic() + delay >= deadline):
+            raise ValueError('inconsistent producer artifact list after refresh')
+        # The count and rows can change during concurrent artifact uploads.
+        # Never admit a candidate or infer absence from an incomplete listing.
+        time.sleep(delay)
+
+
 def select_native_artifact(repository, run, expected_run, distro, listing, family='native-release'):
     current_attempt = run['run_attempt']
-    require(type(listing.get('total_count')) is int and 0 <= listing['total_count'] <= 100
-            and isinstance(listing.get('artifacts'), list)
-            and len(listing['artifacts']) == listing['total_count'],
-            'excessive producer artifact list')
     artifacts = [row for row in listing['artifacts']
                  if row.get('name') == f'{family}-{distro}-{current_attempt}']
     print(f'Native artifact lookup: run={run["id"]} attempt={current_attempt} '
@@ -383,8 +398,7 @@ def find_native_artifact(root, distro, context, event, timeout=1500):
         # A started attempt may already have uploaded a native lane's output
         # while another job is waiting. Keep timestamp and byte admission intact.
         if run.get('run_started_at') is not None:
-            current_attempt = run['run_attempt']
-            listing = api_json(f'repos/{repository}/actions/runs/{selected_id}/artifacts?per_page=100')
+            listing = read_native_artifact_listing(repository, selected_id, deadline=deadline)
             selected = select_native_artifact(repository, run, expected_run, distro, listing)
             if selected is not None:
                 artifact, producer_attempt = selected
@@ -413,7 +427,7 @@ def native_readiness(root, destination, context, event, timeout):
                 'readiness run or attempt changed')
         selected = {}
         if run.get('run_started_at') is not None:
-            listing = api_json(f'repos/{repository}/actions/runs/{run_id}/artifacts?per_page=100')
+            listing = read_native_artifact_listing(repository, run_id, deadline=deadline)
             for distro in FEATURES:
                 found = select_native_artifact(repository, run, expected_run, distro, listing)
                 if found is not None:
@@ -488,7 +502,7 @@ def verify_clippy(root, destination, context, event):
     validate_producer_run(run, expected_run)
     require(run['id'] == int(run_id) and run['run_attempt'] == int(attempt),
             'Clippy run or attempt changed')
-    listing = api_json(f'repos/{repository}/actions/runs/{run_id}/artifacts?per_page=100')
+    listing = read_native_artifact_listing(repository, run_id)
     proofs = {}
     for platform in CLIPPY_PLATFORMS:
         selected = select_native_artifact(repository, run, expected_run, platform, listing,
