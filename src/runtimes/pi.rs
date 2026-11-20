@@ -369,7 +369,8 @@ esac
         fs::write(
             &node,
             format!(
-                "#!/bin/sh\nshift\nwhile [ \"${{1#--}}\" != \"$1\" ]; do shift; done\nexec {} \"$@\"\n",
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" >> {} || exit 1\nshift\nwhile [ \"${{1#--}}\" != \"$1\" ]; do shift; done\nexec {} \"$@\"\n",
+                shell_path(&root.join("managed-node-args"))?,
                 shell_path(npm)?
             ),
         )?;
@@ -425,7 +426,7 @@ esac
             fs::read_to_string(temp.path().join("phases"))?,
             "install\nci\naudit\n"
         );
-        let arguments = fs::read_to_string(temp.path().join("npm-args"))?;
+        let arguments = fs::read_to_string(temp.path().join("managed-node-args"))?;
         assert!(
             arguments
                 .lines()

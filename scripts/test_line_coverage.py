@@ -388,6 +388,20 @@ class MetadataPublicationCoverageTests(unittest.TestCase):
 
 
 class AurArchiveCaptureCoverageTests(unittest.TestCase):
+    def test_missing_srcinfo_fixture_keeps_the_same_refusal_after_source_capture(self):
+        before = ['        };', '        let error = client',
+                  '            .aur_dependency_plan(directory.path(), "example", &["example".to_string()])',
+                  '            .await', '            .expect_err("missing .SRCINFO must fail before PKGBUILD execution");']
+        after = [before[0], '        let source = ReviewedSource {',
+                 '            files: std::collections::BTreeMap::new(),',
+                 '            digest: String::new(),', '            parsed_srcinfo: OnceLock::new(),',
+                 '        };', before[1],
+                 '            .aur_dependency_plan(&source, "example", &["example".to_string()])', *before[3:]]
+        proof = coverage.aur_management_test_source('dependency_plan_refuses_missing_srcinfo', before, after)
+        self.assertEqual(proof, [(0, 0), (1, 6), (3, 8), (4, 9)])
+        after[7] = after[7].replace('"example"', '"different"', 1)
+        self.assertIsNone(coverage.aur_management_test_source('dependency_plan_refuses_missing_srcinfo', before, after))
+
     def test_environment_fixture_launch_keeps_root_dispatch_and_async_entry(self):
         filename = 'src/package_managers/aur/client.rs'
         files = {'/coverage/' + filename: filename}
@@ -1013,6 +1027,33 @@ class PythonCatalogCoverageTests(unittest.TestCase):
 
 
 class PacmanFixtureCoverageTests(unittest.TestCase):
+    def test_removed_shell_reader_accounts_for_each_typed_stream(self):
+        root = '_RNvNtNtNtCsA_7omg_lib16package_managers9pacman_db2db20bounded_native_check'
+        suffix = '0012read_limitedNtNtCsT_5tokio7process11ChildStdoutE0Bg_'
+        worker = '_RNCINvNCNC' + root[2:] + suffix
+        self.assertEqual(coverage.native_health_shell_owner_role(worker, root, 3), ('read', 'ChildStdout', 'body'))
+        self.assertEqual(coverage.native_health_shell_owner_role(
+            worker.replace('ChildStdout', 'ChildStderr'), root, 3), ('read', 'ChildStderr', 'body'))
+        self.assertIsNone(coverage.native_health_shell_owner_role(
+            worker.replace('ChildStdout', 'ChildUnseen'), root, 3))
+        self.assertIsNone(coverage.native_health_shell_owner_role(worker.replace('CsA_', 'CsB_'), root, 3))
+
+    def test_local_catalog_defaults_preserve_version_and_existing_fields(self):
+        before = ['impl Default for LocalDbPackage {', '    fn default() -> Self {', '        Self {',
+                  '            name: String::new(),', '            version: super::super::types::zero_version(),',
+                  '            desc: String::new(),', '            install_date: String::new(),',
+                  '            licenses: Vec::new(),', '            explicit: false,', '            depends: Vec::new(),',
+                  '            optdepends: Vec::new(),', '            provides: Vec::new(),', '        }', '    }', '}']
+        after = [*before[:7], '            url: None,', '            size: 0,', before[7],
+                 '            groups: Vec::new(),', *before[8:]]
+        work = [coverage.SOURCE_CONSTRUCT_WORK_CAPACITY]
+        for source, line in ((before, 8), (after, 10)):
+            code, rows = coverage._construct_inventory(source, work)[:2]
+            self.assertIsNotNone(coverage.localdb_default_record_shape(code, rows, line, work))
+        after[4] = after[4].replace('zero_version()', 'different_version()')
+        code, rows = coverage._construct_inventory(after, work)[:2]
+        self.assertIsNone(coverage.localdb_default_record_shape(code, rows, 10, work))
+
     def test_foreign_inventory_reads_both_catalogs_under_the_epoch_guard(self):
         filename = 'src/package_managers/pacman_db/db.rs'
         files = {'/artifact/' + filename: filename}

@@ -3999,7 +3999,7 @@ def retained_observed_entry(name, sides, indexes, work, source_observer):
                 instance_states=states,observations=receipts)
 
 
-def tail_record_scope(code, rows, line, work):
+def tail_record_scope(code, rows, line, work, *, field_limit=8):
     token=bisect.bisect_left(code.starts,code.offsets[line-1])
     parents=_construct_ancestors(code,token,work)
     if len(parents)!=3:
@@ -4013,9 +4013,47 @@ def tail_record_scope(code, rows, line, work):
             or record['end']+1!=function['end']):
         return None
     arguments=_boolean_arguments(code,record['opening'])
-    if not arguments or len(arguments)>8:
+    if not arguments or len(arguments) > field_limit:
         return None
     return record,function,implementation,arguments
+
+
+def localdb_default_record_shape(code, rows, line, work):
+    scope = tail_record_scope(code, rows, line, work, field_limit=12)
+    if scope is None:
+        return None
+    record, function, implementation, arguments = scope
+    if (function['header'] != ('fn', 'default', '(', ')', '->', 'Self')
+            or implementation['header'] != ('impl', 'Default', 'for', 'LocalDbPackage')):
+        return None
+    fields = [
+        'name : String :: new ( )', 'version : super :: super :: types :: zero_version ( )',
+        'desc : String :: new ( )', 'install_date : String :: new ( )', 'licenses : Vec :: new ( )',
+        'explicit : false', 'depends : Vec :: new ( )', 'optdepends : Vec :: new ( )', 'provides : Vec :: new ( )',
+    ]
+    if len(arguments) == 12:
+        fields[4:4] = ['url : None', 'size : 0']
+        fields.insert(7, 'groups : Vec :: new ( )')
+    if len(arguments) != len(fields):
+        return None
+    selected = []
+    _construct_charge(work, sum(end - start for start, end in arguments))
+    for (start, end), declaration in zip(arguments, fields, strict=True):
+        tokens = tuple(declaration.split())
+        if tuple(code.words[start:end]) != tokens or code.words[end] != ',':
+            return None
+        number = code.position(code.starts[start])[0]
+        callee_end = end - 3 if tokens[-2:] == ('(', ')') else end - 1
+        mark = code.region(start + 2, callee_end)
+        if mark[0] != number or mark[2] != number:
+            return None
+        selected.append((tokens, number, (mark,)))
+    span = code.region(function['first'], function['end'])[0::2]
+    if line != next(number for tokens, number, _ in selected if tokens[0] == 'licenses'):
+        return None
+    anchors = (code.region(function['first'], function['opening'] - 1),
+               code.region(record['first'], record['end']), code.region(function['end'], function['end']))
+    return span, selected, anchors, 'default'
 
 
 def policy_default_record_shape(code, rows, line, work):
@@ -4105,12 +4143,18 @@ def scanner_record_shape(code, rows, line, work):
 def retained_eager_tail_record(name, sides, indexes, work):
     records=[]; copies=[]; states=[]; refinements=[]
     scanner = name == 'src/core/security/vulnerability.rs'
-    if not scanner and name != 'src/core/security/policy.rs':
+    localdb = name == 'src/package_managers/pacman_db/db.rs'
+    if not scanner and not localdb and name != 'src/core/security/policy.rs':
         return None
     leaf, record_type = ('vulnerability', 'VulnerabilityScanner') if scanner else ('policy', 'SecurityPolicy')
     namespace=('type',('type',('type',('crate','omg_lib'),('core','')),('security','')),(leaf,''))
     trait=None if scanner else ('type',('type',('crate','core'),('default','')),('Default',''))
     shape = scanner_record_shape if scanner else policy_default_record_shape
+    if localdb:
+        record_type = 'LocalDbPackage'
+        namespace = ('type', ('type', ('type', ('crate', 'omg_lib'), ('package_managers', '')),
+                              ('pacman_db', '')), ('db', ''))
+        shape = localdb_default_record_shape
     for (_,inventory,spans,counts,line),index in zip(sides,indexes,strict=True):
         parsed=shape(*inventory[:2],line,work)
         if parsed is None:
@@ -4118,7 +4162,8 @@ def retained_eager_tail_record(name, sides, indexes, work):
         (first,last),fields,anchors,method=parsed
         allowed={mark:(n, i) for n,item in enumerate(fields) for i,mark in enumerate(item[2])}
         roots=[]
-        owners=index.inventories.get(name,())
+        owners = (compiled_owners_in_range(index, name, first, last, work, '14LocalDbPackage')
+                  if localdb else index.inventories.get(name, ()))
         _construct_charge(work,len(owners))
         for owner in owners:
             span=spans.get(id(owner))
@@ -4155,11 +4200,27 @@ def retained_eager_tail_record(name, sides, indexes, work):
         scope=roots[0][1].parent_scope
         # Both scanner cohorts are wholly exercised and bound to the same
         # lexical constructor. Its impl ordinal can move between crate builds.
-        records.append(((first,last),fields,(scope[0],scope[2:],method) if scanner else scope))
+        records.append(((first,last),fields,(scope[0],scope[2:],method) if scanner or localdb else scope))
         copies.append([dict(name=owner['name'],count=owner['count'],regions=owner['regions']) for owner,_,_ in roots])
         states.append(sorted(item[0]['count']>0 for item in roots))
         refinements.append(roots[0][2] if scanner else tuple(n for n,_ in roots[0][2]))
     (old,left,old_scope),(new,right,new_scope)=records
+    if localdb:
+        old_fields = {tokens: (index, number) for index, (tokens, number, _) in enumerate(left)}
+        new_fields = {tokens: (index, number) for index, (tokens, number, _) in enumerate(right)}
+        if len(old_fields) != 9 or len(new_fields) != 12 or not old_fields.keys() <= new_fields.keys():
+            return None
+        added = [number for tokens, (_, number) in new_fields.items() if tokens not in old_fields]
+        by_old_index = [new_fields[tokens][0] for tokens in old_fields]
+        if (old_scope != new_scope or states[0] != states[1] or not any(states[0])
+                or not {by_old_index[n] for n in refinements[0]} <= set(refinements[1])
+                or any(sides[1][3].get(number, 0) <= 0 for number in added)):
+            return None
+        pairs = [[old[0], new[0]], [old[0] + 1, new[0] + 1],
+                 *[[number, new_fields[tokens][1]] for tokens, (_, number) in old_fields.items()],
+                 [old[1] - 1, new[1] - 1], [old[1], new[1]]]
+        return dict(file=name, kind='retained-localdb-default-record', pairs=pairs, owners=copies,
+                    instance_states=states, added_lines=added)
     additions=((('arch_endpoint', ':', 'ARCH_ADVISORY_ENDPOINT', '.', 'to_owned', '(', ')'),) if scanner else
                (('advisory_requirement',':','AdvisoryRequirement','::','Optional'),
                 ('arch_advisory_repositories',':','BTreeSet','::','new','(',')')))
@@ -4175,6 +4236,22 @@ def retained_eager_tail_record(name, sides, indexes, work):
     kind='retained-scanner-constructor-record' if scanner else 'retained-policy-default-record'
     return dict(file=name,kind=kind,pairs=pairs,owners=copies,
                 instance_states=states,direct_field_indices=refinements,added_lines=[item[1] for item in right[field_count:]])
+
+
+def retained_pacman_catalog_defaults(name, sides, indexes, work):
+    observations = []
+    for (source, inventory, counts), index in zip(sides, indexes, strict=True):
+        _construct_charge(work, len(source))
+        candidates = [(line, proof) for line, text in enumerate(source, 1)
+                      if text == '            licenses: Vec::new(),'
+                      and (proof := localdb_default_record_shape(*inventory[:2], line, work)) is not None]
+        if len(candidates) != 1:
+            return None
+        (line, ((start, end), _, _, _)), = candidates
+        owners = compiled_owners_in_range(index, name, start, end, work, '14LocalDbPackage')
+        spans = {id(o): span for o in owners if (span := source_owner_span(o, name, index.files, source)) is not None}
+        observations.append((source, inventory, spans, counts, line))
+    return retained_eager_tail_record(name, observations, indexes, work)
 
 
 def retained_match_selector(name, sides, indexes, work):
@@ -14713,7 +14790,13 @@ def compiled_tokio_test_fixture(name, inventory, index, declaration, work,
     function, = functions
     first, opening, end = (function[field] for field in ('first', 'opening', 'end'))
     scope = _boolean_module(code, {'start': first})
-    if scope is None or scope[:2] != ([module[-1]], [module[-1]]):
+    if scope is None and module == ('package_managers', 'aur', 'client', 'tests'):
+        parent = code.parents[opening]
+        module_header = tuple('# [ cfg ( test ) ] # [ expect ( clippy :: unwrap_used ) ] mod tests'.split())
+        if not any(row['opening'] == parent and row['header'] == module_header
+                   and code.parents[row['opening']] is None for row in rows):
+            return None
+    elif scope is None or scope[:2] != ([module[-1]], [module[-1]]):
         return None
     start, stop = code.region(first, end)[0::2]
     owners = compiled_owners_in_range(index, name, start, stop, work, declaration)
@@ -14865,19 +14948,7 @@ def retained_node_retry_fixtures(name, sides, indexes, work):
         matching = retained_node_retry_sources(declaration, observations[0][3], observations[1][3])
         if matching is None:
             continue
-        retained = []
-        for previous, current in matching:
-            line, target = previous + observations[0][2], current + observations[1][2]
-            shapes = []
-            for number, (source, counts, _, _, owners) in zip((line, target), observations, strict=True):
-                if number not in counts:
-                    break
-                shapes.append([fragment_region_states(owner, number, number, source, work) for owner in owners])
-            if len(shapes) == 2 and len(shapes[0]) == len(shapes[1]) and all(old_geometry == new_geometry
-                                       and all(a <= b for a, b in zip(old_state, new_state, strict=True))
-                                       for (old_geometry, old_state), (new_geometry, new_state)
-                                       in zip(*shapes, strict=True)):
-                retained.append([line, target])
+        retained = retained_fixture_line_pairs(observations, matching, work)
         if retained:
             pairs.extend(retained)
             witnesses.append(dict(test=declaration, pairs=retained,
@@ -14885,6 +14956,104 @@ def retained_node_retry_fixtures(name, sides, indexes, work):
     if not pairs:
         return None
     return dict(file=name, kind='retained-node-retry-fixtures', pairs=pairs, fixtures=witnesses)
+
+
+def retained_fixture_line_pairs(observations, matching, work):
+    """Prove source-aligned fixture lines with the same compiled region geometry."""
+    retained = []
+    for previous, current in matching:
+        line, target = previous + observations[0][2], current + observations[1][2]
+        shapes = []
+        for number, (source, counts, _, _, owners) in zip((line, target), observations, strict=True):
+            if number not in counts:
+                break
+            shapes.append([fragment_region_states(owner, number, number, source, work) for owner in owners])
+        if len(shapes) == 2 and len(shapes[0]) == len(shapes[1]) and all(old_geometry == new_geometry
+                                   and all(a <= b for a, b in zip(old_state, new_state, strict=True))
+                                   for (old_geometry, old_state), (new_geometry, new_state)
+                                   in zip(*shapes, strict=True)):
+            retained.append([line, target])
+    return retained
+
+
+_AUR_MANAGEMENT_TESTS = (
+    'dependency_plan_refuses_missing_srcinfo',
+    'package_base_file_locks_live_under_the_build_directory',
+)
+
+
+def aur_management_test_source(declaration, before, after):
+    expected = list(enumerate(before))
+    if declaration == _AUR_MANAGEMENT_TESTS[0]:
+        start = '        let error = client'
+        if before.count(start) != 1:
+            return None
+        expected[before.index(start):before.index(start)] = [(None, line) for line in [
+            '        let source = ReviewedSource {', '            files: std::collections::BTreeMap::new(),',
+            '            digest: String::new(),', '            parsed_srcinfo: OnceLock::new(),', '        };']]
+        changes = [(['            .aur_dependency_plan(directory.path(), "example", &["example".to_string()])'],
+                    ['            .aur_dependency_plan(&source, "example", &["example".to_string()])'])]
+    elif declaration == _AUR_MANAGEMENT_TESTS[1]:
+        changes = [
+            (['        let directory = tempfile::tempdir().unwrap();'],
+             ['        let directory = private_fixture_dir().unwrap();']),
+            (['            build_dir: directory.path().to_path_buf(),'],
+             ['            build_dir: directory.path().join("aur"),']),
+            (['        assert!(directory.path().join("_locks/shared-base.lock").is_file());'], [
+                '        let lock_path = client.build_dir.join("_locks/shared-base.lock");',
+                '        assert!(lock_path.is_file());', '        assert_eq!(',
+                '            std::fs::metadata(lock_path).unwrap().permissions().mode() & 0o777,',
+                '            0o600,', '            "package-base coordination files must be private at creation"',
+                '        );']),
+        ]
+    else:
+        return None
+    for old, new in changes:
+        starts = [i for i, (_, text) in enumerate(expected) if text == old[0]]
+        if len(starts) != 1 or [text for _, text in expected[starts[0]:starts[0] + len(old)]] != old:
+            return None
+        at = starts[0]
+        expected[at:at + len(old)] = [(None, text) for text in new]
+    if [text for _, text in expected] != after:
+        return None
+    return [(previous, current) for current, (previous, _) in enumerate(expected) if previous is not None]
+
+
+def retained_aur_management_tests(name, sides, indexes, work):
+    """Compare fixture operations between absent checkout files and captured source."""
+    witnesses = []
+    for declaration in _AUR_MANAGEMENT_TESTS:
+        observations = []
+        for (source, inventory, counts), index in zip(sides, indexes, strict=True):
+            fixture = compiled_tokio_test_fixture(name, inventory, index, declaration, work,
+                                                 module=('package_managers', 'aur', 'client', 'tests'))
+            if fixture is None:
+                break
+            function, root, body, _ = fixture
+            code = inventory[0]
+            start, stop = code.region(function['opening'], function['end'])[0::2]
+            owners = compiled_owners_in_range(index, name, start, stop, work)
+            _construct_charge(work, sum(len(o['regions']) for o in owners))
+            if any(r[0] <= stop and start <= r[2] for o in owners if o is not root and o is not body
+                   for r in o['regions']):
+                break
+            projection = _owner_line_counts({'regions': root['regions'] + body['regions']}, _ObserverWork(work))
+            if any(projection.get(line) != counts.get(line) for line in range(start + 1, stop)):
+                break
+            observations.append((source, counts, start + 1, source[start:stop - 1], (root, body)))
+        if len(observations) != 2:
+            continue
+        matching = aur_management_test_source(declaration, observations[0][3], observations[1][3])
+        if matching is None:
+            continue
+        retained = retained_fixture_line_pairs(observations, matching, work)
+        if retained:
+            witnesses.append(dict(test=declaration, pairs=retained,
+                                  owners=[[owner['name'] for owner in row[4]] for row in observations]))
+    if not witnesses:
+        return None
+    return dict(file=name, kind='retained-aur-management-tests', fixtures=witnesses,
+                pairs=[pair for row in witnesses for pair in row['pairs']])
 
 
 def python_catalog_request_source(source, modern, work):
@@ -14971,6 +15140,107 @@ _PACMAN_CHILD_FIXTURE_DIGESTS = {
 def retained_native_check_symbols(index, work):
     _construct_charge(work, sum(len(symbol) + 1 for symbol in index.name_counts))
     return tuple(symbol for symbol in index.name_counts if 'native_check' in symbol)
+
+
+def native_health_shell_owner_role(symbol, root, module_depth):
+    if symbol == root:
+        return ('entry',)
+    for depth in (1, 2, 3):
+        if direct_rust_callback_symbol(symbol, root, module_depth, depth):
+            suffix = symbol[len('_R' + 'NC' * depth + root[2:]):]
+            return ('callback', depth, suffix.removesuffix(rust_same_crate_backref(module_depth, depth)))
+    for role, prefix, ending in (
+        ('entry', '_RINvNCNC', 'EBe_'),
+        ('body', '_RNCINvNCNC', 'E0Bg_'),
+    ):
+        prefix += root[2:] + '0012read_limited'
+        if symbol.startswith(prefix) and symbol.endswith(ending):
+            stream = re.fullmatch(r'NtNtCs[0-9A-Za-z]{1,32}_5tokio7process11(ChildStdout|ChildStderr)',
+                                  symbol[len(prefix):-len(ending)])
+            if stream is not None:
+                return 'read', stream[1], role
+    return None
+
+
+def retired_pacman_health_shell(name, sides, indexes, head_constructs, head_names, native_symbols, work):
+    """Account for the removed subprocess and both readers without reducing either base ratio."""
+    digest = '7fd5fc9ad1fab39b3933ce325bd3976c729e3f584a019c980355c5c6bb8cfb09'
+    replacement = {
+        'check_native_local_db_health': 'bc4b94b93464b2b450ffe1504b50a6e17c3e8516161271efb0447fb8e17b499e',
+        'inspect_native_local_database': '7e84678919162927ef1fe949718278fbf9f6dcd522641b109b9a68d6d553a7da',
+    }
+    if (head_constructs is None or 'bounded_native_check' in head_names
+            or any('bounded_native_check' in symbol for symbol in native_symbols)):
+        return None
+    (before, counts), (after, head_counts) = sides
+    if before is None or after is None:
+        return None
+    _construct_charge(work, len(before[1]) + len(after[1]))
+    retired = [row for row in before[1] if row['kind'] == 'fn' and row['digest'] == digest]
+    if len(retired) != 1:
+        return None
+    row, = retired
+    if row['body'] in head_constructs[0] or row['digest'] in head_constructs[1]:
+        return None
+    code = before[0]
+    first, last = code.region(row['first'], row['end'])[0::2]
+    old, new = indexes
+    namespace = ('omg_lib', 'package_managers', 'pacman_db', 'db')
+    owners = compiled_owners_in_range(old, name, first, last, work, '20bounded_native_check')
+    _construct_charge(work, sum(len(o['name']) + 3 * len(o['regions']) for o in owners))
+    roots = [(owner, shape) for owner in owners if (shape := plain_rust_function_symbol(owner['name']))
+             is not None and shape.identifiers == (*namespace, 'bounded_native_check')]
+    if len(roots) != 2:
+        return None
+    expected = {('entry',), ('callback', 1, '0'), ('callback', 2, '00'),
+                ('callback', 3, '000'), ('callback', 3, '00s_0')}
+    expected.update(('read', stream, role) for stream in ('ChildStdout', 'ChildStderr')
+                    for role in ('entry', 'body'))
+    covered = set(); raw = []; witnesses = []
+    for root, shape in roots:
+        keys = {}
+        for owner in owners:
+            symbol = owner['name']
+            role = native_health_shell_owner_role(symbol, root['name'], shape.modules)
+            if role is None:
+                continue
+            if (role not in expected or role in keys or id(owner) in covered or old.name_counts[symbol] != 1
+                    or len(owner['filenames']) != 1 or old.files.get(owner['filenames'][0]) != name
+                    or owner.get('branches') or owner.get('mcdc_records')
+                    or not 0 <= owner['count'] <= root['count'] < COUNTER_LIMIT
+                    or any(not first <= r[0] <= r[2] <= last or r[5:] != [0, 0, 0]
+                           or not 0 <= r[4] < COUNTER_LIMIT for r in owner['regions'])):
+                return None
+            keys[role] = symbol
+            raw.extend(owner['regions'])
+            covered.add(id(owner))
+        if keys.keys() != expected:
+            return None
+        witnesses.append(list(keys.values()))
+    if covered != {id(o) for o in owners if '20bounded_native_check' in o['name']
+                   or any(r[0] <= last and first <= r[2] for r in o['regions'])}:
+        return None
+    projection = _owner_line_counts({'regions': raw}, _ObserverWork(work))
+    if projection != {line: counts[line] for line in range(first, last + 1) if line in counts}:
+        return None
+    replacement_owners = []
+    for declaration, fingerprint in replacement.items():
+        scopes = [row for row in after[1] if row['kind'] == 'fn' and row['digest'] == fingerprint]
+        if len(scopes) != 1:
+            return None
+        target, = scopes
+        start, stop = after[0].region(target['first'], target['end'])[0::2]
+        selected = compiled_owners_in_range(new, name, start, stop, work, declaration)
+        active = [owner for owner in selected if (shape := plain_rust_function_symbol(owner['name']))
+                  is not None and shape.identifiers == (*namespace, declaration)
+                  and new.name_counts[owner['name']] == 1 and owner['count'] > 0
+                  and owner['regions'][0][0] == start and head_counts.get(start, 0) > 0]
+        if len(active) != 1:
+            return None
+        replacement_owners.append(active[0]['name'])
+    return dict(file=name, kind='retired-pacman-health-shell', base_range=[first, last],
+                base_lines=sorted(projection), token_sha256=digest, owners=witnesses,
+                replacement_owners=replacement_owners, summary_credit=[0, 0], mapped_credit=[0, 0])
 
 
 def retired_pacman_child_fixture(name, line, inventory, counts, indexes, head_constructs, head_names, work,
@@ -16738,10 +17008,12 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
                                               retained_aur_hook_preview_map, retained_aur_lifecycle_worker,
                                               retained_aur_package_lock_worker, retained_aur_index_search,
                                               retained_aur_index_info, retained_aur_update_workers,
-                                              retained_aur_rollback_stages, retained_aur_environment_entries),
+                                              retained_aur_rollback_stages, retained_aur_environment_entries,
+                                              retained_aur_management_tests),
         'src/package_managers/aur_metadata.rs': (retained_metadata_publication_success,),
         'src/package_managers/pacman_db/db.rs': (retained_cached_upgrade_comparison, retained_pacman_pattern_inputs,
-                                                retained_pacman_pattern_matcher, retained_pacman_foreign_catalog_reads),
+                                                retained_pacman_pattern_matcher, retained_pacman_foreign_catalog_reads,
+                                                retained_pacman_catalog_defaults),
         'src/runtimes/node.rs': (retained_node_checksum_wait, retained_node_retry_fixtures),
         'src/runtimes/pi.rs': (retained_pi_runtime_fixtures,),
         'src/runtimes/python/catalog.rs': (retained_python_catalog_request,),
@@ -17364,6 +17636,22 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
         if unresolved_fragments:
             source_owner_indexes()
         if unresolved_fragments and inventories is not None:
+            if (name == 'src/package_managers/pacman_db/db.rs'
+                    and bs[name]['expansions'] == hs[name]['expansions'] == []):
+                if native_check_symbols is None:
+                    native_check_symbols = retained_native_check_symbols(owner_indexes[1], construct_work)
+                shell = retired_pacman_health_shell(name, ((inventories[0], before), (inventories[1], after)),
+                                                   owner_indexes, head_construct_inventory(), head_fn_names,
+                                                   native_check_symbols, construct_work)
+                if shell is not None:
+                    lines = set(shell['base_lines'])
+                    if not lines.intersection(anchored) and not lines.intersection(deferred_fragments):
+                        moved_source_lines.update(lines)
+                        for line in lines:
+                            retained.pop(line, None)
+                        unresolved_fragments = [(*bounds, active) for *bounds, pending in unresolved_fragments
+                                                if (active := [line for line in pending if line not in lines])]
+                        retirement_receipts.append(shell)
             _construct_charge(construct_work, sum(len(pending) for *_, pending in unresolved_fragments))
             probes = {line for *_, pending in unresolved_fragments for line in pending
                       if re.fullmatch(r'\s*&(?:mut\s+)?self,\s*', old[line-1])}

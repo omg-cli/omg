@@ -1096,12 +1096,47 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let directory = tempfile::tempdir().unwrap();
-        let data = catalogue("aur-helper");
-        publish_generation(directory.path(), &data, AurMetaCache::default()).unwrap();
-        let (manifest, index) = current_generation(directory.path()).unwrap().unwrap();
-        let (archive_path, index_path) = generation_paths(directory.path(), &manifest).unwrap();
+        let location = MetadataRoot::new(directory.path().join("aur"));
+        let root = location.path();
+
+        let mut json = Vec::new();
+        let mut encoder = flate2::write::GzEncoder::new(&mut json, flate2::Compression::default());
+        serde_json::to_writer(
+            &mut encoder,
+            &serde_json::json!([{"Name": "aur-helper", "Version": "1.2.3-1"}]),
+        )
+        .unwrap();
+        encoder.finish().unwrap();
+
+        publish_generation(&root, &json, AurMetaCache::default()).unwrap();
+        let (manifest, _) = current_generation(&root).unwrap().unwrap();
+        let (archive, index_path) = generation_paths(&root, &manifest).unwrap();
+        assert_eq!(std::fs::read(&archive).unwrap(), json);
         assert_eq!(
-            std::fs::metadata(archive_path.parent().unwrap())
+            read_metadata_archive(File::open(&archive).unwrap()).unwrap()[0].name,
+            "aur-helper",
+            "the published archive must be the validated bytes"
+        );
+        assert!(
+            open_fresh_metadata_index_at(&location, Duration::from_mins(1))
+                .unwrap()
+                .is_some(),
+            "a just-published generation must be coherent and fresh"
+        );
+        let published_index =
+            AurIndex::open(&index_path).expect("the published binary index must be queryable");
+        assert_eq!(
+            published_index
+                .search("", 2)
+                .unwrap()
+                .iter()
+                .map(|entry| (entry.name.as_str(), entry.version.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("aur-helper", "1.2.3-1")],
+            "the published binary index must contain exactly the literal package and version"
+        );
+        assert_eq!(
+            std::fs::metadata(archive.parent().unwrap())
                 .unwrap()
                 .permissions()
                 .mode()
@@ -1109,19 +1144,14 @@ mod tests {
             0o700,
             "published generations must remain private"
         );
-        for path in [&archive_path, &index_path] {
+        for path in [&archive, &index_path] {
             assert_eq!(
                 std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
                 0o600,
                 "published metadata files must remain private"
             );
         }
-        assert_eq!(
-            std::fs::read(generation_paths(directory.path(), &manifest).unwrap().0).unwrap(),
-            data
-        );
-        let entry = index.get("aur-helper").unwrap().unwrap();
-        assert_eq!(entry.version.as_str(), "1-1");
+        let entry = published_index.get("aur-helper").unwrap().unwrap();
         assert!(entry.maintainer.is_none());
         assert!(entry.last_modified.is_none());
         assert!(entry.description.is_none());
