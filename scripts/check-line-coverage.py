@@ -1111,6 +1111,17 @@ def nested_map_err_states(source, group, inventory, name_counts, first, last, co
     return states, (tuple(body), bindings[0], geometry[0], parents[0].disambiguators), proof
 
 
+def node_checksum_owner(symbol):
+    shape = nominal_method_path(symbol)
+    namespace = ('type', ('type', ('crate', 'omg_lib'), ('runtimes', '')), ('node', ''))
+    if (shape is not None and shape.kind == 'M' and shape.namespace == namespace
+            and shape.self_type == ('type', namespace, ('NodeManager', ''))
+            and shape.trait is None and shape.type_argument is None
+            and shape.method == ('fetch_checksum', '') and shape.callbacks in ((), ('',))):
+        return shape
+    return None
+
+
 def closed_pgp_checksum_prefixes(name, source, inventory, files, spans, structure, work):
     """Qualify the Node checksum method from complete copies of its active declaration."""
     if (name != 'src/runtimes/node.rs' or not structure
@@ -1184,8 +1195,6 @@ def closed_pgp_checksum_prefixes(name, source, inventory, files, spans, structur
     if opening_point[1] > len(source[first - 1]):
         return {}
 
-    namespace = ('type', ('type', ('crate', 'omg_lib'), ('runtimes', '')), ('node', ''))
-    self_type = 'type', namespace, ('NodeManager', '')
     _construct_charge(work, sum(len(owner['regions']) + len(owner['name']) + 1 for owner in inventory))
     copies = {}
     for owner in inventory:
@@ -1196,10 +1205,8 @@ def closed_pgp_checksum_prefixes(name, source, inventory, files, spans, structur
             return {}
         if max(first_region, first) > min(last_region, last):
             continue
-        shape = nominal_method_path(owner['name'])
-        if (shape is None or shape.kind != 'M' or shape.namespace != namespace or shape.self_type != self_type
-                or shape.trait is not None or shape.type_argument is not None
-                or shape.method != ('fetch_checksum', '') or shape.callbacks not in ((), ('',))
+        shape = node_checksum_owner(owner['name'])
+        if (shape is None
                 or len(owner['filenames']) != 1 or files.get(owner['filenames'][0]) != name
                 or owner.get('branches') or owner.get('mcdc_records')
                 or any(len(row) != 8 or row[5:] != [0, 0, 0]
@@ -14049,7 +14056,8 @@ def retained_aur_git_limits(name, sides, indexes, work):
                 instance_matching=matching)
 
 
-def aur_source_tokio_fixture(name, inventory, index, declaration, work):
+def compiled_tokio_test_fixture(name, inventory, index, declaration, work,
+                                module=('package_managers', 'aur_sources', 'public_source_tests')):
     """Identify the constructor and future body of a synchronous test entry point."""
     code, rows = inventory[:2]
     header = tuple(f'# [ tokio :: test ] async fn {declaration} ( )'.split())
@@ -14060,13 +14068,13 @@ def aur_source_tokio_fixture(name, inventory, index, declaration, work):
     function, = functions
     first, opening, end = (function[field] for field in ('first', 'opening', 'end'))
     scope = _boolean_module(code, {'start': first})
-    if scope is None or scope[:2] != (['public_source_tests'], ['public_source_tests']):
+    if scope is None or scope[:2] != ([module[-1]], [module[-1]]):
         return None
     owners = index.inventories.get(name, ())
     _construct_charge(work, sum(len(owner['name']) + len(owner['regions']) + 1 for owner in owners))
     roots = [(owner, shape) for owner in owners
              if (shape := plain_rust_function_symbol(owner['name'])) is not None
-             and shape.identifiers == ('omg_lib', 'package_managers', 'aur_sources', 'public_source_tests', declaration)]
+             and shape.identifiers == ('omg_lib', *module, declaration)]
     if len(roots) != 1:
         return None
     (root, shape), = roots
@@ -14088,6 +14096,226 @@ def aur_source_tokio_fixture(name, inventory, index, declaration, work):
     return function, root, body, markers
 
 
+_PACMAN_CHILD_FIXTURE_DIGESTS = {
+    'native_check_propagates_failure_and_sanitizes_diagnostic':
+        '4ba20387cba17511c8a6f88c448f60b965bead75fb4082e8d9365c7b6bf279fa',
+    'native_check_requires_success_and_bounds_elapsed_and_both_streams':
+        '6323e36f933545da7d62d7a149d83918ce17a79ebce16c3ae0a77495a626929a',
+}
+
+
+def retired_pacman_child_fixture(name, line, inventory, counts, indexes, head_constructs, head_names, work):
+    """Retire the removed pacman subprocess tests without subtracting baseline rows."""
+    if inventory is None or head_constructs is None or 'bounded_native_check' in head_names:
+        return None
+    code, rows = inventory[:2]
+    _construct_charge(work, len(rows))
+    candidates = [row for row in rows if row['kind'] == 'fn'
+                  and row['digest'] in _PACMAN_CHILD_FIXTURE_DIGESTS.values()
+                  and code.region(row['opening'], row['end'])[0] <= line <= code.region(row['end'], row['end'])[2]]
+    if len(candidates) != 1:
+        return None
+    row, = candidates
+    declaration = row['header'][row['header'].index('fn') + 1]
+    bodies, statements = head_constructs
+    if (_PACMAN_CHILD_FIXTURE_DIGESTS.get(declaration) != row['digest'] or declaration in head_names
+            or row['body'] in bodies or row['digest'] in statements):
+        return None
+    base, head = indexes
+    fixture = compiled_tokio_test_fixture(name, inventory, base, declaration, work,
+                                         ('package_managers', 'pacman_db', 'db', 'native_health_tests'))
+    if fixture is None:
+        return None
+    function, root, body, _ = fixture
+    start, _, stop, _ = code.region(function['first'], function['end'])
+    observed = base.inventories.get(name, ())
+    _construct_charge(work, sum(len(owner['regions']) + 1 for owner in observed) + stop - start + 1)
+    touching = [owner for owner in observed if any(r[0] <= stop and start <= r[2] for r in owner['regions'])]
+    _construct_charge(work, sum(len(symbol) + 1 for symbol in head.name_counts))
+    if (len(touching) != 2 or {id(owner) for owner in touching} != {id(root), id(body)}
+            or any(declaration in symbol or 'bounded_native_check' in symbol for symbol in head.name_counts)):
+        return None
+    regions = root['regions'] + body['regions']
+    _construct_charge(work, len(regions))
+    if any(len(r) != 8 or not start <= r[0] <= r[2] <= stop or r[5:] != [0, 0, 0] for r in regions):
+        return None
+    projected = _owner_line_counts({'regions': regions}, _ObserverWork(work))
+    expected = {number: counts[number] for number in range(start, stop + 1) if number in counts}
+    if projected != expected or line not in expected:
+        return None
+    return dict(file=name, kind='retired-pacman-child-fixture', declaration=declaration,
+                base_range=[start, stop], base_lines=sorted(expected), token_sha256=row['digest'],
+                owners=[root['name'], body['name']], summary_credit=[0, 0], mapped_credit=[0, 0])
+
+
+def retained_cached_upgrade_comparison(name, sides, indexes, work):
+    """Verify the same typed upgrade predicate after the catalog selection change."""
+    signature = '# [ instrument ] pub fn check_updates_cached ( ) -> Result < Vec < CachedUpdate > >'.split()
+    path = 'crate :: package_managers :: types :: compare_versions'.split()
+    predicate = [*path, *'( & local_pkg . version , & sync_pkg . version , ) = = std :: cmp :: Ordering :: Less'.split()]
+    filter_open = '. filter ( | sync_pkg | {'.split()
+    outer_open = '= local_cache . packages . par_iter ( ) . filter_map ( | ( name , local_pkg ) | {'.split()
+    observations = []
+    for (_, inventory, counts), index in zip(sides, indexes, strict=True):
+        code, rows = inventory[:2]
+        _construct_charge(work, len(rows))
+        functions = [row for row in rows if row['kind'] == 'fn' and row['header'] == tuple(signature)
+                     and code.parents[row['opening']] is None]
+        if len(functions) != 1:
+            return None
+        function, = functions
+        start, end = function['opening'] + 1, function['end']
+        _construct_charge(work, end - start)
+        matches = [token - len(path) + 1 for token in range(start, end) if code.words[token] == path[-1]
+                   and code.words[token - len(path) + 1:token - len(path) + 1 + len(predicate)] == predicate]
+        if len(matches) != 1:
+            return None
+        first, = matches
+        last = first + len(predicate) - 1
+        ancestors = _construct_ancestors(code, first, work)
+        if len(ancestors) != 5:
+            return None
+        inner, call, outer, outer_call, parent = ancestors
+        if (first != inner + 1 or last + 1 != code.pairs[inner] or parent != function['opening']
+                or code.words[inner - len(filter_open) + 1:inner + 1] != filter_open
+                or code.words[outer - len(outer_open) + 1:outer + 1] != outer_open
+                or code.pairs[call] != last + 2 or code.pairs[outer_call] != code.pairs[outer] + 1):
+            return None
+        outer_marker = code.region(outer, outer)
+        close = code.pairs[inner]
+        slots = (code.region(inner, inner), code.region(first, first + len(path) - 1),
+                 code.region(first, last), code.region(close, close))
+        low, high = slots[2][0], slots[2][2]
+        owners = index.inventories.get(name, ())
+        _construct_charge(work, sum(len(owner['name']) + len(owner['regions']) + 1 for owner in owners))
+        roots = [(owner, shape) for owner in owners if (shape := plain_rust_function_symbol(owner['name'])) is not None
+                 and shape.identifiers == ('omg_lib', 'package_managers', 'pacman_db', 'db', 'check_updates_cached')]
+        affected = [owner for owner in owners if any(r[0] <= high and low <= r[2] for r in owner['regions'])]
+        if not 1 <= len(roots) <= 16 or len(affected) != len(roots):
+            return None
+        _construct_charge(work, len(roots) * sum(len(owner['name']) + 1 for owner in owners))
+        matched = []; hits = []; witnesses = []
+        for root, shape in roots:
+            parents = [owner for owner in owners if direct_rust_callback_symbol(owner['name'], root['name'], shape.modules)
+                       and [r[4:] for r in owner['regions'] if tuple(r[:4]) == outer_marker] == [[owner['count'], 0, 0, 0]]]
+            children = [owner for owner in affected
+                        if direct_rust_callback_symbol(owner['name'], root['name'], shape.modules, depth=2)]
+            if len(parents) != 1 or len(children) != 1:
+                return None
+            carrier, = parents
+            callback, = children
+            count = callback['count']
+            if (not 0 <= count <= carrier['count'] < COUNTER_LIMIT
+                    or callback['regions'] != [[*slot, count, 0, 0, 0] for slot in slots]
+                    or any(index.name_counts[owner['name']] != 1 or owner.get('branches') or owner.get('mcdc_records')
+                           or len(owner['filenames']) != 1 or index.files.get(owner['filenames'][0]) != name
+                           for owner in (root, carrier, callback))):
+                return None
+            matched.append(id(callback)); hits.append(count)
+            witnesses.append([root['name'], carrier['name'], callback['name'], count])
+        _construct_charge(work, high - low + 1)
+        lines = list(range(low, high + 1))
+        total = sum(hits)
+        if len(set(matched)) != len(affected) or total <= 0 or any(counts.get(line) != total for line in lines):
+            return None
+        observations.append((lines, [[int(count > 0)] for count in hits], slots, witnesses))
+    before, after = observations
+    _construct_charge(work, len(before[1]) * len(after[1]))
+    matching = compiled_hit_state_matching(before[1], after[1])
+    if matching is None or len(before[0]) != len(after[0]):
+        return None
+    return dict(file=name, kind='retained-cached-upgrade-comparison',
+                pairs=[list(pair) for pair in zip(before[0], after[0], strict=True)],
+                regions=[before[2], after[2]], owners=[before[3], after[3]], instance_matching=matching)
+
+
+def retained_node_checksum_wait(name, sides, indexes, work):
+    """Bind the original fetch await to the bounded signed-manifest await."""
+    observations = []
+    signature = 'async fn fetch_checksum ( & self , version : & str , filename : & str ) -> Result < String >'.split()
+    for modern, ((_, inventory, counts), index) in enumerate(zip(sides, indexes, strict=True)):
+        code, rows = inventory[:2]
+        guard = '# [ cfg ( feature = "pgp" ) ]'.split() if modern else []
+        _construct_charge(work, 2 * len(rows))
+        methods = [row for row in rows if row['kind'] == 'fn' and row['header'] == (*guard, *signature)]
+        if len(methods) != 1:
+            return None
+        method, = methods
+        enclosing = [row for row in rows if row['kind'] == 'impl' and row['header'] == ('impl', 'NodeManager')
+                     and row['opening'] == code.parents[method['opening']]]
+        if (len(enclosing) != 1 or code.parents[enclosing[0]['opening']] is not None
+                or _boolean_attributes(code, enclosing[0]['first']) != []):
+            return None
+        verifier = 'let verifier = node_release_verifier ( ) ? ;'.split() if modern else []
+        suffix = '.asc' if modern else ''
+        url = [*'let url = format ! ('.split(), f'"{{NODE_DIST_URL}}/v{{version}}/SHASUMS256.txt{suffix}"', ')', ';']
+        fetch = ('let signed = crate :: core :: http :: fetch_metadata_text_limited ( self . client , & url , 1024 * 1024 )'
+                 if modern else 'let text = crate :: core :: http :: fetch_metadata_text ( self . client , & url )').split()
+        context = ['.', 'context', '(', '"Failed to fetch Node.js checksum manifest"', ')', '?', ';']
+        expected = [*verifier, *url, *fetch, '.', 'await', *context]
+        _construct_charge(work, len(expected))
+        opening = method['opening']
+        first = opening + 1
+        if code.words[first:first + len(expected)] != expected:
+            return None
+        await_token = first + len(expected) - len(context) - 1
+        call_token = first + len(verifier) + len(url) + fetch.index('crate')
+        poll = code.region(call_token, await_token)
+        line = poll[2]
+        diagnostic = code.region(await_token + 2, await_token + 2)
+        returned = code.region(await_token + 6, await_token + 6)
+        if not all(slot[0] == slot[2] == line + 1 for slot in (diagnostic, returned)):
+            return None
+        slots = (poll, diagnostic, returned)
+        header = code.region(method['first'] + len(guard), opening - 1)
+        body_entry = code.region(opening, opening)
+        owners = index.inventories.get(name, ())
+        _construct_charge(work, sum(len(owner['regions']) + len(owner['name']) for owner in owners))
+        copies = {}
+        for owner in owners:
+            touching = [r for r in owner['regions'] if r[0] <= line + 1 and line <= r[2]]
+            shape = node_checksum_owner(owner['name'])
+            if shape is None:
+                if touching:
+                    return None
+                continue
+            count = owner['count']
+            if (not 0 <= count < COUNTER_LIMIT or len(owner['filenames']) != 1
+                    or index.files.get(owner['filenames'][0]) != name or index.name_counts[owner['name']] != 1
+                    or owner.get('branches') or owner.get('mcdc_records')):
+                return None
+            phases = copies.setdefault(shape.copy_identity, {})
+            if shape.callbacks in phases:
+                return None
+            if not shape.callbacks:
+                if owner['regions'] != [[*header, count, 0, 0, 0]]:
+                    return None
+                phases[()] = (owner['name'], count, ())
+            else:
+                if ([r[4:] for r in owner['regions'] if tuple(r[:4]) == body_entry] != [[count, 0, 0, 0]]
+                        or [tuple(r[:4]) for r in touching] != list(slots)
+                        or any(r[5:] != [0, 0, 0] or not 0 <= r[4] <= count for r in touching)):
+                    return None
+                phases[('',)] = (owner['name'], count, tuple(r[4] for r in touching))
+        if not copies or any(set(phases) != {(), ('',)} or phases[('',)][1] > phases[()][1]
+                             for phases in copies.values()):
+            return None
+        entries = [list(phases.values()) for phases in copies.values()]
+        witnesses = [phases[('',)][2] for phases in copies.values()]
+        if any(sum(row[phase] for row in witnesses) != counts.get(line + phase) or not counts.get(line + phase)
+               for phase in (0, 1)):
+            return None
+        observations.append((line, [[int(value > 0) for value in row] for row in witnesses], entries, slots))
+    before, after = observations
+    _construct_charge(work, 3 * len(before[1]) * len(after[1]))
+    matching = compiled_hit_state_matching(before[1], after[1])
+    if matching is None:
+        return None
+    return dict(file=name, kind='retained-node-checksum-wait',
+                pairs=[[before[0] + offset, after[0] + offset] for offset in (0, 1)],
+                compiled_entries=[before[2], after[2]], regions=[before[3], after[3]], instance_matching=matching)
+
+
 def retained_aur_git_cancellation_entry(name, sides, indexes, work):
     """Check that the cancellation fixture still spawns and polls the same child."""
     witnesses = []
@@ -14106,15 +14334,22 @@ def retained_aur_git_cancellation_entry(name, sides, indexes, work):
         *'command . current_dir ( & task_staging ) . args ( ['.split(), '"-c"', ',',
         '"printf ready > ready; (sleep 1; printf survived > survived) & wait"', ',', ']', ')', ';',
     ]
-    for (_, inventory, counts), index in zip(sides, indexes, strict=True):
+    for modern, ((_, inventory, counts), index) in enumerate(zip(sides, indexes, strict=True)):
         code = inventory[0]
-        fixture = aur_source_tokio_fixture(name, inventory, index, declaration, work)
+        fixture = compiled_tokio_test_fixture(name, inventory, index, declaration, work)
         if fixture is None:
             return None
         function, root, body, _ = fixture
         start = function['opening'] + 1
-        _construct_charge(work, len(prefix) + len(spawn) + len(command))
-        expected = [*prefix, *spawn, *command]
+        invoke = ('run_bounded_git ( & mut command , & task_staging , GitLimits { stdout_bytes : 64 , '
+                  'stderr_bytes : 64 , staging_bytes : 1024 , staging_entries : 32 , '
+                  'poll_interval : Duration :: from_millis ( 10 ) , } , '
+                  'tokio :: time :: Instant :: now ( ) + Duration :: from_secs ( 10 ) , ) . await'
+                  if modern else 'run_bounded_git_clone ( & mut command , & task_staging , GitCloneLimits { '
+                  'output_bytes : 64 , staging_bytes : 1024 , duration : Duration :: from_secs ( 10 ) , '
+                  'poll_interval : Duration :: from_millis ( 10 ) , } , ) . await').split()
+        expected = [*prefix, *spawn, *command, *invoke]
+        _construct_charge(work, len(expected))
         if code.words[start:start + len(expected)] != expected:
             return None
         worker = start + len(prefix)
@@ -14123,6 +14358,15 @@ def retained_aur_git_cancellation_entry(name, sides, indexes, work):
         body_slots = (code.region(worker + 1, worker + 1), code.region(worker + 3, worker + 5))
         nested_slots = (code.region(opening, opening), code.region(opening + 2, opening + 3),
                         code.region(opening + 5, opening + 1 + command.index('new')))
+        call = opening + 1 + len(command)
+        operands = (code.region(call + 2, call + 4), code.region(call + 6, call + 7))
+        call_slots = (code.region(call, call + len(invoke) - 1), *operands)
+        if modern:
+            record = call + invoke.index('GitLimits')
+            call_slots += (code.region(record, code.pairs[record + 1]),)
+        limits = [code.region(call + invoke.index(field), call + invoke.index(field))[0]
+                  for field in ('staging_bytes', 'poll_interval')]
+        selected = (*(slot[0] for slot in operands), *limits, call_slots[0][2])
         owners = index.inventories.get(name, ())
         _construct_charge(work, sum(len(owner['regions']) + len(owner['name']) for owner in owners))
         entries = [(owner, raw) for owner in owners if (raw := [r for r in owner['regions']
@@ -14141,10 +14385,18 @@ def retained_aur_git_cancellation_entry(name, sides, indexes, work):
                 or nested.get('mcdc_records') or nested['count'] != count
                 or raw != nested_regions[:1] or constructor_rows != nested_regions):
             return None
-        witnesses.append((worker_line, [root['name'], body['name'], nested['name']],
-                          [spawn_regions, nested_regions]))
+        _construct_charge(work, sum(len(owner['regions']) + 1 for owner in owners))
+        operand_owners = [(owner, raw) for owner in owners if (raw := [r for r in owner['regions']
+                          if any(r[0] <= line <= r[2] for line in selected)])]
+        call_regions = [[*slot, count, 0, 0, 0] for slot in call_slots]
+        if (operand_owners != [(nested, call_regions)]
+                or any(counts.get(line) != count for line in selected)):
+            return None
+        witnesses.append(((worker_line, *selected), [root['name'], body['name'], nested['name']],
+                          [spawn_regions, nested_regions, call_regions]))
     return dict(file=name, kind='retained-aur-git-cancellation-entry',
-                pairs=[[row[0] for row in witnesses]], owners=[row[1] for row in witnesses],
+                pairs=[list(pair) for pair in zip(*(row[0] for row in witnesses), strict=True)],
+                owners=[row[1] for row in witnesses],
                 regions=[row[2] for row in witnesses])
 
 
@@ -14153,7 +14405,7 @@ def retained_aur_git_fixture_limits(name, sides, indexes, work):
     witnesses = []
     for side, ((_, inventory, counts), index) in enumerate(zip(sides, indexes, strict=True)):
         code = inventory[0]
-        fixture = aur_source_tokio_fixture(name, inventory, index,
+        fixture = compiled_tokio_test_fixture(name, inventory, index,
                                           'host_git_clone_has_output_duration_and_staging_budgets', work)
         if fixture is None:
             return None
@@ -14196,7 +14448,7 @@ def retained_aur_prefetch_test_wait(name, sides, indexes, work):
     witnesses = []
     for side, ((_, inventory, counts), index) in enumerate(zip(sides, indexes, strict=True)):
         code = inventory[0]
-        fixture = aur_source_tokio_fixture(name, inventory, index, 'prefetch_refuses_loopback_before_connecting', work)
+        fixture = compiled_tokio_test_fixture(name, inventory, index, 'prefetch_refuses_loopback_before_connecting', work)
         if fixture is None:
             return None
         function, root, body, markers = fixture
@@ -14694,6 +14946,8 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
         _AUR_GIT_SOURCE: (retained_aur_git_limits, retained_aur_prefetch_test_wait,
                           retained_aur_git_fixture_limits, retained_aur_git_cancellation_entry),
         _AUR_DEPS_SOURCE: (retained_aur_dependency_packages,),
+        'src/package_managers/pacman_db/db.rs': (retained_cached_upgrade_comparison,),
+        'src/runtimes/node.rs': (retained_node_checksum_wait,),
     }
     for name in bs:
         file_replacement_start = len(replacement_receipts)
@@ -15190,6 +15444,14 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
                                     moved_source_lines.update(moved['base_lines'])
                                     obligation_receipts.append(moved)
                                     continue
+                        if (proof is None and name == 'src/package_managers/pacman_db/db.rs'
+                                and inventories is not None and bs[name]['expansions'] == hs[name]['expansions'] == []):
+                            retired = retired_pacman_child_fixture(name, line, inventories[0], before,
+                                source_owner_indexes(), head_construct_inventory(), head_fn_names, construct_work)
+                            if retired is not None and not anchored.keys() & set(retired['base_lines']):
+                                moved_source_lines.update(retired['base_lines'])
+                                retirement_receipts.append(retired)
+                                continue
                         if proof is None:
                             raise ValueError(f'Ambiguous unchanged work in replaced compiler owner: {name}:{line}')
                         for original, current in proof['pairs']:

@@ -296,6 +296,143 @@ class ConstructTokenDigestTests(unittest.TestCase):
             digest(0, 3)
 
 
+class RetainedNodeChecksumWaitTests(unittest.TestCase):
+    def test_requires_the_signed_fetch_and_complete_compiled_await_owners(self):
+        filename = 'src/runtimes/node.rs'
+        files = {'/artifact/' + filename: filename}
+        for fault in (None, 'different-url', 'missing-copy', 'cold-await', 'unproved-context', 'wrong-owner'):
+            with self.subTest(fault=fault):
+                work = [coverage.SOURCE_CONSTRUCT_WORK_CAPACITY]
+                sides, indexes, waits = [], [], []
+                for side in range(2):
+                    method = '    async fn fetch_checksum(&self, version: &str, filename: &str) -> Result<String> {'
+                    suffix = '.asc' if side and fault != 'different-url' else ''
+                    fetch = ('        let signed = crate::core::http::fetch_metadata_text_limited(self.client, &url, 1024 * 1024)'
+                             if side else '        let text = crate::core::http::fetch_metadata_text(self.client, &url)')
+                    source = ['impl NodeManager {', *(['    #[cfg(feature = "pgp")]'] if side else []),
+                              method, *(['        let verifier = node_release_verifier()?;'] if side else []),
+                              '        let url = format!("{NODE_DIST_URL}/v{version}/SHASUMS256.txt' + suffix + '");',
+                              fetch, '            .await', '            .context("Failed to fetch Node.js checksum manifest")?;',
+                              '    }', '}']
+                    header = source.index(method) + 1
+                    wait = source.index('            .await') + 1
+                    waits.append(wait)
+                    owners = []
+                    for copy in range(2):
+                        count = copy + 2
+                        path = f'NvMs0_NtNtCs{side + 1}{copy + 1}_7omg_lib8runtimes4nodeNtB7_11NodeManager14fetch_checksum'
+                        if side and copy and fault == 'missing-copy':
+                            continue
+                        if side and copy and fault == 'wrong-owner':
+                            path = path.replace('14fetch_checksum', '13fetch_current')
+                        decl = [header, 5, header, len(method) - 1, count, 0, 0, 0]
+                        entry = [header, len(method), header, len(method) + 1, count, 0, 0, 0]
+                        hits = 0 if side and copy and fault == 'cold-await' else count
+                        poll = [wait - 1, fetch.index('crate') + 1, wait, 19, hits, 0, 0, 0]
+                        context = source[wait]
+                        residual = context.index('?') + 1
+                        diagnostic = [wait + 1, 14, wait + 1, 21, hits, 0, 0, 0]
+                        returned = [wait + 1, residual, wait + 1, residual + 1, count - 1, 0, 0, 0]
+                        if side and copy and fault == 'unproved-context':
+                            returned[4] = 0
+                        for symbol, regions in (('_R' + path.replace('NtB7_', 'NtB5_'), [decl]),
+                                                ('_RNC' + path + '0Bb_', [entry, poll, diagnostic, returned])):
+                            owners.append(dict(name=symbol, filenames=list(files), count=count, regions=regions))
+                    sides.append((source, coverage._construct_inventory(source, work), {wait: 5, wait + 1: 5}))
+                    indexes.append(coverage.index_compiled_owner_sources(owners, files, work, {filename}))
+                proof = coverage.retained_node_checksum_wait(filename, sides, indexes, work)
+                if fault is None:
+                    self.assertIsNotNone(proof)
+                    self.assertEqual(proof['pairs'], [waits, [line + 1 for line in waits]])
+                else:
+                    self.assertIsNone(proof)
+
+
+class PacmanFixtureCoverageTests(unittest.TestCase):
+    def test_cached_upgrade_comparison_keeps_the_same_typed_operands(self):
+        filename = 'src/package_managers/pacman_db/db.rs'
+        files = {'/artifact/' + filename: filename}
+        for fault in (None, 'reversed-operands', 'different-ordering', 'wrong-copy', 'unmapped-predicate'):
+            with self.subTest(fault=fault):
+                work = [coverage.SOURCE_CONSTRUCT_WORK_CAPACITY]
+                sides, indexes = [], []
+                for side in range(2):
+                    left, right = ('sync_pkg', 'local_pkg') if side and fault == 'reversed-operands' else ('local_pkg', 'sync_pkg')
+                    ordering = 'Greater' if side and fault == 'different-ordering' else 'Less'
+                    source = [
+                        '#[instrument]', 'pub fn check_updates_cached() -> Result<Vec<CachedUpdate>> {',
+                        '    let updates: Vec<_> = local_cache.packages.par_iter().filter_map(|(name, local_pkg)| {',
+                        '            sync_packages.get(name).filter(|sync_pkg| {',
+                        '                    crate::package_managers::types::compare_versions(',
+                        f'                        &{left}.version,', f'                        &{right}.version,',
+                        f'                    ) == std::cmp::Ordering::{ordering}',
+                        '                })', '    }).collect();', '    Ok(updates)', '}',
+                    ]
+                    root = f'NvNtNtNtCs{side + 1}_7omg_lib16package_managers9pacman_db2db20check_updates_cached'
+                    inner = root if not (side and fault == 'wrong-copy') else root.replace('Cs2_', 'Cs3_')
+                    count = 2 + side
+                    parent_open = source[2].index('{') + 1
+                    filter_open = source[3].index('{') + 1
+                    owners = [dict(name='_R' + root, filenames=list(files), count=1,
+                                   regions=[[2, 1, 2, len(source[1]) - 1, 1, 0, 0, 0]]),
+                              dict(name='_RNC' + root + '0B9_', filenames=list(files), count=count,
+                                   regions=[[3, parent_open, 3, parent_open + 1, count, 0, 0, 0]]),
+                              dict(name='_RNCNC' + inner + '0s_0Bb_', filenames=list(files), count=count,
+                                   regions=[[4, filter_open, 4, filter_open + 1, count, 0, 0, 0],
+                                            [5, 21, 5, 69, count, 0, 0, 0],
+                                            [5, 21, 8, len(source[7]) + 1, count, 0, 0, 0],
+                                            [9, 17, 9, 18, count, 0, 0, 0]])]
+                    counts = {line: count for line in range(5, 9)}
+                    if side and fault == 'unmapped-predicate':
+                        del counts[6]
+                    sides.append((source, coverage._construct_inventory(source, work), counts))
+                    indexes.append(coverage.index_compiled_owner_sources(owners, files, work, {filename}))
+                proof = coverage.retained_cached_upgrade_comparison(filename, sides, indexes, work)
+                if fault is None:
+                    self.assertIsNotNone(proof)
+                    self.assertEqual(proof['pairs'], [[line, line] for line in range(5, 9)])
+                else:
+                    self.assertIsNone(proof)
+
+    def test_retirement_requires_the_whole_fixture_and_no_surviving_child_path(self):
+        filename = 'src/package_managers/pacman_db/db.rs'
+        files = {'/artifact/' + filename: filename}
+        declaration = 'native_check_propagates_failure_and_sanitizes_diagnostic'
+        source = ['#[cfg(test)]', 'mod native_health_tests {', '    #[tokio::test]',
+                  f'    async fn {declaration}() {{',
+                  '        bounded_native_check(command, deadline, limit).await.unwrap_err();',
+                  '    }', '}']
+        symbol = 'NvNtNtNtNtCs1_7omg_lib16package_managers9pacman_db2db19native_health_testss_56' + declaration
+        opening = source[3].index('{') + 1
+        close = [6, 5, 6, 6, 1, 0, 0, 0]
+        entry = [4, opening, 4, opening + 1, 1, 0, 0, 0]
+        awaited = [5, 9, 5, 64, 1, 0, 0, 0]
+        owners = [dict(name=name, filenames=list(files), count=1, regions=rows) for name, rows in (
+            ('_R' + symbol, [[4, 11, 4, opening - 1, 1, 0, 0, 0], close]),
+            ('_RNC' + symbol + '0Bb_', [entry, awaited]))]
+        for fault in (None, 'live-helper', 'surviving-body', 'incomplete-evidence', 'different-fixture'):
+            with self.subTest(fault=fault):
+                work = [coverage.SOURCE_CONSTRUCT_WORK_CAPACITY]
+                inventory = coverage._construct_inventory(source, work)
+                base = coverage.index_compiled_owner_sources(owners, files, work, {filename})
+                head = coverage.index_compiled_owner_sources([], files, work, {filename})
+                fixture = next(row for row in inventory[1] if declaration in row['header'])
+                declarations = {'bounded_native_check'} if fault == 'live-helper' else set()
+                body_hashes = {fixture['body']} if fault == 'surviving-body' else set()
+                counts = {4: 1, 6: 1} if fault == 'incomplete-evidence' else {4: 1, 5: 1, 6: 1}
+                approved = 'f' * 64 if fault == 'different-fixture' else fixture['digest']
+                with patch.object(coverage, '_PACMAN_CHILD_FIXTURE_DIGESTS', {declaration: approved}):
+                    proof = coverage.retired_pacman_child_fixture(filename, 5, inventory, counts,
+                                                                  (base, head), (body_hashes, set()),
+                                                                  declarations, work)
+                if fault is None:
+                    self.assertIsNotNone(proof)
+                    self.assertEqual(proof['base_lines'], [4, 5, 6])
+                    self.assertEqual((proof['summary_credit'], proof['mapped_credit']), ([0, 0], [0, 0]))
+                else:
+                    self.assertIsNone(proof)
+
+
 class CompiledPlainParentFilesTests(unittest.TestCase):
     def test_lookup_preserves_literal_scopes_and_conservative_opaque_owners(self):
         scope = '7omg_lib3pkg5tests'
@@ -2242,12 +2379,14 @@ class RetainedAurGitLimitTests(unittest.TestCase):
     def test_cancellation_fixture_spawns_and_polls_the_same_command(self):
         filename = 'src/package_managers/aur_sources.rs'
         files = {'/artifact/' + filename: filename}
-        for fault in (None, 'different-command', 'cold-child', 'foreign-owner'):
+        for fault in (None, 'different-command', 'different-staging', 'cold-child', 'foreign-owner'):
             with self.subTest(fault=fault):
                 sides, indexes = [], []
                 work = [coverage.SOURCE_CONSTRUCT_WORK_CAPACITY]
                 for side in range(2):
                     shell = 'bash' if side and fault == 'different-command' else 'sh'
+                    staging = '&other_checkout' if side and fault == 'different-staging' else '&task_staging'
+                    supervisor = 'run_bounded_git' if side else 'run_bounded_git_clone'
                     source = [
                         '#[cfg(test)]', 'mod public_source_tests {', '    #[tokio::test]',
                         '    async fn cancelling_host_git_clone_terminates_descendants() {',
@@ -2263,30 +2402,49 @@ class RetainedAurGitLimitTests(unittest.TestCase):
                         '                "-c",',
                         '                "printf ready > ready; (sleep 1; printf survived > survived) & wait",',
                         '            ]);',
+                        f'            {supervisor}(',
+                        '                &mut command,',
+                        f'                {staging},',
+                        *(['                GitLimits {', '                    stdout_bytes: 64,',
+                            '                    stderr_bytes: 64,', '                    staging_bytes: 1024,',
+                            '                    staging_entries: 32,', '                    poll_interval: Duration::from_millis(10),',
+                            '                },', '                tokio::time::Instant::now() + Duration::from_secs(10),']
+                          if side else ['                GitCloneLimits {', '                    output_bytes: 64,',
+                                        '                    staging_bytes: 1024,', '                    duration: Duration::from_secs(10),',
+                                        '                    poll_interval: Duration::from_millis(10),', '                },']),
+                        '            )', '            .await',
                         '        });', '    }', '}',
                     ]
                     base = f'NvNtNtNtCs{side + 1}1_7omg_lib16package_managers11aur_sources19public_source_testss_48cancelling_host_git_clone_terminates_descendants'
                     opening = source[3].index('{') + 1
-                    roots = [[4, 11, 4, opening - 1, 1, 0, 0, 0], [18, 5, 18, 6, 1, 0, 0, 0]]
+                    close = len(source) - 1
+                    roots = [[4, 11, 4, opening - 1, 1, 0, 0, 0], [close, 5, close, 6, 1, 0, 0, 0]]
                     entry = [[4, opening, 4, opening + 1, 1, 0, 0, 0],
                              [11, 13, 11, 19, 1, 0, 0, 0], [11, 22, 11, 34, 1, 0, 0, 0]]
                     count = 0 if side and fault == 'cold-child' else 1
                     nested = [[11, 46, 11, 47, count, 0, 0, 0],
                               [12, 17, 12, 28, count, 0, 0, 0],
-                              [12, 31, 12, 59, count, 0, 0, 0]]
+                              [12, 31, 12, 59, count, 0, 0, 0],
+                              [17, 13, close - 2, 19, count, 0, 0, 0],
+                              [18, 17, 18, 29, count, 0, 0, 0],
+                              [19, 17, 19, 30, count, 0, 0, 0]]
+                    if side:
+                        nested.append([20, 17, 26, 18, count, 0, 0, 0])
                     owners = [dict(name=symbol, filenames=list(files), count=hits, regions=regions)
                               for symbol, hits, regions in (('_R' + base, 1, roots),
                                   ('_RNC' + base + '0B9_', 1, entry),
                                   ('_RNCNC' + base + '00Bb_', count, nested))]
                     if side and fault == 'foreign-owner':
                         owners.append(dict(owners[-1], name='foreign'))
-                    counts = {11: 1, 12: count}
+                    fields = (23, 25) if side else (22, 24)
+                    counts = {11: 1, 12: count, 18: count, 19: count,
+                              fields[0]: count, fields[1]: count, close - 2: count}
                     sides.append((source, coverage._construct_inventory(source, work), counts))
                     indexes.append(coverage.index_compiled_owner_sources(owners, files, work, {filename}))
                 proof = coverage.retained_aur_git_cancellation_entry(filename, sides, indexes, work)
                 if fault is None:
                     self.assertIsNotNone(proof)
-                    self.assertEqual(proof['pairs'], [[11, 11]])
+                    self.assertEqual(proof['pairs'], [[11, 11], [18, 18], [19, 19], [22, 23], [24, 25], [27, 29]])
                 else:
                     self.assertIsNone(proof)
 
