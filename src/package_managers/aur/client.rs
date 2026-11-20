@@ -10467,14 +10467,11 @@ finally:
         let fixture = tempfile::tempdir_in(paths::cache_dir())?;
         let repo = fixture.path().join("source");
         std::fs::create_dir(&repo)?;
-        std::fs::write(
-            repo.join("PKGBUILD"),
-            "pkgname=demo\npkgver=1\npkgrel=1\narch=(any)\npkgdesc='Historical release fixture'\nlicense=(MIT)\npkgver() { echo 2; }\npackage() { install -Dm644 /dev/null \"$pkgdir/usr/share/demo/empty\"; }\n",
-        )?;
-        std::fs::write(
-            repo.join(".SRCINFO"),
-            "pkgbase = demo\n\tpkgver = 1\n\tpkgrel = 1\n\tarch = any\n\npkgname = demo\n",
-        )?;
+        let pkgbuild = "pkgname=demo\npkgver=1\npkgrel=1\narch=(any)\npkgdesc='Historical release fixture'\nlicense=(MIT)\npkgver() { echo 2; }\npackage() { install -Dm644 /dev/null \"$pkgdir/usr/share/demo/empty\"; }\n";
+        let srcinfo =
+            "pkgbase = demo\n\tpkgver = 1\n\tpkgrel = 1\n\tarch = any\n\npkgname = demo\n";
+        std::fs::write(repo.join("PKGBUILD"), pkgbuild)?;
+        std::fs::write(repo.join(".SRCINFO"), srcinfo)?;
         let git = crate::core::privilege::root_controlled_program_path("git")?;
         let run_git = |args: &[&str]| -> Result<()> {
             let output = std::process::Command::new(&git)
@@ -10502,16 +10499,14 @@ finally:
             "--message",
             "Historical package fixture",
         ])?;
-        let git_config = fixture.path().join("gitconfig");
-        std::fs::write(
-            &git_config,
-            format!(
-                "[url \"file://{}\"]\n\tinsteadOf = https://aur.archlinux.org/demo.git\n",
-                repo.display(),
-            ),
-        )?;
+        let git_config_path = fixture.path().join("gitconfig");
+        let git_config = format!(
+            "[url \"file://{}\"]\n\tinsteadOf = https://aur.archlinux.org/demo.git\n",
+            repo.display(),
+        );
+        std::fs::write(&git_config_path, git_config)?;
 
-        let terminal_driver = r#"
+        let terminal_driver = r"
 import errno, os, pty, select, signal, sys, time
 
 pid, fd = pty.fork()
@@ -10554,14 +10549,14 @@ finally:
         os.waitpid(pid, 0)
     os.close(fd)
     sys.stdout.buffer.write(output)
-"#;
+";
         let output = std::process::Command::new("python3")
             .args(["-c", terminal_driver])
             .arg(std::env::current_exe()?)
             .args(["--exact", CASE, "--include-ignored", "--nocapture"])
             .env(CHILD, fixture.path())
             .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_CONFIG_GLOBAL", git_config)
+            .env("GIT_CONFIG_GLOBAL", git_config_path)
             .env("CARGO_PRIMARY_PACKAGE", "1")
             .env("OMG_DATA_DIR", fixture.path())
             .env("OMG_SOCKET_PATH", fixture.path().join("absent.sock"))
