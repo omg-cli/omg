@@ -13657,6 +13657,74 @@ def retained_aur_git_limits(name, sides, indexes, work):
                 instance_matching=matching)
 
 
+def retained_aur_prefetch_test_wait(name, sides, indexes, work):
+    """Observe polling the same HTTP-refusal fixture after strengthening its assertion."""
+    declaration = 'prefetch_refuses_loopback_before_connecting'
+    header = tuple(f'# [ tokio :: test ] async fn {declaration} ( )'.split())
+    witnesses = []
+    for side, ((_, inventory, counts), index) in enumerate(zip(sides, indexes, strict=True)):
+        code, rows = inventory[:2]
+        _construct_charge(work, len(rows))
+        functions = [row for row in rows if row['kind'] == 'fn' and row['header'] == header]
+        if len(functions) != 1:
+            return None
+        function, = functions
+        first, opening, end = (function[field] for field in ('first', 'opening', 'end'))
+        scope = _boolean_module(code, {'start': first})
+        if scope is None or scope[:2] != (['public_source_tests'], ['public_source_tests']):
+            return None
+        private = [*'assert ! ( fetch_public_source ('.split(), '"https://127.0.0.1/source"',
+                   *') . await . unwrap_err ( ) . to_string ( ) . contains ('.split(),
+                   '"non-public"', *') ) ;'.split()]
+        host = '127.0.0.1' if side else 'example.org'
+        assertion = 'assert_eq' if side else 'assert'
+        check = [*f'{assertion} ! ( fetch_public_source ('.split(), f'"http://{host}/source"', ')', '.', 'await']
+        expectation = ([*'. unwrap_err ( ) . to_string ( ) ,'.split(),
+                        '"AUR sources require HTTPS without URL credentials"']
+                       if side else '. is_err ( )'.split())
+        _construct_charge(work, end - opening)
+        if code.words[opening + 1:end] != [*private, *check, *expectation, ')', ';']:
+            return None
+        second = opening + 1 + len(private)
+        wait = second + len(check) - 1
+        call = second + check.index('fetch_public_source')
+        line = code.region(wait, wait)[0]
+        slots = (code.region(call if side else wait, wait), code.region(second, end - 1))
+        owners = index.inventories.get(name, ())
+        _construct_charge(work, sum(len(owner['name']) + len(owner['regions']) + 1 for owner in owners))
+        roots = [(owner, shape) for owner in owners
+                 if (shape := plain_rust_function_symbol(owner['name'])) is not None
+                 and shape.identifiers == ('omg_lib', 'package_managers', 'aur_sources', 'public_source_tests', declaration)]
+        touching = [(owner, raw) for owner in owners if (raw := [
+            r for r in owner['regions'] if r[0] <= line <= r[2]])]
+        if len(roots) != 1 or len(touching) != 2:
+            return None
+        (root, shape), = roots
+        children = [(owner, raw) for owner, raw in touching if owner is not root]
+        if len(children) != 1:
+            return None
+        (body, raw), = children
+        regions = [code.region(first + header.index('fn'), opening - 1),
+                   code.region(opening, opening), code.region(end, end)]
+        hits = body['count']
+        if (not 0 < hits <= root['count'] or root['count'] >= COUNTER_LIMIT
+                or not direct_rust_callback_symbol(body['name'], root['name'], shape.modules)
+                or any(index.name_counts[owner['name']] != 1 or owner.get('branches') or owner.get('mcdc_records')
+                       or len(owner['filenames']) != 1 or index.files.get(owner['filenames'][0]) != name
+                       for owner in (root, body))
+                or root['regions'] != [[*slot, root['count'], 0, 0, 0]
+                                       for slot in (regions[0], slots[1], regions[2])]
+                or [r[4:] for r in body['regions'] if tuple(r[:4]) == regions[1]] != [[hits, 0, 0, 0]]
+                or raw != [[*slots[0], hits, 0, 0, 0]]):
+            return None
+        mapped = _owner_line_counts({'regions': [*raw, root['regions'][1]]}, _ObserverWork(work))
+        if mapped.get(line) != counts.get(line):
+            return None
+        witnesses.append((line, root['name'], body['name'], [*raw, root['regions'][1]]))
+    return dict(file=name, kind='retained-aur-prefetch-test-wait', pairs=[[row[0] for row in witnesses]],
+                owners=[list(row[1:3]) for row in witnesses], regions=[row[3] for row in witnesses])
+
+
 def retained_aur_history_diagnostic(sides, indexes, work):
     """Verify the exact rollback message after it moves out of AurClient."""
     declaration = 'historical_version_not_found_message'
@@ -14280,12 +14348,13 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
         if (name == _AUR_GIT_SOURCE and inventories is not None and all(item is not None for item in inventories)
                 and bs[name]['expansions'] == hs[name]['expansions'] == []):
             sides = ((old, inventories[0], before), (new, inventories[1], after))
-            proof = retained_aur_git_limits(name, sides, source_owner_indexes(), construct_work)
-            if proof is not None:
-                if any(n in anchored and anchored[n] != t for n, t in proof['pairs']):
-                    raise ValueError('Ambiguous Git staging limit correspondence')
-                anchored.update(proof['pairs'])
-                obligation_receipts.append(proof)
+            for observe in (retained_aur_git_limits, retained_aur_prefetch_test_wait):
+                proof = observe(name, sides, source_owner_indexes(), construct_work)
+                if proof is not None:
+                    if any(n in anchored and anchored[n] != t for n, t in proof['pairs']):
+                        raise ValueError('Ambiguous AUR source correspondence')
+                    anchored.update(proof['pairs'])
+                    obligation_receipts.append(proof)
         construct_pairs, witnesses = retained_construct_anchors(name, old, new, before, after,
             bf, hf, base_files, head_files, construct_work, inventories, grouped)
         anchored.update(construct_pairs); construct_receipts.extend(witnesses)

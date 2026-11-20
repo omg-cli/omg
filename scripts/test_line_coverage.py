@@ -2029,6 +2029,68 @@ class RetainedAurGitLimitTests(unittest.TestCase):
                     self.assertIsNone(proof)
 
 
+class RetainedAurPrefetchFixtureTests(unittest.TestCase):
+    def test_http_refusal_await_survives_the_stronger_error_assertion(self):
+        filename = 'src/package_managers/aur_sources.rs'
+        files = {'/artifact/' + filename: filename}
+        for fault in (None, 'wrong-scheme', 'missing-wait', 'cold-wait', 'wrong-diagnostic', 'foreign-owner'):
+            with self.subTest(fault=fault):
+                sides, indexes = [], []
+                work = [coverage.SOURCE_CONSTRUCT_WORK_CAPACITY]
+                for side in range(2):
+                    host = '127.0.0.1' if side else 'example.org'
+                    scheme = 'https' if side and fault == 'wrong-scheme' else 'http'
+                    message = ('Different diagnostic' if side and fault == 'wrong-diagnostic'
+                               else 'AUR sources require HTTPS without URL credentials')
+                    source = [
+                        '#[cfg(test)]',
+                        'mod public_source_tests {',
+                        '    #[tokio::test]',
+                        '    async fn prefetch_refuses_loopback_before_connecting() {',
+                        '        assert!(',
+                        '            fetch_public_source("https://127.0.0.1/source")',
+                        '                .await',
+                        '                .unwrap_err()',
+                        '                .to_string()',
+                        '                .contains("non-public")',
+                        '        );',
+                        '        assert_eq!(' if side else '        assert!(',
+                        f'            fetch_public_source("{scheme}://{host}/source")',
+                        '                .await',
+                        *(['                .unwrap_err()', '                .to_string(),', f'            "{message}"']
+                          if side else ['                .is_err()']),
+                        '        );',
+                        '    }',
+                        '}',
+                    ]
+                    symbol = f'NvNtNtNtCs{side + 1}1_7omg_lib16package_managers11aur_sources19public_source_testss_43prefetch_refuses_loopback_before_connecting'
+                    root = '_R' + symbol
+                    child = '_RNC' + symbol + '0B9_'
+                    opening = source[3].index('{') + 1
+                    tail = len(source) - 1
+                    hit = 0 if side and fault == 'cold-wait' else 1
+                    header = [4, 11, 4, opening - 1, 1, 0, 0, 0]
+                    raw = [[4, opening, 4, opening + 1, 1, 0, 0, 0],
+                           *([] if side and fault == 'missing-wait' else [
+                               [13, 13, 14, 23, hit, 0, 0, 0] if side else [14, 18, 14, 23, hit, 0, 0, 0]
+                           ])]
+                    root_regions = [header, [12, 9, tail - 1, 11, 1, 0, 0, 0], [tail, 5, tail, 6, 1, 0, 0, 0]]
+                    owners = [dict(name=symbol, filenames=list(files), count=1, regions=regions)
+                              for symbol, regions in ((root, root_regions), (child, raw))]
+                    if side and fault == 'foreign-owner':
+                        owners.append(dict(owners[-1], name='foreign', regions=[raw[1]]))
+                    counts = coverage._owner_line_counts({'regions': [r for item in owners for r in item['regions']]},
+                                                        coverage._ObserverWork(work))
+                    sides.append((source, coverage._construct_inventory(source, work), counts))
+                    indexes.append(coverage.index_compiled_owner_sources(owners, files, work, {filename}))
+                proof = coverage.retained_aur_prefetch_test_wait(filename, sides, indexes, work)
+                if fault is None:
+                    self.assertIsNotNone(proof)
+                    self.assertEqual(proof['pairs'], [[14, 14]])
+                else:
+                    self.assertIsNone(proof)
+
+
 class MovedAurHistoryDiagnosticTests(unittest.TestCase):
     def test_exact_history_diagnostic_move_preserves_each_compiled_copy(self):
         filenames = ('src/package_managers/aur/client.rs', 'src/package_managers/aur/history.rs')
