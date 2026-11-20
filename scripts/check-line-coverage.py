@@ -13572,6 +13572,91 @@ def retained_aur_update_config(name, sides, indexes, work):
                 instance_matching=matching)
 
 
+_AUR_GIT_SOURCE = 'src/package_managers/aur_sources.rs'
+
+
+def retained_aur_git_limits(name, sides, indexes, work):
+    """Observe the same staging bound and polling interval in both Git supervisors."""
+    header = tuple('async fn mirror_git_repository ( url : & str , destination : & Path ) -> Result < ( ) >'.split())
+    observations = []
+    for side, ((source, inventory, counts), index) in enumerate(zip(sides, indexes, strict=True)):
+        code, rows = inventory[:2]
+        _construct_charge(work, len(rows) + len(source) + len(code.words))
+        bounds = [row for row in rows if row['kind'] == 'fn' and row['header'] == header
+                  and code.parents[row['opening']] is None]
+        if (len(bounds) != 1 or source.count('const MAX_GIT_MIRROR_BYTES: u64 = 2 * 1024 * 1024 * 1024;') != 1
+                or code.words.count('MAX_GIT_MIRROR_BYTES') != 2
+                or source.count('use std::time::Duration;') != 1
+                or side and source.count('use super::aur::git_process::{GitLimits, run_bounded_git};') != 1):
+            return None
+        function, = bounds
+        callee = 'run_bounded_git' if side else 'run_bounded_git_clone'
+        record = 'GitLimits' if side else 'GitCloneLimits'
+        opening, end = function['opening'], function['end']
+        _construct_charge(work, end - opening)
+        calls = [i for i in range(opening + 1, end) if code.words[i] == callee and code.parents[i] == opening]
+        if len(calls) != 1:
+            return None
+        call, = calls
+        assignment = ('let output =' if side else 'let ( status , output ) =').split()
+        output = ('stdout_bytes : MAX_GIT_STDERR_BYTES , stderr_bytes : MAX_GIT_STDERR_BYTES ,'
+                  if side else 'output_bytes : MAX_GIT_STDERR_BYTES ,')
+        limit = 'staging_entries : MAX_GIT_MIRROR_ENTRIES ,' if side else 'duration : MAX_GIT_CLONE_DURATION ,'
+        deadline = 'tokio :: time :: Instant :: now ( ) + MAX_GIT_CLONE_DURATION ,' if side else ''
+        expression = (
+            f'{callee} ( & mut command , & staging_path , {record} {{ {output} '
+            f'staging_bytes : MAX_GIT_MIRROR_BYTES , {limit} '
+            f'poll_interval : Duration :: from_millis ( 250 ) , }} , {deadline} ) . await ? ;'
+        ).split()
+        if (code.words[call - len(assignment):call] != assignment
+                or code.words[call:call + len(expression)] != expression):
+            return None
+        selected = tuple(code.region(i, i)[0] for i in
+                         (call + expression.index('staging_bytes'), call + expression.index('poll_interval')))
+        shapes = [code.region(call, call + expression.index('await'))]
+        if side:
+            record_start = call + expression.index(record)
+            shapes.append(code.region(record_start, code.pairs[record_start + 1]))
+        owners = index.inventories.get(name, ())
+        phases = compiled_async_function_groups(name, owners, index.files, source, work, inventory, index.name_counts)
+        groups = [group for group in phases.values() if group.span == code.region(function['first'], end)[0::2]]
+        if len(groups) != 1 or not 1 <= len(groups[0].copies) <= 16:
+            return None
+        group, = groups
+        _construct_charge(work, sum(len(owner['regions']) + 1 for owner in owners))
+        affected = {id(owner): raw for owner in owners if (raw := [
+            r for r in owner['regions'] if any(r[0] <= n <= r[2] for n in selected)])}
+        if affected.keys() != {id(copy.body) for copy in group.copies}:
+            return None
+        states = []; regions = []; symbols = []
+        for copy in group.copies:
+            parent, body = copy.constructor, copy.body
+            shape = plain_rust_function_symbol(parent['name'])
+            raw = affected[id(body)]
+            if (shape is None or shape.identifiers != ('omg_lib', 'package_managers', 'aur_sources', 'mirror_git_repository')
+                    or any(owner.get('branches') or owner.get('mcdc_records') for owner in (parent, body))
+                    or not 0 <= body['count'] < COUNTER_LIMIT
+                    or [tuple(r[:4]) for r in raw] != shapes
+                    or any(r[5:] != [0, 0, 0] or not 0 <= r[4] <= body['count'] or r[4] != raw[0][4] for r in raw)):
+                return None
+            states.append((parent['count'] > 0, body['count'] > 0, raw[0][4] > 0))
+            regions.extend(raw)
+            symbols.append([parent['name'], body['name']])
+        projection = _owner_line_counts({'regions': regions}, _ObserverWork(work))
+        if any(n not in projection or projection[n] != counts.get(n) for n in selected):
+            return None
+        observations.append((selected, states, symbols))
+    before, after = observations
+    _construct_charge(work, 3 * len(before[1]) * len(after[1]))
+    matching = compiled_hit_state_matching(before[1], after[1])
+    if matching is None:
+        return None
+    return dict(file=name, kind='retained-aur-git-limits',
+                pairs=[list(pair) for pair in zip(before[0], after[0], strict=True)],
+                instance_states=[before[1], after[1]], owners=[before[2], after[2]],
+                instance_matching=matching)
+
+
 def retained_aur_history_diagnostic(sides, indexes, work):
     """Verify the exact rollback message after it moves out of AurClient."""
     declaration = 'historical_version_not_found_message'
@@ -14192,6 +14277,15 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
                         source_prefix_sha256=hashlib.sha256(prefix.encode()).hexdigest(),
                         base_instance_states=states[0], head_instance_states=states[1], instance_matching=matching))
         inventories = None if old == new else tuple(inventory_for_side(side) for side in (0, 1))
+        if (name == _AUR_GIT_SOURCE and inventories is not None and all(item is not None for item in inventories)
+                and bs[name]['expansions'] == hs[name]['expansions'] == []):
+            sides = ((old, inventories[0], before), (new, inventories[1], after))
+            proof = retained_aur_git_limits(name, sides, source_owner_indexes(), construct_work)
+            if proof is not None:
+                if any(n in anchored and anchored[n] != t for n, t in proof['pairs']):
+                    raise ValueError('Ambiguous Git staging limit correspondence')
+                anchored.update(proof['pairs'])
+                obligation_receipts.append(proof)
         construct_pairs, witnesses = retained_construct_anchors(name, old, new, before, after,
             bf, hf, base_files, head_files, construct_work, inventories, grouped)
         anchored.update(construct_pairs); construct_receipts.extend(witnesses)

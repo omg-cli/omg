@@ -1954,6 +1954,81 @@ class RetainedAurHookRenderingTests(unittest.TestCase):
                     self.assertIsNone(proof)
 
 
+class RetainedAurGitLimitTests(unittest.TestCase):
+    def test_git_mirror_keep_staging_bound_after_supervisor_migration(self):
+        filename = 'src/package_managers/aur_sources.rs'
+        files = {'/artifact/' + filename: filename}
+        for fault in (None, 'different-cap', 'shadowed-cap', 'changed-callee',
+                      'cold-copy', 'truncated-call', 'foreign-owner'):
+            with self.subTest(fault=fault):
+                sides, indexes = [], []
+                work = [coverage.SOURCE_CONSTRUCT_WORK_CAPACITY]
+                for side in range(2):
+                    value = 3 if side and fault == 'different-cap' else 2
+                    method = 'run_bounded_git' if side else 'run_bounded_git_clone'
+                    if side and fault == 'changed-callee':
+                        method = 'different_git'
+                    source = [
+                        'use std::time::Duration;',
+                        f'const MAX_GIT_MIRROR_BYTES: u64 = {value} * 1024 * 1024 * 1024;',
+                        *(['use super::aur::git_process::{GitLimits, run_bounded_git};'] if side else []),
+                        'async fn mirror_git_repository(url: &str, destination: &Path) -> Result<()> {',
+                        *(['    const MAX_GIT_MIRROR_BYTES: u64 = 4;'] if side and fault == 'shadowed-cap' else []),
+                        ('    let output = ' if side else '    let (status, output) = ') + method + '(',
+                        '        &mut command,',
+                        '        &staging_path,',
+                        '        GitLimits {' if side else '        GitCloneLimits {',
+                        *(['            stdout_bytes: MAX_GIT_STDERR_BYTES,',
+                           '            stderr_bytes: MAX_GIT_STDERR_BYTES,'] if side else [
+                           '            output_bytes: MAX_GIT_STDERR_BYTES,']),
+                        '            staging_bytes: MAX_GIT_MIRROR_BYTES,',
+                        '            staging_entries: MAX_GIT_MIRROR_ENTRIES,' if side else
+                            '            duration: MAX_GIT_CLONE_DURATION,',
+                        '            poll_interval: Duration::from_millis(250),',
+                        '        },',
+                        *(['        tokio::time::Instant::now() + MAX_GIT_CLONE_DURATION,'] if side else []),
+                        '    )',
+                        '    .await?;',
+                        '    Ok(())',
+                        '}',
+                    ]
+                    start = 4 if side else 3
+                    opening = source[start - 1].index('{') + 1
+                    await_line = source.index('    .await?;') + 1
+                    call_line = next(i for i, text in enumerate(source, start=1) if text.startswith('    let ') and method in text)
+                    body_start = source[call_line - 1].index(method) + 1
+                    record = source.index('        GitLimits {') + 1 if side else None
+                    owners = []
+                    for copy in range(2):
+                        nominal = f'NvNtNtCs{side + 1}{copy + 1}_7omg_lib16package_managers11aur_sources21mirror_git_repository'
+                        constructor = '_R' + nominal
+                        future = '_RNC' + nominal + '0B7_'
+                        hit = 0 if side and fault == 'cold-copy' else copy
+                        span = [[start, opening, start, opening + 1, hit, 0, 0, 0],
+                                [call_line, body_start, await_line, 10 if side and fault == 'truncated-call' else 11,
+                                 hit, 0, 0, 0]]
+                        if record is not None:
+                            span.append([record, 9, record + 6, 10, hit, 0, 0, 0])
+                        span.append([len(source), 1, len(source), 2, hit, 0, 0, 0])
+                        owners.extend([
+                            dict(name=constructor, filenames=list(files), count=hit,
+                                 regions=[[start, 1, start, opening - 1, hit, 0, 0, 0]]),
+                            dict(name=future, filenames=list(files), count=hit, regions=span),
+                        ])
+                    if side and fault == 'foreign-owner':
+                        owners.append(dict(owners[-1], name='foreign', regions=[owners[-1]['regions'][1]]))
+                    counts = coverage._owner_line_counts({'regions': [r for item in owners for r in item['regions']]},
+                                                        coverage._ObserverWork(work))
+                    sides.append((source, coverage._construct_inventory(source, work), counts))
+                    indexes.append(coverage.index_compiled_owner_sources(owners, files, work, {filename}))
+                proof = coverage.retained_aur_git_limits(filename, sides, indexes, work)
+                if fault is None:
+                    self.assertIsNotNone(proof)
+                    self.assertEqual(proof['pairs'], [[9, 11], [11, 13]])
+                else:
+                    self.assertIsNone(proof)
+
+
 class MovedAurHistoryDiagnosticTests(unittest.TestCase):
     def test_exact_history_diagnostic_move_preserves_each_compiled_copy(self):
         filenames = ('src/package_managers/aur/client.rs', 'src/package_managers/aur/history.rs')
