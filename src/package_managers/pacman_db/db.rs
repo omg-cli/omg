@@ -4886,7 +4886,8 @@ mod tests {
         fs::write(
             directory.path().join("sync_db_source_v4.bin"),
             b"older derived cache",
-        )?;
+        )
+        .expect("write the previous cache namespace sentinel");
         fs::write(
             directory.path().join(format!("{SYNC_CACHE_NAME}.bin")),
             bitcode::serialize(&cache)?,
@@ -6177,7 +6178,8 @@ mod tests {
         fs::write(
             cache.join("fixture.bin"),
             bitcode::serialize(&LocalDbCache::default())?,
-        )?;
+        )
+        .expect("write a valid cache record under the shared writable parent");
         let loaded = load_cache_from_disk_in::<LocalDbCache>(&cache, "fixture");
         let saved = save_cache_to_disk_in(&LocalDbCache::default(), &cache, "other");
         assert!(
@@ -6220,7 +6222,8 @@ mod tests {
         nix::unistd::mkfifo(
             &path,
             nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
-        )?;
+        )
+        .expect("create the derived cache's nonregular-file fixture");
         let directory = owner.path().to_owned();
         let (done, received) = std::sync::mpsc::channel();
         let reader = std::thread::spawn(move || {

@@ -5663,13 +5663,15 @@ mod tests {
         std::fs::write(
             &srcinfo,
             "pkgbase = demo\npkgver = 1\npkgrel = 1\narch = any\nsource = https://example.org/reviewed.tar.gz\nsource = git+https://example.org/reviewed.git\npkgname = demo\n",
-        )?;
+        )
+        .expect("write the original reviewed source manifest");
         let reviewed = ReviewedSource::capture(directory.path())?;
         tokio::task::yield_now().await;
         std::fs::write(
             &srcinfo,
             "pkgbase = demo\npkgver = 1\npkgrel = 1\narch = any\nsource = https://example.org/replacement.tar.gz\nsource = git+https://example.org/replacement.git\npkgname = demo\n",
-        )?;
+        )
+        .expect("write the replacement checkout manifest");
 
         Ok((directory, reviewed))
     }
@@ -7467,12 +7469,14 @@ mod tests {
         std::fs::write(
             &path,
             "pkgbase = demo\npkgver = 1\npkgrel = 1\narch = any\npkgname = demo\n",
-        )?;
+        )
+        .expect("write the installed dependency plan's reviewed source manifest");
         let source = ReviewedSource::capture(fixture.directory.path())?;
         std::fs::write(
             &path,
             "pkgbase = demo\npkgver = 1\npkgrel = 1\narch = any\npkgname = replacement\n",
-        )?;
+        )
+        .expect("write the changed dependency plan checkout");
         fixture.with_environment(async {
             tokio::task::yield_now().await;
             let client = fixture.client();
@@ -10282,7 +10286,8 @@ finally:
                 std::fs::write(
                     configuration.join("config.toml"),
                     "[aur]\nsecurity_profile = 'standard'\n",
-                )?;
+                )
+                .expect("write the isolated Standard AUR profile");
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()?;
@@ -10514,7 +10519,8 @@ finally:
                 std::fs::write(
                     fixture.join("config/config.toml"),
                     "[aur]\nsecurity_profile = 'hardened'\n",
-                )?;
+                )
+                .expect("switch the isolated fixture to the Hardened AUR profile");
                 let error =
                     AurClient::install_built_packages(std::slice::from_ref(&accepted), None)
                         .await
@@ -10566,15 +10572,18 @@ finally:
         header.set_size(desc.len() as u64);
         header.set_mode(0o644);
         header.set_cksum();
-        archive.append_data(
-            &mut header,
-            format!("helper-{version}/desc"),
-            desc.as_bytes(),
-        )?;
+        archive
+            .append_data(
+                &mut header,
+                format!("helper-{version}/desc"),
+                desc.as_bytes(),
+            )
+            .expect("append the fixture package descriptor");
         std::fs::write(
             database.join("sync").join(format!("{repository}.db")),
             archive.into_inner()?.finish()?,
-        )?;
+        )
+        .expect("write the fixture sync database");
         Ok(())
     }
 
@@ -10647,7 +10656,8 @@ finally:
         std::fs::write(
             &fixture.conf,
             "[options]\nSigLevel = Never\n[missing]\n[low]\n",
-        )?;
+        )
+        .expect("write the fixture with an unavailable first-priority repository");
         std::fs::write(fixture.directory.path().join("PKGBUILD"), "pkgname=demo\n")?;
         fixture.with_environment(async {
             S72Fixture::index(&["aur-helper"])?;
@@ -10678,7 +10688,8 @@ finally:
         std::fs::write(
             &fixture.conf,
             "[options]\nSigLevel = Never\n[search-only]\nUsage = Search\n[empty]\n[high]\n[low]\n",
-        )?;
+        )
+        .expect("write the isolated repository usage order");
         std::fs::write(fixture.directory.path().join("PKGBUILD"), "pkgname=demo\n")?;
         fixture.with_environment(async {
             let client = fixture.client();
@@ -10808,15 +10819,18 @@ finally:
             header.set_size(desc.len() as u64);
             header.set_mode(0o644);
             header.set_cksum();
-            archive.append_data(
-                &mut header,
-                format!("helper-{version}/desc"),
-                desc.as_bytes(),
-            )?;
+            archive
+                .append_data(
+                    &mut header,
+                    format!("helper-{version}/desc"),
+                    desc.as_bytes(),
+                )
+                .expect("append the versioned fixture package descriptor");
             std::fs::write(
                 database.join("sync").join(format!("{repository}.db")),
                 archive.into_inner()?.finish()?,
-            )?;
+            )
+            .expect("write the versioned fixture sync database");
         }
         let alpm = alpm::Alpm::new(
             root.to_str().context("fixture root is not UTF-8")?,

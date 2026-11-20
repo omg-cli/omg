@@ -2006,7 +2006,8 @@ mod tests {
                 &toolchain.name(),
                 &version_dir,
                 &version_dir,
-            )?;
+            )
+            .expect("bind advisory evidence to the installed fixture compiler");
             let compiler = if tampered {
                 fs::write(version_dir.join("bin/rustc"), b"changed compiler")?;
                 b"changed compiler".as_slice()
