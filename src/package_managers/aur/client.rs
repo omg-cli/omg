@@ -5053,21 +5053,29 @@ mod tests {
                 "a real panicked task must use the same fallback contract"
             );
 
-            let (started, entered) = tokio::sync::oneshot::channel();
-            let cancelled = tokio::spawn(async move {
-                started
-                    .send(())
-                    .expect("cancellation observer remains alive");
-                std::future::pending::<Result<Option<AurIndex>>>().await
-            });
-            entered
-                .await
-                .context("metadata cancellation task must have started")?;
-            cancelled.abort();
-            assert!(
-                finish_metadata_read(cancelled).await.is_none(),
-                "a genuinely cancelled async task must fall back without propagating a JoinError"
-            );
+            for cancel in [false, true] {
+                let (started, entered) = tokio::sync::oneshot::channel();
+                let (finish, completion) = tokio::sync::oneshot::channel();
+                let reader = tokio::spawn(async move {
+                    started
+                        .send(())
+                        .expect("metadata worker observer stays alive");
+                    completion.await.expect("metadata worker must be released");
+                    Ok(None)
+                });
+                entered.await.expect("metadata worker must have started");
+                if cancel {
+                    reader.abort();
+                } else {
+                    finish
+                        .send(())
+                        .expect("metadata worker still awaits completion");
+                }
+                assert!(
+                    finish_metadata_read(reader).await.is_none(),
+                    "both an empty result and cancellation must fall back, cancellation={cancel}"
+                );
+            }
             assert!(
                 snapshot.get("metadata-demo")?.is_some(),
                 "task failures must not invalidate a separately owned index"

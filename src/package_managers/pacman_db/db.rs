@@ -6133,6 +6133,41 @@ mod tests {
     }
 
     #[test]
+    fn package_cache_reports_read_only_parent_without_publishing() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        const TEST: &str = "package_managers::pacman_db::db::tests::package_cache_reports_read_only_parent_without_publishing";
+        if crate::config::Settings::rerun_test_unprivileged(TEST) {
+            return Ok(());
+        }
+        let owner = tempfile::tempdir()?;
+        let existing = owner.path().join("existing");
+        let missing = owner.path().join("missing");
+        fs::create_dir(&existing)?;
+        let writable = fs::Permissions::from_mode(0o700);
+        let read_only = fs::Permissions::from_mode(0o500);
+        fs::set_permissions(&existing, read_only.clone())?;
+        fs::set_permissions(owner.path(), read_only)?;
+
+        let cache = LocalDbCache::default();
+        let create_directory = save_cache_to_disk_in(&cache, &missing, "fixture");
+        let create_archive = save_cache_to_disk_in(&cache, &existing, "fixture");
+
+        fs::set_permissions(owner.path(), writable.clone())?;
+        fs::set_permissions(&existing, writable)?;
+        for result in [create_directory, create_archive] {
+            let error = result.expect_err("read-only cache setup must refuse publication");
+            assert_eq!(
+                error.downcast_ref::<rustix::io::Errno>(),
+                Some(&rustix::io::Errno::ACCESS)
+            );
+        }
+        assert!(!missing.exists());
+        assert_eq!(fs::read_dir(existing)?.count(), 0);
+        Ok(())
+    }
+
+    #[test]
     fn failed_cache_publication_keeps_the_existing_entry_and_cleans_the_temporary_file()
     -> Result<()> {
         let directory = tempfile::tempdir()?;

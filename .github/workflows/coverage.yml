@@ -492,7 +492,11 @@ jobs:
                 if [[ "$test_name" == config::settings::tests::hardened_aur_settings_refuse_incompatible_build_options ||
                       "$test_name" == cli::packages::update::omarchy::tests::media_launcher_cleanup_reports_a_matching_launcher_it_cannot_remove ||
                       "$test_name" == runtimes::npm::admission_tests::banned_transitive_dependency_stops_npm_before_materialization ||
-                      "$test_name" == runtimes::npm::admission_tests::retained_npm_admission_refuses_policy_changes_before_publication ]]; then
+                      "$test_name" == runtimes::npm::admission_tests::retained_npm_admission_refuses_policy_changes_before_publication ||
+                      "$test_name" == package_managers::aur::client::tests::build_only_refuses_an_in_flight_package_without_touching_the_checkout ||
+                      "$test_name" == package_managers::aur::client::tests::build_only_inner_refuses_an_invalid_package_before_creating_a_checkout ||
+                      "$test_name" == package_managers::pacman_db::db::tests::package_cache_reports_read_only_parent_without_publishing ||
+                      "$test_name" == package_managers::pacman_db::db::tests::sync_catalog_remains_readable_when_worker_creation_is_refused ]]; then
                   grep -F "[omg-unprivileged-fixture]" "$log" | grep -F "parent_uid=0"
                   grep -F "[omg-unprivileged-fixture-child]" "$log" | grep -F "uid=65534 "
                 fi
@@ -515,7 +519,11 @@ jobs:
                 package_managers::alpm_worker::tests::initialization_errors_are_returned_to_the_caller
                 package_managers::pacman_db::db::tests::fast_path_and_libalpm_counts_agree_on_fixture_local_db
                 package_managers::pacman_db::db::tests::fast_path_and_libalpm_counts_preserve_distinct_soname_dependencies
+                package_managers::pacman_db::db::tests::package_cache_reports_read_only_parent_without_publishing
+                package_managers::pacman_db::db::tests::sync_catalog_remains_readable_when_worker_creation_is_refused
                 package_managers::aur::client::tests::attended_review_requires_hardened_confirmation_even_with_yes
+                package_managers::aur::client::tests::build_only_refuses_an_in_flight_package_without_touching_the_checkout
+                package_managers::aur::client::tests::build_only_inner_refuses_an_invalid_package_before_creating_a_checkout
                 package_managers::aur::client::tests::native_isolated_fixture_builds_reviewed_source_without_installing
                 package_managers::aur::client::tests::native_isolated_history_requires_hardened_review
                 config::settings::tests::hardened_aur_settings_refuse_incompatible_build_options

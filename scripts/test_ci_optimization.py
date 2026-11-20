@@ -406,8 +406,16 @@ git() { printf '%040d\\n' 1; }
         omarchy_test = 'cli::packages::update::omarchy::tests::media_launcher_cleanup_reports_a_matching_launcher_it_cannot_remove'
         self.assertIn(omarchy_test, selected)
         self.assertIn('"$test_name" == ' + omarchy_test, script)
+        for name in (
+            'package_managers::aur::client::tests::build_only_refuses_an_in_flight_package_without_touching_the_checkout',
+            'package_managers::aur::client::tests::build_only_inner_refuses_an_invalid_package_before_creating_a_checkout',
+            'package_managers::pacman_db::db::tests::package_cache_reports_read_only_parent_without_publishing',
+            'package_managers::pacman_db::db::tests::sync_catalog_remains_readable_when_worker_creation_is_refused',
+        ):
+            self.assertIn(name, selected)
+            self.assertIn('"$test_name" == ' + name, script)
         self.assertIn('runner=(env OMG_ISOLATED_FIXTURE_TEST="$test_name")', script)
-        self.assertEqual(len(selected), 31)
+        self.assertEqual(len(selected), 35)
         self.assertIn('package_managers::aur::client::tests::sandbox_launcher_isolates_host_ipc_namespace', selected)
         for test in ('descriptor_creation_denial_refuses_installation_handoff', 'descriptor_sealing_denial_refuses_installation_handoff'):
             name = 'package_managers::arch_install::native_tests::' + test
