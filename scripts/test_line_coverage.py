@@ -388,6 +388,20 @@ class MetadataPublicationCoverageTests(unittest.TestCase):
 
 
 class AurArchiveCaptureCoverageTests(unittest.TestCase):
+    def test_direct_execution_context_distinguishes_blocks_and_callbacks(self):
+        ordinary = ['fn process() {', '    if ready {', '        check();', '    }', '}']
+        changed = [ordinary[0], '    if !ready {', *ordinary[2:]]
+        callback = [ordinary[0], '    visit(|| {', ordinary[2], '    });', '}']
+        contexts = []
+        for source in (ordinary, changed, callback):
+            work = [10000]
+            inventory = coverage._construct_inventory(source, work)
+            contexts.append(coverage.direct_source_context(inventory, (1, 5), (3,), work, {}))
+        self.assertIsNotNone(contexts[0])
+        self.assertIsNotNone(contexts[1])
+        self.assertNotEqual(contexts[0], contexts[1])
+        self.assertIsNone(contexts[2])
+
     def test_retained_region_geometry_indexes_braces_once_for_the_same_source(self):
         source = ['fn first() {', '    emit();', '}', '',
                   'fn second() {', '    emit();', '}']
@@ -432,6 +446,19 @@ class AurArchiveCaptureCoverageTests(unittest.TestCase):
         self.assertEqual(coverage.reviewed_source_completion_window(after, True)[1], [2, 3, 4])
         changed = [*after[:3], '            digest: remembered_digest,', *after[4:]]
         self.assertIsNone(coverage.reviewed_source_completion_window(changed, True))
+
+    def test_local_descriptor_fields_keep_the_required_version_after_catalog_expansion(self):
+        core = ['        name,', '        version: require_package_version(&version)?,',
+                '        desc,', '        install_date,']
+        stored = ['        licenses,', '        explicit,', '        depends,',
+                  '        optdepends,', '        provides,']
+        old = ['    Ok(LocalDbPackage {', *core, *stored, '    })', '}']
+        new = ['    Ok(LocalDbPackage {', *core, '        url,', '        size,', stored[0],
+               '        groups,', *stored[1:], '    })', '}']
+        self.assertEqual(coverage.pacman_local_descriptor_window(old, False)[1], list(range(2, 11)))
+        self.assertEqual(coverage.pacman_local_descriptor_window(new, True)[1], [2, 3, 4, 5, 8, 10, 11, 12, 13])
+        new[2] = '        version: Version::default(),'
+        self.assertIsNone(coverage.pacman_local_descriptor_window(new, True))
 
     def test_cache_limit_matches_guard_expressions_with_the_same_cap(self):
         cap = 'MAX_DERIVED_CACHE_BYTES'
@@ -1363,6 +1390,20 @@ class PacmanFixtureCoverageTests(unittest.TestCase):
 
 
 class CompiledPlainParentFilesTests(unittest.TestCase):
+    def test_batched_copy_index_preserves_overlapping_literal_matches(self):
+        path = '/archive/src/example.rs'
+        name = 'src/example.rs'
+        owners = [dict(name=symbol, filenames=[path], regions=[])
+                  for symbol in ('alpha-beta-tail', 'carry-beta', 'alpha-beta', 'foreign')]
+        keys = ('alpha-beta', 'beta', 'beta-tail', 'tail', 'missing')
+        work = [10000]
+        index = coverage.index_compiled_owner_sources(owners, {path: name}, work, {name})
+        coverage.index_compiled_copy_substrings(index, name, keys, work)
+        for key in keys:
+            with self.subTest(key=key):
+                self.assertEqual(coverage.compiled_owners_in_range(index, name, 5, 5, work, key),
+                                 tuple(owner for owner in owners if key in owner['name']))
+
     def test_owner_interval_lookup_reuses_named_copy_inventory_across_ranges(self):
         path = '/archive/src/example.rs'
         name = 'src/example.rs'

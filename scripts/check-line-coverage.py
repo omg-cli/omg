@@ -3,7 +3,7 @@
 import argparse
 import ast
 import bisect
-from collections import Counter
+from collections import Counter, deque
 from dataclasses import asdict, dataclass, field, fields, is_dataclass
 import hashlib
 import json
@@ -3220,6 +3220,59 @@ def index_compiled_owner_sources(owners, files, work, source_names=None, *, inde
     _construct_charge(work, sum(len(rows) for rows in inventories.values()))
     return CompiledOwnerSourceIndex(owners, files, len(owners), len(files),
         {name: tuple(rows) for name, rows in inventories.items()}, names, source_names, declaration_ends)
+
+
+def index_compiled_copy_substrings(index, name, selectors, work):
+    """Find overlapping literal symbol selectors in a single pass over the owners."""
+    keys = {key for key in selectors if key and (name, key) not in index.named_copies}
+    if not keys:
+        return
+    transitions = [{}]
+    failures = [0]
+    outputs = [[]]
+    for key in sorted(keys):
+        _construct_charge(work, len(key) + 1)
+        node = 0
+        for character in key:
+            next_node = transitions[node].get(character)
+            if next_node is None:
+                next_node = len(transitions)
+                transitions[node][character] = next_node
+                transitions.append({})
+                failures.append(0)
+                outputs.append([])
+            node = next_node
+        outputs[node].append(key)
+    queue = deque(transitions[0].values())
+    while queue:
+        node = queue.popleft()
+        for character, target in transitions[node].items():
+            failure = failures[node]
+            while failure and character not in transitions[failure]:
+                _construct_charge(work, 1)
+                failure = failures[failure]
+            failures[target] = transitions[failure].get(character, 0)
+            inherited = outputs[failures[target]]
+            _construct_charge(work, 1 + len(inherited))
+            outputs[target].extend(inherited)
+            queue.append(target)
+    matches = {key: [] for key in keys}
+    owners = index.inventories.get(name, ())
+    for offset, owner in enumerate(owners):
+        symbol = owner['name']
+        _construct_charge(work, 2 * len(symbol) + 1)
+        found = set()
+        node = 0
+        for character in symbol:
+            while node and character not in transitions[node]:
+                node = failures[node]
+            node = transitions[node].get(character, 0)
+            if outputs[node]:
+                _construct_charge(work, len(outputs[node]))
+                found.update(outputs[node])
+        for key in found:
+            matches[key].append(offset)
+    index.named_copies.update({(name, key): tuple(rows) for key, rows in matches.items()})
 
 
 def compiled_owners_in_range(index, name, first, last, work, include_symbol=''):
@@ -6798,10 +6851,86 @@ def prepared_policy_environment_entry(name, source, counts, group, owners, names
                          environment_entries=environment_entries)
 
 
+def direct_source_context(inventory, span, lines, work, cache):
+    """Identify an observed synchronous scope without borrowing a callback's execution."""
+    if inventory is None:
+        return None
+    code, rows = inventory[:2]
+    key = id(code)
+    if key not in cache:
+        _construct_charge(work, len(rows))
+        blocks = {row['opening']: row for row in rows if row['opening'] is not None}
+        functions = {}
+        for row in blocks.values():
+            if row['kind'] != 'fn':
+                continue
+            header = row['header']
+            _construct_charge(work, len(header))
+            start = row['first'] + header.index('fn')
+            bounds = code.region(start, row['end'])[0::2]
+            functions.setdefault(bounds, []).append(row)
+        cache[key] = blocks, functions
+    blocks, functions = cache[key]
+    candidates = functions.get(span, ())
+    if len(candidates) != 1 or 'async' in candidates[0]['header']:
+        return None
+    function, = candidates
+    contexts = []
+    for line in lines:
+        _construct_charge(work, len(code.starts).bit_length() + 1)
+        token = bisect.bisect_left(code.starts, code.offsets[line - 1])
+        if token >= len(code.words) or code.position(code.starts[token])[0] != line:
+            return None
+        contexts.append([])
+        for parent in _construct_ancestors(code, token, work):
+            if parent == function['opening']:
+                break
+            if not function['opening'] < parent < function['end']:
+                return None
+            if parent in blocks:
+                header = blocks[parent]['header']
+            else:
+                start = parent - 1
+                if start < 0:
+                    return None
+                callee = code.words[start]
+                if callee == '!':
+                    start -= 1
+                    if start < 0:
+                        return None
+                _construct_charge(work, token - parent)
+                if any(word in ('|', '||', 'async') for word in code.words[parent + 1:token]):
+                    return None
+                header = tuple(code.words[start:parent + 1])
+            _construct_charge(work, len(header) + 1)
+            if not header or any(word in ('|', '||', 'async', 'move') for word in header):
+                return None
+            contexts[-1].append(header)
+        else:
+            return None
+    return tuple(tuple(context) for context in contexts)
+
+
+def direct_compiled_role(owners, work):
+    roles = set()
+    for owner in owners:
+        symbol = owner['name']
+        _construct_charge(work, len(symbol) + 1)
+        plain = plain_rust_function_symbol(symbol)
+        if plain is not None:
+            roles.add((plain.identifiers, plain.disambiguators))
+            continue
+        method = nominal_method_path(symbol)
+        if method is None or method.callbacks:
+            return None
+        roles.add((method.parent_scope, method.method, method.type_argument))
+    return next(iter(roles)) if len(roles) == 1 else None
+
+
 def positive_source_fragments(name, old, new, before, after, base, head, base_files, head_files,
                               fragments, work=None, construct_inventories=None, compiled_groups=None,
                               callback_functions=(), owner_indexes=None, inherent_async_lines=((), ()),
-                              macro_expansions=(None, None), source_structures=(None, None)):
+                              macro_expansions=(None, None), source_structures=(None, None), direct_requirements=()):
     """Prove positive head pairs, retaining every base state, copy and candidate."""
     if not fragments:
         return {}, []
@@ -6854,6 +6983,7 @@ def positive_source_fragments(name, old, new, before, after, base, head, base_fi
     receipts = []
     nominal_phase_cache = {}; literal_loop_cache = {}; join_cache = {}; callback_phase_cache = {}
     fixture_forests = {}; fixture_receipts = {}
+    direct_context_cache = {}
     preproved_callback_pairs = {}
     leaf_inventories = None
     for a, b, c, d, pending in fragments:
@@ -7329,6 +7459,9 @@ def positive_source_fragments(name, old, new, before, after, base, head, base_fi
         if len(joined_statements)!=2 or joined_statements[0].signature!=joined_statements[1].signature:
             joined_statements.clear()
         occurrences = []; callback_signature = None; callback_mode = None; precise_signature = None; scoped_callback = False
+        direct_requested = (construct_inventories is not None and macro_expansions == ([], [])
+                            and any((line, c + line - a) in direct_requirements for line in pending))
+        direct_observations = []
         for side, source, counts, group, proposed in ((0, old, before, bg, a), (1, new, after, hg, c)):
             start, end, members = group
             starts = [proposed] if joined_statements else [offset for offset in range(start - 1, end - (b - a) + 1)
@@ -7466,6 +7599,16 @@ def positive_source_fragments(name, old, new, before, after, base, head, base_fi
                         or observed is not None and observed != states):
                     refuse()
                 observed = states
+                if direct_requested and not nested and len(starts) == 1:
+                    context = direct_source_context(construct_inventories[side], group[:2], lines,
+                                                    work, direct_context_cache)
+                    role = direct_compiled_role(members, work) if context is not None else None
+                    if role is not None:
+                        regions = [fragment_region_states(owner, offset + 1, offset + b - a, source, work)
+                                   for owner in members]
+                        geometry = regions[0][0]
+                        if geometry and all(row[0] == geometry for row in regions):
+                            direct_observations.append(((role, context), geometry, [row[1] for row in regions]))
                 if prefix in async_groups[side]:
                     pieces = [fragment_region_states(owner, offset + 1, offset + b - a, source, work)
                               for owner in members]
@@ -7488,6 +7631,14 @@ def positive_source_fragments(name, old, new, before, after, base, head, base_fi
             entry.setdefault('callback_fragments', []).append(dict(
                 pairs=[[line, c + line - a] for line in pending],
                 base_range=[a + 1, b], head_range=[c + 1, d]))
+        if len(direct_observations) == 2 and direct_observations[0][:2] == direct_observations[1][:2]:
+            for side, proof in enumerate(direct_observations):
+                for compiled_copy, hits in zip(entry['states'][side], proof[2], strict=True):
+                    compiled_copy.extend(hits)
+            entry.setdefault('direct_fragments', []).append(dict(
+                pairs=[[line, c + line - a] for line in pending],
+                context_sha256=hashlib.sha256(repr(direct_observations[0][0]).encode()).hexdigest(),
+                geometry=direct_observations[0][1]))
         if precise_signature is not None:
             entry.setdefault('async_fragment_regions', []).append(dict(
                 base_range=[a + 1, b], head_range=[c + 1, d],
@@ -15150,6 +15301,136 @@ def reviewed_source_text_window(source, modern):
          '        Ok(std::str::from_utf8(bytes)?)', '    }'], [0, 1, 2, 4])
 
 
+def aur_containment_guard_window(source, modern):
+    def diagnostic(indent, message):
+        prefix = ' ' * indent
+        if modern:
+            return [f'{prefix}"AUR source symlink {message}: {{link_display}} -> {{target_display}}"']
+        return [f'{prefix}"AUR source symlink {message}: {{}} -> {{}}",',
+                prefix + 'link_path.display(),', prefix + 'target.display()']
+
+    window = [
+        '            std::path::Component::ParentDir => {',
+        '                anyhow::ensure!(',
+        '                    resolved.starts_with(root) && resolved != root && resolved.pop(),',
+        *diagnostic(20, 'escapes the checkout'), '                );', '            }',
+        '            std::path::Component::RootDir | std::path::Component::Prefix(_) => {',
+        '                anyhow::bail!(', *diagnostic(20, 'must be relative'), '                );',
+        '            }', '        }', '    }', '    anyhow::ensure!(',
+        '        resolved.starts_with(root) && resolved != root,',
+        *diagnostic(8, 'escapes the checkout'), '    );',
+        '    let canonical_root = root.canonicalize()?;',
+        '    let canonical_target = link_path', '        .canonicalize()',
+        '        .context("AUR source symlink must resolve to a reviewed checkout entry")?;',
+        '    anyhow::ensure!(',
+        '        canonical_target.starts_with(&canonical_root) && canonical_target != canonical_root,',
+        *diagnostic(8, 'escapes the checkout'), '    );', '    Ok(())', '}',
+    ]
+    selected = [at for at, line in enumerate(window) if line.lstrip().startswith(
+        ('anyhow::', 'resolved.starts_with', 'canonical_target.starts_with'))]
+    return retained_source_window(source, window, selected)
+
+
+def aur_rollback_checkout_window(source, modern):
+    permissions = ['            .permissions(std::fs::Permissions::from_mode(0o700))'] if modern else []
+    window = ['        tempfile::Builder::new()', '            .prefix(&format!("{base}-"))',
+              *permissions, '            .tempdir_in(work)',
+              '            .context("Failed to create owned AUR rollback checkout")', '    }']
+    return retained_source_window(source, window, [0, 1, len(window) - 3, len(window) - 2])
+
+
+def aur_hook_review_record_window(source, modern, *, complete=False):
+    cache = ['            parsed_srcinfo: OnceLock::new(),'] if modern else []
+    if complete:
+        initializer = ['        let source = ReviewedSource {', '            files,', '            digest: String::new(),']
+        return retained_source_window(source, [*initializer, *cache, '        };'], [0, 1, 2])
+    initializer = ['        let mut source = ReviewedSource {',
+                   '            files: std::collections::BTreeMap::from([(',
+                   '                PathBuf::from(".SRCINFO"),',
+                   '                b"install = demo.install\\n".to_vec(),',
+                   '            )]),', '            digest: String::new(),']
+    return retained_source_window(source, [*initializer, *cache, '        };'], [0, 1, 2, 3, 5])
+
+
+def aur_hook_preview_record_window(source, modern):
+    return aur_hook_review_record_window(source, modern, complete=True)
+
+
+def aur_archive_selection_window(source, modern):
+    version = 'srcinfo_version' if modern else 'Self::srcinfo_version'
+    window = [
+        '        let srcinfo = source.text(Path::new(".SRCINFO"))?;',
+        '        let expected_version =',
+        f'            {version}(srcinfo).context("Missing reviewed package version")?;',
+        '        anyhow::ensure!(',
+        '            Self::srcinfo_pkgbase(srcinfo) == Some(base)',
+        '                && paths.len() == outputs.len()',
+        '                && !paths.is_empty(),',
+        '            "AUR output set/base does not match reviewed source"', '        );',
+        '        let pkgbuild = source.text(Path::new("PKGBUILD"))?;',
+        '        // VCS recipes intentionally calculate pkgver during build. A changed',
+        '        // version still cannot change output names/base or approved root hooks.',
+        '        let dynamic_version = fresh', '            && pkgbuild.lines().any(|line| {',
+        '                line.trim_start().starts_with("pkgver()")',
+        '                    || line.trim_start().starts_with("pkgver ()")', '            });',
+        '        let architecture_metadata = alpm_srcinfo::SourceInfoV1::from_string(srcinfo);',
+        '        paths', '            .iter()', '            .zip(outputs)',
+        '            .map(|(path, output)| {',
+    ]
+    start = retained_source_window(source, window, [1, 18, 19, 20])
+    result = retained_source_window(source, ['                Ok(snapshot)', '            })',
+                                            '            .collect()', '    }'], [2])
+    if start is None or result is None or start[0] >= result[0]:
+        return None
+    return start[0], [*start[1], *result[1]]
+
+
+def aur_cleanup_lock_window(source, modern):
+    acquisition = (['        let _lifecycle_guard = BuildLifecycleLease::try_exclusive(self.open_lifecycle_lock()?)']
+                   if modern else ['        let lifecycle_guard = self.open_lifecycle_lock()?;',
+                                   '        lifecycle_guard', '            .try_lock()'])
+    return retained_source_window(source,
+        [*acquisition,
+         '            .context("Cannot clean AUR cache: a build or another cleanup may be active")?;',
+         '        if self.build_dir.exists() {'], [len(acquisition)])
+
+
+def aur_fixture_index_window(source, modern):
+    publication = (['            publish_test_metadata(&archive)?;'] if modern else
+                   ['            crate::package_managers::aur_index::build_index(&archive, &index_path())?;'])
+    freshness = ('open_fresh_metadata_index(Duration::from_hours(1))?.is_some()' if modern else
+                 'metadata_index_is_fresh(&archive, &index_path(), Duration::from_hours(1))')
+    return retained_source_window(source,
+        [*publication, '            anyhow::ensure!(', f'                {freshness},',
+         '                "fixture index must actually be fresh and coherent"', '            );', '            Ok(())'],
+        [1])
+
+
+def metadata_publication_fixture_window(source, modern):
+    archive = ('read_metadata_archive(File::open(&archive).unwrap())' if modern else
+               'read_metadata_archive(&archive)')
+    freshness = (['            open_fresh_metadata_index_at(&location, Duration::from_mins(1))',
+                  '                .unwrap()', '                .is_some(),'] if modern else
+                 ['            metadata_index_is_fresh(&archive, &index, Duration::from_mins(1)),'])
+    return retained_source_window(source,
+        ['        assert_eq!(std::fs::read(&archive).unwrap(), json);',
+         '        assert_eq!(', f'            {archive}.unwrap()[0].name,',
+         '            "aur-helper",', '            "the published archive must be the validated bytes"',
+         '        );', '        assert!(', *freshness,
+         '            "a just-published generation must be coherent and fresh"', '        );'],
+        [0, 1, 6])
+
+
+def pacman_local_descriptor_window(source, modern):
+    old_fields = ('name', 'version: require_package_version(&version)?', 'desc', 'install_date',
+                  'licenses', 'explicit', 'depends', 'optdepends', 'provides')
+    fields = [*old_fields]
+    if modern:
+        fields[4:5] = ['url', 'size', 'licenses', 'groups']
+    window = ['    Ok(LocalDbPackage {', *(f'        {field},' for field in fields), '    })', '}']
+    return retained_source_window(source, window, [at + 1 for at, field in enumerate(fields) if field in old_fields])
+
+
 def pi_constructor_window(source, modern):
     setup = (['            advisories: Arc::new(VulnerabilityScanner::new()),',
               '            security: RuntimeSecurity::default(),'] if modern else
@@ -15199,6 +15480,75 @@ _PACMAN_SYNC_CATALOG_SIGNATURES = (
 )
 
 
+def runtime_archive_extract_window(source, modern):
+    extract = (['        let result = extract_component_tar_gz(&archive_path, &dest_dir, max_bytes, &select);']
+               if modern else ['        let result =',
+                               '            extract_component_tar_gz(&archive_path, &dest_dir, MAX_DECOMPRESSED_BYTES, &select);'])
+    window = ['    let archive_path = archive_path.to_path_buf();', '    let dest_dir = dest_dir.to_path_buf();', '',
+              '    tokio::task::spawn_blocking(move || {',
+              '        let select = |path: &Path| -> Result<Option<PathBuf>> {',
+              '            stripped_archive_path(path, strip_components)', '        };',
+              '        let task = extract_task(&archive_path);', *extract, '        task.finish(Outcome::Done);',
+              '        result', '    })', '    .await?', '}']
+    return retained_source_window(source, window, [0, 1, 3, 4, 5, 6, 7])
+
+
+_RUNTIME_ARCHIVE_EXTRACT_SIGNATURES = (
+    tuple('pub ( crate ) async fn extract_tar_gz ( archive_path : & Path , dest_dir : & Path , '
+          'strip_components : usize , ) -> Result < ( ) >'.split()),
+    tuple('pub ( crate ) async fn extract_tar_gz_with_budget ( archive_path : & Path , dest_dir : & Path , '
+          'strip_components : usize , max_bytes : u64 , ) -> Result < ( ) >'.split()),
+)
+
+
+def runtime_copy_completion_window(source, modern):
+    preserve = ', preserve_directory_modes' if modern else ''
+    window = ['    fs::create_dir_all(dest)',
+              '        .with_context(|| format!("Failed to create destination directory: {}", dest.display()))?;',
+              f'    copy_regular_tree_contents(src, dest{preserve})', '}']
+    return retained_source_window(source, window, [3])
+
+
+_RUNTIME_COPY_SIGNATURES = (
+    tuple('pub ( crate ) fn copy_regular_tree ( src : & Path , dest : & Path ) -> Result < ( ) >'.split()),
+    tuple('pub ( crate ) fn copy_regular_tree ( src : & Path , dest : & Path , preserve_directory_modes : bool , '
+          ') -> Result < ( ) >'.split()),
+)
+
+
+def rust_incremental_fixture_window(source, modern):
+    extra = ', false' if modern else ''
+    case = 'installed, candidate, tampered, compatible' if modern else 'installed, candidate, compatible'
+    matrix = [
+        f'        for ({case}) in [', '            (',
+        '                Some("1.95.0-nightly (aaaa 2026-01-01)"),',
+        '                "1.95.0-nightly (bbbb 2026-01-02)",',
+        *(['                false,'] if modern else []), '                false,', '            ),',
+        f'            (Some("1.93.1"), "1.94.0"{extra}, false),',
+        f'            (None, "1.93.1"{extra}, false),', f'            (Some(""), ""{extra}, false),',
+        f'            (Some("1.93.1"), "1.93.1"{extra}, true),',
+        *(['            (Some("1.93.1"), "1.93.1", true, false),'] if modern else []), '        ] {',
+    ]
+    setup = [
+        '            let versions = TempDir::new()?;', '            let manager = RustManager {',
+        *(['                security: crate::runtimes::security::RuntimeSecurity::fixture(),'] if modern else []),
+        '                versions_dir: versions.path().to_path_buf(),', '                client: download_client(),',
+        '            };', '            let toolchain = RustToolchainSpec::parse("nightly")?;',
+    ]
+    cohort = retained_source_window(source, [*matrix, *setup],
+        [len(matrix) + 1, len(matrix) + 2 + int(modern), len(matrix) + 3 + int(modern)])
+    contains = (['                        .contains(if tampered {', '                            "reviewed base"',
+                 '                        } else {', '                            "release identity"',
+                 '                        })'] if modern else ['                        .contains("release identity")'])
+    refusal = retained_source_window(source,
+        ['            } else {', '                assert!(', '                    result',
+         '                        .expect_err("incompatible identity")', '                        .to_string()',
+         *contains, '                );'], [1, 2, 3, 4])
+    if cohort is None or refusal is None or cohort[0] >= refusal[0]:
+        return None
+    return cohort[0], [*cohort[1], *refusal[1]]
+
+
 def pacman_upgrade_chain_window(source, modern):
     local_policy = [
         '            if package_is_ignored(', '                &local_pkg.name,',
@@ -15242,36 +15592,41 @@ def retained_source_window(source, window, selected):
 
 
 def retained_compiled_scope_window(name, sides, indexes, work, declaration, select_window, *,
-                                   callback_depth=1, inherent_type=None, signatures=None, test_module=False):
+                                   callback_depth=1, inherent_type=None, signatures=None, test_module=False,
+                                   modern_declaration=None):
     """Check equal lexical operations and compiled hit states across added setup lines."""
     namespace = ('omg_lib', *name.removeprefix('src/').removesuffix('.rs').split('/'), declaration)
+    if test_module:
+        namespace = (*namespace[:-1], 'tests', declaration)
     nominal_namespace = ('crate', namespace[0])
     for segment in namespace[1:-1]:
         nominal_namespace = ('type', nominal_namespace, (segment, ''))
-    if test_module:
-        namespace = (*namespace[:-1], 'tests', declaration)
     observations = []
     for modern, ((source, inventory, counts), index) in enumerate(zip(sides, indexes, strict=True)):
+        expected_declaration = modern_declaration if modern and modern_declaration else declaration
+        expected_namespace = (*namespace[:-1], expected_declaration)
         _construct_charge(work, len(source) + len(inventory[1]))
         code, rows = inventory[:2]
         scope = None
-        if inherent_type:
-            implementations = [row for row in rows if row['kind'] == 'impl'
-                               and row['header'] == ('impl', inherent_type)
-                               and code.parents[row['opening']] is None]
-            if len(implementations) != 1:
-                return None
-            scope = implementations[0]['opening']
-        elif test_module:
+        if test_module:
             modules = [row for row in rows if row['kind'] == 'mod'
-                       and row['header'] == tuple('# [ cfg ( test ) ] mod tests'.split())
+                       and row['header'] in (
+                           tuple('# [ cfg ( test ) ] mod tests'.split()),
+                           tuple('# [ cfg ( test ) ] # [ expect ( clippy :: unwrap_used ) ] mod tests'.split()))
                        and code.parents[row['opening']] is None]
             if len(modules) != 1:
                 return None
             scope = modules[0]['opening']
+        if inherent_type:
+            implementations = [row for row in rows if row['kind'] == 'impl'
+                               and row['header'] == ('impl', inherent_type)
+                               and code.parents[row['opening']] == scope]
+            if len(implementations) != 1:
+                return None
+            scope = implementations[0]['opening']
         functions = [row for row in rows if row['kind'] == 'fn'
                      and (at := row['header'].index('fn') + 1) < len(row['header'])
-                     and row['header'][at] == declaration
+                     and row['header'][at] == expected_declaration
                      and code.parents[row['opening']] == scope]
         if len(functions) != 1:
             return None
@@ -15284,16 +15639,16 @@ def retained_compiled_scope_window(name, sides, indexes, work, declaration, sele
             return None
         _, offsets = selected
         lines = [first + offset for offset in offsets]
-        owners = compiled_owners_in_range(index, name, lines[0], lines[-1], work, declaration)
+        owners = compiled_owners_in_range(index, name, lines[0], lines[-1], work, expected_declaration)
         _construct_charge(work, sum(len(o['name']) + len(o['regions']) * (len(lines) + 1) for o in owners))
         if inherent_type:
             roots = {o['name']: 0 for o in owners if (shape := nominal_method_path(o['name'])) is not None
                      and shape.namespace == nominal_namespace and shape.kind == 'M'
                      and shape.self_type == ('type', nominal_namespace, (inherent_type, ''))
-                     and shape.method == (declaration, '') and not shape.callbacks}
+                     and shape.method == (expected_declaration, '') and not shape.callbacks}
         else:
             roots = {o['name']: shape.modules for o in owners if (shape := plain_rust_function_symbol(o['name']))
-                     is not None and shape.identifiers == namespace}
+                     is not None and shape.identifiers == expected_namespace}
         if not 1 <= len(roots) <= 8:
             return None
         copies = {symbol: {} for symbol in roots}
@@ -15303,17 +15658,16 @@ def retained_compiled_scope_window(name, sides, indexes, work, declaration, sele
             if not regions:
                 continue
             symbol = owner['name']
-            candidates = [root for root, modules in roots.items() if symbol == root or any(
-                direct_rust_callback_symbol(symbol, root, modules, depth)
-                for depth in range(1, callback_depth + 1))]
+            candidates = [(root, depth) for root, modules in roots.items() for depth in range(callback_depth + 1)
+                          if (symbol == root if depth == 0
+                              else direct_rust_callback_symbol(symbol, root, modules, depth))]
             if (len(candidates) != 1 or index.name_counts[symbol] != 1 or owner.get('branches')
                     or owner.get('mcdc_records') or len(owner['filenames']) != 1
                     or index.files.get(owner['filenames'][0]) != name
                     or not 0 <= owner['count'] < COUNTER_LIMIT
                     or any(r[5:] != [0, 0, 0] or not 0 <= r[4] <= COUNTER_LIMIT for r in regions)):
                 return None
-            root, = candidates
-            depth = 0 if symbol == root else 2 if symbol.startswith('_RNCNC') else 1
+            (root, depth), = candidates
             role = depth, symbol[len(root) + 2 * depth:]
             if role in copies[root]:
                 return None
@@ -15365,9 +15719,174 @@ def retained_aur_reviewed_source_text(name, sides, indexes, work):
         'text', reviewed_source_text_window, callback_depth=0, inherent_type='ReviewedSource')
 
 
+def retained_aur_containment_guard(name, sides, indexes, work):
+    return retained_compiled_scope_window(name, sides, indexes, work, 'contained_aur_symlink_target',
+                                          aur_containment_guard_window, callback_depth=0)
+
+
+def retained_aur_rollback_checkout(name, sides, indexes, work):
+    return retained_compiled_scope_window(name, sides, indexes, work, 'begin_rollback_worktree',
+                                          aur_rollback_checkout_window, callback_depth=0, inherent_type='AurClient')
+
+
+def retained_aur_hook_preview_record(name, sides, indexes, work):
+    return retained_compiled_scope_window(name, sides, indexes, work, 'declared_install_hook_previews_render_every_declared_script',
+                                          aur_hook_preview_record_window, callback_depth=0, test_module=True)
+
+
+def retained_aur_hook_review_record(name, sides, indexes, work):
+    return retained_compiled_scope_window(name, sides, indexes, work, 'install_hook_review_fails_closed_and_preserves_long_lines',
+                                          aur_hook_review_record_window, callback_depth=0, test_module=True)
+
+
+def retained_aur_archive_selection(name, sides, indexes, work):
+    return retained_compiled_scope_window(name, sides, indexes, work, 'authorize_archives',
+                                          aur_archive_selection_window, callback_depth=1, inherent_type='AurClient')
+
+
+def cold_aur_dispatch_slots(source, declaration, modern):
+    primary = declaration == 'install_package_outputs'
+    archives = '&archives' if primary else '&dep_packages'
+    if modern:
+        archives = f'std::slice::from_ref({archives})'
+    indent = ' ' * (8 if primary else 12)
+    sudo = 'sudoloop.as_ref()' if primary else 'sudoloop'
+    callee = 'Self::install_built_packages'
+    dispatch = f'{indent}{callee}({archives}, {sudo}).await?;'
+    if primary:
+        window = [
+            '        let archives = self',
+            '            .install_authorized_package_outputs(authorized, sudoloop.as_ref())',
+            '            .await?;',
+            '        crate::cli::modern_ui::print_info(&format!("Installing {output_names}"));',
+            dispatch,
+            '        crate::cli::modern_ui::print_success(&format!("Installed {output_names}"));',
+        ]
+    else:
+        window = [
+            '            let dep_packages = self',
+            '                .build_only(&dep, &mut dependency_builds, sudoloop)',
+            '                .await?;', dispatch,
+            '            crate::cli::modern_ui::print_success(&format!("Installed dependency: {dep}"));',
+        ]
+    selected = retained_source_window(source, window, [window.index(dispatch)])
+    if selected is None:
+        return None
+    first = len(indent) + 1
+    await_error = dispatch.index('?') + 1
+    arg_start = first + len(callee) + 1
+    arg_stop = arg_start + len(archives)
+    cols = [(first, first + len(callee)), (first, await_error), (arg_start, arg_stop)]
+    if primary:
+        cols.append((arg_stop + 2, arg_stop + 2 + len('sudoloop')))
+    cols.append((await_error, await_error + 1))
+    return selected[1][0], cols
+
+
+def retained_cold_aur_dispatch(name, sides, indexes, work):
+    """Keep the measured cold AUR install calls after switching their typed input."""
+    receipts = []
+    for declaration in ('install_package_outputs', 'install_authorized_package_outputs'):
+        observations = []
+        for modern, ((source, inventory, counts), index) in enumerate(zip(sides, indexes, strict=True)):
+            code, rows = inventory[:2]
+            _construct_charge(work, len(rows))
+            wrapper = tuple(f'pub ( crate ) async fn {declaration} ('.split())
+            methods = [row for row in rows if row['kind'] == 'fn'
+                       and row['header'][:len(wrapper)] == wrapper]
+            if len(methods) != 1:
+                break
+            method, = methods
+            first, last = code.region(method['opening'], method['end'])[0::2]
+            selected = cold_aur_dispatch_slots(source[first:last], declaration, modern)
+            if selected is None:
+                break
+            offset, cols = selected
+            line = first + offset
+            if counts.get(line) != 0:
+                break
+            owners = compiled_owners_in_range(index, name, line, line, work, declaration)
+            _construct_charge(work, sum(len(o['name']) + len(o['regions']) for o in owners))
+            marker = code.region(method['opening'], method['opening'])
+            candidates = []
+            expected = [[line, start, line, end, 0, 0, 0, 0] for start, end in cols]
+            for owner in owners:
+                raw = [r for r in owner['regions'] if r[0] <= line <= r[2]]
+                if not raw:
+                    continue
+                shape = nominal_method_path(owner['name'])
+                if (shape is None or shape.kind != 'M' or shape.namespace != _AUR_CLIENT_NAMESPACE
+                        or shape.self_type != ('type', _AUR_CLIENT_NAMESPACE, ('AurClient', ''))
+                        or shape.method != (declaration, '') or shape.callbacks != ('',)
+                        or index.name_counts[owner['name']] != 1 or owner.get('branches')
+                        or owner.get('mcdc_records') or len(owner['filenames']) != 1
+                        or index.files.get(owner['filenames'][0]) != name or raw != expected
+                        or owner['regions'][0] != [*marker, owner['count'], 0, 0, 0]):
+                    break
+                candidates.append(owner['name'])
+            else:
+                if 1 <= len(candidates) <= 8:
+                    observations.append((line, candidates))
+                continue
+            break
+        if len(observations) == 2 and len(observations[0][1]) == len(observations[1][1]):
+            receipts.append(dict(declaration=declaration,
+                pair=[result[0] for result in observations], owners=[result[1] for result in observations]))
+    if not receipts:
+        return None
+    return dict(file=name, kind='retained-cold-aur-dispatch',
+                pairs=[proof['pair'] for proof in receipts], dispatches=receipts)
+
+
+def retained_aur_cleanup_lock(name, sides, indexes, work):
+    return retained_compiled_scope_window(name, sides, indexes, work, 'clean_all',
+                                          aur_cleanup_lock_window, callback_depth=0, inherent_type='AurClient')
+
+
+def retained_aur_fixture_index(name, sides, indexes, work):
+    return retained_compiled_scope_window(name, sides, indexes, work, 'index',
+        aur_fixture_index_window, callback_depth=0, inherent_type='S72Fixture', test_module=True)
+
+
+def retained_aur_metadata_fixture(name, sides, indexes, work):
+    return retained_compiled_scope_window(name, sides, indexes, work, 'published_metadata_generation_is_coherent_and_fresh',
+                                          metadata_publication_fixture_window, callback_depth=0, test_module=True)
+
+
+def retained_pacman_local_descriptor(name, sides, indexes, work):
+    return retained_compiled_scope_window(name, sides, indexes, work, 'parse_local_desc_manual',
+                                          pacman_local_descriptor_window, callback_depth=0)
+
+
 def retained_pi_constructor(name, sides, indexes, work):
     return retained_compiled_scope_window(name, sides, indexes, work, 'new', pi_constructor_window,
                                           callback_depth=0, inherent_type='PiManager')
+
+
+def retained_runtime_archive_extraction(name, sides, indexes, work):
+    forward = [
+        'pub(crate) async fn extract_tar_gz(',
+        '    archive_path: &Path,', '    dest_dir: &Path,', '    strip_components: usize,',
+        ') -> Result<()> {', '    extract_tar_gz_with_budget(',
+        '        archive_path,', '        dest_dir,', '        strip_components,',
+        '        MAX_DECOMPRESSED_BYTES,', '    )', '    .await', '}',
+    ]
+    _construct_charge(work, len(sides[1][0]))
+    if retained_source_window(sides[1][0], forward, [0]) is None:
+        return None
+    return retained_compiled_scope_window(name, sides, indexes, work, 'extract_tar_gz',
+        runtime_archive_extract_window, callback_depth=3, signatures=_RUNTIME_ARCHIVE_EXTRACT_SIGNATURES,
+        modern_declaration='extract_tar_gz_with_budget')
+
+
+def retained_runtime_copy_completion(name, sides, indexes, work):
+    return retained_compiled_scope_window(name, sides, indexes, work, 'copy_regular_tree',
+        runtime_copy_completion_window, callback_depth=0, signatures=_RUNTIME_COPY_SIGNATURES)
+
+
+def retained_rust_incremental_fixture(name, sides, indexes, work):
+    return retained_compiled_scope_window(name, sides, indexes, work, 'incremental_updates_fixture',
+        rust_incremental_fixture_window, callback_depth=1, test_module=True)
 
 
 def retained_node_refusal_fixture(name, sides, indexes, work):
@@ -17494,17 +18013,37 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
                                               retained_aur_index_info, retained_aur_update_workers,
                                               retained_aur_rollback_stages, retained_aur_environment_entries,
                                               retained_aur_management_tests, retained_aur_pgp_initialization,
-                                              retained_aur_reviewed_source, retained_aur_reviewed_source_text),
-        'src/package_managers/aur_metadata.rs': (retained_metadata_publication_success,),
+                                              retained_aur_reviewed_source, retained_aur_reviewed_source_text,
+                                              retained_aur_containment_guard, retained_aur_rollback_checkout,
+                                              retained_aur_hook_preview_record, retained_aur_hook_review_record,
+                                              retained_aur_archive_selection, retained_aur_cleanup_lock,
+                                              retained_aur_fixture_index, retained_cold_aur_dispatch),
+        'src/package_managers/aur_metadata.rs': (retained_metadata_publication_success,
+                                                retained_aur_metadata_fixture),
         'src/package_managers/pacman_db/db.rs': (retained_cached_upgrade_comparison, retained_pacman_pattern_inputs,
                                                 retained_pacman_pattern_matcher, retained_pacman_foreign_catalog_reads,
                                                 retained_pacman_catalog_defaults, retained_pacman_cache_bounds,
                                                 retained_pacman_cache_epoch, retained_pacman_upgrade_chain,
-                                                retained_pacman_sync_catalog_iteration),
+                                                retained_pacman_sync_catalog_iteration, retained_pacman_local_descriptor),
         'src/runtimes/node.rs': (retained_node_checksum_wait, retained_node_retry_fixtures,
                                  retained_node_refusal_fixture),
+        'src/runtimes/common.rs': (retained_runtime_archive_extraction, retained_runtime_copy_completion),
+        'src/runtimes/rust.rs': (retained_rust_incremental_fixture,),
         'src/runtimes/pi.rs': (retained_pi_runtime_fixtures, retained_pi_constructor),
         'src/runtimes/python/catalog.rs': (retained_python_catalog_request,),
+    }
+    archived_symbol_selectors = {
+        'src/package_managers/aur/client.rs': (
+            '18authorize_archives', *_AUR_MANAGEMENT_TESTS, 'create_scoped_pgp_home', 'capture', 'text',
+            'contained_aur_symlink_target', 'begin_rollback_worktree',
+            'declared_install_hook_previews_render_every_declared_script',
+            'install_hook_review_fails_closed_and_preserves_long_lines', 'authorize_archives', 'clean_all', 'index',
+            'install_package_outputs', 'install_authorized_package_outputs',
+        ),
+        'src/package_managers/pacman_db/db.rs': (
+            '14LocalDbPackage', '23load_cache_from_disk_in', 'ensure_local_cache_loaded',
+            'check_updates_cached', 'load_sync_packages', 'parse_local_desc_manual', '20bounded_native_check',
+        ),
     }
     for name in bs:
         file_replacement_start = len(replacement_receipts)
@@ -17704,6 +18243,9 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
         if (early_observers and inventories is not None and all(item is not None for item in inventories)
                 and bs[name]['expansions'] == hs[name]['expansions'] == []):
             sides = ((old, inventories[0], before), (new, inventories[1], after))
+            if name in archived_symbol_selectors:
+                for index in source_owner_indexes():
+                    index_compiled_copy_substrings(index, name, archived_symbol_selectors[name], construct_work)
             for observe in early_observers:
                 proof = observe(name, sides, source_owner_indexes(), construct_work)
                 if proof is not None:
@@ -18250,12 +18792,15 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
                         if (active := [line for line in pending if line not in retired])]
         async_obligations = [(line, fragment.target) for line, fragment in deferred_fragments.items()
                              if fragment.kind == 'async']
+        direct_requirements = {(line, fragment.target) for line, fragment in deferred_fragments.items()
+                               if fragment.kind == 'callback'}
         _construct_charge(construct_work, len(deferred_fragments))
         positive, receipts = positive_source_fragments(
             name, old, new, before, after, bf, hf, base_files, head_files, unresolved_fragments,
             construct_work, inventories, grouped, callback_functions, owner_indexes,
             tuple(zip(*async_obligations)) if async_obligations else ((), ()),
-            macro_expansions=(bs[name]['expansions'],hs[name]['expansions']), source_structures=structures)
+            macro_expansions=(bs[name]['expansions'],hs[name]['expansions']), source_structures=structures,
+            direct_requirements=direct_requirements)
         proof_pairs = {
             'async': {tuple(pair) for receipt in receipts
                       if 'async_copies' in receipt and 'async_fragment_regions' in receipt
@@ -18263,6 +18808,8 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
             'callback': {tuple(pair) for receipt in receipts
                          for fragment in receipt.get('callback_fragments', []) for pair in fragment['pairs']},
         }
+        proof_pairs['callback'].update(tuple(pair) for receipt in receipts
+                                      for fragment in receipt.get('direct_fragments', []) for pair in fragment['pairs'])
         proof_pairs['callback'].update(callback_anchors.items())
         for line, fragment in deferred_fragments.items():
             if (line, fragment.target) not in proof_pairs[fragment.kind]:
