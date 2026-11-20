@@ -6387,15 +6387,12 @@ mod tests {
             ])
             .output()
             .await?;
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert_ne!(
-            String::from_utf8(output.stdout)?.trim(),
-            host_namespace.to_string_lossy()
-        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stderr}");
+        let namespace = String::from_utf8(output.stdout)?;
+        let namespace = namespace.trim();
+        assert!(namespace.starts_with("ipc:[") && namespace.ends_with(']'));
+        assert_ne!(namespace, host_namespace.to_string_lossy());
         Ok(())
     }
 
