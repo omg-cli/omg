@@ -1352,15 +1352,14 @@ mod tests {
             .find_map(|_| sender.write(&payload).err())
             .expect("the bounded real socket buffer must apply backpressure");
         assert_eq!(super::review_io_count(Err(pending)).unwrap(), None);
-        let inherited_receiver = receiver.try_clone().unwrap();
-        receiver.shutdown(Shutdown::Both).unwrap();
-        drop(receiver);
+        // Local write shutdown makes the kernel error independent of peer
+        // closure timing and queued data.
+        sender.shutdown(Shutdown::Write).unwrap();
         let error = super::review_io_count(sender.write(b"closed")).unwrap_err();
         assert_eq!(
             error.downcast_ref::<std::io::Error>().unwrap().kind(),
             std::io::ErrorKind::BrokenPipe
         );
-        drop(inherited_receiver);
         let (sender, mut receiver) = UnixStream::pair().unwrap();
         sender.shutdown(Shutdown::Write).unwrap();
         drop(sender);
