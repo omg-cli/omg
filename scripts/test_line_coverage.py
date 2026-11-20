@@ -1880,7 +1880,7 @@ class RetainedAurHookRenderingTests(unittest.TestCase):
     def test_hook_rendering_requires_matching_outer_and_inner_callback_evidence(self):
         filename = 'src/package_managers/aur/client.rs'
         files = {'/artifact/' + filename: filename}
-        for fault in (None, 'rebound-text', 'changed-rendering', 'lost-inner-hit',
+        for fault in (None, 'rebound-names', 'rebound-text', 'changed-rendering', 'lost-inner-hit',
                       'missing-inner-copy', 'foreign-owner', 'foreign-root-coverage'):
             with self.subTest(fault=fault):
                 sides, indexes = [], []
@@ -1891,6 +1891,7 @@ class RetainedAurHookRenderingTests(unittest.TestCase):
                     operation = 'escape_default' if side and fault == 'changed-rendering' else 'to_string'
                     source = [
                         'fn declared_install_hook_previews(source: &ReviewedSource) -> Result<Vec<(String, String)>> {',
+                        *(['    let names = different_names;'] if side and fault == 'rebound-names' else []),
                         '    names',
                         '        .into_iter()',
                         '        .map(|name| {',
@@ -1914,7 +1915,7 @@ class RetainedAurHookRenderingTests(unittest.TestCase):
                         '        .collect()',
                         '}',
                     ]
-                    line = 13 + side
+                    line = source.index('            let contents = text') + 1
                     owners = []
                     for copy in range(2):
                         root = f'_RNvNtNtNtCs{side + 1}{copy + 1}_7omg_lib16package_managers3aur6client30declared_install_hook_previews'

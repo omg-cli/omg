@@ -13481,7 +13481,7 @@ def retained_aur_hook_rendering(name, sides, indexes, work):
     """Observe hook text rendering after the same bounded UTF-8 read."""
     function_name = 'declared_install_hook_previews'
     scope = ('omg_lib', 'package_managers', 'aur', 'client', function_name)
-    previous = None
+    previous_context = None
     evidence = []
     for (source, inventory, counts, line), index in zip(sides, indexes, strict=True):
         code, constructs, _, statements, *_ = inventory
@@ -13528,10 +13528,12 @@ def retained_aur_hook_rendering(name, sides, indexes, work):
             return None
         function_end = code.pairs[function]
         finish = code.region(start, function_end)[2]
-        excerpt = tuple(source[line - 1:finish])
-        if previous is not None and previous != excerpt:
+        context_start = root_rows[0]['first']
+        _construct_charge(work, closure - context_start + 1 + sum(len(s) + 1 for s in source[line - 1:finish]))
+        context = (tuple(code.words[context_start:closure + 1]), tuple(source[line - 1:finish]))
+        if previous_context is not None and previous_context != context:
             return None
-        previous = excerpt
+        previous_context = context
         opening = start + len(rendering) - 1
         closing = code.pairs[opening]
         if closing != end + 1 - len(collect):
