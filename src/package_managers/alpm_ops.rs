@@ -2847,13 +2847,14 @@ fn configure_mirrors(
         configured.push((database, servers));
     }
     for (database, servers) in configured {
-        database
-            .set_servers(servers.iter().map(String::as_str))
-            .with_context(|| {
-                format!("Failed to set mirrors for repository '{}'", database.name())
-            })?;
+        let result = database.set_servers(servers.iter().map(String::as_str));
+        mirror_configuration_result(database.name(), result)?;
     }
     ensure_mirror_servers(alpm)
+}
+
+fn mirror_configuration_result(repository: &str, result: alpm::Result<()>) -> Result<()> {
+    result.with_context(|| format!("Failed to set mirrors for repository '{repository}'"))
 }
 
 fn ensure_mirror_servers(alpm: &alpm::Alpm) -> Result<()> {
@@ -4738,6 +4739,16 @@ mod tests {
                 .to_string()
                 .contains("Registered repository 'retired' is absent from pacman.conf"),
             "{error:#}"
+        );
+        let error = super::mirror_configuration_result("core", Err(alpm::Error::Memory))
+            .expect_err("a native mirror setter error must retain the repository and cause");
+        assert_eq!(
+            error.to_string(),
+            "Failed to set mirrors for repository 'core'"
+        );
+        assert_eq!(
+            error.downcast_ref::<alpm::Error>(),
+            Some(&alpm::Error::Memory)
         );
         Ok(())
     }
