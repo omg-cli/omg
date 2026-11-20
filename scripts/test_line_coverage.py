@@ -1132,6 +1132,52 @@ class PythonCatalogCoverageTests(unittest.TestCase):
 
 
 class PacmanFixtureCoverageTests(unittest.TestCase):
+    def test_provider_insertion_preserves_its_direct_regions_and_limits_paint_to_the_old_loop(self):
+        name = 'src/package_managers/pacman_db/db.rs'
+        files = {'/coverage/' + name: name}
+
+        def observe(fault=None):
+            work = [100000]
+            sides, indexes = [], []
+            for modern in (False, True):
+                result = ('Result<std::collections::HashSet<String>>' if modern
+                          else 'std::collections::HashSet<String>')
+                source = ['fn compute_required_names(', '    packages: &HashMap<String, LocalDbPackage>,',
+                          f') -> {result} {{', '    for (name, pkg) in packages {',
+                          '        for provide in &pkg.provides {']
+                if modern:
+                    source.extend(['            let relation = health_relation(provide)?;',
+                                   '            anyhow::ensure!(',
+                                   '                matches!(relation.operator, "" | "="),',
+                                   '                "Unsupported provision {provide} declared by {name}"',
+                                   '            );'])
+                entry = len(source) + 1
+                argument = 'relation.name' if modern else 'dependency_base_name(provide)'
+                values = '(name, relation)' if modern else 'name'
+                source.extend(['            providers', f'                .entry({argument})',
+                               '                .or_default()', f'                .push({values});',
+                               '        }', '    }', '}'])
+                hits = 0 if modern and fault == 'lost-insertion' else 7
+                raw = [[entry, 13, entry, 22, hits, 0, 0, 0],
+                       [entry, 13, entry + 2, 30, hits, 0, 0, 0]]
+                if not modern:
+                    raw.insert(0, [entry - 1, 38, entry + 4, 10, hits, 0, 0, 0])
+                if modern and fault == 'unexplained-delimiter':
+                    raw.append([entry + 4, 9, entry + 4, 10, hits, 0, 0, 0])
+                owner = dict(name=f'_RNvNtNtNtCs{modern + 1}_7omg_lib16package_managers9pacman_db2db22compute_required_names',
+                             count=1, filenames=list(files), regions=raw)
+                counts = coverage._owner_line_counts(owner, coverage._ObserverWork(work))
+                sides.append((source, coverage._construct_inventory(source, work), counts))
+                indexes.append(coverage.index_compiled_owner_sources([owner], files, work, {name}))
+            return coverage.retained_pacman_provision_insertion(name, sides, indexes, work)
+
+        proof = observe()
+        self.assertEqual(proof['pairs'], [[6, 11], [8, 13]])
+        self.assertEqual(proof['retired_base_paint'], [10])
+        for fault in ('lost-insertion', 'unexplained-delimiter'):
+            with self.subTest(fault=fault):
+                self.assertIsNone(observe(fault))
+
     def test_removed_shell_reader_accounts_for_each_typed_stream(self):
         root = '_RNvNtNtNtCsA_7omg_lib16package_managers9pacman_db2db20bounded_native_check'
         suffix = '0012read_limitedNtNtCsT_5tokio7process11ChildStdoutE0Bg_'

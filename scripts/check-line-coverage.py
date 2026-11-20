@@ -15437,6 +15437,41 @@ def pacman_cache_namespace_fixture_window(source, modern):
     return None
 
 
+def pacman_provider_iteration_window(source, modern):
+    if modern:
+        window = [
+            '            if let Some(candidates) = providers.get(relation.name) {',
+            '                required.extend(', '                    candidates', '                        .iter()',
+            '                        .filter(|(owner, provided)| {',
+            '                            *owner != pkg.name && relation.accepts(provided.version)',
+            '                        })', '                        .map(|(owner, _)| (*owner).to_owned()),',
+            '                );', '            }',
+        ]
+    else:
+        window = [
+            '        for depend in &pkg.depends {',
+            '            let target = dependency_base_name(depend);',
+            '            if target == pkg.name {', '                continue;', '            }',
+            '            if packages.contains_key(target) {',
+            '                required.insert(target.to_owned());', '            }',
+            '            if let Some(provider_names) = providers.get(target) {',
+            '                required.extend(', '                    provider_names', '                        .iter()',
+            '                        .filter(|provider| **provider != pkg.name)',
+            '                        .map(|provider| (*provider).to_owned()),',
+            '                );', '            }',
+        ]
+    selected = window.index('                required.extend(')
+    return retained_source_window(source, window, [selected, selected + 2])
+
+
+_PACMAN_REQUIRED_NAMES_SIGNATURES = (
+    tuple('fn compute_required_names ( packages : & HashMap < String , LocalDbPackage > , )'
+          ' -> std :: collections :: HashSet < String >'.split()),
+    tuple('fn compute_required_names ( packages : & HashMap < String , LocalDbPackage > , )'
+          ' -> Result < std :: collections :: HashSet < String > >'.split()),
+)
+
+
 def metadata_publication_fixture_window(source, modern):
     archive = ('read_metadata_archive(File::open(&archive).unwrap())' if modern else
                'read_metadata_archive(&archive)')
@@ -15889,6 +15924,78 @@ def retained_aur_srcinfo_epoch_fixture(name, sides, indexes, work):
 def retained_pacman_cache_namespace_fixture(name, sides, indexes, work):
     return retained_compiled_scope_window(name, sides, indexes, work, 'sync_identity_cache_uses_versioned_namespace',
         pacman_cache_namespace_fixture_window, callback_depth=0, test_module=True)
+
+
+def retained_pacman_provider_iteration(name, sides, indexes, work):
+    return retained_compiled_scope_window(name, sides, indexes, work, 'compute_required_names',
+        pacman_provider_iteration_window, callback_depth=0, signatures=_PACMAN_REQUIRED_NAMES_SIGNATURES)
+
+
+def retained_pacman_provision_insertion(name, sides, indexes, work):
+    """Keep direct provider insertion and identify older loop-delimiter paint."""
+    observations = []
+    for modern, ((source, inventory, counts), index) in enumerate(zip(sides, indexes, strict=True)):
+        code, rows = inventory[:2]
+        _construct_charge(work, len(rows))
+        functions = [row for row in rows if row['kind'] == 'fn'
+                     and row['header'] == _PACMAN_REQUIRED_NAMES_SIGNATURES[modern]
+                     and code.parents[row['opening']] is None]
+        if len(functions) != 1:
+            return None
+        function, = functions
+        first, last = code.region(function['opening'], function['end'])[0::2]
+        validation = [
+            '            let relation = health_relation(provide)?;', '            anyhow::ensure!(',
+            '                matches!(relation.operator, "" | "="),',
+            '                "Unsupported provision {provide} declared by {name}"', '            );',
+        ] if modern else []
+        argument = 'relation.name' if modern else 'dependency_base_name(provide)'
+        values = '(name, relation)' if modern else 'name'
+        window = [
+            '    for (name, pkg) in packages {', '        for provide in &pkg.provides {', *validation,
+            '            providers', f'                .entry({argument})', '                .or_default()',
+            f'                .push({values});', '        }', '    }',
+        ]
+        selected = retained_source_window(source[first:last], window,
+                                          [2 + len(validation), 4 + len(validation), 6 + len(validation)])
+        if selected is None:
+            return None
+        entry, default, closing = (line + first for line in selected[1])
+        syntax = [(entry, 13, entry, 22), (entry, 13, default, 30)]
+        inherited = (entry - 1, 38, closing, 10)
+        spans = syntax if modern else [inherited, *syntax]
+        owners = compiled_owners_in_range(index, name, entry, closing, work, 'compute_required_names')
+        observed = []
+        for owner in owners:
+            symbol = owner['name']
+            _construct_charge(work, len(symbol) + len(owner['regions']))
+            raw = [row for row in owner['regions'] if any(row[0] <= line <= row[2]
+                   for line in (entry, default, closing))]
+            if not raw:
+                continue
+            shape = plain_rust_function_symbol(symbol)
+            if (shape is None or shape.identifiers != (
+                    'omg_lib', 'package_managers', 'pacman_db', 'db', 'compute_required_names')
+                    or len(owner['filenames']) != 1 or index.files.get(owner['filenames'][0]) != name
+                    or index.name_counts[symbol] != 1 or owner.get('branches') or owner.get('mcdc_records')
+                    or [tuple(row[:4]) for row in raw] != spans
+                    or any(row[5:] != [0, 0, 0] or not 0 <= row[4] < COUNTER_LIMIT for row in raw)
+                    or len({row[4] for row in raw}) != 1):
+                return None
+            observed.append((symbol, raw[0][4]))
+        total = sum(hits for _, hits in observed)
+        if (not observed or total <= 0 or counts.get(entry) != total or counts.get(default) != total
+                or counts.get(closing) != (None if modern else total)):
+            return None
+        observations.append(((entry, default), closing, observed))
+    before, after = observations
+    matching = compiled_hit_state_matching(*[[[int(hits > 0)] for _, hits in cohort[2]]
+                                            for cohort in observations])
+    if matching is None:
+        return None
+    return dict(file=name, kind='retained-pacman-provision-insertion',
+                pairs=[list(pair) for pair in zip(before[0], after[0], strict=True)],
+                retired_base_paint=[before[1]], owners=[before[2], after[2]], instance_matching=matching)
 
 
 def retained_aur_metadata_fixture(name, sides, indexes, work):
@@ -18069,7 +18176,8 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
                                                 retained_pacman_catalog_defaults, retained_pacman_cache_bounds,
                                                 retained_pacman_cache_epoch, retained_pacman_upgrade_chain,
                                                 retained_pacman_sync_catalog_iteration, retained_pacman_local_descriptor,
-                                                retained_pacman_cache_namespace_fixture),
+                                                retained_pacman_cache_namespace_fixture, retained_pacman_provider_iteration,
+                                                retained_pacman_provision_insertion),
         'src/runtimes/node.rs': (retained_node_checksum_wait, retained_node_retry_fixtures,
                                  retained_node_refusal_fixture),
         'src/runtimes/common.rs': (retained_runtime_archive_extraction, retained_runtime_copy_completion),
@@ -18090,6 +18198,7 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
             '14LocalDbPackage', '23load_cache_from_disk_in', 'ensure_local_cache_loaded',
             'check_updates_cached', 'load_sync_packages', 'parse_local_desc_manual', '20bounded_native_check',
             'sync_identity_cache_uses_versioned_namespace',
+            'compute_required_names',
         ),
     }
     for name in bs:
@@ -18287,6 +18396,7 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
                         base_instance_states=states[0], head_instance_states=states[1], instance_matching=matching))
         inventories = None if old == new else tuple(inventory_for_side(side) for side in (0, 1))
         early_observers = early_observers_by_file.get(name, ())
+        retired_base_paint = set()
         if (early_observers and inventories is not None and all(item is not None for item in inventories)
                 and bs[name]['expansions'] == hs[name]['expansions'] == []):
             sides = ((old, inventories[0], before), (new, inventories[1], after))
@@ -18299,6 +18409,7 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
                     if any(n in anchored and anchored[n] != t for n, t in proof['pairs']):
                         raise ValueError('Ambiguous AUR source correspondence')
                     anchored.update(proof['pairs'])
+                    retired_base_paint.update(proof.get('retired_base_paint', ()))
                     obligation_receipts.append(proof)
         construct_pairs, witnesses = retained_construct_anchors(name, old, new, before, after,
             bf, hf, base_files, head_files, construct_work, inventories, grouped)
@@ -18649,6 +18760,14 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
             _construct_charge(construct_work, (len(states[0]) * len(states[1]) + 1) * max(width, 1))
             if compiled_hit_state_matching(*states) is None:
                 raise ValueError('Record completion lost compiled-copy coverage')
+        if retired_base_paint:
+            if retired_base_paint.intersection(anchored) or retired_base_paint.intersection(deferred_fragments):
+                raise ValueError('Retired coverage paint conflicts with a retained executable scope')
+            moved_source_lines.update(retired_base_paint)
+            for line in retired_base_paint:
+                retained.pop(line, None)
+            unresolved_fragments = [(*bounds, active) for *bounds, pending in unresolved_fragments
+                                    if (active := [line for line in pending if line not in retired_base_paint])]
         _construct_charge(construct_work, len(replacement_receipts) - file_replacement_start)
         replaced_functions = {tuple(receipt['base_range'])
                               for receipt in replacement_receipts[file_replacement_start:]
