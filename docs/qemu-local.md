@@ -254,6 +254,16 @@ The package lifecycle also requires a nonempty privileged audit log and runs
 `omg audit verify` against it. Directory modes and verification output are saved
 under guest evidence. See [Linux audit storage and migration](security.md#audit-logging).
 
+For a focused timing comparison, add `--parallel-runtime-installs` to a run
+with inventory, `--inventory-isolate-hermetic`, and `--restrict-egress`.
+The pilot enables it only for automatic staged Fedora x86-64. Package and
+service cases finish first. Rust then runs in a separate SSH session from the
+serial Python, Node, and Go cases. Each live install retains its own data,
+home, temporary files, receipt, and timeout. Compare the
+`runtime-install-phase` timing in `inventory.log` with the serial runtime row
+receipts on the same source, image and runner. Continue comparing the complete
+guest duration and required result when judging whether to expand it.
+
 ## What inventory results prove
 
 The current inventory has 213 rows: 170 hermetic-tier contracts, 35

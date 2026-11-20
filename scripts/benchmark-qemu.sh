@@ -19,6 +19,7 @@ transaction_producer_started=false
 inventory_tiers=
 inventory_mutations=false
 inventory_isolation=false
+parallel_runtime_installs=false
 storage_faults=false
 restrict_egress=false
 allow_tcg=false
@@ -48,6 +49,7 @@ while (($#)); do
     --print-pins) print_pins=true; shift ;;
     --inventory-allow-mutations) inventory_mutations=true; shift ;;
     --inventory-isolate-hermetic) inventory_isolation=true; shift ;;
+    --parallel-runtime-installs) parallel_runtime_installs=true; shift ;;
     --storage-faults) storage_faults=true; shift ;;
     --restrict-egress) restrict_egress=true; shift ;;
     --allow-tcg) allow_tcg=true; shift ;;
@@ -61,7 +63,7 @@ Usage: scripts/benchmark-qemu.sh [--distro all|arch|debian|debian-trixie|ubuntu|
   [--inventory-policy JSON]
   [--fedora-sqlite-bundle DIR] (required for Fedora, including all)
   [--image-policy JSON] [--image-cache DIR] [--image-cache-budget-bytes BYTES]
-  [--inventory-isolate-hermetic]
+  [--inventory-isolate-hermetic] [--parallel-runtime-installs]
   [--allow-tcg]
 
 Runs disposable guests with pinned images, reboot, sudo, package lifecycle,
@@ -101,6 +103,9 @@ if [[ -z "$arch" ]]; then
 fi
 case "$arch" in x86_64|amd64) arch=x86_64 ;; aarch64|arm64) arch=aarch64 ;; *) exit 2 ;; esac
 [[ -z "$staged_dir" || -d "$staged_dir" ]] || exit 2
+if [[ "$parallel_runtime_installs" == true ]]; then
+  [[ -n "$inventory_tiers" && "$inventory_isolation" == true && "$restrict_egress" == true ]] || exit 2
+fi
 [[ -z "$release_dir" || ( -d "$release_dir" && -z "$staged_dir" ) ]] || exit 2
 tsv="${inventory_file:-$here/../tests/cli_behavior_inventory.tsv}"
 if [[ -n "$inventory_tiers" && -z "$staged_dir" && -z "$inventory_file" ]]; then
@@ -238,6 +243,7 @@ if [[ "$distro" == all ]]; then
   [[ -z "$inventory_tiers" ]] || args+=(--inventory-tiers "$inventory_tiers")
   [[ "$inventory_mutations" == false ]] || args+=(--inventory-allow-mutations)
   [[ "$inventory_isolation" == false ]] || args+=(--inventory-isolate-hermetic)
+  [[ "$parallel_runtime_installs" == false ]] || args+=(--parallel-runtime-installs)
   [[ "$storage_faults" == false ]] || args+=(--storage-faults)
   [[ "$restrict_egress" == false ]] || args+=(--restrict-egress)
   [[ "$allow_tcg" == false ]] || args+=(--allow-tcg)
@@ -1523,6 +1529,7 @@ if [[ -n "$inventory_tiers" && "$rc" == 0 ]]; then
   fi
   [[ "$inventory_mutations" == false ]] || inv_args+=(--allow-mutations)
   [[ "$inventory_isolation" == false ]] || inv_args+=(--isolate-hermetic --network-policy /work/inventory-scopes.json)
+  [[ "$parallel_runtime_installs" == false ]] || inv_args+=(--parallel-runtime-installs)
   # Refusal evidence is independent of the normal inventory's mutation opt-in.
   refusal_rc=0
   timeout --kill-after=5s 90 docker exec -w /work "$controller" python3 /work/qemu-mutation-refusal.py \
