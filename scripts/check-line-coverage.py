@@ -15406,6 +15406,37 @@ def aur_fixture_index_window(source, modern):
         [1])
 
 
+def aur_srcinfo_epoch_fixture_window(source, modern):
+    version = 'srcinfo_version' if modern else 'AurClient::srcinfo_version'
+    return retained_source_window(source,
+        ['        assert_eq!(',
+         f'            {version}("pkgver = 1.0~rc1\\npkgrel = 3\\nepoch = 2"),',
+         '            Some("2:1.0~rc1-3".to_string())', '        );', '    }'], [0])
+
+
+def pacman_cache_namespace_fixture_window(source, modern):
+    legacy = '        fs::write(directory.path().join("sync_db.bin"), b"legacy cache")?;'
+    previous = [
+        '        fs::write(',
+        '            directory.path().join("sync_db_source_v4.bin"),',
+        '            b"older derived cache",',
+    ] if modern else []
+    cache_name = 'format!("{SYNC_CACHE_NAME}.bin")' if modern else '"sync_db_source_v1.bin"'
+    lookup = 'SYNC_CACHE_NAME' if modern else '"sync_db_source_v1"'
+    current = ['        fs::write(', f'            directory.path().join({cache_name}),',
+               '            bitcode::serialize(&cache)?,', '        )?;',
+               f'        let decoded: DbCache = load_cache_from_disk_in(directory.path(), {lookup})?;',
+               '        assert_eq!(decoded.last_modified, cache.last_modified);']
+    endings = (['        )?;'],
+               ['        )', '        .expect("write the previous cache namespace sentinel");']) if modern else ([],)
+    for ending in endings:
+        start = [legacy, *previous, *ending]
+        selected = retained_source_window(source, [*start, *current], [len(start), len(start) + 2])
+        if selected is not None:
+            return selected
+    return None
+
+
 def metadata_publication_fixture_window(source, modern):
     archive = ('read_metadata_archive(File::open(&archive).unwrap())' if modern else
                'read_metadata_archive(&archive)')
@@ -15612,7 +15643,9 @@ def retained_compiled_scope_window(name, sides, indexes, work, declaration, sele
             modules = [row for row in rows if row['kind'] == 'mod'
                        and row['header'] in (
                            tuple('# [ cfg ( test ) ] mod tests'.split()),
-                           tuple('# [ cfg ( test ) ] # [ expect ( clippy :: unwrap_used ) ] mod tests'.split()))
+                           tuple('# [ cfg ( test ) ] # [ expect ( clippy :: unwrap_used ) ] mod tests'.split()),
+                           tuple(('# [ cfg ( test ) ] # [ expect ( clippy :: unwrap_used , '
+                                  'clippy :: expect_used ) ] mod tests').split()))
                        and code.parents[row['opening']] is None]
             if len(modules) != 1:
                 return None
@@ -15846,6 +15879,16 @@ def retained_aur_cleanup_lock(name, sides, indexes, work):
 def retained_aur_fixture_index(name, sides, indexes, work):
     return retained_compiled_scope_window(name, sides, indexes, work, 'index',
         aur_fixture_index_window, callback_depth=0, inherent_type='S72Fixture', test_module=True)
+
+
+def retained_aur_srcinfo_epoch_fixture(name, sides, indexes, work):
+    return retained_compiled_scope_window(name, sides, indexes, work, 'srcinfo_version_extracts_pkgver_pkgrel',
+        aur_srcinfo_epoch_fixture_window, callback_depth=0, test_module=True)
+
+
+def retained_pacman_cache_namespace_fixture(name, sides, indexes, work):
+    return retained_compiled_scope_window(name, sides, indexes, work, 'sync_identity_cache_uses_versioned_namespace',
+        pacman_cache_namespace_fixture_window, callback_depth=0, test_module=True)
 
 
 def retained_aur_metadata_fixture(name, sides, indexes, work):
@@ -18017,14 +18060,16 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
                                               retained_aur_containment_guard, retained_aur_rollback_checkout,
                                               retained_aur_hook_preview_record, retained_aur_hook_review_record,
                                               retained_aur_archive_selection, retained_aur_cleanup_lock,
-                                              retained_aur_fixture_index, retained_cold_aur_dispatch),
+                                              retained_aur_fixture_index, retained_cold_aur_dispatch,
+                                              retained_aur_srcinfo_epoch_fixture),
         'src/package_managers/aur_metadata.rs': (retained_metadata_publication_success,
                                                 retained_aur_metadata_fixture),
         'src/package_managers/pacman_db/db.rs': (retained_cached_upgrade_comparison, retained_pacman_pattern_inputs,
                                                 retained_pacman_pattern_matcher, retained_pacman_foreign_catalog_reads,
                                                 retained_pacman_catalog_defaults, retained_pacman_cache_bounds,
                                                 retained_pacman_cache_epoch, retained_pacman_upgrade_chain,
-                                                retained_pacman_sync_catalog_iteration, retained_pacman_local_descriptor),
+                                                retained_pacman_sync_catalog_iteration, retained_pacman_local_descriptor,
+                                                retained_pacman_cache_namespace_fixture),
         'src/runtimes/node.rs': (retained_node_checksum_wait, retained_node_retry_fixtures,
                                  retained_node_refusal_fixture),
         'src/runtimes/common.rs': (retained_runtime_archive_extraction, retained_runtime_copy_completion),
@@ -18039,10 +18084,12 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
             'declared_install_hook_previews_render_every_declared_script',
             'install_hook_review_fails_closed_and_preserves_long_lines', 'authorize_archives', 'clean_all', 'index',
             'install_package_outputs', 'install_authorized_package_outputs',
+            'srcinfo_version_extracts_pkgver_pkgrel',
         ),
         'src/package_managers/pacman_db/db.rs': (
             '14LocalDbPackage', '23load_cache_from_disk_in', 'ensure_local_cache_loaded',
             'check_updates_cached', 'load_sync_packages', 'parse_local_desc_manual', '20bounded_native_check',
+            'sync_identity_cache_uses_versioned_namespace',
         ),
     }
     for name in bs:
