@@ -152,8 +152,9 @@ fn validate_repository_name(name: &str) -> Result<()> {
     let mut components = Path::new(name).components();
     anyhow::ensure!(
         matches!(components.next(), Some(std::path::Component::Normal(component)) if component == name)
-            && components.next().is_none(),
-        "Invalid repository name '{name}': expected one filesystem path component"
+            && components.next().is_none()
+            && !name.chars().any(char::is_control),
+        "Invalid repository name {name:?}: expected one filesystem path component without control characters"
     );
     Ok(())
 }
@@ -354,9 +355,8 @@ impl PacmanConfig {
     fn parse_repo_option(repo: &mut RepoConfig, key: &str, value: Option<&str>) -> Result<()> {
         match key {
             "Server" => {
-                if let Some(v) = value {
-                    repo.servers.push(v.to_string());
-                }
+                let server = value.context("Repository Server requires a value")?;
+                repo.servers.push(server.to_owned());
             }
             "SigLevel" => Self::append_signature_option(&mut repo.sig_level, value),
             "Include" => repo.include = value.map(String::from),
@@ -437,6 +437,13 @@ impl PacmanConfig {
             }
         }
 
+        anyhow::ensure!(
+            servers
+                .iter()
+                .all(|server| !server.is_empty() && !server.chars().any(char::is_control)),
+            "Repository '{}' has an empty mirror or a mirror containing control characters",
+            repo.name
+        );
         Ok(servers)
     }
 }
@@ -581,6 +588,26 @@ mod tests {
             config.resolve_servers(&config.repos[0], "x86_64").unwrap(),
             ["https://mirror.example/core/x86_64"]
         );
+    }
+
+    #[test]
+    fn invalid_repository_mirrors_do_not_reach_native_clients() -> Result<()> {
+        for server in ["", "https://mirror.example/\0repo"] {
+            let config = PacmanConfig::parse_str(&format!("[core]\nServer = {server}\n"))?;
+            let error = config
+                .resolve_servers(&config.repos[0], "x86_64")
+                .expect_err("invalid mirror");
+            assert!(error.to_string().contains("Repository 'core'"));
+        }
+        let missing_value =
+            PacmanConfig::parse_str("[core]\nServer\n").expect_err("missing mirror value");
+        assert!(missing_value.to_string().contains("requires a value"));
+        let invalid_name =
+            PacmanConfig::parse_str("[core\0]\n").expect_err("invalid repository name");
+        let diagnostic = invalid_name.to_string();
+        assert!(diagnostic.contains("Invalid repository name"));
+        assert!(!diagnostic.chars().any(char::is_control));
+        Ok(())
     }
 
     #[test]

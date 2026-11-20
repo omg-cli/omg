@@ -3,18 +3,13 @@
 //! Rust metadata queries with native signature validation and transactions.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
-use regex::Regex;
 
 use crate::cli::progress::{Accent, Outcome, ProgressTask, TaskKind, TaskSpec};
 use crate::core::paths;
 
-/// Regex for parsing mirror server lines from /etc/pacman.d/mirrorlist
-/// Compiled once at first use, then reused for all subsequent calls.
-static MIRRORLIST_REGEX: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^Server\s*=\s*([^#]+)").expect("valid regex pattern"));
 /// Stable cross-layer marker for a requested package absent from every sync repository.
 pub const MISSING_FROM_REPOS_MARKER: &str = "not found in any configured repository";
 const PARALLEL_DOWNLOADS: u32 = 5;
@@ -694,7 +689,7 @@ fn execute_transaction_in(
         &mut owned
     };
 
-    configure_mirrors(alpm)?;
+    configure_mirrors(alpm, &pacman_config)?;
     if matches!(policy, TransactionPolicy::Omarchy) && kind == TransactionKind::Install {
         for name in &packages {
             let (database, _) = omarchy_install_candidate(alpm, name)?;
@@ -2814,73 +2809,29 @@ fn format_trans_prepare_error(err: &str) -> String {
     )
 }
 
-/// Configure ALPM servers for all repos (official + custom)
-fn configure_mirrors(alpm: &mut alpm::Alpm) -> Result<()> {
-    let conf_path = paths::pacman_conf_path();
-
-    if let Ok(config) = crate::core::pacman_conf::PacmanConfig::parse(&conf_path) {
-        let arch = config.primary_package_architecture()?;
-        for repo in &config.repos {
-            match config.resolve_servers(repo, &arch) {
-                Ok(servers) => {
-                    // AlpmListMut is an IntoIterator, not an Iterator.
-                    let target_db = alpm
-                        .syncdbs_mut()
-                        .into_iter()
-                        .find(|db| db.name() == repo.name);
-                    if let Some(db) = target_db {
-                        for server in servers {
-                            if let Err(e) = db.add_server(server.clone()) {
-                                tracing::debug!(
-                                    "Failed to add server '{}' to repo '{}': {e}",
-                                    crate::core::http::redact_url(&server),
-                                    db.name()
-                                );
-                            }
-                        }
-                    } else {
-                        tracing::debug!(
-                            "Repository '{}' from pacman.conf has no registered sync database",
-                            repo.name
-                        );
-                    }
-                }
-                Err(error) => tracing::debug!(
-                    "Failed to resolve mirrors for repository '{}': {error}",
-                    repo.name
-                ),
-            }
-        }
-        return ensure_mirror_servers(alpm);
-    }
-
-    let mirrorlist = paths::pacman_mirrorlist_path();
-    if !mirrorlist.exists() {
-        return ensure_mirror_servers(alpm);
-    }
-
-    let arch = crate::core::pacman_conf::PacmanConfig::default().primary_package_architecture()?;
-    let content = std::fs::read_to_string(mirrorlist)?;
-    let mut servers = Vec::with_capacity(16);
-
-    for line in content.lines() {
-        let line = line.trim();
-        if let Some(url) = MIRRORLIST_REGEX.captures(line).and_then(|caps| caps.get(1)) {
-            servers.push(url.as_str().trim().to_string());
+/// Apply the same repository configuration used to set transaction policy.
+fn configure_mirrors(
+    alpm: &mut alpm::Alpm,
+    config: &crate::core::pacman_conf::PacmanConfig,
+) -> Result<()> {
+    let arch = config.primary_package_architecture()?;
+    let mut configured = Vec::new();
+    for database in alpm.syncdbs_mut() {
+        if let Some(repo) = config
+            .repos
+            .iter()
+            .find(|repo| repo.name == database.name())
+        {
+            let servers = config.resolve_servers(repo, &arch)?;
+            configured.push((database, servers));
         }
     }
-
-    for db in alpm.syncdbs_mut() {
-        let db_name = db.name();
-        for server in &servers {
-            let url = server.replace("$repo", db_name).replace("$arch", &arch);
-            if let Err(e) = db.add_server(url.clone()) {
-                tracing::debug!(
-                    "Failed to add server '{}' to repo '{db_name}': {e}",
-                    crate::core::http::redact_url(&url)
-                );
-            }
-        }
+    for (database, servers) in configured {
+        database
+            .set_servers(servers.iter().map(String::as_str))
+            .with_context(|| {
+                format!("Failed to set mirrors for repository '{}'", database.name())
+            })?;
     }
     ensure_mirror_servers(alpm)
 }
@@ -4721,29 +4672,21 @@ mod tests {
     }
 
     #[test]
-    fn fallback_mirrorlist_substitutes_running_architecture_and_repository() -> anyhow::Result<()> {
-        const NAME: &str = "package_managers::alpm_ops::tests::fallback_mirrorlist_substitutes_running_architecture_and_repository";
-        if crate::core::testing::run_isolated_test(NAME)
-            || crate::config::Settings::rerun_test_unprivileged(NAME)
-        {
-            return Ok(());
-        }
+    fn transaction_mirrors_use_the_loaded_configuration_snapshot() -> anyhow::Result<()> {
         let fixture = RepositoryFixture::new()?;
-        let conf = fixture.directory.path().join("missing-pacman.conf");
+        let conf = fixture.directory.path().join("pacman.conf");
         let mirrorlist = fixture.directory.path().join("mirrorlist");
+        std::fs::write(&conf, "[core]\nInclude = mirrorlist\n")?;
         std::fs::write(
             &mirrorlist,
             "Server = https://mirror.example/$repo/os/$arch\n",
         )?;
+        let config = crate::core::pacman_conf::PacmanConfig::parse(&conf)?;
+        std::fs::remove_file(&conf)?;
+        std::fs::remove_file(&mirrorlist)?;
         let mut alpm = fixture.open();
         alpm.register_syncdb("core", alpm::SigLevel::NONE)?;
-        temp_env::with_vars(
-            [
-                ("OMG_PACMAN_CONF", Some(conf.as_os_str())),
-                ("OMG_PACMAN_MIRRORLIST", Some(mirrorlist.as_os_str())),
-            ],
-            || super::configure_mirrors(&mut alpm),
-        )?;
+        super::configure_mirrors(&mut alpm, &config)?;
         let kernel = nix::sys::utsname::uname()?;
         let expected = format!(
             "https://mirror.example/core/os/{}",
@@ -4992,9 +4935,14 @@ mod tests {
         .expect("open the private mirror fixture database");
         alpm.register_syncdb_mut("core", alpm::SigLevel::NONE)?;
         assert!(ensure_mirror_servers(&alpm).is_err());
-        temp_env::with_var("OMG_PACMAN_CONF", Some(&configuration), || {
-            super::configure_mirrors(&mut alpm)
-        })?;
+        alpm.syncdbs_mut()
+            .into_iter()
+            .next()
+            .expect("registered core database")
+            .add_server("https://previous.example/core")?;
+        let config = crate::core::pacman_conf::PacmanConfig::parse(&configuration)?;
+        super::configure_mirrors(&mut alpm, &config)?;
+        super::configure_mirrors(&mut alpm, &config)?;
 
         let databases: Vec<_> = alpm.syncdbs().into_iter().collect();
         assert_eq!(
