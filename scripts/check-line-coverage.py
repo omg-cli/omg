@@ -1916,6 +1916,60 @@ def format_only_context_prefix(code, start, end):
     return True
 
 
+def guarded_context_scope(source, inventory, function, callback, work):
+    """Bind a diagnostic callback to its unchanged local input and enclosing guard."""
+    code, constructs, _, statements, *_ = inventory
+    opening = callback['opening']
+    call = code.parents[opening]
+    if call is None or call < 2:
+        return None
+    guard = code.parents[call]
+    end = callback['end']
+    if (guard is None or code.parents[guard] != function['opening']
+            or code.words[call - 2:opening] != ['.', 'with_context', '(', '||']
+            or code.pairs[call] != end + 1
+            or code.pairs[guard] != end + 4
+            or code.words[end + 1:end + 4] != [')', '?', ';']):
+        return None
+    _construct_charge(work, len(constructs))
+    guards = [row for row in constructs if row['opening'] == guard]
+    if len(guards) != 1:
+        return None
+    row = guards[0]
+    header = ' '.join(row['header'])
+    names = re.fullmatch(r'for ([A-Za-z_]\w*) in & ([A-Za-z_]\w*)', header, re.ASCII)
+    if names is None:
+        names = re.fullmatch(r'if let Some \( ([A-Za-z_]\w*) \) = ([A-Za-z_]\w*) \. parent \( \)',
+                             header, re.ASCII)
+    if names is None:
+        return None
+    binding, local = names.groups()
+    callee = code.words[guard + 1:call - 2]
+    if (callee[-3:] != ['(', binding, ')']
+            or re.fullmatch(r'[A-Za-z_]\w*( :: [A-Za-z_]\w*)*', ' '.join(callee[:-3]), re.ASCII) is None):
+        return None
+    semicolon = row['first'] - 1
+    line = code.position(code.starts[semicolon])[0]
+    previous = statements.get(line, ())
+    _construct_charge(work, len(previous))
+    declarations = [item for item in previous if item['end'] == semicolon
+                    and code.parents[item['first']] == function['opening']
+                    and code.words[item['first']:item['first'] + 3] == ['let', local, '=']]
+    if len(declarations) != 1:
+        return None
+    start = declarations[0]['first']
+    stop = code.pairs[guard]
+    _construct_charge(work, stop - start + 1)
+    if (any(word in ('#', '!') for word in code.words[start:opening])
+            or not format_only_context_prefix(code, guard + 1, stop)):
+        return None
+    first = code.position(code.starts[start])[0]
+    last = code.position(code.ends[stop])[0]
+    text = tuple(source[first - 1:last])
+    _construct_charge(work, sum(map(len, text)))
+    return first, last, text
+
+
 def zero_arg_callback_fragment(source, group, owners, name_counts, first, last, inventory, work,
                                *, caller_entry=False, single_binding=False, phase_cache=None,
                                environment_test=False, expansions=None):
@@ -2025,12 +2079,21 @@ def zero_arg_callback_fragment(source, group, owners, name_counts, first, last, 
         return None
     result_context = None if caller_entry or single_binding or environment_test else result_context_binding(
         code, function, callback, argument, work)
+    guarded_context = None
+    if (not (caller_entry or single_binding or environment_test or result_context)
+            and expansions in ([], ())):
+        key = ('guarded-context', id(code), callback['opening'])
+        if key not in cache:
+            cache[key] = guarded_context_scope(source, inventory, function, callback, work)
+        guarded_context = cache[key]
     if caller_entry:
         _construct_charge(work, 2 * (len(code.starts).bit_length() + 1))
         start = bisect.bisect_left(code.starts, code.offsets[first - 1])
         prefix = tuple(code.words[start:callback['opening'] + 1])
     elif result_context is not None:
         prefix = result_context.prefix
+    elif guarded_context is not None:
+        prefix = ()
     else:
         prefix = tuple(code.words[function['opening'] + 1:callback['opening']])
     _construct_charge(work, len(prefix) + len(header))
@@ -2118,12 +2181,13 @@ def zero_arg_callback_fragment(source, group, owners, name_counts, first, last, 
                 or not 0 <= child['count'] < COUNTER_LIMIT
                 or len(entries) != 1 or entries[0][4] != child['count']):
             return None
-        if environment_test and any(owner.get('branches') or owner.get('mcdc_records')
-                                    for owner in (parent,child)):
+        if (environment_test or guarded_context is not None) and any(
+                owner.get('branches') or owner.get('mcdc_records') for owner in (parent, child)):
             return None
         children_bound.add(id(child)); bound.add(id(child)); identities.append(shape.identity)
         parent_geometry, parent_states = fragment_region_states(parent, first, last, source, work)
         child_geometry, child_states = fragment_region_states(child, first, last, source, work)
+        complete_child, complete_states = (), ()
         if caller_entry:
             context_geometry, context_states = (), ()
             _construct_charge(work, len(parent['regions']) + len(child['regions']))
@@ -2133,6 +2197,13 @@ def zero_arg_callback_fragment(source, group, owners, name_counts, first, last, 
                     or len(entries[0]) != 8 or list(entries[0][5:]) != [0, 0, 0]
                     or any(owner_covers_lines([row], first, first) and row is not entries[0]
                            for row in child['regions'])):
+                return None
+        elif guarded_context is not None:
+            lo, hi, _ = guarded_context
+            context_geometry, context_states = fragment_region_states(parent, lo, hi, source, work)
+            complete_child, complete_states = fragment_region_states(child, lo, hi, source, work)
+            if not context_geometry or not complete_child or any(
+                    row[4:] != (0, 0, 0) for row in (*context_geometry, *complete_child)):
                 return None
         else:
             context_geometry, context_states = fragment_region_states(parent, group[0], opening[0], source, work)
@@ -2165,9 +2236,10 @@ def zero_arg_callback_fragment(source, group, owners, name_counts, first, last, 
         if assertion_slot is not None and (parent_geometry or child_geometry!=(
                 (0,assertion_slot[1],0,assertion_slot[3],0,0,0),)):
             return None
-        geometries.append((parent_geometry, child_geometry, context_geometry))
+        geometries.append((parent_geometry, child_geometry, context_geometry, *(
+            (complete_child,) if guarded_context is not None else ())))
         states.append((int(parent['count'] > 0), int(child['count'] > 0),
-                       *context_states, *parent_states, *child_states))
+                       *context_states, *complete_states, *parent_states, *child_states))
         _construct_charge(work, (last - first + 1) * (len(parent['regions']) + len(child['regions'])))
         line_states.append(tuple(int(any(row[4] > 0 and owner_covers_lines([row], line, line)
             for owner in (parent, child) for row in owner['regions'])) for line in range(first, last + 1)))
@@ -2175,6 +2247,7 @@ def zero_arg_callback_fragment(source, group, owners, name_counts, first, last, 
                               parent_entry=int(parent['count'] > 0), child_entry=int(child['count'] > 0)))
     if len(set(identities)) != 1 or len(set(geometries)) != 1:
         return None
+    scope_start, scope_end = guarded_context[:2] if guarded_context is not None else (first, last)
     if phase_cache is not None:
         footprint_key = ('owner-line-footprints', id(owners))
         if footprint_key not in phase_cache:
@@ -2188,19 +2261,22 @@ def zero_arg_callback_fragment(source, group, owners, name_counts, first, last, 
                             footprint.setdefault(line,set()).add(id(owner))
             phase_cache[footprint_key] = footprint
         footprint = phase_cache[footprint_key]
-        _construct_charge(work,last-first+1+sum(len(footprint.get(line,())) for line in range(first,last+1)))
-        if any(footprint.get(line,set()) - bound for line in range(first,last+1)):
+        _construct_charge(work, scope_end - scope_start + 1 + sum(
+            len(footprint.get(line, ())) for line in range(scope_start, scope_end + 1)))
+        if any(footprint.get(line, set()) - bound for line in range(scope_start, scope_end + 1)):
             return None
     else:
-        _construct_charge(work, sum(len(owner['regions']) for owner in owners) * (last - first + 1))
+        _construct_charge(work, sum(len(owner['regions']) for owner in owners) * (scope_end - scope_start + 1))
         if any(id(owner) not in bound and any(owner_covers_lines([row], line, line)
-               for row in owner['regions'] for line in range(first, last + 1)) for owner in owners):
+               for row in owner['regions'] for line in range(scope_start, scope_end + 1)) for owner in owners):
             return None
     kind = 'zero-arg-callback-call-entry' if caller_entry else 'zero-arg-callback-fragment'
     if single_binding:
         kind = 'single-bound-callback-entry' if entry_only else 'single-bound-callback-fragment'
     if result_context is not None:
         kind = 'result-context-callback-fragment'
+    if guarded_context is not None:
+        kind = 'guarded-context-callback-fragment'
     signature = (kind, identities[0], tuple(header), prefix, geometries[0])
     if result_context is not None:
         if len(child_roles) != 1:
@@ -2210,10 +2286,12 @@ def zero_arg_callback_fragment(source, group, owners, name_counts, first, last, 
         signature += (tuple(control), fragment_tokens)
     if caller_entry:
         signature += (caller_scope,)
+    if guarded_context is not None:
+        signature += (guarded_context[2],)
+    complete_signature = caller_entry or single_binding or result_context is not None or guarded_context is not None
     witness = dict(kind=kind, owners=witnesses,
         callback_span=[list(opening), list(closing)],
-        context_sha256=hashlib.sha256(repr(signature if caller_entry or single_binding or result_context is not None
-                                           else signature[:-1]).encode()).hexdigest(),
+        context_sha256=hashlib.sha256(repr(signature if complete_signature else signature[:-1]).encode()).hexdigest(),
         parent_geometry=[list(row) for row in geometries[0][0]],
         child_geometry=[list(row) for row in geometries[0][1]],
         parent_context_geometry=[list(row) for row in geometries[0][2]],
@@ -2223,6 +2301,9 @@ def zero_arg_callback_fragment(source, group, owners, name_counts, first, last, 
         witness['parent_entry_slots'] = entry_slots
     if result_context is not None:
         witness['result_binding'] = result_context.binding
+    if guarded_context is not None:
+        witness['guarded_context_lines'] = list(guarded_context[:2])
+        witness['guarded_child_geometry'] = [list(row) for row in geometries[0][3]]
     return CallbackFragmentEvidence(tuple(states), tuple(line_states), signature, witness)
 
 

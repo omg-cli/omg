@@ -7818,6 +7818,67 @@ class SourceAwareCoverageTests(unittest.TestCase):
             with self.subTest(diagnostic=diagnostic, expansions=expansions):
                 self.assertIsNone(self.callback_after_diagnostic_observation(diagnostic, expansions=expansions))
 
+    def guarded_context_observation(self, side, *, optional=False, fault=None):
+        prelude = ['    resolve().with_context(|| format!("unavailable"))?;'] if side else []
+        guard = 'if let Some(path) = paths.parent()' if optional else 'for path in &paths'
+        initializer = 'alternate()?' if fault == 'changed-initializer' else 'configured()?'
+        diagnostic = '"changed"' if fault == 'changed-diagnostic' else '"missing"'
+        source = [
+            'fn verify() -> Result<()> {', *prelude,
+            f'    let paths = {initializer};',
+            f'    {guard} {{',
+            '        fs::create(path).with_context(|| {',
+            f'            format!({diagnostic})',
+            '        })?;',
+            '    }',
+            '    Ok(())',
+            '}',
+        ]
+        anchor = len(prelude) + 2
+        call = anchor + 2
+        opening = source[call - 1].index('{') + 1
+        def region(line, start, end, count=1):
+            return [line, start, line, end, count, 0, 0, 0]
+        parents, children = [], []
+        for copy in range(2):
+            name = f'_RNvNtCs{side * 2 + copy + 1}_7omg_lib7example6verify'
+            parent = dict(name=name, filenames=['/src/example.rs'], count=1, regions=[
+                region(1, 1, source[0].index('{') + 1), region(anchor, 9, 14),
+                region(anchor + 1, 5, 9, int(fault != 'lost-guard')),
+                region(call, 9, opening), region(len(source), 1, 2),
+            ])
+            parents.append(parent)
+            if fault == 'missing-cold-copy' and copy == 0:
+                continue
+            role = 's_0B5_' if side else '0B5_'
+            children.append(dict(name='_RNC' + name[2:] + role, filenames=parent['filenames'],
+                count=copy, regions=[region(call, opening, opening + 1, copy),
+                    region(call + 1, 13, len(source[call]) + 1, copy),
+                    region(call + 2, 9, 10, copy)]))
+        owners = parents + children
+        if fault == 'foreign-copy':
+            owners.append(dict(name='foreign', filenames=['/src/example.rs'], count=1,
+                               regions=[region(call, 9, 10)]))
+        return coverage.zero_arg_callback_fragment(
+            source, (1, len(source), parents), owners, Counter(owner['name'] for owner in owners),
+            call, call, coverage._construct_inventory(source, [1_000_000]), [1_000_000],
+            expansions=['unsupported'] if fault == 'macro-expansion' else [])
+
+    def test_guarded_context_retains_compiled_execution_after_earlier_validation(self):
+        for optional in (False, True):
+            with self.subTest(optional=optional):
+                old = self.guarded_context_observation(0, optional=optional)
+                new = self.guarded_context_observation(1, optional=optional)
+                self.assertIsNotNone(new, 'an earlier validation changed the callback ordinal')
+                self.assertEqual(old.signature, new.signature)
+                self.assertEqual(old.states, new.states)
+                for fault in ('changed-initializer', 'changed-diagnostic', 'lost-guard', 'missing-cold-copy',
+                              'foreign-copy', 'macro-expansion'):
+                    with self.subTest(fault=fault):
+                        changed = self.guarded_context_observation(1, optional=optional, fault=fault)
+                        self.assertTrue(changed is None or (changed.signature, changed.states)
+                                        != (old.signature, old.states))
+
     def compare(self, before=None, after=None, mutate=None, sources=None, filename="example.rs"):
         default_before, default_after = self.fixture()
         before = default_before if before is None else before
