@@ -388,6 +388,115 @@ class MetadataPublicationCoverageTests(unittest.TestCase):
 
 
 class AurArchiveCaptureCoverageTests(unittest.TestCase):
+    def test_package_base_lock_keeps_the_worker_and_blocking_lock(self):
+        filename = 'src/package_managers/aur/client.rs'
+        files = {'/artifact/' + filename: filename}
+        for fault in (None, 'unowned-path', 'nonblocking-lock', 'cold-lock'):
+            with self.subTest(fault=fault):
+                work = [coverage.SOURCE_CONSTRUCT_WORK_CAPACITY]
+                sides, indexes, locks = [], [], []
+                for side in range(2):
+                    header = '    async fn acquire_package_base_file_lock(&self, package_base: &str) -> Result<File> {'
+                    source = ['impl AurClient {', header, '        let lock_dir = self.build_dir.join("_locks");',
+                              '        create_dir_as_user(&lock_dir).await?;',
+                              '        let lock_path = lock_dir.join(format!("{package_base}.lock"));',
+                              '        self.blocking_build_work(move || -> Result<File> {']
+                    if side:
+                        source.append('            let file = super::utils::open_effective_user_lock(&lock_path)?;'
+                                      if fault != 'unowned-path' else '            let file = File::open(&lock_path)?;')
+                    else:
+                        source.extend(['            let file = std::fs::OpenOptions::new()', '                .create(true)',
+                                       '                .read(true)', '                .write(true)', '                .truncate(false)',
+                                       '                .open(&lock_path)', '                .with_context(|| {',
+                                       '                    format!("Failed to open AUR build lock {}", lock_path.display())',
+                                       '                })?;'])
+                    lock = len(source) + 1
+                    locks.append(lock)
+                    trigger = 'try_lock' if side and fault == 'nonblocking-lock' else 'lock'
+                    source.extend([f'            file.{trigger}().with_context(|| {{',
+                                   '                format!("Failed to acquire AUR build lock {}", lock_path.display())',
+                                   '            })?;', '            Ok(file)', '        })',
+                                   '        .await', '        .context("AUR build lock worker failed")', '    }', '}'])
+                    root = (f'NvMs2_NtNtNtCs{side + 1}_7omg_lib16package_managers3aur6clientNtB5_'
+                            '9AurClient30acquire_package_base_file_lock')
+                    future = root.replace('NtB5_', 'NtB7_')
+                    worker = root.replace('NtB5_', 'NtB9_')
+                    diagnostic = root.replace('NtB5_', 'NtBb_')
+                    future_lines = (3, 4, 5, 6, lock + 5, lock + 6)
+                    worker_lines = (6, lock, lock + 2, lock + 3, lock + 4)
+                    owners = [dict(name='_R' + root, count=1, filenames=list(files),
+                                   regions=[[2, 5, 2, len(header) - 1, 1, 0, 0, 0]]),
+                              dict(name='_RNC' + future + '0Bd_', count=1, filenames=list(files),
+                                   regions=[[line, 10, line, 15, 1, 0, 0, 0] for line in future_lines]),
+                              dict(name='_RNCNC' + worker + '00Bf_', count=1, filenames=list(files),
+                                   regions=[[line, 14, line, 15, int(not (side and line == lock and fault == 'cold-lock')),
+                                             0, 0, 0] for line in worker_lines]),
+                              dict(name='_RNCNCNC' + diagnostic + ('000Bh_' if side else '00s_0Bh_'),
+                                   count=0, filenames=list(files), regions=[
+                                       [lock, 41, lock, 42, 0, 0, 0, 0],
+                                       [lock + 1, 17, lock + 1, 24, 0, 0, 0, 0],
+                                       [lock + 2, 13, lock + 2, 14, 0, 0, 0, 0]])]
+                    counts = dict.fromkeys(future_lines + worker_lines, 1)
+                    sides.append((source, coverage._construct_inventory(source, work), counts))
+                    indexes.append(coverage.index_compiled_owner_sources(owners, files, work, {filename}))
+                proof = coverage.retained_aur_package_lock_worker(filename, sides, indexes, work)
+                if fault is None:
+                    self.assertIsNotNone(proof)
+                    self.assertIn(locks, proof['pairs'])
+                else:
+                    self.assertIsNone(proof)
+
+    def test_lifecycle_lease_preserves_the_blocking_worker_and_wait(self):
+        filename = 'src/package_managers/aur/client.rs'
+        files = {'/artifact/' + filename: filename}
+        for fault in (None, 'moved-to-async-worker', 'dropped-await', 'foreign-worker', 'cold-worker'):
+            with self.subTest(fault=fault):
+                work = [coverage.SOURCE_CONSTRUCT_WORK_CAPACITY]
+                sides, indexes, awaits = [], [], []
+                for side in range(2):
+                    output = 'BuildLifecycleLease' if side else 'File'
+                    worker = 'spawn' if side and fault == 'moved-to-async-worker' else 'spawn_blocking'
+                    source = ['impl AurClient {', f'    async fn acquire_build_lifecycle(&self) -> Result<{output}> {{',
+                              '        let client = self.clone();', f'        tokio::task::{worker}(move || {{',
+                              '            let file = client.open_lifecycle_lock()?;']
+                    if side:
+                        source.append('            BuildLifecycleLease::try_shared(file)')
+                    else:
+                        source.append('            file.try_lock_shared()')
+                    source.append('                .context("Failed to acquire AUR build ownership; cleanup may be active")' + ('' if side else '?;'))
+                    if not side:
+                        source.append('            Ok(file)')
+                    source.append('        })')
+                    closed = len(source)
+                    source.extend(['        .wait' if side and fault == 'dropped-await' else '        .await',
+                                   '        .context("AUR lifecycle lock worker failed")?', '    }', '}'])
+                    awaits.append(closed + 1)
+                    root = f'NvMs2_NtNtNtCs{side + 1}_7omg_lib16package_managers3aur6clientNtB5_9AurClient23acquire_build_lifecycle'
+                    future = root.replace('NtB5_', 'NtB7_')
+                    bounded = root.replace('NtB5_', 'NtB9_')
+                    if side and fault == 'foreign-worker':
+                        bounded = bounded.replace('23acquire_build_lifecycle', '15inspect_fixture')
+                    start = source[3].index('{') + 1
+                    hits = 0 if side and fault == 'cold-worker' else 1
+                    owners = [dict(name='_R' + root, count=1, filenames=list(files),
+                                   regions=[[2, 5, 2, len(source[1]) - 1, 1, 0, 0, 0]]),
+                              dict(name='_RNC' + future + '0Bd_', count=1, filenames=list(files),
+                                   regions=[[3, 13, 3, 19, 1, 0, 0, 0], [4, 9, 4, 36, 1, 0, 0, 0],
+                                            [closed + 1, 10, closed + 1, 15, 1, 0, 0, 0],
+                                            [closed + 2, 10, closed + 2, 17, 1, 0, 0, 0]]),
+                              dict(name='_RNCNC' + bounded + '00Bf_', count=hits, filenames=list(files),
+                                   regions=[[4, start, 4, start + 1, hits, 0, 0, 0], [5, 17, 5, 21, hits, 0, 0, 0],
+                                            [closed, 9, closed, 10, hits, 0, 0, 0]])]
+                    counts = dict.fromkeys((3, 4, 5, closed, closed + 1, closed + 2), 1)
+                    sides.append((source, coverage._construct_inventory(source, work), counts))
+                    indexes.append(coverage.index_compiled_owner_sources(owners, files, work, {filename}))
+                proof = coverage.retained_aur_lifecycle_worker(filename, sides, indexes, work)
+                if fault is None:
+                    self.assertIsNotNone(proof)
+                    self.assertIn(awaits, proof['pairs'])
+                else:
+                    self.assertIsNone(proof)
+
     def test_private_fixture_encoder_preserves_the_covered_archive_construction(self):
         filename = 'src/package_managers/aur/client.rs'
         files = {'/artifact/' + filename: filename}
@@ -574,7 +683,8 @@ class PacmanFixtureCoverageTests(unittest.TestCase):
     def test_foreign_inventory_reads_both_catalogs_under_the_epoch_guard(self):
         filename = 'src/package_managers/pacman_db/db.rs'
         files = {'/artifact/' + filename: filename}
-        for fault in (None, 'missing-guard', 'different-directory', 'cold-copy'):
+        for fault in (None, 'missing-guard', 'different-directory', 'cold-copy',
+                      'different-reservation', 'unchecked-return'):
             with self.subTest(fault=fault):
                 work = [coverage.SOURCE_CONSTRUCT_WORK_CAPACITY]
                 sides, indexes, starts = [], [], []
@@ -591,8 +701,27 @@ class PacmanFixtureCoverageTests(unittest.TestCase):
                     source.extend([f'    let sync_dir = paths::{cache_path}()?;', '    let local_dir = paths::pacman_local_dir_result()?;',
                                    '', '    ensure_sync_cache_loaded(&sync_dir)?;', '    ensure_local_cache_loaded(&local_dir)?;',
                                    '', '    let sync_cache = read_lock(&SYNC_DB_CACHE);',
-                                   '    let local_cache = read_lock(&LOCAL_DB_CACHE);', '    Ok(result)', '}'])
-                    lines = [start + offset for offset in (0, 1, 3, 4, 6, 7)]
+                                   '    let local_cache = read_lock(&LOCAL_DB_CACHE);', ''])
+                    if side:
+                        source.append('    let sync_packages = sync_cache.select(RepoUsage::ALL)?;')
+                    reserve = len(source) + 1
+                    fraction = 20 if side and fault == 'different-reservation' else 10
+                    source.append(f'    let mut potential = Vec::with_capacity(local_cache.packages.len() / {fraction});')
+                    source.extend(['    for package in local_cache.packages.values() {',
+                                   '        if !sync_packages.contains_key(package.name.as_str()) {',
+                                   '            potential.push(package.clone());'] if side else [
+                                   '    for name in local_cache.packages.keys() {',
+                                   '        if !sync_cache.packages.contains_key(name) {',
+                                   '            potential.push(name.clone());'])
+                    source.extend(['        }', '    }', ''])
+                    if side and fault != 'unchecked-return':
+                        source.extend(['    anyhow::ensure!(', '        before == AlpmCatalogEpoch::observe()?,',
+                                       '        "Package catalogs changed while classifying foreign packages; retry the operation"',
+                                       '    );'])
+                    finished = len(source) + 1
+                    source.extend(['    Ok(potential)', '}'])
+                    lines = [*[start + offset for offset in (0, 1, 3, 4, 6, 7)], reserve, finished]
+                    starts[-1] = lines
                     owners = []
                     for copy in range(2):
                         count = 0 if side and copy and fault == 'cold-copy' else 1
@@ -605,7 +734,7 @@ class PacmanFixtureCoverageTests(unittest.TestCase):
                 proof = coverage.retained_pacman_foreign_catalog_reads(filename, sides, indexes, work)
                 if fault is None:
                     self.assertIsNotNone(proof)
-                    self.assertEqual(proof['pairs'], [[old + delta for old in starts] for delta in (0, 1, 3, 4, 6, 7)])
+                    self.assertEqual(proof['pairs'], [list(pair) for pair in zip(*starts, strict=True)])
                 else:
                     self.assertIsNone(proof)
 
@@ -2426,6 +2555,8 @@ class RetainedAurHookRenderingTests(unittest.TestCase):
             with self.subTest(fault=fault):
                 sides, indexes = [], []
                 work = [coverage.SOURCE_CONSTRUCT_WORK_CAPACITY]
+                map_lines = []
+                lookup_lines = []
                 for side in range(2):
                     label = 'display_name' if side else 'name'
                     input_bytes = 'different_bytes' if side and fault == 'rebound-text' else 'bytes'
@@ -2456,6 +2587,11 @@ class RetainedAurHookRenderingTests(unittest.TestCase):
                         '        .collect()',
                         '}',
                     ]
+                    map_line = source.index('        .map(|name| {') + 1
+                    map_lines.append(map_line)
+                    lookup_tokens = ('let bytes = source', 'anyhow::ensure!', 'bytes.len()', 'let text = std')
+                    lookup = [next(i for i, text in enumerate(source, 1) if token in text) for token in lookup_tokens]
+                    lookup_lines.append(lookup)
                     line = source.index('            let contents = text') + 1
                     owners = []
                     for copy in range(2):
@@ -2472,8 +2608,10 @@ class RetainedAurHookRenderingTests(unittest.TestCase):
                         if side and fault == 'foreign-root-coverage' and copy == 0:
                             owners.append(owner('foreign', completion, 1))
                             completion = []
-                        owners.append(owner(root, [raw(1, 'fn', 1), *completion], 1))
-                        owners.append(owner(outer, [raw(line, 'contents', entries), raw(line, 'text', entries),
+                        owners.append(owner(root, [raw(1, 'fn', 1), raw(map_line, 'map', 1), *completion], 1))
+                        owners.append(owner(outer, [raw(map_line, '{', entries),
+                            *[raw(n, token, entries) for n, token in zip(lookup, lookup_tokens, strict=True)],
+                            raw(line, 'contents', entries), raw(line, 'text', entries),
                             raw(line + 1, 'chars', entries), raw(line + 2, 'map', entries),
                             raw(line + 5, 'collect', entries), raw(line + 6, 'Ok((name, contents))', entries),
                             raw(line + 7, '}', entries)], entries))
@@ -2488,11 +2626,16 @@ class RetainedAurHookRenderingTests(unittest.TestCase):
                     sides.append((source, coverage._construct_inventory(source, work), counts, line))
                     indexes.append(coverage.index_compiled_owner_sources(owners, files, work, {filename}))
                 proof = coverage.retained_callback_statement(filename, sides, indexes, work)
+                entry = coverage.retained_aur_hook_preview_map(filename, [side[:3] for side in sides], indexes, work)
                 if fault is None:
                     self.assertIsNotNone(proof)
                     self.assertEqual(proof['pairs'], [[line, line + 1] for line in range(13, 23)])
+                    self.assertIsNotNone(entry)
+                    self.assertIn(map_lines, entry['pairs'])
+                    self.assertTrue(all(list(pair) in entry['pairs'] for pair in zip(*lookup_lines, strict=True)))
                 else:
                     self.assertIsNone(proof)
+                    self.assertIsNone(entry)
 
 
 class RetainedRustRelationCoverageTests(unittest.TestCase):

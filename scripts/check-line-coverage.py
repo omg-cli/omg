@@ -14681,10 +14681,12 @@ def retained_pacman_pattern_matcher(name, sides, indexes, work):
 
 
 def retained_pacman_foreign_catalog_reads(name, sides, indexes, work):
-    """Observe the same catalog reads and locks inside the epoch-checked inventory."""
+    """Observe catalog reads, allocation and return inside the epoch-checked inventory."""
     reads = ['    let sync_dir = paths::pacman_sync_dir_result()?;', '    let local_dir = paths::pacman_local_dir_result()?;',
              '', '    ensure_sync_cache_loaded(&sync_dir)?;', '    ensure_local_cache_loaded(&local_dir)?;', '',
-             '    let sync_cache = read_lock(&SYNC_DB_CACHE);', '    let local_cache = read_lock(&LOCAL_DB_CACHE);']
+             '    let sync_cache = read_lock(&SYNC_DB_CACHE);', '    let local_cache = read_lock(&LOCAL_DB_CACHE);', '']
+    reserve = '    let mut potential = Vec::with_capacity(local_cache.packages.len() / 10);'
+    finish = '    Ok(potential)'
     observations = []
     for modern, ((source, inventory, counts), index) in enumerate(zip(sides, indexes, strict=True)):
         declaration = 'get_potential_aur_package_records' if modern else 'get_potential_aur_packages'
@@ -14699,17 +14701,32 @@ def retained_pacman_foreign_catalog_reads(name, sides, indexes, work):
             return None
         function, = matches
         first = code.region(function['first'], function['first'])[0]
-        if source[first - 1:first + len(guard) + len(reads)] != [header, *guard, *reads]:
+        last = code.region(function['end'], function['end'])[0]
+        select = ['    let sync_packages = sync_cache.select(RepoUsage::ALL)?;'] if modern else []
+        collect = (['    for package in local_cache.packages.values() {',
+                    '        if !sync_packages.contains_key(package.name.as_str()) {',
+                    '            potential.push(package.clone());'] if modern else [
+                    '    for name in local_cache.packages.keys() {',
+                    '        if !sync_cache.packages.contains_key(name) {',
+                    '            potential.push(name.clone());'])
+        verify = (['    anyhow::ensure!(', '        before == AlpmCatalogEpoch::observe()?,',
+                   '        "Package catalogs changed while classifying foreign packages; retry the operation"',
+                   '    );'] if modern else [])
+        expected = [header, *guard, *reads, *select, reserve, *collect, '        }', '    }', '',
+                    *verify, finish, '}']
+        if source[first - 1:last] != expected:
             return None
         start = first + len(guard) + 1
-        selected = tuple(start + i for i, text in enumerate(reads) if text)
-        stop = selected[-1]
+        selected = (*(start + i for i, line in enumerate(reads) if line),
+                    start + len(reads) + len(select), last - 1)
+        positions = {line: offset for offset, line in enumerate(selected)}
         owners = index.inventories.get(name, ())
-        _construct_charge(work, sum(len(owner['name']) + len(owner['regions']) + 1 for owner in owners))
+        _construct_charge(work, sum(len(owner['name']) + 4 * len(owner['regions']) + 1 for owner in owners))
         layouts = set(); states = []; witnesses = []; projection = Counter()
         for owner in owners:
             symbol = owner['name']
-            raw = [r for r in owner['regions'] if r[0] <= stop and start <= r[2]]
+            raw = [r for r in owner['regions'] if (at := bisect.bisect_left(selected, r[0])) < len(selected)
+                   and selected[at] <= r[2]]
             shape = plain_rust_function_symbol(symbol) if declaration in symbol else None
             qualified = shape is not None and shape.identifiers == (
                 'omg_lib', 'package_managers', 'pacman_db', 'db', declaration)
@@ -14718,11 +14735,11 @@ def retained_pacman_foreign_catalog_reads(name, sides, indexes, work):
             if (not qualified or not raw or index.name_counts[symbol] != 1 or owner.get('branches')
                     or owner.get('mcdc_records') or len(owner['filenames']) != 1
                     or index.files.get(owner['filenames'][0]) != name or not 0 <= owner['count'] < COUNTER_LIMIT
-                    or any(not start <= r[0] <= r[2] <= stop or r[5:] != [0, 0, 0]
+                    or any(r[0] != r[2] or r[5:] != [0, 0, 0]
                            or not 0 <= r[4] <= owner['count'] for r in raw)):
                 return None
             _construct_charge(work, len(raw))
-            layouts.add(tuple((r[0] - start, r[1], r[2] - start, r[3]) for r in raw))
+            layouts.add(tuple((positions[r[0]], r[1], r[3]) for r in raw))
             states.append(tuple(int(r[4] > 0) for r in raw))
             projection.update(_owner_line_counts({'regions': raw}, _ObserverWork(work)))
             witnesses.append(symbol)
@@ -15171,7 +15188,7 @@ def retained_aur_srcinfo_version(sides, indexes, work):
                 summary_credit=[0, 0], mapped_credit=[0, 0], instance_matching=matching)
 
 
-def retained_aur_hook_rendering(name, sides, indexes, work):
+def retained_aur_hook_rendering(name, sides, indexes, work, *, include_map=False):
     """Observe hook text rendering after the same bounded UTF-8 read."""
     function_name = 'declared_install_hook_previews'
     scope = ('omg_lib', 'package_managers', 'aur', 'client', function_name)
@@ -15251,6 +15268,23 @@ def retained_aur_hook_rendering(name, sides, indexes, work):
             return None
         entries = []
         projection = []
+        map_projection = []
+        lookup_projection = []
+        if include_map:
+            map_slots = (code.region(call - 1, call - 1), code.region(closure, closure))
+            map_line = map_slots[0][0]
+            read_start = closure + 1 + (len(diagnostic) if label == 'display_name' else 0)
+            read_range = code.region(read_start, read_start + setup.index('with_context') - 2)
+            lookup = (*range(read_range[0], read_range[2] + 1), *(code.region(read_start + at, read_start + at)[0]
+                        for at in (setup.index('anyhow'), setup.index('len'), setup.index('text') - 1)))
+            positions = {number: offset for offset, number in enumerate(lookup)}
+            _construct_charge(work, sum(len(owner['regions']) * (len(lookup) + 1) + 1 for owner in owners))
+            map_owners = {owner['name']: (owner['count'], raw) for owner in owners if (raw := [
+                r for r in owner['regions'] if r[0] <= map_line <= r[2]])}
+            lookup_owners = {owner['name']: (owner['count'], raw) for owner in owners if (raw := [
+                r for r in owner['regions'] if any(r[0] <= n <= r[2] for n in lookup)])}
+            if len(map_owners) != 2 * len(roots) or len(lookup_owners) != len(roots):
+                return None
         function_range = code.region(root_rows[0]['first'], code.pairs[function])[0::2]
         for root, shape in roots:
             span = source_owner_span(root, name, index.files, source)
@@ -15296,9 +15330,35 @@ def retained_aur_hook_rendering(name, sides, indexes, work):
                 del touching[symbol]
             matched.append((root['name'], (), (root['count'] > 0,)))
             entries.append(matched)
+            if include_map:
+                symbols = (root['name'], matched[0][0])
+                for symbol, slot in zip(symbols, map_slots, strict=True):
+                    count, raw = map_owners.pop(symbol, (0, ()))
+                    if raw != [[*slot, count, 0, 0, 0]]:
+                        return None
+                    map_projection.extend(raw)
+                outer = matched[0][0]
+                count, raw = lookup_owners.pop(outer, (0, ()))
+                _construct_charge(work, len(raw))
+                if (not raw or any(r[0] not in positions or r[2] not in positions or r[5:] != [0, 0, 0]
+                                   or not 0 <= r[4] <= count for r in raw)):
+                    return None
+                layout = tuple((positions[r[0]], r[1], positions[r[2]], r[3]) for r in raw)
+                matched.append((outer, ('lookup', layout), tuple(r[4] > 0 for r in raw)))
+                lookup_projection.extend(raw)
         observed = _owner_line_counts({'regions': projection}, _ObserverWork(work))
         if touching or observed != {n: counts[n] for n in range(line, finish + 1) if n in counts}:
             return None
+        if include_map:
+            observed_map = _owner_line_counts({'regions': map_projection}, _ObserverWork(work))
+            if map_owners or not counts.get(map_line, 0) or observed_map != {map_line: counts[map_line]}:
+                return None
+            observed_lookup = _owner_line_counts({'regions': lookup_projection}, _ObserverWork(work))
+            if (lookup_owners or any(n not in counts or observed_lookup.get(n) != counts[n] for n in lookup)
+                    or observed_lookup.keys() != set(lookup)):
+                return None
+            observed.update(observed_map)
+            observed.update(observed_lookup)
         geometry = [tuple(row[1] for row in members) for members in entries]
         if len(set(geometry)) != 1:
             return None
@@ -15314,6 +15374,145 @@ def retained_aur_hook_rendering(name, sides, indexes, work):
                 pairs=[list(pair) for pair in zip(left[0], right[0], strict=True)],
                 copy_states=states, owners=[[list(row[0] for row in members) for members in side[1]]
                                             for side in evidence])
+
+
+def retained_aur_hook_preview_map(name, sides, indexes, work):
+    observed = []
+    for source, inventory, counts in sides:
+        _construct_charge(work, len(source))
+        lines = [line for line, text in enumerate(source, 1) if text == '            let contents = text']
+        if len(lines) != 1:
+            return None
+        observed.append((source, inventory, counts, lines[0]))
+    return retained_aur_hook_rendering(name, observed, indexes, work, include_map=True)
+
+
+def retained_aur_lifecycle_worker(name, sides, indexes, work, *, package_base=False):
+    """Compare the blocking worker and join around a changed AUR lock opener."""
+    prefix = ['        let client = self.clone();',
+              '        tokio::task::spawn_blocking(move || {',
+              '            let file = client.open_lifecycle_lock()?;']
+    diagnostic = '                .context("Failed to acquire AUR build ownership; cleanup may be active")'
+    suffix = ['        })', '        .await', '        .context("AUR lifecycle lock worker failed")?', '    }']
+    declaration = 'acquire_build_lifecycle'
+    arguments = ''
+    if package_base:
+        declaration = 'acquire_package_base_file_lock'
+        arguments = ', package_base: &str'
+        prefix = ['        let lock_dir = self.build_dir.join("_locks");',
+                  '        create_dir_as_user(&lock_dir).await?;',
+                  '        let lock_path = lock_dir.join(format!("{package_base}.lock"));',
+                  '        self.blocking_build_work(move || -> Result<File> {']
+        suffix = ['            file.lock().with_context(|| {',
+                  '                format!("Failed to acquire AUR build lock {}", lock_path.display())',
+                  '            })?;', '            Ok(file)', '        })', '        .await',
+                  '        .context("AUR build lock worker failed")', '    }']
+    observations = []
+    for modern, ((source, inventory, counts), index) in enumerate(zip(sides, indexes, strict=True)):
+        code, rows = inventory[:2]
+        result = 'BuildLifecycleLease' if modern and not package_base else 'File'
+        header = f'async fn {declaration}(&self{arguments}) -> Result<{result}>'
+        signature_args = ' , package_base : & str' if package_base else ''
+        _construct_charge(work, len(rows))
+        methods = [row for row in rows if row['kind'] == 'fn' and row['header'] ==
+                   tuple(f'async fn {declaration} ( & self{signature_args} ) -> Result < {result} >'.split())]
+        if len(methods) != 1:
+            return None
+        method, = methods
+        parent = code.parents[method['opening']]
+        if (parent is None or code.parents[parent] is not None or
+                not any(row['opening'] == parent and row['header'] == ('impl', 'AurClient') for row in rows)):
+            return None
+        start = code.position(code.starts[method['first']])[0]
+        stop = code.position(code.ends[method['end']])[0]
+        lock = (['            BuildLifecycleLease::try_shared(file)', diagnostic] if modern else
+                ['            file.try_lock_shared()', diagnostic + '?;', '            Ok(file)'])
+        if package_base:
+            lock = (['            let file = super::utils::open_effective_user_lock(&lock_path)?;'] if modern else [
+                '            let file = std::fs::OpenOptions::new()', '                .create(true)',
+                '                .read(true)', '                .write(true)', '                .truncate(false)',
+                '                .open(&lock_path)', '                .with_context(|| {',
+                '                    format!("Failed to open AUR build lock {}", lock_path.display())',
+                '                })?;'])
+        expected = ['    ' + header + ' {', *prefix, *lock, *suffix]
+        if source[start - 1:stop] != expected:
+            return None
+        if package_base:
+            future_lines = {*range(start + 1, start + 5), stop - 2, stop - 1}
+            worker_lines = {start + 4, stop - 7, *range(stop - 5, stop - 2)}
+            diagnostic_lines = {stop - 7, stop - 5}
+        else:
+            future_lines = {start + 1, start + 2, stop - 2, stop - 1}
+            worker_lines = {start + 2, start + 3, stop - 3}
+            diagnostic_lines = set()
+        lines = sorted(future_lines | worker_lines)
+        positions = {line: ordinal for ordinal, line in enumerate(lines)}
+        diagnostic_role = ('', '', '' if modern else 's_')
+        roles = ((), ('',), ('', ''), diagnostic_role) if package_base else ((), ('',), ('', ''))
+        copies = {}
+        owners = index.inventories.get(name, ())
+        _construct_charge(work, sum(len(lines).bit_length() * len(owner['regions']) + len(owner['name'])
+                                   for owner in owners))
+        for owner in owners:
+            symbol = owner['name']
+            raw = [r for r in owner['regions'] if (at := bisect.bisect_left(lines, r[0])) < len(lines) and lines[at] <= r[2]]
+            shape = nominal_method_path(symbol) if declaration in symbol else None
+            if (shape is None or shape.kind != 'M' or shape.namespace != _AUR_CLIENT_NAMESPACE
+                    or shape.self_type != ('type', _AUR_CLIENT_NAMESPACE, ('AurClient', ''))
+                    or shape.method != (declaration, '') or shape.callbacks not in roles):
+                if raw:
+                    return None
+                continue
+            phases = copies.setdefault(shape.copy_identity, {})
+            count = owner['count']
+            if (shape.callbacks in phases or index.name_counts[symbol] != 1 or owner.get('branches')
+                    or owner.get('mcdc_records') or len(owner['filenames']) != 1
+                    or index.files.get(owner['filenames'][0]) != name or not 0 <= count < COUNTER_LIMIT
+                    or any(row[0] != row[2] or row[5:] != [0, 0, 0] or not 0 <= row[4] <= count
+                           for row in raw)):
+                return None
+            phases[shape.callbacks] = (symbol, count, raw, owner['regions'])
+        if not 1 <= len(copies) <= 16:
+            return None
+        geometry = set()
+        projections = Counter()
+        states = []
+        symbols = []
+        for phases in copies.values():
+            if set(phases) != set(roles):
+                return None
+            root, future, worker, *diagnostics = (phases[role] for role in roles)
+            if (root[3] != [[start, 5, start, len(expected[0]) - 1, root[1], 0, 0, 0]]
+                    or not worker[1] <= future[1] <= root[1]
+                    or {row[0] for row in future[2]} != future_lines
+                    or {row[0] for row in worker[2]} != worker_lines
+                    or any(part[1] > worker[1] or {row[0] for row in part[2]} != diagnostic_lines
+                           for part in diagnostics)):
+                return None
+            selected = (future, worker, *diagnostics)
+            geometry.add(tuple(tuple((positions[row[0]], row[1], row[3]) for row in part[2])
+                               for part in selected))
+            raw = [row for part in selected for row in part[2]]
+            states.append(tuple(row[4] > 0 for row in raw))
+            projections.update(_owner_line_counts({'regions': raw}, _ObserverWork(work)))
+            symbols.append([part[0] for part in (root, *selected)])
+        live_lines = set(lines) - ({stop - 5} if package_base else set())
+        if (len(geometry) != 1 or set(projections) != set(lines)
+                or any(not projections[line] for line in live_lines)
+                or projections != {line: counts.get(line) for line in lines}):
+            return None
+        observations.append((lines, geometry.pop(), states, symbols))
+    before, after = observations
+    _construct_charge(work, len(before[2]) * len(after[2]) * len(before[2][0]))
+    if before[1] != after[1] or compiled_hit_state_matching(before[2], after[2]) is None:
+        return None
+    return dict(file=name, kind='retained-aur-package-lock-worker' if package_base else 'retained-aur-lifecycle-worker',
+                pairs=[list(pair) for pair in zip(before[0], after[0], strict=True)],
+                geometry=before[1], owners=[before[3], after[3]], copy_states=[before[2], after[2]])
+
+
+def retained_aur_package_lock_worker(name, sides, indexes, work):
+    return retained_aur_lifecycle_worker(name, sides, indexes, work, package_base=True)
 
 
 def retained_callback_statement(name, sides, indexes, work):
@@ -15558,7 +15757,9 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
         _AUR_GIT_SOURCE: (retained_aur_git_limits, retained_aur_prefetch_test_wait,
                           retained_aur_git_fixture_limits, retained_aur_git_cancellation_entry),
         _AUR_DEPS_SOURCE: (retained_aur_dependency_packages,),
-        'src/package_managers/aur/client.rs': (retained_aur_archive_capture, retained_private_aur_fixture_encoder),
+        'src/package_managers/aur/client.rs': (retained_aur_archive_capture, retained_private_aur_fixture_encoder,
+                                              retained_aur_hook_preview_map, retained_aur_lifecycle_worker,
+                                              retained_aur_package_lock_worker),
         'src/package_managers/aur_metadata.rs': (retained_metadata_publication_success,),
         'src/package_managers/pacman_db/db.rs': (retained_cached_upgrade_comparison, retained_pacman_pattern_inputs,
                                                 retained_pacman_pattern_matcher, retained_pacman_foreign_catalog_reads),
