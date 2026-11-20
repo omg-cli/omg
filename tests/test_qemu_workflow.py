@@ -612,8 +612,12 @@ exit "$rc"
         self.assertIn("if: inputs.staged", download)
         guest = step('Run disposable guest lifecycle + read benchmarks + inventory rows')
         self.assertIn('STAGED: ${{ inputs.staged }}', guest)
-        script = literal(guest, 'run', 8)
-        script = script.replace('${{ inputs.distro }}', 'arch').replace('${{ inputs.tag }}', 'v1.2.3')
+        self.assertIn('REUSE_CI: ${{ inputs.reuse-ci }}', guest)
+        self.assertIn('DISTRO: ${{ inputs.distro }}', guest)
+        reuse_events = {'push', 'pull_request', 'merge_group'}
+        self.assertIn("reuse-ci: ${{ github.event_name == 'push' || github.event_name == 'pull_request' "
+                      "|| github.event_name == 'merge_group' }}", WORKFLOW.read_text(encoding='utf-8'))
+        script = literal(guest, 'run', 8).replace('${{ inputs.tag }}', 'v1.2.3')
         # The runner-isolation probe deliberately rejects WSL/DrvFs hosts such
         # as /mnt/c (a supported local QEMU environment), so stub only that
         # probe and keep asserting the step still runs it. The probe's own
@@ -622,20 +626,26 @@ exit "$rc"
         script = script.replace('python3 scripts/check-qemu-runner-isolation.py', 'true')
         # Execute the real argument-selection shell, substituting only the VM launch.
         script = script.replace('./scripts/benchmark-qemu.sh', 'printf "%s\\n"')
-        for event, staged in [('push', True), ('pull_request', True),
+        for event, staged in [('push', True), ('pull_request', True), ('merge_group', True),
                               ('workflow_dispatch', True), ('workflow_dispatch', False),
                               ('schedule', True)]:
-            with self.subTest(event=event, staged=staged), tempfile.TemporaryDirectory() as tmp:
-                result, _ = self.run_script(script, {'STAGED': str(staged).lower(),
-                    'RUNNER_TEMP': tmp, 'GITHUB_EVENT_NAME': event,
-                    'QEMU_EVIDENCE_NAME': 'qemu-evidence-123-1-arch'}, Path(tmp))
-                self.assertEqual(result.returncode, 0, result.stderr)
-                args = result.stdout.splitlines()
-                self.assertEqual('--staged-dir' in args, staged)
-                self.assertEqual('--release-dir' in args, not staged)
-                self.assertEqual('--inventory-file' in args, not staged)
-                tiers = args[args.index('--inventory-tiers') + 1].split(',')
-                self.assertIn('network', tiers, 'current-head guests must execute live-network inventory')
+            for distro in ('arch', 'fedora'):
+                with self.subTest(event=event, staged=staged, distro=distro), tempfile.TemporaryDirectory() as tmp:
+                    reuse = event in reuse_events
+                    result, _ = self.run_script(script.replace('${{ inputs.distro }}', distro), {
+                        'STAGED': str(staged).lower(), 'REUSE_CI': str(reuse).lower(), 'DISTRO': distro,
+                        'FEDORA_SQLITE_BUNDLE': str(Path(tmp) / 'bundle'),
+                        'RUNNER_TEMP': tmp, 'GITHUB_EVENT_NAME': event,
+                        'QEMU_EVIDENCE_NAME': f'qemu-evidence-123-1-{distro}',
+                    }, Path(tmp))
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    args = result.stdout.splitlines()
+                    self.assertEqual('--staged-dir' in args, staged)
+                    self.assertEqual('--release-dir' in args, not staged)
+                    self.assertEqual('--inventory-file' in args, not staged)
+                    self.assertEqual('--parallel-runtime-installs' in args, distro == 'fedora' and staged and reuse)
+                    tiers = args[args.index('--inventory-tiers') + 1].split(',')
+                    self.assertIn('network', tiers, 'current-head guests must execute live-network inventory')
 
     def test_nightly_builds_restore_native_caches_without_extra_saves(self):
         ci = WORKFLOW.with_name('ci.yml').read_text(encoding='utf-8')
