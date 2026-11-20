@@ -946,7 +946,33 @@ class RetainedSourceEntryTests(unittest.TestCase):
                 hits=(0,0)
             variants.append((source,6,[(6,'ahash::AHashMap::with_capacity'),(6,'local_pkg_count')],
                              hits,hits,'16package_managers8alpm_ops15collect_updates'))
-        return self.observe('src/package_managers/alpm_ops.rs',variants,coverage.map_capacity_entry_source,fault=fault)
+        return self.observe('src/package_managers/alpm_ops.rs',variants,coverage.map_initializer_entry_source,fault=fault)
+
+    def test_retains_initial_map_allocation_after_key_type_changes(self):
+        for fault in (None, 'conditional', 'missing-copy', 'missing-slot', 'foreign'):
+            with self.subTest(fault=fault):
+                variants = []
+                for side, key in enumerate(('String', 'CacheArchiveGroup')):
+                    prefix = ['    if dry_run { return Ok((0, 0)); }'] if side and fault == 'conditional' else []
+                    source = [
+                        'fn clean_cache_internal(keep_versions: usize, dry_run: bool) -> Result<(usize, u64)> {',
+                        *prefix,
+                        f'    let mut packages: ahash::AHashMap<{key}, Vec<(std::path::PathBuf, String)>> =',
+                        '        ahash::AHashMap::new();',
+                        '    finish(packages)',
+                        '}',
+                    ]
+                    call = 3 + len(prefix)
+                    hits = (36, 14) if side else (0, 4)
+                    variants.append((source, call, [(call, 'ahash::AHashMap::new')],
+                                     hits, hits, '16package_managers8alpm_ops20clean_cache_internal'))
+                proof = self.observe('src/package_managers/alpm_ops.rs', variants,
+                                     coverage.map_initializer_entry_source, fault=fault)
+                if fault is None:
+                    self.assertEqual(proof['pairs'], [[3, 3]])
+                    self.assertEqual(proof['instance_states'], [[False, True], [True, True]])
+                else:
+                    self.assertIsNone(proof)
 
     def alpm_record_entry(self, fault=None):
         variants = []
@@ -7748,6 +7774,49 @@ class SourceAwareCoverageTests(unittest.TestCase):
             with self.subTest(fault=fault):
                 previous, current = self.result_context_observations(fault)
                 self.assertTrue(current is None or previous.signature != current.signature)
+
+    def callback_after_diagnostic_observation(self, diagnostic, *, expansions=()):
+        source = [
+            'fn verify(path: &Path) -> Result<()> {',
+            '    check_cache(path).with_context(|| {',
+            '        ' + diagnostic,
+            '    })?;',
+            '    if let Some(parent) = path.parent() {',
+            '        make_directory(parent).with_context(|| {',
+            '            format!("Invalid log parent {}", parent.display())',
+            '        })?;',
+            '    }',
+            '    Ok(())',
+            '}',
+        ]
+        opening = source[5].index('{') + 1
+        parent = dict(name='_RNvNtCs1_7omg_lib7example6verify', filenames=['/src/example.rs'],
+                      count=1, regions=[[1, 1, 1, source[0].index('{') + 1, 1, 0, 0, 0],
+                                        [2, 5, 2, 34, 1, 0, 0, 0], [5, 5, 5, 41, 1, 0, 0, 0],
+                                        [6, 9, 6, opening, 1, 0, 0, 0], [11, 1, 11, 2, 1, 0, 0, 0]])
+        child = dict(name='_RNC' + parent['name'][2:] + 's_0B5_', filenames=parent['filenames'],
+                     count=0, regions=[[6, opening, 6, opening + 1, 0, 0, 0, 0],
+                                       [7, 13, 7, 72, 0, 0, 0, 0], [8, 9, 8, 10, 0, 0, 0, 0]])
+        return coverage.zero_arg_callback_fragment(
+            source, (1, len(source), [parent]), [parent, child], Counter([parent['name'], child['name']]),
+            6, 6, coverage._construct_inventory(source, [1_000_000]), [1_000_000], expansions=expansions)
+
+    def test_callback_after_format_diagnostic_retains_exact_compiler_state(self):
+        proof = self.callback_after_diagnostic_observation('format!("Invalid cache {}", path.display())')
+        self.assertEqual(proof.line_states, ((1,),))
+        self.assertEqual(proof.witness['owners'][0]['child_entry'], 0)
+        edited = self.callback_after_diagnostic_observation('format!("Unusable path {}", path.display())')
+        self.assertNotEqual(proof.signature, edited.signature)
+
+    def test_prior_diagnostic_must_be_a_plain_format_callback_without_expansions(self):
+        for diagnostic, expansions in [
+            ('bail!("Invalid cache")', ()),
+            ('format!("{}", other!())', ()),
+            ('format!("Invalid cache"); check_more()', ()),
+            ('format!("Invalid cache")', ('unexpected expansion',)),
+        ]:
+            with self.subTest(diagnostic=diagnostic, expansions=expansions):
+                self.assertIsNone(self.callback_after_diagnostic_observation(diagnostic, expansions=expansions))
 
     def compare(self, before=None, after=None, mutate=None, sources=None, filename="example.rs"):
         default_before, default_after = self.fixture()

@@ -1901,9 +1901,24 @@ def result_context_binding(code, function, callback, argument, work):
     return ResultContextBinding(prefix, tuple(code.words[argument:end + 1]), receiver_line, width, binding)
 
 
+def format_only_context_prefix(code, start, end):
+    """Allow opaque format expressions only inside earlier diagnostic callbacks."""
+    for token in range(start, end):
+        if code.words[token] != '!':
+            continue
+        opening = code.parents[token]
+        if (opening is None or opening < start + 4 or token != opening + 2
+                or code.words[opening - 4:token + 2] != ['.', 'with_context', '(', '||', '{', 'format', '!', '(']
+                or not code.words[token + 2].startswith('"')
+                or code.pairs[token + 1] + 1 != code.pairs[opening]
+                or code.pairs[opening] >= end):
+            return False
+    return True
+
+
 def zero_arg_callback_fragment(source, group, owners, name_counts, first, last, inventory, work,
                                *, caller_entry=False, single_binding=False, phase_cache=None,
-                               environment_test=False):
+                               environment_test=False, expansions=None):
     """Prove fragment execution through a uniquely source-bound direct callback."""
     if single_binding and caller_entry or environment_test and (caller_entry or single_binding):
         return None
@@ -2021,13 +2036,16 @@ def zero_arg_callback_fragment(source, group, owners, name_counts, first, last, 
     _construct_charge(work, len(prefix) + len(header))
     if not caller_entry and any(word in ('!', '#') for word in prefix):
         if not environment_test:
-            return None
-        assertion = ('assert','!','(','!','crate','::','core','::','privilege','::','is_root','(',')',')',';')
-        occurrences = [at for at in range(len(prefix)) if prefix[at:at+len(assertion)]==assertion]
-        _construct_charge(work,len(prefix)*len(assertion))
-        if (len(occurrences)!=1 or prefix.count('!')!=2 or '#' in prefix
-                or code.parents[function['opening']+1+occurrences[0]]!=function['opening']):
-            return None
+            if (expansions not in ([], ()) or single_binding or result_context is not None or '#' in prefix
+                    or not format_only_context_prefix(code, function['opening'] + 1, callback['opening'])):
+                return None
+        else:
+            assertion = ('assert','!','(','!','crate','::','core','::','privilege','::','is_root','(',')',')',';')
+            occurrences = [at for at in range(len(prefix)) if prefix[at:at+len(assertion)]==assertion]
+            _construct_charge(work,len(prefix)*len(assertion))
+            if (len(occurrences)!=1 or prefix.count('!')!=2 or '#' in prefix
+                    or code.parents[function['opening']+1+occurrences[0]]!=function['opening']):
+                return None
     opening = code.position(code.starts[callback['opening']])
     closing = code.position(code.ends[callback['end']])
     body_opening = code.position(code.starts[function['opening']])
@@ -3286,17 +3304,21 @@ def ensure_condition_observation(source_condition, roots, counts, work):
 
 
 _MAP_CAPACITY_LINE = 'ahash::AHashMap::with_capacity(local_pkg_count);'
+_MAP_NEW_LINE = 'ahash::AHashMap::new();'
 _ALPM_UPDATE_RECORD_LINE = 'updates.push(UpdateInfo {'
 _ALPM_COLLECT_HEADER = ('pub', '(', 'crate', ')', 'fn', 'collect_updates', '(', 'alpm', ':', '&', 'alpm', '::', 'Alpm', ')', '->')
 
 
-def map_capacity_entry_source(name, source, inventory, line, work):
-    if name!='src/package_managers/alpm_ops.rs' or source[line-1].strip()!=_MAP_CAPACITY_LINE:
+def map_initializer_entry_source(name, source, inventory, line, work):
+    initializer = source[line - 1].strip()
+    if name != 'src/package_managers/alpm_ops.rs' or initializer not in (_MAP_CAPACITY_LINE, _MAP_NEW_LINE):
         return None
     code,rows=inventory[:2]
     _construct_charge(work,len(rows)+len(code.starts).bit_length())
     start=bisect.bisect_left(code.starts,code.offsets[line-1])
-    call=('ahash','::','AHashMap','::','with_capacity','(','local_pkg_count',')',';')
+    call = ('ahash', '::', 'AHashMap', '::', 'with_capacity', '(', 'local_pkg_count', ')', ';')
+    if initializer == _MAP_NEW_LINE:
+        call = ('ahash', '::', 'AHashMap', '::', 'new', '(', ')', ';')
     if tuple(code.words[start:start+len(call)])!=call:
         return None
     end=start+len(call)-1
@@ -3309,27 +3331,41 @@ def map_capacity_entry_source(name, source, inventory, line, work):
     if len(functions)!=1 or len(bindings)!=1:
         return None
     function,=functions; binding,=bindings
+    _construct_charge(work,start-parent)
+    before_binding = code.words[parent + 1:binding['first']]
+    types = tuple(code.words[binding['first']:start])
+    header = function['header']
+    span = (code.position(code.starts[function['first'] + header.index('fn')])[0],
+            code.position(code.ends[function['end']])[0])
+    modules = ('omg_lib', 'package_managers', 'alpm_ops')
+    call_slot = code.region(start, start + 4)
+    if initializer == _MAP_NEW_LINE:
+        if (header[:5] != ('fn', 'clean_cache_internal', '(', 'keep_versions', ':')
+                or before_binding or types[:8] != ('let', 'mut', 'packages', ':', 'ahash', '::', 'AHashMap', '<')
+                or types[8:9] not in (('String',), ('CacheArchiveGroup',))
+                or types[9:] != (',', 'Vec', '<', '(', 'std', '::', 'path', '::', 'PathBuf',
+                                 ',', 'String', ')', '>', '>', '=')):
+            return None
+        return (header, span, code.region(binding['first'], end), (call_slot,),
+                modules, 'clean_cache_internal', None, (None, None), False)
+
     signature = _ALPM_COLLECT_HEADER
-    header=function['header']
     if (header[:len(signature)]!=signature or header[len(signature):] not in
             (('Vec','<','UpdateInfo','>'),('Result','<','Vec','<','UpdateInfo','>','>'))):
         return None
-    _construct_charge(work,start-parent)
-    if code.words[parent+1:binding['first']]!=[
+    if before_binding != [
             'let','localdb','=','alpm','.','localdb','(',')',';',
             'let','syncdbs','=','alpm','.','syncdbs','(',')',';',
             'let','local_pkg_count','=','localdb','.','pkgs','(',')','.','len','(',')',';']:
         return None
-    types=tuple(code.words[binding['first']:start])
     before=('let','mut','sync_map',':','ahash','::','AHashMap','<','&','str',',','(','&')
     after=(',','&','str',')','>','=')
     if types[:len(before)]!=before or types[-len(after):]!=after or types[len(before):-len(after)] not in (
             ('str',),('alpm','::','Package')):
         return None
-    span=(code.position(code.starts[function['first']+4])[0],code.position(code.ends[function['end']])[0])
-    slots=tuple(code.region(a,b) for a,b in ((start,start+4),(start+6,start+6)))
+    slots = (call_slot, code.region(start + 6, start + 6))
     return (signature,span,code.region(binding['first'],end),slots,
-            ('omg_lib','package_managers','alpm_ops'),'collect_updates',None,(None,None),False)
+            modules,'collect_updates',None,(None,None),False)
 
 
 def alpm_update_record_entry_source(name, source, inventory, line, work):
@@ -3399,7 +3435,7 @@ def retained_ensure_entry(name, sides, indexes, work):
 
 def retained_observed_entry(name, sides, indexes, work, source_observer):
     """Compare complete raw copy inventories for a source-owned entry."""
-    map_initializer=source_observer is map_capacity_entry_source
+    map_initializer=source_observer is map_initializer_entry_source
     alpm_record = source_observer is alpm_update_record_entry_source
     identities=[]; receipts=[]; states=[]; conditions=[]
     for (source,inventory,spans,counts,line),index in zip(sides,indexes):
@@ -3511,7 +3547,10 @@ def retained_observed_entry(name, sides, indexes, work, source_observer):
             if candidate==0:
                 break
     pairs.extend(condition_pairs)
-    kind = 'retained-map-capacity-entry' if map_initializer else 'retained-ensure-entry'
+    kind = 'retained-ensure-entry'
+    if map_initializer:
+        kind = ('retained-map-allocation-entry' if sides[0][0][sides[0][-1] - 1].strip() == _MAP_NEW_LINE
+                else 'retained-map-capacity-entry')
     return dict(file=name,kind=kind,pairs=pairs,condition_pairs=condition_pairs,
                 instance_states=states,observations=receipts)
 
@@ -6624,7 +6663,8 @@ def positive_source_fragments(name, old, new, before, after, base, head, base_fi
                                 if construct_inventories is None else construct_inventories[side])
                         callback = joined_statements[side] if joined_statements else zero_arg_callback_fragment(
                             source, group, inventories[side], inventory_names[side], offset + 1, offset + b - a,
-                            callback_inventories[side], work, phase_cache=callback_phase_cache)
+                            callback_inventories[side], work, phase_cache=callback_phase_cache,
+                            expansions=macro_expansions[side])
                         if callback is None:
                             callback = zero_arg_callback_fragment(source, group, inventories[side],
                                 inventory_names[side], offset + 1, offset + b - a,
@@ -13589,8 +13629,8 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
                               and old[line-1].strip()=='&& files.len() < 10_000,'):
                             entry_source=ensure_entry_source
                             entry_lines=(line-3,target-3)
-                        elif name=='src/package_managers/alpm_ops.rs' and old[line-1].strip()==_MAP_CAPACITY_LINE:
-                            entry_source=map_capacity_entry_source
+                        elif name=='src/package_managers/alpm_ops.rs' and old[line-1].strip() in (_MAP_CAPACITY_LINE, _MAP_NEW_LINE):
+                            entry_source=map_initializer_entry_source
                         elif name == 'src/package_managers/alpm_ops.rs' and old[line - 1].strip() == _ALPM_UPDATE_RECORD_LINE:
                             entry_source = alpm_update_record_entry_source
                     if entry_source is not None and (bs[name]['expansions'],hs[name]['expansions'])==([],[]):
