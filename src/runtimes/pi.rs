@@ -3,6 +3,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::{Context, Result, ensure};
 
@@ -137,7 +139,7 @@ impl PiManager {
         let receipt_path = prefix.join(".omg-npm-advisory-review.json");
         let previous_receipt =
             crate::core::security::npm::read_metadata(&receipt_path, 16 * 1024 * 1024)?;
-        let next_admission = (|| {
+        let activation = (|| -> Result<()> {
             let reviewed = review_installed_npm(
                 &format!("{PI_PACKAGE}@{version}"),
                 &prefix,
@@ -154,19 +156,17 @@ impl PiManager {
             let admission = self
                 .security
                 .installed("pi", &prefix, ReviewMode::FreshAttended)?;
-            Ok::<_, anyhow::Error>((reviewed, admission))
+            reviewed.verify(&prefix)?;
+            admission.verify(&prefix)?;
+            common::set_current_version_with_lease(&self.versions_dir, version, lease)
         })();
-        let (reviewed, admission) = match next_admission {
-            Ok(selection) => selection,
-            Err(error) => {
-                crate::core::safe_ops::atomic_write_file_sync(&receipt_path, previous_receipt)
-                    .context("Failed to restore the previous Pi dependency review after admission failed")?;
-                return Err(error);
-            }
-        };
-        reviewed.verify(&prefix)?;
-        admission.verify(&prefix)?;
-        common::set_current_version_with_lease(&self.versions_dir, version, lease)?;
+        if let Err(error) = activation {
+            crate::core::safe_ops::atomic_write_file_sync(&receipt_path, previous_receipt)
+                .context(
+                    "Failed to restore the previous Pi dependency review after activation failed",
+                )?;
+            return Err(error);
+        }
         print_using("Pi", version, &self.versions_dir.join("current/bin"));
         Ok(())
     }
@@ -241,6 +241,7 @@ fn write_launcher(prefix: &Path, destination: &Path, entrypoint: &Path, node: &P
 #[derive(Default)]
 struct TestAdvisories {
     vulnerable: bool,
+    reads: AtomicUsize,
 }
 
 #[cfg(test)]
@@ -260,6 +261,7 @@ impl VulnerabilitySource for TestAdvisories {
                 + 'a,
         >,
     > {
+        self.reads.fetch_add(1, Ordering::SeqCst);
         Box::pin(async move {
             Ok(packages
                 .iter()
@@ -300,6 +302,31 @@ mod tests {
     use super::*;
     #[cfg(unix)]
     use std::os::unix::fs::{PermissionsExt, symlink};
+    #[cfg(unix)]
+    use std::sync::atomic::AtomicBool;
+
+    #[cfg(unix)]
+    #[derive(Default)]
+    struct TestRuntimeEvidence {
+        refuse_pi: AtomicBool,
+        pi_reads: AtomicUsize,
+        reads: AtomicUsize,
+    }
+
+    #[cfg(unix)]
+    impl super::super::security::RuntimeEvidenceSource for TestRuntimeEvidence {
+        fn read(&self, query: &super::super::security::RuntimeQuery) -> Result<Vec<u8>> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            if query.runtime == "pi" {
+                self.pi_reads.fetch_add(1, Ordering::SeqCst);
+            }
+            ensure!(
+                !(query.runtime == "pi" && self.refuse_pi.load(Ordering::SeqCst)),
+                "controlled Pi provider outage"
+            );
+            super::super::security::fixture_runtime_report(query)
+        }
+    }
 
     #[cfg(unix)]
     fn fake_npm(directory: &Path, version: &str, succeed: bool) -> Result<PathBuf> {
@@ -519,13 +546,38 @@ esac
     }
 
     #[cfg(unix)]
+    #[test]
+    fn pi_activation_refuses_malformed_identity_or_missing_executable() -> Result<()> {
+        let prefix = tempfile::tempdir()?;
+        let package = prefix.path().join("node_modules").join(PI_PACKAGE);
+        fs::create_dir_all(&package)?;
+        let manifest = package.join("package.json");
+        fs::write(&manifest, b"{")?;
+        let error = validate_pi_install(prefix.path(), "0.83.0")
+            .expect_err("a malformed package identity cannot be activated");
+        assert!(error.downcast_ref::<serde_json::Error>().is_some());
+
+        fs::write(
+            &manifest,
+            serde_json::to_vec(&serde_json::json!({"name": PI_PACKAGE, "version": "0.83.0"}))?,
+        )?;
+        let error = validate_pi_install(prefix.path(), "0.83.0")
+            .expect_err("an installation without an executable cannot be activated");
+        assert!(format!("{error:#}").contains("Pi package has no contained npm executable"));
+        Ok(())
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn vulnerable_transitive_dependency_is_refused_before_materialization() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let npm = fake_npm(temp.path(), "0.83.0", true)?;
         managed_node(temp.path(), &npm)?;
         let mut manager = PiManager::with_paths(temp.path().join("versions/pi"), npm);
-        manager.advisories = Arc::new(TestAdvisories { vulnerable: true });
+        manager.advisories = Arc::new(TestAdvisories {
+            vulnerable: true,
+            ..TestAdvisories::default()
+        });
         assert!(manager.install("0.83.0").await.is_err());
         assert_eq!(fs::read_to_string(temp.path().join("phases"))?, "install\n");
         assert!(!manager.versions_dir.join("0.83.0").exists());
@@ -564,7 +616,7 @@ esac
             AssessmentUse, PackageAssessment, PackageCoverage, VulnerabilityError,
         };
         use crate::package_managers::types::SecurityPackage;
-        use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+        use std::sync::atomic::AtomicU8;
 
         struct RevisionSource {
             revision: AtomicU8,
@@ -607,29 +659,10 @@ esac
                 })
             }
         }
-        struct ControlledRuntimeSource {
-            refuse_pi: AtomicBool,
-            pi_reads: AtomicUsize,
-        }
-        impl super::super::security::RuntimeEvidenceSource for ControlledRuntimeSource {
-            fn read(&self, query: &super::super::security::RuntimeQuery) -> Result<Vec<u8>> {
-                if query.runtime == "pi" {
-                    self.pi_reads.fetch_add(1, Ordering::SeqCst);
-                }
-                ensure!(
-                    !(query.runtime == "pi" && self.refuse_pi.load(Ordering::SeqCst)),
-                    "controlled Pi provider outage"
-                );
-                super::super::security::fixture_runtime_report(query)
-            }
-        }
         let temp = tempfile::tempdir()?;
         let npm = fake_npm(temp.path(), "0.83.0", true)?;
         managed_node(temp.path(), &npm)?;
-        let source = Arc::new(ControlledRuntimeSource {
-            refuse_pi: AtomicBool::new(false),
-            pi_reads: AtomicUsize::new(0),
-        });
+        let source = Arc::new(TestRuntimeEvidence::default());
         let npm_source = Arc::new(RevisionSource {
             revision: AtomicU8::new(1),
             checked_at: jiff::Timestamp::now(),
@@ -663,46 +696,55 @@ esac
             .security
             .installed("pi", &prefix, ReviewMode::CachedOnly)?
             .verify(&prefix)?;
+
+        source.refuse_pi.store(false, Ordering::SeqCst);
+        let current = manager.versions_dir.join("current");
+        let previous_link = fs::read_link(&current)?;
+        fs::remove_file(&current)?;
+        fs::create_dir(&current)?;
+        let error = temp_env::with_var(
+            crate::cli::tool::ALLOW_NPM_SCRIPTS_ENV,
+            Some("@earendil-works/pi-coding-agent@0.83.0"),
+            || manager.use_version("0.83.0"),
+        )
+        .expect_err("must preserve a regular current directory");
+        assert!(format!("{error:#}").contains("Refusing to replace non-symlink"));
+        assert_eq!(
+            fs::read(prefix.join(".omg-npm-advisory-review.json"))?,
+            previous
+        );
+        assert!(fs::symlink_metadata(&current)?.file_type().is_dir());
+
+        fs::remove_dir(&current)?;
+        symlink(previous_link, &current)?;
+        temp_env::with_var(
+            crate::cli::tool::ALLOW_NPM_SCRIPTS_ENV,
+            Some("@earendil-works/pi-coding-agent@0.83.0"),
+            || manager.use_version("0.83.0"),
+        )?;
+        assert_ne!(
+            fs::read(prefix.join(".omg-npm-advisory-review.json"))?,
+            previous
+        );
+        assert_eq!(manager.current_version().as_deref(), Some("0.83.0"));
         Ok(())
     }
 
     #[cfg(unix)]
     #[tokio::test]
     async fn intact_cached_pi_selection_does_not_call_sources_or_run_npm() -> Result<()> {
-        use crate::core::security::vulnerability::{
-            AssessmentUse, PackageAssessment, VulnerabilityError,
-        };
-        use crate::package_managers::types::SecurityPackage;
-        struct OfflineSource;
-        impl VulnerabilitySource for OfflineSource {
-            fn assess_packages<'a>(
-                &'a self,
-                _packages: &'a [SecurityPackage],
-                _use_case: AssessmentUse,
-            ) -> std::pin::Pin<
-                Box<
-                    dyn std::future::Future<
-                            Output = std::result::Result<
-                                Vec<PackageAssessment>,
-                                VulnerabilityError,
-                            >,
-                        > + Send
-                        + 'a,
-                >,
-            > {
-                panic!("an intact cached Pi inventory must not query the package source")
-            }
-        }
-        impl super::super::security::RuntimeEvidenceSource for OfflineSource {
-            fn read(&self, _query: &super::super::security::RuntimeQuery) -> Result<Vec<u8>> {
-                panic!("an intact cached Pi or Node admission must not query the runtime source")
-            }
-        }
         let temp = tempfile::tempdir()?;
         let npm = fake_npm(temp.path(), "0.83.0", true)?;
         managed_node(temp.path(), &npm)?;
+        let advisories = Arc::new(TestAdvisories::default());
+        let evidence = Arc::new(TestRuntimeEvidence::default());
         let mut manager = PiManager::with_paths(temp.path().join("versions/pi"), npm);
+        manager.advisories = advisories.clone();
+        manager.security = RuntimeSecurity::with_source(evidence.clone());
         manager.install("0.83.0").await?;
+        let package_reads = advisories.reads.load(Ordering::SeqCst);
+        let runtime_reads = evidence.reads.load(Ordering::SeqCst);
+        assert!(package_reads > 0 && runtime_reads > 0);
         let receipt_path = manager
             .versions_dir
             .join("0.83.0/.omg-npm-advisory-review.json");
@@ -712,9 +754,10 @@ esac
             temp.path().join("signature-reject"),
             "cached selection cannot run a new audit",
         )?;
-        manager.advisories = Arc::new(OfflineSource);
-        manager.security = RuntimeSecurity::with_source(Arc::new(OfflineSource));
+        manager.install("0.83.0").await?;
         manager.use_version("0.83.0")?;
+        assert_eq!(advisories.reads.load(Ordering::SeqCst), package_reads);
+        assert_eq!(evidence.reads.load(Ordering::SeqCst), runtime_reads);
         assert_eq!(manager.current_version().as_deref(), Some("0.83.0"));
         assert_eq!(
             fs::read(receipt_path)?,
