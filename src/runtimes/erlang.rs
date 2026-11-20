@@ -37,8 +37,8 @@ use crate::{cli::style, core::http::download_client};
 /// (asdf parity: `ASDF_ERLANG_UBUNTU_RELEASE`).
 const UBUNTU_RELEASE_OVERRIDE_ENV: &str = "OMG_ERLANG_UBUNTU_RELEASE";
 
-/// Hex.pm only publishes these Ubuntu builds; other distros map to the
-/// closest compatible one (same mapping asdf-erlang-prebuilt uses).
+// Hex still serves archived indexes for 18.04 (amd64 only) and 20.04.
+const UBUNTU_BUILD_RELEASES: &[&str] = &["18.04", "20.04", "22.04", "24.04", "26.04"];
 const UBUNTU_FALLBACK_RELEASE: &str = "24.04";
 
 /// An upstream OTP release with its index checksum.
@@ -78,6 +78,7 @@ fn map_os_release(distro_id: &str, version_id: &str) -> &'static str {
             "20.04" => "20.04",
             "22.04" => "22.04",
             "24.04" => "24.04",
+            "26.04" => "26.04",
             _ => UBUNTU_FALLBACK_RELEASE,
         },
         "debian" => match version_id.split('.').next().unwrap_or("") {
@@ -101,19 +102,41 @@ fn os_release_field(content: &str, key: &str) -> String {
 }
 
 /// Detect the hex.pm Ubuntu release for this host.
-fn ubuntu_release() -> String {
-    if let Ok(pinned) = std::env::var(UBUNTU_RELEASE_OVERRIDE_ENV) {
-        let pinned = pinned.trim().to_string();
-        if !pinned.is_empty() {
-            return pinned;
+fn ubuntu_release(arch: &str) -> Result<&'static str> {
+    let releases = if arch == "arm64" {
+        &UBUNTU_BUILD_RELEASES[1..]
+    } else {
+        UBUNTU_BUILD_RELEASES
+    };
+    match std::env::var(UBUNTU_RELEASE_OVERRIDE_ENV) {
+        Ok(pinned) if !pinned.trim().is_empty() => {
+            return releases
+                .iter()
+                .copied()
+                .find(|release| *release == pinned.trim())
+                .with_context(|| {
+                    format!(
+                        "{UBUNTU_RELEASE_OVERRIDE_ENV} must be one of these Hex builds for {arch}: {}",
+                        releases.join(", ")
+                    )
+                });
         }
+        Err(std::env::VarError::NotUnicode(_)) => {
+            anyhow::bail!("{UBUNTU_RELEASE_OVERRIDE_ENV} must be valid UTF-8");
+        }
+        _ => {}
     }
     let content = fs::read_to_string("/etc/os-release").unwrap_or_default();
-    map_os_release(
+    let mapped = map_os_release(
         &os_release_field(&content, "ID"),
         &os_release_field(&content, "VERSION_ID"),
-    )
-    .to_string()
+    );
+    anyhow::ensure!(
+        releases.contains(&mapped),
+        "No Hex Erlang/OTP build for Ubuntu {mapped} on {arch}. Set {UBUNTU_RELEASE_OVERRIDE_ENV} to a compatible release from: {}",
+        releases.join(", ")
+    );
+    Ok(mapped)
 }
 
 /// Version index URL for this host.
@@ -122,7 +145,7 @@ fn index_url() -> Result<String> {
     match std::env::consts::OS {
         "linux" => Ok(format!(
             "https://builds.hex.pm/builds/otp/{arch}/ubuntu-{}/builds.txt",
-            ubuntu_release()
+            ubuntu_release(arch)?
         )),
         "macos" => Ok(format!(
             "https://raw.githubusercontent.com/erlef/otp_builds/refs/heads/main/builds/{arch}-apple-darwin.csv"
@@ -144,7 +167,7 @@ fn tarball_url(version: &str) -> Result<String> {
     match std::env::consts::OS {
         "linux" => Ok(format!(
             "https://builds.hex.pm/builds/otp/{arch}/ubuntu-{}/OTP-{upstream}.tar.gz",
-            ubuntu_release()
+            ubuntu_release(arch)?
         )),
         "macos" => Ok(format!(
             "https://github.com/erlef/otp_builds/releases/download/OTP-{upstream}/otp-{arch}-apple-darwin.tar.gz"
@@ -674,6 +697,7 @@ mod tests {
 
     #[test]
     fn os_release_mapping_matches_asdf_behavior() {
+        assert_eq!(map_os_release("ubuntu", "26.04"), "26.04");
         assert_eq!(map_os_release("ubuntu", "24.04"), "24.04");
         assert_eq!(map_os_release("ubuntu", "22.04"), "22.04");
         assert_eq!(map_os_release("ubuntu", "25.10"), "24.04");
@@ -683,6 +707,60 @@ mod tests {
         assert_eq!(map_os_release("debian", "10"), "18.04");
         assert_eq!(map_os_release("fedora", "42"), "24.04");
         assert_eq!(map_os_release("", ""), "24.04");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ubuntu_override_uses_only_publisher_build_tokens() {
+        const NAME: &str =
+            "runtimes::erlang::tests::ubuntu_override_uses_only_publisher_build_tokens";
+        if crate::core::testing::run_isolated_test(NAME) {
+            return;
+        }
+        for release in ["20.04", "22.04", "24.04", "26.04"] {
+            temp_env::with_var(UBUNTU_RELEASE_OVERRIDE_ENV, Some(release), || {
+                assert!(
+                    index_url()
+                        .unwrap()
+                        .ends_with(&format!("/ubuntu-{release}/builds.txt"))
+                );
+                assert!(
+                    tarball_url("28.2.0")
+                        .unwrap()
+                        .ends_with(&format!("/ubuntu-{release}/OTP-28.2.tar.gz"))
+                );
+            });
+        }
+        temp_env::with_var(UBUNTU_RELEASE_OVERRIDE_ENV, Some("18.04"), || {
+            assert_eq!(ubuntu_release("amd64").unwrap(), "18.04");
+            let error = ubuntu_release("arm64").expect_err("Hex has no legacy arm64 build");
+            assert!(error.to_string().contains("for arm64"));
+        });
+        temp_env::with_var(UBUNTU_RELEASE_OVERRIDE_ENV, Some(" 22.04 "), || {
+            assert_eq!(ubuntu_release("amd64").unwrap(), "22.04");
+        });
+        temp_env::with_var(UBUNTU_RELEASE_OVERRIDE_ENV, Some(""), || {
+            assert!(UBUNTU_BUILD_RELEASES.contains(&ubuntu_release("amd64").unwrap()));
+        });
+        use std::os::unix::ffi::OsStrExt as _;
+        let non_unicode = std::ffi::OsStr::from_bytes(b"\xff");
+        temp_env::with_var(UBUNTU_RELEASE_OVERRIDE_ENV, Some(non_unicode), || {
+            let error = index_url().expect_err("non-UTF-8 override must stop URL resolution");
+            assert!(error.to_string().contains("must be valid UTF-8"));
+        });
+        temp_env::with_var(UBUNTU_RELEASE_OVERRIDE_ENV, Some("nobleb"), || {
+            for error in [
+                index_url().expect_err("invalid override must stop index resolution"),
+                tarball_url("28.2.0").expect_err("invalid override must stop archive resolution"),
+            ] {
+                let diagnostic = error.to_string();
+                assert!(
+                    diagnostic.contains(UBUNTU_RELEASE_OVERRIDE_ENV),
+                    "{diagnostic}"
+                );
+                assert!(diagnostic.contains("22.04, 24.04, 26.04"), "{diagnostic}");
+            }
+        });
     }
 
     #[test]
