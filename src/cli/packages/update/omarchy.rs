@@ -20,6 +20,7 @@ const LOCK_FD: &str = "OMG_OMARCHY_LOCK_FD";
 const LOG_FD: &str = "OMG_OMARCHY_LOG_FD";
 const AUTHORIZATION_INTERVAL: Duration = Duration::from_mins(1);
 const TERMINATION_GRACE: Duration = Duration::from_secs(10);
+const DEVELOPMENT_UPDATE_DEADLINE: Duration = Duration::from_mins(2);
 const MAX_MIGRATIONS: usize = 4096;
 const MAX_MIGRATION_BYTES: u64 = 1024 * 1024;
 const OMARCHY_DEV_CONFIG: &str = "/etc/omarchy.conf";
@@ -484,6 +485,28 @@ impl Commands {
             .await
     }
 
+    async fn run_development_checkout(
+        &mut self,
+        program: &Path,
+        args: &[&str],
+        checkout: PathBuf,
+        deadline: Duration,
+    ) -> Result<ExitStatus> {
+        let Ok(result) =
+            tokio::time::timeout(deadline, self.run_program_at(program, args, checkout)).await
+        else {
+            let cleanup = self.stop_active().await;
+            return finish_cleanup(
+                Err(anyhow::anyhow!(
+                    "Omarchy dev checkout update timed out after {} seconds. Check GitHub connectivity and checkout credentials before retrying.",
+                    deadline.as_secs()
+                )),
+                cleanup,
+            );
+        };
+        result
+    }
+
     async fn run_program_at(
         &mut self,
         program: &Path,
@@ -755,7 +778,8 @@ impl StageExecutor for Commands {
             // The vendor helper only fast-forwards Git. Its command lookup and
             // every other stage keep using the packaged runtime.
             let checkout = self.runtime.development_root()?;
-            self.run_program_at(&executable, args, checkout).await?
+            self.run_development_checkout(&executable, args, checkout, DEVELOPMENT_UPDATE_DEADLINE)
+                .await?
         } else {
             self.run_program(&executable, args).await?
         };
@@ -797,6 +821,7 @@ impl StageExecutor for Commands {
 enum NativeMigration {
     TrayMenuDependency,
     OmnibookAudio,
+    MediaViewer,
 }
 
 #[derive(Debug)]
@@ -866,6 +891,10 @@ fn pending_migrations(migrations: &Path, state: &Path) -> Result<Vec<PendingMigr
                 Some("1794675791.sh"),
                 "51547c19027f82b16bfddc3121fb1c14ff01425322afc0bce0ea207f069d4eac",
             ) => Some(NativeMigration::OmnibookAudio),
+            (
+                Some("1794774234.sh"),
+                "2e4a9686547c5615eceb9c23cb3b079df491d000078da10b7d995ea1caf9a954",
+            ) => Some(NativeMigration::MediaViewer),
             _ => None,
         };
         let known_external_aur = [
@@ -1013,6 +1042,7 @@ impl MigrationExecutor for Commands {
                 }
                 NativeOmarchyOperation::InstallOmnibookAudio
             }
+            NativeMigration::MediaViewer => return self.replace_media_viewer().await,
         };
         self.run_native_package(operation).await?;
         if native == NativeMigration::OmnibookAudio {
@@ -1028,6 +1058,95 @@ impl MigrationExecutor for Commands {
         }
         Ok(())
     }
+}
+
+impl Commands {
+    async fn replace_media_viewer(&mut self) -> Result<()> {
+        const SHIPPED_LAUNCHERS: &[&str] = &[
+            "120d30326a77e1f23d050e52293d0acf1aeb9499bf9cd47b93996d6e2be99480",
+            "a7a75999f161c6a409ff4c5da26ad9c79fc1ffdd4e633aac87f972ad72fc85d4",
+            "d105a16b60ecc1c67f6cc37e5bb7831ca8a08d0e602cb64dd4a1386703362385",
+            "9844e9d22d1b4b9801965afea1eb250103cfc6f12e6e62e542ac47abd4b8094d",
+        ];
+        self.run_native_package(NativeOmarchyOperation::InstallMediaViewer)
+            .await?;
+        let applications = dirs::home_dir()
+            .context("Cannot locate the Omarchy user's home")?
+            .join(".local/share/applications");
+        if remove_shipped_media_launchers(&applications, SHIPPED_LAUNCHERS)? {
+            let updater =
+                crate::core::privilege::root_controlled_program_path("update-desktop-database")?;
+            let path = applications
+                .to_str()
+                .context("Desktop application directory is not UTF-8")?;
+            let status = self.run_program(&updater, &[path]).await?;
+            anyhow::ensure!(
+                status.success(),
+                "Cannot refresh the desktop application database: {status}"
+            );
+        }
+        self.run_native_package(NativeOmarchyOperation::RemoveLegacyMediaViewers)
+            .await
+    }
+}
+
+fn remove_shipped_media_launchers(applications: &Path, shipped_digests: &[&str]) -> Result<bool> {
+    use std::io::Read;
+
+    const MAX_LAUNCHER_BYTES: u64 = 64 * 1024;
+    let directory = match std::fs::symlink_metadata(applications) {
+        Ok(directory) => directory,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(error).context("Cannot inspect the desktop application directory");
+        }
+    };
+    if !directory.is_dir() {
+        return Ok(false);
+    }
+    for name in ["imv.desktop", "mpv.desktop"] {
+        let path = applications.join(name);
+        let file = match File::options()
+            .read(true)
+            .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
+            .open(&path)
+        {
+            Ok(file) => file,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    || error.raw_os_error() == Some(nix::libc::ELOOP) =>
+            {
+                continue;
+            }
+            Err(error) => return Err(error).with_context(|| format!("Cannot inspect {name}")),
+        };
+        let metadata = file.metadata()?;
+        if !metadata.is_file() || metadata.len() > MAX_LAUNCHER_BYTES {
+            continue;
+        }
+        let mut contents = Vec::new();
+        file.take(MAX_LAUNCHER_BYTES + 1)
+            .read_to_end(&mut contents)?;
+        use sha2::{Digest, Sha256};
+        let digest = hex::encode(Sha256::digest(&contents));
+        if contents.len() as u64 <= MAX_LAUNCHER_BYTES && shipped_digests.contains(&digest.as_str())
+        {
+            let current = std::fs::symlink_metadata(&path)?;
+            anyhow::ensure!(
+                current.is_file()
+                    && current.dev() == metadata.dev()
+                    && current.ino() == metadata.ino()
+                    && current.mtime() == metadata.mtime()
+                    && current.mtime_nsec() == metadata.mtime_nsec()
+                    && current.ctime() == metadata.ctime()
+                    && current.ctime_nsec() == metadata.ctime_nsec(),
+                "Desktop entry {name} changed while it was being checked"
+            );
+            std::fs::remove_file(path)
+                .with_context(|| format!("Cannot remove the old Omarchy launcher {name}"))?;
+        }
+    }
+    Ok(true)
 }
 
 fn native_reboot_reason() -> Result<Option<&'static str>> {
@@ -3062,7 +3181,7 @@ mod tests {
         .expect("owned fixture must succeed");
     }
 
-    fn native_package_migration_fixtures() -> [(&'static str, &'static str); 2] {
+    fn native_package_migration_fixtures() -> [(&'static str, &'static str); 3] {
         [
             (
                 "1794518371.sh",
@@ -3089,6 +3208,38 @@ omarchy-pkg-add hp-omnibook-3-audio
 omarchy-state set reboot-required
 "#,
             ),
+            (
+                "1794774234.sh",
+                r#"echo "Replace imv and mpv with Omaview"
+
+omarchy-pkg-add omaview
+
+# Omarchy's own Image Viewer (imv) and Media Player (mpv) launchers give way to
+# Omaview's Media Viewer. Only a copy still as Omarchy shipped it goes, so one
+# the user changed, or linked from their dotfiles, stays theirs.
+applications="$HOME/.local/share/applications"
+for entry in imv.desktop mpv.desktop; do
+  file="$applications/$entry"
+  [[ -f $file && ! -L $file ]] || continue
+  case $(sha256sum <"$file") in
+    120d30326a77e1f23d050e52293d0acf1aeb9499bf9cd47b93996d6e2be99480* | \
+      a7a75999f161c6a409ff4c5da26ad9c79fc1ffdd4e633aac87f972ad72fc85d4* | \
+      d105a16b60ecc1c67f6cc37e5bb7831ca8a08d0e602cb64dd4a1386703362385* | \
+      9844e9d22d1b4b9801965afea1eb250103cfc6f12e6e62e542ac47abd4b8094d*)
+      rm -f "$file"
+      ;;
+  esac
+done
+if [[ -d $applications ]]; then
+  update-desktop-database "$applications"
+fi
+
+# imv and mpv-mpris go. mpv stays, as Omarchy's wallpaper engine, owe, plays
+# video wallpapers through it. A mimeapps.list line naming imv.desktop stops
+# resolving, and Omarchy's default, Omaview, opens those files instead.
+omarchy-pkg-drop imv mpv-mpris
+"#,
+            ),
         ]
     }
 
@@ -3102,8 +3253,33 @@ omarchy-state set reboot-required
             std::fs::write(migrations.join(name), contents).expect("deployed migration fixture");
         }
         ensure_migrations_use_native_aur(&migrations, &markers)
-            .expect("both exact deployed scripts must use native package equivalents");
+            .expect("all exact deployed scripts must use native package equivalents");
         assert!(!markers.exists(), "preflight must not claim completion");
+    }
+
+    #[test]
+    fn media_viewer_migration_keeps_custom_and_linked_launchers() -> Result<()> {
+        let owner = private_directory();
+        let applications = owner.path().join("applications");
+        assert!(!remove_shipped_media_launchers(&applications, &[])?);
+        std::fs::create_dir(&applications)?;
+        let imv = applications.join("imv.desktop");
+        let mpv = applications.join("mpv.desktop");
+        let dotfile = owner.path().join("mpv.desktop");
+        let shipped = "unmodified vendor launch command\n";
+        let digest = hex::encode(migration_digest(shipped));
+        std::fs::write(&imv, shipped)?;
+        std::fs::write(&mpv, "modified launcher\n")?;
+        assert!(remove_shipped_media_launchers(&applications, &[&digest])?);
+        assert!(!imv.exists());
+        assert_eq!(std::fs::read_to_string(&mpv)?, "modified launcher\n");
+        std::fs::remove_file(&mpv)?;
+        std::fs::write(&dotfile, shipped)?;
+        std::os::unix::fs::symlink(&dotfile, &mpv)?;
+        assert!(remove_shipped_media_launchers(&applications, &[&digest])?);
+        assert_eq!(std::fs::read_link(&mpv)?, dotfile);
+        assert_eq!(std::fs::read_to_string(dotfile)?, shipped);
+        Ok(())
     }
 
     #[test]
@@ -3178,11 +3354,15 @@ omarchy-state set reboot-required
         assert!(markers.join("0000000000.sh").is_file());
         assert!(markers.join("1794518371.sh").is_file());
         assert!(!markers.join("1794675791.sh").exists());
+        assert!(!markers.join("1794774234.sh").exists());
         assert!(!markers.join("9999999999.sh").exists());
         recorder.calls.clear();
         recorder.fail = false;
         run_migration_plan(&plan, &markers, &mut recorder).await?;
-        assert_eq!(recorder.calls, ["1794675791.sh", "9999999999.sh"]);
+        assert_eq!(
+            recorder.calls,
+            ["1794675791.sh", "1794774234.sh", "9999999999.sh"]
+        );
         assert!(pending_migrations(&migrations, &markers)?.is_empty());
         recorder.calls.clear();
         run_migration_plan(&plan, &markers, &mut recorder).await?;
@@ -5616,6 +5796,47 @@ omarchy-state set reboot-required
             saved,
             "new slave receives saved terminal settings"
         );
+    }
+
+    #[tokio::test]
+    async fn stalled_development_fetch_releases_the_stage_for_cleanup() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let runtime = OmarchyRuntime {
+            root: directory.path().to_path_buf(),
+            migration_state: directory.path().join("markers"),
+        };
+        let shell = crate::core::privilege::root_controlled_program_path("sh")?;
+        let mut commands = Commands::new(false, runtime);
+        let early = commands
+            .run_development_checkout(
+                &shell,
+                &["-c", "exit 7"],
+                directory.path().to_path_buf(),
+                Duration::from_secs(2),
+            )
+            .await?;
+        assert_eq!(early.code(), Some(7));
+        let error = commands
+            .run_development_checkout(
+                &shell,
+                &["-c", "exec /usr/bin/sleep 1"],
+                directory.path().to_path_buf(),
+                Duration::from_millis(50),
+            )
+            .await
+            .expect_err("a stalled development helper must fail the update");
+        assert!(
+            error
+                .to_string()
+                .contains("Omarchy dev checkout update timed out")
+        );
+        assert!(
+            commands
+                .run_program(&shell, &["-c", "exit 0"])
+                .await?
+                .success()
+        );
+        Ok(())
     }
 
     #[tokio::test]

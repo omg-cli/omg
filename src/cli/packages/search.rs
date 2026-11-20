@@ -1156,12 +1156,15 @@ mod tests {
                     super::search_with_json("omg-search-fixture", false, true, false, 10).await?;
                     super::search_with_json("x", false, true, true, 10).await?;
 
-                    std::fs::write(config, "[aur\n")?;
-                    assert!(
-                        super::search_aur_packages("omg-search-fixture", false)
-                            .await
-                            .is_err()
-                    );
+                    // Both backends read this file. Keep its TOML valid and
+                    // make only the AUR settings invalid.
+                    std::fs::write(config, "[aur]\nmetadata_cache_ttl_secs = 604801\n")?;
+                    crate::package_managers::alpm_direct::clear_alpm_cache();
+                    let error = super::search_aur_packages("omg-search-fixture", false)
+                        .await
+                        .err()
+                        .context("invalid AUR cache lifetime was accepted")?;
+                    assert!(format!("{error:#}").contains("metadata_cache_ttl_secs too large"));
                     let (source, count) =
                         super::search_official_packages("omg-search-fixture", 10).await?;
                     assert_eq!(count, 1);

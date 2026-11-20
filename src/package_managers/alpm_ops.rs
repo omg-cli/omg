@@ -597,9 +597,13 @@ pub(crate) fn execute_omarchy_transaction(
     let kind = match operation {
         NativeOmarchyOperation::RefreshKeyrings
         | NativeOmarchyOperation::InstallTrayMenuDependency
-        | NativeOmarchyOperation::InstallOmnibookAudio => TransactionKind::Install,
+        | NativeOmarchyOperation::InstallOmnibookAudio
+        | NativeOmarchyOperation::InstallMediaViewer => TransactionKind::Install,
         NativeOmarchyOperation::UpgradeRepositories => TransactionKind::SystemUpgrade,
-        NativeOmarchyOperation::RemoveOrphans => TransactionKind::Remove { recursive: true },
+        NativeOmarchyOperation::RemoveOrphans
+        | NativeOmarchyOperation::RemoveLegacyMediaViewers => {
+            TransactionKind::Remove { recursive: true }
+        }
         NativeOmarchyOperation::PruneCache => anyhow::bail!("Cache pruning is not a transaction"),
     };
     execute_transaction_in(packages, kind, None, None, &[], TransactionPolicy::Omarchy)

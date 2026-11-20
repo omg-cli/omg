@@ -18,6 +18,8 @@ pub enum NativeOmarchyOperation {
     RemoveOrphans,
     InstallTrayMenuDependency,
     InstallOmnibookAudio,
+    InstallMediaViewer,
+    RemoveLegacyMediaViewers,
 }
 
 impl NativeOmarchyOperation {
@@ -30,6 +32,8 @@ impl NativeOmarchyOperation {
             "orphan-remove" => Some(Self::RemoveOrphans),
             "migration-xrandr" => Some(Self::InstallTrayMenuDependency),
             "migration-omnibook-audio" => Some(Self::InstallOmnibookAudio),
+            "migration-omaview-install" => Some(Self::InstallMediaViewer),
+            "migration-omaview-cleanup" => Some(Self::RemoveLegacyMediaViewers),
             _ => None,
         }
     }
@@ -43,6 +47,8 @@ impl NativeOmarchyOperation {
             Self::RemoveOrphans => "orphan-remove",
             Self::InstallTrayMenuDependency => "migration-xrandr",
             Self::InstallOmnibookAudio => "migration-omnibook-audio",
+            Self::InstallMediaViewer => "migration-omaview-install",
+            Self::RemoveLegacyMediaViewers => "migration-omaview-cleanup",
         }
     }
 }
@@ -154,6 +160,20 @@ pub fn execute_native_omarchy_operation(
         NativeOmarchyOperation::InstallOmnibookAudio => {
             missing_package_target("hp-omnibook-3-audio")?
         }
+        NativeOmarchyOperation::InstallMediaViewer => missing_package_target("omaview")?,
+        NativeOmarchyOperation::RemoveLegacyMediaViewers => {
+            anyhow::ensure!(
+                super::is_installed_fast("omaview")?,
+                "Omaview must be installed before removing its legacy packages"
+            );
+            let mut names = Vec::new();
+            for name in ["imv", "mpv-mpris"] {
+                if super::is_installed_fast(name)? {
+                    names.push(name.to_owned());
+                }
+            }
+            names
+        }
     };
     if operation == NativeOmarchyOperation::RefreshKeyrings {
         tokio::runtime::Builder::new_current_thread()
@@ -164,6 +184,10 @@ pub fn execute_native_omarchy_operation(
     if operation != NativeOmarchyOperation::UpgradeRepositories && targets.is_empty() {
         return Ok(());
     }
+    let removing = matches!(
+        operation,
+        NativeOmarchyOperation::RemoveOrphans | NativeOmarchyOperation::RemoveLegacyMediaViewers
+    );
     let (kind, changes) = if operation == NativeOmarchyOperation::UpgradeRepositories {
         (
             TransactionType::Update,
@@ -181,7 +205,7 @@ pub fn execute_native_omarchy_operation(
         let mut changes = Vec::new();
         for name in &targets {
             let previous = super::get_package_info(name)?;
-            let next = if operation == NativeOmarchyOperation::RemoveOrphans {
+            let next = if removing {
                 None
             } else {
                 Some(super::alpm_direct::with_handle(|handle| {
@@ -201,7 +225,7 @@ pub fn execute_native_omarchy_operation(
             });
         }
         (
-            if operation == NativeOmarchyOperation::RemoveOrphans {
+            if removing {
                 TransactionType::Remove
             } else {
                 TransactionType::Install
