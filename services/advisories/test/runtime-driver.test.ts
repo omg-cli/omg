@@ -13,6 +13,7 @@ function python(code: string) {
 test("refresh driver sends credentials only to the fixed endpoint and refreshes every approved feed", () => {
     const output = python(`
 requests = []
+job_token = "ghs_12345_fixture.header-" + "a" * 475 + ".signature_fixture"
 class Reply:
     status = 200
     def __init__(self, runtime): self.runtime = runtime
@@ -26,10 +27,10 @@ class Opener:
         assert request.get_header("Authorization") == "Bearer " + "s" * 40
         body = json.loads(request.data)
         assert set(body) == {"runtime", "github_token"}
-        assert body["github_token"] == "ghs_" + "a" * 36
+        assert body["github_token"] == job_token
         requests.append(body["runtime"])
         return Reply(body["runtime"])
-assert driver.refresh_all("ghs_" + "a" * 36, "s" * 40, Opener()) == 0
+assert driver.refresh_all(job_token, "s" * 40, Opener()) == 0
 assert requests == ["python", "rust", "ruby", "java", "bun", "deno", "zig", "erlang", "php", "swift"], requests
 print("fixed origin verified")
 `);
@@ -38,7 +39,7 @@ print("fixed origin verified")
 test("refresh driver rejects redirects, incomplete refreshes and invalid credentials without printing tokens", () => {
     const output = python(`
 secret = "s" * 40
-token = "ghs_" + "a" * 36
+token = "ghs_12345_fixture.header-" + "a" * 475 + ".signature_fixture"
 class Redirect:
     def open(self, request, timeout): raise urllib.error.HTTPError(request.full_url, 307, token + secret, {"Location": "https://attacker.invalid/"}, None)
 buffer = io.StringIO()
@@ -47,6 +48,8 @@ with contextlib.redirect_stdout(buffer), contextlib.redirect_stderr(buffer):
 assert token not in buffer.getvalue() and secret not in buffer.getvalue()
 assert driver.refresh_all("ghp_personal_token", secret, Redirect()) == 2
 assert driver.refresh_all(token, "short", Redirect()) == 2
+assert driver.refresh_all(token + "\\n", secret, Redirect()) == 2
+assert driver.refresh_all("ghs_" + "a" * 4096, secret, Redirect()) == 2
 print("secrets and redirects verified")
 `);
     expect(output).toContain("secrets and redirects verified");

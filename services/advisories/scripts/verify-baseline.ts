@@ -1,6 +1,6 @@
 import { lstat, readFile } from "node:fs/promises";
 import { parseArgs } from "node:util";
-import { object, string } from "../src/domain";
+import { isGitHubInstallationToken, object, string } from "../src/domain";
 import { baselineBinding, operatorPost, proofProgress, readCheckpoint } from "./operator";
 
 const { values }=parseArgs({options:{state:{type:"string"},"release-tag":{type:"string"},asset:{type:"string"},"max-steps":{type:"string",default:"20"},"delay-ms":{type:"string",default:"0"},help:{type:"boolean",default:false}},strict:true});
@@ -19,7 +19,7 @@ async function run() {
     const binding=baselineBinding(rawBinding,string(saved.digest),string(rawBinding.endpoint));
     readCheckpoint(saved,binding);
     const secret=process.env.RUNTIME_REFRESH_SECRET, githubToken=process.env.GITHUB_TOKEN;
-    if(!secret || secret.length<32 || !githubToken || !/^ghs_[a-zA-Z0-9]{20,255}$/.test(githubToken)) throw new Error("separate proof secret and ephemeral GitHub installation token required through environment");
+    if(!secret || secret.length<32 || !isGitHubInstallationToken(githubToken)) throw new Error("separate proof secret and ephemeral GitHub installation token required through environment");
     const body=JSON.stringify({...binding,release_tag:values["release-tag"],asset:values.asset,github_token:githubToken});
     for(let step=0;step<steps;step++) {
         const progress=proofProgress(await operatorPost({endpoint:new URL(binding.endpoint),token:secret,path:"/internal/baseline/verify",body}),{digest:binding.digest,release_tag:values["release-tag"],asset:values.asset});

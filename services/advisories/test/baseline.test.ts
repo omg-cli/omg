@@ -10,7 +10,7 @@ import { baselineImportCommands, gitBlobSha1 } from "../src/baseline";
 const now = "2026-11-13T02:00:00.000Z";
 const ingestToken = "controlled-ingest-token-at-least-32-characters";
 const refreshToken = "controlled-refresh-token-at-least-32-characters";
-const githubToken = `ghs_${"A".repeat(40)}`;
+const githubToken = `ghs_12345_fixture.header-${"A".repeat(475)}.signature_fixture`;
 const archiveDigest = "a".repeat(64);
 const commit = "1".repeat(40), rootTree = "2".repeat(40), cvesTree = "3".repeat(40);
 const yearTree = "4".repeat(40), groupTree = "5".repeat(40);
