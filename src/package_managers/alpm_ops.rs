@@ -2980,14 +2980,14 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn advisory_risk_terminal_requires_exact_attended_acceptance() -> anyhow::Result<()> {
-        const NAME: &str = "package_managers::alpm_ops::tests::advisory_risk_terminal_requires_exact_attended_acceptance";
+    fn advisory_risk_refuses_an_unattended_session() -> anyhow::Result<()> {
+        const NAME: &str =
+            "package_managers::alpm_ops::tests::advisory_risk_refuses_an_unattended_session";
         if std::env::var("OMG_ISOLATED_FIXTURE_TEST").as_deref() != Ok(NAME) {
             let output = std::process::Command::new("setsid")
                 .arg(std::env::current_exe()?)
                 .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
                 .env("OMG_ISOLATED_FIXTURE_TEST", NAME)
-                .env_remove("OMG_ADVISORY_TERMINAL_FIXTURE")
                 .output()?;
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -2997,22 +2997,25 @@ mod tests {
             );
             return Ok(());
         }
-        let mode = std::env::var("OMG_ADVISORY_TERMINAL_FIXTURE").unwrap_or_default();
-        assert!(!mode.is_empty() || std::fs::File::open("/dev/tty").is_err());
+        assert!(std::fs::File::open("/dev/tty").is_err());
         let mut signals = super::AdmissionSignals::begin()?;
-        let result = super::confirm_advisory_prompt(
+        let error = super::confirm_advisory_prompt(
             "SECURITY WARNING: fixture 1.0-1 CVE-2026-12345 https://www.cve.org/CVERecord?id=CVE-2026-12345",
             &"ab".repeat(32),
             crate::core::privilege::invoking_uid()?,
             &signals,
+        )
+        .expect_err("an unattended process cannot acknowledge package warnings");
+        let diagnostic = error.to_string();
+        assert!(
+            [
+                "Security review requires an attended controlling terminal",
+                "Security acknowledgement requires the privileged transaction owner",
+            ]
+            .iter()
+            .any(|reason| diagnostic.contains(reason)),
+            "{error:#}"
         );
-        if mode == "accept" {
-            result.expect("exact attended acceptance authorizes this review");
-        } else {
-            let error = result
-                .expect_err("missing terminal, generic yes, blank and wrong review must refuse");
-            assert!(!error.to_string().is_empty());
-        }
         signals.finish()?;
         Ok(())
     }
