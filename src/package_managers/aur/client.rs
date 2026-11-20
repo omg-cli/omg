@@ -2228,11 +2228,8 @@ impl AurClient {
             .version;
         if rebuilt != version {
             let installed = pacman_db::read_local_package(package)?;
-            Self::check_rebuilt_rollback_version(
-                package,
-                &rebuilt,
-                installed.as_ref().map(|record| &record.version),
-            )?;
+            let installed_version = installed.as_ref().map(|record| &record.version);
+            Self::check_rebuilt_rollback_version(package, &rebuilt, installed_version)?;
             crate::cli::modern_ui::print_info(&format!(
                 "Historical recipe for {package} {version} built version {rebuilt}"
             ));

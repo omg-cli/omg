@@ -2024,12 +2024,9 @@ mod tests {
                 .env("OMG_CONFIG_DIR", directory.path().join("config"))
                 .output()?;
             let stdout = String::from_utf8_lossy(&output.stdout);
-            assert!(
-                output.status.success(),
-                "{stdout}\n{}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-            assert!(stdout.contains("example restored as 2.1-1"), "{stdout}");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(output.status.success(), "{stdout}\n{stderr}");
+            assert!(stdout.contains("example restored as 1.1-1"), "{stdout}");
             return Ok(());
         }
 
@@ -2050,7 +2047,7 @@ mod tests {
             async |_, name, requested| {
                 assert_eq!(requested, "1.0-1");
                 anyhow::ensure!(name == "example", "historical source unavailable");
-                Ok("2.1-1".to_owned())
+                Ok("1.1-1".to_owned())
             },
         ));
         let error = result.expect_err("one archive could not be restored");
@@ -2064,7 +2061,7 @@ mod tests {
         assert!(entries[1].success);
         assert_eq!(entries[1].changes.len(), 1);
         assert_eq!(entries[1].changes[0].name, "example");
-        assert_eq!(entries[1].changes[0].new_version.as_deref(), Some("2.1-1"));
+        assert_eq!(entries[1].changes[0].new_version.as_deref(), Some("1.1-1"));
         Ok(())
     }
 
