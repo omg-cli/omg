@@ -296,6 +296,88 @@ class ConstructTokenDigestTests(unittest.TestCase):
             digest(0, 3)
 
 
+class MovedAurSrcinfoCoverageTests(unittest.TestCase):
+    def test_version_parser_move_preserves_the_whole_body_and_compiled_copies(self):
+        names = ('src/package_managers/aur/client.rs', 'src/package_managers/aur/history.rs')
+        for fault in (None, 'different-body', 'missing-copy', 'cold-return', 'foreign-region'):
+            with self.subTest(fault=fault):
+                work = [coverage.SOURCE_CONSTRUCT_WORK_CAPACITY]
+                sides, indexes = [], []
+                for side, filename in enumerate(names):
+                    width = 0 if side else 4
+                    opening = ('pub(super) ' if side else '    ') + 'fn srcinfo_version(content: &str) -> Option<String> {'
+                    body = 'Other' if side and fault == 'different-body' else 'None'
+                    source = ([] if side else ['impl AurClient {']) + [opening, ' ' * (width + 4) + body, ' ' * width + '}']
+                    if not side:
+                        source.append('}')
+                    first = 1 if side else 2
+                    files = {'/artifact/' + filename: filename}
+                    owners = []
+                    for copy in range(2):
+                        count = 1 if copy else 0
+                        crate = f'Cs{side + 1}{copy + 1}_7omg_lib16package_managers3aur'
+                        symbol = ('_RNvNtNtNt' + crate + '7history15srcinfo_version' if side
+                                  else '_RNvMs2_NtNtNt' + crate + '6clientNtB5_9AurClient15srcinfo_version')
+                        if side and copy and fault == 'missing-copy':
+                            continue
+                        regions = [[first, width + 1, first, len(opening) - 1, count, 0, 0, 0],
+                                   [first + 1, width + 5, first + 1, width + 9, count, 0, 0, 0],
+                                   [first + 2, width + 1, first + 2, width + 2, count, 0, 0, 0]]
+                        if side and copy and fault == 'cold-return':
+                            regions[1][4] = 0
+                        owners.append(dict(name=symbol, count=count, filenames=list(files), regions=regions))
+                    if side and fault == 'foreign-region':
+                        owners.append(dict(owners[-1], name='foreign'))
+                    sides.append((filename, coverage._construct_inventory(source, work),
+                                  {first: 1, first + 1: 1, first + 2: 1}))
+                    indexes.append(coverage.index_compiled_owner_sources(owners, files, work, {filename}))
+                proof = coverage.retained_aur_srcinfo_version(sides, indexes, work)
+                if fault is None:
+                    self.assertIsNotNone(proof)
+                    self.assertEqual((proof['base_lines'], proof['head_lines']), ([2, 3, 4], [1, 2, 3]))
+                else:
+                    self.assertIsNone(proof)
+
+
+class BudgetedReaderCoverageTests(unittest.TestCase):
+    def test_new_decoder_copy_preserves_every_existing_read_specialization(self):
+        filename = 'src/runtimes/common.rs'
+        files = {'/artifact/' + filename: filename}
+        file_reader = ('_RNvXs_NtNtCs4HrnUvSITxp_7omg_lib8runtimes6commonINtB4_14BudgetedReader'
+                       'NtNtCsjrHSEGnQ3l9_3std2fs4FileENtNtB1a_2io4Read4readB8_')
+        bzip_reader = ('_RNvXs_NtNtCs6Qq4ufU3ank_7omg_lib8runtimes6commonINtB4_14BudgetedReader'
+                       'INtNtCs9oOJ9EjQ1KU_5bzip24read14MultiBzDecoderNtNtCsjrHSEGnQ3l9_3std2fs4FileEENtNtB1U_2io4Read4readB8_')
+        for fault in (None, 'different-body', 'lost-reader', 'cold-new-reader', 'unobserved-new-state', 'missing-line'):
+            with self.subTest(fault=fault):
+                work = [coverage.SOURCE_CONSTRUCT_WORK_CAPACITY]
+                sides, indexes, inventories = [], [], []
+                for side in range(2):
+                    value = 1 if side and fault == 'different-body' else 0
+                    source = ['impl<R: Read> Read for BudgetedReader<R> {',
+                              '    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {',
+                              f'        Ok({value})', '    }', '}']
+                    symbols = [] if side and fault == 'lost-reader' else [(file_reader, (1, 1, 1))]
+                    if side:
+                        rows = (0, 0, 0) if fault == 'cold-new-reader' else (1, 0, 1) if fault == 'unobserved-new-state' else (1, 1, 1)
+                        symbols.append((bzip_reader, rows))
+                    geometry = [[2, 5, 2, len(source[1]) - 1], [3, 9, 3, 14], [4, 5, 4, 6]]
+                    owners = [dict(name=symbol, count=rows[0], filenames=list(files),
+                                   regions=[[*slot, hit, 0, 0, 0] for slot, hit in zip(geometry, rows, strict=True)])
+                              for symbol, rows in symbols]
+                    counts = {line: sum(rows[i] for _, rows in symbols) for i, line in enumerate((2, 3, 4))}
+                    if side and fault == 'missing-line':
+                        del counts[3]
+                    sides.append((source, counts, owners))
+                    indexes.append(coverage.index_compiled_owner_sources(owners, files, work, {filename}))
+                    inventories.append(coverage._construct_inventory(source, work))
+                proof = coverage.retained_budgeted_reader_copies(filename, sides, indexes, inventories.__getitem__, work)
+                if fault is None:
+                    self.assertIsNotNone(proof)
+                    self.assertEqual(proof['pairs'], [[2, 2], [3, 3], [4, 4]])
+                else:
+                    self.assertIsNone(proof)
+
+
 class RetainedNodeChecksumWaitTests(unittest.TestCase):
     def test_requires_the_signed_fetch_and_complete_compiled_await_owners(self):
         filename = 'src/runtimes/node.rs'

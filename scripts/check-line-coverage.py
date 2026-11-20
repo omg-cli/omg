@@ -916,6 +916,14 @@ def demangle_plain_rust_callbacks(symbols):
             direct_rust_callback_symbol(symbol, parent, shape.modules)
             for parent, shape in parents.items()) != 1 for symbol in symbols):
         raise ValueError('Unsupported raw Rust callback context')
+    return demangle_rust_symbols(symbols)
+
+
+def demangle_rust_symbols(symbols):
+    if (not 1 <= len(symbols) <= 256 or len(set(symbols)) != len(symbols)
+            or any(type(symbol) is not str or re.fullmatch(r'_R[A-Za-z0-9_]{1,4094}', symbol) is None
+                   for symbol in symbols)):
+        raise ValueError('Unsupported raw Rust symbols')
     payload = ('\n'.join(symbols) + '\n').encode('ascii')
     if len(payload) > 64 * 1024:
         raise ValueError('Nested callback symbol inventory exceeds bound')
@@ -13476,6 +13484,112 @@ def retained_specialization_additions(name, sides, indexes, inventory_for_side, 
                 base_types=len(base), head_types=len(head), added_types=sorted(map(repr, added)))
 
 
+def retained_budgeted_reader_copies(name, sides, indexes, inventory_for_side, work):
+    """Verify unchanged Read coverage across the additional archive decoders."""
+    container = tuple('impl < R : Read > Read for BudgetedReader < R >'.split())
+    signature = tuple('fn read ( & mut self , buf : & mut [ u8 ] ) -> std :: io :: Result < usize >'.split())
+    observations = []
+    for side, ((source, counts, owners), index) in enumerate(zip(sides, indexes, strict=True)):
+        inventory = inventory_for_side(side)
+        if inventory is None or not 1 <= len(owners) <= 256:
+            return None
+        code, rows = inventory[:2]
+        _construct_charge(work, len(rows) + sum(len(owner['regions']) + len(owner['name']) for owner in owners))
+        definitions = [row for row in rows if row['kind'] == 'fn' and row['header'] == signature]
+        scopes = [row for row in rows if row['kind'] == 'impl' and row['header'] == container
+                  and code.parents[row['opening']] is None]
+        if len(definitions) != 1 or len(scopes) != 1:
+            return None
+        method, = definitions
+        if code.parents[method['opening']] != scopes[0]['opening']:
+            return None
+        first, begin, last, end = code.region(method['first'], method['end'])
+        inventory_owners = index.inventories.get(name, ())
+        _construct_charge(work, sum(len(owner['regions']) + 1 for owner in inventory_owners))
+        touching = [owner for owner in inventory_owners if any(r[0] <= last and first <= r[2] for r in owner['regions'])]
+        roots = [owner for owner in touching if owner['name'].startswith('_RNvX')]
+        if {id(owner) for owner in roots} != {id(owner) for owner in owners}:
+            return None
+        symbols = tuple(owner['name'] for owner in touching)
+        _construct_charge(work, sum(len(symbol) + 1 for symbol in symbols))
+        if any(not symbol.startswith(('_RNvX', '_RNCNvX')) for symbol in symbols):
+            return None
+        try:
+            labels, decoder = demangle_rust_symbols(symbols)
+        except ValueError:
+            return None
+        groups = {}; layouts = set(); projection = Counter()
+        copies = {}
+        observer = _ObserverWork(work)
+        for owner in touching:
+            symbol = owner['name']; hits = owner['count']; regions = owner['regions']
+            if (index.name_counts[symbol] != 1 or not 0 <= hits < COUNTER_LIMIT
+                    or len(owner['filenames']) != 1 or index.files.get(owner['filenames'][0]) != name
+                    or owner.get('branches') or owner.get('mcdc_records')
+                    or any(r[5:] != [0, 0, 0] or not (first, begin) <= tuple(r[:2]) < tuple(r[2:4]) <= (last, end)
+                           or not 0 <= r[4] < COUNTER_LIMIT for r in regions)):
+                return None
+            label = labels[symbol]
+            parent, marker, ordinal = label.partition('::{closure#')
+            if (bool(marker) != symbol.startswith('_RNCNvX')
+                    or marker and re.fullmatch(r'[0-9]{1,3}\}', ordinal) is None):
+                return None
+            members = copies.setdefault(parent, {})
+            role = int(ordinal[:-1]) if marker else -1
+            if role in members:
+                return None
+            members[role] = owner
+        _construct_charge(work, method['end'] - method['opening'] + 1)
+        closures = sum(code.words[token - 3:token + 1] == ['|', '_', '|', '{']
+                       for token in range(method['opening'] + 1, method['end']))
+        for parent, members in copies.items():
+            label = re.sub(r'\[[0-9a-f]+\]', '', parent)
+            if (not label.startswith('<omg_lib::runtimes::common::BudgetedReader<')
+                    or not label.endswith('> as std::io::Read>::read')
+                    or set(members) != set(range(-1, closures))):
+                return None
+            if any(owner['count'] > members[-1]['count'] for owner in members.values()):
+                return None
+            layout = []; states = []; regions = []
+            for _, owner in sorted(members.items()):
+                slots, hits = fragment_region_states(owner, first, last, source, work)
+                layout.append(slots)
+                states.extend((int(owner['count'] > 0), *hits))
+                regions.extend(owner['regions'])
+            groups.setdefault(label, []).append(tuple(states))
+            layouts.add(tuple(layout))
+            projection.update(_owner_line_counts({'regions': regions}, observer))
+        _construct_charge(work, last - first + 1)
+        expected = {line: counts[line] for line in range(first, last + 1) if line in counts}
+        if len(layouts) != 1 or not expected or projection != expected:
+            return None
+        observations.append((source[first - 1:last], next(iter(layouts)), groups, sorted(expected), decoder))
+    before, after = observations
+    if before[:2] != after[:2] or before[4] != after[4] or len(before[3]) != len(after[3]):
+        return None
+    original, current = before[2], after[2]
+    added = current.keys() - original.keys()
+    if not added or original.keys() - current.keys():
+        return None
+    # Each new decoder must actually exercise one of the already observed read
+    # paths. I/O failure at the decoder and impossible usize conversion remain
+    # observable separately, even when the Read implementation is unchanged.
+    known_states = {state for values in original.values() for state in values if state[0]}
+    if any(state not in known_states for role in added for state in current[role]):
+        return None
+    matching = {}
+    for role, states in original.items():
+        _construct_charge(work, len(states) * len(current[role]) * len(states[0]))
+        match = compiled_hit_state_matching(states, current[role])
+        if match is None:
+            return None
+        matching[role] = match
+    return dict(file=name, kind='retained-budgeted-reader-copies',
+                pairs=[list(pair) for pair in zip(before[3], after[3], strict=True)],
+                base_states=original, head_states=current, instance_matching=matching,
+                added_consumers=sorted(added), decoder=before[4])
+
+
 _AUR_METADATA_POLICY = 'if !self.settings.aur.use_metadata_archive {'
 _AUR_CLIENT_NAMESPACE = ('type', ('type', ('type', ('crate', 'omg_lib'), ('package_managers', '')),
                                  ('aur', '')), ('client', ''))
@@ -14595,6 +14709,105 @@ def retained_aur_history_diagnostic(sides, indexes, work):
                 summary_credit=[0, 0], mapped_credit=[0, 0], instance_matching=matching)
 
 
+def retained_aur_srcinfo_version(sides, indexes, work):
+    """Match the version parser and its closures when moved out of AurClient."""
+    declaration = 'srcinfo_version'
+    signature = f'fn {declaration} ( content : & str ) -> Option < String >'.split()
+    observations = []
+    for modern, ((name, inventory, counts), index) in enumerate(zip(sides, indexes, strict=True)):
+        code, rows = inventory[:2]
+        header = ('pub ( super )'.split() + signature) if modern else signature
+        _construct_charge(work, len(rows))
+        definitions = [row for row in rows if row['kind'] == 'fn' and row['header'] == tuple(header)]
+        if len(definitions) != 1:
+            return None
+        function, = definitions
+        first, opening, end = (function[field] for field in ('first', 'opening', 'end'))
+        ancestry = _construct_ancestors(code, first, work)
+        scopes = [row['header'] for row in rows if row['opening'] in ancestry]
+        if scopes != ([] if modern else [('impl', 'AurClient')]) or len(ancestry) != len(scopes):
+            return None
+        entry = code.region(first, opening - 1)
+        start, indent = entry[:2]
+        stop = code.region(end, end)[2]
+        whole = code.region(first, end)
+        owners = index.inventories.get(name, ())
+        _construct_charge(work, sum(len(owner['name']) + len(owner['regions']) + 1 for owner in owners))
+        affected = [owner for owner in owners if any(r[0] <= stop and start <= r[2] for r in owner['regions'])]
+        roots = []
+        for owner in affected:
+            if modern:
+                shape = plain_rust_function_symbol(owner['name'])
+                qualified = shape is not None and shape.identifiers == ('omg_lib', 'package_managers', 'aur', 'history', declaration)
+            else:
+                shape = nominal_method_path(owner['name'])
+                qualified = (shape is not None and shape.kind == 'M' and not shape.callbacks
+                             and shape.namespace == _AUR_CLIENT_NAMESPACE
+                             and shape.self_type == ('type', _AUR_CLIENT_NAMESPACE, ('AurClient', ''))
+                             and shape.method == (declaration, ''))
+            if qualified:
+                roots.append((owner, shape))
+        if not 1 <= len(roots) <= 16:
+            return None
+        covered = set(); layouts = []; states = []; witnesses = []
+        _construct_charge(work, len(roots) * sum(len(owner['name']) + 1 for owner in affected))
+        for root, parent in roots:
+            copies = {}
+            for owner in affected:
+                if owner is root:
+                    scope = ()
+                elif modern:
+                    if not direct_rust_callback_symbol(owner['name'], root['name'], parent.modules):
+                        continue
+                    suffix = owner['name'][len(root['name']) + 2:]
+                    role = re.match(r's[0-9A-Za-z]{0,32}_', suffix)
+                    scope = (role[0] if role else '',)
+                else:
+                    child = nominal_method_path(owner['name'])
+                    if child is None or child.copy_identity != parent.copy_identity or len(child.callbacks) != 1:
+                        continue
+                    scope = child.callbacks
+                regions = owner['regions']
+                if (scope in copies or id(owner) in covered or index.name_counts[owner['name']] != 1
+                        or len(owner['filenames']) != 1 or index.files.get(owner['filenames'][0]) != name
+                        or owner.get('branches') or owner.get('mcdc_records') or not 0 <= owner['count'] < COUNTER_LIMIT
+                        or any(r[5:] != [0, 0, 0] or not whole[:2] <= tuple(r[:2]) < tuple(r[2:4]) <= whole[2:]
+                               or not 0 <= r[4] < COUNTER_LIMIT for r in regions)):
+                    return None
+                if owner is root and regions[0] != [*entry, owner['count'], 0, 0, 0]:
+                    return None
+                _construct_charge(work, len(regions))
+                shape = tuple((0, 0, 0, 0) if tuple(r[:4]) == entry else
+                              (r[0] - start, r[1] - indent, r[2] - start, r[3] - indent) for r in regions)
+                copies[scope] = (owner['name'], shape, tuple(int(r[4] > 0) for r in regions))
+                covered.add(id(owner))
+            if () not in copies:
+                return None
+            ordered = sorted(copies.items())
+            layouts.append(tuple((scope, member[1]) for scope, member in ordered))
+            states.append(tuple(state for _, member in ordered for state in member[2]))
+            witnesses.append([member[0] for _, member in ordered])
+        if len(covered) != len(affected) or len(set(layouts)) != 1:
+            return None
+        projected = _owner_line_counts({'regions': [r for owner in affected for r in owner['regions']]},
+                                       _ObserverWork(work))
+        _construct_charge(work, stop - start + end - opening + 1)
+        expected = {line: counts[line] for line in range(start, stop + 1) if line in counts}
+        if projected != expected or not any(projected.values()):
+            return None
+        observations.append((code.words[opening:end + 1], layouts[0], states, sorted(expected), witnesses))
+    before, after = observations
+    if before[:2] != after[:2] or not before[2] or not after[2]:
+        return None
+    _construct_charge(work, len(before[2]) * len(after[2]) * len(before[2][0]))
+    matching = compiled_hit_state_matching(before[2], after[2])
+    if matching is None or len(before[3]) != len(after[3]):
+        return None
+    return dict(file=sides[0][0], head_file=sides[1][0], kind='retained-aur-srcinfo-version',
+                base_lines=before[3], head_lines=after[3], owners=[before[4], after[4]],
+                summary_credit=[0, 0], mapped_credit=[0, 0], instance_matching=matching)
+
+
 def retained_aur_hook_rendering(name, sides, indexes, work):
     """Observe hook text rendering after the same bounded UTF-8 read."""
     function_name = 'declared_install_hook_previews'
@@ -15104,12 +15317,17 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
                     proof = retained_specialization_additions(name, ((old, before, previous), (new, after, current)),
                         source_owner_indexes(), inventory_for_side, construct_work, path_reference=path_reference) if (
                             path_reference or default_trait) else None
+                    if (proof is None and name == 'src/runtimes/common.rs'
+                            and declaration == '    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {'):
+                        proof = retained_budgeted_reader_copies(name, ((old, before, previous), (new, after, current)),
+                            source_owner_indexes(), inventory_for_side, construct_work)
                     if proof is not None:
                         for line, target in proof['pairs']:
                             if line in anchored and anchored[line] != target:
                                 raise ValueError('Ambiguous retained specialization owner')
                             anchored[line] = target
-                        key = 'additive_path_reference_copies' if path_reference else 'additive_trait_copies'
+                        key = ('additive_budgeted_reader_copies' if proof.get('kind') == 'retained-budgeted-reader-copies'
+                               else 'additive_path_reference_copies' if path_reference else 'additive_trait_copies')
                         specialization_receipts.setdefault(key, []).append(proof)
                         continue
                     if name=='src/core/security/vulnerability.rs' and 'fetch_alsa_issues(' in declaration:
@@ -15463,6 +15681,10 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
                         if (proof is None and name == 'src/package_managers/aur/client.rs'
                                 and old[line - 1].strip() == 'format!(' and _AUR_HISTORY_SOURCE not in base_sources):
                             moved_target = _AUR_HISTORY_SOURCE, retained_aur_history_diagnostic
+                        elif (proof is None and name == 'src/package_managers/aur/client.rs'
+                              and old[line - 1].strip() == 'let mut epoch: Option<&str> = None;'
+                              and _AUR_HISTORY_SOURCE not in base_sources):
+                            moved_target = _AUR_HISTORY_SOURCE, retained_aur_srcinfo_version
                         elif proof is None and name == _AUR_DEPS_SOURCE and old[line - 1].strip() == 'return true;':
                             _construct_charge(construct_work, len(new))
                             alias = 'use super::types::{dependency_version_satisfies as output_version_satisfies, provision_satisfies};'
