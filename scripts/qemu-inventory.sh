@@ -3,9 +3,9 @@
 # running QEMU guest over SSH and record machine-readable evidence.
 #
 # The guest must already be up (see scripts/benchmark-qemu.sh, which calls
-# this when --inventory-tiers is set). Rows run in file order so the
-# TSV `requires` DAG is satisfied naturally. Disposable guests make
-# package/service-mutation rows safe, but they still need --allow-mutations.
+# this when --inventory-tiers is set). Prerequisites replay inside each row.
+# Independent live runtime installs can be deferred to a parallel phase.
+# Package/service mutation rows still require --allow-mutations.
 set -euo pipefail
 # BEGIN PRODUCT OUTPUT ORACLE
 # This exact function is sent to the guest and exercised by fault-injection tests.
@@ -2303,6 +2303,7 @@ work=""; distro=""; tiers=""; tag=""; binary=""; native_binary=""; tsv=""
 allow_mutations=false
 allow_credentialed=false
 isolate_hermetic=false
+parallel_runtime_installs=false
 network_scope=unconfined
 network_policy=""
 row_timeout=120
@@ -2324,6 +2325,7 @@ while (($#)); do
     --allow-mutations) allow_mutations=true; shift ;;
     --allow-credentialed) allow_credentialed=true; shift ;;
     --isolate-hermetic) isolate_hermetic=true; shift ;;
+    --parallel-runtime-installs) parallel_runtime_installs=true; shift ;;
     --help) printf 'Usage: qemu-inventory.sh --work DIR --distro D --tiers CSV --tag TAG --binary GUEST_PATH --tsv FILE [--allow-mutations] [--allow-credentialed] [--row-timeout S]\nRuns TSV-selected rows in the guest at 127.0.0.1 and writes evidence.\n'; exit 0 ;;
     *) printf 'error: unknown argument %s\n' "$1" >&2; exit 2 ;;
   esac
@@ -2342,6 +2344,10 @@ case "$distro" in arch|debian|debian-trixie|ubuntu|fedora) ;; *) exit 2 ;; esac
 backend_family=$distro
 if [[ "$distro" == debian-trixie ]]; then backend_family=debian; fi
 for tool in ssh jq timeout sha256sum; do command -v "$tool" >/dev/null || exit 3; done
+if [[ "$parallel_runtime_installs" == true ]]; then
+  [[ "$isolate_hermetic" == true && "$ssh_user" != root ]] || exit 2
+  command -v flock >/dev/null || exit 3
+fi
 overlap_fixture=$(jq -rn --rawfile fixture "$(dirname "$0")/workspace-overlap-fixture.sh" '$fixture | @sh')
 license_oracle_path="$(dirname "$0")/qemu-license-oracle.py"
 license_oracle=$(jq -rn --rawfile fixture "$license_oracle_path" '$fixture | @sh')
@@ -2396,13 +2402,20 @@ want=",$tiers,"
 summary_tmp="$out/results.json"
 printf '[]' > "$summary_tmp"
 printf '{"complete":false}\n' > "$out/summary.json"
-pass=0; fail=0; skipped=0
-record() { # case_id result exit_code elapsed
+parallel_active=false
+append_record() { # case_id result exit_code elapsed
   local entry
   entry=$(jq -n --arg c "$1" --arg d "$distro" --arg r "$2" --argjson e "$3" --argjson s "$4" --arg scope "$network_scope" \
     '{case_id:$c, distro:$d, result:$r, artifact_source:"inventory", exit_code:$e, elapsed_seconds:$s, network_scope:$scope}')
   jq --slurpfile e <(printf '%s' "$entry") '. + [$e[0]]' "$summary_tmp" > "$summary_tmp.next"
   mv "$summary_tmp.next" "$summary_tmp"
+}
+record() {
+  if [[ "$parallel_active" == true ]]; then
+    (flock -x 9 || exit 3; append_record "$@") 9>"$out/.result-lock"
+  else
+    append_record "$@"
+  fi
 }
 
 # Prerequisite lookup for requires-chain replay (see below): id to the
@@ -2775,11 +2788,55 @@ prereq_runnable() { # id -> 0 when replayable
   return 0
 }
 
-# Process substitution (not a pipeline): pass/fail counters below must
-# survive the loop; a `tail | while` pipeline would trap them in a subshell.
+# Process substitution keeps deferred cases in this shell for the next phase.
 local_oracle_source=$(jq -Rrs '@sh' "$(dirname "${BASH_SOURCE[0]}")/qemu-local-oracle.py")
 runtime_fixture_source=$(jq -Rrs '@sh' "$runtime_fixture_path")
 runtime_consent_source=$(jq -Rrs '@sh' "$(dirname "${BASH_SOURCE[0]}")/qemu-runtime-advisory-oracle.py")
+run_prepared_row() {
+  local transport=0 elapsed verdict rc receipt phase assertion_rc uptime start_centis
+  # Uptime is monotonic even if WSL steps the wall clock.
+  read -r uptime _ < /proc/uptime
+  start_centis=${uptime/./}
+  if ((receiver_status != 0)); then
+    transport=$receiver_status
+    : > "$out/rows/$case.stdout.log"
+    printf 'error: invalid or oversized inventory row program\n' > "$out/rows/$case.stderr.log"
+  else
+    # opts[0] is -n. Remove it only for this explicit pipe: SSH receives the
+    # exact program, never this TSV loop's stdin. The verified body sees EOF.
+    builtin printf '%s' "$row_program" | timeout --kill-after=5s "$budget" ssh "${opts[@]:1}" "$target" "$remote" > "$out/rows/$case.stdout.log" 2> "$out/rows/$case.stderr.log" || transport=$?
+  fi
+  read -r uptime _ < /proc/uptime
+  elapsed=$(( (10#${uptime/./} - 10#$start_centis) / 100 ))
+  verdict=HARNESS_ERROR; rc=$transport
+  receipt=$(tail -n 1 "$out/rows/$case.stdout.log")
+  if [[ "$transport" == 0 && "$receipt" =~ ^OMG_QEMU_RECEIPT:(product|executor|dependency):([0-9]{1,3}):([01])$ ]]; then
+    phase=${BASH_REMATCH[1]}; rc=${BASH_REMATCH[2]}; assertion_rc=${BASH_REMATCH[3]}
+    verdict=FAIL
+    if [[ "$phase" == dependency ]]; then verdict=BLOCKED
+    elif [[ "$phase" == executor ]]; then
+      [[ "$rc" == 124 || "$rc" == 137 ]] || verdict=HARNESS_ERROR
+    elif [[ "$rc" == "${row_exit[$case]}" && "$assertion_rc" == 0 ]]; then
+      verdict=PASS
+      if [[ "$assertions" == json-stdout && "$rc" == 0 ]]; then
+        head -n -1 "$out/rows/$case.stdout.log" | jq -e -s 'length == 1' >/dev/null 2>&1 || verdict=FAIL
+      fi
+    fi
+  fi
+  write_row_log "$out/rows/$case.log" "$out/rows/$case.stdout.log" "$out/rows/$case.stderr.log" "$case" "$verdict"
+  record "qemu-$distro-$case" "$verdict" "$rc" "$elapsed"
+  printf 'case=%s exit=%s verdict=%s\n' "$case" "$rc" "$verdict"
+}
+
+declare -a runtime_cases=()
+declare -A runtime_programs=() runtime_commands=() runtime_budgets=() runtime_receiver_status=()
+run_deferred_runtime() {
+  local case=$1 assertions=${row_assertions[$1]} network_scope=network
+  local row_program=${runtime_programs[$1]} remote=${runtime_commands[$1]}
+  local budget=${runtime_budgets[$1]} receiver_status=${runtime_receiver_status[$1]}
+  run_prepared_row
+}
+
 while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux requires tier targets assertions cleanup; do
   # Case ids flow into a remote shell command below: reject anything
   # outside the identifier shape instead of executing it.
@@ -2788,7 +2845,7 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
     # Sanitized id: one bad TSV row must fail loudly without poisoning
     # the whole results file for the downstream schema gate.
     safe="invalid-$(printf '%s' "$case" | tr -c 'a-z0-9-' '-' | cut -c1-80)"
-    record "qemu-$distro-$safe" FAIL -1 0; fail=$((fail+1)); continue
+    record "qemu-$distro-$safe" FAIL -1 0; continue
   fi
   # Tier filter (tiers are comma-separated in the TSV too).
   hit=false
@@ -2803,7 +2860,7 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   fi
   # Declaration-only rows are parse-level, covered by cli_comprehensive.
   if [[ "$expected_ux" == declared ]]; then
-    record "qemu-$distro-$case" SKIPPED -1 0; skipped=$((skipped+1)); continue
+    record "qemu-$distro-$case" SKIPPED -1 0; continue
   fi
   # Per-distro target status.
   status=""
@@ -2815,21 +2872,21 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
     done
   fi
   if [[ -z "$status" || "$status" == pending || "$status" == not-applicable ]]; then
-    record "qemu-$distro-$case" SKIPPED -1 0; skipped=$((skipped+1)); continue
+    record "qemu-$distro-$case" SKIPPED -1 0; continue
   fi
-  case "$status" in pass|known-defect) ;; *) record "qemu-$distro-$case" HARNESS_ERROR -1 0; fail=$((fail+1)); continue ;; esac
+  case "$status" in pass|known-defect) ;; *) record "qemu-$distro-$case" HARNESS_ERROR -1 0; continue ;; esac
   # Credentialed rows need a real token in the guest: never run them
   # without an explicit opt-in (tiers match by substring, so "network"
   # would otherwise select "network,credentialed" rows).
   if [[ ",$tier," == *",credentialed,"* && "$allow_credentialed" == false ]]; then
-    record "qemu-$distro-$case" SKIPPED -1 0; skipped=$((skipped+1)); continue
+    record "qemu-$distro-$case" SKIPPED -1 0; continue
   fi
   # Safety gate.
   case "$safety" in
-    interactive) record "qemu-$distro-$case" SKIPPED -1 0; skipped=$((skipped+1)); continue ;;
+    interactive) record "qemu-$distro-$case" SKIPPED -1 0; continue ;;
     package-mutation|service-mutation)
       if [[ "$allow_mutations" == false ]]; then
-        record "qemu-$distro-$case" SKIPPED -1 0; skipped=$((skipped+1)); continue
+        record "qemu-$distro-$case" SKIPPED -1 0; continue
       fi ;;
   esac
   chain=()
@@ -2845,7 +2902,7 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   done
   if [[ "$blocked" == true ]]; then
     printf 'dependency %s is gated\n' "$next" > "$out/rows/$case.log"
-    record "qemu-$distro-$case" BLOCKED -1 0; fail=$((fail+1)); continue
+    record "qemu-$distro-$case" BLOCKED -1 0; continue
   fi
 
   # Quote each literal segment, substituting only the documented ROOT token.
@@ -2859,6 +2916,20 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   quoted_binary_dir=$(jq -rn --arg b "${row_binary%/*}" '$b | @sh')
   export -n remote row_program
   remote="set -eu; export OMG_QEMU_EXECUTABLE=$quoted_binary OMG_QEMU_DISTRO='$distro'; rowdir=\$(mktemp -d \"\$HOME/inventory-$case.XXXXXX\"); cd \"\$rowdir\""
+  defer_runtime=false
+  case "$case" in
+    runtime-rust-install|runtime-node-install|runtime-go-install|runtime-python-install)
+      if [[ "$parallel_runtime_installs" == true && "$network_scope" == network &&
+            "$safety" == isolated-write && "$requires" == - && "$cleanup" == tempdir-drop ]]; then
+        defer_runtime=true
+        remote+="; [[ \$(id -u) != 0 ]] || exit 2; export TMPDIR=\"\$rowdir/runtime-tmp\" OMG_DISABLE_DAEMON=1"
+        remote+=" XDG_CACHE_HOME=\"\$rowdir/xdg-cache\" XDG_CONFIG_HOME=\"\$rowdir/xdg-config\" XDG_DATA_HOME=\"\$rowdir/xdg-data\" XDG_STATE_HOME=\"\$rowdir/xdg-state\""
+        remote+="; unset XDG_RUNTIME_DIR; mkdir -m 700 \"\$TMPDIR\""
+        if [[ "$case" != runtime-rust-install ]]; then
+          remote+="; export HOME=\"\$rowdir/runtime-home\"; mkdir -m 700 \"\$HOME\""
+        fi
+      fi ;;
+  esac
   if [[ "$man_page_mode" == exact ]]; then remote+="; export OMG_QEMU_EXACT_MAN_PAGES=1"; fi
   if [[ "$assertions" == container-run-argv || "$assertions" == container-shell-argv || "$assertions" == container-build-argv ]]; then
     remote+="; mkdir -p \"\$rowdir/engine\"; printf '%s' $container_engine > \"\$rowdir/engine/podman\"; chmod 700 \"\$rowdir/engine/podman\"; ln -s /bin/false \"\$rowdir/engine/docker\""
@@ -3374,12 +3445,6 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
       fi
     fi
   fi
-  # Bash SECONDS follows wall-clock adjustments; WSL can step that clock
-  # backwards while a guest case runs. /proc/uptime uses boot-time monotonic
-  # time, so a passing case cannot acquire a negative elapsed duration.
-  read -r uptime _ < /proc/uptime
-  start_centis=${uptime/./}
-  transport=0
   budget=$(( (row_timeout + 5) * ${#chain[@]} + command_timeout + 20 ))
   # Two trusted setcap operations have independent 10-second setup deadlines.
   # Preserve the actual Doctor command's original row deadline.
@@ -3411,42 +3476,43 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   fi
   if [[ "$case" == runtime-go-install ]]; then budget=$((budget + 210)); fi
   if [[ ( "$distro" == debian || "$distro" == debian-trixie || "$distro" == ubuntu ) && ( "$case" == update-fast || "$case" == update-turbo ) ]]; then budget=$((budget + 60)); fi
-  if ((receiver_status != 0)); then
-    transport=$receiver_status
-    : > "$out/rows/$case.stdout.log"
-    printf 'error: invalid or oversized inventory row program\n' > "$out/rows/$case.stderr.log"
+  if [[ "$defer_runtime" == true ]]; then
+    runtime_cases+=("$case")
+    runtime_programs[$case]=$row_program
+    runtime_commands[$case]=$remote
+    runtime_budgets[$case]=$budget
+    runtime_receiver_status[$case]=$receiver_status
   else
-    # opts[0] is -n. Remove it only for this explicit pipe: SSH receives the
-    # exact program, never this TSV loop's stdin. The verified body sees EOF.
-    builtin printf '%s' "$row_program" | timeout --kill-after=5s "$budget" ssh "${opts[@]:1}" "$target" "$remote" > "$out/rows/$case.stdout.log" 2> "$out/rows/$case.stderr.log" || transport=$?
+    run_prepared_row
   fi
-  read -r uptime _ < /proc/uptime
-  elapsed=$(( (10#${uptime/./} - 10#$start_centis) / 100 ))
-  verdict=HARNESS_ERROR; rc=$transport
-  receipt=$(tail -n 1 "$out/rows/$case.stdout.log")
-  if [[ "$transport" == 0 && "$receipt" =~ ^OMG_QEMU_RECEIPT:(product|executor|dependency):([0-9]{1,3}):([01])$ ]]; then
-    phase=${BASH_REMATCH[1]}; rc=${BASH_REMATCH[2]}; assertion_rc=${BASH_REMATCH[3]}
-    verdict=FAIL
-    if [[ "$phase" == dependency ]]; then verdict=BLOCKED
-    elif [[ "$phase" == executor ]]; then
-      [[ "$rc" == 124 || "$rc" == 137 ]] || verdict=HARNESS_ERROR
-    elif [[ "$rc" == "${row_exit[$case]}" && "$assertion_rc" == 0 ]]; then
-      verdict=PASS
-      if [[ "$assertions" == json-stdout && "$rc" == 0 ]]; then
-        head -n -1 "$out/rows/$case.stdout.log" | jq -e -s 'length == 1' >/dev/null 2>&1 || verdict=FAIL
-      fi
-    fi
-  fi
-  write_row_log "$out/rows/$case.log" "$out/rows/$case.stdout.log" "$out/rows/$case.stderr.log" "$case" "$verdict"
-  record "qemu-$distro-$case" "$verdict" "$rc" "$elapsed"
-  if [[ "$verdict" == PASS ]]; then pass=$((pass+1)); else fail=$((fail+1)); fi
-  printf 'case=%s exit=%s verdict=%s\n' "$case" "$rc" "$verdict"
 done < <(tail -n +2 "$tsv")
-if ((pass + fail == 0)); then
-  record "qemu-$distro-inventory-selection" HARNESS_ERROR -1 0
-  fail=$((fail+1))
+if ((${#runtime_cases[@]} > 0)); then
+  # Package and service rows are complete. Give Rust its own SSH process
+  # while the other live installs retain their serial order.
+  parallel_active=true
+  runtime_rust_pid=
+  read -r runtime_start _ < /proc/uptime
+  if [[ -v 'runtime_programs[runtime-rust-install]' && ${#runtime_cases[@]} -gt 1 ]]; then
+    run_deferred_runtime runtime-rust-install </dev/null &
+    runtime_rust_pid=$!
+  fi
+  for case in "${runtime_cases[@]}"; do
+    [[ "$case" == runtime-rust-install && -n "$runtime_rust_pid" ]] && continue
+    run_deferred_runtime "$case"
+  done
+  if [[ -n "$runtime_rust_pid" ]]; then wait "$runtime_rust_pid"; fi
+  read -r runtime_end _ < /proc/uptime
+  concurrent=false
+  [[ -z "$runtime_rust_pid" ]] || concurrent=true
+  printf 'runtime-install-phase rows=%s concurrent=%s wall_centiseconds=%s\n' \
+    "${#runtime_cases[@]}" "$concurrent" "$((10#${runtime_end/./} - 10#${runtime_start/./}))"
 fi
-printf '{"complete":true,"pass":%s,"fail":%s,"skipped":%s}\n' "$pass" "$fail" "$skipped" > "$out/summary.json.next"
+if jq -e 'all(.[]; .result == "SKIPPED")' "$summary_tmp" >/dev/null; then
+  record "qemu-$distro-inventory-selection" HARNESS_ERROR -1 0
+fi
+jq '{complete:true,pass:map(select(.result=="PASS"))|length,
+     fail:map(select(.result!="PASS" and .result!="SKIPPED"))|length,
+     skipped:map(select(.result=="SKIPPED"))|length}' "$summary_tmp" > "$out/summary.json.next"
 mv "$out/summary.json.next" "$out/summary.json"
 cat "$out/summary.json"
-[[ "$fail" -eq 0 ]]
+jq -e '.fail == 0' "$out/summary.json" >/dev/null

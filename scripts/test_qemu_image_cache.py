@@ -358,7 +358,7 @@ docker() {
                            image_cache_budget_bytes='17', fedora_sqlite_bundle='/checked-sqlite', staged_dir='', release_dir='',
                            inventory_file='', inventory_policy='', image_policy='', benchmark='false',
                            transaction_samples='0', inventory_tiers='', inventory_mutations='false',
-                           inventory_isolation='false', storage_faults='false', restrict_egress='false',
+                           inventory_isolation='false', parallel_runtime_installs='false', storage_faults='false', restrict_egress='false',
                            allow_tcg='false')
         result = subprocess.run(['/bin/bash', '-euo', 'pipefail', '-c', script],
                                 env=environment, capture_output=True, text=True, timeout=10)

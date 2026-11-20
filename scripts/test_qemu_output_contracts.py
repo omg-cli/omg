@@ -3652,7 +3652,7 @@ printf '%s\\n' 'Error: No omg.lock file found' 'Error: 1 project(s) need attenti
     def test_offline_doctor_launch_admits_only_exact_capability_cleanup(self):
         source = (ROOT / 'scripts/qemu-inventory.sh').read_text(encoding='utf-8')
         start = source.index('  if [[ "$network_scope" == offline ]]; then\n')
-        launch = source[start:source.index('  # Bash SECONDS', start)]
+        launch = source[start:source.index('  budget=$(', start)]
         defaults = dict(distro='debian', case='doctor-turbo', safety='isolated-write',
                         assertions='doctor-capability-cleanup', expected_ux='pass',
                         requires='-', tier='container',
@@ -3716,7 +3716,7 @@ export -f sudo unshare setpriv
     def test_offline_doctor_rejects_an_initial_root_user_before_sudo(self):
         source = (ROOT / 'scripts/qemu-inventory.sh').read_text(encoding='utf-8')
         start = source.index('  if [[ "$network_scope" == offline ]]; then\n')
-        launch = source[start:source.index('  # Bash SECONDS', start)]
+        launch = source[start:source.index('  budget=$(', start)]
         setup = '''
 distro=debian; case=doctor-turbo; safety=isolated-write
 assertions=doctor-capability-cleanup; expected_ux=pass; requires=-
@@ -3738,7 +3738,7 @@ export -f id sudo
     def test_offline_preview_launch_admits_only_the_exact_fedora_dry_run(self):
         source = (ROOT / 'scripts/qemu-inventory.sh').read_text(encoding='utf-8')
         start = source.index('  if [[ "$network_scope" == offline ]]; then\n')
-        launch = source[start:source.index('  # Bash SECONDS', start)]
+        launch = source[start:source.index('  budget=$(', start)]
         defaults = dict(distro='fedora', case='remove', safety='read',
                         assertions='package-dry-run-remove', expected_ux='pass',
                         requires='-', tier='hermetic', targets='hermetic:pass',
@@ -3938,7 +3938,57 @@ printf 'Usage: fixture\\n'
                 if expected != 'PASS':
                     self.assertFalse(any('OMG_QEMU_RECEIPT:product:' in value for value in logs.values()), logs)
 
-    def run_inventory(self, product, rows, *, native_commands=None, home_files=None, distro='arch', tiers='hermetic', row_timeout=None, allow_mutations=False, fake_tree_binary=False, exact_man=True, binary_name='product', isolation_scope=None, ssh_body=None):
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_live_runtime_phase_overlaps_and_keeps_every_verdict(self):
+        ids = {'runtime-rust-install', 'runtime-python-install', 'runtime-node-install', 'runtime-go-install'}
+        rows = [row for row in (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8').splitlines()
+                if row.split('\t', 1)[0] in ids]
+        self.assertEqual(len(rows), len(ids))
+        rows.append('help\t["--help"]\thelp-boundary\t0\tpass\t-\thermetic\thermetic:pass\t-\ttempdir-drop')
+        transport = r'''
+program=$(cat)
+wait_for() {
+  for ((attempt=0;attempt<150;attempt++)); do
+    [[ -f "$1" ]] && return 0
+    sleep .02
+  done
+  return 1
+}
+if [[ "$program" == *'/inventory-help.'* ]]; then
+  touch "$HOME/serial-done"
+  printf 'OMG_QEMU_RECEIPT:product:0:0\n'
+  exit 0
+fi
+[[ -f "$HOME/serial-done" && "$program" == *'runtime-tmp'* &&
+   "$program" == *'runtime-home'* && "$program" == *'OMG_DISABLE_DAEMON=1'* ]] || exit 97
+if [[ "$program" == *'/inventory-runtime-rust-install.'* ]]; then
+  touch "$HOME/rust-started"
+  wait_for "$HOME/python-started" || exit 98
+  printf 'OMG_QEMU_RECEIPT:product:%s:0\n' RUST_EXIT
+else
+  wait_for "$HOME/rust-started" || exit 99
+  if [[ "$program" == *'/inventory-runtime-python-install.'* ]]; then
+    touch "$HOME/python-started"
+  fi
+  printf 'OMG_QEMU_RECEIPT:product:0:0\n'
+fi
+'''
+        for rust_exit in (0, 23):
+            with self.subTest(rust_exit=rust_exit):
+                result, evidence, logs = self.run_inventory(
+                    'exit 97\n', rows, tiers='hermetic,container', isolation_scope='network',
+                    parallel_runtime_installs=True, ssh_body=transport.replace('RUST_EXIT', str(rust_exit)))
+                self.assertEqual(result.returncode, int(bool(rust_exit)), result.stdout + result.stderr)
+                self.assertIn('runtime-install-phase rows=4 concurrent=true', result.stdout)
+                self.assertEqual(len(evidence), 5, logs)
+                self.assertEqual(evidence[0]['case_id'], 'qemu-arch-help')
+                expected = {'qemu-arch-' + name: 'PASS' for name in ids | {'help'}}
+                if rust_exit:
+                    expected['qemu-arch-runtime-rust-install'] = 'FAIL'
+                self.assertEqual({row['case_id']: row['result'] for row in evidence}, expected)
+                self.assertTrue(all(row['network_scope'] == 'network' for row in evidence))
+
+    def run_inventory(self, product, rows, *, native_commands=None, home_files=None, distro='arch', tiers='hermetic', row_timeout=None, allow_mutations=False, fake_tree_binary=False, exact_man=True, binary_name='product', isolation_scope=None, ssh_body=None, parallel_runtime_installs=False):
         def shell_path(path):
             value = path.as_posix()
             return '/' + value[0].lower() + value[2:] if os.name == 'nt' else value
@@ -4042,6 +4092,8 @@ RUNTIME_FIXTURE_REVIEW
                     'scopes': {row.split('\t', 1)[0]: isolation_scope for row in rows},
                 }), encoding='utf-8')
                 command += ['--isolate-hermetic', '--network-policy', str(policy)]
+            if parallel_runtime_installs:
+                command.append('--parallel-runtime-installs')
             if exact_man:
                 command += ['--man-page-inventory',
                             shell_path(ROOT / 'tests/man_page_inventory.txt')]
