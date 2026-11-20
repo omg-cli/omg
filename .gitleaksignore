@@ -7,3 +7,8 @@ bfff4883f4fa39c54bbb98473535e642c9cb128d:services/ci-coder/port-origin.json:gene
 
 # Synthetic PAT-rejection fixture in history; current test builds a fixturefake value.
 b59af76393babd0df77f858f1c877cfbcdc798a2:services/advisories/test/runtime.test.ts:github-pat:345
+
+# Synthetic stateless installation-token fragments in the advisory regression fixtures.
+5d7799d86a7c8cefc8373f9f2762a4a03121abde:scripts/test_advisory_baseline.py:generic-api-key:26
+5d7799d86a7c8cefc8373f9f2762a4a03121abde:services/advisories/test/runtime-driver.test.ts:generic-api-key:16
+5d7799d86a7c8cefc8373f9f2762a4a03121abde:services/advisories/test/runtime-driver.test.ts:generic-api-key:42
