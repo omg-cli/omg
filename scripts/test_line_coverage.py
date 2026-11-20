@@ -1953,6 +1953,86 @@ class RetainedAurHookRenderingTests(unittest.TestCase):
                     self.assertIsNone(proof)
 
 
+class RetainedAurMetadataPolicyTests(unittest.TestCase):
+    def test_metadata_reader_keeps_the_opt_out_and_ttl_across_async_copies(self):
+        filename = 'src/package_managers/aur/client.rs'
+        files = {'/artifact/' + filename: filename}
+        for fault in (None, 'different-guard', 'different-ttl', 'lost-guard',
+                      'lost-opt-out', 'different-worker', 'lost-await', 'missing-copy', 'foreign-guard'):
+            with self.subTest(fault=fault):
+                sides, indexes = [], []
+                work = [coverage.SOURCE_CONSTRUCT_WORK_CAPACITY]
+                lines = []
+                opt_out_side = 0 if fault == 'lost-opt-out' else 1
+                for side in range(2):
+                    method = 'fresh_metadata_index' if side else 'fresh_metadata_index_path'
+                    output = 'AurIndex' if side else 'PathBuf'
+                    condition = 'enabled' if side and fault == 'different-guard' else 'use_metadata_archive'
+                    expiry = 'other_ttl' if side and fault == 'different-ttl' else 'metadata_cache_ttl_secs'
+                    read = 'different_index' if side and fault == 'different-worker' else 'open_fresh_metadata_index'
+                    source = [
+                        'impl AurClient {',
+                        f'    async fn {method}(&self) -> Option<{output}> {{',
+                        f'        if !self.settings.aur.{condition} {{',
+                        '            return None;',
+                        '        }',
+                        '',
+                        *([] if side else ['        let archive_path = metadata_path();',
+                                           '        let index_path = index_path();']),
+                        f'        let ttl = Duration::from_secs(self.settings.aur.{expiry});',
+                        *(['        finish_metadata_read(tokio::task::spawn_blocking(move || {',
+                           f'            {read}(ttl)',
+                           '        }))'] if side else [
+                           '        match tokio::task::spawn_blocking({',
+                           '            let index_path = index_path.clone();',
+                           '            move || metadata_index_is_fresh(&archive_path, &index_path, ttl)',
+                           '        })']),
+                        '        .await',
+                        *([] if side else ['        { _ => None, }']),
+                        '    }',
+                        '}',
+                    ]
+                    ttl = 7 if side else 9
+                    awaits = source.index('        .await') + 1
+                    lines.append(awaits)
+                    owners = []
+                    for copy in range(2):
+                        if side and fault == 'missing-copy' and copy == 0:
+                            continue
+                        scope = f'Ms{side + 2}_NtNtNtCs{side + 1}{copy + 1}_7omg_lib16package_managers3aur6client'
+                        root = f'_RNv{scope}NtB5_9AurClient{len(method)}{method}'
+                        body = f'_RNCNv{scope}NtB7_9AurClient{len(method)}{method}0Bd_'
+                        def raw(row, token, hits):
+                            col = source[row - 1].index(token) + 1
+                            return [row, col, row, col + len(token), hits, 0, 0, 0]
+                        entry = copy
+                        condition_hits = 0 if side and fault == 'lost-guard' else entry
+                        opt_out_hits = entry if side == opt_out_side else 0
+                        await_hits = 0 if side and fault == 'lost-await' else entry
+                        opening = source[1].index('{') + 1
+                        outer = [[2, 5, 2, opening - 1, entry, 0, 0, 0]]
+                        inner = [raw(2, '{', entry), raw(3, f'!self.settings.aur.{condition}', condition_hits),
+                                 raw(4, 'None', opt_out_hits), raw(5, '}', entry), raw(ttl, 'ttl', entry),
+                                 raw(ttl, 'Duration::from_secs', entry),
+                                 raw(ttl, f'self.settings.aur.{expiry}', entry),
+                                 raw(awaits, 'await', await_hits),
+                                 raw(len(source) - 1, '}', entry)]
+                        owners.extend([dict(name=symbol, filenames=list(files), regions=regions, count=entry)
+                                       for symbol, regions in ((root, outer), (body, inner))])
+                    if side and fault == 'foreign-guard':
+                        owners.append(dict(owners[-1], name='foreign', regions=[owners[-1]['regions'][1]]))
+                    counts = coverage._owner_line_counts({'regions': [r for item in owners for r in item['regions']]},
+                                                        coverage._ObserverWork(work))
+                    sides.append((source, coverage._construct_inventory(source, work), counts, 3))
+                    indexes.append(coverage.index_compiled_owner_sources(owners, files, work, {filename}))
+                proof = coverage.retained_aur_metadata_policy(filename, sides, indexes, work)
+                if fault is None:
+                    self.assertIsNotNone(proof)
+                    self.assertEqual(proof['pairs'], [[3, 3], [4, 4], [5, 5], [9, 7], lines])
+                else:
+                    self.assertIsNone(proof)
+
+
 class SbomComponentPushTests(unittest.TestCase):
     def test_audit_fixture_observes_coverage_and_applicability_separately(self):
         name = 'src/core/security/sbom_shared.rs'

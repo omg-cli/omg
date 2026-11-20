@@ -4985,6 +4985,12 @@ mod tests {
                 client.fresh_metadata_index().await.is_some(),
                 "restored access must make the same generation readable again"
             );
+            let mut disabled = fixture.client();
+            disabled.settings.aur.use_metadata_archive = false;
+            assert!(
+                disabled.fresh_metadata_index().await.is_none(),
+                "disabling the metadata archive must ignore a healthy generation"
+            );
             Ok(())
         })
     }

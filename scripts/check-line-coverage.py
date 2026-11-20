@@ -13390,6 +13390,93 @@ def retained_specialization_additions(name, sides, indexes, inventory_for_side, 
                 base_types=len(base), head_types=len(head), added_types=sorted(map(repr, added)))
 
 
+_AUR_METADATA_POLICY = 'if !self.settings.aur.use_metadata_archive {'
+
+
+def retained_aur_metadata_policy(name, sides, indexes, work):
+    """Bind the metadata opt-out, TTL, and wait to both async phases."""
+    observations = []
+    for side, ((source, inventory, counts, line), index) in enumerate(zip(sides, indexes, strict=True)):
+        code, rows = inventory[:2]
+        method, result = (('fresh_metadata_index_path', 'PathBuf') if side == 0
+                          else ('fresh_metadata_index', 'AurIndex'))
+        _construct_charge(work, len(rows) + len(code.starts).bit_length())
+        start = bisect.bisect_left(code.starts, code.offsets[line - 1])
+        opening = code.parents[start]
+        functions = [row for row in rows if row['kind'] == 'fn' and row['opening'] == opening]
+        header = tuple(f'async fn {method} ( & self ) -> Option < {result} >'.split())
+        if (len(functions) != 1 or functions[0]['header'] != header
+                or opening + 1 != start):
+            return None
+        guard = 'if ! self . settings . aur . use_metadata_archive { return None ; }'.split()
+        prelude = 'let archive_path = metadata_path ( ) ; let index_path = index_path ( ) ;'.split()
+        ttl = 'let ttl = Duration :: from_secs ( self . settings . aur . metadata_cache_ttl_secs ) ;'.split()
+        ttl_start = start + len(guard) + (0 if side else len(prelude))
+        if (code.words[start:ttl_start] != (guard if side else [*guard, *prelude])
+                or code.words[ttl_start:ttl_start + len(ttl)] != ttl):
+            return None
+        old_worker = ('match tokio :: task :: spawn_blocking ( { '
+                      'let index_path = index_path . clone ( ) ; move || '
+                      'metadata_index_is_fresh ( & archive_path , & index_path , ttl ) } ) . await').split()
+        new_worker = ('finish_metadata_read ( tokio :: task :: spawn_blocking ( move || { '
+                      'open_fresh_metadata_index ( ttl ) } ) ) . await').split()
+        worker = new_worker if side else old_worker
+        worker_start = ttl_start + len(ttl)
+        worker_end = worker_start + len(worker)
+        if (code.words[worker_start:worker_end] != worker
+                or (worker_end != functions[0]['end'] if side else code.words[worker_end] != '{')):
+            return None
+        slots = (code.region(start + 1, start + 8), code.region(start + 11, start + 11),
+                 code.region(start + 13, start + 13), code.region(ttl_start + 1, ttl_start + 1),
+                 code.region(ttl_start + 3, ttl_start + 5), code.region(ttl_start + 7, ttl_start + 13),
+                 code.region(worker_end - 1, worker_end - 1))
+        lines = sorted({slot[0] for slot in slots})
+        owners = index.inventories.get(name, ())
+        phases = compiled_async_function_groups(name, owners, index.files, source, work, inventory,
+                                                index.name_counts, inherent_lines=(line,))
+        groups = [group for group in phases.values() if group.span[0] == line - 1
+                  and group.source_context == ('AurClient', header)]
+        if len(groups) != 1 or not 1 <= len(groups[0].copies) <= 16:
+            return None
+        group, = groups
+        namespace = ('crate', 'omg_lib')
+        for segment in ('package_managers', 'aur', 'client'):
+            namespace = ('type', namespace, (segment, ''))
+        _construct_charge(work, sum(len(owner['regions']) + 1 for owner in owners))
+        affected = {id(owner): regions for owner in owners if (regions := [
+            row for row in owner['regions'] if any(row[0] <= n <= row[2] for n in lines)])}
+        if affected.keys() != {id(copy.body) for copy in group.copies}:
+            return None
+        states = []; raw_regions = []; symbols = []
+        for copy in group.copies:
+            constructor, body = copy.constructor, copy.body
+            shape = nominal_method_path(constructor['name'])
+            regions = affected[id(body)]
+            if (shape is None or shape.namespace != namespace
+                    or any(owner.get('branches') or owner.get('mcdc_records') for owner in (constructor, body))
+                    or tuple(tuple(row[:4]) for row in regions) != slots
+                    or regions[0][4] != body['count']
+                    or any(not 0 <= row[4] <= body['count'] for row in regions)
+                    or not regions[3][4] == regions[4][4] == regions[5][4]):
+                return None
+            states.append((constructor['count'] > 0, body['count'] > 0, *(row[4] > 0 for row in regions)))
+            raw_regions.extend(regions)
+            symbols.append([constructor['name'], body['name']])
+        projected = _owner_line_counts({'regions': raw_regions}, _ObserverWork(work))
+        if projected != {n: counts[n] for n in lines if n in counts} or not counts.get(line, 0):
+            return None
+        observations.append((lines, states, symbols))
+    before, after = observations
+    _construct_charge(work, len(before[1][0]) * len(before[1]) * len(after[1]))
+    matching = compiled_hit_state_matching(before[1], after[1])
+    if matching is None:
+        return None
+    return dict(file=name, kind='retained-aur-metadata-policy',
+                pairs=[list(pair) for pair in zip(before[0], after[0], strict=True)],
+                instance_states=[before[1], after[1]], owners=[before[2], after[2]],
+                instance_matching=matching)
+
+
 def retained_aur_hook_rendering(name, sides, indexes, work):
     """Observe hook text rendering after the same bounded UTF-8 read."""
     function_name = 'declared_install_hook_previews'
@@ -14111,6 +14198,18 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
                 if (line, target) in proved_eager_pairs:
                     retained[line] = target
                 elif line not in anchored:
+                    if (name == 'src/package_managers/aur/client.rs' and inventories is not None
+                            and old[line - 1] == new[target - 1]
+                            and old[line - 1].strip() == _AUR_METADATA_POLICY
+                            and (bs[name]['expansions'], hs[name]['expansions']) == ([], [])):
+                        sides = ((old, inventories[0], before, line), (new, inventories[1], after, target))
+                        proof = retained_aur_metadata_policy(name, sides, source_owner_indexes(), construct_work)
+                        if proof is not None:
+                            if any(n in anchored and anchored[n] != t for n, t in proof['pairs']):
+                                raise ValueError('Ambiguous AUR metadata policy correspondence')
+                            anchored.update(proof['pairs'])
+                            obligation_receipts.append(proof)
+                            continue
                     if (inventories is not None
                             and old[line-1]==new[target-1]
                             and (name,old[line-1].strip()) in (
