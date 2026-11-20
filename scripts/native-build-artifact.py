@@ -228,6 +228,8 @@ def prior_successful_artifact(repository, run, expected_run, distro, artifacts):
     # GitHub includes carried jobs in an attempt's listing and relabels their
     # run_attempt. Their original start time distinguishes them from reruns.
     current_owners = [job for job in jobs['jobs'] if job.get('name') == owner]
+    if not current_owners or any(job.get('started_at') is None for job in current_owners):
+        return None
     require(all(isinstance(job.get('started_at'), str) for job in current_owners),
             'native owner start time is unavailable')
     if any(job['started_at'] >= run['run_started_at'] for job in current_owners):
@@ -307,28 +309,23 @@ def find_native_artifact(root, distro, context, event, timeout=1500):
             'invalid CI workflow identity')
     expected_run = dict(repository=repository, workflow_id=workflow['id'], event=event_name,
                         head_sha=head, pr_number=event.get('number'))
-    started, delay, selected_id = time.monotonic(), 5, None
-    while time.monotonic() - started < timeout:
-        run = None
-        if selected_id is None:
-            listing = api_json(f'repos/{repository}/actions/workflows/ci.yml/runs?event={event_name}&head_sha={head}&per_page=20')
-            candidates = listing.get('workflow_runs')
-            require(isinstance(candidates, list) and len(candidates) <= 20, 'invalid CI run listing')
-            for candidate in candidates:
-                if event_name == 'pull_request' and not any(row.get('number') == event.get('number')
-                                                            for row in candidate.get('pull_requests', [])):
-                    continue
-                validate_producer_run(candidate, expected_run)
-                run, selected_id = candidate, candidate['id']
-                print(f'Waiting for native CI artifact from run {selected_id}', flush=True)
-                break
-        else:
-            run = api_json(f'repos/{repository}/actions/runs/{selected_id}')
-            validate_producer_run(run, expected_run)
+    run_id = context['GITHUB_RUN_ID']
+    attempt = context['GITHUB_RUN_ATTEMPT']
+    require(all(re.fullmatch(r'[1-9][0-9]*', value) for value in (run_id, attempt)),
+            'invalid consumer run or attempt')
+    selected_id = int(run_id)
+    attempt = int(attempt)
+    deadline = time.monotonic() + timeout
+    delay = 10
+    while time.monotonic() < deadline:
+        run = api_json(f'repos/{repository}/actions/runs/{selected_id}')
+        validate_producer_run(run, expected_run)
+        require(run['id'] == selected_id and run['run_attempt'] == attempt,
+                'producer does not match the current CI run and attempt')
         # Aggregate scheduling status does not establish artifact availability.
         # A started attempt may already have uploaded a native lane's output
         # while another job is waiting. Keep timestamp and byte admission intact.
-        if run and run.get('run_started_at') is not None:
+        if run.get('run_started_at') is not None:
             current_attempt = run['run_attempt']
             listing = api_json(f'repos/{repository}/actions/runs/{selected_id}/artifacts?per_page=100')
             require(type(listing.get('total_count')) is int and listing['total_count'] <= 100,
@@ -358,7 +355,9 @@ def find_native_artifact(root, distro, context, event, timeout=1500):
                     return artifact, run, expected_run, producer_attempt
             if run.get('status') == 'completed':
                 raise ArtifactUnavailable('CI finished without the required native artifact')
-        time.sleep(delay)
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            time.sleep(min(delay, remaining))
         delay = min(30, delay * 1.5)
     raise ArtifactUnavailable('CI native artifact did not become available before the deadline')
 
@@ -477,14 +476,22 @@ def validate_bundle(content, server_digest, expected):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('mode', choices=('build', 'reuse'))
+    parser.add_argument('mode', choices=('build', 'reuse', 'wait'))
     parser.add_argument('--distro', choices=tuple(FEATURES))
     parser.add_argument('--image')
     parser.add_argument('--features')
     parser.add_argument('--destination', type=Path)
     parser.add_argument('--timeout', type=int, default=1500)
     args = parser.parse_args(argv)
-    require(1 <= args.timeout <= 1500, 'invalid native wait deadline')
+    require(1 <= args.timeout <= (2700 if args.mode == 'wait' else 1500), 'invalid native wait deadline')
+    if args.mode == 'wait':
+        if not args.distro or any((args.image, args.features, args.destination)):
+            parser.error('wait requires --distro and accepts --timeout')
+        event = json.loads(Path(os.environ['GITHUB_EVENT_PATH']).read_text(encoding='utf-8'))
+        artifact, run, _, attempt = find_native_artifact(
+            Path.cwd(), args.distro, os.environ, event, timeout=args.timeout)
+        print(f'Native artifact {artifact["id"]} is ready for {args.distro} from run {run["id"]} attempt {attempt}')
+        return
     if not all((args.distro, args.image, args.features, args.destination)):
         parser.error('build/reuse require --distro, --image, --features and --destination')
     parameters = (Path.cwd(), args.distro, args.image, args.features,

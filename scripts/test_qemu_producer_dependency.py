@@ -1,4 +1,4 @@
-"""Require scheduler dependencies instead of racing native producer runners."""
+"""Require per-distro readiness before allocating guest runners."""
 from pathlib import Path
 import itertools
 import os
@@ -70,13 +70,13 @@ class QemuProducerDependency(unittest.TestCase):
                 self.assertEqual(result.returncode == 0,
                                  required == 'false' or outcome == fedora == 'success')
 
-    def test_automatic_guests_wait_for_both_native_producer_jobs(self):
+    def test_automatic_guests_wait_only_for_preflight_and_their_own_inputs(self):
         ci = (ROOT / '.github/workflows/ci.yml').read_text(encoding='utf-8')
         final = job_block(ci, 'ci-success')
         self.assertIn('QEMU_FEDORA: ${{ needs.qemu-fedora.result }}', final)
         for name, partition, expected_needs in (
-                ('qemu', 'non-fedora', {'qemu-preflight', 'linux-matrix', 'ubuntu'}),
-                ('qemu-fedora', 'fedora', {'qemu-preflight', 'linux-matrix', 'ubuntu', 'fedora-sqlite'})):
+                ('qemu', 'non-fedora', {'qemu-preflight'}),
+                ('qemu-fedora', 'fedora', {'qemu-preflight', 'fedora-sqlite'})):
             with self.subTest(caller=name):
                 qemu = job_block(ci, name)
                 needs = re.search(r'^    needs: \[([^]]+)\]', qemu, re.MULTILINE)
@@ -85,6 +85,12 @@ class QemuProducerDependency(unittest.TestCase):
                 self.assertIn('uses: ./.github/workflows/qemu-matrix.yml', qemu)
                 self.assertIn('partition: ' + partition, qemu)
                 self.assertRegex(final, r'needs: \[[^\]]*\b' + name + r'\b')
+        lane = (ROOT / '.github/workflows/qemu-lane.yml').read_text(encoding='utf-8')
+        ready = job_block(lane, 'native-ready')
+        self.assertIn('if: inputs.staged && inputs.reuse-ci', ready)
+        self.assertIn('actions: read', ready)
+        self.assertIn('native-build-artifact.py wait --distro "$DISTRO"', ready)
+        self.assertIn("needs.native-ready.result == 'success'", job_block(lane, 'guest'))
 
     def test_preflight_runs_alongside_producers(self):
         ci = (ROOT / '.github/workflows/ci.yml').read_text(encoding='utf-8')

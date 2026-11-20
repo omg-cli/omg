@@ -1837,7 +1837,7 @@ jobs:
 
   qemu:
     name: QEMU behavioral verification (non-Fedora)
-    needs: [qemu-preflight, linux-matrix, ubuntu]
+    needs: [qemu-preflight]
     if: >-
       !cancelled() && needs.qemu-preflight.result != 'skipped'
     uses: ./.github/workflows/qemu-matrix.yml
@@ -1852,7 +1852,7 @@ jobs:
 
   qemu-fedora:
     name: QEMU behavioral verification (Fedora)
-    needs: [qemu-preflight, linux-matrix, ubuntu, fedora-sqlite]
+    needs: [qemu-preflight, fedora-sqlite]
     if: >-
       !cancelled() && needs.qemu-preflight.result != 'skipped'
     uses: ./.github/workflows/qemu-matrix.yml

@@ -210,7 +210,7 @@ jobs:
           printf 'Harness/build revision: `%s`\n\nArtifact source: staged=%s, tag=%s\n\nSelected: distro=%s, x64=%s, arm64=%s\n' \
             "$GITHUB_SHA" "$STAGED" "$tag" "$REQUESTED_DISTRO" "$x64" "$arm64" >> "$GITHUB_STEP_SUMMARY"
 
-  # Automatic calls are scheduled after native producers by CI.
+  # Automatic guests each wait for their own native artifact before allocating KVM.
   # Standalone nightly/manual runs retain their independent build paths.
   guest:
     name: "Distro lane (${{ matrix.distro }})"

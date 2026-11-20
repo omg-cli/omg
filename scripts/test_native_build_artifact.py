@@ -202,16 +202,17 @@ class NativeBuildAdmission(unittest.TestCase):
         artifact = dict(id=9, name='native-release-debian-1', size_in_bytes=100, expired=False,
                         created_at='2026-09-20T09:01:00Z')
         context = dict(GITHUB_REPOSITORY='omg-cli/omg', GITHUB_SHA='a'*40,
-                       GITHUB_EVENT_NAME='merge_group')
+                       GITHUB_EVENT_NAME='merge_group', GITHUB_RUN_ID='123', GITHUB_RUN_ATTEMPT='1')
         event = {'merge_group': {'head_sha': 'a'*40}}
+        artifacts = [dict(artifact, name='native-release-arch-1', id=8), artifact]
+
         def lookup(path):
             if path.endswith('/workflows/ci.yml'):
                 return {'id': 42, 'path': '.github/workflows/ci.yml'}
-            if '/ci.yml/runs?' in path:
-                self.assertIn('event=merge_group&head_sha=' + 'a'*40, path)
-                return {'workflow_runs': [run]}
+            if path.endswith('/runs/123'):
+                return run
             if '/artifacts?' in path:
-                return {'total_count': 1, 'artifacts': [artifact]}
+                return {'total_count': len(artifacts), 'artifacts': artifacts}
             self.fail('unexpected API request: ' + path)
         with tempfile.TemporaryDirectory() as directory, \
                 patch.object(BUILD, 'api_json', side_effect=lookup), \
@@ -219,12 +220,17 @@ class NativeBuildAdmission(unittest.TestCase):
             selected, _, identity, attempt = BUILD.find_native_artifact(
                 Path(directory), 'debian', context, event)
             self.assertEqual((selected['id'], attempt, identity['head_sha']), (9, 1, 'a'*40))
-            for change in ({'head_sha': 'b'*40}, {'event': 'push'}):
+            for change in ({'head_sha': 'b'*40}, {'event': 'push'}, {'id': 456}, {'run_attempt': 2}):
                 original = dict(run)
                 run.update(change)
-                with self.assertRaisesRegex(ValueError, 'producer mismatch'):
+                with self.assertRaisesRegex(ValueError, 'producer (mismatch|does not match)'):
                     BUILD.find_native_artifact(Path(directory), 'debian', context, event)
                 run.update(original)
+
+            artifacts.pop()
+            run.update(status='completed', conclusion='failure')
+            with self.assertRaisesRegex(BUILD.ArtifactUnavailable, 'required native artifact'):
+                BUILD.find_native_artifact(Path(directory), 'debian', context, event)
 
     def test_artifact_download_retries_only_a_transport_timeout(self):
         path = 'repos/omg-cli/omg/actions/artifacts/123/zip'
@@ -297,8 +303,8 @@ class NativeBuildAdmission(unittest.TestCase):
         lane = (root / '.github/workflows/qemu-lane.yml').read_text(encoding='utf-8')
         matrix = (root / '.github/workflows/qemu-matrix.yml').read_text(encoding='utf-8')
         self.assertNotIn('native-build-artifact.py ready', job_block(matrix, 'prepare'))
-        self.assertIn('needs: [qemu-preflight, linux-matrix, ubuntu]', job_block(ci, 'qemu'))
-        self.assertIn('needs: [qemu-preflight, linux-matrix, ubuntu, fedora-sqlite]', job_block(ci, 'qemu-fedora'))
+        self.assertIn('needs: [qemu-preflight]', job_block(ci, 'qemu'))
+        self.assertIn('needs: [qemu-preflight, fedora-sqlite]', job_block(ci, 'qemu-fedora'))
         for owner in ('linux-matrix', 'ubuntu'):
             block = job_block(ci, owner)
             self.assertIn('native-build-artifact.py build', block)
@@ -386,17 +392,21 @@ class NativeBuildAdmission(unittest.TestCase):
                 artifact['created_at'] = 'later'
             if mode == 'future-attempt':
                 artifact['name'] = 'native-release-debian-2'
+            run_lookups = 0
             def lookup(path):
+                nonlocal run_lookups
                 if path.endswith('/workflows/ci.yml'):
                     return {'id': 42, 'path': '.github/workflows/ci.yml'}
-                if '/ci.yml/runs?' in path:
-                    candidate = dict(run, status='queued', conclusion=None, run_started_at=None) if mode == 'queued' else run
-                    return {'workflow_runs': [candidate]}
                 if '/artifacts?' in path:
                     return {'total_count': 0 if mode == 'missing' else 1,
                             'artifacts': [] if mode == 'missing' else [artifact]}
                 if path.endswith('/runs/123'):
-                    return dict(run, run_attempt=2) if mode == 'changed-attempt' else run
+                    run_lookups += 1
+                    if mode == 'queued' and run_lookups == 1:
+                        return dict(run, status='queued', conclusion=None, run_started_at=None)
+                    if mode == 'changed-attempt' and run_lookups == 2:
+                        return dict(run, run_attempt=2)
+                    return run
                 if mode == 'rerun-artifact' and path.endswith('/attempts/2/jobs?per_page=100'):
                     return {'total_count': 0, 'jobs': []}
                 if mode == 'rerun-artifact' and path.endswith('/attempts/1'):
@@ -410,7 +420,8 @@ class NativeBuildAdmission(unittest.TestCase):
                 (root / 'rust-toolchain.toml').write_text('[toolchain]\nchannel="1.95.0"\n')
                 destination = root / 'staged'
                 context = dict(GITHUB_REPOSITORY='omg-cli/omg', GITHUB_SHA='a'*40,
-                               GITHUB_EVENT_NAME='pull_request')
+                               GITHUB_EVENT_NAME='pull_request', GITHUB_RUN_ID='123',
+                               GITHUB_RUN_ATTEMPT=str(run['run_attempt']))
                 event = {'number': 440, 'pull_request': {'head': {'sha': 'c'*40}}}
                 with patch.object(BUILD, 'api_json', side_effect=lookup), patch.object(BUILD, 'api', return_value=data), \
                         patch.object(BUILD, 'command_output', return_value='a'*40), patch.object(BUILD.time, 'sleep'), \
@@ -439,14 +450,14 @@ class NativeBuildAdmission(unittest.TestCase):
                           created_at=('2026-09-20T09:31:00Z' if attempt == 3 else
                                       f'2026-09-20T09:{attempt:02d}:00Z')) for attempt in (1, 2, 3)]
         context = dict(GITHUB_REPOSITORY='omg-cli/omg', GITHUB_SHA='a'*40,
-                       GITHUB_EVENT_NAME='pull_request')
+                       GITHUB_EVENT_NAME='pull_request', GITHUB_RUN_ID='123', GITHUB_RUN_ATTEMPT='3')
         event = {'number': 440, 'pull_request': {'head': {'sha': 'c'*40}}}
 
         def lookup(path):
             if path.endswith('/workflows/ci.yml'):
                 return {'id': 42, 'path': '.github/workflows/ci.yml'}
-            if '/ci.yml/runs?' in path:
-                return {'workflow_runs': [run]}
+            if path.endswith('/runs/123'):
+                return run
             if '/artifacts?' in path:
                 return {'total_count': len(artifacts), 'artifacts': artifacts}
             self.fail('unexpected API request: ' + path)
@@ -475,7 +486,7 @@ class NativeBuildAdmission(unittest.TestCase):
         artifact = dict(id=9, name='native-release-debian-1', size_in_bytes=len(data),
                         expired=False, created_at='2026-09-20T09:01:00Z',
                         digest='sha256:' + hashlib.sha256(data).hexdigest())
-        for mode in ('valid', 'reran-owner', 'failed-owner', 'wrong-head',
+        for mode in ('valid', 'reran-owner', 'queued-owner', 'unlisted-owner', 'failed-owner', 'wrong-head',
                      'late-artifact', 'intermediate-reran-owner'):
             selected_run = dict(run, run_attempt=3,
                                 run_started_at='2026-09-20T11:00:00Z') \
@@ -488,6 +499,10 @@ class NativeBuildAdmission(unittest.TestCase):
             if mode == 'reran-owner':
                 current_jobs.append(dict(job, id=18, run_attempt=2,
                                          started_at='2026-09-20T10:00:30Z'))
+            if mode == 'queued-owner':
+                current_jobs.append(dict(job, id=18, run_attempt=2, started_at=None, status='queued'))
+            if mode == 'unlisted-owner':
+                current_jobs.clear()
             if mode == 'failed-owner':
                 native_job['conclusion'] = 'failure'
             if mode == 'wrong-head':
@@ -497,8 +512,6 @@ class NativeBuildAdmission(unittest.TestCase):
             def lookup(path):
                 if path.endswith('/workflows/ci.yml'):
                     return {'id': 42, 'path': '.github/workflows/ci.yml'}
-                if '/ci.yml/runs?' in path:
-                    return {'workflow_runs': [selected_run]}
                 if path.endswith('/runs/123'):
                     return selected_run
                 if path.endswith('/attempts/1'):
@@ -523,7 +536,8 @@ class NativeBuildAdmission(unittest.TestCase):
                 (root / 'rust-toolchain.toml').write_text('[toolchain]\nchannel="1.95.0"\n')
                 destination = root / 'staged'
                 context = dict(GITHUB_REPOSITORY='omg-cli/omg', GITHUB_SHA='a'*40,
-                               GITHUB_EVENT_NAME='pull_request')
+                               GITHUB_EVENT_NAME='pull_request', GITHUB_RUN_ID='123',
+                               GITHUB_RUN_ATTEMPT=str(selected_run['run_attempt']))
                 event = {'number': 440, 'pull_request': {'head': {'sha': 'c'*40}}}
                 with patch.object(BUILD, 'api_json', side_effect=lookup), patch.object(BUILD, 'api', return_value=data), \
                         patch.object(BUILD, 'command_output', return_value='a'*40), patch.object(BUILD.time, 'sleep'), \

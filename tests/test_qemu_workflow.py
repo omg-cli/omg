@@ -767,11 +767,11 @@ class SecurityBoundaryTests(unittest.TestCase):
         self.assertNotIn('native-build-artifact.py ready', PARENT)
         ci = WORKFLOW.with_name('ci.yml').read_text(encoding='utf-8')
         automatic = ci.split('\n  qemu:\n', 1)[1].split('\n  ci-success:', 1)[0]
-        self.assertIn('needs: [qemu-preflight, linux-matrix, ubuntu]', automatic)
-        self.assertIn('needs: [qemu-preflight, linux-matrix, ubuntu, fedora-sqlite]',
+        self.assertIn('needs: [qemu-preflight]', automatic)
+        self.assertIn('needs: [qemu-preflight, fedora-sqlite]',
                       ci.split('\n  qemu-fedora:\n', 1)[1].split('\n  docs-audit:', 1)[0])
         self.assertIn('inputs.staged && inputs.reuse-ci', LANE)
-        self.assertIn('needs: [build-staged, build-staged-ubuntu, fedora-sqlite]', LANE)
+        self.assertIn('needs: [build-staged, build-staged-ubuntu, fedora-sqlite, native-ready]', LANE)
         self.assertIn("inputs.distro != 'ubuntu' && needs.build-staged.result == 'success'", LANE)
         self.assertIn("inputs.distro == 'ubuntu' && needs.build-staged-ubuntu.result == 'success'", LANE)
         self.assertNotIn('concurrency:', LANE)
@@ -929,7 +929,7 @@ elif args[:2] == ['nextest', 'run']:
         self.assertNotRegex(TEXT, r'(?m)^  GH_TOKEN:')
         for block in re.split(r'(?=^      - )', TEXT, flags=re.M):
             if 'GH_TOKEN:' in block:
-                if any(name in block for name in ('- name: Wait once for native release artifacts',
+                if any(name in block for name in ("- name: Wait for this distro's native release pair",
                                                   '- name: Reuse verified native CI binaries')):
                     self.assertIn('GH_TOKEN: ${{ github.token }}', block)
                     self.assertIn('scripts/native-build-artifact.py', block)
