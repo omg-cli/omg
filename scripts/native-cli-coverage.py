@@ -219,8 +219,19 @@ def fixture_local_package(root, database, name, version, payload_path, payload, 
     target.write_bytes(payload)
 
 
-def create_signed_fixture(owner, current_kernel=False, native_migrations=False, installed_audio=False,
-                          repository_compression="gz"):
+def fixture_signing_key(signing, identity):
+    fixture_command(signing + ['--quick-generate-key', identity, 'ed25519', 'cert,sign', '1d'])
+    listing = fixture_command(signing + ['--with-colons', '--fingerprint', '--list-keys', identity],
+                              text=True).stdout
+    fingerprints = [line.split(':')[9] for line in listing.splitlines() if line.startswith('fpr:')]
+    require(len(fingerprints) == 1 and re.fullmatch('[0-9A-F]{40}', fingerprints[0]),
+            'One exact private fixture signing fingerprint required')
+    return fingerprints[0]
+
+
+def create_signed_fixture(owner, current_kernel=False, native_migrations=False, installed_migrations=False,
+                          repository_compression="gz", unknown_app_signer=False, foreign_package=False,
+                          platform_keyring=False):
     require(repository_compression in ("gz", "bz2"), "Unsupported signed repository compression")
     if os.geteuid() != 0:
         raise RuntimeError('Guest root setup required')
@@ -238,12 +249,7 @@ def create_signed_fixture(owner, current_kernel=False, native_migrations=False, 
         (owner / path).chmod(0o700)
     (owner / 'db/local/ALPM_DB_VERSION').write_text('9\n')
     signing = ['gpg', '--batch', '--homedir', str(owner / 'signing'), '--pinentry-mode', 'loopback', '--passphrase', '']
-    fixture_command(signing + ['--quick-generate-key', 'OMG coverage fixture <coverage@example.invalid>', 'ed25519', 'cert,sign', '1d'])
-    listing = fixture_command(signing + ['--with-colons', '--fingerprint', '--list-keys'], text=True).stdout
-    fingerprints = [line.split(':')[9] for line in listing.splitlines() if line.startswith('fpr:')]
-    if len(fingerprints) != 1 or len(fingerprints[0]) != 40:
-        raise RuntimeError('One exact private fixture signing fingerprint required')
-    fingerprint = fingerprints[0]
+    fingerprint = fixture_signing_key(signing, 'OMG coverage fixture <coverage@example.invalid>')
     before_public = fixture_command(signing + ['--export', fingerprint]).stdout
     public_path = owner / 'fixture-public.gpg'
     public_path.write_bytes(before_public)
@@ -257,12 +263,16 @@ def create_signed_fixture(owner, current_kernel=False, native_migrations=False, 
     updated_public = fixture_command(signing + ['--export', fingerprint]).stdout
     if before_public == updated_public:
         raise RuntimeError('Updated public bundle must differ from initial bundle')
+    unknown_signer = (fixture_signing_key(signing, 'OMG unknown fixture <unknown@example.invalid>')
+                      if unknown_app_signer else fingerprint)
     initial = {}
     repositories = {'core': [], 'omarchy': []}
     packages = [
         ('archlinux-keyring', 'core', 0, ()), ('omarchy-keyring', 'omarchy', 0, ()),
         ('omg-coverage-app', 'core', 0, ('omg-coverage-dep>=1-1',)),
         ('omg-coverage-dep', 'core', 1, ()), ('omg-coverage-desktop', 'omarchy', 0, ())]
+    if platform_keyring:
+        packages.append(('omg-coverage-platform-keyring', 'omarchy', 0, ()))
     migration_packages = {}
     if native_migrations:
         packages.extend((name, 'core', 0, ()) for name in ('xorg-xrandr', 'hp-omnibook-3-audio'))
@@ -283,20 +293,25 @@ def create_signed_fixture(owner, current_kernel=False, native_migrations=False, 
         old_payload = before_public if keyring else (name + ': installed1\n').encode()
         new_payload = updated_public if keyring else (name + ': upgraded3\n').encode()
         migration_only = native_migrations and name in ('xorg-xrandr', 'hp-omnibook-3-audio')
-        if not migration_only or installed_audio and name == 'hp-omnibook-3-audio':
+        if not migration_only or installed_migrations:
             fixture_local_package(owner / 'root', owner / 'db', name, '1-1', payload_path, old_payload, reason, depends)
         archive = fixture_package(owner / 'repos' / repository, name, '3-1', payload_path, new_payload, depends)
-        fixture_command(signing + ['--local-user', fingerprint, '--detach-sign', '--output', str(archive) + '.sig', str(archive)])
+        package_signer = unknown_signer if name == 'omg-coverage-app' else fingerprint
+        fixture_command(signing + ['--local-user', package_signer, '--detach-sign', '--output', str(archive) + '.sig', str(archive)])
         repositories[repository].append((name, archive, payload_path, new_payload, depends))
         inventory = migration_packages if migration_only else initial
         inventory[name] = {'version': '3-1' if migration_only else '1-1', 'reason': reason,
                            'payload_path': payload_path, 'after_sha256': hashlib.sha256(new_payload).hexdigest()}
-        if installed_audio and name == 'hp-omnibook-3-audio':
+        if migration_only and installed_migrations:
             initial[name] = dict(inventory[name], version='1-1', before_sha256=hashlib.sha256(old_payload).hexdigest())
         if not migration_only:
             inventory[name]['before_sha256'] = hashlib.sha256(old_payload).hexdigest()
     for name, reason in (('omg-coverage-dead-dep', 1),):
         fixture_local_package(owner / 'root', owner / 'db', name, '1-1', 'usr/share/omg-coverage/' + name + '.txt', b'retain unless actual orphan\n', reason)
+    if foreign_package:
+        fixture_local_package(owner / 'root', owner / 'db', 'omg-coverage-foreign', '1-1',
+                              'usr/share/omg-coverage/omg-coverage-foreign.txt',
+                              b'Explicitly installed foreign package\n', 0)
     for repository, records in repositories.items():
         database = owner / 'repos' / repository / (repository + '.db')
         fixture_repository_database(database, records, repository_compression)
@@ -315,10 +330,11 @@ def create_signed_fixture(owner, current_kernel=False, native_migrations=False, 
         configuration += '[' + repository + ']\nSigLevel = Required TrustedOnly\nServer = file://' + str(owner / 'repos' / repository) + '\n'
     (owner / 'pacman.conf').write_text(configuration)
     receipt = {'status': 'PREPARED_DATA_ONLY_NOT_RUNTIME_PROOF', 'owner': str(owner), 'created_unix': time.time(),
-               'fixture_signer_fingerprint': fingerprint, 'signer_is_authored_throwaway_key': True,
+               'fixture_signer_fingerprint': fingerprint, 'fixture_app_signer_fingerprint': unknown_signer,
+               'signer_is_authored_throwaway_key': True,
                'host_or_publisher_secret_material_used': False, 'siglevel_weakened': False,
                'initial_packages': initial, 'migration_packages': migration_packages, 'config_sha256': sha(owner / 'pacman.conf'),
-               'running_kernel_modules': running_modules,
+               'running_kernel_modules': running_modules, 'foreign_package': foreign_package,
                'initial_database_sha256': fixture_tree_hashes(owner / 'db/local'),
                'initial_payload_sha256': fixture_tree_hashes(owner / 'root'),
                'public_before_sha256': hashlib.sha256(before_public).hexdigest(),
@@ -332,6 +348,7 @@ def create_signed_fixture(owner, current_kernel=False, native_migrations=False, 
 NATIVE_PHASES = {
     'initial': 'PASS_NATIVE_INITIAL_STATE',
     'cache-pruned': 'PASS_NATIVE_CACHE_PRUNED_STATE',
+    'keyrings-refreshed': 'PASS_NATIVE_KEYRINGS_REFRESHED_STATE',
     'complete': 'PASS_SIGNED_NATIVE_STATE',
     'migrated': 'PASS_SIGNED_NATIVE_MIGRATIONS_STATE',
     'migrated-unmatched': 'PASS_SIGNED_NATIVE_MIGRATIONS_UNMATCHED_STATE',
@@ -368,7 +385,11 @@ FRESH_ADMISSION_CASES = (
     FreshAdmissionCase('archive-batch-limit', 'none', '', False, 'at most 64 archives'),
     FreshAdmissionCase('repository-accept', 'none', '', True, ''),
     FreshAdmissionCase('repository-stale-evidence', 'none', 'stale', False, 'stale Arch snapshot'),
+    FreshAdmissionCase('repository-unknown-signing-key', 'none', '', False, 'Unknown signing key refused'),
+    FreshAdmissionCase('repository-decline-signing-key', 'key-decline', '', False, 'import an untrusted signing key'),
 )
+
+UNKNOWN_SIGNING_KEY_CASES = {'repository-unknown-signing-key', 'repository-decline-signing-key'}
 
 
 # Additional decoder evidence never replaces the original admission matrix.
@@ -526,6 +547,15 @@ def fresh_admission_terminal(cli, arguments, environment, case, directory, state
                     data = b''
                 transcript.extend(data)
                 require(len(transcript) <= 1024 * 1024, 'Fresh admission transcript exceeds budget')
+            if case.interaction == 'key-decline':
+                if not state.get('install_confirmed') and b'Proceed with installation of 1 package(s)? (y/n)' in transcript:
+                    state['install_confirmed'] = True
+                    os.write(terminal, b'y')
+                fingerprint = state['signing_key_fingerprint'][-16:].encode()
+                if not state.get('signing_key_declined') and b'Import PGP key ' + fingerprint + b'? (y/n)' in transcript:
+                    require(state.get('install_confirmed'), 'Signing-key prompt preceded installation confirmation')
+                    os.write(terminal, b'n')
+                    state['signing_key_declined'] = True
             if not answered and b'seconds to continue (default: cancel): ' in transcript:
                 found = re.search(rb'Full prepared batch SHA-256: ([a-f0-9]{64})', transcript)
                 require(found is not None, 'Native acknowledgement must publish its exact batch digest')
@@ -672,7 +702,8 @@ def run_fresh_admission_fixture(owner, cli, names=None, profiles=None, decoder_c
             current['requests'].append(dict(path=self.path, prompt_seen=current['prompt_seen']))
             try:
                 case, fixture, archive = current['definition'], current['fixture'], current['archive']
-                require(case.interaction == 'none' or current['prompt_seen'],
+                require(case.interaction == 'none' or current['prompt_seen']
+                        or case.interaction == 'key-decline' and current.get('install_confirmed'),
                         'Advisory fetch preceded mandatory archive acknowledgement')
                 if case.mutation == 'policy':
                     (config / 'policy.toml').write_text(current['policy'] + 'banned_packages = ["omg-fresh-archive"]\n')
@@ -725,8 +756,9 @@ def run_fresh_admission_fixture(owner, cli, names=None, profiles=None, decoder_c
             directory.mkdir()
             fixture = owner.parent / (owner.name + '-' + case.name)
             read_only = case.name == 'repository-bzip2-info'
+            unknown_key = case.name in UNKNOWN_SIGNING_KEY_CASES
             prepared = create_signed_fixture(fixture, native_migrations=read_only,
-                repository_compression='bz2' if read_only else 'gz')
+                repository_compression='bz2' if read_only else 'gz', unknown_app_signer=unknown_key)
             for repository in ('core', 'omarchy'):
                 for suffix in ('.db', '.db.sig'):
                     name = repository + suffix
@@ -745,9 +777,13 @@ def run_fresh_admission_fixture(owner, cli, names=None, profiles=None, decoder_c
             fixture_command(['mount', '--bind', str(fixture / 'pacman.conf'), '/etc/pacman.conf'])
             before = fixture_tree_hashes(fixture / 'db/local')
             payload_before = fixture_tree_hashes(fixture / 'root')
+            keyring = fixture / 'gnupg/pubring.gpg'
+            keyring_before = sha(keyring) if unknown_key else None
             arguments = ['install', str(archive), '--allow-local-file', '--yes']
             if case.name.startswith('repository-'):
-                arguments = ['install', 'omg-coverage-app', '--yes']
+                arguments = ['install', 'omg-coverage-app']
+                if case.interaction != 'key-decline':
+                    arguments.append('--yes')
             if read_only:
                 require(not (fixture / 'db/local/xorg-xrandr-3-1').exists(),
                         'Bzip2 info must query a repository-only package')
@@ -765,6 +801,8 @@ def run_fresh_admission_fixture(owner, cli, names=None, profiles=None, decoder_c
             current = dict(definition=case, fixture=fixture, archive=archive, policy=policy,
                 prompt_seen=False, requests=[], server_errors=[],
                 old_stages=set(Path('/var/tmp').glob('omg-package-*/' + archive.name)))
+            if case.interaction == 'key-decline':
+                current['signing_key_fingerprint'] = prepared['fixture_app_signer_fingerprint']
             state['case'] = current
             environment = dict(PATH='/usr/bin:/bin', LANG='C.UTF-8', HOME='/root', SUDO_USER='bench',
                 OMG_DISABLE_DAEMON='1', OMG_DISABLE_TELEMETRY='1', OMG_COLORS='never', RUST_LOG='warn',
@@ -810,6 +848,16 @@ def run_fresh_admission_fixture(owner, cli, names=None, profiles=None, decoder_c
                         require('applicability is UNKNOWN' in result['output'], 'Archive acknowledgement lost Unknown coverage')
                 else:
                     require(after == before and payload_after == payload_before, 'Refused admission changed its private package state')
+                if unknown_key:
+                    keyring_after = sha(keyring)
+                    require(keyring_after == keyring_before, 'Refused package changed the verification keyring')
+                    row['keyring_sha256'] = [keyring_before, keyring_after]
+                if case.interaction == 'key-decline':
+                    fingerprint = current['signing_key_fingerprint']
+                    require(current.get('signing_key_declined')
+                            and f'Import PGP key {fingerprint[-16:]}? · no' in result['output'],
+                            'Native signing key refusal did not decline the fixture key')
+                    row.update(signing_key_fingerprint=fingerprint, signing_key_declined=True)
                 require(not (fixture / 'db/db.lck').exists(), 'Native admission left its transaction lock')
                 if case.interaction == 'timeout':
                     require(result['elapsed_seconds'] >= 59, 'Native acknowledgement timed out prematurely')
@@ -867,7 +915,7 @@ def validate_fresh_admission(value, cli_sha256, decoder_cases=False):
                 and type(row.get('exit_code')) is int and row['exit_code'] == fresh_case_exit(case)
                 and row.get('stopped_signal') is None and row.get('transaction_lock_remains') is False
                 and row.get('server_errors') == [], 'Native admission failed or left a stopped transaction: ' + case.name)
-        prompt = case.interaction not in ('none', 'noninteractive')
+        prompt = case.interaction not in ('none', 'noninteractive', 'key-decline')
         require(row.get('prompt_seen') is prompt, 'Native attended admission was not exercised: ' + case.name)
         output = row.get('output')
         require(type(output) is str and len(output.encode()) <= 1024 * 1024
@@ -894,6 +942,17 @@ def validate_fresh_admission(value, cli_sha256, decoder_cases=False):
             require(package + '/desc' in row['database_after'] and row['database_before'] != row['database_after']
                     and row['payload_after'].get(path) == hashlib.sha256(payload).hexdigest(),
                     'Native admission did not commit the approved package bytes: ' + case.name)
+        if case.name in UNKNOWN_SIGNING_KEY_CASES:
+            keyring = row.get('keyring_sha256')
+            require(type(keyring) is list and len(keyring) == 2 and keyring[0] == keyring[1]
+                    and type(keyring[0]) is str and re.fullmatch('[0-9a-f]{64}', keyring[0]),
+                    'Unknown signing key refusal lacks an unchanged verification keyring')
+        if case.interaction == 'key-decline':
+            fingerprint = row.get('signing_key_fingerprint')
+            require(row.get('signing_key_declined') is True and type(fingerprint) is str
+                    and re.fullmatch('[0-9A-F]{40}', fingerprint)
+                    and f'Import PGP key {fingerprint[-16:]}? · no' in output,
+                    'Attended signing key refusal must decline the exact fixture key')
         if decoder_cases:
             validate_signed_decoder_input(case, row)
         if case.interaction == 'foreground-loss':
@@ -910,6 +969,8 @@ def verify_signed_fixture(owner, phase='complete'):
     receipt = json.loads((owner / 'data-receipt.json').read_text())
     completed = phase in ('complete', 'migrated', 'migrated-unmatched', 'repository-upgraded')
     packages = dict(receipt['initial_packages'])
+    refreshed = {'archlinux-keyring', 'omarchy-keyring'} if phase == 'keyrings-refreshed' else set()
+    require(refreshed <= packages.keys(), 'Expected native keyring packages are missing')
     if phase in ('migrated', 'migrated-unmatched'):
         require(set(receipt.get('migration_packages', {})) == {'xorg-xrandr', 'hp-omnibook-3-audio'},
                 'Native migration package fixtures are missing')
@@ -919,20 +980,41 @@ def verify_signed_fixture(owner, phase='complete'):
             if name not in packages:
                 require(not (owner / 'root' / value['payload_path']).exists(),
                         'Non-matching hardware received an unrelated package payload')
-    version = '3-1' if completed else '1-1'
-    obsolete = '1-1' if completed else '3-1'
-    payload_hash = 'after_sha256' if completed else 'before_sha256'
-    expected_records = {name + '-' + version for name in packages}
+    versions = {name: '3-1' if completed or name in refreshed else '1-1' for name in packages}
+    expected_records = {name + '-' + version for name, version in versions.items()}
+    foreign_record = 'omg-coverage-foreign-1-1'
+    if receipt.get('foreign_package'):
+        expected_records.add(foreign_record)
+        local = owner / 'db/local' / foreign_record
+        initial_database = receipt['initial_database_sha256']
+        require(fixture_tree_hashes(local)
+                == {path.removeprefix(foreign_record + '/'): digest for path, digest in initial_database.items()
+                    if path.startswith(foreign_record + '/')},
+                'AUR outage changed installed foreign package metadata')
+        foreign_payload = 'usr/share/omg-coverage/omg-coverage-foreign.txt'
+        require(sha(owner / 'root' / foreign_payload) == receipt['initial_payload_sha256'][foreign_payload],
+                'AUR outage changed the installed foreign package payload')
     if not completed or phase == 'repository-upgraded':
         expected_records.add('omg-coverage-dead-dep-1-1')
     actual_records = {path.name for path in (owner / 'db/local').iterdir() if path.is_dir()}
-    require(actual_records == expected_records, 'Native package inventory differs from expected phase')
+    require(actual_records == expected_records,
+            f'Native package inventory differs for {phase}: missing={sorted(expected_records - actual_records)}, '
+            f'extra={sorted(actual_records - expected_records)}')
     if not completed:
-        require(fixture_tree_hashes(owner / 'db/local') == receipt['initial_database_sha256'],
+        keyring_records = {f'{name}-{version}' for name in refreshed for version in ('1-1', '3-1')}
+        keyring_payloads = {packages[name]['payload_path'] for name in refreshed}
+        database = fixture_tree_hashes(owner / 'db/local')
+        payloads = fixture_tree_hashes(owner / 'root')
+        require({p:h for p,h in database.items() if p.split('/',1)[0] not in keyring_records}
+                == {p:h for p,h in receipt['initial_database_sha256'].items() if p.split('/',1)[0] not in keyring_records},
                 'Native package database differs from initial state')
-        require(fixture_tree_hashes(owner / 'root') == receipt['initial_payload_sha256'],
+        require({p:h for p,h in payloads.items() if p not in keyring_payloads}
+                == {p:h for p,h in receipt['initial_payload_sha256'].items() if p not in keyring_payloads},
                 'Native transaction payload differs from initial state')
     for name, expected in packages.items():
+        version = versions[name]
+        obsolete = '1-1' if version == '3-1' else '3-1'
+        payload_hash = 'after_sha256' if version == '3-1' else 'before_sha256'
         installed = owner / 'db/local' / (name + '-' + version)
         require(installed.is_dir() and not (owner / 'db/local' / (name + '-' + obsolete)).exists(),
                 'Native transaction has an unexpected version for ' + name)
@@ -953,6 +1035,20 @@ def verify_signed_fixture(owner, phase='complete'):
                     'Native cache pruning removed a retained version')
     require(not (owner / 'db/db.lck').exists(), 'Native transaction leaked its database lock')
     result = dict(status=NATIVE_PHASES[phase], packages=packages)
+    if receipt.get('foreign_package'):
+        result['unchanged_foreign_package'] = foreign_record
+    signer = receipt.get('fixture_app_signer_fingerprint')
+    trusted = receipt.get('fixture_signer_fingerprint')
+    if signer is not None and signer != trusted:
+        require(type(trusted) is str and re.fullmatch('[0-9A-F]{40}', trusted)
+                and type(signer) is str and re.fullmatch('[0-9A-F]{40}', signer),
+                'Native signer fingerprints are invalid')
+        listing = fixture_command(['gpg', '--batch', '--homedir', str(owner / 'gnupg'), '--no-default-keyring',
+            '--keyring', str(owner / 'gnupg/pubring.gpg'), '--with-colons', '--fingerprint', '--list-keys']).stdout
+        keys = {record.split(b':')[9] for record in listing.splitlines() if record.startswith(b'fpr:')}
+        require(trusted.encode() in keys and signer.encode() not in keys,
+                'Rejected fixture signer must stay outside the verification keyring')
+        result['refused_signer'] = signer
     kernel = receipt.get('running_kernel_modules')
     if kernel is not None:
         require(sha(Path('/') / kernel['path']) == kernel['sha256'], 'Real guest kernel inventory was changed')
@@ -1085,6 +1181,12 @@ OMARCHY_SUFFIX = (
     'omarchy-update-restart\t--services-only', 'omarchy-hook\tpost-update',
     'omarchy-update-mise', 'omarchy-update-boot', 'omarchy-update-stay-awake\tstop')
 
+PLATFORM_KEYRING_FAILURES = {
+    'platform-unreadable': 'Cannot read platform keyring packages',
+    'platform-untrusted': 'Platform keyring list must be a root-controlled regular file',
+    'platform-oversize': 'Platform keyring list exceeds its limit',
+}
+
 
 class OmarchyCase(NamedTuple):
     exit_status: int
@@ -1101,7 +1203,8 @@ class OmarchyCase(NamedTuple):
 
 
 OMARCHY_CASES = {
-    'omarchy-success': OmarchyCase(0, OMARCHY_PREFIX + OMARCHY_SUFFIX, native_phase='complete'),
+    'omarchy-success': OmarchyCase(0, OMARCHY_PREFIX + OMARCHY_SUFFIX,
+        scene='dev-link', native_phase='complete'),
     'omarchy-native-migrations': OmarchyCase(0, OMARCHY_PREFIX + OMARCHY_SUFFIX[:2] + (
         'omarchy-hw-aarch64-qualcomm', 'omarchy-hw-match\tOmniBook 3 Laptop',
         'omarchy-state\tset\treboot-required', 'omarchy-notification-dismiss\tOmarchy Migrations',
@@ -1119,7 +1222,7 @@ OMARCHY_CASES = {
     ) + OMARCHY_SUFFIX[3:], absent_helper='omarchy-notification-dismiss', native_phase='migrated'),
     'omarchy-native-migrations-script-failure': OmarchyCase(1, OMARCHY_PREFIX + OMARCHY_SUFFIX[:2] + (
         'omarchy-update-stay-awake\tstop',), native_phase='repository-upgraded'),
-    'omarchy-native-migrations-installed-audio': OmarchyCase(0, OMARCHY_PREFIX + OMARCHY_SUFFIX[:2] + (
+    'omarchy-native-migrations-preinstalled': OmarchyCase(0, OMARCHY_PREFIX + OMARCHY_SUFFIX[:2] + (
         'omarchy-hw-aarch64-qualcomm', 'omarchy-hw-match\tOmniBook 3 Laptop',
         'omarchy-notification-dismiss\tOmarchy Migrations',
     ) + OMARCHY_SUFFIX[3:], native_phase='migrated'),
@@ -1127,9 +1230,21 @@ OMARCHY_CASES = {
         'omarchy-update-stay-awake\tstop',), scene='migration-inventory-error', native_phase='repository-upgraded'),
     'omarchy-native-migrations-directory-untrusted': OmarchyCase(1, OMARCHY_PREFIX + OMARCHY_SUFFIX[:2] + (
         'omarchy-update-stay-awake\tstop',), scene='migration-directory-untrusted', native_phase='repository-upgraded'),
-    'omarchy-current-kernel': OmarchyCase(0, OMARCHY_PREFIX + OMARCHY_SUFFIX, native_phase='complete'),
+    'omarchy-current-kernel': OmarchyCase(0, OMARCHY_PREFIX + OMARCHY_SUFFIX,
+        scene='packaged-config', native_phase='complete'),
     'omarchy-runtime-unset': OmarchyCase(0, OMARCHY_PREFIX + OMARCHY_SUFFIX, native_phase='complete'),
+    'omarchy-aur-unavailable': OmarchyCase(0, OMARCHY_PREFIX + OMARCHY_SUFFIX,
+        scene='aur-unavailable', native_phase='complete'),
+    'omarchy-platform-keyring': OmarchyCase(0, OMARCHY_PREFIX + OMARCHY_SUFFIX,
+        scene='platform-configured', native_phase='complete'),
+    'omarchy-platform-keyring-unreadable': OmarchyCase(1, OMARCHY_PREFIX + ('omarchy-update-stay-awake\tstop',),
+        scene='platform-unreadable', native_phase='cache-pruned'),
+    'omarchy-platform-keyring-untrusted': OmarchyCase(1, OMARCHY_PREFIX + ('omarchy-update-stay-awake\tstop',),
+        scene='platform-untrusted', native_phase='cache-pruned'),
+    'omarchy-platform-keyring-oversize': OmarchyCase(1, OMARCHY_PREFIX + ('omarchy-update-stay-awake\tstop',),
+        scene='platform-oversize', native_phase='cache-pruned'),
     'omarchy-vendor-failure': OmarchyCase(1, OMARCHY_PREFIX + ('omarchy-update-stay-awake\tstop',), native_phase='cache-pruned'),
+    'omarchy-unknown-signing-key': OmarchyCase(1, OMARCHY_PREFIX + ('omarchy-update-stay-awake\tstop',), native_phase='keyrings-refreshed'),
     'omarchy-declined': OmarchyCase(0, ('omarchy-update-requires-free-space', 'omarchy-update-confirm')),
     'omarchy-optional-failures': OmarchyCase(0, tuple(
         item for item in OMARCHY_PREFIX + OMARCHY_SUFFIX
@@ -1181,13 +1296,16 @@ OMARCHY_CASES = {
         scene='confirmation-failure', failure_command='omarchy-update-confirm', failure_status=2),
     'omarchy-development-failure': OmarchyCase(1, OMARCHY_PREFIX + ('omarchy-update-stay-awake\tstop',),
         scene='development-failure', native_phase='cache-pruned', failure_command='omarchy-update-dev'),
+    'omarchy-dev-config-unreadable': OmarchyCase(1, OMARCHY_PREFIX[:3] + ('omarchy-update-stay-awake\tstop',),
+        scene='unreadable-config', native_phase='cache-pruned'),
     'omarchy-inhibitor-start-failure': OmarchyCase(1, OMARCHY_PREFIX[:3] + ('omarchy-update-stay-awake\tstop',),
         scene='inhibitor-start-failure', native_phase='cache-pruned', failure_command='omarchy-update-stay-awake'),
     'omarchy-inhibitor-stop-failure': OmarchyCase(1, OMARCHY_PREFIX + OMARCHY_SUFFIX + ('omarchy-update-stay-awake\tstop',),
         scene='inhibitor-stop-failure', native_phase='complete', failure_command='omarchy-update-stay-awake'),
 }
 
-ARCH_READONLY_STAGES = ('arch-dry-run', 'arch-check')
+ARCH_AUR_UNAVAILABLE_STAGE = 'arch-aur-unavailable'
+ARCH_READONLY_STAGES = ('arch-dry-run', 'arch-check', ARCH_AUR_UNAVAILABLE_STAGE)
 NATIVE_PREFLIGHT_TEST = 'cli::packages::install::arch::tests::native_fresh_snapshot_preflight_defers_evidence_but_enforces_source_policy'
 FRESH_ADMISSION_STAGES = tuple('fresh-' + case.name for case in FRESH_ADMISSION_CASES)
 SIGNED_DECODER_STAGES = tuple('fresh-' + case.name for case in SIGNED_DECODER_CASES)
@@ -1233,10 +1351,11 @@ import re
 import sys
 from pathlib import Path
 root = Path(sys.argv[1])
-host = 'omg-advisories.latham.workers.dev'
+offline_hosts = ('omg-advisories.latham.workers.dev', 'aur.archlinux.org')
 hosts = Path('/etc/hosts').read_text()
-assert all(host not in line.split('#', 1)[0].split()[1:] for line in hosts.splitlines())
-(root / 'advisory-hosts').write_text(hosts.rstrip() + '\n127.0.0.1 ' + host + '\n')
+assert all(host not in line.split('#', 1)[0].split()[1:]
+           for line in hosts.splitlines() for host in offline_hosts)
+(root / 'advisory-hosts').write_text(hosts.rstrip() + '\n127.0.0.1 ' + ' '.join(offline_hosts) + '\n')
 nss = Path('/etc/nsswitch.conf').read_text()
 assert len(re.findall(r'^hosts:.*$', nss, flags=re.M)) == 1
 (root / 'advisory-nss').write_text(re.sub(r'^hosts:.*$', 'hosts: files', nss, flags=re.M))
@@ -1246,20 +1365,22 @@ mount --bind "$fixture/advisory-nss" /etc/nsswitch.conf
 ip link set lo up
 python3 - <<'OMG_OMARCHY_OFFLINE_PROBE'
 import socket
-host = 'omg-advisories.latham.workers.dev'
-assert {row[4][0] for row in socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)} == {'127.0.0.1'}
-try:
-    socket.create_connection((host, 443), timeout=1).close()
-except ConnectionRefusedError:
-    print('[native-coverage] Omarchy advisory provider is explicitly unavailable on private loopback')
-else:
-    raise AssertionError('unexpected advisory listener in private Omarchy network')
+for host in ('omg-advisories.latham.workers.dev', 'aur.archlinux.org'):
+    assert {row[4][0] for row in socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)} == {'127.0.0.1'}
+    try:
+        socket.create_connection((host, 443), timeout=1).close()
+    except ConnectionRefusedError:
+        print(f'[native-coverage] {host} is unavailable on private loopback')
+    else:
+        raise AssertionError(f'unexpected provider listener in private Omarchy network: {host}')
 OMG_OMARCHY_OFFLINE_PROBE
 printf 'ID=omarchy\nID_LIKE=arch\n' > "$fixture/release"
 mount --bind "$fixture/release" /etc/os-release
 mount -t tmpfs -o nosuid,nodev,mode=1777 tmpfs /tmp
 install -d -m 755 "$fixture/runtime" "$fixture/runtime/migrations" /usr/share/omarchy
 mount --bind "$fixture/runtime" /usr/share/omarchy
+install -d -m 755 "$fixture/platform" /usr/share/omarchy-platform
+mount --bind "$fixture/platform" /usr/share/omarchy-platform
 test "$(stat -c '%u:%a' /usr/share/omarchy)" = 0:755
 test "$(stat -c '%u:%a' /usr/share/omarchy/migrations)" = 0:755
 cat > "$fixture/stage" <<'OMG_INERT_OMARCHY_STAGE'
@@ -1279,7 +1400,18 @@ omarchy_security_require_source_root() {
     return 1
   fi
 }
-case "$name" in omarchy-*) omarchy_security_require_source_root "$0" ;; esac
+if [[ $name == omarchy-update-dev && ${OMARCHY_FIXTURE_SCENE:-none} == dev-link ]]; then
+  test "$OMARCHY_PATH" = "$HOME/dev-checkout"
+  nested=$(command -v omarchy-migrate)
+  test "$(/usr/bin/readlink -e -- "$nested")" = /usr/bin/omarchy-migrate
+  printf '\nconfigured_dev_checkout=selected nested_helper=packaged\n'
+else
+  case "$name" in omarchy-*) omarchy_security_require_source_root "$0" ;; esac
+  if [[ $name == omarchy-update-dev && ${OMARCHY_FIXTURE_SCENE:-none} == packaged-config ]]; then
+    test "$OMARCHY_PATH" = /usr/share/omarchy
+    printf '\nconfigured_dev_checkout=packaged\n'
+  fi
+fi
 { printf '%s' "$name"; if test "$#" -gt 0; then printf '\t%s' "$@"; fi; printf '\n'; } >> "$OMARCHY_HELPER_TRACE"
 case "$name:${OMARCHY_FIXTURE_SCENE:-none}:${1:-}" in
   omarchy-hw-aarch64-qualcomm:migration-hardware-unmatched:*) exit 1 ;;
@@ -1554,7 +1686,10 @@ for stage in OMARCHY_STAGE_NAMES; do
   signed_options=()
   if test "$stage" = omarchy-current-kernel; then signed_options=(--current-kernel); fi
   if [[ $stage == omarchy-native-migrations* ]]; then signed_options=(--native-migrations); fi
-  if test "$stage" = omarchy-native-migrations-installed-audio; then signed_options+=(--installed-audio); fi
+  if test "$stage" = omarchy-native-migrations-preinstalled; then signed_options+=(--installed-migrations); fi
+  if test "$stage" = omarchy-unknown-signing-key; then signed_options+=(--unknown-app-signer); fi
+  if test "$stage" = omarchy-aur-unavailable; then signed_options+=(--foreign-package); fi
+  if test "$stage" = omarchy-platform-keyring; then signed_options+=(--platform-keyring); fi
   python3 /native-cli-coverage.py signed-fixture --owner "$signed_owner" "${signed_options[@]}"
   sed -i "s|file://$signed_owner/repos/|http://127.0.0.1:18080/${signed_owner##*/}/repos/|g" "$signed_owner/pacman.conf"
   cp "$signed_owner/pacman.conf" "$case_dir/pacman.conf"
@@ -1648,6 +1783,39 @@ OMG_NATIVE_MIGRATION_1794675791
   case "$stage" in
 OMARCHY_CASE_SETUP
   esac
+  caller_path=/usr/bin:/bin
+  platform_file="$fixture/platform/keyrings"
+  case "$scene" in
+    platform-configured)
+      printf '\n# Fixture platform keyrings\nnot-a-keyring-package\nbad name-keyring\narchlinux-keyring\nmissing-platform-keyring\n  omg-coverage-platform-keyring  \n' > "$platform_file"
+      chmod 644 "$platform_file"
+      ;;
+    platform-unreadable) ln -s "$fixture/missing-platform-keyrings" "$platform_file" ;;
+    platform-untrusted) install -m 666 /dev/null "$platform_file" ;;
+    platform-oversize)
+      truncate -s 65537 "$platform_file"
+      chmod 644 "$platform_file"
+      ;;
+  esac
+  case "$scene" in
+    dev-link|packaged-config|unreadable-config)
+      test ! -e /etc/omarchy.conf && test ! -L /etc/omarchy.conf
+      created+=(/etc/omarchy.conf)
+      case "$scene" in
+        dev-link)
+          install -d -m 700 -o nobody -g nobody "$case_dir/dev-checkout"
+          printf 'export OMARCHY_PATH="%s"\n' "$case_dir/dev-checkout" > /etc/omarchy.conf
+          chmod 644 /etc/omarchy.conf
+          caller_path="$case_dir/checkout/bin:$caller_path"
+          ;;
+        packaged-config)
+          printf 'export OMARCHY_PATH="/usr/share/omarchy"\n' > /etc/omarchy.conf
+          chmod 644 /etc/omarchy.conf
+          ;;
+        unreadable-config) ln -s "$fixture/missing-dev-config" /etc/omarchy.conf ;;
+      esac
+      ;;
+  esac
   if test -n "$absent_helper"; then
     test -f "/usr/bin/$absent_helper" && test ! -L "/usr/bin/$absent_helper"
     test ! -e "$fixture/saved/$absent_helper"
@@ -1689,7 +1857,8 @@ OMARCHY_CASE_SETUP
   if test -n "$control"; then
     launch=(python3 "$fixture/control.py" "$control")
   fi
-  if test "$native_phase" != initial && test "$native_phase" != cache-pruned && test -z "$reboot_answer" && test -z "$control"; then
+  if test "$native_phase" != initial && test "$native_phase" != cache-pruned \
+       && test -z "$reboot_answer" && test -z "$control"; then
     launch=(python3 /attend-unknown-fixture.py --timeout "$((stage_timeout-2))" \
       --receipt "$case_dir/unknown.json" -- "${launch[@]}")
   fi
@@ -1727,7 +1896,7 @@ OMARCHY_CASE_SETUP
   fi
   result=0
   timeout --signal=TERM --kill-after=3 "$stage_timeout" runuser -u nobody -- env -i \
-    PATH=/usr/bin:/bin LANG=C.UTF-8 HOME="$case_dir" TMPDIR="$case_dir" \
+    PATH="$caller_path" LANG=C.UTF-8 HOME="$case_dir" TMPDIR="$case_dir" \
     "${runtime_environment[@]}" XDG_CONFIG_HOME="$case_dir/config" \
     XDG_CACHE_HOME="$case_dir/cache" XDG_DATA_HOME="$case_dir/data" XDG_STATE_HOME="$case_dir/state" \
     OMG_CONFIG_DIR="$case_dir/config" OMG_CACHE_DIR="$case_dir/cache" OMG_DATA_DIR="$case_dir/data" \
@@ -1737,6 +1906,20 @@ OMARCHY_CASE_SETUP
     OMARCHY_FIXTURE_CASE="$stage" OMARCHY_FIXTURE_SCENE="$scene" OMARCHY_HELPER_TRACE="$case_dir/helpers.tsv" \
     LLVM_PROFILE_FILE="/profiles/omg-extra-$stage-%p-%m.profraw" "${extra[@]}" \
     "${launch[@]}" < /dev/null > "/evidence/cli/$stage.log" 2>&1 || result=$?
+  case "$scene" in
+    dev-link|packaged-config|unreadable-config) rm -- /etc/omarchy.conf ;;
+  esac
+  case "$scene" in
+    platform-configured) rm -- "$platform_file" ;;
+    platform-unreadable|platform-untrusted|platform-oversize)
+      rm -- "$platform_file"
+      if test -n "$(find "$signed_owner/db/sync" -mindepth 1 -print -quit)"; then
+        printf 'Rejected platform keyring configuration refreshed repository state\n' >&2
+        exit 1
+      fi
+      printf 'sync_databases=unchanged\n' > "/evidence/cli/$stage-platform-keyrings.txt"
+      ;;
+  esac
   if test -n "$boundary_job"; then
     if test ! -f "$case_dir/helpers.tsv.boundary-done"; then
       kill "$boundary_job" 2>/dev/null || true
@@ -1849,16 +2032,26 @@ OMG_AUTHORIZATION_RECEIPT
   printf '[native-coverage] completed %s in %ss\n' "$stage" "$((SECONDS-stage_started))"
 done
 printf 'ID=arch\n' > "$fixture/release"
-case_dir="$case_root/omarchy-success"
-signed_owner=/opt/omg-coverage-omarchy-success
-chmod 755 "$signed_owner/gnupg"
-chmod 644 "$signed_owner/gnupg/pubring.gpg" "$signed_owner/gnupg/trustdb.gpg"
 transcript_before=$(sha256sum /tmp/omarchy-update.log)
-for stage in arch-dry-run arch-check; do
-  args=(--dry-run)
-  if test "$stage" = arch-check; then args=(--check); fi
+for stage in ARCH_READONLY_STAGE_NAMES; do
+  source_stage=omarchy-success
+  expected=0
+  case "$stage" in
+    arch-dry-run) args=(--dry-run) ;;
+    arch-check) args=(--check) ;;
+    arch-aur-unavailable)
+      args=(--check --aur-only)
+      source_stage=omarchy-aur-unavailable
+      expected=1
+      ;;
+  esac
+  case_dir="$case_root/$source_stage"
+  signed_owner="/opt/omg-coverage-$source_stage"
+  chmod 755 "$signed_owner/gnupg"
+  chmod 644 "$signed_owner/gnupg/pubring.gpg" "$signed_owner/gnupg/trustdb.gpg"
   : > "$case_dir/arch-helpers.tsv"
   chown nobody:nobody "$case_dir/arch-helpers.tsv"
+  result=0
   timeout --signal=TERM --kill-after=3 40 runuser -u nobody -- env -i \
     PATH=/usr/bin:/bin LANG=C.UTF-8 HOME="$case_dir" TMPDIR="$case_dir" \
     XDG_RUNTIME_DIR="$case_dir/run" XDG_CONFIG_HOME="$case_dir/config" \
@@ -1870,7 +2063,9 @@ for stage in arch-dry-run arch-check; do
     OMARCHY_FIXTURE_CASE="$stage" OMARCHY_HELPER_TRACE="$case_dir/arch-helpers.tsv" \
     LLVM_PROFILE_FILE="/profiles/omg-extra-$stage-%p-%m.profraw" \
     bash -c 'test "$(id -u)" -ne 0; test -z "${OMG_TEST_MODE+x}"; test -z "${CARGO_PRIMARY_PACKAGE+x}"; exec /omg-extra-bin/cli update "$@" --no-sync --yes' bash "${args[@]}" \
-    < /dev/null > "/evidence/cli/$stage.log" 2>&1
+    < /dev/null > "/evidence/cli/$stage.log" 2>&1 || result=$?
+  test "$result" = "$expected"
+  printf '%s\n' "$result" > "/evidence/cli/$stage-exit.txt"
   test ! -s "$case_dir/arch-helpers.tsv"
   test "$(sha256sum /tmp/omarchy-update.log)" = "$transcript_before"
   python3 /native-cli-coverage.py verify-signed-fixture --owner "$signed_owner" --phase complete \
@@ -1892,6 +2087,7 @@ OMG_OMARCHY_NAMESPACE
         f'stage_timeout={95 if case.authorization else 40} ;;'
         for stage, case in OMARCHY_CASES.items())
     return (script.replace('OMARCHY_STAGE_NAMES', ' '.join(map(shlex.quote, OMARCHY_CASES)))
+            .replace('ARCH_READONLY_STAGE_NAMES', ' '.join(map(shlex.quote, ARCH_READONLY_STAGES)))
             .replace('OMARCHY_CASE_SETUP', setup))
 
 
@@ -2282,6 +2478,15 @@ def validate_evidence(evidence, profiles, artifacts, commit):
         if stage == 'omarchy-runtime-unset':
             require(log.splitlines().count('caller_runtime_hint=unset') == 1,
                     'Native caller runtime hint absence was not witnessed')
+        if case.scene == 'dev-link':
+            require(log.splitlines().count('configured_dev_checkout=selected nested_helper=packaged') == 1,
+                    'The dev checkout or packaged nested helper was not selected')
+        elif case.scene == 'packaged-config':
+            require(log.splitlines().count('configured_dev_checkout=packaged') == 1,
+                    'The packaged dev configuration did not retain the selected runtime')
+        elif case.scene == 'unreadable-config':
+            require('Cannot open Omarchy dev-link configuration' in log,
+                    'The unreadable Omarchy dev-link configuration failure was not reported')
         if helpers:
             require((evidence / f'{stage}-coordination.txt').read_text()
                     == 'released private lock; owned transcript mode=600\n',
@@ -2290,11 +2495,24 @@ def validate_evidence(evidence, profiles, artifacts, commit):
             require(transcript.startswith('OMG Omarchy update started\n')
                     and '\nOMG Omarchy update finished: ' in transcript,
                     'Omarchy has no complete genuine PTY transcript: ' + stage)
-        require(json.loads((evidence / f'{stage}-native-state.json').read_text())['status']
-                == NATIVE_PHASES[case.native_phase], 'Native package state differs: ' + stage)
-        if case.native_phase in ('complete', 'migrated', 'migrated-unmatched'):
+        native_state = json.loads((evidence / f'{stage}-native-state.json').read_text())
+        require(native_state['status'] == NATIVE_PHASES[case.native_phase], 'Native package state differs: ' + stage)
+        if case.scene == 'aur-unavailable':
+            require(native_state.get('unchanged_foreign_package') == 'omg-coverage-foreign-1-1'
+                    and 'AUR is unavailable. Skipping AUR updates and continuing to Omarchy boot verification' in log,
+                    'Omarchy AUR outage lacks the warning or unchanged foreign package proof')
+        elif case.native_phase in ('complete', 'migrated', 'migrated-unmatched'):
             require('up to date' in log.lower(),
                     'Native OMG AUR did not complete: ' + stage)
+        if case.scene == 'platform-configured':
+            before_upgrade, refreshed, _ = log.partition('Native Omarchy keyring-refresh completed')
+            require(refreshed and before_upgrade.count('Package: ["omg-coverage-platform-keyring","3-1",') == 1
+                    and 'Package: ["missing-platform-keyring",' not in before_upgrade,
+                    'Platform keyring configuration did not select the installed platform package for refresh')
+        elif case.scene in PLATFORM_KEYRING_FAILURES:
+            require(PLATFORM_KEYRING_FAILURES[case.scene] in log
+                    and (evidence / f'{stage}-platform-keyrings.txt').read_text() == 'sync_databases=unchanged\n',
+                    'Platform keyring configuration must fail before refreshing repository state: ' + stage)
         if case.scene in ('migration-inventory-error', 'migration-directory-untrusted'):
             require((evidence / f'{stage}-migrations.txt').read_text()
                     == f'boundary_control={case.scene} completion_markers=0\n',
@@ -2312,14 +2530,13 @@ def validate_evidence(evidence, profiles, artifacts, commit):
             require((evidence / f'{stage}-migrations.txt').read_text()
                     == 'ordered_configuration=before,after recognized_native_migrations=2 completion_markers=4\n',
                     'Native migration completion evidence differs')
-            audio_installed = stage.endswith(('-unmatched', '-installed-audio'))
-            operations = ('migration-xrandr',) if audio_installed else ('migration-xrandr', 'migration-omnibook-audio')
-            require(all(f'Native Omarchy {operation} completed' in log
-                        for operation in operations),
-                    'Native migration package operations did not complete')
-            if audio_installed:
-                require('Native Omarchy migration-omnibook-audio completed' not in log,
-                        'Skipped audio migration invoked an unnecessary package transaction')
+            preinstalled = stage.endswith('-preinstalled')
+            for operation, expected in (
+                    ('migration-xrandr', not preinstalled),
+                    ('migration-omnibook-audio', not preinstalled and not stage.endswith('-unmatched'))):
+                completed = f'Native Omarchy {operation} completed' in log
+                require(completed == expected, 'Native migration package operations did not complete'
+                        if expected else 'Skipped migration invoked an unnecessary package transaction')
         if stage == 'omarchy-native-migrations-notification-error':
             require('Cannot dismiss the Omarchy migration notification:' in log,
                     'Migration notification failure was hidden')
@@ -2410,6 +2627,13 @@ def validate_evidence(evidence, profiles, artifacts, commit):
                     'Optional Omarchy update failures were not visible: ' + stage)
         elif stage == 'omarchy-vendor-failure':
             require('Omarchy update did not complete' in log, 'Missing vendor failure diagnostic')
+        elif stage == 'omarchy-unknown-signing-key':
+            state = json.loads((evidence / f'{stage}-native-state.json').read_text())
+            signer = state.get('refused_signer')
+            require(type(signer) is str and re.fullmatch('[0-9A-F]{40}', signer)
+                    and ('ALPM transaction aborted: it requires an unconfirmed package mutation '
+                         'or signing-key import (import an untrusted signing key)') in log,
+                    'Missing native signing-key refusal or unchanged verification keyring')
         elif stage == 'omarchy-migration-refusal' or stage.startswith('omarchy-migration-helper-'):
             require('external package helper' in log, 'Missing native package migration refusal')
         elif stage in ('omarchy-unsupported-mode', 'omarchy-unsupported-turbo-mode'):
@@ -2420,11 +2644,18 @@ def validate_evidence(evidence, profiles, artifacts, commit):
         require((evidence / f'{stage}-isolation.txt').read_text()
                 == 'actual_id=arch ordinary_uid=65534 vendor_helpers=0 transcript_unchanged=yes\n',
                 'Normal Arch update crossed the vendor lifecycle boundary')
-        require(json.loads((evidence / f'{stage}-native-state.json').read_text())['status']
-                == NATIVE_PHASES['complete'], 'Read-only Arch update changed native package state')
+        native_state = json.loads((evidence / f'{stage}-native-state.json').read_text())
+        require(native_state['status'] == NATIVE_PHASES['complete'], 'Read-only Arch update changed native package state')
         log = (evidence / f'{stage}.log').read_text()
-        require('up to date' in log.lower() and 'Omarchy runtime' not in log,
-                'Normal Arch read-only update did not complete independently')
+        exit_status = (evidence / f'{stage}-exit.txt').read_text()
+        if stage == ARCH_AUR_UNAVAILABLE_STAGE:
+            require(exit_status == '1\n' and 'Failed to check AUR updates' in log
+                    and native_state.get('unchanged_foreign_package') == 'omg-coverage-foreign-1-1',
+                    'Normal Arch AUR outage must fail with the foreign package unchanged')
+        else:
+            require(exit_status == '0\n' and 'up to date' in log.lower(),
+                    'Normal Arch read-only update did not complete independently')
+        require('Omarchy runtime' not in log, 'Normal Arch read-only update used Omarchy')
         modules = {PROFILE.fullmatch(p.name)[3] for p in grouped[stage]}
         require(modules == cli_modules, 'Normal Arch profiles do not match the actual CLI')
     for path in evidence.rglob('*'):
@@ -2567,7 +2798,10 @@ def main():
     signed.add_argument('--owner', required=True, type=Path)
     signed.add_argument('--current-kernel', action='store_true')
     signed.add_argument('--native-migrations', action='store_true')
-    signed.add_argument('--installed-audio', action='store_true')
+    signed.add_argument('--installed-migrations', action='store_true')
+    signed.add_argument('--unknown-app-signer', action='store_true')
+    signed.add_argument('--foreign-package', action='store_true')
+    signed.add_argument('--platform-keyring', action='store_true')
     fresh = commands.add_parser('fresh-admission-fixture')
     fresh.add_argument('--owner', required=True, type=Path)
     fresh.add_argument('--cli', required=True, type=Path)
@@ -2604,7 +2838,9 @@ def main():
             json.dump(value, stream, indent=2)
             stream.write('\n')
     elif args.operation == 'signed-fixture':
-        create_signed_fixture(args.owner, args.current_kernel, args.native_migrations, args.installed_audio)
+        create_signed_fixture(args.owner, args.current_kernel, args.native_migrations, args.installed_migrations,
+                              unknown_app_signer=args.unknown_app_signer, foreign_package=args.foreign_package,
+                              platform_keyring=args.platform_keyring)
     elif args.operation == 'fresh-admission-fixture':
         print(json.dumps(run_fresh_admission_fixture(args.owner, args.cli, args.case, args.profiles, args.decoder_cases)))
     elif args.operation == 'verify-signed-fixture':

@@ -383,12 +383,42 @@ impl PacmanConfig {
         self.repos.iter().map(|r| r.name.as_str()).collect()
     }
 
-    pub(crate) fn repository_architecture(&self) -> &str {
-        self.architecture
+    #[cfg(feature = "arch")]
+    pub(crate) fn package_architectures(&self) -> Result<Vec<String>> {
+        let mut architectures = self
+            .architecture
             .as_deref()
-            .and_then(|value| value.split_whitespace().next())
-            .filter(|value| *value != "auto")
-            .unwrap_or(std::env::consts::ARCH)
+            .filter(|configured| !configured.trim().is_empty())
+            .unwrap_or("auto")
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        if architectures
+            .iter()
+            .any(|architecture| architecture == "auto")
+        {
+            let system = nix::sys::utsname::uname()
+                .context("Cannot read the kernel machine architecture")?;
+            let machine = system
+                .machine()
+                .to_str()
+                .context("Kernel machine architecture is not UTF-8")?;
+            for architecture in architectures
+                .iter_mut()
+                .filter(|architecture| architecture.as_str() == "auto")
+            {
+                machine.clone_into(architecture);
+            }
+        }
+        Ok(architectures)
+    }
+
+    #[cfg(feature = "arch")]
+    pub(crate) fn primary_package_architecture(&self) -> Result<String> {
+        self.package_architectures()?
+            .into_iter()
+            .next()
+            .context("No package architecture is configured")
     }
 
     pub fn resolve_servers(&self, repo: &RepoConfig, arch: &str) -> Result<Vec<String>> {

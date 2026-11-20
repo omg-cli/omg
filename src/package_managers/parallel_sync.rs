@@ -45,16 +45,6 @@ async fn persist_same_dir_temp(
     Ok(())
 }
 
-/// Build the URL for a database file
-fn build_db_url(mirror_template: &str, repo: &str, architecture: &str) -> String {
-    mirror_template
-        .replace("$repo", repo)
-        .replace("$arch", architecture)
-        + "/"
-        + repo
-        + ".db"
-}
-
 fn build_signature_url(database_url: &str) -> String {
     format!("{database_url}.sig")
 }
@@ -821,7 +811,7 @@ fn repository_database_urls(
         !config.repos.is_empty(),
         "pacman configuration contains no repositories"
     );
-    let architecture = config.repository_architecture();
+    let architecture = config.primary_package_architecture()?;
     config
         .repos
         .iter()
@@ -831,7 +821,7 @@ fn repository_database_urls(
         })
         .map(|repo| {
             let servers = config
-                .resolve_servers(repo, architecture)
+                .resolve_servers(repo, &architecture)
                 .with_context(|| format!("Failed to resolve servers for repo '{}'", repo.name))?;
             anyhow::ensure!(
                 !servers.is_empty(),
@@ -841,7 +831,7 @@ fn repository_database_urls(
             let urls = servers
                 .iter()
                 .take(MAX_MIRRORS_PER_REPO)
-                .map(|server| build_db_url(server, &repo.name, architecture))
+                .map(|server| format!("{server}/{}.db", repo.name))
                 .collect();
             Ok((repo.name.clone(), urls))
         })
@@ -1269,18 +1259,26 @@ mod tests {
     }
 
     #[test]
-    fn db_urls_substitute_repo_and_runtime_arch() {
-        let arch = std::env::consts::ARCH;
-        let url = build_db_url("https://mirror.example.com/$repo/os/$arch", "core", arch);
-        assert_eq!(
-            url,
-            format!("https://mirror.example.com/core/os/{arch}/core.db")
-        );
-        let extra = build_db_url("https://mirror.example.com/$repo/os/$arch", "extra", arch);
-        assert_eq!(
-            extra,
-            format!("https://mirror.example.com/extra/os/{arch}/extra.db")
-        );
+    fn db_urls_substitute_repo_and_running_kernel_machine() {
+        let config = crate::core::pacman_conf::PacmanConfig::parse_str(
+            "[options]\nArchitecture = auto explicit-machine\n\n\
+             [core]\nServer = https://mirror.example.com/$repo/os/$arch\n\n\
+             [extra]\nServer = https://mirror.example.com/$repo/os/$arch\n",
+        )
+        .expect("valid repository fixtures");
+        let kernel = nix::sys::utsname::uname().expect("running kernel identity");
+        let machine = kernel.machine().to_str().expect("UTF-8 kernel machine");
+        let urls = repository_database_urls(&config).expect("resolved repository URLs");
+        assert_eq!(urls.len(), 2);
+        for ((name, servers), repo) in urls.into_iter().zip(["core", "extra"]) {
+            assert_eq!(name, repo);
+            assert_eq!(
+                servers,
+                [format!(
+                    "https://mirror.example.com/{repo}/os/{machine}/{repo}.db"
+                )]
+            );
+        }
     }
 
     #[test]

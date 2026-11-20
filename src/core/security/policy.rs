@@ -993,7 +993,8 @@ mod tests {
         fs::write(
             &path,
             "advisory_requirement = 'fresh_snapshot'\narch_advisory_repositories = ['core', 'extra']\n",
-        )?;
+        )
+        .expect("write the fresh advisory policy fixture");
         let policy = SecurityPolicy::load(&path)?;
         assert_eq!(
             policy.advisory_requirement,
@@ -1141,9 +1142,17 @@ mod tests {
         let address = listener.local_addr()?;
         let payload = r#"[{"name":"AVG-fixture","packages":["fixture"],"status":"Fixed","severity":"High","affected":"1-1","fixed":"2-1","issues":["CVE-2026-1234"],"type":"code execution"}]"#;
         let now = jiff::Timestamp::now().to_string();
-        let body = serde_json::to_vec(
-            &serde_json::json!({"schema_version":1,"source":"arch-security","source_url":"https://security.archlinux.org/issues/all.json","fetched_at":now,"checked_at":now,"complete":true,"payload_sha256":hex::encode(Sha256::digest(payload.as_bytes())),"payload_json":payload}),
-        )?;
+        let body = serde_json::json!({
+            "schema_version": 1,
+            "source": "arch-security",
+            "source_url": "https://security.archlinux.org/issues/all.json",
+            "fetched_at": now,
+            "checked_at": now,
+            "complete": true,
+            "payload_sha256": hex::encode(Sha256::digest(payload.as_bytes())),
+            "payload_json": payload,
+        })
+        .to_string();
         let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await?;
             let mut request = [0_u8; 4096];
@@ -1161,7 +1170,7 @@ mod tests {
                     .as_bytes(),
                 )
                 .await?;
-            socket.write_all(&body).await?;
+            socket.write_all(body.as_bytes()).await?;
             Ok::<_, anyhow::Error>(())
         });
         let package = |origin| SecurityPackage {
@@ -2023,16 +2032,20 @@ mod tests {
                     minimum_grade: SecurityGrade::Community,
                     ..policy.clone()
                 };
-                assert!(
-                    matches!(
-                        source_permitted.check_assessments(&[assessment]),
-                        Err(PolicyError::GradeTooLow {
-                            grade: SecurityGrade::Risk,
-                            ..
-                        })
-                    ),
-                    "score={score:?}, origin={origin:?}"
+                let refusal = source_permitted
+                    .check_assessments(&[assessment])
+                    .expect_err("a known finding must be refused even from a permitted source");
+                let expected_refusal = PolicyError::GradeTooLow {
+                    name: "candidate".into(),
+                    grade: SecurityGrade::Risk,
+                    minimum: SecurityGrade::Community,
+                };
+                let actual = (std::mem::discriminant(&refusal), refusal.to_string());
+                let expected = (
+                    std::mem::discriminant(&expected_refusal),
+                    expected_refusal.to_string(),
                 );
+                assert_eq!(actual, expected, "score={score:?}, origin={origin:?}");
             }
         }
     }
@@ -2304,6 +2317,47 @@ mod tests {
     }
 
     #[test]
+    fn current_policy_refuses_changes_after_handoff() -> anyhow::Result<()> {
+        const TEST: &str =
+            "core::security::policy::tests::current_policy_refuses_changes_after_handoff";
+        if crate::core::testing::run_isolated_test(TEST)
+            || crate::config::Settings::rerun_test_unprivileged(TEST)
+        {
+            return Ok(());
+        }
+
+        assert!(!crate::core::privilege::is_root());
+        let directory = tempfile::tempdir()?;
+        temp_env::with_var("OMG_CONFIG_DIR", Some(directory.path()), || {
+            let inherited = SecurityPolicy {
+                allow_aur: false,
+                ..SecurityPolicy::default()
+            };
+            let file = directory.path().join("policy.toml");
+            fs::write(&file, toml::to_string(&inherited)?)?;
+            validate_inherited_policy(&inherited)?;
+            INHERITED_POLICY
+                .set(inherited.clone())
+                .expect("isolated handoff fixture");
+            assert_eq!(SecurityPolicy::load_current()?, inherited);
+
+            let updated = SecurityPolicy {
+                allow_aur: true,
+                ..inherited
+            };
+            let changed = toml::to_string(&updated)?;
+            fs::write(&file, &changed)?;
+            let error = SecurityPolicy::load_current().expect_err("changed policy must refuse");
+            assert_eq!(
+                error.to_string(),
+                "Security policy changed after elevation; retry the operation"
+            );
+            assert_eq!(fs::read_to_string(&file)?, changed);
+            Ok(())
+        })
+    }
+
+    #[test]
     fn policy_file_accepts_exact_byte_limit_and_refuses_larger_files() -> anyhow::Result<()> {
         let directory = tempfile::tempdir()?;
         let file = directory.path().join("policy.toml");
@@ -2339,12 +2393,13 @@ mod tests {
             !crate::core::privilege::is_root(),
             "fixture must be unprivileged"
         );
-        let policy = SecurityPolicy::default();
+        let policy: SecurityPolicy = toml::from_str("advisory_requirement = 'optional'")?;
         assert_eq!(
-            policy.advisory_requirement,
-            AdvisoryRequirement::Optional,
-            "the built-in policy allows optional advisory coverage"
+            policy,
+            SecurityPolicy::default(),
+            "omitted fields retain defaults"
         );
+        assert_eq!(policy.advisory_requirement, AdvisoryRequirement::Optional);
         assert!(policy.allow_aur, "the default allows AUR");
         let argument = format!(
             "{POLICY_MARKER}{}",

@@ -175,15 +175,11 @@ jobs:
         run: cargo-machete
 
   standalone-suites:
-    name: "Standalone suites (${{ matrix.os }})"
+    name: "Standalone suites (ubuntu-24.04)"
     needs: quick-gate
     if: needs.quick-gate.outputs.should-build == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group'
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-24.04, macos-15]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -1146,9 +1142,17 @@ jobs:
 
       - name: Platform clippy
         if: matrix.phase == 'clippy'
+        shell: bash
         run: |
+          set -euo pipefail
+          cargo_source=()
+          if [ '${{ matrix.platform }}' = debian ]; then
+            # Cargo otherwise fetches an unrelated website submodule while resolving the lockfile.
+            python3 scripts/check-alpm-pins.py --prepare-cargo-source "$RUNNER_TEMP/omg-alpm-source"
+            cargo_source=(--config "$RUNNER_TEMP/omg-alpm-source/cargo-config.toml")
+          fi
           cargo clippy --all-targets --no-default-features --features ${{ matrix.features }} \
-            --locked -- -D warnings
+            "${cargo_source[@]}" --locked -- -D warnings
 
       - name: Test emitted shell hooks
         if: matrix.phase == 'validation' && matrix.platform == 'fedora'
@@ -1552,6 +1556,13 @@ jobs:
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           toolchain: "1.95.0"
+
+      # Reuse the ARM64 runner for the independent runtime workspaces.
+      - name: Test mise compatibility
+        run: cargo test --manifest-path tests/mise-compat/Cargo.toml --locked
+
+      - name: Test portable environment planner
+        run: cargo test --manifest-path tests/env-portable/Cargo.toml --locked
 
       - name: Setup cache
         if: inputs.skip-cache != true

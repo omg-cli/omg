@@ -140,6 +140,22 @@ pub(crate) fn validate_sync_database(alpm: &alpm::Alpm, database: &alpm::Db) -> 
         .with_context(|| format!("Repository '{}' failed native validation", database.name()))
 }
 
+pub(crate) fn omarchy_install_candidate<'a>(
+    alpm: &'a alpm::Alpm,
+    name: &str,
+) -> Result<Option<(&'a alpm::Db, &'a alpm::Package)>> {
+    for database in alpm.syncdbs() {
+        if !database.usage()?.contains(alpm::Usage::INSTALL) {
+            continue;
+        }
+        validate_sync_database(alpm, database)?;
+        if let Ok(package) = database.pkg(name) {
+            return Ok(Some((database, package)));
+        }
+    }
+    Ok(None)
+}
+
 pub fn get_update_list() -> Result<Vec<UpdateInfo>> {
     if crate::core::paths::test_mode() {
         let updates = crate::package_managers::pacman_db::check_updates_cached()?;
@@ -681,18 +697,9 @@ fn execute_transaction_in(
     configure_mirrors(alpm)?;
     if matches!(policy, TransactionPolicy::Omarchy) && kind == TransactionKind::Install {
         for name in &packages {
-            let mut trusted_repository = None;
-            for database in alpm.syncdbs() {
-                if !database.usage()?.contains(alpm::Usage::INSTALL) {
-                    continue;
-                }
-                validate_sync_database(alpm, database)?;
-                if database.pkg(name.as_str()).is_ok() {
-                    trusted_repository = Some(database.siglevel());
-                    break;
-                }
-            }
-            let level = trusted_repository.context("Omarchy package is unavailable")?;
+            let (database, _) =
+                omarchy_install_candidate(alpm, name)?.context("Omarchy package is unavailable")?;
+            let level = database.siglevel();
             anyhow::ensure!(
                 level.contains(alpm::SigLevel::PACKAGE)
                     && !level.intersects(
@@ -1679,12 +1686,10 @@ fn prepare_alpm_transaction_in<'a>(
     let mut admissions = std::collections::BTreeMap::new();
     if kind == TransactionKind::InstallAurArtifact {
         for target in &packages {
-            if crate::core::security::is_local_package_file(target) {
-                let path = crate::core::security::validate_local_package_file(target)?;
-                let admission =
-                    crate::package_managers::aur::artifact_inspector::inspect_archive(&path)?;
-                admissions.insert(path, admission);
-            }
+            let path = crate::core::security::validate_local_package_file(target)?;
+            let admission =
+                crate::package_managers::aur::artifact_inspector::inspect_archive(&path)?;
+            admissions.insert(path, admission);
         }
     }
     check_database_lock(std::path::Path::new(alpm.dbpath().trim_end_matches('/')))?;
@@ -1722,13 +1727,17 @@ fn prepare_alpm_transaction_in<'a>(
                     std::iter::once(pkg_name.as_str()),
                     &pacman_config.hold_pkg,
                 )?;
-                if let Ok(pkg) = tx_guard.0.localdb().pkg(pkg_name.as_str()) {
-                    tx_guard.0.trans_remove_pkg(pkg).map_err(|e| {
-                        anyhow::anyhow!("Failed to add {pkg_name} to removal list: {e}")
+                let pkg = tx_guard
+                    .0
+                    .localdb()
+                    .pkg(pkg_name.as_str())
+                    .with_context(|| {
+                        format!("Cannot remove '{pkg_name}' from the installed package database")
                     })?;
-                } else {
-                    tracing::warn!("Package '{pkg_name}' is not installed; skipping removal");
-                }
+                tx_guard
+                    .0
+                    .trans_remove_pkg(pkg)
+                    .with_context(|| format!("Failed to add {pkg_name} to removal list"))?;
             } else {
                 if crate::core::security::is_local_package_file(&pkg_name) {
                     let canonical_path =
@@ -1912,19 +1921,8 @@ fn configure_transaction_options(
     alpm.set_hookdirs(hook_dirs.into_iter())
         .context("Failed to configure pacman hooks")?;
 
-    let architectures = pacman_config
-        .architecture
-        .as_deref()
-        .unwrap_or("auto")
-        .split_whitespace()
-        .map(|architecture| {
-            if architecture == "auto" {
-                std::env::consts::ARCH
-            } else {
-                architecture
-            }
-        });
-    alpm.set_architectures(architectures)
+    let architectures = pacman_config.package_architectures()?;
+    alpm.set_architectures(architectures.iter().map(String::as_str))
         .context("Failed to configure package architecture validation")?;
     alpm.set_check_space(true);
     alpm.set_parallel_downloads(
@@ -2249,15 +2247,7 @@ impl AdmissionSignals {
             );
             action.sa_sigaction = cancel_admission as *const () as usize;
             action.sa_flags = 0;
-            // SAFETY: action.sa_mask is an initialized sigset_t whose address remains valid for this call.
-            #[expect(
-                unsafe_code,
-                reason = "the scoped cancellation handler must not inherit unrelated signal masks"
-            )]
-            if unsafe { nix::libc::sigemptyset(&raw mut action.sa_mask) } == -1 {
-                return Err(std::io::Error::last_os_error())
-                    .context("Cannot configure admission signal mask");
-            }
+            action.sa_mask = *nix::sys::signal::SigSet::empty().as_ref();
             let previous = admission_signal_action(signal, Some(&action))?;
             let default = previous.sa_sigaction == nix::libc::SIG_DFL;
             guard.previous.push((signal, previous));
@@ -2380,13 +2370,11 @@ fn confirm_advisory_prompt(
     anyhow::bail!("Security acknowledgement requires Linux terminal ownership checks")
 }
 
-fn confirm_unknown_archives(
+fn unknown_archives_prompt(
     packages: &[PreparedAdvisoryPackage],
     digest: &str,
     invoking_uid: u32,
-    signals: &AdmissionSignals,
-) -> Result<UnknownArchiveAcknowledgement> {
-    use std::fmt::Write as _;
+) -> Result<String> {
     let unknown = packages
         .iter()
         .filter(|item| {
@@ -2405,18 +2393,26 @@ fn confirm_unknown_archives(
         "\nArch advisory applicability is UNKNOWN for these exact archives. This acknowledgement does not establish coverage.\nInvoking UID: {invoking_uid}\nFull prepared batch SHA-256: {digest}\n"
     );
     for item in unknown {
-        writeln!(
-            prompt,
-            "{}",
-            serde_json::to_string(&(
-                &item.package.name,
-                &item.package.version,
-                &item.package.architecture,
-                &item.package.origin,
-                &item.sha256,
-            ))?
-        )?;
+        let identity = (
+            &item.package.name,
+            &item.package.version,
+            &item.package.architecture,
+            &item.package.origin,
+            &item.sha256,
+        );
+        prompt.push_str(&serde_json::to_string(&identity)?);
+        prompt.push('\n');
     }
+    Ok(prompt)
+}
+
+fn confirm_unknown_archives(
+    packages: &[PreparedAdvisoryPackage],
+    digest: &str,
+    invoking_uid: u32,
+    signals: &AdmissionSignals,
+) -> Result<UnknownArchiveAcknowledgement> {
+    let prompt = unknown_archives_prompt(packages, digest, invoking_uid)?;
     confirm_advisory_prompt(&prompt, digest, invoking_uid, signals)?;
     Ok(UnknownArchiveAcknowledgement {
         batch_digest: digest.to_owned(),
@@ -2447,6 +2443,31 @@ fn prepared_risk_review(
     } else {
         AdvisoryRiskReview::new_with_unknown(assessments, context)
     }
+}
+
+fn require_fresh_arch_coverage(
+    assessment: &crate::core::security::vulnerability::PackageAssessment,
+    archive_acknowledged: bool,
+) -> Result<()> {
+    use super::types::SecurityOrigin;
+    let private_archive = matches!(
+        assessment.package.origin,
+        SecurityOrigin::AurArchive | SecurityOrigin::LocalArchive
+    );
+    anyhow::ensure!(
+        assessment.coverage.is_assessed() || private_archive && archive_acknowledged,
+        "FreshSnapshot requires assessed coordinates or an exact private archive acknowledgement"
+    );
+    Ok(())
+}
+
+fn begin_prepared_review_signals(
+    signals: &mut Option<AdmissionSignals>,
+    details: &str,
+) -> Result<()> {
+    AdmissionSignals::begin_in(signals).with_context(|| {
+        format!("{details}\nAdvisory risk review requires an attended native OMG CLI")
+    })
 }
 
 impl PreparedAdvisoryAdmission {
@@ -2572,15 +2593,7 @@ impl PreparedAdvisoryAdmission {
                 );
                 if policy.advisory_requirement == AdvisoryRequirement::FreshSnapshot {
                     for assessment in operation.assessments() {
-                        anyhow::ensure!(
-                            assessment.coverage.is_assessed()
-                                || matches!(
-                                    assessment.package.origin,
-                                    super::types::SecurityOrigin::AurArchive
-                                        | super::types::SecurityOrigin::LocalArchive
-                                ) && acknowledgement.is_some(),
-                            "FreshSnapshot requires assessed coordinates or an exact private archive acknowledgement"
-                        );
+                        require_fresh_arch_coverage(assessment, acknowledgement.is_some())?;
                     }
                 }
             }
@@ -2600,18 +2613,11 @@ impl PreparedAdvisoryAdmission {
             },
             |operation| operation.assessments().to_vec(),
         );
-        if let Some(review) = prepared_risk_review(
-            &assessments,
-            &advisory_batch_digest(&packages, &policy, &profile, invoking_uid)?,
-            policy.advisory_requirement,
-        )? {
+        let digest = advisory_batch_digest(&packages, &policy, &profile, invoking_uid)?;
+        let review = prepared_risk_review(&assessments, &digest, policy.advisory_requirement)?;
+        if let Some(review) = review {
             if signals.is_none() {
-                AdmissionSignals::begin_in(signals).with_context(|| {
-                    format!(
-                        "{}\nAdvisory risk review requires an attended native OMG CLI",
-                        review.details(),
-                    )
-                })?;
+                begin_prepared_review_signals(signals, review.details())?;
             }
             confirm_advisory_prompt(
                 review.details(),
@@ -2672,11 +2678,9 @@ impl PreparedAdvisoryAdmission {
         if let Some(operation) = &self.operation {
             operation.validate_now()?;
         }
-        if let Some(review) = prepared_risk_review(
-            &self.assessments,
-            &advisory_batch_digest(&current, &policy, &profile, invoking_uid)?,
-            policy.advisory_requirement,
-        )? {
+        let digest = advisory_batch_digest(&current, &policy, &profile, invoking_uid)?;
+        let review = prepared_risk_review(&self.assessments, &digest, policy.advisory_requirement)?;
+        if let Some(review) = review {
             anyhow::ensure!(
                 self.risk_acceptance
                     .as_ref()
@@ -2824,12 +2828,11 @@ fn format_trans_prepare_error(err: &str) -> String {
 /// Configure ALPM servers for all repos (official + custom)
 fn configure_mirrors(alpm: &mut alpm::Alpm) -> Result<()> {
     let conf_path = paths::pacman_conf_path();
-    let arch = std::env::consts::ARCH;
 
     if let Ok(config) = crate::core::pacman_conf::PacmanConfig::parse(&conf_path) {
-        let arch = config.repository_architecture();
+        let arch = config.primary_package_architecture()?;
         for repo in &config.repos {
-            match config.resolve_servers(repo, arch) {
+            match config.resolve_servers(repo, &arch) {
                 Ok(servers) => {
                     // AlpmListMut is an IntoIterator, not an Iterator.
                     let target_db = alpm
@@ -2840,7 +2843,8 @@ fn configure_mirrors(alpm: &mut alpm::Alpm) -> Result<()> {
                         for server in servers {
                             if let Err(e) = db.add_server(server.clone()) {
                                 tracing::debug!(
-                                    "Failed to add server '{server}' to repo '{}': {e}",
+                                    "Failed to add server '{}' to repo '{}': {e}",
+                                    crate::core::http::redact_url(&server),
                                     db.name()
                                 );
                             }
@@ -2866,6 +2870,7 @@ fn configure_mirrors(alpm: &mut alpm::Alpm) -> Result<()> {
         return ensure_mirror_servers(alpm);
     }
 
+    let arch = crate::core::pacman_conf::PacmanConfig::default().primary_package_architecture()?;
     let content = std::fs::read_to_string(mirrorlist)?;
     let mut servers = Vec::with_capacity(16);
 
@@ -2879,7 +2884,7 @@ fn configure_mirrors(alpm: &mut alpm::Alpm) -> Result<()> {
     for db in alpm.syncdbs_mut() {
         let db_name = db.name();
         for server in &servers {
-            let url = server.replace("$repo", db_name).replace("$arch", arch);
+            let url = server.replace("$repo", db_name).replace("$arch", &arch);
             if let Err(e) = db.add_server(url.clone()) {
                 tracing::debug!(
                     "Failed to add server '{}' to repo '{db_name}': {e}",
@@ -2904,6 +2909,49 @@ fn ensure_mirror_servers(alpm: &alpm::Alpm) -> Result<()> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn archive_acknowledgement_lists_only_private_archives_and_bounds_the_batch()
+    -> anyhow::Result<()> {
+        use crate::package_managers::types::{SecurityOrigin, SecurityPackage};
+        let prepared =
+            |name: &str, origin: SecurityOrigin, digest: &str| super::PreparedAdvisoryPackage {
+                package: SecurityPackage {
+                    name: name.into(),
+                    version: "1-1".into(),
+                    architecture: Some("x86_64".into()),
+                    origin,
+                    advisory_source: None,
+                    description: String::new(),
+                    licenses: Vec::new(),
+                },
+                sha256: Some(digest.repeat(64)),
+                archive: None,
+            };
+        let aur = prepared("aur-fixture", SecurityOrigin::AurArchive, "a");
+        let local = prepared("local-fixture", SecurityOrigin::LocalArchive, "b");
+        let repository = prepared(
+            "official-fixture",
+            SecurityOrigin::ArchRepository {
+                repository: "core".into(),
+            },
+            "c",
+        );
+        let prompt = super::unknown_archives_prompt(
+            &[aur.clone(), repository, local],
+            "prepared-batch",
+            1000,
+        )?;
+        assert!(prompt.contains("Invoking UID: 1000"));
+        assert!(prompt.contains("Full prepared batch SHA-256: prepared-batch"));
+        assert!(prompt.contains("aur-fixture") && prompt.contains(&"a".repeat(64)));
+        assert!(prompt.contains("local-fixture") && prompt.contains(&"b".repeat(64)));
+        assert!(!prompt.contains("official-fixture"));
+        let error = super::unknown_archives_prompt(&vec![aur; 65], "oversize", 1000)
+            .expect_err("oversized archive acknowledgements must be split");
+        assert!(error.to_string().contains("at most 64 archives"));
+        Ok(())
+    }
+
+    #[test]
     fn prepared_unknown_review_is_required_and_bound_without_fabricating_snapshot_authority()
     -> anyhow::Result<()> {
         use crate::core::security::policy::AdvisoryRequirement;
@@ -2923,6 +2971,13 @@ mod tests {
             },
             UnknownCoverage::EvidenceUnavailable,
         );
+        assert!(super::require_fresh_arch_coverage(&assessment, true).is_err());
+        for origin in [SecurityOrigin::AurArchive, SecurityOrigin::LocalArchive] {
+            let mut archive = assessment.clone();
+            archive.package.origin = origin;
+            assert!(super::require_fresh_arch_coverage(&archive, false).is_err());
+            super::require_fresh_arch_coverage(&archive, true)?;
+        }
         for requirement in [AdvisoryRequirement::Optional, AdvisoryRequirement::Review] {
             let review = super::prepared_risk_review(
                 std::slice::from_ref(&assessment),
@@ -3003,8 +3058,15 @@ mod tests {
         if crate::core::testing::run_isolated_test(NAME) {
             return Ok(());
         }
+        let invalid_signal = super::admission_signal_action(0, None)
+            .expect_err("the kernel must refuse a signal outside the sigaction domain");
+        assert_eq!(invalid_signal.raw_os_error(), Some(nix::libc::EINVAL));
         let mut guard = super::AdmissionSignals::begin()?;
         assert!(super::AdmissionSignals::begin().is_err());
+        let error = super::begin_prepared_review_signals(&mut None, "disclosed fixture risk")
+            .expect_err("a second transaction must not take cancellation ownership");
+        assert!(error.to_string().contains("disclosed fixture risk"));
+        assert!(format!("{error:#}").contains("owns signal cancellation"));
         assert!(
             !nix::sys::signal::SigSet::thread_get_mask()?
                 .contains(nix::sys::signal::Signal::SIGINT),
@@ -3016,6 +3078,7 @@ mod tests {
             "synchronous current-thread SIGINT must cancel admission"
         );
         assert!(guard.finish().is_err());
+        guard.finish()?;
         for signal in [nix::libc::SIGINT, nix::libc::SIGTERM, nix::libc::SIGHUP] {
             assert_eq!(
                 super::admission_signal_action(signal, None)?.sa_sigaction,
@@ -4641,6 +4704,7 @@ mod tests {
                 let lookup = alpm.syncdbs().first().expect("fixture repository");
                 assert_eq!(lookup.usage()?, alpm::Usage::SEARCH);
                 assert_eq!(lookup.pkg(package)?.name(), package);
+                assert!(super::omarchy_install_candidate(&alpm, package)?.is_none());
 
                 let error = super::execute_transaction_in(
                     vec![package.to_owned()],
@@ -4657,6 +4721,43 @@ mod tests {
                 Ok(())
             },
         )
+    }
+
+    #[test]
+    fn fallback_mirrorlist_substitutes_running_architecture_and_repository() -> anyhow::Result<()> {
+        const NAME: &str = "package_managers::alpm_ops::tests::fallback_mirrorlist_substitutes_running_architecture_and_repository";
+        if crate::core::testing::run_isolated_test(NAME)
+            || crate::config::Settings::rerun_test_unprivileged(NAME)
+        {
+            return Ok(());
+        }
+        let fixture = RepositoryFixture::new()?;
+        let conf = fixture.directory.path().join("missing-pacman.conf");
+        let mirrorlist = fixture.directory.path().join("mirrorlist");
+        std::fs::write(
+            &mirrorlist,
+            "Server = https://mirror.example/$repo/os/$arch\n",
+        )?;
+        let mut alpm = fixture.open();
+        alpm.register_syncdb("core", alpm::SigLevel::NONE)?;
+        temp_env::with_vars(
+            [
+                ("OMG_PACMAN_CONF", Some(conf.as_os_str())),
+                ("OMG_PACMAN_MIRRORLIST", Some(mirrorlist.as_os_str())),
+            ],
+            || super::configure_mirrors(&mut alpm),
+        )?;
+        let kernel = nix::sys::utsname::uname()?;
+        let expected = format!(
+            "https://mirror.example/core/os/{}",
+            kernel.machine().to_string_lossy()
+        );
+        let core = alpm.syncdbs().first().expect("test repository");
+        assert_eq!(
+            core.servers().iter().collect::<Vec<_>>(),
+            [expected.as_str()]
+        );
+        Ok(())
     }
 
     #[test]
@@ -5390,37 +5491,28 @@ mod tests {
             || -> anyhow::Result<()> {
                 paths::reset_test_overrides();
                 assert!(super::open_default_alpm()?.localdb().pkgs().is_empty());
-                let mut outcomes = Vec::new();
                 for (field, selected_root, selected_database) in [
                     ("root", &byte_root, &database),
                     ("database", &root, &byte_database),
                 ] {
-                    let outcome = temp_env::with_vars(
+                    let error = temp_env::with_vars(
                         [
                             ("OMG_PACMAN_ROOT", Some(selected_root.as_os_str())),
                             ("OMG_PACMAN_DB_DIR", Some(selected_database.as_os_str())),
                         ],
-                        || match super::open_default_alpm() {
-                            Ok(handle) => Err(handle
-                                .localdb()
-                                .pkgs()
-                                .iter()
-                                .map(|package| package.name().to_owned())
-                                .collect::<Vec<_>>()),
-                            Err(error) => Ok(format!("{error:#}")),
-                        },
+                        || super::open_default_alpm().err(),
+                    )
+                    .expect(
+                        "non-UTF-8 paths must refuse before opening a replacement-character alias",
                     );
-                    outcomes.push((field, outcome));
-                }
-                assert_eq!(std::fs::read(&sentinel)?, sentinel_bytes);
-                assert!(!alias_database.join("db.lck").exists());
-                for (field, outcome) in outcomes {
-                    let diagnostic = outcome.unwrap_or_else(|packages| panic!("non-UTF8 {field} must refuse instead of opening a replacement-character alias; native packages: {packages:?}"));
+                    let diagnostic = format!("{error:#}");
                     assert!(
                         diagnostic.to_ascii_lowercase().contains("utf-8"),
                         "{field}: {diagnostic}"
                     );
                 }
+                assert_eq!(std::fs::read(&sentinel)?, sentinel_bytes);
+                assert!(!alias_database.join("db.lck").exists());
                 Ok(())
             },
         )
@@ -5458,7 +5550,6 @@ mod tests {
                 );
                 std::fs::write(&config, &valid)?;
                 assert!(super::open_default_alpm()?.localdb().pkgs().is_empty());
-                let mut outcomes = Vec::new();
                 for (field, bad) in [
                     ("RootDir", format!("{}\0invalid", root.display())),
                     ("DBPath", format!("{}\0invalid", database.display())),
@@ -5476,20 +5567,11 @@ mod tests {
                         .join("\n")
                         + "\n";
                     std::fs::write(&config, contents)?;
-                    let result = std::panic::catch_unwind(super::open_default_alpm);
-                    let (panicked, diagnostic) = match result {
-                        Ok(Err(error)) => (false, Some(format!("{error:#}"))),
-                        Ok(Ok(_)) => (false, None),
-                        Err(_) => (true, None),
-                    };
-                    outcomes.push((field, panicked, diagnostic));
-                }
-                for (field, panicked, diagnostic) in outcomes {
-                    assert!(
-                        !panicked,
-                        "NUL-bearing {field} configuration must return an error instead of unwinding in the native constructor"
-                    );
-                    let diagnostic = diagnostic.expect("NUL-bearing configuration must refuse");
+                    let refusal = std::panic::catch_unwind(super::open_default_alpm)
+                        .expect("NUL-bearing configuration must return an error without unwinding")
+                        .map(drop)
+                        .expect_err("NUL-bearing configuration must refuse");
+                    let diagnostic = format!("{refusal:#}");
                     assert!(
                         diagnostic.to_ascii_lowercase().contains("nul"),
                         "{field}: {diagnostic}"
@@ -5888,5 +5970,72 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn aur_archive_preparation_refuses_repository_targets_before_opening_a_transaction()
+    -> anyhow::Result<()> {
+        let fixture = RepositoryFixture::new()?;
+        fixture.write_sync("core", &[("omg-fixture-package", "1-1", "")])?;
+        let mut alpm = fixture.open();
+        alpm.register_syncdb("core", alpm::SigLevel::NONE)?;
+        let result = super::prepare_alpm_transaction(
+            &mut alpm,
+            vec!["omg-fixture-package".to_owned()],
+            TransactionKind::InstallAurArtifact,
+            &crate::core::pacman_conf::PacmanConfig::default(),
+        );
+        let error = result
+            .err()
+            .expect("archive-only preparation must refuse a repository target");
+        assert!(
+            error
+                .to_string()
+                .contains("not a supported local package archive path")
+        );
+        assert!(!fixture.database().join("db.lck").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn removal_refuses_missing_targets_and_releases_the_private_transaction() -> anyhow::Result<()>
+    {
+        let fixture = RepositoryFixture::new()?;
+        fixture.write_local("omg-fixture-kept", "1-1")?;
+        let mut alpm = fixture.open();
+        let absent = "omg-fixture-absent".to_owned();
+        let kept = "omg-fixture-kept".to_owned();
+        let kind = TransactionKind::Remove { recursive: false };
+        let config = crate::core::pacman_conf::PacmanConfig::default();
+        for targets in [vec![absent.clone()], vec![kept.clone(), absent.clone()]] {
+            let error = super::prepare_alpm_transaction(&mut alpm, targets, kind, &config)
+                .err()
+                .expect("a missing package must fail the entire removal request");
+            assert!(error.to_string().contains(&absent));
+            assert_eq!(
+                error.downcast_ref::<alpm::Error>(),
+                Some(&alpm::Error::PkgNotFound)
+            );
+            assert_eq!(alpm.localdb().pkg(kept.as_str())?.version().as_str(), "1-1");
+            assert!(!fixture.database().join("db.lck").exists());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn auto_package_architecture_uses_the_running_kernel_machine() -> anyhow::Result<()> {
+        let fixture = RepositoryFixture::new()?;
+        let mut alpm = fixture.open();
+        let kernel = nix::sys::utsname::uname()?;
+        let machine = kernel.machine().to_str().expect("kernel machine is UTF-8");
+        let config = crate::core::pacman_conf::PacmanConfig::parse_str(
+            "[options]\nArchitecture = explicit-machine auto\n",
+        )?;
+        super::configure_transaction_options(&mut alpm, &config)?;
+        assert_eq!(
+            alpm.architectures().into_iter().collect::<Vec<_>>(),
+            ["explicit-machine", machine],
+        );
+        Ok(())
     }
 }

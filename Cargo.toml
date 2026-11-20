@@ -385,6 +385,7 @@ arch = [
   "alpm-db",
   "alpm-mtree",
   "alpm-repo-db",
+  "nix/feature",
 ]
 # Optional PGP verification of package signatures (sequoia-openpgp).
 # Built against the MSRV pinned in rust-toolchain.toml / package.rust-version.

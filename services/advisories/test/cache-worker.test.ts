@@ -86,8 +86,29 @@ test("real Worker caches public reads, isolates private reads and uses indexed r
         expect(rowsRead).toBeLessThanOrEqual(12);
         process.stdout.write(`recent D1 page: ${JSON.stringify({ totalRecords: 4097, returned: page.records.length, rowsRead, migrationRowsRead: index.meta.rows_read, migrationRowsWritten: index.meta.rows_written })}\n`);
         await db.prepare("UPDATE source_checkpoint SET bootstrap_complete=0 WHERE source='cve'").run();
-        const recent = await worker.fetch("https://advisories.example/v1/cves/recent");
-        expect(object(await recent.json()).complete).toBe(false);
+        await store.cve(JSON.stringify({
+            dataType: "CVE_RECORD", dataVersion: "5.2",
+            cveMetadata: { cveId: "CVE-2026-10000", state: "PUBLISHED", dateUpdated: now, datePublished: now },
+            containers: { cna: {} },
+        }), now);
+        const recentUrl = "https://advisories.example/v1/cves/recent";
+        const recent = await worker.fetch(recentUrl);
+        expect(object(await recent.json())).toMatchObject({
+            complete: false, records: [{ id }, { id: "CVE-2026-10000" }],
+        });
+        // These requests have the same pathname and different public representations.
+        const narrowerUrl = `${recentUrl}?limit=1`;
+        const narrower = await worker.fetch(narrowerUrl);
+        expect(narrower.status).toBe(200);
+        expect(narrower.headers.get("etag")).not.toBe(recent.headers.get("etag"));
+        expect(object(await narrower.json())).toMatchObject({ records: [{ id }] });
+        const conditional = await worker.fetch(narrowerUrl, {
+            headers: { "if-none-match": String(narrower.headers.get("etag")) },
+        });
+        expect(conditional.status).toBe(304);
+        const invalidPage = await worker.fetch(`${recentUrl}?limit=0`);
+        expect(invalidPage.status).toBe(400);
+        expect(invalidPage.headers.get("cache-control")).toBe("no-store");
     } finally {
         await runtime.dispose();
     }

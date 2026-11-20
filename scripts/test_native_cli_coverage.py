@@ -523,6 +523,47 @@ with socket.socket(socket.AF_UNIX) as server:
             self.assertEqual(case.native_phase, 'cache-pruned')
             self.assertEqual(case.exit_status, 1)
 
+    def test_unknown_signer_refusal_preserves_packages_after_keyrings_refresh(self):
+        with tempfile.TemporaryDirectory() as directory:
+            owner = Path(directory)
+            database = owner / 'db'
+            (database / 'local').mkdir(parents=True)
+            (owner / 'cache').mkdir()
+            packages = {}
+            for name in ('omg-coverage-app','archlinux-keyring','omarchy-keyring','omg-coverage-dead-dep'):
+                relative = 'usr/share/fixture/' + name
+                old = f'{name} before'.encode()
+                new = f'{name} after'.encode()
+                reason = int(name=='omg-coverage-dead-dep')
+                PRODUCER.fixture_local_package(owner / 'root',database,name,'1-1',relative,old,reason)
+                if name != 'omg-coverage-dead-dep':
+                    packages[name] = dict(reason=reason,payload_path=relative,
+                                          before_sha256=hashlib.sha256(old).hexdigest(),
+                                          after_sha256=hashlib.sha256(new).hexdigest())
+            (owner / 'data-receipt.json').write_text(json.dumps(dict(initial_packages=packages,
+                initial_database_sha256=PRODUCER.fixture_tree_hashes(database / 'local'),
+                initial_payload_sha256=PRODUCER.fixture_tree_hashes(owner / 'root'))))
+            (owner / 'cache/unrelated.txt').write_text('must survive pruning\n')
+            (owner / 'outside-cache.txt').write_text('must survive symlink escape\n')
+            (owner / 'cache/escape.pkg.tar.gz').symlink_to(owner / 'outside-cache.txt')
+            for version in ('1-1','2-1'):
+                for suffix in ('','.sig'):
+                    (owner / f'cache/omg-coverage-app-{version}-any.pkg.tar.gz{suffix}').write_bytes(b'cache')
+            for name in ('archlinux-keyring','omarchy-keyring'):
+                old_record = database / 'local' / (name+'-1-1')
+                for file in old_record.iterdir():
+                    file.unlink()
+                old_record.rmdir()
+                PRODUCER.fixture_local_package(owner / 'root',database,name,'3-1',packages[name]['payload_path'],
+                                               f'{name} after'.encode(),0)
+            phase = PRODUCER.OMARCHY_CASES['omarchy-unknown-signing-key'].native_phase
+            self.assertEqual(phase,'keyrings-refreshed')
+            self.assertEqual(PRODUCER.verify_signed_fixture(owner,phase)['status'],
+                             'PASS_NATIVE_KEYRINGS_REFRESHED_STATE')
+            (owner / 'root/usr/share/fixture/omg-coverage-app').write_bytes(b'unreviewed package contents')
+            with self.assertRaisesRegex(ValueError,'payload differs'):
+                PRODUCER.verify_signed_fixture(owner,phase)
+
     def test_normal_arch_readonly_updates_are_required_after_vendor_scenarios(self):
         for stage in ('arch-dry-run', 'arch-check'):
             self.assertIn(stage, PRODUCER.PROCESS_STAGES)
@@ -738,7 +779,7 @@ with socket.socket(socket.AF_UNIX) as server:
             self.assertEqual(result.returncode, 0, result.stderr)
             root = Path(directory)
             self.assertEqual((root / 'advisory-hosts').read_text().splitlines()[-1],
-                             '127.0.0.1 omg-advisories.latham.workers.dev')
+                             '127.0.0.1 omg-advisories.latham.workers.dev aur.archlinux.org')
             self.assertTrue((root / 'advisory-hosts').read_bytes().startswith(original_hosts.rstrip()))
             nss_lines = (root / 'advisory-nss').read_text().splitlines()
             self.assertEqual([line for line in nss_lines if line.startswith('hosts:')], ['hosts: files'])
@@ -910,6 +951,32 @@ with socket.socket(socket.AF_UNIX) as server:
                                  name + ' must refuse with the package sentinel status: ' + result.stderr)
                 self.assertEqual(trace.read_text().splitlines()[-1], name,
                                  'Forbidden execution must leave a real invocation record')
+
+    @unittest.skipIf(os.name == 'nt', 'Guest lifecycle helpers require POSIX Bash')
+    def test_linked_checkout_resolves_packaged_helper_through_aliases(self):
+        script = PRODUCER.omarchy_guest_script()
+        helper = script.split("<<'OMG_INERT_OMARCHY_STAGE'\n", 1)[1].split('\nOMG_INERT_OMARCHY_STAGE', 1)[0]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            for name in ('packaged', 'alias', 'shadow', 'dev-checkout'):
+                (root / name).mkdir()
+            canonical = root / 'packaged/omarchy-migrate'
+            shadow = root / 'shadow/omarchy-migrate'
+            for path in (canonical, shadow):
+                path.write_text('#!/bin/bash\nexit 99\n')
+                path.chmod(0o755)
+            (root / 'alias/omarchy-migrate').symlink_to(canonical)
+            program = root / 'packaged/omarchy-update-dev'
+            program.write_text(helper.replace('/usr/bin/omarchy-migrate', str(canonical)))
+            program.chmod(0o755)
+            env = dict(os.environ, HOME=str(root), OMARCHY_PATH=str(root / 'dev-checkout'),
+                       OMARCHY_FIXTURE_SCENE='dev-link', OMARCHY_HELPER_TRACE=str(root / 'trace'))
+            for name, status in (('alias', 0), ('shadow', 1)):
+                with self.subTest(lookup=name):
+                    result = subprocess.run([program], env=dict(env, PATH=f'{root / name}:/usr/bin:/bin'),
+                                            capture_output=True, text=True, timeout=5)
+                    self.assertEqual(result.returncode, status, result.stderr)
+            self.assertEqual((root / 'trace').read_text().splitlines(), ['omarchy-update-dev'])
 
     @unittest.skipIf(os.name == 'nt', 'Guest lifecycle helpers require POSIX Bash')
     def test_lifecycle_helper_refusals_have_real_exit_statuses(self):
@@ -1112,7 +1179,7 @@ class SignedDecoderFixtures(unittest.TestCase):
                 PRODUCER.validate_fresh_admission(value, 'a' * 64, decoder_cases=True)
 
     def test_decoder_cases_are_additive_and_have_distinct_mandatory_cli_profiles(self):
-        self.assertEqual(len(PRODUCER.FRESH_ADMISSION_CASES), 20)
+        self.assertEqual(len(PRODUCER.FRESH_ADMISSION_CASES), 22)
         self.assertEqual({case.name for case in PRODUCER.FRESH_ADMISSION_CASES if case.commits},
                          {'archive-accept', 'archive-source-replaced', 'repository-accept'})
         for case in PRODUCER.SIGNED_DECODER_CASES:
@@ -1129,7 +1196,7 @@ def fresh_admission_receipt(decoder_cases=False):
     rows = []
     cases = PRODUCER.SIGNED_DECODER_CASES if decoder_cases else PRODUCER.FRESH_ADMISSION_CASES
     for case in cases:
-        prompt = case.interaction not in ('none', 'noninteractive')
+        prompt = case.interaction not in ('none', 'noninteractive', 'key-decline')
         fetched = case.interaction == 'accept' or (case.name.startswith('repository-')
                                                    and case.name != 'repository-bzip2-info')
         before = {'installed-1-1/desc': 'd' * 64}
@@ -1164,6 +1231,11 @@ def fresh_admission_receipt(decoder_cases=False):
                     description='inert signed coverage fixture', url=None,
                     size=len(b'xorg-xrandr: upgraded3\n'), install_size=len(b'xorg-xrandr: upgraded3\n'),
                     download_size=512, repo='core', depends=[], licenses=['MIT'], installed=False))
+        if case.name in PRODUCER.UNKNOWN_SIGNING_KEY_CASES:
+            rows[-1]['keyring_sha256'] = ['c' * 64, 'c' * 64]
+        if case.interaction == 'key-decline':
+            rows[-1].update(signing_key_fingerprint='A' * 40, signing_key_declined=True,
+                            output=f'Import PGP key {"A" * 16}? · no\n{case.diagnostic}')
     return dict(status='PASS', cli_sha256='a' * 64, cases=rows,
         selected=[row['name'] for row in rows], complete_matrix=True,
         profile_stages=['fresh-' + row['name'] for row in rows],
@@ -1253,6 +1325,13 @@ def evidence_fixture(root):
                 'released private lock; owned transcript mode=600\n')
             (evidence / f'{stage}-transcript.log').write_text('OMG Omarchy update started\nOMG Omarchy update finished: exit status: 0\n')
         (evidence / f'{stage}-native-state.json').write_text(json.dumps(dict(status=PRODUCER.NATIVE_PHASES[case.native_phase])))
+        if stage == 'omarchy-unknown-signing-key':
+            (evidence / f'{stage}-native-state.json').write_text(json.dumps(dict(
+                status=PRODUCER.NATIVE_PHASES[case.native_phase], refused_signer='A' * 40)))
+        if stage == 'omarchy-aur-unavailable':
+            (evidence / f'{stage}-native-state.json').write_text(json.dumps(dict(
+                status=PRODUCER.NATIVE_PHASES[case.native_phase],
+                unchanged_foreign_package='omg-coverage-foreign-1-1')))
         if case.scene in ('migration-inventory-error', 'migration-directory-untrusted'):
             (evidence / f'{stage}-migrations.txt').write_text(f'boundary_control={case.scene} completion_markers=0\n')
         elif stage == 'omarchy-native-migrations-script-failure':
@@ -1300,20 +1379,26 @@ def evidence_fixture(root):
         if case.absent_helper:
             (evidence / f'{stage}-layout.txt').write_text(
                 'absent helper restored after genuine CLI execution\n')
+        if case.scene in PRODUCER.PLATFORM_KEYRING_FAILURES:
+            (evidence / f'{stage}-platform-keyrings.txt').write_text('sync_databases=unchanged\n')
         if stage == 'omarchy-optional-failures':
             (evidence / f'{stage}-layout.txt').write_text(
                 'foreign optional helpers never executed; original helpers restored\n')
         log = {
-            'omarchy-success': '| System is up to date',
+            'omarchy-success': 'configured_dev_checkout=selected nested_helper=packaged\n| System is up to date',
             'omarchy-native-migrations': '| System is up to date\nNative Omarchy migration-xrandr completed\nNative Omarchy migration-omnibook-audio completed',
             'omarchy-native-migrations-unmatched': '| System is up to date\nNative Omarchy migration-xrandr completed',
             'omarchy-native-migrations-notification-error': '| System is up to date\nNative Omarchy migration-xrandr completed\nNative Omarchy migration-omnibook-audio completed\nCannot dismiss the Omarchy migration notification:',
             'omarchy-native-migrations-notification-missing': '| System is up to date\nNative Omarchy migration-xrandr completed\nNative Omarchy migration-omnibook-audio completed',
-            'omarchy-native-migrations-installed-audio': '| System is up to date\nNative Omarchy migration-xrandr completed',
+            'omarchy-native-migrations-preinstalled': '| System is up to date',
             'omarchy-native-migrations-script-failure': '0000000000.sh failed: exit status: 7',
             'omarchy-native-migrations-inventory-error': 'Cannot inspect pending Omarchy migrations',
             'omarchy-native-migrations-directory-untrusted': 'Selected Omarchy runtime directory is not root-controlled',
-            'omarchy-current-kernel': '| System is up to date',
+            'omarchy-current-kernel': 'configured_dev_checkout=packaged\n| System is up to date',
+            'omarchy-dev-config-unreadable': 'Cannot open Omarchy dev-link configuration',
+            'omarchy-aur-unavailable': 'AUR is unavailable. Skipping AUR updates and continuing to Omarchy boot verification',
+            'omarchy-platform-keyring': 'Package: ["omg-coverage-platform-keyring","3-1",{}]\n'
+                                       'Native Omarchy keyring-refresh completed\nSystem is up to date',
             'omarchy-runtime-unset': 'caller_runtime_hint=unset\n| System is up to date',
             'omarchy-interrupted': 'Omarchy update interrupted',
             'omarchy-output-closed': 'Update output disconnected',
@@ -1330,6 +1415,9 @@ def evidence_fixture(root):
             'omarchy-required-helper-missing': 'Omarchy update did not complete: omarchy-update-dev',
             'omarchy-optional-failures': '| System is up to date\n! Continuing without a snapshot\n! Some mise tools could not be updated',
             'omarchy-vendor-failure': 'Omarchy update did not complete',
+            'omarchy-unknown-signing-key': 'Error: ALPM transaction aborted: it requires an unconfirmed package '
+                                          'mutation or signing-key import (import an untrusted signing key) '
+                                          'the required consent was not granted; resolve the conflict explicitly and retry',
             'omarchy-declined': 'declined',
             'omarchy-migration-refusal': 'external package helper',
             'omarchy-migration-helper-tabs': 'external package helper',
@@ -1340,6 +1428,8 @@ def evidence_fixture(root):
             'omarchy-unsupported-turbo-mode': 'complete update lifecycle',
             'omarchy-invalid-transport': 'Incomplete Omarchy update transport',
         }.get(stage, '')
+        if case.scene in PRODUCER.PLATFORM_KEYRING_FAILURES:
+            log = PRODUCER.PLATFORM_KEYRING_FAILURES[case.scene]
         if case.failure_command:
             log = f'Omarchy stage {case.failure_command} did not complete: exit status: {case.failure_status}'
             if case.native_phase == 'complete':
@@ -1348,14 +1438,77 @@ def evidence_fixture(root):
             log += '\n' + UnknownFixtureTerminal.prompt().decode()
         (evidence / f'{stage}.log').write_text(log)
     for stage in PRODUCER.ARCH_READONLY_STAGES:
-        (evidence / f'{stage}.log').write_text('System is up to date\n')
+        outage = stage == PRODUCER.ARCH_AUR_UNAVAILABLE_STAGE
+        (evidence / f'{stage}.log').write_text(
+            'Failed to check AUR updates\n' if outage else 'System is up to date\n')
+        (evidence / f'{stage}-exit.txt').write_text('1\n' if outage else '0\n')
         (evidence / f'{stage}-isolation.txt').write_text(
             'actual_id=arch ordinary_uid=65534 vendor_helpers=0 transcript_unchanged=yes\n')
-        (evidence / f'{stage}-native-state.json').write_text(json.dumps(dict(status='PASS_SIGNED_NATIVE_STATE')))
+        state = dict(status='PASS_SIGNED_NATIVE_STATE')
+        if outage:
+            state['unchanged_foreign_package'] = 'omg-coverage-foreign-1-1'
+        (evidence / f'{stage}-native-state.json').write_text(json.dumps(state))
     return evidence, profiles, artifacts
 
 
 class SupplementalEvidence(unittest.TestCase):
+    def test_platform_keyring_configuration_preserves_the_refresh_boundary(self):
+        control = 'omarchy-platform-keyring-unreadable'
+        self.assertEqual(PRODUCER.OMARCHY_CASES[control].native_phase, 'cache-pruned')
+        with tempfile.TemporaryDirectory() as directory:
+            evidence, profiles, artifacts = evidence_fixture(Path(directory))
+            PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
+            receipt = evidence / f'{control}-platform-keyrings.txt'
+            receipt.write_text('sync_databases=changed\n')
+            with self.assertRaisesRegex(ValueError, 'Platform keyring configuration'):
+                PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
+
+    def test_normal_arch_aur_outage_requires_the_failure_diagnostic(self):
+        stage = 'arch-aur-unavailable'
+        self.assertIn(stage, PRODUCER.ARCH_READONLY_STAGES)
+        with tempfile.TemporaryDirectory() as directory:
+            evidence, profiles, artifacts = evidence_fixture(Path(directory))
+            PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
+            log = evidence / f'{stage}.log'
+            log.write_text('System is up to date\n')
+            with self.assertRaisesRegex(ValueError, 'Normal Arch AUR outage'):
+                PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
+
+    def test_omarchy_aur_outage_requires_a_retained_foreign_package_and_boot_verification(self):
+        case = PRODUCER.OMARCHY_CASES['omarchy-aur-unavailable']
+        self.assertEqual(case.native_phase, 'complete')
+        self.assertIn('omarchy-update-boot', case.helpers)
+        with tempfile.TemporaryDirectory() as directory:
+            evidence, profiles, artifacts = evidence_fixture(Path(directory))
+            PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
+            path = evidence / 'omarchy-aur-unavailable-native-state.json'
+            state = json.loads(path.read_text())
+            self.assertEqual(state.pop('unchanged_foreign_package'), 'omg-coverage-foreign-1-1')
+            path.write_text(json.dumps(state))
+            with self.assertRaisesRegex(ValueError, 'AUR outage'):
+                PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
+
+    def test_dev_configuration_controls_require_their_actual_lifecycle_results(self):
+        self.assertEqual(PRODUCER.OMARCHY_CASES['omarchy-current-kernel'].scene, 'packaged-config')
+        self.assertEqual(PRODUCER.OMARCHY_CASES['omarchy-dev-config-unreadable'].native_phase,
+                         'cache-pruned')
+        with tempfile.TemporaryDirectory() as directory:
+            evidence, profiles, artifacts = evidence_fixture(Path(directory))
+            PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
+            for stage, witness in (
+                ('omarchy-current-kernel', 'configured_dev_checkout=packaged'),
+                ('omarchy-dev-config-unreadable', 'Cannot open Omarchy dev-link configuration'),
+            ):
+                path = evidence / f'{stage}.log'
+                log = path.read_text()
+                self.assertIn(witness, log)
+                path.write_text(log.replace(witness, 'unrelated fixture output'))
+                try:
+                    with self.assertRaisesRegex(ValueError, 'dev-link|packaged dev configuration'):
+                        PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
+                finally:
+                    path.write_text(log)
+
     def test_native_unknown_decisions_require_nonempty_exact_prompt_fingerprints(self):
         with tempfile.TemporaryDirectory() as directory:
             evidence, profiles, artifacts = evidence_fixture(Path(directory))
@@ -1553,9 +1706,8 @@ class SupplementalEvidence(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'Current kernel'):
                 PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
             state.write_text(original)
-            (evidence / 'omarchy-current-kernel.log').write_text(
-                'System is up to date\nRun omarchy-system reboot when ready.\n'
-                + UnknownFixtureTerminal.prompt().decode())
+            log = evidence / 'omarchy-current-kernel.log'
+            log.write_text(log.read_text() + '\nRun omarchy-system reboot when ready.\n')
             with self.assertRaisesRegex(ValueError, 'Current kernel'):
                 PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
 
@@ -1595,10 +1747,24 @@ class SupplementalEvidence(unittest.TestCase):
             files = PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
             receipt = json.loads((evidence / 'verification.json').read_text())
             self.assertEqual(len(receipt['tests']), 22)
-            self.assertEqual(len(receipt['process_checks']), 74)
-            self.assertEqual(len(receipt['fresh_admission']), 20)
+            self.assertEqual(receipt['process_checks'], list(PRODUCER.PROCESS_STAGES))
+            self.assertEqual(len(receipt['fresh_admission']), 22)
             self.assertEqual(len(receipt['signed_decoders']), 2)
             self.assertEqual(len(files), len(receipt['profiles']))
+
+    def test_omarchy_signing_key_refusal_requires_the_transaction_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            evidence, profiles, artifacts = evidence_fixture(Path(directory))
+            log = evidence / 'omarchy-unknown-signing-key.log'
+            original = log.read_text()
+            for mismatch in ('Native Omarchy updates require existing trusted signing keys',
+                             'ALPM transaction aborted: insufficient disk space'):
+                with self.subTest(mismatch=mismatch):
+                    log.write_text(original.replace(
+                        'ALPM transaction aborted: it requires an unconfirmed package mutation '
+                        'or signing-key import (import an untrusted signing key)', mismatch))
+                    with self.assertRaisesRegex(ValueError, 'Missing native signing-key refusal'):
+                        PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
 
     def test_forged_omarchy_helper_evidence_is_refused(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1756,11 +1922,24 @@ class FreshAdmissionFixture(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'migration package operations'):
                 PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
 
+    def test_preinstalled_migration_packages_must_not_run_an_install_transaction(self):
+        stage = 'omarchy-native-migrations-preinstalled'
+        with tempfile.TemporaryDirectory() as directory:
+            evidence, profiles, artifacts = evidence_fixture(Path(directory))
+            log = evidence / f'{stage}.log'
+            original = log.read_text()
+            PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
+            for operation in ('migration-xrandr', 'migration-omnibook-audio'):
+                with self.subTest(operation=operation):
+                    log.write_text(original + f'\nNative Omarchy {operation} completed\n')
+                    with self.assertRaisesRegex(ValueError, 'unnecessary package transaction'):
+                        PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
+
     def test_native_migration_failure_cases_are_mandatory_and_cannot_forge_completion(self):
         required = {'omarchy-native-migrations-notification-error',
                     'omarchy-native-migrations-notification-missing',
                     'omarchy-native-migrations-script-failure',
-                    'omarchy-native-migrations-installed-audio'}
+                    'omarchy-native-migrations-preinstalled'}
         self.assertTrue(required <= PRODUCER.OMARCHY_CASES.keys())
         with tempfile.TemporaryDirectory() as directory:
             evidence, profiles, artifacts = evidence_fixture(Path(directory))
@@ -1769,11 +1948,7 @@ class FreshAdmissionFixture(unittest.TestCase):
                     ('omarchy-native-migrations-notification-error.log',
                      'Cannot dismiss the Omarchy migration notification:', '', 'notification'),
                     ('omarchy-native-migrations-script-failure-migrations.txt',
-                     'completion_markers=0', 'completion_markers=1', 'completion marker'),
-                    ('omarchy-native-migrations-installed-audio.log',
-                     'Native Omarchy migration-xrandr completed',
-                     'Native Omarchy migration-xrandr completed\nNative Omarchy migration-omnibook-audio completed',
-                     'unnecessary package transaction')):
+                     'completion_markers=0', 'completion_markers=1', 'completion marker')):
                 path = evidence / filename
                 contents = path.read_text()
                 self.assertIn(original, contents)
@@ -1902,7 +2077,8 @@ class FreshAdmissionFixture(unittest.TestCase):
                          'archive-profile-changed', 'archive-staged-bytes-changed',
                          'archive-source-replaced', 'archive-identity-changed',
                          'archive-stale-evidence', 'archive-minimum-verified',
-                         'repository-accept', 'repository-stale-evidence',
+                         'repository-accept', 'repository-stale-evidence', 'repository-unknown-signing-key',
+                         'repository-decline-signing-key',
                          'archive-long-input', 'archive-timeout', 'archive-batch-limit'} <= by_name.keys())
         self.assertEqual({case.name for case in cases if case.commits},
                          {'archive-accept', 'archive-source-replaced', 'repository-accept'})
@@ -1922,6 +2098,39 @@ class FreshAdmissionFixture(unittest.TestCase):
         self.assertEqual(stale['payload_sha256'], fresh['payload_sha256'])
         with self.assertRaisesRegex(ValueError, 'snapshot mode'):
             PRODUCER.fresh_admission_snapshot('unrecognized', 1_800_000_000)
+
+    def test_unknown_signing_key_refusal_requires_the_original_keyring_digest(self):
+        receipt = fresh_admission_receipt()
+        row, = [item for item in receipt['cases'] if item['name'] == 'repository-unknown-signing-key']
+        self.assertEqual(row['exit_code'], 1)
+        self.assertEqual(row['database_before'], row['database_after'])
+        PRODUCER.validate_fresh_admission(receipt, 'a' * 64)
+        for keyring in (None, ['c' * 64, 'd' * 64], ['c' * 63, 'c' * 63]):
+            with self.subTest(keyring=keyring), self.assertRaisesRegex(ValueError, 'keyring'):
+                row['keyring_sha256'] = keyring
+                PRODUCER.validate_fresh_admission(receipt, 'a' * 64)
+
+    def test_omarchy_signer_refusal_exercises_native_review_after_keyring_refresh(self):
+        stage = 'omarchy-unknown-signing-key'
+        case = PRODUCER.OMARCHY_CASES[stage]
+        self.assertEqual((case.exit_status, case.native_phase), (1, 'keyrings-refreshed'))
+        self.assertEqual(case.helpers, PRODUCER.OMARCHY_PREFIX + ('omarchy-update-stay-awake\tstop',))
+        script = PRODUCER.guest_script({role: {'sha256': 'a' * 64} for role in PRODUCER.ROLES}, '/build/omg')
+        self.assertIn(f'{stage}; then signed_options+=(--unknown-app-signer); fi', script)
+        self.assertRegex(script, rf'{stage}\).*native_phase=keyrings-refreshed;')
+        self.assertIn('&& test -z "$reboot_answer" && test -z "$control"; then\n'
+                      '    launch=(python3 /attend-unknown-fixture.py', script)
+
+    def test_attended_signer_refusal_requires_the_fixture_key_and_decline(self):
+        receipt = fresh_admission_receipt()
+        PRODUCER.validate_fresh_admission(receipt, 'a' * 64)
+        for change in (dict(signing_key_declined=False), dict(signing_key_fingerprint='0' * 40),
+                       dict(output='import an untrusted signing key')):
+            with self.subTest(change=change), self.assertRaisesRegex(ValueError, 'signing.key'):
+                candidate = fresh_admission_receipt()
+                row, = [item for item in candidate['cases'] if item['name'] == 'repository-decline-signing-key']
+                row.update(change)
+                PRODUCER.validate_fresh_admission(candidate, 'a' * 64)
 
     def test_native_matrix_refuses_an_ordinary_process_before_creating_fixtures(self):
         with patch.object(PRODUCER.os, 'geteuid', return_value=1000), \

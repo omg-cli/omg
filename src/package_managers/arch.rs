@@ -89,25 +89,19 @@ pub fn execute_native_omarchy_operation(
         "Native Omarchy package operations require elevation"
     );
     crate::core::privilege::set_yes_flag(interaction == NativeOmarchyInteraction::Unattended);
-    if operation == NativeOmarchyOperation::PruneCache {
-        let (files, bytes) = super::alpm_ops::clean_cache(2)?;
-        println!(
-            "Pruned {files} cache files ({bytes} bytes), retaining two versions per directory and architecture"
-        );
-        return Ok(());
-    }
-    if operation == NativeOmarchyOperation::RefreshKeyrings {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?
-            .block_on(super::sync_databases_parallel())?;
-    }
     let targets = match operation {
+        NativeOmarchyOperation::PruneCache => {
+            let (files, bytes) = super::alpm_ops::clean_cache(2)?;
+            println!(
+                "Pruned {files} cache files ({bytes} bytes), retaining two versions per directory and architecture"
+            );
+            return Ok(());
+        }
         NativeOmarchyOperation::RefreshKeyrings => {
+            const MAX_KEYRING_LIST_BYTES: usize = 64 * 1024;
             let mut names = vec!["archlinux-keyring".to_owned(), "omarchy-keyring".to_owned()];
-            if std::env::consts::ARCH == "aarch64"
-                && super::is_installed_fast("archlinuxarm-keyring")?
-            {
+            #[cfg(target_arch = "aarch64")]
+            if super::is_installed_fast("archlinuxarm-keyring")? {
                 names.push("archlinuxarm-keyring".to_owned());
             }
             let path = std::path::Path::new("/usr/share/omarchy-platform/keyrings");
@@ -124,14 +118,11 @@ pub fn execute_native_omarchy_operation(
                         metadata.is_file() && metadata.uid() == 0 && metadata.mode() & 0o022 == 0,
                         "Platform keyring list must be a root-controlled regular file"
                     );
-                    anyhow::ensure!(
-                        metadata.len() <= 65536,
-                        "Platform keyring list exceeds its limit"
-                    );
                     let mut contents = String::new();
-                    file.take(65537).read_to_string(&mut contents)?;
+                    file.take(MAX_KEYRING_LIST_BYTES as u64 + 1)
+                        .read_to_string(&mut contents)?;
                     anyhow::ensure!(
-                        contents.len() <= 65536,
+                        contents.len() <= MAX_KEYRING_LIST_BYTES,
                         "Platform keyring list exceeds its limit"
                     );
                     for line in contents.lines() {
@@ -159,21 +150,18 @@ pub fn execute_native_omarchy_operation(
         }
         NativeOmarchyOperation::UpgradeRepositories => Vec::new(),
         NativeOmarchyOperation::RemoveOrphans => super::list_orphans_direct()?,
-        NativeOmarchyOperation::InstallTrayMenuDependency => {
-            if super::is_installed_fast("xorg-xrandr")? {
-                return Ok(());
-            }
-            vec!["xorg-xrandr".to_owned()]
-        }
+        NativeOmarchyOperation::InstallTrayMenuDependency => missing_package_target("xorg-xrandr")?,
         NativeOmarchyOperation::InstallOmnibookAudio => {
-            if super::is_installed_fast("hp-omnibook-3-audio")? {
-                return Ok(());
-            }
-            vec!["hp-omnibook-3-audio".to_owned()]
+            missing_package_target("hp-omnibook-3-audio")?
         }
-        NativeOmarchyOperation::PruneCache => unreachable!(),
     };
-    if operation == NativeOmarchyOperation::RemoveOrphans && targets.is_empty() {
+    if operation == NativeOmarchyOperation::RefreshKeyrings {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(super::sync_databases_parallel())?;
+    }
+    if operation != NativeOmarchyOperation::UpgradeRepositories && targets.is_empty() {
         return Ok(());
     }
     let (kind, changes) = if operation == NativeOmarchyOperation::UpgradeRepositories {
@@ -197,18 +185,11 @@ pub fn execute_native_omarchy_operation(
                 None
             } else {
                 Some(super::alpm_direct::with_handle(|handle| {
-                    for database in handle.syncdbs() {
-                        if !database.usage()?.contains(alpm::Usage::INSTALL) {
-                            continue;
-                        }
-                        super::alpm_ops::validate_sync_database(handle, database)?;
-                        if let Ok(package) = database.pkg(name.as_str()) {
-                            return Ok((package.version().to_string(), database.name().to_owned()));
-                        }
-                    }
-                    anyhow::bail!(
-                        "Omarchy package {name} is unavailable from configured install repositories"
-                    )
+                    let (database, package) = super::alpm_ops::omarchy_install_candidate(handle, name)?
+                        .with_context(|| format!(
+                            "Omarchy package {name} is unavailable from configured install repositories"
+                        ))?;
+                    Ok((package.version().to_string(), database.name().to_owned()))
                 })?)
             };
             changes.push(PackageChange {
@@ -236,6 +217,14 @@ pub fn execute_native_omarchy_operation(
     invalidate_caches()?;
     println!("Native Omarchy {} completed", operation.argument());
     Ok(())
+}
+
+fn missing_package_target(name: &str) -> AnyhowResult<Vec<String>> {
+    Ok(if super::is_installed_fast(name)? {
+        Vec::new()
+    } else {
+        vec![name.to_owned()]
+    })
 }
 
 /// Arch Linux package manager (ALPM) implementation

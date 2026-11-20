@@ -1,4 +1,4 @@
-//! Canonical package display ranking shared with authoritative RPM catalog search.
+//! Shared package search validation and display ranking.
 use std::cmp::Reverse;
 
 use crate::package_managers::SearchNameKind;
@@ -6,6 +6,42 @@ use nucleo_matcher::{
     Config, Matcher, Utf32String,
     pattern::{CaseMatching, Normalization, Pattern},
 };
+
+pub(crate) const MAX_SEARCH_QUERY_BYTES: usize = 100;
+
+pub(crate) fn validate_search_query(query: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        query.len() <= MAX_SEARCH_QUERY_BYTES,
+        "Search query too long (max 100 characters)"
+    );
+    anyhow::ensure!(
+        !query.chars().any(char::is_control),
+        "Search query contains invalid characters"
+    );
+    anyhow::ensure!(
+        !query.contains('/') && !query.contains('\\') && !query.contains(".."),
+        "Invalid search query: path traversal detected"
+    );
+    anyhow::ensure!(
+        !query.chars().any(|character| ";|&><$".contains(character)),
+        "Invalid search query: shell metacharacters detected"
+    );
+    Ok(())
+}
+
+pub(crate) fn validate_aur_search_length(query: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        query.trim().len() >= 2,
+        "AUR search requires at least 2 non-whitespace bytes"
+    );
+    Ok(())
+}
+
+#[cfg(feature = "arch")]
+pub(crate) fn validate_aur_search_query(query: &str) -> anyhow::Result<()> {
+    validate_search_query(query)?;
+    validate_aur_search_length(query)
+}
 
 /// Display tier for one search hit. Lower sorts first. A single table owns
 /// result ordering for the daemon, native, and AUR paths together.

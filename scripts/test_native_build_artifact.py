@@ -226,14 +226,34 @@ class NativeBuildAdmission(unittest.TestCase):
                     BUILD.find_native_artifact(Path(directory), 'debian', context, event)
                 run.update(original)
 
-    def test_artifact_download_retries_only_a_transport_timeout(self):
+    def test_artifact_download_recovers_with_a_fresh_response_after_gateway_failure(self):
+        path = 'repos/omg-cli/omg/actions/artifacts/123/zip'
+        archive = b'PK\x03\x04fixture-bytes\r\n\r\nwith-binary-separators'
+        replies = self.metadata_response([(503, b'service unavailable'), (200, archive)])
+        with patch.object(BUILD.subprocess, 'run', side_effect=replies) as request, \
+                patch.object(BUILD.time, 'sleep') as sleep:
+            self.assertEqual(BUILD.download_artifact(path), archive)
+        self.assertEqual(request.call_count, 2)
+        sleep.assert_called_once_with(1)
+
+        for status in (401, 403, 404, 429):
+            with self.subTest(status=status), patch.object(BUILD.subprocess, 'run',
+                    side_effect=self.metadata_response([(status, b'refused')])) as request:
+                with self.assertRaises(subprocess.CalledProcessError):
+                    BUILD.download_artifact(path)
+                self.assertEqual(request.call_count, 1)
+
+    def test_artifact_download_retries_transport_timeouts(self):
         path = 'repos/omg-cli/omg/actions/artifacts/123/zip'
         timeout = subprocess.TimeoutExpired(['gh', 'api', path], 90)
-        with patch.object(BUILD, 'api', side_effect=[timeout, b'verified bundle']) as request, \
+        response = b'HTTP/1.1 200 OK\r\n\r\nverified bundle'
+        limit = BUILD.MAX_DOWNLOAD + BUILD.MAX_HTTP_HEADERS
+        with patch.object(BUILD, 'api', side_effect=[timeout, response]) as request, \
                 patch.object(BUILD.time, 'sleep') as sleep:
             self.assertEqual(BUILD.download_artifact(path), b'verified bundle')
         self.assertEqual(request.call_count, 2)
-        request.assert_any_call(path, BUILD.MAX_DOWNLOAD)
+        self.assertEqual(request.call_args.args, (path, limit))
+        self.assertTrue(request.call_args.kwargs['include_status'])
         sleep.assert_called_once_with(1)
 
         with patch.object(BUILD, 'api', side_effect=timeout) as request, \
@@ -247,7 +267,8 @@ class NativeBuildAdmission(unittest.TestCase):
         with patch.object(BUILD, 'api', side_effect=rejected) as request:
             with self.assertRaises(subprocess.CalledProcessError):
                 BUILD.download_artifact(path)
-        request.assert_called_once_with(path, BUILD.MAX_DOWNLOAD)
+        self.assertEqual(request.call_count, 1)
+        self.assertEqual(request.call_args.args, (path, limit))
 
     def test_trixie_pair_retains_its_native_abi_recipe_identity(self):
         expected, provenance, payload = fixture('debian-trixie')
@@ -412,7 +433,8 @@ class NativeBuildAdmission(unittest.TestCase):
                 context = dict(GITHUB_REPOSITORY='omg-cli/omg', GITHUB_SHA='a'*40,
                                GITHUB_EVENT_NAME='pull_request')
                 event = {'number': 440, 'pull_request': {'head': {'sha': 'c'*40}}}
-                with patch.object(BUILD, 'api_json', side_effect=lookup), patch.object(BUILD, 'api', return_value=data), \
+                response = b'HTTP/1.1 200 OK\r\n\r\n' + data
+                with patch.object(BUILD, 'api_json', side_effect=lookup), patch.object(BUILD, 'api', return_value=response), \
                         patch.object(BUILD, 'command_output', return_value='a'*40), patch.object(BUILD.time, 'sleep'), \
                         patch.object(BUILD.time, 'monotonic', side_effect=range(0, 10000, 100)):
                     if mode in ('valid', 'in-progress', 'queued', 'queued-artifact',
@@ -525,7 +547,8 @@ class NativeBuildAdmission(unittest.TestCase):
                 context = dict(GITHUB_REPOSITORY='omg-cli/omg', GITHUB_SHA='a'*40,
                                GITHUB_EVENT_NAME='pull_request')
                 event = {'number': 440, 'pull_request': {'head': {'sha': 'c'*40}}}
-                with patch.object(BUILD, 'api_json', side_effect=lookup), patch.object(BUILD, 'api', return_value=data), \
+                response = b'HTTP/1.1 200 OK\r\n\r\n' + data
+                with patch.object(BUILD, 'api_json', side_effect=lookup), patch.object(BUILD, 'api', return_value=response), \
                         patch.object(BUILD, 'command_output', return_value='a'*40), patch.object(BUILD.time, 'sleep'), \
                         patch.object(BUILD.time, 'monotonic', side_effect=range(0, 10000, 100)):
                     if mode == 'valid':

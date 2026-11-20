@@ -47,8 +47,8 @@ class AllowlistTests(unittest.TestCase):
 
     def test_arch_readonly_reports_have_exact_boundaries(self):
         root = ('run-test', 'native-evidence', 'cli')
-        for stage in ('arch-dry-run', 'arch-check'):
-            for suffix in ('.log', '-native-state.json', '-isolation.txt'):
+        for stage in ('arch-dry-run', 'arch-check', 'arch-aur-unavailable'):
+            for suffix in ('.log', '-native-state.json', '-isolation.txt', '-exit.txt'):
                 self.assertTrue(exporter.allowed_file((*root, stage + suffix)))
                 self.assertFalse(exporter.allowed_file((*root, 'private', stage + suffix)))
                 self.assertFalse(exporter.allowed_file((*root, stage + suffix + '.bak')))
@@ -544,15 +544,21 @@ class DescriptorTests(unittest.TestCase):
 
     def test_native_guest_failure_exports_case_evidence_but_excludes_private_neighbors(self):
         prefix = 'run-test/native-evidence/cli/'
-        for name in ('omarchy-vendor-failure.log', 'omarchy-success-native-state.json',
-                     'test-01.log', 'verification.json'):
+        included = ('omarchy-vendor-failure.log', 'omarchy-success-native-state.json',
+                    'omarchy-unknown-signing-key.log', 'omarchy-unknown-signing-key-native-state.json',
+                    'omarchy-unknown-signing-key-unknown.json', 'omarchy-current-kernel.log',
+                    'omarchy-dev-config-unreadable.log', 'omarchy-aur-unavailable-native-state.json',
+                    'omarchy-aur-unavailable-unknown.json', 'omarchy-platform-keyring.log',
+                    'omarchy-platform-keyring-unreadable-platform-keyrings.txt',
+                    'test-01.log', 'verification.json')
+        for name in included:
             self.fixture(prefix + name, b'actual captured case evidence')
-        for name in ('credentials.json', 'private/verification.json', 'config/config.toml'):
+        for name in ('credentials.json', 'private/verification.json', 'config/config.toml',
+                     'omarchy-dev-config-unreadable.conf', 'omarchy-aur-unavailable-profile.profraw'):
             self.fixture(prefix + name, b'private neighbor')
         status, report = self.run_export()
         self.assertEqual(status, 0, report)
-        expected = {prefix + name for name in ('omarchy-vendor-failure.log', 'omarchy-success-native-state.json',
-                                              'test-01.log', 'verification.json')}
+        expected = {prefix + name for name in included}
         self.assertEqual(set(report['copied']), expected)
         self.assertFalse((self.destination / prefix / 'credentials.json').exists())
 

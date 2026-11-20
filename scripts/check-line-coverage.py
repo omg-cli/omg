@@ -1231,22 +1231,26 @@ def _compiled_function_groups(name, owners, files, source, work=None, source_str
                               validated_spans=None, shared_prefixes=None):
     if work is not None:
         _construct_charge(work, len(source) + len(owners))
-        if source_structure is None:
-            _construct_charge(work, sum(len(line) + 1 for line in source))
-        scans = 2 if validated_spans is None else 1
-        _construct_charge(work, sum(len(owner['filenames']) + scans * len(owner['regions']) for owner in owners))
+        _construct_charge(work, sum(len(owner['filenames']) for owner in owners))
     names = Counter(owner['name'] for owner in owners)
     inventory = [owner for owner in owners if any(
         files.get(path) == name or path.endswith('/' + name) for path in owner['filenames'])]
     by_span = {}
     for owner in inventory:
+        if work is not None and validated_spans is None:
+            _construct_charge(work, len(owner['regions']))
         span = (source_owner_span(owner, name, files, source) if validated_spans is None
                 else validated_spans.get(id(owner)))
         if span is None:
             return None
         by_span.setdefault(span[:2], []).append(owner)
+    if not by_span:
+        return inventory, {}, names
     if shared_prefixes is None:
-        if source_structure is None:source_structure=_source_structural_map(source)
+        if source_structure is None:
+            if work is not None:
+                _construct_charge(work, sum(len(line) + 1 for line in source))
+            source_structure = _source_structural_map(source)
         prefixes = source_function_prefixes(source, by_span, work, source_structure)
         if work is not None:
             qualified=closed_pgp_checksum_prefixes(name,source,inventory,files,by_span,source_structure,work)
@@ -1256,15 +1260,33 @@ def _compiled_function_groups(name, owners, files, source, work=None, source_str
         if work is not None:
             _construct_charge(work,len(by_span))
         prefixes = {span:shared_prefixes[span] for span in by_span if span in shared_prefixes}
+
+    def reaches_end(owner, end, column):
+        for region in reversed(owner['regions']):
+            if work is not None:
+                _construct_charge(work, 1)
+            if region[2] == end and region[3] > column:
+                return True
+        return False
+
     valid = {}
     for span, prefix in prefixes.items():
         members = by_span[span]
-        shapes = {tuple(sorted(tuple(row[:4] + row[5:]) for row in owner['regions']))
-                  for owner in members}
-        if (len(shapes) == 1 and all(names[owner['name']] == 1 for owner in members)
-                and all(any(row[2] == span[1]
-                            and row[3] > len(source[span[1] - 1].rstrip().encode())
-                            for row in owner['regions']) for owner in members)):
+        end = span[1]
+        closing = source[end - 1].rstrip()
+        if work is not None:
+            _construct_charge(work, len(members) + len(source[end - 1]) + 1)
+        if not all(names[owner['name']] == 1 for owner in members):
+            continue
+        if len(members) > 1:
+            if work is not None:
+                _construct_charge(work, sum(len(owner['regions']) for owner in members))
+            shapes = {tuple(sorted(tuple(row[:4] + row[5:]) for row in owner['regions']))
+                      for owner in members}
+            if len(shapes) != 1:
+                continue
+        column = len(closing.encode())
+        if all(reaches_end(owner, end, column) for owner in members):
             valid[prefix] = (*span, members)
     return inventory, valid, names
 
@@ -3072,7 +3094,7 @@ def ensure_entry_source(name, source, inventory, line, work):
         if not row['supported'] or row['kind']!='fn' or header.count('fn')!=1:
             return None
         index=header.index('fn')
-        if header[:index] not in ((),('pub','(','crate',')')):
+        if header[:index] not in ((), ('pub','(','crate',')'), ('pub','(','super',')')):
             return None
         first=code.position(code.starts[row['first']+index])[0]
         last=code.position(code.ends[row['end']])[0]
@@ -3142,9 +3164,17 @@ def ensure_entry_source(name, source, inventory, line, work):
                 and not any(code.words[token]=='||' and code.parents[token]==opening
                             for token in range(conjunct+1,condition_end))):
             leading=prefix,(source[first-1],)
+    trailing=None
+    tail=['files','.','len','(',')','<','10_000']
+    tail_start=condition_end-len(tail)
+    if (name=='src/package_managers/aur/client.rs' and leading is not None
+            and tail_start>conjunct and code.words[tail_start-1:condition_end]==['&&',*tail]
+            and code.parents[tail_start-1]==opening and last>first
+            and source[last-1].strip()=='&& files.len() < 10_000,'):
+        trailing=code.region(tail_start,condition_end-1),(source[last-1],)
     repeatable=any(row['kind'] in ('for','while','loop') for row in parents[:function_at])
     return (syntax,span,code.region(start,stop),(code.region(start,start+3),),
-            modules,function_name,method,(condition,leading),repeatable)
+            modules,function_name,method,(condition,leading,trailing),repeatable)
 
 
 def ensure_condition_observation(source_condition, roots, counts, work):
@@ -3390,7 +3420,7 @@ def retained_observed_entry(name, sides, indexes, work, source_observer):
         return dict(file=name, kind='retained-alpm-update-record-entry', pairs=pairs,
                     instance_states=states, observations=receipts)
     condition_pairs=[]
-    for candidate in (0,1):
+    for candidate in range(len(conditions[0][0])):
         old_source,new_source=(item[0][candidate] for item in conditions)
         if old_source is None or new_source is None or old_source[1]!=new_source[1]:
             continue
@@ -3398,15 +3428,16 @@ def retained_observed_entry(name, sides, indexes, work, source_observer):
                      for item in conditions]
         if all(item is not None for item in projections) and projections[0][1:]==projections[1][1:]:
             old,new=[item[0] for item in projections]
-            condition_pairs=[[old+offset,new+offset] for offset in projections[0][2]]
-            pairs.extend(condition_pairs)
-            break
+            condition_pairs.extend([old+offset,new+offset] for offset in projections[0][2])
+            if candidate==0:
+                break
+    pairs.extend(condition_pairs)
     kind = 'retained-map-capacity-entry' if map_initializer else 'retained-ensure-entry'
     return dict(file=name,kind=kind,pairs=pairs,condition_pairs=condition_pairs,
                 instance_states=states,observations=receipts)
 
 
-def policy_default_record_shape(code, rows, line, work):
+def tail_record_scope(code, rows, line, work):
     token=bisect.bisect_left(code.starts,code.offsets[line-1])
     parents=_construct_ancestors(code,token,work)
     if len(parents)!=3:
@@ -3416,12 +3447,22 @@ def policy_default_record_shape(code, rows, line, work):
     if len(shapes)!=3:
         return None
     record,function,implementation=(shapes[token] for token in parents)
-    if (record['header']!=('Self',) or function['header']!=('fn','default','(',')','->','Self')
-            or implementation['header']!=('impl','Default','for','SecurityPolicy')
-            or record['first']!=function['opening']+1 or record['end']+1!=function['end']):
+    if (record['header']!=('Self',) or record['first']!=function['opening']+1
+            or record['end']+1!=function['end']):
         return None
     arguments=_boolean_arguments(code,record['opening'])
     if not arguments or len(arguments)>8:
+        return None
+    return record,function,implementation,arguments
+
+
+def policy_default_record_shape(code, rows, line, work):
+    scope = tail_record_scope(code, rows, line, work)
+    if scope is None:
+        return None
+    record,function,implementation,arguments=scope
+    if (function['header']!=('fn','default','(',')','->','Self')
+            or implementation['header']!=('impl','Default','for','SecurityPolicy')):
         return None
     fields=[]
     for start,end in arguments:
@@ -3439,7 +3480,7 @@ def policy_default_record_shape(code, rows, line, work):
         field_line=code.position(code.starts[start])[0]
         if marker[0]!=field_line or marker[2]!=field_line:
             return None
-        fields.append((words,field_line,marker))
+        fields.append((words,field_line,(marker,)))
     first=code.position(code.starts[function['first']])[0]
     last=code.position(code.ends[function['end']])[0]
     if (fields[0][1]!=line or len({item[0][0] for item in fields})!=len(fields)
@@ -3447,19 +3488,73 @@ def policy_default_record_shape(code, rows, line, work):
         return None
     anchors=(code.region(function['first'],function['opening']-1),
              code.region(record['first'],record['end']),code.region(function['end'],function['end']))
-    return (first,last),fields,anchors
+    return (first,last),fields,anchors,'default'
 
 
-def retained_policy_default_record(name, sides, indexes, work):
+def scanner_record_shape(code, rows, line, work):
+    scope = tail_record_scope(code, rows, line, work)
+    if scope is None:
+        return None
+    record, function, implementation, arguments = scope
+    if implementation['header'] != ('impl', 'VulnerabilityScanner'):
+        return None
+    header = function['header']
+    if header == ('pub', 'fn', 'new', '(', ')', '->', 'Self'):
+        retained = [
+            (('osv_api_url', ':', '"https://api.osv.dev/v1/query"', '.', 'to_string', '(', ')'), ((2, 2), (4, 4))),
+            (('osv_ecosystem_override', ':', 'None'), ((2, 2),)),
+        ]
+    elif header == ('pub', 'fn', 'with_osv_endpoint', '(', 'osv_api_url', ':', 'String',
+                    ',', 'ecosystem', ':', 'String', ')', '->', 'Self'):
+        retained = [
+            (('osv_api_url',), ((0, 0),)),
+            (('osv_ecosystem_override', ':', 'Some', '(', 'ecosystem', ')'), ((2, 5),)),
+        ]
+    else:
+        return None
+    fields = []
+    expected = [
+        (('client', ':', 'shared_client', '(', ')', '.', 'clone', '(', ')'), ((2, 4), (6, 6))),
+        *retained,
+    ]
+    if len(arguments) == 4:
+        expected.append((('arch_endpoint', ':', 'ARCH_ADVISORY_ENDPOINT', '.', 'to_owned', '(', ')'),
+                         ((2, 2), (4, 4), (2, 6))))
+    if len(arguments) != len(expected):
+        return None
+    for (start, end), (tokens, markings) in zip(arguments, expected, strict=True):
+        _construct_charge(work, end - start + len(markings))
+        if tuple(code.words[start:end]) != tokens or code.words[end] != ',':
+            return None
+        number = code.position(code.starts[start])[0]
+        marks = tuple(code.region(start + lo, start + hi) for lo, hi in markings)
+        if any(mark[0] != number or mark[2] != number for mark in marks):
+            return None
+        fields.append((tokens, number, marks))
+    first = code.position(code.starts[function['first']])[0]
+    last = code.position(code.ends[function['end']])[0]
+    if line != fields[0][1] or [field[1] for field in fields] != list(range(first + 2, last - 1)):
+        return None
+    anchors = (code.region(function['first'], function['opening'] - 1),
+               code.region(record['first'], record['end']), code.region(function['end'], function['end']))
+    return (first, last), fields, anchors, header[2]
+
+
+def retained_eager_tail_record(name, sides, indexes, work):
     records=[]; copies=[]; states=[]; refinements=[]
-    namespace=('type',('type',('type',('crate','omg_lib'),('core','')),('security','')),('policy',''))
-    trait=('type',('type',('crate','core'),('default','')),('Default',''))
+    scanner = name == 'src/core/security/vulnerability.rs'
+    if not scanner and name != 'src/core/security/policy.rs':
+        return None
+    leaf, record_type = ('vulnerability', 'VulnerabilityScanner') if scanner else ('policy', 'SecurityPolicy')
+    namespace=('type',('type',('type',('crate','omg_lib'),('core','')),('security','')),(leaf,''))
+    trait=None if scanner else ('type',('type',('crate','core'),('default','')),('Default',''))
+    shape = scanner_record_shape if scanner else policy_default_record_shape
     for (_,inventory,spans,counts,line),index in zip(sides,indexes,strict=True):
-        parsed=policy_default_record_shape(*inventory[:2],line,work)
+        parsed=shape(*inventory[:2],line,work)
         if parsed is None:
             return None
-        (first,last),fields,anchors=parsed
-        allowed={item[2]:n for n,item in enumerate(fields)}
+        (first,last),fields,anchors,method=parsed
+        allowed={mark:(n, i) for n,item in enumerate(fields) for i,mark in enumerate(item[2])}
         roots=[]
         owners=index.inventories.get(name,())
         _construct_charge(work,len(owners))
@@ -3472,13 +3567,14 @@ def retained_policy_default_record(name, sides, indexes, work):
             if not any(r[0]<=last and (r[2]>first or r[2]==first and r[3]>1) for r in raw):
                 continue
             symbol=owner['name']; _construct_charge(work,len(symbol)+len(raw)+1)
-            decoded=nominal_method_path(symbol,core_default_impl=True)
+            decoded=nominal_method_path(symbol,core_default_impl=not scanner)
             hits=owner['count']
             if (span is None or span[:2]!=(first,last) or index.name_counts[symbol]!=1
-                    or decoded is None or decoded.kind!='X' or decoded.namespace!=namespace
-                    or decoded.self_type!=('type',namespace,('SecurityPolicy','')) or decoded.trait!=trait
-                    or decoded.method!=('default','') or decoded.callbacks
+                    or decoded is None or decoded.kind!=('M' if scanner else 'X') or decoded.namespace!=namespace
+                    or decoded.self_type!=('type',namespace,(record_type,'')) or decoded.trait!=trait
+                    or decoded.method!=(method,'') or decoded.callbacks
                     or owner.get('branches') or owner.get('mcdc_records') or not 0<=hits<COUNTER_LIMIT
+                    or scanner and hits==0
                     or any(r[5:]!=[0,0,0] or r[4]!=hits for r in raw)):
                 return None
             geometry={tuple(r[:4]) for r in raw}
@@ -3494,22 +3590,29 @@ def retained_policy_default_record(name, sides, indexes, work):
         if _owner_line_counts({'regions':raw},_ObserverWork(work))!={
                 n:counts[n] for n in range(first,last+1) if n in counts}:
             return None
-        records.append(((first,last),fields,roots[0][1].parent_scope))
+        scope=roots[0][1].parent_scope
+        # Both scanner cohorts are wholly exercised and bound to the same
+        # lexical constructor. Its impl ordinal can move between crate builds.
+        records.append(((first,last),fields,(scope[0],scope[2:],method) if scanner else scope))
         copies.append([dict(name=owner['name'],count=owner['count'],regions=owner['regions']) for owner,_,_ in roots])
         states.append(sorted(item[0]['count']>0 for item in roots))
-        refinements.append(roots[0][2])
+        refinements.append(roots[0][2] if scanner else tuple(n for n,_ in roots[0][2]))
     (old,left,old_scope),(new,right,new_scope)=records
-    additions=(('advisory_requirement',':','AdvisoryRequirement','::','Optional'),
-               ('arch_advisory_repositories',':','BTreeSet','::','new','(',')'))
-    if (len(left)!=5 or len(right)!=7 or [item[0] for item in left]!=[item[0] for item in right[:5]]
-            or tuple(item[0] for item in right[5:])!=additions or old_scope!=new_scope
+    additions=((('arch_endpoint', ':', 'ARCH_ADVISORY_ENDPOINT', '.', 'to_owned', '(', ')'),) if scanner else
+               (('advisory_requirement',':','AdvisoryRequirement','::','Optional'),
+                ('arch_advisory_repositories',':','BTreeSet','::','new','(',')')))
+    field_count = 3 if scanner else 5
+    if (len(left)!=field_count or len(right)!=field_count+len(additions)
+            or [item[0] for item in left]!=[item[0] for item in right[:field_count]]
+            or tuple(item[0] for item in right[field_count:])!=additions or old_scope!=new_scope
             or states[0]!=states[1] or not any(states[0]) or not set(refinements[0])<=set(refinements[1])
-            or any(sides[1][3].get(item[1],0)<=0 for item in right[5:])):
+            or any(sides[1][3].get(item[1],0)<=0 for item in right[field_count:])):
         return None
     pairs=[[line,new[0]+line-old[0]] for line in range(old[0],old[1]-1)]
     pairs.extend([[old[1]-1,new[1]-1],[old[1],new[1]]])
-    return dict(file=name,kind='retained-policy-default-record',pairs=pairs,owners=copies,
-                instance_states=states,direct_field_indices=refinements,added_lines=[item[1] for item in right[5:]])
+    kind='retained-scanner-constructor-record' if scanner else 'retained-policy-default-record'
+    return dict(file=name,kind=kind,pairs=pairs,owners=copies,
+                instance_states=states,direct_field_indices=refinements,added_lines=[item[1] for item in right[field_count:]])
 
 
 def retained_match_selector(name, sides, indexes, work):
@@ -3870,10 +3973,29 @@ def async_test_fragment_owners(name, group, owners, names, inventory, first, las
     tokio_test = ('#','[','tokio','::','test',']','async','fn')
     headers = (tokio_test, ('#','[','cfg','(','unix',')',']')+tokio_test) if result_alias else (tokio_test,)
     result = ('(',')','->','Result','<','(',')','>') if result_alias else _RESULT_TEST_SIGNATURE[6:]
-    helper = (runtime_helper and result_alias and name=='src/runtimes/rust.rs'
-              and words[:declaration+1]==('async','fn')
-              and words[declaration+2:]==('(','corrupt',':','bool',',','missing_launcher',':',
+    if name=='src/core/security/vulnerability.rs' and words[declaration+1]=='test_vulnerability_report_creation':
+        result = ('(',')')
+    runtime_header=(runtime_helper and result_alias and name=='src/runtimes/rust.rs'
+                    and words[:declaration+1]==('async','fn'))
+    helper = (runtime_header and words[declaration+2:]==('(','corrupt',':','bool',',','missing_launcher',':',
                   'Option','<','&','str','>',')','->','Result','<','(',')','>'))
+    if runtime_header and words[declaration+1:]==('incremental_updates_fixture',*result):
+        helper=True
+    enum_binding=None
+    if (runtime_header and scope is not None and words[declaration+2:]==(
+            '(','incremental',':','bool',',','selection',':','SourceSelection',')','->','Result','<','(',')','>')):
+        module=code.parents[fn['first']]
+        header=('#','[','derive','(','Clone',',','Copy',',','Debug',')',']','enum','SourceSelection')
+        variants=('Wildcard',',','HostPreferred',',','Unavailable',',','Missing',',')
+        _construct_charge(work,len(rows)+len(code.words)+1)
+        enums=[row for row in rows if row['kind']=='enum' and row.get('header')==header
+               and code.parents[row['first']]==module]
+        bindings=[i for i,word in enumerate(code.words) if i and word=='SourceSelection'
+                  and code.parents[i]==module and code.words[i-1] in ('enum','struct','type','trait','union','mod','fn')]
+        if (len(enums)==len(bindings)==1
+                and tuple(code.words[enums[0]['opening']+1:enums[0]['end']])==variants):
+            enum_binding=(tuple(scope[0]),header,variants)
+            helper=True
     if ((not helper and (words[:declaration+1] not in headers or words[declaration+2:]!=result))
             or scope is None or scope[:2]!=(['tests'],['tests'])):
         return None
@@ -3913,7 +4035,12 @@ def async_test_fragment_owners(name, group, owners, names, inventory, first, las
             or [r[4] for r in child['regions'] if tuple(r[:4])==body_entry and r[5:]==[0,0,0]]!=[child['count']]
             or any(not open_at<=tuple(r[:2])<tuple(r[2:4])<=close_at for r in child['regions'])):
         return None
-    return fn, (shape.identity,words), dict(root=root['name'],body=child['name'],regions=raw,entry=body_entry), child['count']
+    identity=(shape.identity,words)
+    witness=dict(root=root['name'],body=child['name'],regions=raw,entry=body_entry)
+    if enum_binding is not None:
+        identity=(*identity,enum_binding)
+        witness['enum_parameter_source']=enum_binding
+    return fn, identity, witness, child['count']
 
 
 def initial_async_test_record(name, source, counts, group, owners, names, inventory, first, last, work):
@@ -3985,62 +4112,410 @@ def async_test_expected_error(name, source, counts, group, owners, names, invent
     return (*identity,tuple(binder),slot),witness
 
 
+def sync_runtime_fragment_owners(name, group, owners, names, inventory, first, last, work):
+    """Observe one exact synchronous Result test owner without inventing a future."""
+    if inventory is None or len(group[2])!=1 or name not in (
+            'src/runtimes/java.rs','src/runtimes/rust.rs','src/core/security/sbom_shared.rs'):
+        return None
+    code,rows=inventory[:2]
+    _construct_charge(work,len(rows)+1)
+    functions=[row for row in rows if row['kind']=='fn' and 'fn' in row['header'] and 'async' not in row['header']
+               and code.position(code.starts[row['first']+row['header'].index('fn')])[0]==group[0]
+               and code.position(code.ends[row['end']])[0]==group[1]]
+    if len(functions)!=1:
+        return None
+    fn,=functions;words=fn['header'];at=words.index('fn')
+    test=('#','[','test',']');unix=('#','[','cfg','(','unix',')',']')
+    if (words[:at] not in (test,test+unix,unix+test)
+            or words[at+2:] not in (('(',')'),('(',')','->','Result','<','(',')','>'))):
+        return None
+    scope=_boolean_module(code,{'start':fn['first']})
+    if scope is None and name=='src/runtimes/rust.rs':
+        enclosing=code.ancestors(fn['first'])
+        if len(enclosing)==1:
+            module,=enclosing
+            if (code.words[module-2:module]==['mod','tests'] and _boolean_attributes(code,module-2)==[
+                    ['expect','(','clippy','::','unwrap_used',')'],['cfg','(','test',')']]):
+                scope=['tests'],['tests'],[module]
+    if scope is None or scope[:2]!=(['tests'],['tests']):
+        return None
+    root,=group[2];shape=plain_rust_function_symbol(root['name']);hits=root.get('count')
+    path=('omg_lib',*name.removeprefix('src/').removesuffix('.rs').split('/'),'tests',words[at+1])
+    entry=code.region(fn['first']+at,fn['opening']-1);terminal=code.region(fn['end'],fn['end'])
+    if (shape is None or shape.identifiers!=path or names[root['name']]!=1
+            or type(hits) is not int or not 0<hits<COUNTER_LIMIT or len(root['filenames'])!=1
+            or not root['filenames'][0].endswith('/'+name) or root.get('branches') or root.get('mcdc_records')
+            or [r[4] for r in root['regions'] if tuple(r[:4])==entry and r[5:]==[0,0,0]]!=[hits]
+            or [r[4] for r in root['regions'] if tuple(r[:4])==terminal and r[5:]==[0,0,0]]!=[hits]):
+        return None
+    records=[row for row in rows if row['opening'] is not None
+             and code.position(code.starts[row['first']])[0]==first
+             and code.position(code.ends[row['end']])[0]==last]
+    if len(records)!=1:
+        return None
+    lo,hi=code.region(records[0]['first'],records[0]['end'])[:2],code.region(records[0]['first'],records[0]['end'])[2:]
+    _construct_charge(work,sum(len(owner['regions'])+1 for owner in owners))
+    touching=[(owner,[r for r in owner['regions'] if tuple(r[:2])<hi and lo<tuple(r[2:4])]) for owner in owners]
+    affected=[(owner,raw) for owner,raw in touching if raw]
+    if (len(affected)!=1 or affected[0][0] is not root
+            or any(r[5:]!=[0,0,0] or type(r[4]) is not int or not 0<=r[4]<=hits
+                   or not lo<=tuple(r[:2])<tuple(r[2:4])<=hi for r in affected[0][1])):
+        return None
+    return fn,(shape.identity,words),dict(root=root['name'],regions=affected[0][1],entry=entry,synchronous=True),hits
+
+
+def literal_fixture_loop(inventory, function, record, owners, witness, entries, work):
+    """Bind record execution to a fixed table exercised by the async body."""
+    code, rows=inventory[:2]
+    function_header = function['header']
+    declaration = function_header.index('fn')
+    ecosystem_cache = function_header[declaration+1] == 'cache_key_includes_the_ecosystem'
+    if function_header[:3] == ('async','fn','incremental_updates_fixture'):
+        header = ('for','(','installed',',','candidate',',','compatible',')','in','[')
+        setup = ['let','versions','=','TempDir','::','new','(',')','?',';']
+        binding_offsets = (2,4,6)
+    elif ecosystem_cache:
+        header = ('for','(','expected_requests',',','ecosystem',')','in','[')
+        setup = []
+        binding_offsets = (2,4)
+    else:
+        return None
+    opening=code.parents[record['first']]
+    _construct_charge(work,len(rows))
+    matches=[row for row in rows if row['kind']=='for' and row['opening']==opening]
+    if len(matches)!=1:
+        return None
+    loop,=matches
+    if (loop['header'][:len(header)]!=header or code.parents[loop['first']]!=function['opening']
+            or code.words[opening+1:record['first']]!=setup):
+        return None
+    array=loop['first']+len(header)-1
+    if code.pairs.get(array)!=opening-1 or opening-array>512:
+        return None
+    cases=_boolean_arguments(code,array)
+    if cases is None or not 1<=len(cases)<=16:
+        return None
+    _construct_charge(work,opening-array)
+    literals=re.compile(r'"[^"\\\r\n]{0,256}"',re.ASCII)
+    for begin,end in cases:
+        if code.words[begin]!='(' or code.pairs.get(begin)!=end-1:
+            return None
+        parts=_boolean_arguments(code,begin)
+        if ecosystem_cache:
+            if parts is None or len(parts)!=2:
+                return None
+            requests, ecosystem = (code.words[a:b] for a,b in parts)
+            if (len(requests)!=1 or re.fullmatch(r'[1-9][0-9]?', requests[0]) is None
+                    or len(ecosystem)!=1 or literals.fullmatch(ecosystem[0]) is None):
+                return None
+            continue
+        if parts is None or len(parts)!=3:
+            return None
+        installed,candidate,compatible=(code.words[a:b] for a,b in parts)
+        if ((installed!=['None'] and (len(installed)!=4 or installed[:2]!=['Some','(']
+                or installed[3]!=')' or literals.fullmatch(installed[2]) is None))
+                or len(candidate)!=1 or literals.fullmatch(candidate[0]) is None
+                or compatible not in (['true'],['false'])):
+            return None
+    bindings=[code.region(loop['first']+offset,loop['first']+offset) for offset in binding_offsets]
+    envelope=code.region(array,opening-1)
+    # LLVM emits one array region for the inline OSV table.
+    if ecosystem_cache and envelope[0] != envelope[2]:
+        return None
+    case_spans = [] if ecosystem_cache else [code.region(begin,end-1) for begin,end in cases[:-1]]
+    expected={*bindings,envelope,*case_spans}
+    low,high=code.region(loop['first'],opening-1)[:2],envelope[2:]
+    rows_seen={}
+    for owner in owners:
+        _construct_charge(work,len(owner['regions']))
+        for row in owner['regions']:
+            if not (tuple(row[:2])<high and low<tuple(row[2:4])):
+                continue
+            span=tuple(row[:4])
+            if (owner['name']!=witness['body'] or span not in expected or span in rows_seen
+                    or row[5:]!=[0,0,0] or not 0<row[4]<COUNTER_LIMIT):
+                return None
+            rows_seen[span]=row[4]
+    if rows_seen.keys()!=expected or rows_seen[envelope]>entries:
+        return None
+    iterations=rows_seen[envelope]*len(cases)
+    if (any(rows_seen[span]!=iterations for span in bindings)
+            or any(rows_seen[span]!=rows_seen[envelope] for span in case_spans)):
+        return None
+    return iterations,tuple(loop['header'])
+
+
 def async_runtime_fixture_record(name, source, counts, group, owners, names, inventory, first, last, work):
-    """Project a fixture record through the addition of its eager security field."""
+    """Project a fixture record through separately observed eager security fields."""
     managers = {'src/runtimes/java.rs':'JavaManager', 'src/runtimes/rust.rs':'RustManager'}
-    manager = managers.get(name)
-    if (manager is None or inventory is None or first!=last
-            or source[first-1].strip()!=f'let manager = {manager} {{'):
+    scanner = name == 'src/core/security/vulnerability.rs'
+    if scanner:
+        bindings, record_type, original_size = ('scanner',), 'VulnerabilityScanner', 7
+        initializer = 'ARCH_ADVISORY_ENDPOINT.to_owned()'
+        fields = [(7,f'arch_endpoint: {initializer},',initializer)]
+    elif name=='src/core/security/sbom_shared.rs' and source[first-1].strip()=='let audit = SecurityAuditResult {':
+        bindings, record_type, original_size = ('audit',), 'SecurityAuditResult', 14
+        coverage = 'crate::core::security::scan::AuditCoverage::Unreported'
+        applicability = 'crate::core::security::scan::FindingApplicability::Possible'
+        fields = [(1,f'coverage: {coverage},',coverage), (7,f'applicability: {applicability},',applicability)]
+    elif name == 'src/core/security/sbom_shared.rs':
+        bindings, record_type, original_size = ('package','old'), 'SecurityPackage', 7
+        initializer = 'crate::package_managers::types::SecurityOrigin::Unknown'
+        fields = [(1,f'origin: {initializer},',initializer)]
+    elif name in managers:
+        bindings, record_type, original_size = ('manager',), managers[name], 3
+        initializer = 'crate::runtimes::security::RuntimeSecurity::fixture'
+        fields = [(1,f'security: {initializer}(),',initializer)]
+    else:
+        return None
+    if (inventory is None or first!=last or source[first-1].strip() not in
+            {f'let {binding} = {record_type} {{' for binding in bindings}):
         return None
     code, rows = inventory[:2]
     _construct_charge(work,len(rows))
-    candidates = [row for row in rows if row.get('header')==('let','manager','=',manager)
+    candidates = [row for row in rows if row.get('header') in {('let',binding,'=',record_type) for binding in bindings}
                   and code.position(code.starts[row['first']])[0]==first]
     if len(candidates)!=1:
         return None
     record, = candidates
     closing = code.position(code.ends[record['end']])[0]
-    if closing-first not in (3,4) or source[closing-1].strip()!='};':
+    cache_record = scanner and closing-first in (4,5)
+    if cache_record:
+        original_size = 4
+        fields = [(4,f'arch_endpoint: {initializer},',initializer)]
+    if closing-first not in (original_size,original_size+len(fields)) or source[closing-1].strip()!='};':
         return None
-    bound = async_test_fragment_owners(name,group,owners,names,inventory,first,closing,work,
-                                       result_alias=True,runtime_helper=True)
+    synchronous=source[group[0]-1].lstrip().startswith('fn ')
+    if synchronous:
+        bound=sync_runtime_fragment_owners(name,group,owners,names,inventory,first,closing,work)
+    else:
+        bound = async_test_fragment_owners(name,group,owners,names,inventory,first,closing,work,
+                                           result_alias=not cache_record,runtime_helper=True)
     if bound is None:
         return None
     function, identity, witness, entry_hits = bound
-    if identity[1][:2]==('async','fn') and any(row[4]>entry_hits for row in witness['regions']):
+    if cache_record and ('cache_key_includes_the_ecosystem' not in function['header']
+                         or code.parents[record['first']]==function['opening']):
         return None
-    if code.parents[record['first']]!=function['opening'] or counts.get(first,0)<=0:
+    if code.parents[record['first']]!=function['opening']:
+        loop=literal_fixture_loop(inventory,function,record,owners,witness,entry_hits,work)
+        if loop is None:
+            return None
+        entry_hits, header=loop
+        binder=code.region(record['first']+1,record['first']+1)
+        if [row[4] for row in witness['regions'] if tuple(row[:4])==binder]!=[entry_hits]:
+            return None
+        identity=(*identity,header)
+        witness['loop_iterations']=entry_hits
+    if (synchronous or identity[1][:2]==('async','fn')) and any(row[4]>entry_hits for row in witness['regions']):
         return None
-    initializer = 'crate::runtimes::security::RuntimeSecurity::fixture'
-    insertion = closing-first==4
-    added = first+1
-    if insertion and source[added-1].strip()!=f'security: {initializer}(),':
+    if counts.get(first,0)<=0:
+        return None
+    insertion = closing-first!=original_size
+    inserted = {}
+    if insertion:
+        for offset, field, initializer in fields:
+            added = first+offset
+            text = source[added-1]
+            if text.strip()!=field:
+                return None
+            start = text.index(initializer)+1
+            inserted[added] = (added,start,added,start+len(initializer))
+    if record_type=='SecurityAuditResult' and source[first+4+int(insertion)].strip()!='vec![Vulnerability {':
         return None
     source_rows = source[first-1:closing]
     _construct_charge(work,sum(len(text)+1 for text in source_rows)+len(witness['regions']))
-    if insertion:
-        extra = source_rows.pop(1)
-        start = extra.index(initializer)+1
-        slot = (added,start,added,start+len(initializer))
+    for added in reversed(inserted):
+        source_rows.pop(added-first)
     def relative(line):
-        return line-first-int(insertion and line>added)
+        return line-first-sum(number<line for number in inserted)
     region_states = []; additions = []
     for row in witness['regions']:
         if row[5:]!=[0,0,0]:
             return None
-        if insertion and tuple(row[:4])==slot:
+        if row[0] in inserted and tuple(row[:4])==inserted[row[0]]:
             additions.append(row)
             continue
-        if insertion and added in (row[0],row[2]):
+        if row[0] in inserted or row[2] in inserted:
             return None
         region_states.append((relative(row[0]),row[1],relative(row[2]),row[3],row[4]>0))
-    if insertion and (len(additions)!=1 or additions[0][4]!=entry_hits or counts.get(added,0)<=0):
-        return None
+    if insertion:
+        if scanner and not additions:
+            added, = inserted
+            envelope = code.region(record['first']+3,record['end'])
+            additions = [row for row in witness['regions'] if tuple(row[:4])==envelope and row[0]<added<row[2]]
+            witness['initializer_uses_record_envelope'] = True
+        if sorted(row[0] for row in additions)!=list(inserted) and not witness.get('initializer_uses_record_envelope'):
+            return None
+        if len(additions)!=len(inserted) or any(row[4]!=entry_hits for row in additions) or any(counts.get(line,0)<=0 for line in inserted):
+            return None
+        if scanner and witness.get('initializer_uses_record_envelope'):
+            preceding = source[added-2]
+            value = ('Some(ecosystem.to_string())' if cache_record
+                     else 'Some("Debian:12".to_string())')
+            if preceding.strip()==f'osv_ecosystem_override: {value},':
+                start = preceding.index(value)+1
+                field = (added-1,start,added-1,start+len(value))
+                redundant = [row for row in witness['regions'] if tuple(row[:4])==field and row[4]==entry_hits]
+                if len(redundant)==1:
+                    region_states.remove((relative(field[0]),field[1],relative(field[2]),field[3],True))
+                    witness['retained_field_region'] = redundant[0]
     observed = _owner_line_counts({'regions':witness['regions']},_ObserverWork(work))
     if observed!={line:counts[line] for line in range(first,closing+1) if line in counts}:
         return None
-    witness.update(record_span=[first,closing],security_initializer=additions)
+    witness.update(record_span=[first,closing],security_initializer=additions,
+                   shifts=[first+offset-index-1 for index,(offset,_,_) in enumerate(fields)])
     return (identity,tuple(source_rows),tuple(sorted(region_states))),witness
+
+
+def async_osv_report_call(name, source, counts, group, owners, names, inventory, first, last, work):
+    if (name!='src/core/security/vulnerability.rs' or first!=last or first+3>len(source)
+            or source[first-1]!='        let reports = scanner'):
+        return None
+    call = re.fullmatch(r'            \.(scan_package|scan_osv_package)\((|&package, &version\))',source[first])
+    if call is None:
+        return None
+    short = bool(call[2])
+    if short:
+        tail = ['            .await','            .expect("actual report");']
+        test = 'test_vulnerability_report_creation'
+        setup_line = '            osv_ecosystem_override: Some("Debian:12".to_string()),'
+    else:
+        tail = ['                &format!("vector-test-{}", uuid::Uuid::new_v4()),',
+                '                &crate::package_managers::parse_version_or_zero("1.0"),',
+                '            )','            .await?;']
+        test = 'osv_ingestion_retains_the_highest_numeric_or_vector_score'
+        setup_line = '        let scanner = VulnerabilityScanner::with_osv_endpoint(endpoint, "Debian:12".into());'
+    end = first+len(tail)+1
+    if source[first+1:end]!=tail:
+        return None
+    scope = async_test_fragment_owners(name,group,owners,names,inventory,first,end,work,result_alias=short)
+    if scope is None:
+        return None
+    function, identity, witness, hits = scope
+    if test not in function['header']:
+        return None
+    setup = source[group[0]-1:first-1]
+    _construct_charge(work,sum(len(line)+1 for line in setup))
+    if setup.count(setup_line)!=1:
+        return None
+    expanded = len(call[1])-len('scan_package')
+    slots = [(0,13,0,20),(0,23,0,30),(0,23,2 if short else 5,19),(1,14,1,26+expanded)]
+    if short:
+        slots.extend([(1,27+expanded,1,35+expanded),(3,14,3,20),(3,21,3,36)])
+    else:
+        slots.append((2,17,2,65))
+    expected = [[first+a,b,first+c,d,hits,0,0,0] for a,b,c,d in slots]
+    if not short:
+        expected.append([end,19,end,20,0,0,0,0])
+    if witness['regions']!=expected or any(counts.get(line)!=hits for line in range(first,end+1)):
+        return None
+    return identity,dict(witness,method=call[1],record_span=[first,end])
+
+
+_OSV_PAGINATION_FIXTURE = 'incomplete_osv_pages_fail_without_caching_partial_findings'
+
+
+def retained_osv_fixture_migration(sides, work):
+    """Compare complete fixtures whose explicit OSV scanner calls were renamed."""
+    observations = []
+    copies = []
+    for source, counts, group, owners, names, inventory in sides:
+        first,last,roots = group
+        if len(roots)!=1:
+            return None
+        root, = roots
+        symbol = root['name']
+        shape = plain_rust_function_symbol(symbol)
+        if (shape is None or shape.identifiers[:-1]!=('omg_lib','core','security','vulnerability','tests')
+                or shape.identifiers[-1]!=_OSV_PAGINATION_FIXTURE or names[symbol]!=1 or not root['count']):
+            return None
+        code, constructs = inventory[:2]
+        _construct_charge(work,len(constructs)+last-first+1)
+        functions = [fn for fn in constructs if fn['kind']=='fn' and 'async' in fn['header']
+                     and fn['header'][fn['header'].index('async')+2]==shape.identifiers[-1]
+                     and code.position(code.starts[fn['first']+fn['header'].index('async')])[0]==first
+                     and code.position(code.ends[fn['end']])[0]==last]
+        if len(functions)!=1:
+            return None
+        fn, = functions
+        scope = range(fn['opening']+1,fn['end'])
+        _construct_charge(work,len(scope)+sum(len(line)+1 for line in source[first-1:last]))
+        methods = ('scan_package','scan_osv_package')
+        replacements = {}
+        projection = source[first-1:last]
+        bound = Counter(code.words[i+1] for i in scope if code.words[i]=='let' and
+                        code.words[i+2:i+7]==['=','VulnerabilityScanner','::','with_osv_endpoint','('])
+        for index in scope:
+            method = code.words[index]
+            if method not in methods:
+                continue
+            line,start = code.position(code.starts[index])
+            receiver = code.words[index-2]
+            if (bound[receiver]!=1 or code.words[index-1]!='.' or code.words[index+1]!='('
+                    or line in replacements or not source[line-1].isascii()):
+                return None
+            replacements[line] = start,len(method)
+            text = source[line-1]
+            projection[line-first] = text[:start-1]+methods[0]+text[start+len(method)-1:]
+        if not replacements or {width for _,width in replacements.values()} not in ({len(methods[0])},{len(methods[1])}):
+            return None
+        widths = {width for _,width in replacements.values()}
+        def column(line, position):
+            if line not in replacements:
+                return position
+            start,width = replacements[line]
+            if start<position<start+width:
+                return None
+            return position-(width-len(methods[0]))*int(position>=start+width)
+        records = {}; all_rows = []; body_owners = []
+        for owner in owners:
+            child = owner['name']
+            _construct_charge(work,4*len(owner['regions'])+len(child)+1)
+            touching = [r for r in owner['regions'] if r[0]<=last and r[2]>=first]
+            if not touching:
+                continue
+            depth = re.match(r'_R((?:NC){1,8})',child) if child!=symbol else None
+            if owner is root:
+                role = ''
+            elif depth and direct_rust_callback_symbol(child,symbol,shape.modules,len(depth[1])//2):
+                role = depth[1]+child[len('_R'+depth[1]+symbol[2:]):]
+                if depth[1] == 'NC':
+                    body_owners.append(owner)
+            else:
+                return None
+            if (role in records or names[child]!=1 or owner['filenames']!=root['filenames']
+                    or len(root['filenames'])!=1 or owner.get('branches') or owner.get('mcdc_records')
+                    or type(owner.get('count')) is not int or not 0<=owner['count']<COUNTER_LIMIT):
+                return None
+            rows = []
+            for a,b,c,d,hit,*channels in touching:
+                begin,end = column(a,b),column(c,d)
+                if (channels!=[0,0,0] or begin is None or end is None or not first<=a<=c<=last
+                        or not 0<=hit<COUNTER_LIMIT):
+                    return None
+                rows.append((a-first,begin,c-first,end,hit))
+            records[role] = (owner['count'],tuple(rows))
+            all_rows.extend(touching)
+        compared = {i:counts[i] for i in range(first,last+1) if i in counts}
+        if ('' not in records or len(body_owners)!=1 or not body_owners[0]['count'] or
+                _owner_line_counts({'regions':all_rows},_ObserverWork(work))!=compared):
+            return None
+        body, = body_owners
+        copies.append(dict(constructor=symbol,body=body['name'],
+                           constructor_state=int(root['count']>0),body_state=int(body['count']>0)))
+        observations.append((shape.identity,tuple(projection),records,list(compared),first,widths))
+    before, after = observations
+    if before[:3]!=after[:3] or before[5]!={len('scan_package')} or after[5]!={len('scan_osv_package')}:
+        return None
+    pairs = [[line,line+after[4]-before[4]] for line in before[3]]
+    if [target for _,target in pairs]!=after[3]:
+        return None
+    bounds = [[side[4],side[4]+len(side[1])-1] for side in observations]
+    fragment = dict(base_range=bounds[0],head_range=bounds[1],
+                    geometry={role:[list(row[:4]) for row in data[1]] for role,data in before[2].items()})
+    return dict(kind='retained-osv-fixture-migration',pairs=pairs,counter_roles=list(before[2]),
+                async_copies=dict(base=[copies[0]],head=[copies[1]]),async_fragment_regions=[fragment])
 
 
 def async_runtime_inventory_assertion(name, source, counts, group, owners, names, inventory, first, last, work):
@@ -4260,7 +4735,604 @@ def async_test_expected_variant(name, source, counts, group, owners, names, inve
     return (*identity,code.words[value],message,tuple(named)), dict(witness,wrapped=wrapped)
 
 
-def direct_assertion_anchor(code, start, stop, work):
+def arch_package_manager_symbol(symbol, method):
+    crate = ('crate', 'omg_lib')
+    managers = ('type', crate, ('package_managers', ''))
+    namespace = ('type', managers, ('arch', ''))
+    parent = ('type', namespace, ('ArchPackageManager', ''))
+    trait = ('type', ('type', managers, ('traits', '')), ('PackageManager', ''))
+    shape = nominal_method_path(symbol)
+    if (shape is not None and shape.kind=='X' and shape.namespace==namespace and shape.self_type==parent
+            and shape.trait==trait and shape.method==(method,'') and shape.callbacks in ((), ('',), ('',''))):
+        return shape
+    return None
+
+
+def retained_arch_audit_entry(sides, work):
+    """Observe the Arch audit wrapper and its two future entries in every copy."""
+    evidence = []
+    for source, counts, group, owners, names, inventory, line in sides:
+        code, rows = inventory[:2]
+        start = bisect.bisect_left(code.starts,code.offsets[line-1])
+        opening = code.parents[start]
+        _construct_charge(work,len(rows)*2+len(code.starts).bit_length())
+        functions = [row for row in rows if row['kind']=='fn' and row['opening']==opening and
+                     row['header'][:2]==('fn','security_audit')]
+        if (len(functions)!=1 or start!=opening+1 or code.words[start:start+16] !=
+                ['Some','(','Box','::','pin','(','async','move','{','use','anyhow','::','Context',';','async','{']):
+            return None
+        if not any(row['kind']=='impl' and row['opening']==code.parents[opening] and
+                row['header']==('impl','PackageManager','for','ArchPackageManager') for row in rows):
+            return None
+        slots = (code.region(start+2,start+4),code.region(start+8,start+8),code.region(start+15,start+15))
+        selected_lines = (line,slots[-1][0])
+        roots = {id(owner) for owner in group[2]}
+        seen_roots = set(); copies = {}; raw = []
+        if not 1<=len(roots)<=16:
+            return None
+        for owner in owners:
+            symbol = owner['name']
+            _construct_charge(work,2*len(owner['regions'])+1)
+            touching = [r for r in owner['regions'] if any(r[0]<=number<=r[2] for number in selected_lines)]
+            if not touching:
+                continue
+            _construct_charge(work,len(symbol)+len(touching)+1)
+            shape = arch_package_manager_symbol(symbol,'security_audit')
+            if shape is None or names[symbol]!=1 or owner.get('branches') or owner.get('mcdc_records'):
+                return None
+            depth = len(shape.callbacks)
+            count = owner['count']
+            if (not 0<=count<COUNTER_LIMIT or touching != [[*slots[depth],count,0,0,0]]
+                    or (depth==0) != (id(owner) in roots)):
+                return None
+            roles = copies.setdefault(shape.copy_identity,{})
+            if depth in roles:
+                return None
+            roles[depth] = (symbol,count,owner['filenames'])
+            if depth==0:
+                seen_roots.add(id(owner))
+            raw.extend(touching)
+        if seen_roots!=roots or len(copies)!=len(roots) or any(
+                roles.keys()!={0,1,2} or roles[0][1:]!=roles[1][1:]
+                or roles[1][1]<roles[2][1] or roles[1][2]!=roles[2][2] for roles in copies.values()):
+            return None
+        if _owner_line_counts({'regions':raw},_ObserverWork(work))!={number:counts.get(number) for number in selected_lines}:
+            return None
+        evidence.append((functions[0]['header'],selected_lines,
+                         [tuple(roles[depth][:2] for depth in (0,1,2)) for roles in copies.values()]))
+    base, head = evidence
+    if (base[0]!=head[0] or len(base[2])!=len(head[2]) or any(hits<=0 for copy in head[2] for _,hits in copy)):
+        return None
+    return dict(kind='retained-arch-audit-entry',pairs=[list(pair) for pair in zip(base[1],head[1],strict=True)],
+                compiled_entries=[base[2],head[2]],summary_credit=[0,0],mapped_credit=[0,0])
+
+
+def retained_arch_advisory_await(sides, work, *, finish=False):
+    """Observe the audit's advisory wait after its migration to prepared admission."""
+    scanner = 'crate::core::security::vulnerability::VulnerabilityScanner::new()'
+    evidence = []
+    for modern,(source,counts,group,owners,names,line) in enumerate(sides):
+        operation = ['                let operation = '+scanner, '                    .assess_arch_operation(',
+                     '                        &before,',
+                     '                        crate::core::security::vulnerability::AssessmentUse::Admission,',
+                     '                    )'] if modern else [
+                         '                let advisories = '+scanner, '                    .fetch_alsa_issues()']
+        if finish:
+            tail = ['                Ok(result)','            }','            .await',
+                    '            .context("Failed to query native security advisories")']
+            if modern:
+                tail.insert(0,'                operation.validate_now()?;')
+            if line+1>group[1] or source[line+1-len(tail):line+1]!=tail:
+                return None
+            selected = (line,line+1)
+            roles = ('',)
+            slots = [(line,14,line,19),(line+1,14,line+1,21)]
+        else:
+            first = line-len(operation)
+            if first<group[0] or source[first-1:line]!=[*operation,'                    .await?;']:
+                return None
+            _construct_charge(work,sum(len(text)+1 for text in operation))
+            selected = (line,)
+            roles = ('','')
+            slots = [(first,operation[0].index(scanner)+1,line,27),(line,27,line,28)]
+        roots = {}
+        for owner in group[2]:
+            shape = arch_package_manager_symbol(owner['name'],'security_audit')
+            if shape is None or shape.callbacks or shape.copy_identity in roots:
+                return None
+            roots[shape.copy_identity] = owner
+        observed = {}; raw = []
+        for owner in owners:
+            _construct_charge(work,len(owner['regions'])+1)
+            touching = [r for r in owner['regions'] if any(r[0]<=number<=r[2] for number in selected)]
+            if not touching:
+                continue
+            symbol = owner['name']
+            shape = arch_package_manager_symbol(symbol,'security_audit')
+            if (shape is None or shape.callbacks!=roles or shape.copy_identity not in roots
+                    or shape.copy_identity in observed or names[symbol]!=1
+                    or owner['filenames']!=roots[shape.copy_identity]['filenames']
+                    or owner.get('branches') or owner.get('mcdc_records') or len(touching)!=2):
+                return None
+            counts_at_slots = [row[4] for row in touching]
+            entered, completed = counts_at_slots
+            # An entered await can suspend without reaching the following context call.
+            if (any(tuple(row[:4])!=slot or row[5:]!=[0,0,0] for row,slot in zip(touching,slots,strict=True))
+                    or not 0<=completed<=entered<=owner['count']<COUNTER_LIMIT
+                    or finish and (entered!=owner['count'] or entered>0 and completed==0)
+                    or not modern and any(counts_at_slots)):
+                return None
+            observed[shape.copy_identity] = (symbol,counts_at_slots)
+            raw.extend(touching)
+        projection = _owner_line_counts({'regions':raw},_ObserverWork(work))
+        if (not roots or observed.keys()!=roots.keys() or
+                any(number not in projection or projection[number]!=counts.get(number) for number in selected)):
+            return None
+        evidence.append((selected,list(observed.values())))
+    base,head = evidence
+    if len(base[1])!=len(head[1]) or not any(counts[0]>0 for _,counts in head[1]):
+        return None
+    return dict(kind='retained-arch-advisory-finish' if finish else 'retained-arch-advisory-await',
+                pairs=[list(pair) for pair in zip(base[0],head[0],strict=True)],
+                compiled_waits=[base[1],head[1]],summary_credit=[0,0],mapped_credit=[0,0])
+
+
+def retained_arch_install_prelude(sides, work):
+    """Close the raw copy inventory for preparation, empty input and validation."""
+    prelude = ['        let packages = packages.to_vec();','        Box::pin(async move {',
+               '            if packages.is_empty() {','                return Ok(());','            }',
+               '            crate::core::security::validate_package_names_or_files(&packages)?;']
+    evidence = []
+    for source,counts,group,owners,names,line in sides:
+        first,last = line-1,line+4
+        if not group[0]<=first<=last<=group[1] or source[first-1:last]!=prelude:
+            return None
+        slots = [[(0,13,21),(0,24,32),(0,33,39),(1,9,17)],
+                 [(1,29,30),(2,16,24),(2,25,33),(3,24,30),(4,13,14),(5,13,67),(5,68,77),(5,78,79)]]
+        copies = {}; raw = []
+        roots = {id(owner) for owner in group[2]}
+        seen_roots = set()
+        _construct_charge(work,sum(len(text)+1 for text in prelude))
+        for owner in owners:
+            _construct_charge(work,len(owner['regions'])+1)
+            touching = [r for r in owner['regions'] if r[0]<=last and r[2]>=first]
+            if not touching:
+                continue
+            name = owner['name']
+            shape = arch_package_manager_symbol(name,'install')
+            if shape is None or len(shape.callbacks)>1 or names[name]!=1 or owner.get('branches') or owner.get('mcdc_records'):
+                return None
+            depth = len(shape.callbacks)
+            call_count = owner['count']
+            measured = [r[4] for r in touching]
+            if (len(measured)!=len(slots[depth]) or (id(owner) in roots)!=(depth==0)
+                    or any(not 0<=hit<=call_count<COUNTER_LIMIT for hit in measured)
+                    or touching!=[[first+i,a,first+i,b,hit,0,0,0] for (i,a,b),hit in zip(slots[depth],measured,strict=True)]):
+                return None
+            if depth==1:
+                if (measured[:3]!=[call_count]*3 or measured[3]+measured[4]!=call_count
+                        or measured[4:7]!=[measured[4]]*3 or measured[7]>measured[4]):
+                    return None
+            else:
+                if measured!=[call_count]*4:
+                    return None
+                seen_roots.add(id(owner))
+            roles = copies.setdefault(shape.copy_identity,{})
+            if depth in roles:
+                return None
+            roles[depth] = (call_count,owner['filenames'],measured)
+            raw.extend(touching)
+        if (not roots or roots!=seen_roots or len(copies)!=len(roots)
+                or any(roles.keys()!={0,1} or roles[0][:2]!=roles[1][:2] for roles in copies.values())):
+            return None
+        if _owner_line_counts({'regions':raw},_ObserverWork(work))!={i:counts.get(i) for i in range(first,last+1)}:
+            return None
+        evidence.append((first,list(copies),[tuple(hit>0 for depth in (0,1) for hit in roles[depth][2])
+                                           for roles in copies.values()]))
+    base,head = evidence
+    matching = compiled_hit_state_matching(base[2],head[2],[base[1],head[1]])
+    if matching is None:
+        return None
+    return dict(kind='retained-arch-install-prelude',pairs=[[base[0]+i,head[0]+i] for i in range(len(prelude))],
+                role_matching=matching,compiled_states=[base[2],head[2]],summary_credit=[0,0],mapped_credit=[0,0])
+
+
+def retained_pi_fixture_exit(sides, work):
+    namespace = ('type',('type',('crate','omg_lib'),('runtimes','')),('pi',''))
+    expected_type = ('type',namespace,('PiManager',''))
+    lines = []; symbols = []
+    for modern, (source, counts, group, owners, names, line) in enumerate(sides):
+        first,last,roots = group
+        parameter = '_unused_ambient_npm' if modern else 'npm'
+        declaration = f'    fn with_paths(versions_dir: PathBuf, {parameter}: PathBuf) -> Self {{'
+        body = ['        Self {', '            versions_dir,',
+                '            advisories: Arc::new(TestAdvisories::default()),',
+                '            security: RuntimeSecurity::fixture(),', '        }'] if modern else [
+                    '        Self { versions_dir, npm }']
+        expected_source = ['    #[cfg(test)]',declaration,*body,'    }']
+        _construct_charge(work,sum(len(text)+1 for text in expected_source))
+        if (line!=last or first<2 or len(roots)!=1 or source[first-2:last]!=expected_source):
+            return None
+        root, = roots
+        symbol = root['name']
+        shape = nominal_method_path(symbol)
+        hits = root['count']
+        if (shape is None or shape.kind!='M' or shape.namespace!=namespace or shape.self_type!=expected_type
+                or shape.method!=('with_paths','') or shape.callbacks or names[symbol]!=1
+                or not 0<hits<COUNTER_LIMIT or root.get('branches') or root.get('mcdc_records')):
+            return None
+        slots = [(first,5,first,len(declaration)-1),(first+1,9,last-1,len(body[-1])+1)]
+        if modern:
+            slots.append((first+2,13,first+2,25))
+        slots.append((last,5,last,6))
+        if root['regions']!=[[*slot,hits,0,0,0] for slot in slots]:
+            return None
+        _construct_charge(work,sum(len(owner['regions'])+1 for owner in owners))
+        if any(owner is not root and any(r[0]<=last and r[2]>=first for r in owner['regions']) for owner in owners):
+            return None
+        observed = {i:counts[i] for i in range(first,last+1) if i in counts}
+        if _owner_line_counts({'regions':root['regions']},_ObserverWork(work))!=observed:
+            return None
+        lines.append(last); symbols.append(symbol)
+    return dict(kind='retained-pi-fixture-exit',pairs=[lines],owners=symbols)
+
+
+def retained_osv_request(sides, work):
+    """Observe the same request fields before and after extracting the OSV scan."""
+    observations = []
+    for modern, (source, counts, inventory, owners, copies, first) in enumerate(sides):
+        code = inventory[0]
+        _construct_charge(work, len(code.starts).bit_length() + 45)
+        start = bisect.bisect_left(code.starts, code.offsets[first-1])
+        ecosystem = 'ecosystem : ecosystem . to_owned ( )' if modern else 'ecosystem'
+        version = 'version . to_owned ( )' if modern else 'version_str'
+        request = (f'let mut request = OsvRequest {{ package : OsvPackage {{ '
+                   f'name : name . to_string ( ) , {ecosystem} , }} , '
+                   f'version : {version} , page_token : None , }} ;').split()
+        if code.words[start:start+len(request)] != request:
+            return None
+        last = code.position(code.ends[start+len(request)-1])[0]
+        if last != first+7 or not copies:
+            return None
+        slots = [(1,2),(4,len(request)-2),(8,code.pairs[start+9]-start),(12,12)]
+        if modern:
+            offset = request.index('version') + 2
+            slots.append((offset,offset))
+        expected = {code.region(start+a,start+b) for a,b in slots}
+        name_call = code.region(start+14,start+14)
+        bodies = {id(copy.body): copy for copy in copies}
+        if len(bodies) != len(copies):
+            return None
+        observed = {}; raw = []
+        for owner in owners:
+            _construct_charge(work, len(owner['regions']))
+            selected = [r for r in owner['regions'] if r[0] <= last and first <= r[2]]
+            if not selected:
+                continue
+            key = id(owner)
+            if key not in bodies or key in observed or owner.get('branches') or owner.get('mcdc_records'):
+                return None
+            hits = selected[0][4]
+            spans = {tuple(row[:4]) for row in selected}
+            if (len(selected) != len(spans) or spans - {name_call} != expected
+                    or not 0 <= hits <= owner['count'] < COUNTER_LIMIT
+                    or any(row[4:] != [hits,0,0,0] for row in selected)):
+                return None
+            observed[key] = (int(hits > 0), int(name_call in spans))
+            raw.extend(selected)
+        if observed.keys() != bodies.keys() or not all(active for active, _ in observed.values()):
+            return None
+        projection = _owner_line_counts({'regions': raw}, _ObserverWork(work))
+        if projection != {i:counts[i] for i in range(first,last+1) if i in counts}:
+            return None
+        observed_lines = {offset:source[first+offset-1] for offset in (0,1,2,4,6,7)
+                          if projection.get(first+offset,0)>0}
+        observations.append((first, observed_lines, [
+            dict(constructor=copy.constructor['name'], body=copy.body['name'],
+                 state=[int(copy.constructor['count']>0), int(copy.body['count']>0), *observed[id(copy.body)]])
+            for copy in copies]))
+    (first, old, left), (start, new, right) = observations
+    matching = compiled_hit_state_matching([x['state'] for x in left], [x['state'] for x in right])
+    if old != new or not old or matching is None:
+        return None
+    return dict(kind='retained-osv-request', pairs=[[first+i,start+i] for i in sorted(old)],
+                async_copies=dict(base=left,head=right), instance_matching=matching,
+                summary_credit=[0,0], mapped_credit=[0,0])
+
+
+def osv_request_obligations(sources, counts, inventories, grouped, work):
+    namespace = ('crate', 'omg_lib')
+    for component in ('core', 'security', 'vulnerability'):
+        namespace = ('type', namespace, (component, ''))
+    scanner = ('type', namespace, ('VulnerabilityScanner', ''))
+    sides = []
+    excerpts = []
+    methods = ('scan_package', 'scan_osv_coordinates')
+    for source, mapped, inventory, compiled, method in zip(
+            sources, counts, inventories, grouped, methods, strict=True):
+        code, rows = inventory[:2]
+        _construct_charge(work, len(source) + len(rows))
+        request = [i for i, text in enumerate(source, 1) if text.strip() == 'let mut request = OsvRequest {']
+        if len(request) != 1:
+            return None
+        line, = request
+        implementations = {row['opening']:row for row in rows if row['kind'] == 'impl'}
+        scopes = [row for row in rows if row['kind'] == 'fn' and 'async' in row['header']
+                  and row['header'][row['header'].index('fn')+1] == method
+                  and inherent_async_type(code,row,implementations) == 'VulnerabilityScanner'
+                  and code.position(code.starts[row['opening']])[0] < line < code.position(code.ends[row['end']])[0]]
+        if len(scopes) != 1:
+            return None
+        scope, = scopes
+        first = code.position(code.starts[scope['first']])
+        opening = code.position(code.starts[scope['opening']])
+        terminal = code.position(code.ends[scope['end']])
+        constructors = {}; bodies = {}
+        for owner in compiled[0]:
+            symbol = owner['name']
+            _construct_charge(work,len(symbol)+1)
+            if method not in symbol:
+                continue
+            shape = nominal_method_path(symbol, inventory=True)
+            if (shape is None or shape.kind != 'M' or shape.namespace != namespace or shape.self_type != scanner
+                    or shape.method != (method, '') or shape.callbacks not in ((), ('',))):
+                continue
+            count = owner['count']; raw = owner['regions']; identity = shape.copy_identity
+            _construct_charge(work, len(raw)+1)
+            if compiled[2][symbol] != 1 or owner.get('branches') or owner.get('mcdc_records'):
+                return None
+            if not shape.callbacks:
+                if identity in constructors or raw != [[*first,opening[0],opening[1]-1,count,0,0,0]]:
+                    return None
+                constructors[identity] = owner
+            else:
+                if (identity in bodies or raw[0] != [*opening,opening[0],opening[1]+1,count,0,0,0]
+                        or raw[-1][:4] != [terminal[0],terminal[1]-1,*terminal]
+                        or not 0 <= raw[-1][4] <= count < COUNTER_LIMIT):
+                    return None
+                bodies[identity] = owner
+        if not constructors or constructors.keys() != bodies.keys() or any(
+                constructors[key]['filenames'] != bodies[key]['filenames']
+                or not 0 <= bodies[key]['count'] <= constructors[key]['count'] < COUNTER_LIMIT for key in bodies):
+            return None
+        copies = tuple(AsyncCompiledCopy(constructors[key],body,key) for key,body in bodies.items())
+        sides.append((source,mapped,inventory,compiled[0],copies,line))
+        excerpts.append(('\n'.join(source[first[0]-1:terminal[0]])+'\n').encode())
+    request = retained_osv_request(sides, work)
+    if request is not None:
+        require_rustfmt_syntax(excerpts)
+    return request
+
+
+def retained_sbom_metadata(sides, work):
+    """Observe the same record fields around the changed advisory properties."""
+    evidence = []
+    for source, counts, group, owners, names, inventory, line in sides:
+        code = inventory[0]
+        _construct_charge(work, len(code.starts).bit_length() * 2)
+        start = bisect.bisect_left(code.starts, code.offsets[line-1])
+        outer = code.parents[start]
+        if (outer is None or code.words[outer-2:outer+2] != ['(', 'Sbom', '{', 'bom_format']
+                or code.words[outer-3] != 'Ok'):
+            return None
+        close = code.pairs[outer]
+        _construct_charge(work, close - start + 1)
+        component = [i+4 for i in range(start,close) if code.words[i:i+5] ==
+                     ['component', ':', 'Some', '(', 'SbomComponent']]
+        if len(component) != 1:
+            return None
+        record = component[0] + 1
+        if code.words[record] != '{':
+            return None
+        component_end = code.pairs[record]
+        properties = [i for i in range(record+1,component_end) if code.parents[i]==record
+                      and code.words[i:i+2]==['properties',':']]
+        if len(properties) != 1 or code.words[component_end:component_end+5] != ['}',')',',','manufacture',':']:
+            return None
+        last = code.position(code.starts[properties[0]])[0] - 1
+        suffix = code.position(code.starts[component_end+3])[0]
+        if not line < last < suffix < group[1]:
+            return None
+        ranges = ((line,last), (suffix,group[1]))
+        assigned = {}; raw = []
+        roots = {id(root) for root in group[2]}
+        for owner in owners:
+            _construct_charge(work,2*len(owner['regions'])+1)
+            regions = [r for r in owner['regions'] if any(r[0]<=end and start<=r[2] for start,end in ranges)]
+            if not regions:
+                continue
+            symbol = owner['name']; shape = plain_rust_function_symbol(symbol)
+            _construct_charge(work,len(symbol)+len(regions)*(len(regions).bit_length()+1))
+            if (id(owner) not in roots or symbol in assigned or names[symbol]!=1
+                    or shape is None or shape.identifiers!=('omg_lib','core','security','sbom_shared','compose')
+                    or owner.get('branches') or owner.get('mcdc_records')
+                    or any(not any(start<=r[0]<=r[2]<=end for start,end in ranges)
+                           or r[5:]!=[0,0,0] or not 0<=r[4]<COUNTER_LIMIT
+                           or r[4] and not owner['count'] for r in regions)):
+                return None
+            slots=sorted(((segment,a-start,b,c-start,d), int(hits>0))
+                         for segment,(start,end) in enumerate(ranges) for a,b,c,d,hits,*_ in regions if start<=a<=end)
+            geometry, states = zip(*slots,strict=True)
+            if len(set(geometry)) != len(geometry):
+                return None
+            assigned[symbol] = (geometry,states)
+            raw.extend(regions)
+        if not roots or len(assigned) != len(roots):
+            return None
+        projection = _owner_line_counts({'regions':raw},_ObserverWork(work))
+        _construct_charge(work,sum(end-start+1 for start,end in ranges))
+        if projection != {i:counts[i] for start,end in ranges for i in range(start,end+1) if i in counts} or not counts.get(line,0):
+            return None
+        observed = [(segment,i-start) for segment,(start,end) in enumerate(ranges)
+                    for i in range(start,end+1) if i in projection]
+        evidence.append(([source[first-1:end] for first,end in ranges], observed, assigned, ranges))
+    old,new = evidence
+    if old[:2]!=new[:2]:
+        return None
+    geometries = {geometry for side in evidence for geometry,_ in side[2].values()}
+    if len(geometries)!=1:
+        return None
+    matching = compiled_hit_state_matching(*[[states for _,states in side[2].values()] for side in evidence],
+                                           [list(side[2]) for side in evidence])
+    if matching is None:
+        return None
+    return dict(kind='retained-sbom-metadata', pairs=[[old[3][segment][0]+i,new[3][segment][0]+i]
+                                                      for segment,i in old[1]],
+                geometry=list(geometries)[0], owners=[list(side[2]) for side in evidence], role_matching=matching)
+
+
+def retained_sbom_push(sides, work, vulnerability=False):
+    """Match the retained record fields and their complete callback forest."""
+    witnesses = []
+    receiver, record_type, loop_variable, callback_field, depths = (
+        ('vulnerabilities', 'SbomVulnerability', 'finding', 'advisories', (0,1,2)) if vulnerability else
+        ('components', 'SbomComponent', 'package', 'licenses', (0,1)))
+    iterable = 'findings' if vulnerability else 'installed'
+    for modern, (source, counts, group, owners, names, inventory, line) in enumerate(sides):
+        code = inventory[0]
+        _construct_charge(work, len(code.starts).bit_length())
+        start = bisect.bisect_left(code.starts, code.offsets[line - 1])
+        if code.words[start:start+5] != [receiver, '.', 'push', '(', record_type]:
+            return None
+        scope = code.parents[start]
+        record = start + 5
+        closing = code.pairs.get(record)
+        if (scope is None or code.words[scope-4:scope+1] != ['for', loop_variable, 'in', iterable, '{']
+                or code.words[record] != '{' or closing is None or code.pairs[start+3] != closing+1
+                or code.words[closing-1:closing+3] != [',','}',')',';']):
+            return None
+        _construct_charge(work, closing - start + 1)
+        field = None
+        if vulnerability:
+            changed = max((i+1 for i in range(record+1,closing-1) if code.parents[i] == record
+                           and code.words[i] == ','), default=record+1)
+            if (modern and code.words[changed:closing] != ['properties',',']
+                    or not modern and code.words[changed:changed+4] != ['properties',':','finding','.']):
+                return None
+            high = (code.position(code.starts[changed])[0],1)
+            last = high[0]-1
+        else:
+            value = ['Some', '(', 'properties', ')'] if modern else ['None']
+            changed = closing - len(value) - 3
+            if code.words[changed:closing] != ['properties', ':', *value, ',']:
+                return None
+            field = code.region(changed+2, closing-2)
+            high = code.region(start, closing+2)[2:]
+            last = high[0]
+        fields = [i for i in range(record+1, changed) if code.parents[i] == record
+                  and code.words[i:i+2] == [callback_field, ':']]
+        if len(fields) != 1:
+            return None
+        callback_start, = fields
+        callback_end = next((i for i in range(callback_start+2, changed) if code.parents[i] == record
+                             and code.words[i] == ','), None)
+        if callback_end is None:
+            return None
+        callback_span = code.region(callback_start+2, callback_end-1)
+        entry = {code.region(start, start), code.region(start+2, start+2)}
+        low = code.region(start, closing+2)[:2]
+        roots = group[2]
+        normal = ('omg_lib', 'core', 'security', 'sbom_shared', 'compose')
+        parts = {root['name']: plain_rust_function_symbol(root['name']) for root in roots}
+        if (not 1 <= len(roots) <= 16 or len(parts) != len(roots)
+                or any(shape is None or shape.identifiers != normal for shape in parts.values())):
+            return None
+        records = {}
+        raw = []
+        for owner in owners:
+            _construct_charge(work, len(owner['regions']) + 1)
+            touching = [r for r in owner['regions'] if tuple(r[:2]) < high and low < tuple(r[2:4])]
+            if not touching:
+                continue
+            symbol = owner['name']
+            parents = [(root, depth) for root in roots for depth in depths if
+                       (root is owner if depth == 0 else direct_rust_callback_symbol(
+                           symbol, root['name'], parts[root['name']].modules, depth))]
+            _construct_charge(work, len(depths)*len(roots)*(len(symbol)+1) + 4*len(touching))
+            if len(parents) != 1 or names[symbol] != 1 or owner.get('branches') or owner.get('mcdc_records'):
+                return None
+            (parent, depth), = parents
+            geometry = {tuple(row[:4]): row[4] for row in touching}
+            hits = touching[0][4]
+            if (len(geometry) != len(touching) or owner['filenames'] != parent['filenames']
+                    or not 0 <= hits < COUNTER_LIMIT or (hits and not parent['count'])
+                    or any(row[4:] != [hits, 0, 0, 0] or not low <= tuple(row[:2]) < tuple(row[2:4]) <= high
+                           for row in touching)):
+                return None
+            if (depth==0 and (not entry <= geometry.keys() or field is not None and field not in geometry)
+                    or depth>0 and (touching != owner['regions'] or hits != owner['count']
+                        or any(not callback_span[:2] <= span[:2] < span[2:] <= callback_span[2:]
+                               for span in geometry))):
+                return None
+            key = parent['name'], depth
+            if key in records:
+                return None
+            retained = sorted((a-line,b,c-line,d) for a,b,c,d in geometry.keys() - {field})
+            records[key] = (tuple(retained), bool(hits), symbol)
+            raw.extend(touching)
+        if records.keys() != {(root['name'], depth) for root in roots for depth in depths}:
+            return None
+        projection = _owner_line_counts({'regions': raw}, _ObserverWork(work))
+        _construct_charge(work, last - line + 1)
+        if projection != {i: counts[i] for i in range(line, last+1) if i in counts} or not counts.get(line, 0):
+            return None
+        property_line = field[0] if field is not None else None
+        retained_lines = {i-line for i in projection if i != property_line}
+        source_lines = tuple(source[i-1] for i in range(line, last+1) if i != property_line)
+        witnesses.append((tuple(code.words[start:changed]), source_lines, retained_lines, records, line))
+    old, new = witnesses
+    if old[:3] != new[:3]:
+        return None
+    instances = []
+    identities = []
+    geometries = []
+    for _, _, _, records, _ in witnesses:
+        parents = [name for name, depth in records if depth==0]
+        geometries.extend(tuple(records[name, depth][0] for depth in depths) for name in parents)
+        instances.append([tuple(records[name, depth][1] for depth in depths) for name in parents])
+        identities.append(parents)
+    if any(geometry != geometries[0] for geometry in geometries):
+        return None
+    matching = compiled_hit_state_matching(*instances, identities)
+    if matching is None:
+        return None
+    return dict(kind='retained-sbom-record-push', record=record_type,
+                pairs=[[old[4]+offset,new[4]+offset] for offset in sorted(old[2])],
+                role_matching=matching, geometry=geometries[0], instances=instances,
+                owners=[[entry[2] for entry in witness[3].values()] for witness in witnesses])
+
+
+def advisory_count_assertion(code, args, work):
+    (left, end), (right, last) = args
+    call = 'vulnerability_count_from_scan'
+    if code.words[left] != call:
+        return None
+    opening = left + 1
+    if code.words[opening:opening+5] == ['::', '<', '(', ')', '>']:
+        opening += 5
+    if code.pairs.get(opening) != end - 1 or code.words[opening] != '(':
+        return None
+    operands = _boolean_arguments(code, opening)
+    if operands is None or len(operands) != 2:
+        return None
+    parts = [tuple(code.words[first:stop]) for first, stop in (*operands, (right, last))]
+    identity = []
+    for words, constructors in zip(parts, (('& Ok', '& Err'), ('Some',), ('Some', 'None')), strict=True):
+        _construct_charge(work, len(words))
+        plain = ' '.join(words)
+        value = re.fullmatch(r'(& Ok|Some) \( (?:(\d+) |\( (\d+) , 0 \) )\)', plain, re.ASCII)
+        if value is not None and value[1] in constructors:
+            identity.append((value[1], value[2] or value[3]))
+        elif plain == '& Err ( "alsa unavailable" )' and '& Err' in constructors or (
+                plain == 'None' and constructors != ('& Ok', '& Err')):
+            identity.append(plain)
+        else:
+            return None
+    entries = (code.region(left, opening - 1), *(code.region(a, b - 1) for a, b in operands))
+    return ('assert_eq', call, *identity), (), entries
+
+
+def direct_assertion_anchor(code, start, stop, work, advisory_count=False):
     """Identify one direct assertion by a stable condition role or expected value."""
     macro = code.words[start]
     if (macro not in ('assert', 'assert_eq') or code.words[start+1:start+3]!=['!','(']
@@ -4270,6 +5342,10 @@ def direct_assertion_anchor(code, start, stop, work):
     args = _boolean_arguments(code,start+2)
     if args is None or len(args)!=2:
         return None
+    if advisory_count and macro == 'assert_eq':
+        count = advisory_count_assertion(code, args, work)
+        if count is not None:
+            return count
     (left,end),(right,last) = args
     if last-right!=1 or not code.words[right].startswith('"'):
         return None
@@ -4331,7 +5407,8 @@ def retained_direct_unit_assertion(name, source, line, mapped, group, owners, na
     statement = [(row,anchor) for row in rows
                  if row['kind']=='statement' and row['supported'] and code.parents[row['first']]==function_open
                  and code.words[row['first']]==code.words[line_start]
-                 and (anchor:=direct_assertion_anchor(code,row['first'],row['end'],work)) is not None]
+                 and (anchor:=direct_assertion_anchor(code,row['first'],row['end'],work,
+                     advisory_count=name=='src/daemon/status_policy.rs')) is not None]
     current = [(row,anchor) for row,anchor in statement if row['first']==line_start]
     if len(current)!=1:
         return None
@@ -4689,43 +5766,63 @@ def prepared_policy_environment_entry(name, source, counts, group, owners, names
     code,rows=inventory[:2]
     _construct_charge(work,len(rows)+len(code.starts).bit_length())
     start=bisect.bisect_left(code.starts,code.offsets[line-1])
+    single=code.words[start:start+4]==['temp_env','::','with_var','(']
+    if single:
+        argument=start+3
+        key=argument+1
+        value=key+2
+        start=value+9
+        if code.words[key:start]!=['"OMG_CONFIG_DIR"',',','Some','(','directory','.','path','(',')',')',',']:
+            return None
+        argument_slot=code.region(value,start-2)
     opening=start+len(_RESULT_CLOSURE)
     if tuple(code.words[start:opening])!=_RESULT_CLOSURE or code.words[opening:opening+1]!=['{']:
         return None
-    closing=code.pairs[opening]; argument=code.parents[opening]
-    if argument is None or code.words[argument-3:argument+1]!=['temp_env','::','with_vars','(']:
+    closing=code.pairs[opening];argument=code.parents[opening]
+    if argument is None or code.words[argument-3:argument+1]!=[
+            'temp_env','::','with_var' if single else 'with_vars','(']:
         return None
     body=code.parents[argument]
     functions=[row for row in rows if row['kind']=='fn' and row['opening']==body]
     if len(functions)!=1 or len(group[2])!=1:
         return None
     fn,=functions
-    header=fn['header']
-    if ((*header[:12],'<declaration>',*header[13:])!=
-            ('#','[','cfg','(','debug_assertions',')',']')+_RESULT_TEST_SIGNATURE
+    header=fn['header'];fn_at=header.index('fn')
+    expected=_RESULT_TEST_SIGNATURE if single else ('#','[','cfg','(','debug_assertions',')',']')+_RESULT_TEST_SIGNATURE
+    if ((*header[:fn_at+1],'<declaration>',*header[fn_at+2:])!=expected
             or code.words[closing+1:fn['end']]!=[',',')']
             or (context:=_boolean_module(code,{'start':fn['first']})) is None
             or context[:2]!=(['tests'],['tests'])):
         return None
-    array=argument+1
-    if code.words[array:array+1]!=['['] or code.pairs[array]+2!=start:
-        return None
-    arguments=_boolean_arguments(code,array)
-    if arguments is None or len(arguments)!=3:
-        return None
-    _construct_charge(work,start-body)
-    values={code.words[begin+1]:tuple(code.words[begin:end])
-            for begin,end in arguments if code.words[begin]=='(' and code.pairs[begin]==end-1}
-    config=('(','"OMG_CONFIG_DIR"',',','Some','(','directory','.','path','(',')','.','as_os_str','(',')',')',')')
-    test_mode=('(','"OMG_TEST_MODE"',',','Some','(','std','::','ffi','::','OsStr','::','new','(','"1"',')',')',')')
-    data=('(','"OMG_DATA_DIR"',',','Some','(','data_dir','.','as_os_str','(',')',')',')')
-    distro=('(','"OMG_TEST_DISTRO"',',','Some','(','std','::','ffi','::','OsStr','::','new','(','"fedora"',')',')',')')
-    if values.get('"OMG_CONFIG_DIR"')!=config or values.get('"OMG_TEST_MODE"')!=test_mode:
-        return None
-    modern=values.get('"OMG_DATA_DIR"')==data
-    if not modern and values.get('"OMG_TEST_DISTRO"')!=distro:
-        return None
+    if single:
+        if not environment_result_callback(code,fn,dict(opening=opening,end=closing)):
+            return None
+        modern=None
+    else:
+        array=argument+1
+        if code.words[array:array+1]!=['['] or code.pairs[array]+2!=start:
+            return None
+        arguments=_boolean_arguments(code,array)
+        if arguments is None or len(arguments)!=3:
+            return None
+        _construct_charge(work,start-body)
+        positions={code.words[begin+1]:(begin,end) for begin,end in arguments
+                   if code.words[begin]=='(' and code.pairs[begin]==end-1}
+        if len(positions)!=3:
+            return None
+        values={key:tuple(code.words[begin:end]) for key,(begin,end) in positions.items()}
+        config=('(','"OMG_CONFIG_DIR"',',','Some','(','directory','.','path','(',')','.','as_os_str','(',')',')',')')
+        test_mode=('(','"OMG_TEST_MODE"',',','Some','(','std','::','ffi','::','OsStr','::','new','(','"1"',')',')',')')
+        data=('(','"OMG_DATA_DIR"',',','Some','(','data_dir','.','as_os_str','(',')',')',')')
+        distro=('(','"OMG_TEST_DISTRO"',',','Some','(','std','::','ffi','::','OsStr','::','new','(','"fedora"',')',')',')')
+        if values.get('"OMG_CONFIG_DIR"')!=config or values.get('"OMG_TEST_MODE"')!=test_mode:
+            return None
+        modern=values.get('"OMG_DATA_DIR"')==data
+        if not modern and values.get('"OMG_TEST_DISTRO"')!=distro:
+            return None
+        argument_slot=code.region(array,code.pairs[array])
     call=argument-3
+    _construct_charge(work,call-body)
     prefix=code.words[body+1:call]
     added=['let','data_dir','=','directory','.','path','(',')','.','join','(','"data"',')',';']
     tempdir=['let','directory','=','tempfile','::','tempdir','(',')','?',';']
@@ -4738,13 +5835,14 @@ def prepared_policy_environment_entry(name, source, counts, group, owners, names
     last_setup=code.position(code.ends[body+len(prefix)])[0]
     tail=('assert_eq','!','(','fs','::','read_to_string','(','&','path',')','?',',','bytes',')',';',
           'Ok','(','(',')',')')
+    tail=tail[-5:] if single else tail
     if tuple(code.words[closing-len(tail):closing])!=tail:
         return None
     tokens=code.words[opening+1:closing]
     _construct_charge(work,3*len(tokens))
     nested_pattern=['let','package','=','||','{']
     factories=[opening+1+i+4 for i in range(len(tokens)) if tokens[i:i+5]==nested_pattern]
-    if len(factories)!=int(not modern):
+    if len(factories)!=int(modern is False):
         return None
     if modern:
         for requirement in (['.','remove','(','"advisory_requirement"',')'],
@@ -4753,7 +5851,7 @@ def prepared_policy_environment_entry(name, source, counts, group, owners, names
                 return None
     root,=group[2]; symbol=root['name']; shape=plain_rust_function_symbol(symbol)
     modules=('omg_lib',*name.removeprefix('src/').removesuffix('.rs').split('/'),'tests')
-    if (shape is None or shape.identifiers!=(*modules,header[12])
+    if (shape is None or len(root['filenames'])!=1 or shape.identifiers!=(*modules,header[fn_at+1])
             or not 0<root['count']<COUNTER_LIMIT):
         return None
     child_key='_RNC'+symbol[2:]+'0'+rust_same_crate_backref(shape.modules,1)
@@ -4779,14 +5877,18 @@ def prepared_policy_environment_entry(name, source, counts, group, owners, names
         return None
     child,raw=observed[child_key]; hits=child['count']
     opener=code.region(opening,opening); closer=code.region(closing,closing)
+    opener_line=opener[0]
     if (not 0<hits<=root['count'] or len(raw)!=len(child['regions'])
             or not direct_rust_callback_symbol(child_key,symbol,shape.modules)
             or any(not opener[:2]<=tuple(r[:2])<tuple(r[2:4])<=closer[2:] for r in raw)
-            or [r for r in raw if r[0]<=line<=r[2]]!=[[*opener,hits,0,0,0]]
+            or [r for r in raw if r[0]<=opener_line<=r[2]]!=[[*opener,hits,0,0,0]]
             or [r for r in raw if tuple(r[:4])==closer]!=[[*closer,hits,0,0,0]]):
         return None
     root_raw=observed[symbol][1]
-    for slot in (code.region(call,call+2),code.region(array,code.pairs[array])):
+    call_slot=code.region(call,call+2)
+    if single and len(root_raw)!=2:
+        return None
+    for slot in (call_slot,argument_slot):
         if [r[4] for r in root_raw if tuple(r[:4])==slot]!=[hits]:
             return None
     if any(tuple(row[2:4])>opener[:2] for row in root_raw):
@@ -4804,9 +5906,29 @@ def prepared_policy_environment_entry(name, source, counts, group, owners, names
         return None
     setup=fragment_region_states(root,group[0],last_setup,source,work)
     identity=(shape.identity,header,tuple(prefix),setup,root['count'],hits,opener[1::2])
+    if single:
+        entry=[line,argument_slot[0],opener_line,closer[0]]
+        return (*identity,call_slot[1::2],argument_slot[1::2]),dict(
+            parent=symbol,child=child_key,span=[*low,*high],entry=list(opener),
+            nested=[],modern=None,file_steps=None,observed_lines=entry)
+    environment_entries={'call':call_slot}
+    for key,role in (('"OMG_CONFIG_DIR"','config-directory'),('"OMG_TEST_MODE"','test-mode')):
+        begin,end=positions[key]
+        whole=code.region(begin,end-1)
+        marker=whole if role=='config-directory' else code.region(begin+1,begin+1)
+        if whole[0]!=whole[2]:
+            continue
+        regions=[r for r in root_raw if tuple(r[:2])<whole[2:] and whole[:2]<tuple(r[2:4])
+                 and tuple(r[:4])!=argument_slot]
+        _construct_charge(work,len(root_raw)+len(regions))
+        geometries={tuple(r[:4]) for r in regions}
+        if (marker in geometries and geometries<={marker,whole} and len(geometries)==len(regions)
+                and all(r[4]==hits for r in regions)):
+            environment_entries[role]=marker
     steps=prepared_policy_file_steps(code,rows,opening,closing,raw,hits,modern,work)
     return identity,dict(parent=symbol,child=child_key,span=[*low,*high],entry=list(opener),
-                         nested=[nested_key] if factories else [],modern=modern,file_steps=steps)
+                         nested=[nested_key] if factories else [],modern=modern,file_steps=steps,
+                         environment_entries=environment_entries)
 
 
 def positive_source_fragments(name, old, new, before, after, base, head, base_files, head_files,
@@ -4870,9 +5992,42 @@ def positive_source_fragments(name, old, new, before, after, base, head, base_fi
         current_fragment = (a, b, c, d, pending)
         if pending and all(preproved_callback_pairs.get(line)==line+c-a for line in pending):
             continue
+        if (name=='src/runtimes/pi.rs' and macro_expansions==([],[]) and a+1==b and c+1==d
+                and tuple(pending)==(b,) and old[a]==new[c]=='    }'):
+            _construct_charge(work,len(groups[0])+len(groups[1]))
+            constructors = [[group for prefix,group in groups[side].items()
+                             if prefix.startswith('    fn with_paths(') and group[1]==line]
+                            for side,line in enumerate((b,d))]
+            if all(len(entries)==1 for entries in constructors):
+                sides = [(source,counts,constructors[side][0],inventories[side],inventory_names[side],line)
+                         for side,(source,counts,line) in enumerate(((old,before,b),(new,after,d)))]
+                entry = retained_pi_fixture_exit(sides,work)
+                if entry is not None:
+                    if b in pairs and pairs[b]!=d:
+                        refuse()
+                    pairs[b]=d
+                    preproved_callback_pairs[b]=d
+                    receipts.append(dict(file=name,**entry,callback_fragments=[dict(pairs=[[b,d]])]))
+                    continue
         candidates = [(prefix, group, groups[1][prefix]) for prefix, group in groups[0].items()
                       if prefix in groups[1] and group[0] <= a + 1 <= b <= group[1]
                       and groups[1][prefix][0] <= c + 1 <= d <= groups[1][prefix][1]]
+        if (name=='src/core/security/vulnerability.rs' and len(candidates)==1
+                and construct_inventories is not None and macro_expansions==([],[])):
+            _, bg, hg = candidates[0]
+            roots = [group[2][0]['name'] for group in (bg,hg) if len(group[2])==1]
+            if len(roots)==2 and all(symbol.endswith(_OSV_PAGINATION_FIXTURE) for symbol in roots):
+                sides = [(source,counts,group,inventories[side],inventory_names[side],construct_inventories[side])
+                         for side,(source,counts,group) in enumerate(((old,before,bg),(new,after,hg)))]
+                entry = retained_osv_fixture_migration(sides,work)
+                if entry is not None:
+                    matched = entry['pairs']
+                    if any(line in pairs and pairs[line]!=target for line,target in matched):
+                        refuse()
+                    pairs.update(matched)
+                    preproved_callback_pairs.update(matched)
+                    receipts.append(dict(file=name,**entry,callback_fragments=[dict(pairs=matched)]))
+                    continue
         if (len(candidates)==1 and a+1==b and c+1==d and tuple(pending)==(b,)
                 and before.get(b)==0 and after.get(d,0)>0
                 and b in inherent_async_lines[0] and d in inherent_async_lines[1]):
@@ -4941,16 +6096,34 @@ def positive_source_fragments(name, old, new, before, after, base, head, base_fi
                     instance_states=states,owners=owners,
                     callback_fragments=[dict(pairs=matched,base_range=[a+1,b],head_range=[c+1,d])]))
                 continue
+        environment=(name=='src/core/security/policy.rs' and a+1==b and c+1==d
+                     and tuple(pending)==(b,) and old[a]==new[c]
+                     and old[a].strip()=='temp_env::with_var(')
         if (name=='src/core/security/policy.rs' and construct_inventories is not None
-                and macro_expansions==([],[]) and len(candidates)==1 and b-a==d-c==1
-                and tuple(pending)==(b,) and old[a]==new[c] and old[a].strip()=='|| -> anyhow::Result<()> {'):
+                and macro_expansions==([],[]) and len(candidates)==1
+                and (environment or (b-a==d-c==1 and tuple(pending)==(b,)
+                    and old[a]==new[c] and old[a].strip()=='|| -> anyhow::Result<()> {'))):
+            single=environment
             _,bg,hg=candidates[0]
             observations=[prepared_policy_environment_entry(name,source,counts,group,inventories[side],
                             inventory_names[side],construct_inventories[side],line,work)
                           for side,(source,counts,group,line) in enumerate(((old,before,bg,b),(new,after,hg,d)))]
             if (all(observations) and observations[0][0]==observations[1][0]
-                    and [entry[1]['modern'] for entry in observations]==[False,True]):
+                    and [entry[1]['modern'] for entry in observations]==([None,None] if single else [False,True])):
+                witnesses=[entry[1] for entry in observations]
                 matched=[[b,d]]
+                if single:
+                    matched=[list(pair) for pair in zip(*(item['observed_lines'] for item in witnesses),strict=True)]
+                    if (not all([line,line+c-a] in matched for line in pending)
+                            or any(old[line-1]!=new[target-1] for line,target in matched)):
+                        refuse()
+                else:
+                    previous,current=(item['environment_entries'] for item in witnesses)
+                    for role in sorted(previous.keys() & current.keys()):
+                        source_span,target_span=previous[role],current[role]
+                        line,target=source_span[0],target_span[0]
+                        if source_span[1::2]==target_span[1::2] and old[line-1]==new[target-1]:
+                            matched.append([line,target])
                 steps=[entry[1]['file_steps'] for entry in observations]
                 if all(steps):
                     matched.extend([previous['line'],current['line']]
@@ -4964,7 +6137,7 @@ def positive_source_fragments(name, old, new, before, after, base, head, base_fi
                     _construct_charge(work,sum(len(text)+1 for text in source[first-1:last]))
                     excerpts[side,first,last]=('\n'.join(source[first-1:last])+'\n').encode()
                 receipts.append(dict(file=name,kind='prepared-policy-environment-entry',pairs=matched,
-                    owners=[entry[1] for entry in observations],
+                    owners=witnesses,
                     callback_fragments=[dict(pairs=[[line,target]],base_range=[line,line],head_range=[target,target])
                                         for line,target in matched]))
                 continue
@@ -5009,10 +6182,15 @@ def positive_source_fragments(name, old, new, before, after, base, head, base_fi
         elif (name=='src/core/security/policy.rs' and b-a==1 and tuple(pending)==(b,)
               and b<len(old) and old[a].strip()=='assert!(' and '&FailingVulns)' in old[b]):
             async_fragment = async_policy_unavailable_assertion
-        elif b-a==1 and old[a].strip() in ('let manager = JavaManager {','let manager = RustManager {'):
+        elif b-a==1 and (old[a].strip() in ('let manager = JavaManager {','let manager = RustManager {')
+                or name=='src/core/security/vulnerability.rs' and old[a].strip()=='let scanner = VulnerabilityScanner {'
+                or name=='src/core/security/sbom_shared.rs' and old[a].strip() in
+                    ('let package = SecurityPackage {','let old = SecurityPackage {','let audit = SecurityAuditResult {')):
             async_fragment = async_runtime_fixture_record
         elif name=='src/runtimes/rust.rs' and b-a==1 and tuple(pending)==(b,) and old[a].strip()=='assert_eq!(':
             async_fragment = async_runtime_inventory_assertion
+        elif name=='src/core/security/vulnerability.rs' and b-a==1 and old[a].strip()=='let reports = scanner':
+            async_fragment = async_osv_report_call
         if async_fragment is not None and macro_expansions==([],[]) and construct_inventories is not None:
             observations = [async_fragment(name,source,counts,group,inventories[side],
                 inventory_names[side],construct_inventories[side],first,last,work)
@@ -5024,19 +6202,26 @@ def positive_source_fragments(name, old, new, before, after, base, head, base_fi
                          [entry[1]['typed'] for entry in observations]==[False,True])
                 and (async_fragment is not async_runtime_fixture_record or
                          [bool(entry[1]['security_initializer']) for entry in observations]==[False,True])
+                and (async_fragment is not async_osv_report_call or
+                         [entry[1]['method'] for entry in observations]==['scan_package','scan_osv_package'])
                     and (async_fragment is not async_runtime_inventory_assertion or
                          [bool(entry[1]['security_terms']) for entry in observations]==[False,True])):
                 matched = [(line,line+c-a) for line in pending]
                 if async_fragment in (async_runtime_fixture_record,async_runtime_inventory_assertion):
                     old_first,old_last = observations[0][1]['record_span']
                     new_first = observations[1][1]['record_span'][0]
-                    shift_after=observations[0][1].get('shift_after',old_first)
-                    shift_count=2 if async_fragment is async_runtime_inventory_assertion else 1
-                    matched = [(line,line+new_first-old_first+shift_count*int(line>shift_after))
+                    shifts=observations[0][1].get('shifts')
+                    if shifts is None:
+                        shifts=(observations[0][1]['shift_after'],)*2
+                    matched = [(line,line+new_first-old_first+sum(point<line for point in shifts))
                                for line in range(old_first,old_last+1) if line in before]
                     _construct_charge(work,len(matched))
                     if any(target not in after for _,target in matched):
                         refuse()
+                    preproved_callback_pairs.update(matched)
+                if async_fragment is async_osv_report_call:
+                    old_start,old_end = observations[0][1]['record_span']
+                    matched = [(line,line+d-b) for line in range(old_start,old_end+1)]
                     preproved_callback_pairs.update(matched)
                 if any(line in pairs and pairs[line]!=target for line,target in matched):
                     refuse()
@@ -5045,19 +6230,36 @@ def positive_source_fragments(name, old, new, before, after, base, head, base_fi
                     first,last=group[:2]
                     _construct_charge(work,sum(len(line)+1 for line in source[first-1:last]))
                     excerpts[side,first,last]=('\n'.join(source[first-1:last])+'\n').encode()
+                synchronous_record=(async_fragment is async_runtime_fixture_record
+                                    and any(owner['synchronous'] for _,owner in observations if 'synchronous' in owner))
+                if synchronous_record and not all(owner.get('synchronous') for _,owner in observations):
+                    refuse()
                 kind = {initial_async_test_record:'initial-async-test-record',
                         async_test_expected_error:'async-test-expected-error-call',
                         async_test_expected_variant:'async-test-expected-variant-entry',
                         async_policy_unavailable_assertion:'async-policy-unavailable-assertion-entry',
                         async_runtime_fixture_record:'async-runtime-fixture-record',
+                        async_osv_report_call:'async-osv-fixture-call',
                         async_runtime_inventory_assertion:'async-runtime-inventory-assertion'}[async_fragment]
+                if synchronous_record:
+                    kind='sync-sbom-fixture-record' if name=='src/core/security/sbom_shared.rs' else 'sync-runtime-fixture-record'
+                elif async_fragment is async_runtime_fixture_record and name=='src/core/security/vulnerability.rs':
+                    kind='async-osv-fixture-record'
                 evidence = [observation[1] for observation in observations]
                 receipt = dict(kind=kind,file=name,pairs=matched,owners=evidence)
-                if async_fragment in (async_runtime_fixture_record,async_runtime_inventory_assertion):
+                if synchronous_record:
+                    receipt['callback_fragments'] = [dict(pairs=matched,
+                        base_range=evidence[0]['record_span'],head_range=evidence[1]['record_span'])]
+                else:
                     receipt['async_copies'] = {side:[dict(constructor=owner['root'],body=owner['body'],
                         constructor_state=1,body_state=1)] for side,owner in zip(('base','head'),evidence)}
-                    receipt['async_fragment_regions'] = [dict(base_range=evidence[0]['record_span'],
-                        head_range=evidence[1]['record_span'],geometry=observations[0][0][2])]
+                    if async_fragment in (async_runtime_fixture_record,async_runtime_inventory_assertion):
+                        fragment = dict(base_range=evidence[0]['record_span'],head_range=evidence[1]['record_span'],
+                                        geometry=observations[0][0][2])
+                    else:
+                        fragment = dict(base_range=[a+1,b],head_range=[c+1,d],
+                                        regions=[owner['regions'] for owner in evidence])
+                    receipt['async_fragment_regions'] = [fragment]
                 receipts.append(receipt)
                 continue
         if (construct_inventories is not None and macro_expansions==([],[]) and prefix in callback_functions
@@ -5079,6 +6281,41 @@ def positive_source_fragments(name, old, new, before, after, base, head, base_fi
                     first,last=group[:2]
                     _construct_charge(work,sum(len(text)+1 for text in source[first-1:last]))
                     excerpts[side,first,last]=('\n'.join(source[first-1:last])+'\n').encode()
+                continue
+        arch_entry = name=='src/package_managers/arch.rs' and old[a].strip()=='Some(Box::pin(async move {'
+        arch_wait = name=='src/package_managers/arch.rs' and old[a].strip() in ('.await?;','.await')
+        arch_install = name=='src/package_managers/arch.rs' and old[a].strip()=='Box::pin(async move {'
+        sbom_entry = name=='src/core/security/sbom_shared.rs' and old[a].strip() in (
+            'components.push(SbomComponent {', 'vulnerabilities.push(SbomVulnerability {', 'bom_format: "CycloneDX".into(),')
+        if ((arch_entry or arch_wait or arch_install or sbom_entry) and construct_inventories is not None and macro_expansions==([],[])
+                and a+1==b and c+1==d and tuple(pending)==(b,) and old[a]==new[c]):
+            sides = [
+                (source, counts, group, inventories[side], inventory_names[side],
+                 construct_inventories[side], line)
+                for side, (source, counts, group, line) in enumerate(((old,before,bg,b),(new,after,hg,d)))
+            ]
+            if arch_entry:
+                entry = retained_arch_audit_entry(sides,work)
+            elif arch_wait:
+                entry = retained_arch_advisory_await([(*side[:5],side[-1]) for side in sides],work,
+                                                     finish=old[a].strip()=='.await')
+            elif arch_install:
+                entry = retained_arch_install_prelude([(*side[:5],side[-1]) for side in sides],work)
+            elif old[a].lstrip().startswith('bom_format:'):
+                entry = retained_sbom_metadata(sides,work)
+            else:
+                entry = retained_sbom_push(sides,work,vulnerability=old[a].lstrip().startswith('vulnerabilities.'))
+            if entry is not None:
+                matched = entry['pairs']
+                if any(line in pairs and pairs[line] != target for line, target in matched):
+                    refuse()
+                pairs.update(matched)
+                preproved_callback_pairs.update(matched)
+                for side, (source, group) in enumerate(((old,bg),(new,hg))):
+                    first,last = group[:2]
+                    _construct_charge(work, sum(len(text)+1 for text in source[first-1:last]))
+                    excerpts[side,first,last] = ('\n'.join(source[first-1:last])+'\n').encode()
+                receipts.append(dict(file=name, **entry, callback_fragments=[dict(pairs=matched)]))
                 continue
         if (construct_inventories is not None and macro_expansions==([],[])
                 and a+1==b and c+1==d and tuple(pending)==(b,)
@@ -5444,6 +6681,7 @@ def _construct_inventory(source, work):
         rows = boundaries.get(parent, [])
         at = bisect.bisect_left(rows, index)
         return rows[at - 1] + 1 if at else (parent + 1 if parent is not None else 0)
+
     def digest(first, last):
         _construct_charge(work, last - first + 1)
         return hashlib.sha256(repr(tuple(code.words[first:last + 1])).encode()).hexdigest()
@@ -7296,6 +8534,67 @@ def callback_island_import_context(name, contexts, words, blobs, work):
     return len(found)==1 and found[0][0]=='enum'
 
 
+def closed_record_child_fields(code, first, last, work):
+    """Read only an explicit named-record callback value, without updates or control flow."""
+    _construct_charge(work, last-first+1)
+    if last-first>512 or first>=last:
+        return None
+    identifier=r'[A-Za-z_]\w*'
+    at=first
+    while at<last and re.fullmatch(identifier,code.words[at],re.ASCII):
+        at+=1
+        if code.words[at]!='::':break
+        at+=1
+    if (at>=last or code.words[at]!='{' or code.pairs.get(at)!=last
+            or re.fullmatch(r'[A-Z]\w*',code.words[at-1],re.ASCII) is None):
+        return None
+    opening=at; fields=[];names=set();start=opening+1
+    for end in range(start,last+1):
+        if end!=last and not (code.parents[end]==opening and code.words[end]==','):
+            continue
+        if start==end:
+            return None
+        if (end-start<3 or code.parents[start]!=opening or code.words[start+1]!=':'
+                or re.fullmatch(identifier,code.words[start],re.ASCII) is None
+                or code.words[start] in names):
+            return None
+        names.add(code.words[start]);value=start+2
+        if any(code.words[i] in ('?','await','return','break','continue','yield','async','move',
+                '|','||','unsafe','loop','if','match','for','while','{','}','..','..=','#')
+               for i in range(value,end)):
+            return None
+        trailer=None; expression=code.words[value:end]
+        if (len(expression)>=5 and expression[-2:]==['(',')']
+                and code.pairs.get(end-2)==end-1):
+            path=expression[:-2]
+            if (len(path)%2==1 and all(re.fullmatch(identifier,word,re.ASCII) for word in path[::2])
+                    and all(word=='.' for word in path[1::2])):
+                trailer=code.position(code.ends[end-3])
+        fields.append((code.words[start],code.region(value,end-1),trailer))
+        start=end+1
+        if start==last:break
+    return tuple(fields) if 1<=len(fields)<=8 else None
+
+
+def closed_record_child_geometry(raw, entry, bounds, fields, work):
+    """Require every field's exact extent and the closing marker in the owned channel."""
+    _construct_charge(work,len(raw)*(len(fields)+1))
+    terminal=(*bounds[2:3],bounds[3]-1,*bounds[2:])
+    if (any(len(row)!=8 or row[5:]!=[0,0,0] or type(row[4]) is not int or row[4]!=entry for row in raw)
+            or [row[4] for row in raw if tuple(row[:4])==terminal]!=[entry]):
+        return False
+    classified=set()
+    for _,field,trailer in fields:
+        members=[i for i,row in enumerate(raw)
+                 if tuple(field[:2])<=tuple(row[:2])<tuple(row[2:4])<=tuple(field[2:])]
+        if (not members or any(i in classified for i in members)
+                or min(tuple(raw[i][:2]) for i in members)!=tuple(field[:2])
+                or max(tuple(raw[i][2:4]) for i in members) not in (tuple(field[2:]),trailer)):
+            return False
+        classified.update(members)
+    return classified=={i for i,row in enumerate(raw) if tuple(row[:4])!=terminal}
+
+
 def retained_callback_island_obligations(name, sources, counts, descriptors, inventories,
                                         replacements, work, indexes_factory, expansions, blobs=None):
     """Bind an unchanged iterator callback and every overlapping compiled child."""
@@ -7317,12 +8616,15 @@ def retained_callback_island_obligations(name, sources, counts, descriptors, inv
             candidate_sets.append(candidates);continue
         for row in rows:
             header=row.get('header',());opening=row['opening']
+            identity_check=(name=='src/core/security/sbom_shared.rs' and header==('||',))
+            unary=(len(header)>=3 and header[0]=='|' and header[2]=='|'
+                   and re.fullmatch(r'[A-Za-z_]\w*',header[1],re.ASCII) is not None)
             if (row['kind']!='expression' or not row['supported'] or opening is None
-                    or len(header)<3 or header[0]!='|' or header[2]!='|'
-                    or re.fullmatch(r'[A-Za-z_]\w*',header[1],re.ASCII) is None):
+                    or not (unary or identity_check)):
                 continue
             parent=code.parents[row['first']]
-            if (parent is None or parent<2 or code.words[parent-2:parent]!=['.','map']
+            method='ok_or_else' if identity_check else 'map'
+            if (parent is None or parent<2 or code.words[parent-2:parent]!=['.',method]
                     or code.words[parent]!='(' or code.pairs[parent]!=row['end']+1):
                 continue
             parents=[d for d in selected if d['row']['opening']<row['first']<row['end']<d['row']['end']]
@@ -7337,6 +8639,14 @@ def retained_callback_island_obligations(name, sources, counts, descriptors, inv
                 if code.parents[at]==scope and code.words[at] in (';',','):
                     start=at+1
             prefix=list(code.words[start:parent-2]);filters=[];normalized=[];at=0
+            identity_paint=None
+            if identity_check:
+                continuation=code.pairs[parent]+1
+                if (prefix!='let reference = identities . get ( & key )'.split()
+                        or code.words[continuation:continuation+2]!=['?',';']):
+                    continue
+                identity_paint=(code.region(start,parent-1),code.region(continuation,continuation),
+                                code.region(parent-1,parent-1))
             while at<len(prefix):
                 _construct_charge(work,1)
                 if prefix[at:at+3]==['.','filter','(']:
@@ -7363,7 +8673,7 @@ def retained_callback_island_obligations(name, sources, counts, descriptors, inv
             if any(not line.isascii() for line in body):continue
             key=(descriptor['declaration'],descriptor['signature'],tuple(descriptor['attributes']),tuple(ancestors),
                  tuple(normalized),tuple(header),body)
-            candidates.setdefault(key,[]).append((descriptor,row,filters))
+            candidates.setdefault(key,[]).append((descriptor,row,filters,identity_paint))
         candidate_sets.append(candidates)
     common=candidate_sets[0].keys()&candidate_sets[1].keys()
     pairs={};targets={};receipts=[];indexes=None
@@ -7377,7 +8687,8 @@ def retained_callback_island_obligations(name, sources, counts, descriptors, inv
                 word for word in inventories[0][0].words[selected[0][1]['first']:selected[0][1]['end']+1]),blobs,work):continue
         if indexes is None:indexes=indexes_factory()
         sides=[];valid=True
-        for side,((descriptor,callback,filters),inventory,index) in enumerate(zip(selected,inventories,indexes)):
+        for side,((descriptor,callback,filters,identity_paint),inventory,index) in enumerate(
+                zip(selected,inventories,indexes,strict=True)):
             code=inventory[0];opening,closing=code.region(callback['opening'],callback['end'])[:2],code.region(callback['opening'],callback['end'])[2:]
             available=index.inventories.get(name,());_construct_charge(work,sum(len(o['regions'])+1 for o in available))
             forest=[o for o in available if any(tuple(r[:2])<closing and opening<tuple(r[2:4]) for r in o['regions'])]
@@ -7393,9 +8704,33 @@ def retained_callback_island_obligations(name, sources, counts, descriptors, inv
                     valid=False;break
                 end=code.pairs[call]-1
                 slots.append((code.region(body,end),
-                    (*code.position(code.starts[body]),*code.position(code.ends[body+int(code.words[body+1]=='!')]))))
+                    (*code.position(code.starts[body]),*code.position(code.ends[body+int(code.words[body+1]=='!')])),
+                    closed_record_child_fields(code,body,end,work)))
                 at=end+1
             if not valid or len(slots)>8:valid=False;break
+            prefix_rows={}
+            include_roots=identity_paint is not None or any(fields is not None for _,_,fields in slots)
+            if include_roots:
+                call=code.parents[callback['first']]
+                if call is None:valid=False;break
+                prefix=tuple(code.region(call-1,call-1))
+                windows=tuple(map(tuple,identity_paint[:2])) if identity_paint else (prefix,)
+                required={prefix,tuple(identity_paint[1])} if identity_paint else {prefix}
+                roots={o['name'] for o in descriptor['group'][2]}
+                _construct_charge(work,sum((len(o['regions'])+1)*len(windows) for o in available))
+                for owner in available:
+                    touches=[r for r in owner['regions'] if any(tuple(r[:2])<window[2:] and window[:2]<tuple(r[2:4])
+                                                                for window in windows)]
+                    if not touches:continue
+                    spans={tuple(r[:4]) for r in touches}
+                    if (owner['name'] not in roots or len(touches)!=len(spans) or not required<=spans
+                            or any(r[5:]!=[0,0,0] or type(r[4]) is not int or not 0<=r[4]<COUNTER_LIMIT
+                                   or not any(window[:2]<=tuple(r[:2])<tuple(r[2:4])<=window[2:]
+                                              for window in windows) for r in touches)):
+                        valid=False;break
+                    prefix_rows[owner['name']]=sorted(touches,key=lambda r:tuple(r[:4]))
+                if not valid or (identity_paint or prefix_rows) and set(prefix_rows)!=roots:
+                    valid=False;break
             roles=[];owned=set();filter_owned=set();filter_evidence=[]
             filter_touching=[]
             if filters:
@@ -7449,7 +8784,7 @@ def retained_callback_island_obligations(name, sources, counts, descriptors, inv
                 for path,owner in related.items():
                     if len(path)==1:continue
                     if path[:1]!=outer_path:valid=False;break
-                    matches=[number for number,(bounds,_) in enumerate(slots)
+                    matches=[number for number,(bounds,_,_) in enumerate(slots)
                         if all(tuple(bounds[:2])<=tuple(r[:2])<tuple(r[2:4])<=tuple(bounds[2:]) for r in owner['regions'])]
                     if len(matches)!=1 or matches[0] in members:valid=False;break
                     members[matches[0]]=owner
@@ -7472,19 +8807,32 @@ def retained_callback_island_obligations(name, sources, counts, descriptors, inv
                     else:
                         suffix=symbol[len('_RNCNC'+root['name'][2:]):]
                         nested_ordinals.append(tuple(re.findall(r'(s[0-9A-Za-z]{0,32}_)?0',suffix)[:2])[1])
-                        bounds,marker=slots[role]
-                        if (min(tuple(r[:2]) for r in raw)!=tuple(bounds[:2])
-                                or [r[4] for r in raw if tuple(r[:4])==marker]!=[entry]):valid=False;break
+                        bounds,marker,fields=slots[role]
+                        if fields is None:
+                            if (min(tuple(r[:2]) for r in raw)!=tuple(bounds[:2])
+                                    or [r[4] for r in raw if tuple(r[:4])==marker]!=[entry]):valid=False;break
+                        elif not closed_record_child_geometry(raw,entry,bounds,fields,work):
+                            valid=False;break
                     owned.add(id(owner));names.append(symbol)
                     ordered=sorted(raw,key=lambda r:tuple(r[:4]+r[5:]));_construct_charge(work,len(raw)*(len(raw).bit_length()+1))
                     geometry.append(tuple((r[0]-opening[0],r[1],r[2]-opening[0],r[3],*r[5:]) for r in ordered))
                     states.extend([int(entry>0),*[int(r[4]>0) for r in ordered]])
                 if not valid:break
+                outer=prefix_rows.get(root['name'],[])
+                method_count=next((r[4] for r in outer if tuple(r[:4])==prefix),None)
+                if outer and (method_count is None or mapper['count']>method_count
+                              or root['count']==0 and any(r[4]>0 for r in outer)):
+                    valid=False;break
+                if include_roots:
+                    geometry.append(tuple((r[0]-opening[0],r[1],r[2]-opening[0],r[3],*r[5:]) for r in outer))
+                    states.extend(int(r[4]>0) for r in outer)
                 roles.append(dict(role=shape.identity,identity=root['name'],geometry=tuple(geometry),states=tuple(states),
                     nested_ordinals=tuple(nested_ordinals),names=names))
             if (not valid or owned!={id(o) for o in forest}
                     or filters and filter_owned!={id(o) for o in filter_touching}):valid=False;break
-            observer=_ObserverWork(work);observed=dict(_llvm22_rows(_llvm22_segments([r for o in forest for r in o['regions']],observer),observer))
+            reconstruction=[r for o in forest for r in o['regions']]
+            reconstruction.extend(r for rows in prefix_rows.values() for r in rows)
+            observer=_ObserverWork(work);observed=dict(_llvm22_rows(_llvm22_segments(reconstruction,observer),observer))
             if not observed:valid=False;break
             first,last=min(observed),max(observed);_construct_charge(work,last-first+1)
             measured={line:counts[side][line] for line in range(first,last+1) if line in counts[side]}
@@ -7517,6 +8865,238 @@ def retained_callback_island_obligations(name, sources, counts, descriptors, inv
             source_sha256=hashlib.sha256(('\n'.join(key[-1])+'\n').encode()).hexdigest(),
             claim='Only unchanged callback lines; complete overlapping forest and cold roles; zero deletion credit'))
     return pairs,receipts
+
+
+def retained_daemon_audit_fixture_fields(name, sources, counts, descriptors, grouped, work, expansions):
+    """Keep the oversized response fixture's coverage when its enum fields are initialized."""
+    if name != 'src/daemon/server.rs' or expansions != ([], []):
+        return None
+    declaration = 'oversized_security_audit_is_not_reported_as_complete'
+    entries = [[row for row in functions.values() if row['declaration'] == declaration]
+               for functions in descriptors]
+    _construct_charge(work, sum(map(len, descriptors)))
+    if any(len(rows) != 1 for rows in entries):
+        return None
+    left, right = (rows[0] for rows in entries)
+    if (left['signature'] != _RESULT_TEST_SIGNATURE[:8] or left['signature'] != right['signature']
+            or left['context'] != right['context']
+            or left['context'][0] != (('#','[','cfg','(','test',')',']','mod','tests'),)):
+        return None
+    groups = [entry['group'] for entry in (left, right)]
+    (first, last), (start, end) = (group[:2] for group in groups)
+    if not 1 <= last - first <= 128 or end - start != last - first + 2:
+        return None
+    expected = {
+        'applicability: crate::core::security::scan::FindingApplicability::Possible,':
+            'let vulnerability = super::super::protocol::Vulnerability {',
+        'coverage: crate::core::security::scan::AuditCoverage::Unreported,':
+            'result: ResponseResult::SecurityAudit(SecurityAuditResult {',
+    }
+    added = {}
+    retained = {}
+    previous = first
+    for line in range(start, end + 1):
+        text = sources[1][line - 1]
+        _construct_charge(work, len(text) + 1)
+        field = text.strip()
+        if previous <= last and text == sources[0][previous - 1]:
+            retained[line] = previous
+            previous += 1
+        elif (line > start and field in expected and sources[1][line - 2].strip() == expected[field]
+                and field not in added and text.isascii()):
+            column = text.index('crate::') + 1
+            added[field] = (line, column, line, len(text.rstrip()))
+        else:
+            return None
+    if previous != last + 1 or added.keys() != expected.keys():
+        return None
+    geometry = []
+    forests = []
+    for side, (group, compiled, mapped) in enumerate(zip(groups, grouped, counts, strict=True)):
+        low, high, roots = group
+        if len(roots) != 1:
+            return None
+        root, = roots
+        shape = plain_rust_function_symbol(root['name'])
+        if shape is None or shape.identifiers != ('omg_lib','daemon','server','tests',declaration):
+            return None
+        members = {}
+        names = []
+        raw = []
+        new_fields = set(added.values()) if side else set()
+        for owner in compiled[0]:
+            regions = owner['regions']
+            _construct_charge(work, len(regions) + 1)
+            if not any(row[0] <= high and low <= row[2] for row in regions):
+                continue
+            symbol = owner['name']
+            _construct_charge(work, 2 * len(symbol) + len(regions))
+            is_root = owner is root
+            if (not is_root and not direct_rust_callback_symbol(symbol, root['name'], shape.modules)
+                    or compiled[2][symbol] != 1 or owner['filenames'] != root['filenames']
+                    or owner.get('branches') or owner.get('mcdc_records')
+                    or not 0 < owner['count'] < COUNTER_LIMIT):
+                return None
+            role = '' if is_root else symbol[len('_RNC'+root['name'][2:]):]
+            if role in members:
+                return None
+            rows = []
+            for row in regions:
+                a, x, b, y, hits, *channel = row
+                if not low <= a <= b <= high or channel != [0,0,0] or not 0 <= hits < COUNTER_LIMIT:
+                    return None
+                if side and (a not in retained or b not in retained):
+                    field = (a,x,b,y)
+                    if not is_root or field not in new_fields or hits != root['count']:
+                        return None
+                    new_fields.remove(field)
+                    continue
+                rows.append((retained[a] if side else a, x, retained[b] if side else b, y, hits > 0))
+            _construct_charge(work, len(rows) * (len(rows).bit_length() + 1))
+            members[role] = tuple(sorted(rows))
+            names.append(symbol)
+            raw.extend(regions)
+        if new_fields or len(members) != 2 or '' not in members:
+            return None
+        observer = _ObserverWork(work)
+        observed = dict(_llvm22_rows(_llvm22_segments(raw, observer), observer))
+        _construct_charge(work, high - low + 1)
+        if observed != {line: mapped[line] for line in range(low, high + 1) if line in mapped}:
+            return None
+        geometry.append(members)
+        forests.append(sorted(names))
+    if geometry[0] != geometry[1]:
+        return None
+    pairs = {old: new for new, old in retained.items() if old in counts[0]}
+    if any(new not in counts[1] for new in pairs.values()) or any(counts[1].get(row[0],0) <= 0 for row in added.values()):
+        return None
+    return pairs, dict(kind='retained-daemon-audit-fixture-fields', file=name, base_range=[first,last],
+        head_range=[start,end], pairs=[list(pair) for pair in sorted(pairs.items())],
+        added_lines=sorted(row[0] for row in added.values()), forests=forests,
+        claim='Complete existing fixture and mapper geometry, with new field counters kept separately')
+
+
+def retained_sbom_advisory_properties(name, sources, counts, descriptors, inventories,
+                                      grouped, work, expansions, blobs):
+    """Bind the same three native advisory records in the optional mapper and borrowed array."""
+    if name != 'src/core/security/sbom_shared.rs' or expansions != ([], []):
+        return None
+    entries = [[row for row in side.values() if row['declaration'] == 'compose'] for side in descriptors]
+    _construct_charge(work, sum(map(len, descriptors)))
+    if any(len(rows) != 1 for rows in entries):
+        return None
+    left, right = (rows[0] for rows in entries)
+    fields = (
+        ('omg:advisory:title', 'finding . summary'),
+        ('omg:advisory:nevra', 'native . advisory_nevra'),
+        ('omg:advisory:published-severity', 'native . published_severity'),
+    )
+    prefixes = (
+        'properties : finding . native_advisory . as_ref ( ) . map ( | native | { vec !',
+        'if let Some ( native ) = & finding . native_advisory { properties . extend (',
+    )
+    filter_call = '. into_iter ( ) . filter ( | property | ! property . value . is_empty ( ) )'
+    suffixes = (filter_call + ' . collect ( ) } ) . unwrap_or_default ( ) ,',
+                filter_call + ' , ) ; }')
+    bindings = (' '.join(prefixes+suffixes) + ' SbomProperty name audit findings '
+                + ' '.join(value for _, value in fields)).split()
+    if (left['signature'] != right['signature'] or left['attributes'] != right['attributes']
+            or not callback_island_import_context(name, [row['context'] for row in (left,right)],
+                bindings, blobs, work)):
+        return None
+    results = []
+    for side, (source, inventory, descriptor, compiled) in enumerate(
+            zip(sources, inventories, (left,right), grouped, strict=True)):
+        code = inventory[0]
+        function = descriptor['row']
+        prefix, suffix = prefixes[side].split(), suffixes[side].split()
+        _construct_charge(work, function['end'] - function['opening'])
+        candidates = []
+        for token in range(function['opening']+1, function['end']):
+            if code.words[token] == '[':
+                _construct_charge(work, len(prefix))
+                if code.words[token-len(prefix):token] == prefix:
+                    candidates.append(token)
+        if len(candidates) != 1:
+            return None
+        opening, = candidates
+        closing = code.pairs[opening]
+        if code.words[closing+1:closing+1+len(suffix)] != suffix:
+            return None
+        containing = _construct_ancestors(code, opening, work)
+        controls = [head.split() for head in (
+            'for finding in findings', 'for ( name , findings ) in & audit . vulnerabilities')]
+        if any(sum(code.words[i-len(control):i] == control for i in containing) != 1 for control in controls):
+            return None
+        elements = _boolean_arguments(code, opening)
+        if elements is None or len(elements) != len(fields):
+            return None
+        marker = tuple(code.region(opening, closing) if side else code.region(opening-2,opening-1))
+        expected = {marker}
+        for ordinal, ((start, end), (label, value)) in enumerate(zip(elements, fields, strict=True)):
+            expression = ('SbomProperty { name : "' + label
+                          + '" . into ( ) , value : ' + value + ' . clone ( ) , }').split()
+            _construct_charge(work, end - start + 1)
+            if code.words[start:end] != expression:
+                return None
+            if not side or ordinal < len(fields)-1:
+                expected.add(tuple(code.region(start,end-1)))
+            expected.update(tuple(code.region(token,token)) for token in (start+4,start+6))
+        low, high = code.region(opening, closing)[::2]
+        _construct_charge(work, high - low + 1)
+        roots = descriptor['group'][2]
+        if len(roots) != 2:
+            return None
+        root_shapes = {item['name']:plain_rust_function_symbol(item['name']) for item in roots}
+        nominal = ('omg_lib','core','security','sbom_shared','compose')
+        if any(shape is None or shape.identifiers != nominal for shape in root_shapes.values()):
+            return None
+        copies = {}
+        raw = []
+        for owner in compiled[0]:
+            _construct_charge(work, len(owner['regions']) + 1)
+            selected = [row for row in owner['regions'] if row[0] <= high and low <= row[2]]
+            if not selected:
+                continue
+            symbol = owner['name']
+            parents = [root for root in roots if (root is owner if side else direct_rust_callback_symbol(
+                symbol,root['name'],root_shapes[root['name']].modules))]
+            if len(parents) != 1:
+                return None
+            parent, = parents
+            identity = parent['name']
+            _construct_charge(work, len(selected) + len(symbol))
+            state = selected[0][4]
+            if (identity in copies or compiled[2][symbol] != 1 or compiled[2][identity] != 1
+                    or owner['filenames'] != parent['filenames'] or owner.get('branches') or owner.get('mcdc_records')
+                    or not 0 <= state <= parent['count'] < COUNTER_LIMIT or not side and owner['count'] != state
+                    or any(row[4:] != [state,0,0,0] for row in selected)
+                    or len(selected) != len(expected) or {tuple(row[:4]) for row in selected} != expected):
+                return None
+            copies[identity] = (symbol,(int(state > 0),))
+            raw.extend(selected)
+        if set(copies) != root_shapes.keys():
+            return None
+        observer = _ObserverWork(work)
+        observed = dict(_llvm22_rows(_llvm22_segments(raw, observer), observer))
+        if observed != {line: counts[side][line] for line in range(low,high+1) if line in counts[side]}:
+            return None
+        body = source[low:high-1]
+        _construct_charge(work, sum(len(line)+1 for line in body))
+        results.append((low,high,[line.strip() for line in body],copies,observed))
+    (first,last,old_body,old_copies,old_rows),(start,end,new_body,new_copies,new_rows) = results
+    states = [[row[1] for row in copies.values()] for copies in (old_copies,new_copies)]
+    if old_body != new_body or sorted(states[0]) != sorted(states[1]):
+        return None
+    matching = compiled_hit_state_matching(*states, [tuple(old_copies),tuple(new_copies)])
+    pairs = {n:n+start-first for n in range(first+1,last) if n in old_rows}
+    if matching is None or not pairs or set(pairs.values()) != set(range(start+1,end)) & new_rows.keys():
+        return None
+    return pairs, dict(kind='retained-sbom-advisory-properties', file=name,
+        pairs=[list(pair) for pair in sorted(pairs.items())], base_range=list(left['group'][:2]),
+        head_range=list(right['group'][:2]), array_ranges=[[first,last],[start,end]],
+        copies=[list(copies.items()) for copies in (old_copies,new_copies)], role_matching=matching,
+        claim='Source-identical records in every measured array copy; no deletion credit')
 
 
 def projected_iterator_source(left, right, inventories, sources, work):
@@ -7701,6 +9281,17 @@ def retained_projected_iterator_obligations(name,sources,counts,descriptors,inve
     return pairs,receipts,proved
 
 
+def sync_record_factory_header(code, opening):
+    if opening < 10:
+        return None
+    let, binding, equals, bar, parameter, colon, borrow, kind, closing, record = code.words[opening-10:opening]
+    if ((let,equals,bar,colon,borrow,kind,closing)!=('let','=','|',':','&','str','|')
+            or any(re.fullmatch(r'[A-Za-z_]\w*',name,re.ASCII) is None for name in (binding,parameter,record))
+            or code.words[opening]!='{' or code.words[code.pairs[opening]+1:code.pairs[opening]+2]!=[';']):
+        return None
+    return binding,parameter,record
+
+
 def positive_sync_fixture_change(descriptors,inventories,work):
     """Admit only one pure local fixture field addition before owner indexing."""
     codes=[i[0] for i in inventories];functions=[d['row'] for d in descriptors]
@@ -7714,10 +9305,22 @@ def positive_sync_fixture_change(descriptors,inventories,work):
             if (added[1::2]==[':','::',','] and all(re.fullmatch(r'[A-Za-z_]\w*',added[n],re.ASCII) for n in (0,2,4))
                     and words[0]==words[1][:at]+words[1][at+6:]):
                 parents=[c.parents[r['first']+at] for c,r in zip(codes,functions)]
-                if all(parent is not None and c.words[parent]=='{' and c.words[parent-2]=='='
-                        and re.fullmatch(r'[A-Za-z_]\w*',c.words[parent-1],re.ASCII)
-                        and (c.words[parent-4]=='let' or c.words[parent-5:parent-3]==['let','mut'])
-                        for c,parent in zip(codes,parents)):
+                if all(parent is not None and c.parents[parent]==fn['opening']
+                       and sync_record_factory_header(c,parent)
+                       for c,parent,fn in zip(codes,parents,functions)):
+                    return 'scalar-record-factory-field'
+                def record_let(code,opening):
+                    if opening is None or code.words[opening]!='{' or opening<5:
+                        return False
+                    record=opening-1
+                    enclosing=code.parents[opening]
+                    if (enclosing==record-1 and code.words[enclosing]=='['
+                            and code.pairs[enclosing]==code.pairs[opening]+1):
+                        record=enclosing
+                    return (code.words[record-1]=='='
+                            and re.fullmatch(r'[A-Za-z_]\w*',code.words[opening-1],re.ASCII)
+                            and (code.words[record-3]=='let' or code.words[record-4:record-2]==['let','mut']))
+                if all(record_let(code,opening) for code,opening in zip(codes,parents)):
                     return 'scalar-record-field'
     values=[];bindings=[]
     def unique_fields(pairs):
@@ -7761,7 +9364,7 @@ def positive_sync_fixture_change(descriptors,inventories,work):
 
 
 def positive_sync_test_slots(descriptor,inventory,source,work):
-    """Recognize a small sync unit routine with only direct expression callbacks."""
+    """Recognize a small sync unit routine with direct expression callbacks or a record factory."""
     code=inventory[0];fn=descriptor['row'];first,last=fn['opening']+1,fn['end']
     if last-first>2048:return None
     _construct_charge(work,last-first+1)
@@ -7775,6 +9378,19 @@ def positive_sync_test_slots(descriptor,inventory,source,work):
         _construct_charge(work,1)
         if code.words[at]!='|':at+=1;continue
         call=code.parents[at]
+        opening=at+7
+        if (call==fn['opening'] and opening<last and code.words[opening]=='{'
+                and (header:=sync_record_factory_header(code,opening)) is not None
+                and re.fullmatch(r'[A-Za-z_]\w*',code.words[opening+1],re.ASCII)
+                and code.words[opening+2]==':'):
+            end=code.pairs[opening]
+            _construct_charge(work,end-opening+1)
+            if any(word in ('|','||','async','move') for word in code.words[opening+1:end]):
+                return None
+            begin=code.position(code.starts[opening+3]);finish=code.position(code.ends[end])
+            slots.append((begin,finish,'record-factory',header))
+            if len(slots)>2:return None
+            at=end+1;continue
         if (call is None or code.words[call]!='(' or code.words[call-2]!='.'
                 or code.words[call-1] not in ('map','any','find') or call+1!=at):return None
         if code.words[at+2:at+3]==['|']:
@@ -7810,6 +9426,7 @@ def positive_sync_callback_members(root,forest,slots,work):
         if (any(owner is other for other in selected)
                 or type(quantity) is not int or not 0<quantity<COUNTER_LIMIT
                 or min(tuple(r[:2]) for r in owner['regions'])!=first
+                or method=='record-factory' and max(tuple(r[2:4]) for r in owner['regions'])!=last
                 or any(r[4]!=quantity for r in owner['regions'])):return None
         selected.append(owner);roles.append((method,header,first,last,owner['name']))
     return selected,tuple(roles)
@@ -7905,7 +9522,9 @@ def same_qualified_positive_test_obligations(name, sources, counts, descriptors,
                 _construct_charge(work,sum(d['group'][1]-d['group'][0]+1 for d in chosen))
                 if any(any(da.get(n,1)<=0 for n in range(d['group'][0],d['group'][1]+1)) for da,d in zip(counts,chosen)):continue
                 slots=tuple(positive_sync_test_slots(d,i,s,work) for d,i,s in zip(chosen,inventories,sources))
-                if any(s is None for s in slots) or any(len(s)!=(0 if fixture=='scalar-record-field' else 2) for s in slots):continue
+                expected={'scalar-record-field':0,'scalar-record-factory-field':1,'literal-json-field':2}[fixture]
+                if any(s is None or len(s)!=expected for s in slots):continue
+                if any(sum(slot[2]=='record-factory' for slot in s)!=int(expected==1) for s in slots):continue
                 sync_shapes[declaration]=slots;sync_potential.append((declaration,chosen))
             else:potential.append((declaration,chosen))
     if len(sync_potential)<=16:potential.extend(sync_potential)
@@ -8007,14 +9626,16 @@ def retained_replacement_obligations(name, old, new, before, after, inventories,
         code = inventory[0]
         _construct_charge(work, 3 * len(inventory[1]) + len(code.words))
         by_opening = {row['opening']: row for row in inventory[1] if row['opening'] is not None}
-        function_rows = {}
+        function_rows = {}; statements = []
         for row in inventory[1]:
-            if row['kind'] == 'fn' and 'fn' in row['header']:
+            if row['kind'] == 'statement':
+                statements.append(row)
+            elif row['kind'] == 'fn' and 'fn' in row['header']:
                 span = (code.position(code.starts[row['first'] + row['header'].index('fn')])[0],
                         code.position(code.starts[row['end']])[0])
                 function_rows.setdefault(span, []).append(row)
-        _construct_charge(work, len(inventory[1]) * (len(inventory[1]).bit_length() + 1))
-        statements = sorted((row for row in inventory[1] if row['kind'] == 'statement'), key=lambda row: row['first'])
+        _construct_charge(work, len(statements) * (len(statements).bit_length() + 1))
+        statements.sort(key=lambda row: row['first'])
         statement_starts = [row['first'] for row in statements]
         functions = {}
         for prefix, group in compiled[1].items():
@@ -8320,6 +9941,23 @@ def retained_replacement_obligations(name, old, new, before, after, inventories,
     record_pairs, record_receipts, record_proved = retained_record_field_obligations(
         name,(old,new),(before,after),descriptors,inventories,grouped,replacements,work,
         record_indexes,record_expansions)
+    daemon_fields = retained_daemon_audit_fixture_fields(
+        name,(old,new),(before,after),descriptors,grouped,work,record_expansions)
+    if daemon_fields is not None:
+        fields, receipt = daemon_fields
+        if set(fields) & record_pairs.keys() or set(fields.values()) & set(record_pairs.values()):
+            raise ValueError('Ambiguous daemon fixture record correspondence')
+        record_pairs.update(fields)
+        record_receipts.append(receipt)
+        record_proved.add(tuple(receipt['base_range']))
+    sbom_fields = retained_sbom_advisory_properties(
+        name,(old,new),(before,after),descriptors,inventories,grouped,work,record_expansions,island_blobs)
+    if sbom_fields is not None:
+        fields, receipt = sbom_fields
+        if set(fields) & record_pairs.keys() or set(fields.values()) & set(record_pairs.values()):
+            raise ValueError('Ambiguous SBOM advisory-property correspondence')
+        record_pairs.update(fields)
+        record_receipts.append(receipt)
     island_pairs, island_receipts = retained_callback_island_obligations(
         name,(old,new),(before,after),descriptors,inventories,replacements,work,
         record_indexes,record_expansions,island_blobs)
@@ -8366,7 +10004,7 @@ def retained_replacement_obligations(name, old, new, before, after, inventories,
     if any(n in extra_pairs and extra_pairs[n]!=t or t in projection_targets and projection_targets[t]!=n for n,t in projection_pairs.items()):
         raise ValueError('Ambiguous projected iterator and retained correspondence')
     extra_pairs.update(projection_pairs);extra_receipts.extend(projection_receipts);extra_proved.update(projection_proved)
-    candidates = []; receiver_candidates = []
+    candidates = []; receiver_candidates = []; paused_wait_migrations = set()
     previous, current = descriptors
     _construct_charge(work,len(current))
     added_functions = [(prefix, descriptor) for prefix, descriptor in current.items() if prefix not in previous]
@@ -8408,13 +10046,31 @@ def retained_replacement_obligations(name, old, new, before, after, inventories,
                 if None in parents[0] or None in parents[1] or len(parents[0]) != 1 or parents[0] != parents[1]:
                     continue
                 parent = next(iter(parents[0]))
+                paused_waits = ()
+                if (name=='src/daemon/server.rs' and method_migration
+                        and (left['declaration'],right['declaration'])==('scan_package','assess_packages')
+                        and left['context'][0]==(
+                            tuple('impl crate :: core :: security :: vulnerability :: VulnerabilitySource for PausedAdvisorySource'.split()),
+                            ('#','[','cfg','(','test',')',']','mod','tests'))):
+                    prefix='Box :: pin ( async move {'.split()
+                    notify='self . started . notify_one ( ) ;'.split()
+                    wait='self . resume . notified ( ) . await ;'.split()
+                    code_prefix=prefix+notify+wait
+                    starts=[descriptor['row']['opening']+1 for descriptor in (left,right)]
+                    _construct_charge(work,2*len(code_prefix))
+                    if all(inventory[0].words[start:start+len(code_prefix)]==code_prefix
+                           for inventory,start in zip(inventories,starts)):
+                        paused_waits=tuple(tuple(start+offset for start in starts)
+                            for offset in (len(prefix),len(prefix)+len(notify)))
                 for digest, rows in left['statements'].items():
                     targets = right['statements'].get(digest, [])
                     tokens = inventories[0][0].words[rows[0]['first']:rows[0]['end'] + 1]
                     _construct_charge(work, len(tokens))
-                    if (len(rows) == len(targets) == file_counts[0][digest] == file_counts[1][digest] == 1
-                            and rows[0]['supported'] and targets[0]['supported']
-                            and len(tokens) >= 12 and tokens[0] not in
+                    unique = (len(rows) == len(targets) == file_counts[0][digest] == file_counts[1][digest] == 1
+                              and rows[0]['supported'] and targets[0]['supported'])
+                    if unique and (rows[0]['first'],targets[0]['first']) in paused_waits:
+                        qualified_seeds.append((rows[0],targets[0]))
+                    elif (unique and len(tokens) >= 12 and tokens[0] not in
                                 ('let', 'Ok', 'Err', 'return', 'fn', 'struct', 'enum', 'impl', 'mod',
                                  'static', 'const', 'type', 'use', 'extern', '#')):
                         if head_counts is None or head_counts[digest] == 1:
@@ -8426,6 +10082,11 @@ def retained_replacement_obligations(name, old, new, before, after, inventories,
                                 and statement_context(left, inventories[0][0], rows[0])
                                     == statement_context(right, inventories[1][0], targets[0])):
                             qualified_seeds.append((rows[0], targets[0]))
+                if paused_waits:
+                    observed = {(old_row['first'],new_row['first']) for old_row,new_row in qualified_seeds}
+                    if not set(paused_waits)<=observed:
+                        continue
+                    paused_wait_migrations.add((left_prefix,right_prefix))
                 if (not seeds and not method_migration
                         or parent_files is not None and parent_files(parent) != {name}):
                     continue
@@ -8519,6 +10180,14 @@ def retained_replacement_obligations(name, old, new, before, after, inventories,
             if covered is not None and (seeds or qualified_seeds or all(len(owners) == len(group[2])
                     for owners, group in zip(covered[1]['fully_covered_replacement_owners'], groups))):
                 mapped, receipt = covered
+                if (left_prefix,right_prefix) in paused_wait_migrations:
+                    shapes = [[nominal_method_path(owner['name']) for owner in owners]
+                              for owners in receipt['fully_covered_replacement_owners']]
+                    if any(shape is None for owners in shapes for shape in owners):
+                        continue
+                    depths = [sorted(len(shape.callbacks) for shape in owners) for owners in shapes]
+                    if depths != [[0,1],[0,1,2]]:
+                        continue
                 if qualified_seeds and not seeds:
                     retained = qualified_test_retained_statements((old, new), (left, right), inventories,
                         grouped, file_counts, selected, qualified_seeds, receipt, work)
@@ -8887,7 +10556,7 @@ def _construct_replacements(old, new, work, head_inventory=None, compatible=None
         return [row for row in rows if row['end'] - row['first'] == size]
     proposals = {}
     if line_operations is None:
-        line_operations = difflib.SequenceMatcher(None, old, new, autojunk=False).get_opcodes()
+        line_operations = source_line_diff(old, new)
     for tag, a, b, c, d in line_operations:
         if tag != 'equal':
             continue
@@ -9193,6 +10862,88 @@ def retired_assertion_delimiter(name, line, target, sides, indexes, head_invento
                 summary_credit=[0,0],mapped_credit=[0,0])
 
 
+def retired_policy_grade_metadata(name, lines, sides, indexes, work):
+    """Prove that removed Tokio wrapper paint covered static assertion arguments."""
+    if name!='src/core/security/policy.rs':
+        return None
+    declaration='official_packages_are_verified_not_locked_by_name'
+    scope=('omg_lib','core','security','policy','tests',declaration)
+    expected=['SecurityGrade','::','Verified']
+    diagnostic='"package names must not mint a Locked SLSA grade"'
+    observations=[]; retired=[]
+    for side,((source,inventory,counts),line,index) in enumerate(zip(sides,lines,indexes,strict=True)):
+        code,rows=inventory[:2]
+        _construct_charge(work,len(rows)+len(code.starts).bit_length())
+        first=bisect.bisect_left(code.starts,code.offsets[line-1])
+        paren=code.parents[first]
+        if paren is None or code.words[paren-2:paren+1]!=['assert_eq','!','(']:
+            return None
+        macro=paren-2;end=code.pairs[paren]
+        if code.words[end+1:end+2]!=[';']:
+            return None
+        args=_boolean_arguments(code,paren)
+        if args is None or len(args)!=3:
+            return None
+        (left,left_end),(right,right_end),(note,note_end)=args
+        grade_call=['SecurityPolicy','::','source_grade','(','&','package','.','package','.','origin',')']
+        if (code.words[left:left_end]!=(grade_call if side else ['grade'])
+                or code.words[right:right_end]!=expected or code.words[note:note_end]!=[diagnostic]
+                or first not in (right,note)):
+            return None
+        metadata=[code.region(a,b-1) for a,b in ((right,right_end),(note,note_end))]
+        metadata.append(code.region(end,end+1))
+        if (any(span[0]!=span[2] for span in metadata)
+                or any((span[0] in counts if side else counts.get(span[0])!=1) for span in metadata)):
+            return None
+        block=code.parents[macro]
+        attrs=('#','[','test',']') if side else ('#','[','tokio','::','test',']','async')
+        funcs=[row for row in rows if row['kind']=='fn' and row['opening']==block and
+               row['header']==(*attrs,'fn',declaration,'(',')')]
+        if len(funcs)!=1:
+            return None
+        function,=funcs
+        context=_boolean_module(code,{'start':function['first']})
+        if context is None or context[:2]!=(['tests'],['tests']):
+            return None
+        invocation=code.region(macro,end+1);entry=code.region(macro,macro+1)
+        declared=code.region(function['first']+len(attrs),block-1)
+        low,high=invocation[:2],invocation[2:]
+        forest=[]
+        for owner in index.inventories.get(name,()):
+            _construct_charge(work,len(owner['regions'])+1)
+            touching=[r for r in owner['regions'] if tuple(r[:2])<high and low<tuple(r[2:4])]
+            if touching:
+                if (owner['count']!=1 or owner.get('branches') or owner.get('mcdc_records')
+                        or index.name_counts[owner['name']]!=1 or len(owner['filenames'])!=1
+                        or index.files.get(owner['filenames'][0])!=name):
+                    return None
+                forest.append((owner,touching))
+        roots=[(owner,raw,shape) for owner,raw in forest if
+               (shape:=plain_rust_function_symbol(owner['name'])) is not None and shape.identifiers==scope]
+        if len(roots)!=1:
+            return None
+        root,raw,shape=roots[0]
+        if [*declared,1,0,0,0] not in root['regions'] or counts.get(entry[0])!=1:
+            return None
+        if side:
+            slots=[entry,code.region(left,left+2),code.region(left+4,left_end-2)]
+            if len(forest)!=1 or sorted(raw)!=sorted([*slot,1,0,0,0] for slot in slots):
+                return None
+        else:
+            children=[rows for owner,rows in forest if direct_rust_callback_symbol(
+                owner['name'],root['name'],shape.modules)]
+            if len(forest)!=2 or raw!=[[*invocation,1,0,0,0]] or children!=[[[*entry,1,0,0,0]]]:
+                return None
+        retired.append([span[0] for span in metadata])
+        observations.append(dict(owners=[o['name'] for o,_ in forest],
+                                 assertion_regions=[r for _,raw in forest for r in raw]))
+    pairs=[list(pair) for pair in zip(*retired,strict=True)]
+    if any(sides[0][0][line-1]!=sides[1][0][target-1] for line,target in pairs):
+        return None
+    return dict(file=name,kind='retired-policy-grade-metadata',retired_lines=pairs,
+                observations=observations,summary_credit=[0,0],mapped_credit=[0,0])
+
+
 _DECLARATION_PARAMETER = re.compile(r"\s*(?:&\s*(?:'[A-Za-z_]\w*\s+)?(?:mut\s+)?self|"
                                     r"[A-Za-z_]\w*\s*:\s*[A-Za-z_]\w*)\s*,\s*", re.ASCII)
 
@@ -9273,7 +11024,9 @@ def retired_declaration_parameter(name, line, target, sides, indexes, head_names
         if qualifiers and re.fullmatch(r"< '[A-Za-z_]\w*(?: , '[A-Za-z_]\w*)* >",qualifiers,re.ASCII) is None:
             return None
         begin = code.position(code.starts[definition['first']]); brace = code.position(code.starts[definition['opening']])
-        end = code.position(code.ends[definition['end']]); entry = (*begin,brace[0],brace[1]-1)
+        end = code.position(code.ends[definition['end']])
+        last_header_token = code.position(code.ends[definition['opening']-1])
+        entry = (*begin, *(last_header_token if last_header_token[0] < brace[0] else (brace[0],brace[1]-1)))
         if not begin[0] < number < brace[0]:
             return None
         holding = code.parents[definition['opening']]
@@ -9286,7 +11039,7 @@ def retired_declaration_parameter(name, line, target, sides, indexes, head_names
                 return None
             implementation, = implementations
             nominal_impl = ' '.join(implementation['header'])
-            match = re.fullmatch(r'impl (super(?: :: super)* :: (?:[A-Za-z_]\w* :: )*[A-Za-z_]\w*) for ([A-Za-z_]\w*)',
+            match = re.fullmatch(r'impl ((?:super(?: :: super)* :: (?:[A-Za-z_]\w* :: )*)?[A-Za-z_]\w*) for ([A-Za-z_]\w*)',
                                  nominal_impl,re.ASCII)
             context = _boolean_module(code, {'start':implementation['first']})
             if match is None or context is None:
@@ -9297,7 +11050,17 @@ def retired_declaration_parameter(name, line, target, sides, indexes, head_names
             crate += tuple(context[0])
             if supers >= len(crate):
                 return None
-            trait = nominal((*crate[:-supers], *path[supers:])); owner_type = nominal((*crate,match[2]))
+            if supers:
+                trait = nominal((*crate[:-supers], *path[supers:]))
+            else:
+                module = code.parents[holding]
+                local_traits = [row for row in rows if row['kind']=='trait' and code.parents[row['opening']]==module
+                                and 'trait' in row['header'] and row['header'][row['header'].index('trait')+1]==path[0]]
+                _construct_charge(work,len(rows))
+                if len(path) != 1 or len(local_traits) != 1:
+                    return None
+                trait = nominal((*crate,*path))
+            owner_type = nominal((*crate,match[2]))
         low = code.position(code.starts[first]); high = code.position(code.ends[last-1]); roots = {}
         roles = declaration_signature_roles(code,args,definition['opening'],source,work)
         signature_low = (min(roles.values(),default=number),1)
@@ -9472,9 +11235,15 @@ def retained_construct_anchors(name, old, new, before, after, base, head, base_f
             if word == 'fn' and code.parents[index] is None:
                 rows.setdefault(code.position(code.starts[index])[0], []).append(index)
         declarations[id(code)] = rows
-        _construct_charge(work, len(inventory[1]) * (len(inventory[1]).bit_length() + 2))
-        ordered = sorted(inventory[1], key=lambda row: row['first'])
-        construct_rows[id(code)] = ordered, [code.position(code.starts[row['first']])[0] for row in ordered]
+    def control_rows(inventory):
+        code, rows = inventory[:2]
+        if id(code) not in construct_rows:
+            _construct_charge(work, len(rows))
+            controls = [row for row in rows if row['supported'] and row['kind'] in ('if', 'for', 'while', 'loop', 'match')]
+            _construct_charge(work, len(controls) * (len(controls).bit_length() + 2))
+            controls.sort(key=lambda row: row['first'])
+            construct_rows[id(code)] = controls, [code.position(code.starts[row['first']])[0] for row in controls]
+        return construct_rows[id(code)]
     def line_counts(side, owner):
         key = side, id(owner)
         if key not in projections:
@@ -9512,14 +11281,13 @@ def retained_construct_anchors(name, old, new, before, after, base, head, base_f
         for inventory, group in zip(inventories, groups):
             by_digest = {}
             code = inventory[0]
-            rows, positions = construct_rows[id(code)]
+            rows, positions = control_rows(inventory)
             first = bisect.bisect_right(positions, group[0])
             last = bisect.bisect_left(positions, group[1])
             _construct_charge(work, last - first)
             for index in range(first, last):
                 row = rows[index]
-                if (row['kind'] in ('if', 'for', 'while', 'loop', 'match') and row['supported']
-                        and group[0] < code.position(code.starts[row['first']])[0]
+                if (group[0] < code.position(code.starts[row['first']])[0]
                         <= code.position(code.starts[row['end']])[0] < group[1]):
                     by_digest.setdefault(row['digest'], []).append(row)
             selected.append(by_digest)
@@ -9674,11 +11442,17 @@ def retained_construct_anchors(name, old, new, before, after, base, head, base_f
     return pairs, receipts
 
 
+def source_line_diff(old, new):
+    if old == new:
+        return [('equal', 0, len(old), 0, len(new))] if old else []
+    return difflib.SequenceMatcher(None, old, new, autojunk=False).get_opcodes()
+
+
 def source_opcodes(old, new, function_scopes, mapped, head_inventory=None, compatible=None,
                    work=None, inventories=None, replacements=None, line_operations=None):
     work = [20_000_000] if work is None else work
     if line_operations is None:
-        line_operations = difflib.SequenceMatcher(None, old, new, autojunk=False).get_opcodes()
+        line_operations = source_line_diff(old, new)
     replacements = replacements if replacements is not None else ({} if old == new else _construct_replacements(
         old, new, work, head_inventory, compatible, inventories, line_operations=line_operations)[0])
     for row in _line_source_opcodes(old, new, function_scopes, mapped, line_operations):
@@ -10958,11 +12732,75 @@ def retained_boolean_argument_paint(name, old, new, before, after, base, head, b
     return results
 
 
-def retained_specialization_additions(name, sides, indexes, work, *, path_reference=False):
+def replaced_cold_arch_snapshot_reader(name, declaration, sides, indexes, work):
+    """Prove that a replaced feed reader contributes no previously covered execution."""
+    if (name != 'src/core/security/vulnerability.rs'
+            or declaration.strip() != 'pub async fn fetch_alsa_issues(&self) -> Result<Vec<AlsaIssue>, VulnerabilityError> {'):
+        return None
+    namespace = ('crate','omg_lib')
+    for component in ('core','security','vulnerability'):
+        namespace = ('type',namespace,(component,''))
+    self_type = ('type',namespace,('VulnerabilityScanner',''))
+    evidence = []
+    for side, ((source, spans, counts, futures), index) in enumerate(zip(sides, indexes, strict=True)):
+        boundaries = {spans.get(id(owner)) for owner in futures}
+        if len(boundaries) != 1 or None in boundaries:
+            return None
+        (first,last,header,_), = boundaries
+        if header != declaration or not 1 <= last-first <= 128:
+            return None
+        if side and source[first:last] != [
+                '        let snapshot = self.arch_snapshot(AssessmentUse::Admission).await?;',
+                '        Ok(snapshot.issues.clone())',
+                '    }']:
+            return None
+        members = []
+        regions = []
+        depths = Counter()
+        seen_futures = set()
+        for owner in index.inventories.get(name, ()):
+            raw = owner['regions']
+            _construct_charge(work, len(raw)+1)
+            if not any(row[0]<=last and first<=row[2] for row in raw):
+                continue
+            symbol = owner['name']
+            _construct_charge(work, len(symbol)+len(raw))
+            shape = nominal_method_path(symbol,inventory=True)
+            if (shape is None or shape.kind!='M' or shape.namespace!=namespace or shape.self_type!=self_type
+                    or shape.method!=('fetch_alsa_issues','') or index.name_counts[symbol]!=1
+                    or len(owner['filenames'])!=1 or index.files.get(owner['filenames'][0])!=name
+                    or owner.get('branches') or owner.get('mcdc_records')
+                    or not 0<=owner['count']<COUNTER_LIMIT or not side and owner['count']!=0
+                    or any(not first<=row[0]<=row[2]<=last or row[5:]!=[0,0,0]
+                           or not 0<=row[4]<COUNTER_LIMIT or not side and row[4]!=0 for row in raw)):
+                return None
+            depth = len(shape.callbacks)
+            depths[depth] += 1
+            if depth==1:
+                seen_futures.add(id(owner))
+            members.append(dict(name=symbol,count=owner['count'],regions_sha256=hashlib.sha256(repr(raw).encode()).hexdigest()))
+            regions.extend(raw)
+        expected = {0:2,1:3} if side else {0:2,1:2,2:8}
+        if depths!=expected or seen_futures!={id(owner) for owner in futures}:
+            return None
+        observer = _ObserverWork(work)
+        observed = dict(_llvm22_rows(_llvm22_segments(regions,observer),observer))
+        _construct_charge(work,last-first+1)
+        if (not observed or observed!={line:counts[line] for line in range(first,last+1) if line in counts}
+                or any(bool(hits)!=bool(side) for hits in observed.values())):
+            return None
+        evidence.append(([first,last],members,list(observed)))
+    return dict(kind='replaced-cold-arch-snapshot-reader',file=name,
+        base_range=evidence[0][0],head_range=evidence[1][0],compiled_owners=[side[1] for side in evidence],
+        preserved_base_mapped=evidence[0][2],pairs=[],summary_credit=[0,0],mapped_credit=[0,0],
+        claim='The complete baseline reader was cold and the replacement reader executes on every mapped line')
+
+
+def retained_specialization_additions(name, sides, indexes, inventory_for_side, work, *, path_reference=False):
     """Match every original specialization and observe additional consumers in full."""
     layouts = []; roles = []; spans = []; containers = []; summaries = []; source_bytes = []; compiled_methods = set()
-    source_tokens = []; previous_source = None; inventory = None
-    for (source, counts, candidates), index in zip(sides, indexes, strict=True):
+    source_tokens = []
+    for side, ((source, counts, candidates), index) in enumerate(zip(sides, indexes, strict=True)):
         _construct_charge(work, sum(3*len(owner['regions'])+1 for owner in candidates))
         bounds = {source_owner_span(owner, name, index.files, source) for owner in candidates}
         if len(bounds) != 1 or None in bounds:
@@ -10971,11 +12809,7 @@ def retained_specialization_additions(name, sides, indexes, work, *, path_refere
         if declaration is None:
             return None
         spans.append((first, last)); source_bytes.append(source[first-1:last])
-        _construct_charge(work,len(source))
-        if source!=previous_source:
-            _construct_charge(work, sum(len(line)+1 for line in source))
-            inventory = _construct_inventory(source, work)
-            previous_source = source
+        inventory = inventory_for_side(side)
         if inventory is None:
             return None
         code, rows = inventory[:2]
@@ -11125,7 +12959,7 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
     construct_work = [SOURCE_CONSTRUCT_WORK_CAPACITY]; complete_head = []; head_inventories = {}; head_capsule_counts = Counter()
     head_fn_names = set(); retirement_receipts = []; retired_declaration_receipts = []
     specialization_receipts = {}
-    retired_assertion_receipts = []; retired_constructor_receipts = []
+    retired_assertion_receipts = []; retired_constructor_receipts = []; retired_policy_metadata = []
     parent_file_cache = {}; method_parent_files = None; plain_parent_files = None; owner_indexes = None
     def source_owner_indexes():
         nonlocal owner_indexes
@@ -11184,6 +13018,16 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
     for name in bs:
         old = base_sources[name].decode("utf-8").splitlines()
         new = head_sources[name].decode("utf-8").splitlines()
+        same_source = base_sources[name] == head_sources[name]
+        base_inventory = []
+
+        def inventory_for_side(side):
+            if side or same_source:
+                return head_constructs(name)
+            if not base_inventory:
+                base_inventory.append(_construct_inventory(old, construct_work))
+            return base_inventory[0]
+
         before, after = bs[name]["counts"], hs[name]["counts"]
         if any(line > len(old) for line in before) or any(line > len(new) for line in after):
             raise ValueError("Coverage line exceeds exact source blob")
@@ -11255,7 +13099,7 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
             for other in function_scopes)]
         source_structure = None
         shared_prefixes = None
-        if base_sources[name] == head_sources[name]:
+        if same_source:
             _construct_charge(construct_work, sum(len(line) + 1 for line in old))
             source_structure = _source_structural_map(old)
             if source_structure is not None:
@@ -11271,6 +13115,7 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
             for groups in (base_groups, head_groups) for group in groups.values()))
         closed = [{frozenset(id(owner) for owner in group[2]) for group in groups.values()}
                   for groups in (base_groups, head_groups)]
+        cold_replacements = []
         for declaration in base_declarations.keys() & head_declarations.keys():
             previous, current = base_declarations[declaration], head_declarations[declaration]
             _construct_charge(construct_work, len(previous) + len(current) + 1)
@@ -11282,7 +13127,7 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
                     path_reference = all(owner['name'].startswith('_RINvM') for owner in candidates)
                     default_trait = all(owner['name'].startswith('_RNvY') for owner in candidates)
                     proof = retained_specialization_additions(name, ((old, before, previous), (new, after, current)),
-                        source_owner_indexes(), construct_work, path_reference=path_reference) if (
+                        source_owner_indexes(), inventory_for_side, construct_work, path_reference=path_reference) if (
                             path_reference or default_trait) else None
                     if proof is not None:
                         for line, target in proof['pairs']:
@@ -11292,6 +13137,14 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
                         key = 'additive_path_reference_copies' if path_reference else 'additive_trait_copies'
                         specialization_receipts.setdefault(key, []).append(proof)
                         continue
+                    if name=='src/core/security/vulnerability.rs' and 'fetch_alsa_issues(' in declaration:
+                        proof = replaced_cold_arch_snapshot_reader(name,declaration,
+                            ((old,base_spans,before,previous),(new,head_spans,after,current)),
+                            source_owner_indexes(),construct_work)
+                        if proof is not None:
+                            cold_replacements.append(proof)
+                            obligation_receipts.append(proof)
+                            continue
                 raise ValueError(f'Ambiguous unchanged source correspondence: {name}; '
                                  'Retained covered line requires a complete compiled-copy inventory')
             if frozenset(map(id, current)) not in closed[1]:
@@ -11323,7 +13176,7 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
                     completion_receipts.append(dict(file=name, pairs=[[group[1], target[1]]],
                         source_prefix_sha256=hashlib.sha256(prefix.encode()).hexdigest(),
                         base_instance_states=states[0], head_instance_states=states[1], instance_matching=matching))
-        inventories = None if old == new else (_construct_inventory(old, construct_work), head_constructs(name))
+        inventories = None if old == new else tuple(inventory_for_side(side) for side in (0, 1))
         construct_pairs, witnesses = retained_construct_anchors(name, old, new, before, after,
             bf, hf, base_files, head_files, construct_work, inventories, grouped)
         anchored.update(construct_pairs); construct_receipts.extend(witnesses)
@@ -11349,6 +13202,12 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
                 for number in range(group[0], group[1] + 1):
                     rows[number] = (prefix, group) if number not in rows else None
             partitions.append(rows)
+        compatible_head_scopes = {}
+        if inventories is not None:
+            for start, end, newstart, newend in set(function_scopes):
+                _construct_charge(construct_work, end - start + 1)
+                for line in range(start, end + 1):
+                    compatible_head_scopes[line] = (newstart, newend)
         def compatible_replacement(line, target, kind):
             if kind == 'control-endpoint':
                 return before.get(line, 0) > 0 and target not in after
@@ -11373,12 +13232,12 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
                             record_projections[key] = _owner_line_counts(owner, record_work)
                         state.append(int(record_projections[key].get(number, 0) > 0))
                 return True
-            _construct_charge(construct_work, len(function_scopes))
-            return (any(start <= line <= end and newstart <= target <= newend
-                        for start, end, newstart, newend in function_scopes)
+            _construct_charge(construct_work, 1)
+            bounds = compatible_head_scopes.get(line)
+            return (bounds is not None and bounds[0] <= target <= bounds[1]
                     or kind == 'statement' and left is not None and right is not None
                     and left[0] in removed_prefixes and len(left[1][2]) == len(right[1][2]))
-        line_operations = difflib.SequenceMatcher(None, old, new, autojunk=False).get_opcodes()
+        line_operations = source_line_diff(old, new)
         replacement_candidates = {} if old == new else _construct_replacements(
             old, new, construct_work, head_construct_inventory, compatible_replacement, inventories,
             deferred=True, line_operations=line_operations)[0]
@@ -11410,6 +13269,15 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
             construct_work, head_capsule_counts, parent_files, record_indexes=source_owner_indexes,
             record_expansions=(bs[name]['expansions'],hs[name]['expansions']),island_blobs=(base_sources,head_sources),
             line_operations=line_operations) if inventories is not None else ({}, [], set())
+        if (name == 'src/core/security/vulnerability.rs' and inventories is not None
+                and bs[name]['expansions'] == hs[name]['expansions'] == []):
+            request = osv_request_obligations((old,new), (before,after), inventories, grouped, construct_work)
+            if request is not None:
+                for line, target in request['pairs']:
+                    if line in obligation_pairs and obligation_pairs[line] != target:
+                        raise ValueError('Ambiguous OSV request correspondence')
+                    obligation_pairs[line] = target
+                residual_receipts.append(dict(file=name, **request))
         anchored.update(obligation_pairs); obligation_receipts.extend(residual_receipts)
         retained_statement_rows = {}
         def retire_declaration(line,target):
@@ -11486,13 +13354,15 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
                 if (line, target) in proved_eager_pairs:
                     retained[line] = target
                 elif line not in anchored:
-                    if (name=='src/core/security/policy.rs' and inventories is not None
+                    if (inventories is not None
                             and old[line-1]==new[target-1]
-                            and old[line-1].strip()=='minimum_grade: SecurityGrade::Community,'
+                            and (name,old[line-1].strip()) in (
+                                ('src/core/security/policy.rs','minimum_grade: SecurityGrade::Community,'),
+                                ('src/core/security/vulnerability.rs','client: shared_client().clone(),'))
                             and (bs[name]['expansions'],hs[name]['expansions'])==([],[])):
                         sides=((old,inventories[0],base_spans,before,line),
                                (new,inventories[1],head_spans,after,target))
-                        proof=retained_policy_default_record(name,sides,source_owner_indexes(),construct_work)
+                        proof=retained_eager_tail_record(name,sides,source_owner_indexes(),construct_work)
                         if proof is not None:
                             if any(n in anchored and anchored[n]!=t for n,t in proof['pairs']):
                                 raise ValueError('Ambiguous policy default correspondence')
@@ -11500,18 +13370,23 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
                             obligation_receipts.append(proof)
                             continue
                     entry_source = None
+                    entry_lines = (line,target)
                     if inventories is not None and old[line-1]==new[target-1]:
                         if old[line-1].strip()=='anyhow::ensure!(':
                             entry_source=ensure_entry_source
+                        elif (name=='src/package_managers/aur/client.rs' and min(line,target)>3
+                              and old[line-1].strip()=='&& files.len() < 10_000,'):
+                            entry_source=ensure_entry_source
+                            entry_lines=(line-3,target-3)
                         elif name=='src/package_managers/alpm_ops.rs' and old[line-1].strip()==_MAP_CAPACITY_LINE:
                             entry_source=map_capacity_entry_source
                         elif name == 'src/package_managers/alpm_ops.rs' and old[line - 1].strip() == _ALPM_UPDATE_RECORD_LINE:
                             entry_source = alpm_update_record_entry_source
                     if entry_source is not None and (bs[name]['expansions'],hs[name]['expansions'])==([],[]):
-                        sides=((old,inventories[0],base_spans,before,line),
-                               (new,inventories[1],head_spans,after,target))
+                        sides=((old,inventories[0],base_spans,before,entry_lines[0]),
+                               (new,inventories[1],head_spans,after,entry_lines[1]))
                         proof=retained_observed_entry(name,sides,source_owner_indexes(),construct_work,entry_source)
-                        if proof is not None:
+                        if proof is not None and [line,target] in proof['pairs']:
                             if any(previous in anchored and anchored[previous] != current
                                    for previous, current in proof['pairs']):
                                 raise ValueError('Ambiguous retained entry correspondence')
@@ -11566,7 +13441,7 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
         for start, end in replaced_functions:
             _construct_charge(construct_work, end - start + 1)
             gone.difference_update(range(start, end + 1))
-        for receipt in residual_receipts:
+        for receipt in (*residual_receipts,*cold_replacements):
             protected=receipt.get('preserved_base_mapped',())
             _construct_charge(construct_work,len(protected))
             gone.difference_update(protected)
@@ -11748,6 +13623,21 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
                                  f'at {name}:{line} -> {fragment.target} ({fragment.kind})')
         retained.update(positive)
         positive_receipts.extend(receipts)
+        if (name=='src/core/security/policy.rs' and inventories is not None
+                and (bs[name]['expansions'],hs[name]['expansions'])==([],[])):
+            _construct_charge(construct_work,len(retained))
+            for line,target in list(retained.items()):
+                if (target in after or line in anchored or old[line-1]!=new[target-1]
+                        or old[line-1].strip()!='SecurityGrade::Verified,'):
+                    continue
+                proof=retired_policy_grade_metadata(name,(line,target),
+                    ((old,inventories[0],before),(new,inventories[1],after)),source_owner_indexes(),construct_work)
+                if proof is not None and all(previous not in anchored and retained.get(previous,current)==current
+                                             for previous,current in proof['retired_lines']):
+                    for previous,_ in proof['retired_lines']:
+                        retained.pop(previous,None)
+                        gone.discard(previous)
+                    retired_policy_metadata.append(proof)
         gone.difference_update(anchored)
         anchored_new = set(anchored.values())
         paint = []
@@ -11838,6 +13728,8 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
         paint_receipt['retired_async_test_constructor_delimiters']=retired_constructor_receipts
     if retired_assertion_receipts:
         paint_receipt['retired_assertion_delimiters'] = retired_assertion_receipts
+    if retired_policy_metadata:
+        paint_receipt['retired_policy_grade_metadata'] = retired_policy_metadata
     paint_receipt.update(specialization_receipts)
     if construct_receipts:
         paint_receipt['retained_constructs'] = construct_receipts

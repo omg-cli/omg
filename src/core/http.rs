@@ -155,7 +155,19 @@ pub(crate) async fn fetch_public_download_fresh(
     user_agent: &str,
     total_timeout: Option<Duration>,
 ) -> anyhow::Result<reqwest::Response> {
-    fetch_public_download_with_options(raw, user_agent, total_timeout, None, false, true).await
+    let request =
+        || fetch_public_download_with_options(raw, user_agent, total_timeout, None, false, true);
+    match request().await {
+        // A transient timeout could invalidate a review already accepted by the user.
+        Err(error)
+            if error
+                .downcast_ref::<reqwest::Error>()
+                .is_some_and(reqwest::Error::is_timeout) =>
+        {
+            request().await
+        }
+        result => result,
+    }
 }
 
 /// Request the remaining bytes of a public archive using a strong entity tag.
@@ -862,6 +874,14 @@ mod metadata_limit_tests {
                     let line = request.lines().next().unwrap().to_owned();
                     anyhow::ensure!(line == "GET /manifest HTTP/1.1", "unexpected request");
                     requests.push(request);
+                    if response.is_empty() {
+                        let closed = stream
+                            .read_u8()
+                            .await
+                            .expect_err("timed-out client must close");
+                        assert_eq!(closed.kind(), std::io::ErrorKind::UnexpectedEof);
+                        continue;
+                    }
                     let header_end = response
                         .windows(4)
                         .position(|bytes| bytes == b"\r\n\r\n")
@@ -930,6 +950,19 @@ mod metadata_limit_tests {
                 assert!(headers.lines().any(|line| line == "user-agent: omg-runtime-security-fixture"));
                 assert_eq!(headers.lines().filter(|line| line.starts_with("cache-control:")).collect::<Vec<_>>(), if index < 2 { vec!["cache-control: no-cache"] } else { Vec::new() }, "request {index} must preserve its cache policy across redirects");
             }
+            let success = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec();
+            let retry = RetryFixture::new(vec![Vec::new(), success], false).await?;
+            let timeout = Some(Duration::from_millis(250));
+            let fresh = fetch_public_download_fresh(&retry.url, "omg-runtime-security-fixture", timeout).await?;
+            assert_eq!(fresh.text().await?, "ok");
+            let requests = retry.finish().await?;
+            assert_eq!(requests.len(), 2, "fresh advisory reads recover from one silent timeout");
+            assert!(requests.iter().all(|request| request.to_ascii_lowercase().contains("cache-control: no-cache\r\n")));
+            let exhausted = RetryFixture::new(vec![Vec::new(), Vec::new()], false).await?;
+            let error = fetch_public_download_fresh(&exhausted.url, "omg-runtime-security-fixture", timeout)
+                .await.expect_err("a second timeout must remain an error");
+            assert!(error.downcast_ref::<reqwest::Error>().is_some_and(reqwest::Error::is_timeout));
+            assert_eq!(exhausted.finish().await?.len(), 2);
             Ok(())
         })
     }

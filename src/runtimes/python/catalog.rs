@@ -270,6 +270,7 @@ mod tests {
             let error = parse_catalog(catalog(selected), target).unwrap_err();
             assert!(error.to_string().starts_with(expected), "{error:#}");
         }
+        assert!(parse_catalog(catalog(original.clone()), target).is_ok());
     }
 
     #[test]

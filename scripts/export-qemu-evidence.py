@@ -178,9 +178,17 @@ def allowed_file(parts):
         return name in {"tests.xml", "verification.json", "expected-tests.tsv", "passed.tsv",
                         "process-checks.tsv", "db-before.txt", "db-after.txt", "identity.txt",
                         "artifacts.sha256", "artifact-check.txt", "all-stages-pass.txt"} or re.fullmatch(
-            r"(?:omarchy-(?:success|vendor-failure|declined|optional-failures|migration-refusal|unsupported-mode|invalid-transport|snapshot-missing|snapshot-unsupported|required-helper-missing|reboot-decline|reboot-accept|reboot-failure|authorization-refresh|authorization-denied|runtime-fallback|runtime-foreign-lock|interrupted|output-closed|terminal-closed|preflight-failure|confirmation-failure|development-failure|inhibitor-start-failure|inhibitor-stop-failure)"
+            r"(?:omarchy-(?:success|vendor-failure|unknown-signing-key|declined|optional-failures|migration-refusal|"
+            r"unsupported-mode|invalid-transport|snapshot-missing|snapshot-unsupported|required-helper-missing|"
+            r"reboot-decline|reboot-accept|reboot-failure|authorization-refresh|authorization-denied|runtime-fallback|"
+            r"runtime-foreign-lock|interrupted|output-closed|terminal-closed|preflight-failure|confirmation-failure|"
+            r"development-failure|inhibitor-start-failure|inhibitor-stop-failure|current-kernel|dev-config-unreadable|"
+            r"aur-unavailable|platform-keyring(?:-unreadable|-untrusted|-oversize)?)"
             r"(?:\.log|-helpers\.tsv|-native-state\.json|-transcript\.log|-coordination\.txt|-layout\.txt|-interaction\.json|-control\.json|-authorization\.json|-authorization\.log|-exit\.txt)"
-            r"|arch-(?:dry-run|check)(?:\.log|-native-state\.json|-isolation\.txt)|test-[0-9]{2}\.log|daemon\.log|cli-(?:q|v|vv|vvv)\.log)", name
+            r"|omarchy-(?:unknown-signing-key|aur-unavailable)-unknown\.json"
+            r"|omarchy-platform-keyring-(?:unreadable|untrusted|oversize)-platform-keyrings\.txt"
+            r"|arch-(?:dry-run|check|aur-unavailable)(?:\.log|-native-state\.json|-isolation\.txt|-exit\.txt)"
+            r"|test-[0-9]{2}\.log|daemon\.log|cli-(?:q|v|vv|vvv)\.log)", name
         ) is not None
     if parent == ("guest",):
         return name in {"serial.log", "qemu-startup.log"}

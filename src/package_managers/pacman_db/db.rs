@@ -12,7 +12,7 @@ use flate2::read::GzDecoder;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufReader, Cursor, Read, Seek, Write};
 use std::os::unix::{
@@ -35,6 +35,8 @@ const CACHE_TTL_SECS: u64 = 30 * 60;
 const MAX_DESC_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_SYNC_ENTRIES: usize = 100_000;
 const MAX_DERIVED_CACHE_BYTES: u64 = 512 * 1024 * 1024;
+const SYNC_CACHE_NAME: &str = "sync_db_source_v5";
+const LOCAL_CACHE_NAME: &str = "local_db_source_v5";
 
 /// Sync database cache, validated against its source identity on reuse.
 static SYNC_DB_CACHE: std::sync::LazyLock<RwLock<DbCache>> =
@@ -664,6 +666,19 @@ fn parse_desc_content(content: &str, repo: &str) -> Result<ParsedSyncDesc> {
 }
 
 fn parse_desc_manual(content: &str, repo: &str) -> Result<SyncDbPackage> {
+    validate_desc_cardinality(
+        content,
+        &[
+            "%NAME%",
+            "%VERSION%",
+            "%DESC%",
+            "%URL%",
+            "%ARCH%",
+            "%CSIZE%",
+            "%ISIZE%",
+            "%FILENAME%",
+        ],
+    )?;
     let mut pkg = SyncDbPackage {
         repo: repo.to_string(),
         ..SyncDbPackage::default()
@@ -716,6 +731,35 @@ fn parse_desc_manual(content: &str, repo: &str) -> Result<SyncDbPackage> {
 
     anyhow::ensure!(has_version, "Missing package version in repository {repo}");
     Ok(pkg)
+}
+
+fn validate_desc_cardinality(content: &str, scalar_sections: &[&str]) -> Result<()> {
+    // Sparse vendor records still follow the upstream section cardinality rules.
+    let mut sections = HashSet::new();
+    let mut scalar = None;
+    let mut value_seen = false;
+    for line in content
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        if line.starts_with('%') && line.ends_with('%') {
+            anyhow::ensure!(
+                sections.insert(line),
+                "Duplicate descriptor section {}",
+                crate::cli::style::sanitize_terminal_text(line)
+            );
+            scalar = scalar_sections.contains(&line).then_some(line);
+            value_seen = false;
+        } else if let Some(section) = scalar {
+            anyhow::ensure!(
+                !value_seen,
+                "Multiple values in descriptor section {section}"
+            );
+            value_seen = true;
+        }
+    }
+    Ok(())
 }
 
 /// Doctor resolves dependencies from one validated package snapshot.
@@ -839,6 +883,7 @@ mod native_health_tests {
     async fn native_health_accepts_shared_directories_without_writes_or_repository_access() {
         let owner = tempfile::tempdir().unwrap();
         let database = owner.path();
+        let local = database.join("local");
         package(
             database,
             "app",
@@ -851,15 +896,13 @@ mod native_health_tests {
             "%PROVIDES%\nvirtual=2\n\n",
             "usr/\nusr/lib/provider",
         );
-        std::fs::write(database.join("local/ALPM_DB_VERSION"), "9\n").unwrap();
-        let before = super::LocalHealthSnapshot::capture(&database.join("local")).unwrap();
-        let report = check_native_local_db_health(&database.join("local"))
-            .await
-            .unwrap();
+        std::fs::write(local.join("ALPM_DB_VERSION"), "9\n").unwrap();
+        let before = super::LocalHealthSnapshot::capture(&local).unwrap();
+        let report = check_native_local_db_health(&local).await.unwrap();
         assert_eq!(report.packages, 2);
         assert!(report.missing.is_empty());
         report.native.unwrap();
-        before.revalidate(&database.join("local")).unwrap();
+        before.revalidate(&local).unwrap();
         assert!(!database.join("db.lck").exists());
         assert!(!database.join("sync").exists());
     }
@@ -880,19 +923,18 @@ mod native_health_tests {
             ("", "usr/bin/shared", "Duplicate installed file ownership"),
         ] {
             let owner = tempfile::tempdir().unwrap();
+            let local = owner.path().join("local");
             package(owner.path(), "app", extra, files);
             package(owner.path(), "other", "", "usr/bin/shared");
-            std::fs::write(owner.path().join("local/ALPM_DB_VERSION"), "9\n").unwrap();
-            let before = super::LocalHealthSnapshot::capture(&owner.path().join("local")).unwrap();
-            let report = check_native_local_db_health(&owner.path().join("local"))
-                .await
-                .unwrap();
+            std::fs::write(local.join("ALPM_DB_VERSION"), "9\n").unwrap();
+            let before = super::LocalHealthSnapshot::capture(&local).unwrap();
+            let report = check_native_local_db_health(&local).await.unwrap();
             let error = report.native.expect_err("unhealthy native database");
             assert!(
                 error.to_string().contains(expected),
                 "{expected}: {error:#}"
             );
-            before.revalidate(&owner.path().join("local")).unwrap();
+            before.revalidate(&local).unwrap();
             assert!(!owner.path().join("db.lck").exists());
         }
     }
@@ -1171,6 +1213,18 @@ fn parse_local_desc_content(content: &str) -> Result<LocalDbPackage> {
 }
 /// Manual local desc parser as fallback
 fn parse_local_desc_manual(content: &str) -> Result<LocalDbPackage> {
+    validate_desc_cardinality(
+        content,
+        &[
+            "%NAME%",
+            "%VERSION%",
+            "%DESC%",
+            "%INSTALLDATE%",
+            "%URL%",
+            "%SIZE%",
+            "%REASON%",
+        ],
+    )?;
     let mut name = String::new();
     let mut version = String::new();
     let mut desc = String::new();
@@ -1552,9 +1606,8 @@ fn ensure_cache_loaded<C: PackageCache>(
 /// Ensure sync cache is loaded (fast if already loaded)
 fn ensure_sync_cache_loaded(sync_dir: &Path) -> Result<()> {
     let current_epoch = SyncDbEpoch::from_configured_sync_dir(sync_dir)?;
-    // v4 also requires complete compressed-stream validation. Older cache
-    // records may have been derived without checking their source footer.
-    ensure_cache_loaded(&SYNC_DB_CACHE, "sync_db_source_v4", current_epoch, || {
+    // Older cache generations may contain descriptors accepted before cardinality checks.
+    ensure_cache_loaded(&SYNC_DB_CACHE, SYNC_CACHE_NAME, current_epoch, || {
         let packages = load_sync_packages(sync_dir)?;
         anyhow::ensure!(
             current_epoch == SyncDbEpoch::from_configured_sync_dir(sync_dir)?,
@@ -1574,8 +1627,8 @@ fn ensure_sync_cache_loaded(sync_dir: &Path) -> Result<()> {
 /// Ensure local cache is loaded (fast if already loaded)
 fn ensure_local_cache_loaded(local_dir: &Path) -> Result<()> {
     let current_epoch = LocalDbEpoch::from_local_dir(local_dir)?;
-    // v4 also retains URL and installed size for Rust package-info queries.
-    ensure_cache_loaded(&LOCAL_DB_CACHE, "local_db_source_v4", current_epoch, || {
+    // Revalidate installed descriptors before using fields from an older generation.
+    ensure_cache_loaded(&LOCAL_DB_CACHE, LOCAL_CACHE_NAME, current_epoch, || {
         let packages = parse_local_db(local_dir)?;
         #[cfg(test)]
         AFTER_LOCAL_PARSE.with(|hook| {
@@ -1817,9 +1870,11 @@ pub fn invalidate_caches() -> Result<()> {
 
 fn invalidate_derived_cache_files(cache_dir: &Path) -> Result<()> {
     for name in [
+        SYNC_CACHE_NAME,
         "sync_db_source_v4",
         "sync_db_source_v3",
         "sync_db_source_v2",
+        LOCAL_CACHE_NAME,
         "local_db_source_v4",
         "local_db_source_v3",
         "local_db_source_v2",
@@ -2426,6 +2481,7 @@ mod tests {
         )
         .unwrap();
         let cache = temp.path().join("cache");
+        let config_dir = temp.path().join("config");
         struct Restore;
         impl Drop for Restore {
             fn drop(&mut self) {
@@ -2444,6 +2500,7 @@ mod tests {
                 ("OMG_TEST_MODE", None),
                 ("OMG_PACMAN_CONF", Some(conf.to_str().unwrap())),
                 ("OMG_CACHE_DIR", Some(cache.to_str().unwrap())),
+                ("OMG_CONFIG_DIR", Some(config_dir.to_str().unwrap())),
             ],
             || run(&db),
         );
@@ -2770,6 +2827,67 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
+    fn older_caches_cannot_skip_descriptor_cardinality_validation() {
+        batch2_catalog_fixture(
+            "package_managers::pacman_db::db::tests::older_caches_cannot_skip_descriptor_cardinality_validation",
+            "[core]\n",
+            |db| {
+                let sync_dir = db.join("sync");
+                let sync = "%NAME%\nwidget\n\n%VERSION%\n2-1\n\n%NAME%\nwidget\n\n";
+                write_sync_identity_fixture(
+                    &sync_dir.join("core.db"),
+                    &[("widget-2-1/desc", sync)],
+                );
+                let old_sync = DbCache {
+                    packages: vec![RepositoryPackages {
+                        name: "core".into(),
+                        usage: RepoUsage::ALL,
+                        packages: Ok(HashMap::from([(
+                            "widget".into(),
+                            SyncDbPackage {
+                                name: "widget".into(),
+                                version: require_package_version("2-1").unwrap(),
+                                repo: "core".into(),
+                                ..SyncDbPackage::default()
+                            },
+                        )])),
+                    }],
+                    last_modified: Some(SyncDbEpoch::from_configured_sync_dir(&sync_dir).unwrap()),
+                    ..DbCache::default()
+                };
+                save_cache_to_disk(&old_sync, "sync_db_source_v4").unwrap();
+                let error =
+                    check_updates_cached().expect_err("validate source before showing updates");
+                assert!(format!("{error:#}").contains("Duplicate descriptor section %NAME%"));
+
+                let local_dir = db.join("local");
+                fs::write(
+                    local_dir.join("widget-1/desc"),
+                    "%NAME%\nwidget\n\n%VERSION%\n1-1\n\n%NAME%\nwidget\n\n",
+                )
+                .unwrap();
+                let old_local = LocalDbCache {
+                    packages: HashMap::from([(
+                        "widget".into(),
+                        LocalDbPackage {
+                            name: "widget".into(),
+                            version: require_package_version("1-1").unwrap(),
+                            ..LocalDbPackage::default()
+                        },
+                    )]),
+                    last_modified: Some(LocalDbEpoch::from_local_dir(&local_dir).unwrap()),
+                    ..LocalDbCache::default()
+                };
+                save_cache_to_disk(&old_local, "local_db_source_v4").unwrap();
+                let error =
+                    get_local_package("widget").expect_err("validate installed source metadata");
+                assert!(format!("{error:#}").contains("Duplicate descriptor section %NAME%"));
+            },
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn installed_info_uses_source_metadata_instead_of_derived_cache() {
         batch2_catalog_fixture(
             "package_managers::pacman_db::db::tests::installed_info_uses_source_metadata_instead_of_derived_cache",
@@ -2793,7 +2911,7 @@ mod tests {
                     .unwrap()
                     .unwrap();
                 assert_eq!(info.description, "source description");
-                save_cache_to_disk(&*read_lock(&LOCAL_DB_CACHE), "local_db_source_v4").unwrap();
+                save_cache_to_disk(&*read_lock(&LOCAL_DB_CACHE), LOCAL_CACHE_NAME).unwrap();
                 *write_lock(&LOCAL_DB_CACHE) = LocalDbCache::default();
                 assert_eq!(
                     get_local_package("widget").unwrap().unwrap().desc,
@@ -2874,7 +2992,7 @@ mod tests {
                     "old cache must not erase installed IgnoreGroup membership"
                 );
                 assert_eq!(fs::read(&old_path).unwrap(), bytes);
-                assert!(cache_dir.join("local_db_source_v4.bin").is_file());
+                assert!(cache_dir.join(format!("{LOCAL_CACHE_NAME}.bin")).is_file());
             },
         );
     }
@@ -3168,6 +3286,69 @@ mod tests {
         format!(
             "%FILENAME%\n{name}-{file_version}-x86_64.pkg.tar.zst\n\n%NAME%\n{name}\n\n%BASE%\n{name}\n\n%VERSION%\n{version}\n\n%DESC%\nComplete typed metadata\n\n%GROUPS%\nfixture-group\n\n%CSIZE%\n1024\n\n%ISIZE%\n4096\n\n%SHA256SUM%\n0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n\n{v1_fields}%URL%\nhttps://example.invalid/widget\n\n%LICENSE%\nMIT\n\n%ARCH%\nx86_64\n\n%BUILDDATE%\n1700000000\n\n%PACKAGER%\nOMG Fixture <fixture@example.invalid>\n\n%DEPENDS%\nglibc>=2.40\n\n%MAKEDEPENDS%\ncmake>=3\n\n%CHECKDEPENDS%\npytest\n\n%OPTDEPENDS%\noptional: runtime support\n\n%PROVIDES%\nvirtual-widget=1\n\n%CONFLICTS%\nincompatible-widget<2\n\n%REPLACES%\nolder-widget\n\n"
         )
+    }
+
+    #[test]
+    fn repository_fallback_rejects_repeated_descriptor_sections_and_values() {
+        let directory = tempfile::tempdir().expect("private repository fixture");
+        let path = directory.path().join("extra.db");
+        for legacy in [false, true] {
+            let descriptor = typed_sync_projection_fixture("widget", "1-1", legacy);
+            for (malformed, expected) in [
+                (
+                    format!("{descriptor}%NAME%\nwidget\n\n"),
+                    "Duplicate descriptor section %NAME%",
+                ),
+                (
+                    format!("{descriptor}%LICENSE%\nMIT\n\n"),
+                    "Duplicate descriptor section %LICENSE%",
+                ),
+                (
+                    descriptor.replace("%VERSION%\n1-1\n", "%VERSION%\n1-1\n1-1\n"),
+                    "Multiple values in descriptor section %VERSION%",
+                ),
+            ] {
+                let upstream_rejected = if legacy {
+                    alpm_repo_db::desc::RepoDescFileV1::from_str(&malformed).is_err()
+                } else {
+                    alpm_repo_db::desc::RepoDescFileV2::from_str(&malformed).is_err()
+                };
+                assert!(
+                    upstream_rejected,
+                    "upstream requires a single descriptor section"
+                );
+                write_sync_identity_fixture(&path, &[("widget-1-1/desc", &malformed)]);
+                let all = parse_sync_db(&path, "extra").expect_err(expected);
+                assert!(format!("{all:#}").contains(expected));
+                let exact = parse_sync_db_package(&path, "extra", "widget").expect_err(expected);
+                assert!(format!("{exact:#}").contains(expected));
+            }
+        }
+    }
+
+    #[test]
+    fn local_fallback_rejects_repeated_descriptor_sections_and_values() {
+        let descriptor = "%NAME%\nwidget\n\n%VERSION%\n1-1\n\n%LICENSE%\nMIT\nBSD-2-Clause\n\n";
+        let ordinary =
+            parse_local_desc_content(descriptor).expect("valid sparse installed metadata");
+        assert_eq!(ordinary.licenses, ["MIT", "BSD-2-Clause"]);
+        for (malformed, expected) in [
+            (
+                format!("{descriptor}%NAME%\nwidget\n\n"),
+                "Duplicate descriptor section %NAME%",
+            ),
+            (
+                format!("{descriptor}%LICENSE%\nMIT\n\n"),
+                "Duplicate descriptor section %LICENSE%",
+            ),
+            (
+                descriptor.replace("%VERSION%\n1-1\n", "%VERSION%\n1-1\n1-1\n"),
+                "Multiple values in descriptor section %VERSION%",
+            ),
+        ] {
+            let error = parse_local_desc_content(&malformed).expect_err(expected);
+            assert!(format!("{error:#}").contains(expected));
+        }
     }
 
     #[test]
@@ -4617,9 +4798,9 @@ mod tests {
                 }],
                 ..DbCache::default()
             };
-            save_cache_to_disk_in(&sync, directory.path(), "sync_db_source_v4")?;
+            save_cache_to_disk_in(&sync, directory.path(), SYNC_CACHE_NAME)?;
             let loaded_sync: Result<DbCache> =
-                load_cache_from_disk_in(directory.path(), "sync_db_source_v4");
+                load_cache_from_disk_in(directory.path(), SYNC_CACHE_NAME);
             assert_eq!(
                 loaded_sync.is_ok(),
                 !raw.contains('\0'),
@@ -4637,9 +4818,9 @@ mod tests {
                 )]),
                 ..LocalDbCache::default()
             };
-            save_cache_to_disk_in(&local, directory.path(), "local_db_source_v4")?;
+            save_cache_to_disk_in(&local, directory.path(), LOCAL_CACHE_NAME)?;
             let loaded_local: Result<LocalDbCache> =
-                load_cache_from_disk_in(directory.path(), "local_db_source_v4");
+                load_cache_from_disk_in(directory.path(), LOCAL_CACHE_NAME);
             assert_eq!(
                 loaded_local.is_ok(),
                 !raw.contains('\0'),
@@ -4659,10 +4840,18 @@ mod tests {
         fs::write(directory.path().join("sync_db.bin"), b"legacy cache")?;
         fs::write(
             directory.path().join("sync_db_source_v4.bin"),
+            b"older derived cache",
+        )?;
+        fs::write(
+            directory.path().join(format!("{SYNC_CACHE_NAME}.bin")),
             bitcode::serialize(&cache)?,
         )?;
-        let decoded: DbCache = load_cache_from_disk_in(directory.path(), "sync_db_source_v4")?;
+        let decoded: DbCache = load_cache_from_disk_in(directory.path(), SYNC_CACHE_NAME)?;
         assert_eq!(decoded.last_modified, cache.last_modified);
+        assert_eq!(
+            fs::read(directory.path().join("sync_db_source_v4.bin"))?,
+            b"older derived cache"
+        );
         assert_eq!(
             fs::read(directory.path().join("sync_db.bin"))?,
             b"legacy cache"
@@ -4674,9 +4863,11 @@ mod tests {
     fn invalidate_derived_cache_files_removes_live_and_legacy_names() -> Result<()> {
         let directory = tempfile::tempdir()?;
         for name in [
+            "sync_db_source_v5.bin",
             "sync_db_source_v4.bin",
             "sync_db_source_v3.bin",
             "sync_db_source_v2.bin",
+            "local_db_source_v5.bin",
             "local_db_source_v4.bin",
             "local_db_source_v3.bin",
             "local_db_source_v2.bin",
@@ -4691,9 +4882,11 @@ mod tests {
         }
         invalidate_derived_cache_files(directory.path())?;
         for name in [
+            "sync_db_source_v5.bin",
             "sync_db_source_v4.bin",
             "sync_db_source_v3.bin",
             "sync_db_source_v2.bin",
+            "local_db_source_v5.bin",
             "local_db_source_v4.bin",
             "local_db_source_v3.bin",
             "local_db_source_v2.bin",
@@ -5988,9 +6181,8 @@ mod tests {
         };
 
         fs::write(temp.path().join("local_db_rdeps.bin"), b"legacy cache").unwrap();
-        save_cache_to_disk_in(&cache, temp.path(), "local_db_source_v4").unwrap();
-        let loaded: LocalDbCache =
-            load_cache_from_disk_in(temp.path(), "local_db_source_v4").unwrap();
+        save_cache_to_disk_in(&cache, temp.path(), LOCAL_CACHE_NAME).unwrap();
+        let loaded: LocalDbCache = load_cache_from_disk_in(temp.path(), LOCAL_CACHE_NAME).unwrap();
         assert!(loaded.packages.contains_key("firefox"));
         assert_eq!(loaded.last_modified, cache.last_modified);
         assert_eq!(
