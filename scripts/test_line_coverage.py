@@ -1954,6 +1954,61 @@ class RetainedAurHookRenderingTests(unittest.TestCase):
                     self.assertIsNone(proof)
 
 
+class MovedAurHistoryDiagnosticTests(unittest.TestCase):
+    def test_exact_history_diagnostic_move_preserves_each_compiled_copy(self):
+        filenames = ('src/package_managers/aur/client.rs', 'src/package_managers/aur/history.rs')
+        for fault in (None, 'rewritten-message', 'changed-caption', 'lost-hit', 'foreign-owner',
+                      'missing-copy', 'missing-index'):
+            with self.subTest(fault=fault):
+                sides, indexes = [], []
+                work = [coverage.SOURCE_CONSTRUCT_WORK_CAPACITY]
+                for side, filename in enumerate(filenames):
+                    files = {'/artifact/' + filename: filename}
+                    padding = '    ' if side == 0 else ''
+                    visibility = 'pub(super) ' if side else ''
+                    constructor = 'format!' if not (side and fault == 'changed-caption') else 'concat!'
+                    message = 'Different' if side and fault == 'rewritten-message' else 'Missing {version} in {base}'
+                    source = [
+                        *([] if side else ['impl AurClient {']),
+                        f'{padding}{visibility}fn historical_version_not_found_message(base: &str, version: &str) -> String {{',
+                        f'{padding}    {constructor}(',
+                        f'{padding}        "{message}"',
+                        f'{padding}    )',
+                        f'{padding}}}',
+                        *([] if side else ['}']),
+                    ]
+                    first = 1 if side else 2
+                    owners = []
+                    for copy in range(2):
+                        if side and fault == 'missing-copy' and copy == 0:
+                            continue
+                        nominal = f'NtNtNtCs{side + 1}{copy + 1}_7omg_lib16package_managers3aur'
+                        method = '36historical_version_not_found_message'
+                        symbol = ('_RNv' + nominal + '7history' + method if side else
+                                  '_RNvMs2_' + nominal + '6clientNtB5_9AurClient' + method)
+                        hits = 0 if side and fault == 'lost-hit' else copy
+                        raw = [[first, len(padding) + 1, first, len(source[first - 1]) - 1, hits, 0, 0, 0],
+                               [first + 1, len(padding) + 5, first + 1, len(padding) + 5 + len(constructor), hits, 0, 0, 0],
+                               [first + 4, len(padding) + 1, first + 4, len(padding) + 2, hits, 0, 0, 0]]
+                        owners.append(dict(name=symbol, filenames=list(files), count=hits, regions=raw))
+                    if side and fault == 'foreign-owner':
+                        owners.append(dict(owners[-1], name='foreign', regions=[owners[-1]['regions'][1]]))
+                    counts = coverage._owner_line_counts({'regions': [r for item in owners for r in item['regions']]},
+                                                        coverage._ObserverWork(work))
+                    sides.append((filename, coverage._construct_inventory(source, work), counts))
+                    selected = set() if side and fault == 'missing-index' else {filename}
+                    indexes.append(coverage.index_compiled_owner_sources(owners, files, work, selected))
+                proof = coverage.retained_aur_history_diagnostic(sides, indexes, work)
+                if fault is None:
+                    self.assertIsNotNone(proof)
+                    self.assertEqual(proof['base_lines'], [2, 3, 6])
+                    self.assertEqual(proof['head_lines'], [1, 2, 5])
+                    self.assertEqual(proof['summary_credit'], [0, 0])
+                    self.assertEqual(proof['mapped_credit'], [0, 0])
+                else:
+                    self.assertIsNone(proof)
+
+
 class RetainedAurUpdateFilterTests(unittest.TestCase):
     def test_shared_pacman_config_read_preserves_the_error_exit_in_each_worker_copy(self):
         filename = 'src/package_managers/aur/client.rs'

@@ -13396,6 +13396,7 @@ _AUR_CLIENT_NAMESPACE = ('type', ('type', ('type', ('crate', 'omg_lib'), ('packa
 _AUR_UPDATE_CONFIG_CALL = (
     'let config = crate::core::pacman_conf::PacmanConfig::parse(paths::pacman_conf_path())'
 )
+_AUR_HISTORY_SOURCE = 'src/package_managers/aur/history.rs'
 
 
 def retained_aur_metadata_policy(name, sides, indexes, work):
@@ -13569,6 +13570,76 @@ def retained_aur_update_config(name, sides, indexes, work):
                 pairs=[list(pair) for pair in zip(before[0], after[0], strict=True)],
                 instance_states=[before[1], after[1]], owners=[before[2], after[2]],
                 instance_matching=matching)
+
+
+def retained_aur_history_diagnostic(sides, indexes, work):
+    """Verify the exact rollback message after it moves out of AurClient."""
+    declaration = 'historical_version_not_found_message'
+    parameters = f'fn {declaration} ( base : & str , version : & str ) -> String'.split()
+    previous_body = None
+    observations = []
+    for side, ((name, inventory, counts), index) in enumerate(zip(sides, indexes, strict=True)):
+        code, rows = inventory[:2]
+        _construct_charge(work, len(rows))
+        header = ('pub ( super )'.split() + parameters) if side else parameters
+        functions = [row for row in rows if row['kind'] == 'fn' and row['header'] == tuple(header)]
+        if len(functions) != 1:
+            return None
+        function, = functions
+        first, opening, end = (function[field] for field in ('first', 'opening', 'end'))
+        ancestry = _construct_ancestors(code, first, work)
+        scopes = [row['header'] for row in rows if row['opening'] in ancestry]
+        if scopes != ([] if side else [('impl', 'AurClient')]) or len(ancestry) != len(scopes):
+            return None
+        body = code.words[opening + 1:end]
+        if (len(body) != 5 or body[:3] != ['format', '!', '('] or body[4] != ')'
+                or not body[3].startswith('"') or previous_body is not None and previous_body != body):
+            return None
+        previous_body = body
+        slots = (code.region(first, opening - 1), code.region(opening + 1, opening + 2), code.region(end, end))
+        start, stop = slots[0][0], slots[-1][2]
+        projection = []; states = []; symbols = []
+        owners = index.inventories.get(name, ())
+        _construct_charge(work, sum(len(owner['name']) + len(owner['regions']) + 1 for owner in owners))
+        for owner in owners:
+            raw = owner['regions']
+            if not any(region[0] <= stop and start <= region[2] for region in raw):
+                continue
+            symbol = owner['name']
+            if side:
+                shape = plain_rust_function_symbol(symbol)
+                qualified = (shape is not None and shape.identifiers ==
+                             ('omg_lib', 'package_managers', 'aur', 'history', declaration))
+            else:
+                shape = nominal_method_path(symbol)
+                qualified = (shape is not None and shape.kind == 'M' and not shape.callbacks
+                             and shape.namespace == _AUR_CLIENT_NAMESPACE
+                             and shape.self_type == ('type', _AUR_CLIENT_NAMESPACE, ('AurClient', ''))
+                             and shape.method == (declaration, ''))
+            hits = owner['count']
+            if (not qualified or index.name_counts[symbol] != 1 or owner.get('branches') or owner.get('mcdc_records')
+                    or len(owner['filenames']) != 1 or index.files.get(owner['filenames'][0]) != name
+                    or not 0 <= hits < COUNTER_LIMIT or tuple(tuple(r[:4]) for r in raw) != slots
+                    or any(r[4:] != [hits, 0, 0, 0] for r in raw)):
+                return None
+            projection.extend(raw)
+            states.append((hits > 0,))
+            symbols.append(symbol)
+        if not 1 <= len(states) <= 16 or not any(row[0] for row in states):
+            return None
+        _construct_charge(work, stop - start + 1)
+        mapped = _owner_line_counts({'regions': projection}, _ObserverWork(work))
+        if mapped != {n: counts[n] for n in range(start, stop + 1) if n in counts}:
+            return None
+        observations.append((sorted(mapped), states, symbols))
+    before, after = observations
+    _construct_charge(work, len(before[1]) * len(after[1]))
+    matching = compiled_hit_state_matching(before[1], after[1])
+    if matching is None:
+        return None
+    return dict(file=sides[0][0], head_file=sides[1][0], kind='retained-aur-history-diagnostic',
+                base_lines=before[0], head_lines=after[0], owners=[before[2], after[2]],
+                summary_credit=[0, 0], mapped_credit=[0, 0], instance_matching=matching)
 
 
 def retained_aur_hook_rendering(name, sides, indexes, work):
@@ -13902,8 +13973,9 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
     def source_owner_indexes():
         nonlocal owner_indexes
         if owner_indexes is None:
+            selected_head = bs.keys() | ({_AUR_HISTORY_SOURCE} & hs.keys())
             owner_indexes = (index_compiled_owner_sources(bf, base_files, construct_work, bs.keys()),
-                             index_compiled_owner_sources(hf, head_files, construct_work, bs.keys(),
+                             index_compiled_owner_sources(hf, head_files, construct_work, selected_head,
                                                           index_declaration_ends=True))
         return owner_indexes
     def parent_files(parent):
@@ -14124,6 +14196,7 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
             bf, hf, base_files, head_files, construct_work, inventories, grouped)
         anchored.update(construct_pairs); construct_receipts.extend(witnesses)
         retained = {}; gone = set(); unresolved_fragments = []; deferred_fragments = {}; neutral_declarations = {}
+        moved_diagnostic_lines = set()
         callback_anchors = {}
         declaration_roles = {}
         record_states = {}; record_projections = {}; record_work = _ObserverWork(construct_work)
@@ -14391,7 +14464,7 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
                 if block.get('retained_statements') and not any(
                         start <= block['base_line'] <= end for start, end in proved_functions):
                     for line in retained_statement_lines(block):
-                        if line in anchored or line in deferred_fragments:
+                        if line in anchored or line in deferred_fragments or line in moved_diagnostic_lines:
                             continue
                         low, high = block['head_range']
                         _construct_charge(construct_work, high - low + 1)
@@ -14402,6 +14475,19 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
                             target, = candidates
                             sides = ((old, inventories[0], before, line), (new, inventories[1], after, target))
                             proof = retained_callback_statement(name, sides, source_owner_indexes(), construct_work)
+                        if (proof is None and name == 'src/package_managers/aur/client.rs'
+                                and inventories is not None and old[line - 1].strip() == 'format!('
+                                and _AUR_HISTORY_SOURCE in hs and _AUR_HISTORY_SOURCE not in base_sources
+                                and bs[name]['expansions'] == hs[_AUR_HISTORY_SOURCE]['expansions'] == []):
+                            destination = head_constructs(_AUR_HISTORY_SOURCE)
+                            if destination is not None:
+                                sides = ((name, inventories[0], before),
+                                         (_AUR_HISTORY_SOURCE, destination, hs[_AUR_HISTORY_SOURCE]['counts']))
+                                moved = retained_aur_history_diagnostic(sides, source_owner_indexes(), construct_work)
+                                if moved is not None and line in moved['base_lines']:
+                                    moved_diagnostic_lines.update(moved['base_lines'])
+                                    obligation_receipts.append(moved)
+                                    continue
                         if proof is None:
                             raise ValueError(f'Ambiguous unchanged work in replaced compiler owner: {name}:{line}')
                         for original, current in proof['pairs']:
@@ -14628,6 +14714,7 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
                         gone.discard(previous)
                     retired_policy_metadata.append(proof)
         gone.difference_update(anchored)
+        gone.difference_update(moved_diagnostic_lines)
         anchored_new = set(anchored.values())
         paint = []
         final_pairs = {**retained, **anchored}
