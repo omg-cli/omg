@@ -948,35 +948,33 @@ fn check_pacman_lock_with(
     manager_running: impl FnOnce() -> std::io::Result<bool>,
 ) -> usize {
     let lock = std::path::Path::new(db_path.unwrap_or("/var/lib/pacman")).join("db.lck");
-    if let Err(error) = std::fs::symlink_metadata(&lock) {
-        if error.kind() == std::io::ErrorKind::NotFound {
-            return 0;
-        }
-        println!(
-            "  {} Cannot inspect database lock ({}): {error}",
+    let (issue, icon, detail) = match std::fs::symlink_metadata(&lock) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return 0,
+        Err(error) => (
+            true,
             style::error("✗"),
-            lock.display()
-        );
-        return 1;
-    }
-    let detail = match manager_running() {
-        Ok(true) => {
-            println!(
-                "  {} Database lock present while a package manager is running ({})",
+            format!("Cannot inspect database lock: {error}"),
+        ),
+        Ok(_) => match manager_running() {
+            Ok(true) => (
+                false,
                 style::info("ℹ"),
-                lock.display()
-            );
-            return 0;
-        }
-        Ok(false) => "No recognized package manager was visible".to_owned(),
-        Err(error) => format!("Process scan unavailable: {error}"),
+                "Database lock present while a package manager is running".to_owned(),
+            ),
+            Ok(false) => (
+                true,
+                style::error("✗"),
+                "Database lock owner could not be verified. No recognized package manager was visible.".to_owned(),
+            ),
+            Err(error) => (
+                true,
+                style::error("✗"),
+                format!("Database lock owner could not be verified. Process scan unavailable: {error}"),
+            ),
+        },
     };
-    println!(
-        "  {} Database lock owner could not be verified ({}). {detail}.",
-        style::error("✗"),
-        lock.display()
-    );
-    1
+    println!("  {icon} {detail} ({})", lock.display());
+    usize::from(issue)
 }
 
 /// Check for end-of-life runtimes
@@ -2206,6 +2204,12 @@ mod tests {
 
         let lock = dir.path().join("db.lck");
         std::fs::write(&lock, b"sentinel").expect("stale lock");
+        assert_eq!(
+            check_pacman_lock_with(lock.to_str(), || panic!(
+                "metadata failure must not scan processes"
+            )),
+            1
+        );
         let self_pid = 4242;
         std::fs::create_dir(proc.path().join("4242")).expect("self pid dir");
         std::fs::write(proc.path().join("4242/comm"), "omg\n").expect("self comm");

@@ -1457,6 +1457,7 @@ mod tests {
     }
     #[test]
     fn rekor_entry_verification_roundtrips_rsa_and_p256() {
+        const RSA_SHA256: &str = "1.2.840.113549.1.1.11";
         use base64::Engine as _;
         let artifact_bytes = b"omg release artifact bytes (wave-12 fixture)".to_vec();
         let mut fixture_hasher = sha2::Sha256::new();
@@ -1505,6 +1506,31 @@ mod tests {
         };
         let good_sig: rsa::pkcs1v15::Signature = signing.sign_prehash(&prehash).unwrap();
         let bad_sig: rsa::pkcs1v15::Signature = signing.sign_prehash(&[0u8; 32]).unwrap();
+
+        assert!(!verify_x509_signature(
+            b"invalid SPKI",
+            &artifact_bytes,
+            &good_sig.to_bytes(),
+            RSA_SHA256
+        ));
+        assert!(!verify_x509_signature(
+            rsa_spki_der.as_bytes(),
+            &artifact_bytes,
+            &[0; rsa::pkcs1v15::Signature::MAX_LEN + 1],
+            RSA_SHA256
+        ));
+        assert!(verify_x509_signature(
+            rsa_spki_der.as_bytes(),
+            &artifact_bytes,
+            &good_sig.to_bytes(),
+            RSA_SHA256
+        ));
+        assert!(!verify_x509_signature(
+            rsa_spki_der.as_bytes(),
+            &artifact_bytes,
+            &bad_sig.to_bytes(),
+            RSA_SHA256
+        ));
 
         for (sig, integrity_expected) in
             [(&good_sig.to_bytes(), true), (&bad_sig.to_bytes(), false)]

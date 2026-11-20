@@ -95,6 +95,21 @@ mod tests {
     }
 
     #[test]
+    fn prompt_preserves_control_characters_as_visible_escapes() -> Result<()> {
+        let mut inspection = inspection();
+        inspection.privileged_files.push(PrivilegedFile {
+            path: "etc/demo\r\u{202e}.conf".into(),
+            mode: 0o644,
+            capability: None,
+        });
+        let prompt = exception_prompt(&[inspection])?.expect("exception prompt");
+        assert!(prompt.contains("etc/demo\\r\\u{202e}.conf"));
+        assert!(!prompt.contains('\r'));
+        assert!(!prompt.contains('\u{202e}'));
+        Ok(())
+    }
+
+    #[test]
     fn many_privileged_outputs_cannot_truncate_the_approval_summary() {
         let inspections: Vec<_> = (0..512)
             .map(|index| {

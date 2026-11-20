@@ -1109,11 +1109,8 @@ mod tests {
         header.set_size(descriptor.len() as u64);
         header.set_mode(0o644);
         header.set_cksum();
-        official.append_data(
-            &mut header,
-            "omg-search-fixture-official-1-1/desc",
-            &descriptor[..],
-        )?;
+        let path = "omg-search-fixture-official-1-1/desc";
+        official.append_data(&mut header, path, &descriptor[..])?;
         official.into_inner()?.finish()?;
         let cache = fixture.path().join("cache");
         let settings_dir = fixture.path().join("config");

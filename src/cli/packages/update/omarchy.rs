@@ -3359,6 +3359,79 @@ omarchy-pkg-drop imv mpv-mpris
         Ok(())
     }
 
+    #[test]
+    fn media_launcher_cleanup_reports_a_matching_launcher_it_cannot_remove() -> Result<()> {
+        const TEST: &str = "cli::packages::update::omarchy::tests::media_launcher_cleanup_reports_a_matching_launcher_it_cannot_remove";
+        if crate::config::Settings::rerun_test_unprivileged(TEST) {
+            return Ok(());
+        }
+        use std::os::unix::fs::PermissionsExt;
+
+        let owner = private_directory();
+        let applications = owner.path().join("applications");
+        std::fs::create_dir(&applications)?;
+        let launcher = applications.join("imv.desktop");
+        let shipped = "vendor image viewer\n";
+        std::fs::write(&launcher, shipped)?;
+        let digest = hex::encode(migration_digest(shipped));
+        std::fs::set_permissions(&applications, std::fs::Permissions::from_mode(0o500))?;
+        let result = remove_shipped_media_launchers(&applications, &[&digest]);
+        std::fs::set_permissions(&applications, std::fs::Permissions::from_mode(0o700))?;
+
+        let error = result.expect_err("the read-only directory must prevent removing the launcher");
+        assert_eq!(
+            error.to_string(),
+            "Cannot remove the old Omarchy launcher imv.desktop"
+        );
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .map(std::io::Error::kind),
+            Some(std::io::ErrorKind::PermissionDenied)
+        );
+        assert_eq!(std::fs::read_to_string(launcher)?, shipped);
+        Ok(())
+    }
+
+    #[test]
+    fn native_package_stage_refuses_malformed_security_policy_before_launch() -> Result<()> {
+        const TEST: &str = "cli::packages::update::omarchy::tests::native_package_stage_refuses_malformed_security_policy_before_launch";
+        if crate::core::testing::run_isolated_test(TEST)
+            || crate::config::Settings::rerun_test_unprivileged(TEST)
+        {
+            return Ok(());
+        }
+
+        let owner = private_directory();
+        std::fs::write(
+            owner.path().join("policy.toml"),
+            "require_pgp = 'not-a-boolean'\n",
+        )?;
+        let runtime = OmarchyRuntime {
+            root: owner.path().to_path_buf(),
+            migration_state: owner.path().join("markers"),
+        };
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let mut commands = Commands::new(false, runtime);
+        let result = temp_env::with_var("OMG_CONFIG_DIR", Some(owner.path()), || {
+            executor
+                .block_on(commands.run_native_package(NativeOmarchyOperation::InstallMediaViewer))
+        });
+        let error = result.expect_err("malformed policy must refuse the native package stage");
+        assert!(
+            error
+                .downcast_ref::<crate::core::security::policy::PolicyError>()
+                .is_some()
+        );
+        assert!(
+            commands.active.is_none(),
+            "no subprocess may launch before policy admission"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn native_media_migration_removes_legacy_packages_only_after_install_and_refresh()
     -> Result<()> {

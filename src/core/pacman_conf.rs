@@ -150,12 +150,15 @@ fn load_config_with_includes(
 }
 
 fn validate_repository_name(name: &str) -> Result<()> {
+    anyhow::ensure!(
+        !name.chars().any(char::is_control),
+        "Invalid repository name {name:?}: control characters are not allowed"
+    );
     let mut components = Path::new(name).components();
     anyhow::ensure!(
         matches!(components.next(), Some(std::path::Component::Normal(component)) if component == name)
-            && components.next().is_none()
-            && !name.chars().any(char::is_control),
-        "Invalid repository name {name:?}: expected one filesystem path component without control characters"
+            && components.next().is_none(),
+        "Invalid repository name '{name}': expected one filesystem path component"
     );
     Ok(())
 }
