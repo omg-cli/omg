@@ -354,7 +354,7 @@ class HostedProducer(unittest.TestCase):
                 self.assertEqual(commands, [['pacman', '-Syu', '--noconfirm', '--needed',
                                             'python', 'sudo', 'bubblewrap', 'fakeroot', 'debugedit',
                                             'git', 'make', 'jq', 'diffutils', 'gnupg', 'openssl',
-                                            'iproute2', 'util-linux']])
+                                'iproute2', 'util-linux', 'desktop-file-utils']])
 
     @unittest.skipUnless(sys.platform == 'linux', 'Native QMP identity requires Linux peer credentials')
     def test_poweroff_ssh_disconnect_preserves_producer_status_after_observed_guest_shutdown(self):
@@ -1336,6 +1336,11 @@ def evidence_fixture(root):
             (evidence / f'{stage}-migrations.txt').write_text(f'boundary_control={case.scene} completion_markers=0\n')
         elif stage == 'omarchy-native-migrations-script-failure':
             (evidence / f'{stage}-migrations.txt').write_text('failed_configuration=before completion_markers=0\n')
+        elif stage == 'omarchy-native-migrations':
+            (evidence / f'{stage}-migrations.txt').write_text(
+                'ordered_configuration=before,after recognized_native_migrations=3 completion_markers=5\n')
+            (evidence / f'{stage}-native-state.json').write_text(json.dumps(dict(
+                status=PRODUCER.NATIVE_PHASES[case.native_phase], packages={'omaview': {}, 'mpv': {}})))
         elif stage.startswith('omarchy-native-migrations'):
             (evidence / f'{stage}-migrations.txt').write_text(
                 'ordered_configuration=before,after recognized_native_migrations=2 completion_markers=4\n')
@@ -1386,7 +1391,10 @@ def evidence_fixture(root):
                 'foreign optional helpers never executed; original helpers restored\n')
         log = {
             'omarchy-success': 'configured_dev_checkout=selected nested_helper=packaged\n| System is up to date',
-            'omarchy-native-migrations': '| System is up to date\nNative Omarchy migration-xrandr completed\nNative Omarchy migration-omnibook-audio completed',
+            'omarchy-native-migrations': '| System is up to date\nNative Omarchy migration-xrandr completed\n'
+                                         'Native Omarchy migration-omnibook-audio completed\n'
+                                         'Native Omarchy migration-omaview-install completed\n'
+                                         'Native Omarchy migration-omaview-cleanup completed',
             'omarchy-native-migrations-unmatched': '| System is up to date\nNative Omarchy migration-xrandr completed',
             'omarchy-native-migrations-notification-error': '| System is up to date\nNative Omarchy migration-xrandr completed\nNative Omarchy migration-omnibook-audio completed\nCannot dismiss the Omarchy migration notification:',
             'omarchy-native-migrations-notification-missing': '| System is up to date\nNative Omarchy migration-xrandr completed\nNative Omarchy migration-omnibook-audio completed',
@@ -1913,10 +1921,11 @@ class FreshAdmissionFixture(unittest.TestCase):
             evidence, profiles, artifacts = evidence_fixture(Path(directory))
             PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
             receipt = evidence / f'{stage}-migrations.txt'
-            receipt.write_text('ordered_configuration=before,after recognized_native_migrations=2 completion_markers=3\n')
+            complete = receipt.read_text()
+            receipt.write_text(complete.replace('completion_markers=5', 'completion_markers=4'))
             with self.assertRaisesRegex(ValueError, 'migration completion'):
                 PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
-            receipt.write_text('ordered_configuration=before,after recognized_native_migrations=2 completion_markers=4\n')
+            receipt.write_text(complete)
             log = evidence / f'{stage}.log'
             log.write_text(log.read_text().replace('Native Omarchy migration-xrandr completed', ''))
             with self.assertRaisesRegex(ValueError, 'migration package operations'):
@@ -2005,6 +2014,38 @@ class FreshAdmissionFixture(unittest.TestCase):
         self.assertIn('--native-migrations', script)
         self.assertIn('1794518371.sh', script)
         self.assertIn('1794675791.sh', script)
+
+    def test_guest_runs_the_exact_native_media_migration(self):
+        script = PRODUCER.omarchy_guest_script()
+        body = re.search(
+            r'1794774234\.sh" <<\'OMG_NATIVE_MIGRATION_1794774234\'\n'
+            r'(.*?)\nOMG_NATIVE_MIGRATION_1794774234\n', script, re.DOTALL)
+        self.assertIsNotNone(body, 'Coverage must exercise the shipped Omaview migration')
+        self.assertEqual(hashlib.sha256((body[1] + '\n').encode()).hexdigest(),
+                         '2e4a9686547c5615eceb9c23cb3b079df491d000078da10b7d995ea1caf9a954')
+        self.assertIn('image/png=imv.desktop;', script)
+        runner = (ROOT / 'scripts/benchmark-qemu.sh').read_text()
+        guest_install = runner.split("cat <<'NATIVE_PACKAGES'", 1)[1].split('\nNATIVE_PACKAGES', 1)[0]
+        self.assertIn('desktop-file-utils', guest_install)
+
+    def test_native_media_migration_requires_both_transactions_and_retains_mpv(self):
+        stage = 'omarchy-native-migrations'
+        with tempfile.TemporaryDirectory() as directory:
+            evidence, profiles, artifacts = evidence_fixture(Path(directory))
+            log = evidence / f'{stage}.log'
+            original = log.read_text()
+            for operation in ('install', 'cleanup'):
+                with self.subTest(operation=operation):
+                    log.write_text(original.replace(f'Native Omarchy migration-omaview-{operation} completed', ''))
+                    with self.assertRaisesRegex(ValueError, 'Omaview replacement evidence'):
+                        PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
+            log.write_text(original)
+            state = evidence / f'{stage}-native-state.json'
+            data = json.loads(state.read_text())
+            data['packages'].pop('mpv')
+            state.write_text(json.dumps(data))
+            with self.assertRaisesRegex(ValueError, 'Omaview replacement evidence'):
+                PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
 
     def test_daemon_scope_and_lifecycle_open_errors_are_mandatory_root_receivers(self):
         for name in (

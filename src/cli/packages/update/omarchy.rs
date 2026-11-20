@@ -660,14 +660,26 @@ impl Commands {
 
     async fn run_native_package(&mut self, operation: NativeOmarchyOperation) -> Result<()> {
         #[cfg(test)]
-        if let Some(fixture) = self.native_fixture.as_mut() {
+        let fixture_result = self.native_fixture.as_mut().map(|fixture| {
             fixture.operations.push(operation);
             anyhow::ensure!(
                 fixture.failure != Some(operation),
                 "Fixture package operation failed"
             );
-            return Ok(());
+            Ok(())
+        });
+        #[cfg(not(test))]
+        let fixture_result = None;
+        match fixture_result {
+            Some(result) => result,
+            None => self.run_native_package_command(operation).await,
         }
+    }
+
+    async fn run_native_package_command(
+        &mut self,
+        operation: NativeOmarchyOperation,
+    ) -> Result<()> {
         use crate::package_managers::arch::NativeOmarchyInteraction;
         let interaction = if self.yes {
             NativeOmarchyInteraction::Unattended

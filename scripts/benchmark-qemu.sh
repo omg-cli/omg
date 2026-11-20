@@ -622,7 +622,7 @@ CLOCK
 if [[ -d /work/native-cli ]]; then
   cat <<'NATIVE_PACKAGES'
 runcmd:
-  - ["pacman", "-Syu", "--noconfirm", "--needed", "python", "sudo", "bubblewrap", "fakeroot", "debugedit", "git", "make", "jq", "diffutils", "gnupg", "openssl", "iproute2", "util-linux"]
+  - ["pacman", "-Syu", "--noconfirm", "--needed", "python", "sudo", "bubblewrap", "fakeroot", "debugedit", "git", "make", "jq", "diffutils", "gnupg", "openssl", "iproute2", "util-linux", "desktop-file-utils"]
 NATIVE_PACKAGES
 fi
 } > user-data

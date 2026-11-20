@@ -273,7 +273,12 @@ def create_signed_fixture(owner, current_kernel=False, native_migrations=False, 
         ('omg-coverage-dep', 'core', 1, ()), ('omg-coverage-desktop', 'omarchy', 0, ())]
     if platform_keyring:
         packages.append(('omg-coverage-platform-keyring', 'omarchy', 0, ()))
+    media = owner.name == 'omg-coverage-omarchy-native-migrations'
     migration_packages = {}
+    if media:
+        packages.extend((('omaview', 'omarchy', 0, ()), ('mpv', 'core', 0, ())))
+        for name in ('imv', 'mpv-mpris'):
+            fixture_local_package(owner / 'root', owner / 'db', name, '1-1', 'usr/share/omg-coverage/' + name + '.txt', b'Legacy media viewer fixture\n', 0)
     if native_migrations:
         packages.extend((name, 'core', 0, ()) for name in ('xorg-xrandr', 'hp-omnibook-3-audio'))
     running_modules = None
@@ -292,7 +297,7 @@ def create_signed_fixture(owner, current_kernel=False, native_migrations=False, 
             payload_path = running_modules['path']
         old_payload = before_public if keyring else (name + ': installed1\n').encode()
         new_payload = updated_public if keyring else (name + ': upgraded3\n').encode()
-        migration_only = native_migrations and name in ('xorg-xrandr', 'hp-omnibook-3-audio')
+        migration_only = native_migrations and name in ('xorg-xrandr', 'hp-omnibook-3-audio', 'omaview')
         if not migration_only or installed_migrations:
             fixture_local_package(owner / 'root', owner / 'db', name, '1-1', payload_path, old_payload, reason, depends)
         archive = fixture_package(owner / 'repos' / repository, name, '3-1', payload_path, new_payload, depends)
@@ -972,7 +977,13 @@ def verify_signed_fixture(owner, phase='complete'):
     refreshed = {'archlinux-keyring', 'omarchy-keyring'} if phase == 'keyrings-refreshed' else set()
     require(refreshed <= packages.keys(), 'Expected native keyring packages are missing')
     if phase in ('migrated', 'migrated-unmatched'):
-        require(set(receipt.get('migration_packages', {})) == {'xorg-xrandr', 'hp-omnibook-3-audio'},
+        expected_migrations = {'xorg-xrandr', 'hp-omnibook-3-audio'}
+        if owner.name == 'omg-coverage-omarchy-native-migrations':
+            expected_migrations.add('omaview')
+            for name in ('imv', 'mpv-mpris'):
+                require(not (owner / 'root/usr/share/omg-coverage' / (name + '.txt')).exists(),
+                        'Legacy media payload survives the migration')
+        require(set(receipt.get('migration_packages', {})) == expected_migrations,
                 'Native migration package fixtures are missing')
         packages.update({name: value for name, value in receipt['migration_packages'].items()
                          if phase == 'migrated' or name == 'xorg-xrandr'})
@@ -1727,6 +1738,49 @@ fi
 omarchy-pkg-add hp-omnibook-3-audio
 omarchy-state set reboot-required
 OMG_NATIVE_MIGRATION_1794675791
+      if test "$stage" = omarchy-native-migrations; then
+        applications="$case_dir/.local/share/applications"
+        install -d -m 700 -o nobody -g nobody "$case_dir/.local" "$case_dir/.local/share" "$applications"
+        cat > "$applications/imv.desktop" <<'OMG_CUSTOM_MEDIA_LAUNCHER'
+[Desktop Entry]
+Type=Application
+Name=Custom Image Viewer
+Exec=imv %f
+MimeType=image/png;
+OMG_CUSTOM_MEDIA_LAUNCHER
+        cp "$applications/imv.desktop" "$fixture/expected-media-launcher"
+        chown nobody:nobody "$applications/imv.desktop"
+        cat > "$fixture/runtime/migrations/1794774234.sh" <<'OMG_NATIVE_MIGRATION_1794774234'
+echo "Replace imv and mpv with Omaview"
+
+omarchy-pkg-add omaview
+
+# Omarchy's own Image Viewer (imv) and Media Player (mpv) launchers give way to
+# Omaview's Media Viewer. Only a copy still as Omarchy shipped it goes, so one
+# the user changed, or linked from their dotfiles, stays theirs.
+applications="$HOME/.local/share/applications"
+for entry in imv.desktop mpv.desktop; do
+  file="$applications/$entry"
+  [[ -f $file && ! -L $file ]] || continue
+  case $(sha256sum <"$file") in
+    120d30326a77e1f23d050e52293d0acf1aeb9499bf9cd47b93996d6e2be99480* | \
+      a7a75999f161c6a409ff4c5da26ad9c79fc1ffdd4e633aac87f972ad72fc85d4* | \
+      d105a16b60ecc1c67f6cc37e5bb7831ca8a08d0e602cb64dd4a1386703362385* | \
+      9844e9d22d1b4b9801965afea1eb250103cfc6f12e6e62e542ac47abd4b8094d*)
+      rm -f "$file"
+      ;;
+  esac
+done
+if [[ -d $applications ]]; then
+  update-desktop-database "$applications"
+fi
+
+# imv and mpv-mpris go. mpv stays, as Omarchy's wallpaper engine, owe, plays
+# video wallpapers through it. A mimeapps.list line naming imv.desktop stops
+# resolving, and Omarchy's default, Omaview, opens those files instead.
+omarchy-pkg-drop imv mpv-mpris
+OMG_NATIVE_MIGRATION_1794774234
+      fi
       printf 'printf "before\\n" >> "$HOME/native-migration-order"\n' > "$fixture/runtime/migrations/0000000000.sh"
       printf 'printf "after\\n" >> "$HOME/native-migration-order"\n' > "$fixture/runtime/migrations/9999999999.sh"
       if test "$stage" = omarchy-native-migrations-script-failure; then
@@ -1982,12 +2036,18 @@ OMG_AUTHORIZATION_RECEIPT
   elif [[ $stage == omarchy-native-migrations* ]]; then
     printf 'before\nafter\n' > "$fixture/expected-migration-order"
     cmp "$fixture/expected-migration-order" "$case_dir/native-migration-order"
-    for name in 0000000000.sh 1794518371.sh 1794675791.sh 9999999999.sh; do
+    markers=(0000000000.sh 1794518371.sh 1794675791.sh 9999999999.sh)
+    if test "$stage" = omarchy-native-migrations; then
+      markers+=(1794774234.sh)
+      cmp "$fixture/expected-media-launcher" "$applications/imv.desktop"
+      grep -Fx 'image/png=imv.desktop;' "$applications/mimeinfo.cache"
+    fi
+    for name in "${markers[@]}"; do
       test -f "$case_dir/migrations/$name" && test ! -L "$case_dir/migrations/$name"
       test ! -s "$case_dir/migrations/$name"
       test "$(stat -c '%u:%a:%h' "$case_dir/migrations/$name")" = "$(id -u nobody):600:1"
     done
-    printf 'ordered_configuration=before,after recognized_native_migrations=2 completion_markers=4\n' \
+    printf 'ordered_configuration=before,after recognized_native_migrations=%s completion_markers=%s\n' "$((${#markers[@]}-2))" "${#markers[@]}" \
       > "/evidence/cli/$stage-migrations.txt"
   fi
   if test "$stage" = omarchy-optional-failures; then
@@ -2528,8 +2588,15 @@ def validate_evidence(evidence, profiles, artifacts, commit):
                     'Migration script failure was hidden')
         elif stage.startswith('omarchy-native-migrations'):
             require((evidence / f'{stage}-migrations.txt').read_text()
-                    == 'ordered_configuration=before,after recognized_native_migrations=2 completion_markers=4\n',
+                    == ('ordered_configuration=before,after recognized_native_migrations=3 completion_markers=5\n'
+                        if stage == 'omarchy-native-migrations' else
+                        'ordered_configuration=before,after recognized_native_migrations=2 completion_markers=4\n'),
                     'Native migration completion evidence differs')
+            if stage == 'omarchy-native-migrations':
+                require('Native Omarchy migration-omaview-install completed' in log
+                        and 'Native Omarchy migration-omaview-cleanup completed' in log
+                        and {'omaview', 'mpv'} <= native_state.get('packages', {}).keys(),
+                        'Native Omaview replacement evidence is incomplete')
             preinstalled = stage.endswith('-preinstalled')
             for operation, expected in (
                     ('migration-xrandr', not preinstalled),
