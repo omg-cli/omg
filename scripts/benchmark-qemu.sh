@@ -10,6 +10,7 @@ inventory_policy=
 image_policy=
 image_cache=
 fedora_sqlite_bundle=
+native_cli_coverage_dir=
 image_cache_budget_bytes=4294967296
 arch=
 print_pins=false
@@ -29,7 +30,7 @@ root="$HOME/.cache/build-targets/omg-qemu-benchmark"
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 while (($#)); do
   case "$1" in
-    --distro|--release|--staged-dir|--release-dir|--inventory-file|--inventory-policy|--image-policy|--image-cache|--image-cache-budget-bytes|--evidence-dir|--inventory-tiers|--arch|--fedora-sqlite-bundle)
+    --distro|--release|--staged-dir|--release-dir|--inventory-file|--inventory-policy|--image-policy|--image-cache|--image-cache-budget-bytes|--evidence-dir|--inventory-tiers|--arch|--fedora-sqlite-bundle|--native-cli-coverage-dir)
       [[ $# -ge 2 && -n "$2" ]] || exit 2
       case "$1" in
         --distro) distro=$2 ;; --release) tag=$2 ;; --staged-dir) staged_dir=$2 ;; --evidence-dir) root=$2 ;;
@@ -37,6 +38,7 @@ while (($#)); do
         --inventory-policy) inventory_policy=$2 ;;
         --image-policy) image_policy=$2 ;;
         --fedora-sqlite-bundle) fedora_sqlite_bundle=$2 ;;
+        --native-cli-coverage-dir) native_cli_coverage_dir=$2 ;;
         --image-cache) image_cache=$2 ;;
         --image-cache-budget-bytes) [[ "$2" =~ ^[0-9]+$ ]] || exit 2; image_cache_budget_bytes=$2 ;;
         --inventory-tiers) inventory_tiers=$2 ;; --arch) arch=$2 ;;
@@ -65,6 +67,7 @@ Usage: scripts/benchmark-qemu.sh [--distro all|arch|debian|debian-trixie|ubuntu|
   [--image-policy JSON] [--image-cache DIR] [--image-cache-budget-bytes BYTES]
   [--inventory-isolate-hermetic] [--parallel-runtime-installs]
   [--allow-tcg]
+  [--native-cli-coverage-dir DIR] (Arch x86_64 staged coverage fixtures only)
 
 Runs disposable guests with pinned images, reboot, sudo, package lifecycle,
 and optional warm read-query timing. KVM with matching host/guest architecture
@@ -107,6 +110,26 @@ if [[ "$parallel_runtime_installs" == true ]]; then
   [[ -n "$inventory_tiers" && "$inventory_isolation" == true && "$restrict_egress" == true ]] || exit 2
 fi
 [[ -z "$release_dir" || ( -d "$release_dir" && -z "$staged_dir" ) ]] || exit 2
+if [[ -n "$native_cli_coverage_dir" ]]; then
+  [[ "$distro" == arch && "$arch" == x86_64 && -n "$staged_dir" && -z "$release_dir" &&
+     "$benchmark" == false && "$allow_tcg" == false && "$storage_faults" == false &&
+     -z "$inventory_tiers" && -d "$native_cli_coverage_dir/bin" &&
+     -f "$native_cli_coverage_dir/native-cli-manifest.json" ]] || exit 2
+  native_cli_coverage_dir=$(cd "$native_cli_coverage_dir" && pwd -P)
+  python3 - "$here/native-cli-coverage.py" "$native_cli_coverage_dir" "$(git -C "$here/.." rev-parse HEAD)" <<'NATIVE_ADMISSION'
+import importlib.util
+from pathlib import Path
+import sys
+source, directory, commit = sys.argv[1:]
+spec = importlib.util.spec_from_file_location('native_cli_coverage', source)
+producer = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(producer)
+inputs = Path(directory)
+manifest = producer.read_manifest(inputs / 'native-cli-manifest.json')
+producer.require(manifest['source_commit'] == commit, 'Native coverage source revision differs')
+producer.validate_artifact_copies(inputs / 'bin', manifest['artifacts'])
+NATIVE_ADMISSION
+fi
 tsv="${inventory_file:-$here/../tests/cli_behavior_inventory.tsv}"
 if [[ -n "$inventory_tiers" && -z "$staged_dir" && -z "$inventory_file" ]]; then
   printf 'error: published inventory needs --inventory-file from the release revision (scripts/prepare-qemu-release.py)\n' >&2
@@ -262,6 +285,7 @@ if [[ "$distro" == all ]]; then
   exit "$rc"
 fi
 case_id="qemu-${distro}${case_suffix}-lifecycle"
+[[ -z "$native_cli_coverage_dir" ]] || case_id="qemu-arch-native-cli-coverage"
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 work=$(mktemp -d "$root/run-XXXXXX")
 controller="omg-qemu-${work##*/}"
@@ -308,7 +332,9 @@ cleanup() {
     printf 'Inventory telemetry projection failed; reporting lifecycle result only\n' >> "$work/cleanup.log"
   fi
   reporting_rc=0
-  timeout --kill-after=2s 12s env OMG_SMOKE_RELEASE="$tag" OMG_SMOKE_ENVIRONMENT=qemu-matrix "$repo_root/scripts/report-smoke-sentry.sh" "$report_input" > "$work/reporting.log" 2>&1 || reporting_rc=$?
+  if [[ -z "${native_cli_coverage_dir:-}" ]]; then
+    timeout --kill-after=2s 12s env OMG_SMOKE_RELEASE="$tag" OMG_SMOKE_ENVIRONMENT=qemu-matrix "$repo_root/scripts/report-smoke-sentry.sh" "$report_input" > "$work/reporting.log" 2>&1 || reporting_rc=$?
+  fi
   jq -n --argjson exit_code "$reporting_rc" '{exit_code:$exit_code}' > "$work/reporting-status.json"
   overall_result=$result
   if [[ "$result" == PASS && "$inventory_product_failure" == true ]]; then
@@ -345,6 +371,10 @@ if [[ "$host_arch" != "$arch" ]]; then
   docker_device_args=()
 elif [[ -c "$kvm_device" && -r "$kvm_device" && -w "$kvm_device" ]]; then
   printf 'kvm=ok device=%s\n' "$kvm_device" > "$work/kvm-probe.log"
+elif [[ -n "$native_cli_coverage_dir" && -e /.dockerenv ]]; then
+  # The job container may not expose the Docker host's device. The controller
+  # still receives /dev/kvm and QEMU must launch with -accel kvm.
+  printf 'kvm=daemon-device-required device=%s\n' "$kvm_device" > "$work/kvm-probe.log"
 elif [[ "$allow_tcg" == true ]]; then
   qemu_accel=tcg
   docker_device_args=()
@@ -412,25 +442,42 @@ fi
 timeout --kill-after=2s 15s docker version --format '{{.Server.Version}}' > "$work/engine-preflight.log" 2>&1 || exit 3
 { date -u; uname -a; cat /proc/loadavg; grep -E 'MemTotal|MemAvailable|SwapFree' /proc/meminfo; } > "$work/host-metadata.txt"
 archive="omg-${tag}-${arch}-linux-${distro}.tar.gz"
-if [[ -n "$staged_dir" ]]; then
-  cp "$staged_dir/$archive" "$staged_dir/$archive.sha256" "$work/release/"
-elif [[ -n "$release_dir" ]]; then
-  cp "$release_dir/$archive" "$release_dir/$archive.sha256" "$work/release/"
-else
-  timeout 120 gh release download "$tag" --repo PyRo1121/omg --pattern "$archive" --pattern "$archive.sha256" --dir "$work/release"
+if [[ -z "$native_cli_coverage_dir" ]]; then
+  if [[ -n "$staged_dir" ]]; then
+    cp "$staged_dir/$archive" "$staged_dir/$archive.sha256" "$work/release/"
+  elif [[ -n "$release_dir" ]]; then
+    cp "$release_dir/$archive" "$release_dir/$archive.sha256" "$work/release/"
+  else
+    timeout 120 gh release download "$tag" --repo PyRo1121/omg --pattern "$archive" --pattern "$archive.sha256" --dir "$work/release"
+  fi
+  read -r digest filename extra < "$work/release/$archive.sha256"
+  [[ "$digest" =~ ^[0-9a-f]{64}$ && "$filename" == "$archive" && -z "${extra:-}" ]]
+  [[ $(wc -l < "$work/release/$archive.sha256") -eq 1 ]]
+  (cd "$work/release" && sha256sum -c "$archive.sha256") > "$work/release-checksum.txt"
 fi
-read -r digest filename extra < "$work/release/$archive.sha256"
-[[ "$digest" =~ ^[0-9a-f]{64}$ && "$filename" == "$archive" && -z "${extra:-}" ]]
-[[ $(wc -l < "$work/release/$archive.sha256") -eq 1 ]]
-(cd "$work/release" && sha256sum -c "$archive.sha256") > "$work/release-checksum.txt"
 printf 'distro=%s\narch=%s\nhost_arch=%s\naccel=%s\ntiming_scope=%s\nrelease=%s\nartifact_source=%s\nimage_url=%s\nimage_digest=%s\nfirmware=%s\nqemu=%s -machine %s\ncontroller=%s\ncase_id=%s\n' "$distro" "$arch" "$host_arch" "$qemu_accel" "$([[ "$qemu_accel" == kvm ]] && printf benchmark || printf correctness-only)" "$tag" "$source_kind" "$image_url" "$image_hash" "$firmware" "$qemu_bin" "$qemu_machine" "$controller_image" "$case_id" > "$work/metadata.txt"
 bash "$here/pull-qemu-controller.sh" "$controller_image" "$work/controller-pull-attempt.log" \
   > "$work/controller-pull.log" 2>&1 || exit 3
+controller_work=$work
+controller_init_args=()
+if [[ -n "$native_cli_coverage_dir" ]]; then
+  # Reap the orphaned QEMU process so the native clean-poweroff check can finish.
+  controller_init_args=(--init)
+  if [[ -e /.dockerenv ]]; then
+    docker inspect --format '{{json .Mounts}}' "${HOSTNAME:?Missing job container identity}" > "$work/job-mounts.json"
+    controller_work=$(python3 "$here/native-cli-coverage.py" controller-path --path "$work" < "$work/job-mounts.json")
+  fi
+  binding_token=$(python3 -c 'import secrets; print(secrets.token_hex(32))')
+  printf '%s\n' "$binding_token" > "$work/controller-binding-token"
+fi
 started=true
-timeout 120 docker run --pull=never -d --name "$controller" --cpus 2 --memory 3g --memory-swap 3g --pids-limit 512 --log-opt max-size=10m --log-opt max-file=2 "${docker_device_args[@]}" \
+timeout 120 docker run --pull=never -d --name "$controller" "${controller_init_args[@]}" --cpus 2 --memory 3g --memory-swap 3g --pids-limit 512 --log-opt max-size=10m --log-opt max-file=2 "${docker_device_args[@]}" \
   --cap-drop NET_RAW --cap-drop NET_ADMIN --dns 1.1.1.1 --dns 9.9.9.9 \
-  --mount "type=bind,src=$work,dst=/work" --workdir /work \
+  --mount "type=bind,src=$controller_work,dst=/work" --workdir /work \
   "$controller_image" sleep infinity > "$work/controller-id.txt"
+if [[ -n "$native_cli_coverage_dir" ]]; then
+  timeout 15 docker exec "$controller" sh -c 'test "$(cat /work/controller-binding-token)" = "$1"' _ "$binding_token"   > "$work/controller-binding-check.log" 2>&1 || exit 3
+fi
 if [[ "$restrict_egress" == true ]]; then
   egress_started=true
   timeout 120 sudo -n python3 "$here/qemu-controller-egress.py" install "$controller" \
@@ -477,6 +524,13 @@ timeout 30 docker exec -w /work/guest "$controller" bash -c '"$1" --version; qem
 cp "$here/qemu-boot-budget.sh" "$work/qemu-boot-budget.sh"
 cp "$here/qemu-boot-diagnostics.sh" "$work/qemu-boot-diagnostics.sh"
 source "$work/qemu-boot-budget.sh"
+if [[ -n "${native_cli_coverage_dir:-}" ]]; then
+  mkdir "$work/native-cli"
+  cp -a "$native_cli_coverage_dir/bin" "$work/native-cli/bin"
+  cp "$native_cli_coverage_dir/native-cli-manifest.json" "$work/native-cli/native-cli-manifest.json"
+  cp "$here/native-cli-coverage.py" "$work/native-cli/native-cli-coverage.py"
+  cp "$here/attend-unknown-fixture.py" "$work/native-cli/attend-unknown-fixture.py"
+fi
 cat > "$work/boot.sh" <<'BOOT'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -565,6 +619,12 @@ write_files:
       [Install]
       WantedBy=timers.target
 CLOCK
+if [[ -d /work/native-cli ]]; then
+  cat <<'NATIVE_PACKAGES'
+runcmd:
+  - ["pacman", "-Syu", "--noconfirm", "--needed", "python", "sudo", "bubblewrap", "fakeroot", "debugedit", "git", "make", "jq", "diffutils", "gnupg", "openssl", "iproute2", "util-linux", "desktop-file-utils"]
+NATIVE_PACKAGES
+fi
 } > user-data
 chmod 600 user-data
 printf 'instance-id: omg-qemu-fresh\n' > meta-data
@@ -584,10 +644,14 @@ legacy_apic=()
 case "$6" in q35|q35,*) legacy_apic=(-global apic-common.vapic=false) ;; esac
 accel=$7
 [[ "$accel" != tcg ]] || accel=tcg,thread=multi
+native_monitor=()
+if [[ -f /work/controller-binding-token ]]; then
+  native_monitor=(-qmp unix:/work/guest/native-qmp.sock,server=on,wait=off)
+fi
 nohup "$5" -machine "$6" -accel "$accel" -cpu "$8" -smp 2 -m 1536 \
   -run-with user=65534:65534 \
   -sandbox on,obsolete=deny,spawn=deny,resourcecontrol=deny \
-  -monitor none "${legacy_apic[@]}" \
+  -monitor none "${legacy_apic[@]}" "${native_monitor[@]}" \
   "${firmware[@]}" -display none -serial "file:$vm_serial" \
   -drive "file=$vm_disk,if=virtio,format=qcow2" -drive file=seed.img,if=virtio,format=raw \
   -netdev user,id=n,net=10.0.2.0/24,host=10.0.2.2,dns=10.0.2.3,dhcpstart=10.0.2.15,ipv6=off,hostfwd=tcp:127.0.0.1:2222-10.0.2.15:22 -device virtio-net-pci,netdev=n,mac=52:54:00:12:34:56,romfile= \
@@ -940,6 +1004,53 @@ boot_rc=0
 timeout --kill-after=5s "$boot_timeout" docker exec "$controller" bash /work/boot.sh "$firmware" "$ssh_service" "$firmware_code" "$firmware_vars_src" "$qemu_bin" "$qemu_machine" "$qemu_accel" "$qemu_cpu" > "$work/boot.log" 2>&1 || boot_rc=$?
 timeout --kill-after=2s 3s docker exec "$controller" bash /work/qemu-boot-diagnostics.sh > "$work/boot.diagnostics.log" 2>&1 || printf 'Boot diagnostics unavailable\n' >> "$work/boot.diagnostics.log"
 [[ "$boot_rc" == 0 ]] || exit "$boot_rc"
+if [[ -n "${native_cli_coverage_dir:-}" ]]; then
+  cat > "$work/native-coverage.sh" <<'NATIVE_COVERAGE'
+#!/usr/bin/env bash
+set -euo pipefail
+cd /work/guest
+opts=(-i client-key -p 2222 -o BatchMode=yes -o ConnectTimeout=5 -o ServerAliveInterval=5 -o ServerAliveCountMax=3 -o StrictHostKeyChecking=yes -o UserKnownHostsFile=known_hosts)
+printf '[native-coverage] preparing guest dependencies\n'
+ssh "${opts[@]}" bench@127.0.0.1 'sudo -n bash -s' <<'NATIVE_SETUP'
+set -euo pipefail
+test "$(id -u)" = 0
+test "$(. /etc/os-release; printf %s "$ID")" = arch
+test "$(cat /proc/1/comm)" = systemd
+chage -E -1 nobody
+install -d -m 1777 /profiles
+install -d -m 755 /evidence /omg-extra-bin
+printf 'nobody ALL=(root) NOPASSWD: /usr/bin/true, /omg-extra-bin/cli\n' > /etc/sudoers.d/omg-native-coverage
+chmod 440 /etc/sudoers.d/omg-native-coverage
+visudo -cf /etc/sudoers.d/omg-native-coverage
+NATIVE_SETUP
+# Tar is only transport: the guest independently checks every admitted digest.
+tar -C /work/native-cli -cf - . | ssh "${opts[@]}" bench@127.0.0.1   'sudo -n sh -c "install -d -m 755 /native-cli-inputs; tar -C /native-cli-inputs -xf -; install -m 644 /native-cli-inputs/native-cli-coverage.py /native-cli-coverage.py; install -m 644 /native-cli-inputs/attend-unknown-fixture.py /attend-unknown-fixture.py; install -m 644 /native-cli-inputs/native-cli-manifest.json /native-cli-manifest.json; install -m 755 /native-cli-inputs/bin/* /omg-extra-bin/"'
+status=0
+printf '[native-coverage] running admitted producer\n'
+ssh "${opts[@]}" bench@127.0.0.1 'sudo -n python3 /native-cli-coverage.py run' || status=$?
+printf '[native-coverage] producer_exit=%s; collecting evidence\n' "$status"
+for kind in evidence profiles; do
+  timeout --kill-after=2s 60s ssh "${opts[@]}" bench@127.0.0.1 "sudo -n tar -C /$kind -cf - ." \
+    | head -c 1073741825 > "/work/native-$kind.tar"
+  python3 /work/native-cli/native-cli-coverage.py unpack \
+    --archive "/work/native-$kind.tar" --directory "/work/native-$kind"
+done
+printf '[native-coverage] requesting clean poweroff\n'
+qemu_pid=$(< /work/guest/qemu.pid)
+[[ "$qemu_pid" =~ ^[0-9]+$ ]]
+python3 /work/native-cli/native-cli-coverage.py poweroff \
+  --qmp /work/guest/native-qmp.sock --pid "$qemu_pid" -- \
+  ssh "${opts[@]}" bench@127.0.0.1 'sudo -n systemctl poweroff' \
+  > /work/native-poweroff.json
+exit "$status"
+NATIVE_COVERAGE
+  native_status=0
+  timeout --kill-after=5s 1200 docker exec "$controller" bash /work/native-coverage.sh > "$work/native-coverage.log" 2>&1 || native_status=$?
+  [[ "$native_status" == 0 ]] || exit "$native_status"
+  python3 "$here/native-cli-coverage.py" verify --manifest "$work/native-cli/native-cli-manifest.json"     --evidence "$work/native-evidence/cli" --profiles "$work/native-profiles"
+  result=PASS
+  exit 0
+fi
 if [[ -n "$inventory_tiers" ]]; then
   # The inventory executor runs inside the controller (same netns as the
   # guest); /work is bind-mounted there.
@@ -953,6 +1064,8 @@ if [[ -n "$inventory_tiers" ]]; then
   cp "$here/qemu-fingerprint-oracle.py" "$work/qemu-fingerprint-oracle.py"
   cp "$here/qemu-license-oracle.py" "$work/qemu-license-oracle.py"
   cp "$here/qemu-rust-install-oracle.py" "$work/qemu-rust-install-oracle.py"
+  cp "$here/qemu-runtime-advisory-oracle.py" "$work/qemu-runtime-advisory-oracle.py"
+  cp "$here/../tests/runtime_advisory_fixture.py" "$work/runtime_advisory_fixture.py"
   cp "$here/qemu-arch-update-fixture.sh" "$work/qemu-arch-update-fixture.sh"
   cp "$here/qemu-run-watch-check.py" "$work/qemu-run-watch-check.py"
   cp "$here/qemu-enterprise-export-oracle.py" "$work/qemu-enterprise-export-oracle.py"
@@ -971,15 +1084,17 @@ if [[ -n "$inventory_tiers" ]]; then
       --inventory "$tsv" --network-scopes > "$work/inventory-scopes.json"
   fi
 fi
+if [[ -z "$inventory_tiers" ]]; then cp "$here/qemu-runtime-advisory-oracle.py" "$work/qemu-runtime-advisory-oracle.py"; fi
 if [[ "$benchmark" == true ]]; then
   cp "$here/../benchmark-hyperfine.sh" "$work/benchmark-hyperfine.sh"
+  cp "$here/attend-unknown-fixture.py" "$work/attend-unknown-fixture.py"
   cp "$here/record-benchmark-run.py" "$work/record-benchmark-run.py"
   if [[ "$transaction_samples" != 0 ]]; then
     cp "$here/qemu-transactions.sh" "$work/qemu-transactions.sh"
     cp "$here/check-qemu-health.py" "$work/check-qemu-health.py"
     sha256sum "$work/qemu-transactions.sh" > "$work/transaction-runner-sha256.txt"
   fi
-  sha256sum "$work/benchmark-hyperfine.sh" "$work/record-benchmark-run.py" > "$work/benchmark-driver-sha256.txt"
+  sha256sum "$work/benchmark-hyperfine.sh" "$work/record-benchmark-run.py" "$work/attend-unknown-fixture.py" > "$work/benchmark-driver-sha256.txt"
 fi
 if [[ "$distro" == fedora ]]; then
   cp "$here/qemu-fedora-advisory-check.sh" "$here/qemu-fedora-advisory-oracle.py" "$work/"
@@ -1045,8 +1160,41 @@ if [[ "$distro" == debian-trixie ]]; then
     --distro "$distro" --arch "$guest_arch" --omg "$bin" --omgd "$daemon" \
     --output "$HOME/evidence/apt-abi" || exit 120
 fi
+native_release="/opt/omg-qemu/omg-${tag}-${guest_arch}-linux-${distro}"
+sudo -n install -d -o root -g root -m 0755 /opt/omg-qemu "$native_release"
+sudo -n install -o root -g root -m 0755 "$bin" "$native_release/omg"
+cmp "$bin" "$native_release/omg"
+native_bin="$native_release/omg"
+sudo -n install -o root -g root -m 0755 "$daemon" "$native_release/omgd"
+cmp "$daemon" "$native_release/omgd"
+stat -c '%n uid=%u gid=%g mode=%a type=%F' / /opt /opt/omg-qemu "$native_release" "$native_bin" > evidence/native-executable-trust.txt
+sha256sum "$bin" "$native_bin" > evidence/native-executable-sha256.txt
 [[ $("$bin" --version | head -1 | tr -d '[:space:]') == "omg${tag#v}" ]]
 [[ $("$daemon" --version | head -1 | tr -d '[:space:]') == "omgd${tag#v}" ]]
+arch_system_upgrade() {
+  local attempt log rc
+  for attempt in 1 2; do
+    log="evidence/arch-system-upgrade-$attempt.txt"
+    rc=0
+    sudo -n pacman -Syu --noconfirm > "$log" 2>&1 || rc=$?
+    cp -- "$log" evidence/arch-system-upgrade.txt || return 1
+    (( rc == 0 )) && return 0
+    (( attempt == 1 )) || break
+    if ! awk '
+      /^error: failed retrieving file .* : (Resolving timed out after [0-9]+ milliseconds|Could not resolve host: [^[:space:]]+)$/ {
+        dns = 1
+        next
+      }
+      /^error: failed to (synchronize all databases|commit transaction) [(]failed to retrieve some files[)]$/ { next }
+      /^error:/ { other = 1 }
+      END { exit !(dns && !other) }
+    ' "$log"; then
+      return 1
+    fi
+    sleep 5
+  done
+  return 1
+}
 fedora_makecache_class() {
   local log=$1
   [[ -r "$log" ]] || return 1
@@ -1082,7 +1230,7 @@ fedora_makecache() {
   return 1
 }
 case "$distro" in
-  arch) sudo -n pacman -Syu --noconfirm >evidence/arch-system-upgrade.txt 2>&1 || exit 120; native=(pacman -Qi tree); version_cmd=(pacman -Q tree) ;;
+  arch) arch_system_upgrade || exit 120; native=(pacman -Qi tree); version_cmd=(pacman -Q tree) ;;
   debian|debian-trixie|ubuntu)
     sudo -n systemctl stop apt-daily.timer apt-daily-upgrade.timer
     printf 'Acquire::ForceIPv4 "true";\nAcquire::Retries "2";\nAcquire::http::Timeout "30";\nAcquire::https::Timeout "30";\nAcquire::Languages "none";\nAcquire::IndexTargets::deb::DEP-11::DefaultEnabled "false";\nAcquire::IndexTargets::deb::CNF::DefaultEnabled "false";\n' | sudo -n tee /etc/apt/apt.conf.d/99omg-qa-network > evidence/apt-network.conf
@@ -1108,7 +1256,32 @@ if [[ "$distro" == fedora ]]; then
 else
   grep -Eqi '^[[:space:]]+tree[[:space:]]' evidence/search.txt
 fi
-sudo -n "$bin" install --yes tree
+if [[ "$distro" == fedora ]]; then
+  rpm -qa --qf '%{NAME}|%{EPOCHNUM}|%{VERSION}|%{RELEASE}|%{ARCH}\n' | LC_ALL=C sort > evidence/native-advisory-denial-before.tsv
+  python3 "$HOME/qemu-runtime-advisory-oracle.py" --native --deny-only --timeout 600 -- sudo -n "$native_bin" install --yes tree > evidence/native-advisory-denial.log
+  rpm -qa --qf '%{NAME}|%{EPOCHNUM}|%{VERSION}|%{RELEASE}|%{ARCH}\n' | LC_ALL=C sort > evidence/native-advisory-denial-after.tsv
+  cmp evidence/native-advisory-denial-before.tsv evidence/native-advisory-denial-after.tsv
+  if installed >/dev/null 2>&1; then echo 'denied advisory risk changed tree state' >&2; exit 1; fi
+fi
+install_review=(python3 "$HOME/qemu-runtime-advisory-oracle.py" --native --accept-only --timeout 600)
+if [[ "$distro" == fedora ]]; then
+  accepted_status=0
+  first_review=evidence/native-advisory-first-review.log
+  "${install_review[@]}" -- sudo -n "$native_bin" install --yes tree > "$first_review" 2>&1 || accepted_status=$?
+  cat "$first_review"
+  if (( accepted_status != 0 )); then
+    if (( accepted_status != 1 )) ||
+       ! grep -Eq $'^Error: Package advisory evidence changed; review this transaction again\r?$' "$first_review"; then
+      exit "$accepted_status"
+    fi
+    rpm -qa --qf '%{NAME}|%{EPOCHNUM}|%{VERSION}|%{RELEASE}|%{ARCH}\n' | LC_ALL=C sort > evidence/native-advisory-drift-after.tsv
+    cmp evidence/native-advisory-denial-before.tsv evidence/native-advisory-drift-after.tsv
+    if installed >/dev/null 2>&1; then echo 'advisory drift changed tree state' >&2; exit 1; fi
+    "${install_review[@]}" --require-review -- sudo -n "$native_bin" install --yes tree
+  fi
+else
+  "${install_review[@]}" -- sudo -n "$native_bin" install --yes tree
+fi
 installed
 "$bin" info tree > evidence/omg-info.txt
 "${native[@]}" > evidence/native-info.txt
@@ -1177,7 +1350,12 @@ if [[ "$distro" == debian || "$distro" == debian-trixie || "$distro" == ubuntu ]
     echo 'local archive was accepted without consent' >&2; exit 1
   fi
   grep -Fq 'require explicit consent' evidence/local-consent.txt
-  sudo -n "$bin" install --allow-local-file --yes "${packages[0]}"
+  dpkg-query -W '-f=${binary:Package}\t${Version}\t${db:Status-Status}\n' | LC_ALL=C sort > evidence/local-advisory-denial-before.tsv
+  python3 "$HOME/qemu-runtime-advisory-oracle.py" --native --deny-only --timeout 600 -- sudo -n "$native_bin" install --allow-local-file --yes "${packages[0]}" > evidence/local-advisory-denial.log
+  dpkg-query -W '-f=${binary:Package}\t${Version}\t${db:Status-Status}\n' | LC_ALL=C sort > evidence/local-advisory-denial-after.tsv
+  cmp evidence/local-advisory-denial-before.tsv evidence/local-advisory-denial-after.tsv
+  if installed >/dev/null 2>&1; then echo 'denied advisory risk installed local tree' >&2; exit 1; fi
+  python3 "$HOME/qemu-runtime-advisory-oracle.py" --native --accept-only --require-review --timeout 600 -- sudo -n "$native_bin" install --allow-local-file --yes "${packages[0]}"
   installed
   sudo -n "$bin" remove --yes tree
   if installed >/dev/null 2>&1; then echo 'local package remains installed' >&2; exit 1; fi
@@ -1260,6 +1438,7 @@ if [[ "$distro" == fedora ]]; then
 fi
 timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 "/work/release/$archive" bench@127.0.0.1:release.tar.gz
 timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 /work/guest-check.sh bench@127.0.0.1:guest-check.sh
+timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 /work/qemu-runtime-advisory-oracle.py bench@127.0.0.1:qemu-runtime-advisory-oracle.py
 if [[ "$distro" == ubuntu ]]; then
   timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 /work/setup-ubuntu-apt.sh bench@127.0.0.1:setup-ubuntu-apt.sh
 fi
@@ -1302,6 +1481,7 @@ fi
 timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 /work/daemon-advisory-shutdown.sh bench@127.0.0.1:daemon-advisory-shutdown.sh
 if [[ "$benchmark" == true ]]; then
   timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 /work/benchmark-hyperfine.sh bench@127.0.0.1:benchmark-hyperfine.sh
+  timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 /work/attend-unknown-fixture.py bench@127.0.0.1:attend-unknown-fixture.py
 fi
 rc=0
 timeout "$guest_timeout" docker exec -w /work/guest "$controller" ssh "${opts[@]}" -p 2222 bench@127.0.0.1 "bash guest-check.sh '$distro' '$tag' '$digest' '$benchmark' '$arch' '$guest_uname' '$inventory_tiers' '$qemu_accel'" > "$work/guest-check.log" 2>&1 || rc=$?
@@ -1523,7 +1703,8 @@ if [[ -n "$inventory_tiers" && "$rc" == 0 ]]; then
   # TSV-driven rows run only on a healthy guest, inside the controller
   # (same netns; /work is bind-mounted). Evidence lands in $work/inventory.
   inv_args=(--work /work --distro "$distro" --tiers "$inventory_tiers" --tag "$tag"
-    --binary "/home/bench/omg-${tag}-${arch}-linux-${distro}/omg" --tsv /work/cases.tsv)
+    --binary "/home/bench/omg-${tag}-${arch}-linux-${distro}/omg"
+    --native-binary "/opt/omg-qemu/omg-${tag}-${arch}-linux-${distro}/omg" --tsv /work/cases.tsv)
   if [[ "$source_kind" == staged ]]; then
     inv_args+=(--man-page-inventory /work/man_page_inventory.txt)
   fi

@@ -266,6 +266,44 @@ pub fn sanitize_terminal_text(text: &str) -> String {
         .collect()
 }
 
+// Preserve the owned callback's coverage ownership; exhaustive scalar parity prevents drift.
+#[cfg(any(feature = "arch", test))]
+fn terminal_character_allowed(character: char) -> bool {
+    !character.is_control()
+        && !matches!(
+            character,
+            // Bidi embedding/override/isolate (Trojan Source class)
+            '\u{202a}'..='\u{202e}'
+                | '\u{2066}'..='\u{2069}'
+                // Zero-width + invisible formatting (LRM/RLM/ZWJ/WJ)
+                | '\u{200b}'..='\u{200f}'
+                | '\u{2060}'..='\u{2064}'
+                // Unicode line/paragraph separator (breaks single-line layout)
+                | '\u{2028}' | '\u{2029}'
+                // Zero-width no-break space / BOM in the middle of text
+                | '\u{feff}'
+        )
+}
+
+#[must_use]
+#[cfg(any(feature = "arch", test))]
+pub(crate) fn display_terminal_text(text: &str) -> impl std::fmt::Display + '_ {
+    struct TerminalText<'a>(&'a str);
+
+    impl std::fmt::Display for TerminalText<'_> {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            use std::fmt::Write as _;
+
+            for character in self.0.chars().filter(|c| terminal_character_allowed(*c)) {
+                formatter.write_char(character)?;
+            }
+            Ok(())
+        }
+    }
+
+    TerminalText(text)
+}
+
 /// URL formatting (underlined blue)
 #[must_use]
 pub fn url(link: &str) -> String {
@@ -349,6 +387,27 @@ mod tests {
     use super::*;
     use serial_test::serial;
     use temp_env;
+
+    #[test]
+    #[serial]
+    fn spinner_keeps_the_message_until_finished() {
+        for (color, unicode) in [("always", "1"), ("never", "0")] {
+            temp_env::with_vars(
+                [
+                    ("NO_COLOR", None),
+                    ("OMG_COLORS", Some(color)),
+                    ("OMG_UNICODE", Some(unicode)),
+                ],
+                || {
+                    let progress = spinner("Checking package sources");
+                    assert_eq!(progress.message(), "Checking package sources");
+                    assert!(!progress.is_finished());
+                    progress.finish_and_clear();
+                    assert!(progress.is_finished());
+                },
+            );
+        }
+    }
 
     #[test]
     #[serial]
@@ -463,6 +522,36 @@ mod tests {
                 assert_eq!(rendered.matches("OK").count(), 1, "{rendered:?}");
             },
         );
+    }
+
+    #[test]
+    fn streaming_terminal_text_matches_owned_sanitization_for_every_unicode_scalar() {
+        for character in (0..=0x0010_ffff).filter_map(char::from_u32) {
+            let codepoint = u32::from(character);
+            let mut bytes = [0; 4];
+            let input = character.encode_utf8(&mut bytes);
+            assert_eq!(
+                display_terminal_text(input).to_string(),
+                sanitize_terminal_text(input),
+                "terminal filters differ for U+{codepoint:04X}"
+            );
+        }
+    }
+
+    #[test]
+    fn streaming_terminal_text_matches_owned_sanitization() {
+        for input in [
+            "plain visible text",
+            "core\u{1b}]0;pwn\u{202e}db\u{7}\n",
+            "x\u{200b}y\u{200c}z\u{2060}w\u{feff}",
+            "one\u{2028}two\u{2029}three",
+            "é 日本語 🎉",
+        ] {
+            assert_eq!(
+                display_terminal_text(input).to_string(),
+                sanitize_terminal_text(input)
+            );
+        }
     }
 
     #[test]

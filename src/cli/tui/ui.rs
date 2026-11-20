@@ -411,7 +411,7 @@ fn draw_health_cards(f: &mut Frame, area: Rect, app: &App) {
     let total_packages = app.get_total_packages();
     let updates = app.get_updates_available();
     let orphans = app.get_orphan_packages();
-    let vulns = app.get_security_vulnerabilities();
+    let vulns = app.get_security_findings_summary();
 
     // Packages card
     if let Some(c) = cards.first() {
@@ -474,20 +474,36 @@ fn draw_health_cards(f: &mut Frame, area: Rect, app: &App) {
 
     // Security card
     if let Some(c) = cards.get(3) {
-        let (color, status_icon, label) = match vulns {
-            Some(0) => (colors::ACCENT_GREEN, "󰒃", Cow::Borrowed("Secure")),
-            Some(count) => (colors::ACCENT_RED, "󰀦", Cow::Owned(format!("{count} CVEs"))),
-            None => (colors::FG_MUTED, "󰀦", Cow::Borrowed("Not scanned")),
+        let (color, status_icon, label, caption) = match vulns {
+            Some((0, 0)) => (
+                colors::ACCENT_GREEN,
+                "󰒃",
+                Cow::Borrowed("No matches"),
+                Cow::Borrowed("Reported coverage"),
+            ),
+            Some((count, unknown)) => (
+                if count > 0 {
+                    colors::ACCENT_RED
+                } else {
+                    colors::ACCENT_YELLOW
+                },
+                "󰀦",
+                Cow::Owned(format!("{count} findings")),
+                if unknown > 0 {
+                    Cow::Owned(format!("{unknown} unassessed"))
+                } else {
+                    Cow::Borrowed("Reported coverage")
+                },
+            ),
+            None => (
+                colors::FG_MUTED,
+                "󰀦",
+                Cow::Borrowed("Unreported"),
+                Cow::Borrowed("Advisory coverage"),
+            ),
         };
         f.render_widget(
-            stat_card(
-                "Security",
-                status_icon,
-                color,
-                label,
-                color,
-                "Compliance Status",
-            ),
+            stat_card("Security", status_icon, color, label, color, &caption),
             *c,
         );
     }
@@ -943,15 +959,17 @@ fn draw_security(f: &mut Frame, area: Rect, app: &App) {
         return;
     };
 
-    let vulnerabilities = app.get_security_vulnerabilities();
-    let (status_color, status_icon, status_text) = match vulnerabilities {
-        Some(0) => (colors::ACCENT_GREEN, "󰒃", "SECURE"),
-        Some(_) => (colors::ACCENT_RED, "󰀦", "VULNERABLE"),
-        None => (colors::FG_MUTED, "󰀦", "NOT SCANNED"),
+    let summary = app.get_security_findings_summary();
+    let vulnerabilities = summary.map(|(findings, _)| findings);
+    let (status_color, status_icon, status_text) = match summary {
+        Some((_, unknown)) if unknown > 0 => (colors::ACCENT_YELLOW, "󰀦", "PARTIAL COVERAGE"),
+        Some((0, 0)) => (colors::ACCENT_GREEN, "󰒃", "NO REPORTED MATCHES"),
+        Some(_) => (colors::ACCENT_RED, "󰀦", "FINDINGS"),
+        None => (colors::FG_MUTED, "󰀦", "UNREPORTED"),
     };
 
     // Security Overview
-    let security_lines = vec![
+    let mut security_lines = vec![
         Line::from(""),
         Line::from(vec![
             Span::styled(
@@ -968,7 +986,7 @@ fn draw_security(f: &mut Frame, area: Rect, app: &App) {
         ]),
         Line::from(""),
         Line::from(vec![
-            Span::styled("   CVEs Found: ", Style::default().fg(colors::FG_MUTED)),
+            Span::styled("   Findings: ", Style::default().fg(colors::FG_MUTED)),
             Span::styled(
                 match vulnerabilities {
                     Some(count) => count.to_string(),
@@ -983,30 +1001,80 @@ fn draw_security(f: &mut Frame, area: Rect, app: &App) {
             ),
         ]),
         Line::from(""),
-        Line::from(Span::styled(
-            "   Policy:",
-            Style::default()
-                .fg(colors::FG_PRIMARY)
-                .add_modifier(Modifier::BOLD),
-        )),
-        // These are the built-in DEFAULTS, not live configuration; label them
-        // as such so they cannot be mistaken for actual policy state.
         Line::from(vec![
-            Span::styled("   ├─ Min Grade: ", Style::default().fg(colors::FG_MUTED)),
+            Span::styled("   Unassessed: ", Style::default().fg(colors::FG_MUTED)),
             Span::styled(
-                "VERIFIED (default)",
-                Style::default().fg(colors::ACCENT_GREEN),
+                summary.map_or_else(|| "n/a".to_owned(), |(_, count)| count.to_string()),
+                Style::default().fg(status_color),
             ),
         ]),
-        Line::from(vec![
-            Span::styled("   ├─ AUR: ", Style::default().fg(colors::FG_MUTED)),
-            Span::styled("Allowed", Style::default().fg(colors::ACCENT_YELLOW)),
-        ]),
-        Line::from(vec![
-            Span::styled("   └─ PGP: ", Style::default().fg(colors::FG_MUTED)),
-            Span::styled("Required", Style::default().fg(colors::ACCENT_GREEN)),
-        ]),
     ];
+    match &app.security_policy {
+        Some(Ok(policy)) => {
+            security_lines.push(Line::from(Span::styled(
+                "   Configured policy snapshot:",
+                Style::default()
+                    .fg(colors::FG_PRIMARY)
+                    .add_modifier(Modifier::BOLD),
+            )));
+            for (label, value) in [
+                ("Min Grade", policy.minimum_grade.to_string()),
+                (
+                    "AUR",
+                    if policy.allow_aur {
+                        "Allowed"
+                    } else {
+                        "Disabled"
+                    }
+                    .to_owned(),
+                ),
+                (
+                    "PGP",
+                    if policy.require_pgp {
+                        "Required"
+                    } else {
+                        "Not required"
+                    }
+                    .to_owned(),
+                ),
+                (
+                    "Advisories",
+                    match policy.advisory_requirement {
+                        crate::core::security::policy::AdvisoryRequirement::Optional => "Optional",
+                        crate::core::security::policy::AdvisoryRequirement::Review => {
+                            "Review required"
+                        }
+                        crate::core::security::policy::AdvisoryRequirement::FreshSnapshot => {
+                            "Fresh snapshot required"
+                        }
+                    }
+                    .to_owned(),
+                ),
+            ] {
+                security_lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("   {label}: "),
+                        Style::default().fg(colors::FG_MUTED),
+                    ),
+                    Span::styled(value, Style::default().fg(colors::ACCENT_YELLOW)),
+                ]));
+            }
+        }
+        Some(Err(error)) => {
+            security_lines.push(Line::from(Span::styled(
+                "   Policy unavailable",
+                Style::default().fg(colors::ACCENT_RED),
+            )));
+            security_lines.push(Line::from(format!(
+                "   {}",
+                truncate_width(
+                    &error.to_string(),
+                    usize::from(left.width.saturating_sub(6))
+                )
+            )));
+        }
+        None => security_lines.push(Line::from("   Policy not loaded")),
+    }
 
     let security_widget = Paragraph::new(security_lines)
         .block(styled_block("󰒃 Security Status"))
@@ -1412,6 +1480,204 @@ mod tests {
     use super::*;
     use ratatui::{Terminal, backend::TestBackend};
 
+    #[test]
+    fn security_tab_tracks_configured_policy_and_reports_invalid_policy() {
+        const NAME: &str =
+            "cli::tui::ui::tests::security_tab_tracks_configured_policy_and_reports_invalid_policy";
+        if crate::core::testing::run_isolated_test(NAME) {
+            return;
+        }
+        if crate::config::Settings::rerun_test_unprivileged(NAME) {
+            return;
+        }
+        let directory = tempfile::tempdir().expect("private policy directory");
+        let path = directory.path().to_str().expect("UTF-8 fixture path");
+        temp_env::with_vars(
+            [
+                ("OMG_CONFIG_DIR", Some(path)),
+                ("OMG_DATA_DIR", Some(path)),
+                ("OMG_TEST_MODE", Some("1")),
+            ],
+            || {
+                let policy_path = directory.path().join("policy.toml");
+                let mut policy = crate::core::security::SecurityPolicy {
+                    allow_aur: false,
+                    require_pgp: true,
+                    minimum_grade: crate::core::security::SecurityGrade::Verified,
+                    advisory_requirement:
+                        crate::core::security::policy::AdvisoryRequirement::FreshSnapshot,
+                    ..Default::default()
+                };
+                std::fs::write(&policy_path, toml::to_string(&policy).unwrap()).unwrap();
+                let mut app = App::new()
+                    .expect("private app state")
+                    .with_tab(Tab::Security);
+                let render = |app: &App| {
+                    let mut terminal = Terminal::new(TestBackend::new(160, 40)).unwrap();
+                    terminal.draw(|frame| draw(frame, app)).unwrap();
+                    terminal
+                        .backend()
+                        .buffer()
+                        .content()
+                        .iter()
+                        .map(ratatui::buffer::Cell::symbol)
+                        .collect::<String>()
+                };
+                let text = render(&app);
+                assert!(text.contains("Configured policy snapshot"), "{text}");
+                assert!(text.contains("AUR: Disabled"), "{text}");
+                assert!(text.contains("PGP: Required"), "{text}");
+                assert!(text.contains("VERIFIED"), "{text}");
+                assert!(
+                    text.contains("Advisories: Fresh snapshot required"),
+                    "{text}"
+                );
+                assert!(!text.contains("COMMUNITY"), "{text}");
+                policy.advisory_requirement =
+                    crate::core::security::policy::AdvisoryRequirement::Review;
+                std::fs::write(&policy_path, toml::to_string(&policy).unwrap()).unwrap();
+                app.refresh().unwrap();
+                assert!(render(&app).contains("Advisories: Review required"));
+                std::fs::write(&policy_path, "allow_aur = [broken").unwrap();
+                app.refresh()
+                    .expect("invalid policy remains visible without closing the UI");
+                let text = render(&app);
+                assert!(text.contains("Policy unavailable"), "{text}");
+                assert!(
+                    !text.contains("AUR: Allowed") && !text.contains("AUR: Disabled"),
+                    "{text}"
+                );
+                std::fs::remove_file(&policy_path).unwrap();
+                app.refresh().unwrap();
+                let text = render(&app);
+                assert!(
+                    text.contains("AUR: Allowed") && text.contains("PGP: Not required"),
+                    "{text}"
+                );
+            },
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unknown_coverage_keeps_findings_visible_without_claiming_secure() {
+        let mut app = app_on(Tab::Security);
+        app.status = Some(crate::daemon::protocol::StatusResult {
+            total_packages: 1,
+            explicit_packages: 1,
+            orphan_packages: 0,
+            updates_available: 0,
+            security_vulnerabilities: 17,
+            vulnerabilities_scanned: true,
+            security_unknown_packages: Some(1),
+            runtime_versions: vec![],
+        });
+        let mut terminal = Terminal::new(TestBackend::new(140, 40)).expect("test terminal");
+        terminal
+            .draw(|frame| draw(frame, &app))
+            .expect("security tab");
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(text.contains("PARTIAL COVERAGE"));
+        assert!(text.contains("Findings: 17"));
+        assert!(text.contains("Unassessed: 1"));
+        assert!(!text.contains("SECURE"));
+        assert!(text.contains("Policy not loaded"));
+        assert!(!text.contains("COMMUNITY"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dashboard_and_security_tab_preserve_reported_advisory_scope() {
+        for (findings, unknown, scanned, card, detail, security) in [
+            (
+                0,
+                Some(0),
+                true,
+                "No matches",
+                "Reported coverage",
+                "NO REPORTED MATCHES",
+            ),
+            (
+                2,
+                Some(0),
+                true,
+                "2 findings",
+                "Reported coverage",
+                "FINDINGS",
+            ),
+            (
+                0,
+                Some(3),
+                true,
+                "0 findings",
+                "3 unassessed",
+                "PARTIAL COVERAGE",
+            ),
+            (
+                2,
+                None,
+                true,
+                "Unreported",
+                "Advisory coverage",
+                "UNREPORTED",
+            ),
+            (
+                2,
+                Some(0),
+                false,
+                "Unreported",
+                "Advisory coverage",
+                "UNREPORTED",
+            ),
+        ] {
+            for tab in [Tab::Dashboard, Tab::Security] {
+                let mut app = app_on(tab);
+                app.status = Some(crate::daemon::protocol::StatusResult {
+                    total_packages: 9,
+                    explicit_packages: 5,
+                    orphan_packages: 0,
+                    updates_available: 2,
+                    security_vulnerabilities: findings,
+                    vulnerabilities_scanned: scanned,
+                    security_unknown_packages: unknown,
+                    runtime_versions: vec![],
+                });
+                let mut terminal = Terminal::new(TestBackend::new(160, 45)).expect("test terminal");
+                terminal
+                    .draw(|frame| draw(frame, &app))
+                    .expect("draw advisory scope");
+                let text: String = terminal
+                    .backend()
+                    .buffer()
+                    .content()
+                    .iter()
+                    .map(ratatui::buffer::Cell::symbol)
+                    .collect();
+                if tab == Tab::Dashboard {
+                    assert!(text.contains(card) && text.contains(detail), "{text}");
+                } else {
+                    assert!(text.contains(security), "{text}");
+                    if scanned && let Some(unknown) = unknown {
+                        assert!(text.contains(&format!("Findings: {findings}")), "{text}");
+                        assert!(text.contains(&format!("Unassessed: {unknown}")), "{text}");
+                    } else {
+                        assert!(
+                            text.contains("Findings: n/a") && text.contains("Unassessed: n/a"),
+                            "{text}"
+                        );
+                    }
+                }
+                assert!(!text.contains("SECURE"), "{text}");
+            }
+        }
+    }
+
     fn app_on(tab: Tab) -> App {
         App::new_detached().with_tab(tab)
     }
@@ -1429,9 +1695,8 @@ mod tests {
             .collect()
     }
 
-    /// Builds a backend version from raw metadata text. The strict parser
-    /// rejects poisoned strings, so this goes through the domain type's serde
-    /// path the way cached/remote metadata does.
+    /// Builds a backend version through the same validated serde boundary as
+    /// cached metadata. Arch ALPM 0.14 rejects non-ASCII version characters.
     fn poisoned_version(raw: &str) -> crate::package_managers::types::Version {
         #[cfg(feature = "arch")]
         {
@@ -1439,13 +1704,24 @@ mod tests {
                 r#"{{"pkgver":{},"epoch":null,"pkgrel":{{"major":1,"minor":null}}}}"#,
                 serde_json::to_string(raw).expect("json version string")
             ))
-            .expect("serde constructs versions without strict validation")
+            .expect("version fixture must satisfy the backend's serde validation")
         }
         #[cfg(not(feature = "arch"))]
         {
             let _ = raw;
             crate::package_managers::types::DebVersion::new(raw)
         }
+    }
+
+    #[cfg(feature = "arch")]
+    #[test]
+    fn cached_arch_versions_reject_bidi_before_rendering() {
+        let value = serde_json::json!({
+            "pkgver": "1.0\u{202e}evil",
+            "epoch": null,
+            "pkgrel": { "major": 1, "minor": null }
+        });
+        assert!(serde_json::from_value::<crate::package_managers::types::Version>(value).is_err());
     }
 
     fn package_app() -> App {
@@ -1733,7 +2009,7 @@ mod tests {
             (Tab::Dashboard, "Usage Stats"),
             (Tab::Packages, "Type / to search packages"),
             (Tab::Runtimes, "Runtimes"),
-            (Tab::Security, "NOT SCANNED"),
+            (Tab::Security, "UNREPORTED"),
             (Tab::Activity, "Activity Log"),
             (Tab::Team, "Not in a team workspace"),
         ] {

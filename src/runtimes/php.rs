@@ -79,6 +79,7 @@ pub(crate) struct PhpVersion {
 }
 
 pub(crate) struct PhpManager {
+    security: super::security::RuntimeSecurity,
     versions_dir: PathBuf,
     client: &'static reqwest::Client,
 }
@@ -355,6 +356,7 @@ fn pathdiff_relative(target: &Path, base: &Path) -> PathBuf {
 impl PhpManager {
     pub fn new() -> Self {
         Self {
+            security: super::security::RuntimeSecurity::default(),
             versions_dir: super::DATA_DIR.join("versions/php"),
             client: download_client(),
         }
@@ -473,15 +475,28 @@ impl PhpManager {
         download_with_progress(self.client, &url, &download_path, &checksum).await?;
 
         println!("{} Extracting (pure Rust)...", style::informative("→"));
+        self.publish_download(&download_path, &url, &version)
+            .await?;
+        remove_file_best_effort(&download_path, "runtime archive");
+        print_installed("PHP", &version);
+        self.use_version(&version)?;
+
+        Ok(())
+    }
+
+    async fn publish_download(&self, download_path: &Path, url: &str, version: &str) -> Result<()> {
+        let version_dir = self.versions_dir.join(version);
+        let publisher =
+            super::security::record_download("php", version, &version_dir, download_path, url)?;
         let staging = begin_staged_install(&self.versions_dir)?;
         // System-root tarballs unwrap one level (`usr/bin/php8.5` becomes
         // `bin/php8.5`); flat archives fall back to strip 0.
-        extract_tar_xz(&download_path, staging.path(), 1).await?;
-        let mut found = find_php_binary(staging.path(), &version);
+        extract_tar_xz(download_path, staging.path(), 1).await?;
+        let mut found = find_php_binary(staging.path(), version);
         if found.is_none() {
             clear_dir_contents(staging.path())?;
-            extract_tar_xz(&download_path, staging.path(), 0).await?;
-            found = find_php_binary(staging.path(), &version);
+            extract_tar_xz(download_path, staging.path(), 0).await?;
+            found = find_php_binary(staging.path(), version);
         }
         let found = found.with_context(|| {
             format!(
@@ -490,6 +505,10 @@ impl PhpManager {
         })?;
         make_staged_executable(&found)?;
         link_staged_php(staging.path(), &found)?;
+        let admission =
+            self.security
+                .prepare_staged("php", version, staging.path(), &version_dir)?;
+        admission.before_execution(staging.path())?;
         println!("{} Verifying installation...", style::informative("→"));
         if let Err(error) = smoke_php(staging.path()) {
             return Err(error.context(format!(
@@ -498,20 +517,28 @@ impl PhpManager {
         }
 
         if is_valid_version_dir(&version_dir) {
-            replace_staged_install(&staging, &version_dir, &version)?;
+            replace_staged_install(&staging, &version_dir, version)?;
         } else {
-            complete_staged_install(&staging, &version_dir, &version)?;
+            complete_staged_install(&staging, &version_dir, version)?;
         }
-        remove_file_best_effort(&download_path, "runtime archive");
-        print_installed("PHP", &version);
-        self.use_version(&version)?;
-
+        publisher.commit();
         Ok(())
     }
 
     /// Switch to a specific version.
     pub fn use_version(&self, version: &str) -> Result<()> {
         let version = normalize_version(version);
+        crate::core::security::validate_runtime_version(&version)?;
+        super::common::require_internal_runtime_binary(
+            &self.versions_dir.join(&version),
+            Path::new("bin/php"),
+        )?;
+        let admission = self.security.installed(
+            "php",
+            &self.versions_dir.join(&version),
+            super::security::ReviewMode::FreshAttended,
+        )?;
+        admission.verify(&self.versions_dir.join(&version))?;
         activate_version_with_linked_binary(&self.versions_dir, &version, Path::new("bin/php"))?;
         print_using("PHP", &version, &self.versions_dir.join("current"));
         Ok(())
@@ -534,29 +561,13 @@ fn smoke_php(version_dir: &Path) -> Result<()> {
     let php = version_dir.join("bin/php");
     let mut command = std::process::Command::new(&php);
     super::common::harden_untrusted_runtime_command(&mut command, version_dir);
-    let output = command
-        .arg("-v")
-        .output()
-        .with_context(|| format!("Failed to run smoke test: {}", php.display()))?;
-    if output.status.success() {
-        return Ok(());
-    }
-    let detail: String =
-        crate::cli::style::sanitize_terminal_text(&String::from_utf8_lossy(&output.stderr))
-            .trim()
-            .chars()
-            .take(300)
-            .collect();
-    anyhow::bail!(
-        "PHP smoke test (`php -v`) failed with status {}: {}{}",
-        output.status,
-        php.display(),
-        if detail.is_empty() {
-            String::new()
-        } else {
-            format!("\n{detail}")
-        }
-    )
+    command.arg("-v");
+    super::tool_artifacts::run_with_timeout(
+        command,
+        "PHP smoke test (`php -v`)",
+        std::time::Duration::from_secs(30),
+    )?;
+    Ok(())
 }
 
 /// Ensure the installed `php` is executable (tarballs may drop modes).
@@ -584,6 +595,96 @@ fn make_staged_executable(_path: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn smoke_php_refuses_excessive_output() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let fixture = tempfile::tempdir()?;
+        let bin = fixture.path().join("bin");
+        std::fs::create_dir(&bin)?;
+        let php = bin.join("php");
+        std::fs::write(&php, b"#!/bin/sh\nhead -c 1100000 /dev/zero >&2\n")?;
+        std::fs::set_permissions(&php, std::fs::Permissions::from_mode(0o700))?;
+        let error = super::smoke_php(fixture.path()).expect_err("probe output must be bounded");
+        assert!(error.to_string().contains("output"));
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires the isolated fixed-public TLS native fixture"]
+    async fn native_public_install_preserves_authenticated_download_boundary() {
+        use super::super::test_archive::{PublicationFixture, tar_xz_entries};
+        use sha2::{Digest as _, Sha256};
+
+        let version = "8.5";
+        let launcher = b"#!/bin/sh\nprintf 'PHP 8.5.1 (cli)\\n'\n";
+        let archive = tar_xz_entries(
+            "usr",
+            &[
+                ("bin/php8.5", launcher),
+                (
+                    "include/php/main/php_version.h",
+                    b"#define PHP_VERSION \"8.5.1\"\n",
+                ),
+                ("lib/owned.data", b"complete PHP implementation"),
+            ],
+        )
+        .unwrap();
+        let filename = asset_name(version, &php_distro().unwrap(), host_arch_suffix().unwrap());
+        let path = format!("/shivammathur/php-builder/releases/download/{version}/{filename}");
+        let metadata = serde_json::to_vec(&serde_json::json!([{
+            "tag_name":version,"prerelease":false,
+            "assets":[{"name":filename,"browser_download_url":format!("https://github.com{path}"),"digest":format!("sha256:{}",hex::encode(Sha256::digest(&archive)))}]
+        }])).unwrap();
+        super::super::test_https::fixed_public_routes(&[
+            (
+                "api.github.com",
+                "/repos/shivammathur/php-builder/releases?per_page=50&page=1",
+                &metadata,
+            ),
+            (
+                "api.github.com",
+                "/repos/shivammathur/php-builder/releases?per_page=50&page=1",
+                &metadata,
+            ),
+            ("github.com", &path, &archive),
+        ]);
+
+        let fixture = PublicationFixture::new("php", "bin/php");
+        let manager = PhpManager {
+            security: super::super::security::RuntimeSecurity::fixture(),
+            versions_dir: fixture.versions.clone(),
+            client: download_client(),
+        };
+        manager
+            .install(version)
+            .await
+            .expect("complete authenticated public installation");
+        let installed = fixture.versions.join(version);
+        assert_eq!(
+            fs::read(fixture.versions.join("current").join("bin/php")).unwrap(),
+            launcher
+        );
+        assert_eq!(
+            fs::read(installed.join("lib/owned.data")).unwrap(),
+            b"complete PHP implementation"
+        );
+        assert_eq!(
+            fs::read(fixture.versions.join("1.0.0/bin/php")).unwrap(),
+            b"previous reviewed runtime"
+        );
+        super::super::security::admit_installed(
+            "php",
+            &installed,
+            super::super::security::ReviewMode::CachedOnly,
+        )
+        .expect("retain exact authenticated publisher authority")
+        .verify(&installed)
+        .expect("complete published tree matches its admission");
+    }
+
     use super::*;
 
     fn asset(name: &str, digest: Option<&str>) -> GithubAsset {
@@ -816,5 +917,95 @@ mod tests {
             pathdiff_relative(target, base),
             PathBuf::from("../usr/bin/php8.5")
         );
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn downloaded_php_publication_refuses_changed_content_and_preserves_prior_channel() {
+        use super::super::test_archive::{PublicationFixture, mutation_security, tar_xz_entries};
+        let fixture = PublicationFixture::new("php", "bin/php");
+        let mut manager = PhpManager {
+            security: super::super::security::RuntimeSecurity::fixture(),
+            versions_dir: fixture.versions.clone(),
+            client: download_client(),
+        };
+        let url = "https://github.com/php/php-builder/releases/download/8.5/php.tar.xz";
+        assert!(
+            manager
+                .publish_download(&fixture.archive, url, "8.5")
+                .await
+                .is_err()
+        );
+        fixture.assert_previous();
+        fixture.write(b"invalid compressed archive");
+        assert!(
+            manager
+                .publish_download(&fixture.archive, url, "8.5")
+                .await
+                .is_err()
+        );
+        fixture.assert_previous();
+        for case in ["tamper", "smoke-failure", "success", "replace"] {
+            let script = if case == "smoke-failure" {
+                b"#!/bin/sh\nexit 17\n".as_slice()
+            } else {
+                b"#!/bin/sh\nprintf 'PHP 8.5.1 (cli)\\n'\n".as_slice()
+            };
+            let (root, launcher) = if case == "replace" {
+                (".", "php8.5")
+            } else {
+                ("usr", "bin/php8.5")
+            };
+            let bytes = tar_xz_entries(
+                root,
+                &[
+                    (launcher, script),
+                    (
+                        "include/php/main/php_version.h",
+                        b"#define PHP_VERSION \"8.5.1\"\n",
+                    ),
+                ],
+            )
+            .expect("controlled exact PHP publisher archive");
+            fixture.write(&bytes);
+            manager.security = if case == "tamper" {
+                mutation_security(&fixture.versions)
+            } else {
+                super::super::security::RuntimeSecurity::fixture()
+            };
+            let result = manager.publish_download(&fixture.archive, url, "8.5").await;
+            if matches!(case, "success" | "replace") {
+                result.expect("publish and replace the complete reviewed PHP channel");
+                assert_eq!(
+                    fs::read_link(fixture.versions.join("8.5/bin/php")).unwrap(),
+                    Path::new(if case == "replace" {
+                        "../php8.5"
+                    } else {
+                        "php8.5"
+                    })
+                );
+            } else {
+                let error = result.expect_err("changed or unexecutable PHP cannot publish");
+                let message = format!("{error:#}");
+                assert!(
+                    message.contains(if case == "tamper" {
+                        "Runtime content changed after advisory review"
+                    } else {
+                        "PHP smoke test"
+                    }),
+                    "{message}"
+                );
+                assert!(!fixture.versions.join("8.5").exists());
+            }
+            fixture.assert_previous();
+        }
+        manager
+            .use_version("8.5")
+            .expect("select reviewed exact PHP channel");
+        fs::remove_file(fixture.versions.join("current")).expect("restore prior PHP selection");
+        std::os::unix::fs::symlink("1.0.0", fixture.versions.join("current"))
+            .expect("prior PHP selection");
+        fixture.corrupt_identity("8.5");
+        assert!(manager.use_version("8.5").is_err());
+        fixture.assert_previous();
     }
 }

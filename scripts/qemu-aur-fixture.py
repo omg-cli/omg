@@ -57,11 +57,13 @@ class FixtureServer(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
     daemon_threads = True
 
-    def __init__(self, address, cert, key, log):
+    def __init__(self, address, cert, key, log, *, query=QUERY, response=RESPONSE):
         self.context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         self.context.load_cert_chain(cert, key)
         self.log_path = Path(log)
         self.log_lock = threading.Lock()
+        self.query = query
+        self.response = response
         super().__init__(address, FixtureHandler)
 
     def record(self, event, value):
@@ -90,16 +92,16 @@ class FixtureHandler(socketserver.BaseRequestHandler):
                     return
                 parsed = urlsplit(parts[1])
                 query = parse_qs(parsed.query)
-                if parsed.path != "/rpc" or query != {"v": ["5"], "type": ["search"], "arg": [QUERY]}:
+                if parsed.path != "/rpc" or query != {"v": ["5"], "type": ["search"], "arg": [self.server.query]}:
                     self.server.record("rejected-request", parts[1])
                     tls.sendall(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
                     return
                 self.server.record("request", parts[1])
                 tls.sendall(
                     b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: "
-                    + str(len(RESPONSE)).encode()
+                    + str(len(self.server.response)).encode()
                     + b"\r\nConnection: close\r\n\r\n"
-                    + RESPONSE
+                    + self.server.response
                 )
         except (OSError, ValueError, ssl.SSLError) as error:
             self.server.record("error", type(error).__name__)

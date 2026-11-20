@@ -1673,7 +1673,10 @@ PY_DNF_LOG
 }
 
 check_product_output() {
-  local safety=$1 assertion=$2 code=$3 stdout=$4 stderr=$5 distro=${6:-arch}
+  local safety=$1 assertion=$2 code=$3 stdout=$4 stderr=$5 distro=${6:-arch} update_output
+  if [[ "$assertion" == update-fast-output || "$assertion" == update-turbo-output ]]; then
+    update_output=$(sed -E $'s/\033\\[[0-?]*[ -/]*[@-~]//g' "$stdout") || return 1
+  fi
   if [[ "$assertion" == local:* ]]; then
     python3 .qemu-local-oracle.py check "${assertion#local:}" "$code" "$stdout" "$stderr" || return 1
     if [[ "$assertion" == local:team-golden-create-flags ]] \
@@ -2171,15 +2174,15 @@ PY
           printf 'assertion failed: inventory-only SBOM lacks the advisory-scan marker or warning\n' >&2; return 1
         fi ;;
       update-fast-output)
-        if ! grep -Fq 'Fast System Update' "$stdout" \
-          || ! grep -Eqi 'Syncing package|Synced' "$stdout" \
-          || ! grep -Eqi 'System is up to date|System updated successfully|Upgraded [0-9]+ packages?' "$stdout"; then
+        if ! grep -Fq 'Fast System Update' <<< "$update_output" \
+          || ! grep -Eqi 'Syncing package|Synced' <<< "$update_output" \
+          || ! grep -Eqi 'System is up to date|System updated successfully|Upgraded [0-9]+ packages?' <<< "$update_output"; then
           printf 'assertion failed: update --fast lacked sync and completion evidence\n' >&2; return 1
         fi ;;
       update-turbo-output)
-        if ! grep -Fq 'TURBO System Update' "$stdout" \
-          || ! grep -Eqi 'Turbo upgrade|cached, no sync|Checking for updates.*cached' "$stdout" \
-          || ! grep -Eqi 'System is up to date|System updated successfully|Upgraded [0-9]+ packages?' "$stdout"; then
+        if ! grep -Fq 'TURBO System Update' <<< "$update_output" \
+          || ! grep -Eqi 'Turbo upgrade|cached, no sync|Checking for updates.*cached' <<< "$update_output" \
+          || ! grep -Eqi 'System is up to date|System updated successfully|Upgraded [0-9]+ packages?' <<< "$update_output"; then
           printf 'assertion failed: update --turbo lacked cached-mode and completion evidence\n' >&2; return 1
         fi ;;
       daemon-foreground-lifecycle)
@@ -2296,7 +2299,7 @@ QEMU_ROW_RECEIVER
 
 trap 'rc=$?; if [[ "$rc" == 2 ]]; then printf "error: invalid inventory configuration or row %s\n" "${id:-<preflight>}" >&2; fi' EXIT
 
-work=""; distro=""; tiers=""; tag=""; binary=""; tsv=""
+work=""; distro=""; tiers=""; tag=""; binary=""; native_binary=""; tsv=""
 allow_mutations=false
 allow_credentialed=false
 isolate_hermetic=false
@@ -2308,11 +2311,12 @@ ssh_port=2222
 ssh_user=bench
 while (($#)); do
   case "$1" in
-    --work|--distro|--tiers|--tag|--binary|--tsv|--row-timeout|--ssh-port|--ssh-user|--network-policy|--man-page-inventory)
+    --work|--distro|--tiers|--tag|--binary|--native-binary|--tsv|--row-timeout|--ssh-port|--ssh-user|--network-policy|--man-page-inventory)
       [[ $# -ge 2 && -n "$2" ]] || exit 2
       case "$1" in
         --work) work=$2 ;; --distro) distro=$2 ;; --tiers) tiers=$2 ;;
         --tag) tag=$2 ;; --binary) binary=$2 ;; --tsv) tsv=$2 ;;
+        --native-binary) native_binary=$2 ;;
         --network-policy) network_policy=$2 ;;
         --man-page-inventory) man_page_inventory=$2 ;;
         --row-timeout) row_timeout=$2 ;; --ssh-port) ssh_port=$2 ;; --ssh-user) ssh_user=$2 ;;
@@ -2327,6 +2331,7 @@ while (($#)); do
   esac
 done
 [[ -n "$work" && -n "$distro" && -n "$tiers" && -n "$tag" && -n "$binary" && -n "$tsv" ]] || exit 2
+native_binary=${native_binary:-$binary}
 man_page_inventory=${man_page_inventory:-}
 if [[ -n "$man_page_inventory" ]]; then
   [[ -f "$man_page_inventory" && ! -L "$man_page_inventory" ]] || exit 2
@@ -2373,7 +2378,12 @@ out="$root/inventory"
 [[ ! -e "$out" ]] || { printf 'error: inventory evidence already exists: %s\n' "$out" >&2; exit 2; }
 mkdir -p "$out/rows"
 local_oracle_path="$(dirname "${BASH_SOURCE[0]}")/qemu-local-oracle.py"
+runtime_fixture_path="$(dirname "${BASH_SOURCE[0]}")/runtime_advisory_fixture.py"
+if [[ ! -f "$runtime_fixture_path" ]]; then
+  runtime_fixture_path="$(dirname "${BASH_SOURCE[0]}")/../tests/runtime_advisory_fixture.py"
+fi
 sha256sum "${BASH_SOURCE[0]}" "$tsv" "$license_oracle_path" "$local_oracle_path" "$container_engine_path" "$(dirname "$0")/qemu-run-watch-check.py" "$(dirname "$0")/qemu-enterprise-export-oracle.py" "$(dirname "$0")/qemu-audit-log-oracle.py" "$(dirname "$0")/qemu-rust-install-oracle.py" "$(dirname "$0")/qemu-doctor-live-oracle.py" "$(dirname "$0")/qemu-doctor-turbo-oracle.py" > "$out/input-sha256.txt"
+sha256sum "$(dirname "$0")/qemu-runtime-advisory-oracle.py" "$runtime_fixture_path" >> "$out/input-sha256.txt"
 if [[ "$man_page_mode" == exact ]]; then sha256sum "$man_page_inventory" >> "$out/input-sha256.txt"; fi
 jq -n --arg release "$tag" --arg distro "$distro" --arg tiers "$tiers" --arg binary "$binary" --arg man_page_mode "$man_page_mode" \
   --argjson mutations "$allow_mutations" --argjson credentialed "$allow_credentialed" --argjson deadline "$row_timeout" \
@@ -2780,6 +2790,8 @@ prereq_runnable() { # id -> 0 when replayable
 
 # Process substitution keeps deferred cases in this shell for the next phase.
 local_oracle_source=$(jq -Rrs '@sh' "$(dirname "${BASH_SOURCE[0]}")/qemu-local-oracle.py")
+runtime_fixture_source=$(jq -Rrs '@sh' "$runtime_fixture_path")
+runtime_consent_source=$(jq -Rrs '@sh' "$(dirname "${BASH_SOURCE[0]}")/qemu-runtime-advisory-oracle.py")
 run_prepared_row() {
   local transport=0 elapsed verdict rc receipt phase assertion_rc uptime start_centis
   # Uptime is monotonic even if WSL steps the wall clock.
@@ -2898,8 +2910,10 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   quote_args() {
     jq -r '[.[] | if . == "" then @sh else split("${ROOT}") | map(@sh) | join("\"$rowdir\"") end] | join(" ")' <<< "$1"
   }
-  quoted_binary=$(jq -rn --arg b "$binary" '$b | @sh')
-  quoted_binary_dir=$(jq -rn --arg b "${binary%/*}" '$b | @sh')
+  row_binary=$binary
+  if [[ "$safety" == package-mutation && "$distro" != arch ]]; then row_binary=$native_binary; fi
+  quoted_binary=$(jq -rn --arg b "$row_binary" '$b | @sh')
+  quoted_binary_dir=$(jq -rn --arg b "${row_binary%/*}" '$b | @sh')
   export -n remote row_program
   remote="set -eu; export OMG_QEMU_EXECUTABLE=$quoted_binary OMG_QEMU_DISTRO='$distro'; rowdir=\$(mktemp -d \"\$HOME/inventory-$case.XXXXXX\"); cd \"\$rowdir\""
   defer_runtime=false
@@ -2939,7 +2953,9 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   fi
   [[ "$case" != metrics ]] || remote+="; export OMG_DISABLE_DAEMON=0"
   for p in "${chain[@]}"; do [[ "${row_assertions[$p]}" != local:* ]] || needs_local=true; done
-  if [[ "$needs_local" == true ]]; then remote+="; printf '%s' $local_oracle_source > .qemu-local-oracle.py"; fi
+  if [[ "$needs_local" == true || "$case" == run-all || "$assertions" == runtime-switch-state || "$assertions" == runtime-list-state ]]; then
+    remote+="; printf '%s' $local_oracle_source > .qemu-local-oracle.py; printf '%s' $runtime_fixture_source > runtime_advisory_fixture.py"
+  fi
   if [[ "$assertions" == doctor-eol-state || "$assertions" == audit-eol-state ]]; then
     remote+="; [[ \$(id -u) != 0 ]] || { printf 'assertion failed: EOL fixture requires an unprivileged guest user\n' >&2; exit 2; }; export OMG_CONFIG_DIR=\"\$rowdir/eol-config\" OMG_DATA_DIR=\"\$rowdir/runtime-data\" OMG_CACHE_DIR=\"\$rowdir/eol-cache\" OMG_DISABLE_DAEMON=1 OMG_TEST_MODE=0"
     remote+="; mkdir -p \"\$OMG_DATA_DIR/versions/node/16.20.2\" \"\$OMG_DATA_DIR/versions/python/3.12.14\"; ln -s 16.20.2 \"\$OMG_DATA_DIR/versions/node/current\"; ln -s 3.12.14 \"\$OMG_DATA_DIR/versions/python/current\""
@@ -2984,6 +3000,7 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   fi
   if [[ "$case" == run-all ]]; then
     remote+="; mkdir -p \"\$rowdir/run-all-bin\"; printf '#!/bin/sh\ncase \$1:\$2 in\n  --version:) echo 9.0.0 ;;\n  run:smoke) printf npm-smoke-task > npm-task.marker; echo npm-task-ok ;;\n  *) exit 96 ;;\nesac\n' > \"\$rowdir/run-all-bin/npm\"; printf '#!/bin/sh\necho v24.0.0\n' > \"\$rowdir/run-all-bin/node\"; chmod 755 \"\$rowdir/run-all-bin/npm\" \"\$rowdir/run-all-bin/node\"; export PATH=\"\$rowdir/run-all-bin:\$PATH\"; printf '%s\n' '{\"scripts\":{\"smoke\":\"echo npm-task-ok\"}}' > package.json"
+    remote+="; export OMG_DATA_DIR=\"\$rowdir/runtime-data\" OMG_CACHE_DIR=\"\$rowdir/runtime-cache\" OMG_CONFIG_DIR=\"\$rowdir/runtime-config\" OMG_DISABLE_DAEMON=1 OMG_TEST_MODE=0; mkdir -p \"\$OMG_DATA_DIR/versions/node/24.0.0/bin\"; chmod 700 \"\$OMG_DATA_DIR\"; cp \"\$rowdir/run-all-bin/node\" \"\$rowdir/run-all-bin/npm\" \"\$OMG_DATA_DIR/versions/node/24.0.0/bin/\"; printf '24.0.0\\n' > .node-version; ln -s 24.0.0 \"\$OMG_DATA_DIR/versions/node/current\"; python3 .qemu-local-oracle.py seed-runtime node 24.0.0"
   fi
   if [[ "$assertions" == audit-source-failure || "$assertions" == sbom-source-failure ]]; then
     # DNF5 can satisfy an offline advisory query from a previous row's cache.
@@ -3028,6 +3045,12 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   supervisor=$(jq -rn --arg s 'rc=0; "$@" 3>&- || rc=$?; printf "%s\n" "$rc" >&3' '$s | @sh')
   remote+="; status_file=\$(mktemp \"\$HOME/inventory-status.XXXXXX\"); trap 'rm -f \"\$status_file\"' EXIT"
   remote+="; run_omg() { local deadline=\$1; shift; execution_phase=executor; rc=0; timeout --kill-after=5s \"\$deadline\" bash -c $supervisor _ \"\$@\" 3>\"\$status_file\" || rc=\$?; if [ \"\$rc\" = 0 ]; then if IFS= read -r rc < \"\$status_file\"; then execution_phase=product; else rc=125; fi; fi; }"
+  if [[ "$safety" == package-mutation ]]; then
+    remote+="; printf '%s' $runtime_consent_source > qemu-runtime-advisory-oracle.py; native_review_binary=$quoted_binary"
+    remote+="; run_native_omg() { local deadline=\$1; shift; if [[ \$1 == \"\$native_review_binary\" && ( \${2:-} == install || \${2:-} == update || \${2:-} == rollback ) ]]; then run_omg \"\$deadline\" python3 qemu-runtime-advisory-oracle.py --native --accept-only --timeout \"\$deadline\" -- \"\$@\"; else run_omg \"\$deadline\" \"\$@\"; fi; }"
+  else
+    remote+="; run_native_omg() { run_omg \"\$@\"; }"
+  fi
   if [[ "$case" == release-package-install-tree || "$case" == release-package-remove-tree || "$case" == release-package-rollback-tree || "$case" == clean-orphans-native ]]; then
     remote+="; $(declare -f check_native_tree_state)"
   fi
@@ -3057,7 +3080,7 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
     if [[ "${row_assertions[$p]}" == local:* ]]; then
       remote+="; python3 .qemu-local-oracle.py prepare '$p' || { printf '\nOMG_QEMU_RECEIPT:dependency:2:1\n'; exit 0; }"
     fi
-    remote+="; run_omg '$row_timeout' $quoted_binary $pargs > '$p.prereq.log' 2> '$p.prereq.stderr.log'"
+    remote+="; run_native_omg '$row_timeout' $quoted_binary $pargs > '$p.prereq.log' 2> '$p.prereq.stderr.log'"
     remote+="; printf 'prereq $p exit=%s\n' \"\$rc\" >&2; cat '$p.prereq.log' '$p.prereq.stderr.log' >&2"
     remote+="; if [ \"\$rc\" != '${row_exit[$p]}' ] || [ \"\$execution_phase\" != product ]; then printf '\nOMG_QEMU_RECEIPT:dependency:%s:0\n' \"\$rc\"; exit 0; fi"
     remote+="; if ! check_product_output '${row_safety[$p]}' '${row_assertions[$p]}' \"\$rc\" '$p.prereq.log' '$p.prereq.stderr.log' '$distro'; then printf '\nOMG_QEMU_RECEIPT:dependency:%s:1\n' \"\$rc\"; exit 0; fi"
@@ -3158,6 +3181,11 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
     rust_oracle=$(jq -rn --rawfile fixture "$(dirname "$0")/qemu-rust-install-oracle.py" '$fixture | @sh')
     remote+="; printf '%s' $rust_oracle > qemu-rust-install-oracle.py; python3 qemu-rust-install-oracle.py prepare \"\$rowdir\"; rust_parent_home=\"\$HOME\"; export HOME=\"\$rowdir/runtime-home\" OMG_DATA_DIR=\"\$rowdir/runtime-data\" OMG_CACHE_DIR=\"\$rowdir/runtime-cache\" OMG_CONFIG_DIR=\"\$rowdir/runtime-config\" OMG_TEST_MODE=0 OMG_DISABLE_DAEMON=1"
   fi
+  if [[ "$case" == runtime-python-install || "$case" == runtime-node-install || "$case" == runtime-go-install || "$case" == runtime-rust-install ]]; then
+    runtime_name=$(jq -r '.[1]' <<< "$args_json")
+    runtime_version=$(jq -r '.[2]' <<< "$args_json")
+    remote+="; printf '%s' $runtime_consent_source > qemu-runtime-advisory-oracle.py"
+  fi
   if [[ "$assertions" == runtime-version-removed ]]; then
     runtime_name=${case#runtime-}; runtime_name=${runtime_name%-uninstall}
     runtime_version=$(jq -r '.[2]' <<< "$args_json")
@@ -3184,6 +3212,7 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
         '  *) printf runtime-fixture ;;' 'esac' | jq -Rrs '@sh')
       remote+="; printf '%s' $node_fixture > \"\$versions/$runtime_version/bin/$runtime_launcher\""
     fi
+    remote+="; python3 .qemu-local-oracle.py seed-runtime '$runtime_name' '$runtime_version'"
   fi
   if [[ "$distro" == arch && "$safety" == package-mutation && ( "$case" == update-fast || "$case" == update-turbo ) ]]; then
     # A loopback repository exposes a versioned native ALPM upgrade while
@@ -3198,13 +3227,15 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
     remote+="; export OMG_DISABLE_DAEMON=1; apt_fixture_installed=0; apt_fixture_pin_created=0"
     remote+="; apt_fixture_exit_cleanup() { if [[ \"\$apt_fixture_installed\" == 1 || \"\$apt_fixture_pin_created\" == 1 ]]; then cleanup_apt_update_fixture '$distro' >/dev/null 2>&1 || true; fi; rm -f \"\$status_file\"; }; trap apt_fixture_exit_cleanup EXIT"
     remote+="; if ! prepare_apt_update_fixture '$distro' \"\$rowdir\" || ! apt_before=\$(native_package_snapshot '$distro'); then if ! cleanup_apt_update_fixture '$distro'; then printf 'assertion failed: APT setup cleanup failed\\n' >&2; fi; printf '\nOMG_QEMU_RECEIPT:dependency:2:1\n'; exit 0; fi"
-    remote+="; run_omg '$command_timeout' $quoted_binary $arg_string > command.stdout.log 2> command.stderr.log; assertion=0"
+    remote+="; run_native_omg '$command_timeout' $quoted_binary $arg_string > command.stdout.log 2> command.stderr.log; assertion=0"
   elif [[ "$case" == release-package-rollback-tree ]]; then
-    remote+="; run_omg '$command_timeout' $quoted_binary rollback \"\$rollback_id\" --yes > command.stdout.log 2> command.stderr.log; assertion=0"
+    remote+="; run_native_omg '$command_timeout' $quoted_binary rollback \"\$rollback_id\" --yes > command.stdout.log 2> command.stderr.log; assertion=0"
   elif [[ "$case" == daemon-foreground ]]; then
     remote+="; run_omg '$command_timeout' bash \"\$HOME/qemu-daemon-check.sh\" $quoted_binary \"\$rowdir/daemon-evidence\" > command.stdout.log 2> command.stderr.log; assertion=0"
   elif [[ "$case" == run-watch ]]; then
     remote+="; run_omg '$command_timeout' python3 \"\$HOME/qemu-run-watch-check.py\" $quoted_binary \"\$rowdir\" > command.stdout.log 2> command.stderr.log; assertion=0"
+  elif [[ "$case" == runtime-python-install || "$case" == runtime-node-install || "$case" == runtime-go-install || "$case" == runtime-rust-install ]]; then
+    remote+="; run_omg '$command_timeout' python3 qemu-runtime-advisory-oracle.py --runtime '$runtime_name' --version '$runtime_version' --timeout '$command_timeout' -- $quoted_binary $arg_string </dev/null > command.stdout.log 2> command.stderr.log; assertion=0"
   elif [[ "$case" == doctor-turbo ]]; then
     capability_oracle=$(jq -rn --rawfile fixture "$(dirname "$0")/qemu-doctor-turbo-oracle.py" '$fixture | @sh')
     remote+="; printf '%s' $capability_oracle > qemu-doctor-turbo-oracle.py"
@@ -3215,7 +3246,7 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
     remote+="; if ! command -v strace >/dev/null || ! strace --seccomp-bpf -f -qq -e trace=execve -o doctor.preflight.log true; then printf '\nOMG_QEMU_RECEIPT:dependency:2:1\n'; exit 0; fi"
     remote+="; run_omg '$command_timeout' strace --seccomp-bpf -f -qq -e trace=execve -o doctor.exec.log $quoted_binary $arg_string > command.stdout.log 2> command.stderr.log; assertion=0"
   else
-    remote+="; run_omg '$command_timeout' $quoted_binary $arg_string </dev/null > command.stdout.log 2> command.stderr.log; assertion=0"
+    remote+="; run_native_omg '$command_timeout' $quoted_binary $arg_string </dev/null > command.stdout.log 2> command.stderr.log; assertion=0"
   fi
   remote+="; cat command.stdout.log; cat command.stderr.log >&2"
   remote+="; if [ \"\$execution_phase\" = executor ]; then printf 'assertion failed: command exceeded ${command_timeout}s QEMU row deadline (executor exit %s)\n' \"\$rc\" >&2; assertion=1; elif ! check_product_output '$safety' '$assertions' \"\$rc\" command.stdout.log command.stderr.log '$distro'; then assertion=1; fi"

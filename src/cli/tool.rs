@@ -12,19 +12,22 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::cli::style;
+#[cfg(test)]
+use crate::runtimes::npm::ManagedNpm;
+use crate::runtimes::npm::install_reviewed_npm;
 
-const ALLOW_NPM_SCRIPTS_ENV: &str = "OMG_TOOL_DANGEROUSLY_ALLOW_ALL_NPM_SCRIPTS";
+pub(crate) const ALLOW_NPM_SCRIPTS_ENV: &str = "OMG_TOOL_DANGEROUSLY_ALLOW_ALL_NPM_SCRIPTS";
 const ALLOW_PIP_SDISTS_ENV: &str = "OMG_TOOL_ALLOW_PIP_SDISTS";
 const ALLOW_CARGO_UNLOCKED_ENV: &str = "OMG_TOOL_ALLOW_CARGO_UNLOCKED";
 const ALLOW_HOST_ENV: &str = "OMG_TOOL_ALLOW_HOST_ENV";
-const ALLOW_UNVERIFIED_ENV: &str = "OMG_TOOL_ALLOW_UNVERIFIED";
+pub(crate) const ALLOW_UNVERIFIED_ENV: &str = "OMG_TOOL_ALLOW_UNVERIFIED";
 const ALLOW_GO_CGO_ENV: &str = "OMG_TOOL_ALLOW_GO_CGO";
 const ALLOW_GO_TOOLCHAIN_ENV: &str = "OMG_TOOL_ALLOW_GO_TOOLCHAIN_DOWNLOAD";
 
 #[cfg(unix)]
 const TOOL_SYSTEM_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
-fn package_is_allowed(variable: &str, package: &str) -> bool {
+pub(crate) fn package_is_allowed(variable: &str, package: &str) -> bool {
     std::env::var(variable).is_ok_and(|value| {
         value
             .split(',')
@@ -33,7 +36,7 @@ fn package_is_allowed(variable: &str, package: &str) -> bool {
     })
 }
 
-fn host_environment_is_allowed(manager: &str, package: &str) -> bool {
+pub(crate) fn host_environment_is_allowed(manager: &str, package: &str) -> bool {
     package_is_allowed(ALLOW_HOST_ENV, &format!("{manager}:{package}"))
 }
 
@@ -77,24 +80,11 @@ fn validate_managed_package(manager: &str, package: &str) -> Result<()> {
                 .all(|character| character.is_ascii_alphanumeric() || "-_.+".contains(character))
     };
     let valid = match manager {
-        "npm" => {
-            package
-                .strip_prefix('@')
-                .and_then(|value| value.split_once('/'))
-                .is_some_and(|(scope, name)| registry_name(scope) && registry_name(name))
-                || (!package.contains('/') && !package.contains('@') && registry_name(package))
-        }
-        "cargo" | "pip" | "pacman" => {
-            !package.contains('/') && !package.contains('@') && registry_name(package)
-        }
-        "go" => {
-            let (module, version) = package
-                .rsplit_once('@')
-                .map_or((package, None), |(module, version)| (module, Some(version)));
-            module.split('/').all(registry_name)
-                && version
-                    .is_none_or(|version| crate::core::security::validate_version(version).is_ok())
-        }
+        "npm" => crate::core::security::npm::NpmSpec::parse(package).is_ok(),
+        "cargo" => crate::runtimes::cargo_tool::validate_request(package).is_ok(),
+        "pip" => crate::runtimes::pip_tool::validate_request(package).is_ok(),
+        "pacman" => !package.contains('/') && !package.contains('@') && registry_name(package),
+        "go" => crate::runtimes::go_tool::validate_request(package).is_ok(),
         _ => false,
     };
     if !valid {
@@ -105,7 +95,7 @@ fn validate_managed_package(manager: &str, package: &str) -> Result<()> {
     Ok(())
 }
 
-fn active_security_overrides(manager: &str, package: &str) -> Vec<&'static str> {
+pub(crate) fn active_security_overrides(manager: &str, package: &str) -> Vec<&'static str> {
     let mut active = Vec::new();
     if manager == "npm" && package_is_allowed(ALLOW_NPM_SCRIPTS_ENV, package) {
         active.push(ALLOW_NPM_SCRIPTS_ENV);
@@ -131,7 +121,11 @@ fn active_security_overrides(manager: &str, package: &str) -> Vec<&'static str> 
     active
 }
 
-fn write_security_receipt(staging_dir: &Path, manager: &str, package: &str) -> Result<()> {
+pub(crate) fn write_security_receipt(
+    staging_dir: &Path,
+    manager: &str,
+    package: &str,
+) -> Result<()> {
     let host_environment = host_environment_is_allowed(manager, package);
     let unverified = package_is_allowed(ALLOW_UNVERIFIED_ENV, &format!("{manager}:{package}"));
     let npm_scripts_disabled =
@@ -271,7 +265,7 @@ fn validate_tool_binary_containment(install_dir: &Path) -> Result<()> {
 /// Clearing it here prevents an untrusted package from reading ambient registry,
 /// Git, SSH, cloud, and CI credentials. Private registries can opt out for one
 /// exact manager/package pair through `OMG_TOOL_ALLOW_HOST_ENV`.
-fn secured_manager_command(
+pub(crate) fn secured_manager_command(
     program: impl AsRef<std::ffi::OsStr>,
     staging_dir: &Path,
     manager: &str,
@@ -487,7 +481,7 @@ fn is_venv_base_entry(install_dir: &Path, path: &Path) -> Result<bool> {
     }
 }
 
-fn relocate_venv_entry_points(staging_dir: &Path, install_dir: &Path) -> Result<()> {
+pub(crate) fn relocate_venv_entry_points(staging_dir: &Path, install_dir: &Path) -> Result<()> {
     use std::io::{Seek as _, Write as _};
 
     if !staging_dir.join("pyvenv.cfg").is_file() {
@@ -549,27 +543,6 @@ fn relocate_venv_entry_points(staging_dir: &Path, install_dir: &Path) -> Result<
             .with_context(|| format!("Relocate venv entry point {}", path.display()))?;
     }
     Ok(())
-}
-
-/// Pick the best available CPython launcher.
-///
-/// PEP 394: upstream recommends `python3`, and minimal distributions may not
-/// provide an unversioned `python` at all, so probe `python3` first.
-/// https://peps.python.org/pep-0394/
-fn python_binary() -> &'static str {
-    for candidate in ["python3", "python"] {
-        let available = Command::new(candidate)
-            .arg("--version")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok_and(|status| status.success());
-        if available {
-            return candidate;
-        }
-    }
-    "python3" // default; the venv step surfaces a clear error when missing
 }
 
 impl LocalCommandRunner for ToolCommands {
@@ -862,6 +835,15 @@ fn get_dirs() -> (PathBuf, PathBuf) {
 }
 
 pub async fn install(name: &str) -> Result<()> {
+    #[derive(Clone, Copy)]
+    enum Source {
+        System,
+        Cargo,
+        Npm,
+        Pip,
+        Go,
+    }
+
     // SECURITY: Validate tool name
     crate::core::security::validate_package_name(name)?;
 
@@ -898,25 +880,30 @@ pub async fn install(name: &str) -> Result<()> {
         );
     }
     let choices = [
-        "Pacman (System)",
-        "Cargo (Isolated)",
-        "NPM (Isolated)",
-        "Pip (Isolated)",
-        "Go (Isolated)",
+        ("Pacman (System)", Source::System),
+        ("Cargo (Isolated)", Source::Cargo),
+        ("NPM (Isolated)", Source::Npm),
+        ("Pip (Isolated)", Source::Pip),
+        ("Go (Isolated)", Source::Go),
     ];
     let selection = Select::with_theme(&ColorfulTheme::default())
         .with_prompt(format!("Tool '{name}' not in registry. Source?"))
         .default(0)
-        .items(choices.as_slice())
+        .items(choices.map(|(label, _)| label))
         .interact()?;
 
-    match selection {
-        0 => crate::cli::packages::install(&[name.to_string()], false, false, false).await,
-        1 => install_managed("cargo", name, name, &tools_dir, &bin_dir).await,
-        2 => install_managed("npm", name, name, &tools_dir, &bin_dir).await,
-        3 => install_managed("pip", name, name, &tools_dir, &bin_dir).await,
-        4 => install_managed("go", name, name, &tools_dir, &bin_dir).await,
-        _ => Ok(()),
+    match choices[selection].1 {
+        Source::System => {
+            crate::cli::packages::install(&[name.to_string()], false, false, false).await
+        }
+        Source::Cargo => install_managed("cargo", name, name, &tools_dir, &bin_dir).await,
+        Source::Npm => {
+            let spec = crate::core::security::npm::NpmSpec::parse(name)?;
+            let install_name = spec.name.replace('/', "__");
+            install_managed("npm", name, &install_name, &tools_dir, &bin_dir).await
+        }
+        Source::Pip => install_managed("pip", name, name, &tools_dir, &bin_dir).await,
+        Source::Go => install_managed("go", name, name, &tools_dir, &bin_dir).await,
     }
 }
 
@@ -930,6 +917,27 @@ async fn install_managed(
     install_name: &str,
     tools_dir: &Path,
     bin_dir: &Path,
+) -> Result<()> {
+    install_managed_with_advisories(
+        manager,
+        pkg,
+        install_name,
+        tools_dir,
+        bin_dir,
+        std::sync::Arc::new(crate::core::security::vulnerability::VulnerabilityScanner::new()),
+        crate::runtimes::security::RuntimeSecurity::default(),
+    )
+    .await
+}
+
+async fn install_managed_with_advisories(
+    manager: &str,
+    pkg: &str,
+    install_name: &str,
+    tools_dir: &Path,
+    bin_dir: &Path,
+    advisories: std::sync::Arc<dyn crate::core::security::vulnerability::VulnerabilitySource>,
+    runtime_security: crate::runtimes::security::RuntimeSecurity,
 ) -> Result<()> {
     crate::core::security::validate_package_name(install_name)?;
     validate_managed_package(manager, pkg)?;
@@ -982,6 +990,8 @@ async fn install_managed(
             &tools_dir,
             &bin_dir,
             has_previous_install,
+            &advisories,
+            &runtime_security,
         );
         if let Err(error) = &outcome {
             tracing::warn!(%manager, %pkg, %error, "managed tool installation failed");
@@ -999,6 +1009,8 @@ fn install_managed_blocking(
     tools_dir: &Path,
     bin_dir: &Path,
     has_previous_install: bool,
+    advisories: &std::sync::Arc<dyn crate::core::security::vulnerability::VulnerabilitySource>,
+    runtime_security: &crate::runtimes::security::RuntimeSecurity,
 ) -> Result<()> {
     let install_dir = tools_dir.join(manager).join(install_name);
     for variable in active_security_overrides(manager, pkg) {
@@ -1021,169 +1033,46 @@ fn install_managed_blocking(
 
     // The closure keeps `?`/`bail!` exits inside `outcome` so the staging
     // directory is always cleaned up on failure.
-    let run_install = || -> Result<()> {
+    let mut npm_admission = None;
+    let mut tool_admission: Option<Box<dyn crate::runtimes::package_manager::ReviewedTool>> = None;
+    let mut run_install = || -> Result<()> {
         match manager {
             "npm" => {
-                // Lifecycle scripts are publisher-controlled code. Keep them
-                // disabled unless this exact package is explicitly approved.
-                let install_path = staging_dir
-                    .to_str()
-                    .context("Install directory path contains invalid UTF-8")?;
-                let allow_scripts = package_is_allowed(ALLOW_NPM_SCRIPTS_ENV, pkg);
-                let allow_host_environment = host_environment_is_allowed(manager, pkg);
-                let mut command = secured_manager_command("npm", &staging_dir, manager, pkg)?;
-                command.args(["install", "--prefix", install_path]);
-                if !allow_host_environment {
-                    command.arg("--registry=https://registry.npmjs.org/");
-                }
-                // Download and materialize the tree without executing it. An
-                // approved script phase happens only after signature checks.
-                command.arg("--ignore-scripts");
-                let status = command
-                    .args(["--", pkg])
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::inherit())
-                    .status()?;
-
-                if !status.success() {
-                    anyhow::bail!(
-                        "NPM install of '{pkg}' failed. If the reviewed package requires lifecycle scripts, retry with {ALLOW_NPM_SCRIPTS_ENV}={pkg}"
-                    );
-                }
-                if !package_is_allowed(ALLOW_UNVERIFIED_ENV, &format!("npm:{pkg}")) {
-                    let mut verification =
-                        secured_manager_command("npm", &staging_dir, manager, pkg)?;
-                    verification.args(["audit", "signatures", "--prefix", install_path]);
-                    if !allow_host_environment {
-                        verification.arg("--registry=https://registry.npmjs.org/");
-                    }
-                    let signature_status = verification
-                        .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::inherit())
-                        .status()?;
-                    if !signature_status.success() {
-                        anyhow::bail!(
-                            "NPM signature/provenance verification failed for '{pkg}'; refusing to activate it. A trusted private registry without signature support can be scoped with {ALLOW_UNVERIFIED_ENV}=npm:{pkg}"
-                        );
-                    }
-                }
-                if allow_scripts {
-                    let rebuild_status =
-                        secured_manager_command("npm", &staging_dir, manager, pkg)?
-                            .args(["rebuild", "--prefix", install_path])
-                            .stdout(std::process::Stdio::null())
-                            .stderr(std::process::Stdio::inherit())
-                            .status()?;
-                    if !rebuild_status.success() {
-                        anyhow::bail!(
-                            "NPM lifecycle-script rebuild failed for '{pkg}'; refusing to activate it"
-                        );
-                    }
-                }
-                Ok(())
+                npm_admission = Some(install_reviewed_npm(
+                    pkg,
+                    &staging_dir,
+                    &install_dir,
+                    tools_dir,
+                    advisories.as_ref(),
+                    runtime_security,
+                )?);
             }
-            "cargo" => {
-                let install_path = staging_dir
-                    .to_str()
-                    .context("Install directory path contains invalid UTF-8")?;
-                let mut command = secured_manager_command("cargo", &staging_dir, manager, pkg)?;
-                command.args(["install", "--root", install_path]);
-                if !package_is_allowed(ALLOW_CARGO_UNLOCKED_ENV, pkg) {
-                    command.arg("--locked");
-                }
-                let status = command
-                    .args(["--", pkg])
-                    .stdout(std::process::Stdio::null()) // Cargo is noisy
-                    .status()?;
-
-                if !status.success() {
-                    anyhow::bail!(
-                        "Cargo install of '{pkg}' failed. If the reviewed crate does not publish Cargo.lock, retry with {ALLOW_CARGO_UNLOCKED_ENV}={pkg}"
-                    );
-                }
-                Ok(())
-            }
-            "pip" => {
-                // 1. Create venv (PEP 394-aware launcher resolution, see python_binary)
-                let install_path = staging_dir
-                    .to_str()
-                    .context("Install directory path contains invalid UTF-8")?;
-                let status_venv =
-                    secured_manager_command(python_binary(), &staging_dir, manager, pkg)?
-                        .args(["-m", "venv", "--", install_path])
-                        .status()?;
-
-                if !status_venv.success() {
-                    anyhow::bail!("Failed to create python venv at '{install_path}'");
-                }
-
-                // 2. Install into venv
-                let pip_path = staging_dir.join("bin").join("pip");
-                let mut command = secured_manager_command(&pip_path, &staging_dir, manager, pkg)?;
-                command.args(["install", "--disable-pip-version-check"]);
-                if !host_environment_is_allowed(manager, pkg) {
-                    command.args(["--index-url", "https://pypi.org/simple"]);
-                }
-                if !package_is_allowed(ALLOW_PIP_SDISTS_ENV, pkg) {
-                    command.arg("--only-binary=:all:");
-                }
-                let status_install = command
-                    .args(["--", pkg])
-                    .stdout(std::process::Stdio::null())
-                    .status()?;
-
-                if !status_install.success() {
-                    anyhow::bail!(
-                        "Pip install of '{pkg}' failed. If the reviewed package has no wheel, retry with {ALLOW_PIP_SDISTS_ENV}={pkg}"
-                    );
-                }
-                Ok(())
-            }
-            "go" => {
-                // GOBIN=<dir>/bin go install <pkg>@latest
-                let target = if pkg.contains('@') {
-                    pkg.to_string()
-                } else {
-                    format!("{pkg}@latest")
+            "cargo" | "go" | "pip" => {
+                let install = match manager {
+                    "cargo" => crate::runtimes::cargo_tool::install_reviewed,
+                    "go" => crate::runtimes::go_tool::install_reviewed,
+                    _ => crate::runtimes::pip_tool::install_reviewed,
                 };
-
-                // Go installs to $GOBIN
-                let go_bin = staging_dir.join("bin");
-                fs::create_dir_all(&go_bin)?;
-
-                let mut command = secured_manager_command("go", &staging_dir, manager, pkg)?;
-                command
-                    .arg("install")
-                    .args(["--", &target])
-                    .env("GOBIN", &go_bin);
-                if !host_environment_is_allowed(manager, pkg) {
-                    command
-                        .env("GOPROXY", "https://proxy.golang.org")
-                        .env("GOSUMDB", "sum.golang.org")
-                        .env("GOPRIVATE", "")
-                        .env("GONOPROXY", "")
-                        .env("GONOSUMDB", "")
-                        .env("GOENV", "off");
-                }
-                if !package_is_allowed(ALLOW_GO_CGO_ENV, pkg) {
-                    command.env("CGO_ENABLED", "0");
-                }
-                if !package_is_allowed(ALLOW_GO_TOOLCHAIN_ENV, pkg) {
-                    command.env("GOTOOLCHAIN", "local");
-                }
-                let status = command.stdout(std::process::Stdio::null()).status()?;
-
-                if !status.success() {
-                    anyhow::bail!(
-                        "Go install of '{pkg}' failed. Reviewed packages may opt into CGO with {ALLOW_GO_CGO_ENV}={pkg} or toolchain downloads with {ALLOW_GO_TOOLCHAIN_ENV}={pkg}"
-                    );
-                }
-                Ok(())
+                tool_admission = Some(install(
+                    pkg,
+                    &staging_dir,
+                    &install_dir,
+                    tools_dir,
+                    std::sync::Arc::clone(advisories),
+                    runtime_security,
+                )?);
             }
             _ => anyhow::bail!(
                 "Unknown package manager '{manager}'. Supported: npm, cargo, pip, go, pacman"
             ),
         }
+        if let Some(admission) = &npm_admission {
+            admission.verify(&staging_dir)?;
+        }
+        if let Some(admission) = &tool_admission {
+            admission.verify(&staging_dir)?;
+        }
+        Ok(())
     };
     let outcome: Result<()> = run_install();
 
@@ -1192,7 +1081,6 @@ fn install_managed_blocking(
         let _ = fs::remove_dir_all(&staging_dir);
         return Err(error);
     }
-
     if let Err(error) = validate_tool_binary_containment(&staging_dir) {
         pb.finish_and_clear();
         let _ = fs::remove_dir_all(&staging_dir);
@@ -1203,7 +1091,11 @@ fn install_managed_blocking(
         let _ = fs::remove_dir_all(&staging_dir);
         return Err(error);
     }
-    if let Err(error) = write_security_receipt(&staging_dir, manager, pkg) {
+    if let Err(error) = write_security_receipt(&staging_dir, manager, pkg).and_then(|()| {
+        tool_admission
+            .as_ref()
+            .map_or(Ok(()), |admission| admission.verify(&staging_dir))
+    }) {
         pb.finish_and_clear();
         let _ = fs::remove_dir_all(&staging_dir);
         return Err(error);
@@ -1236,7 +1128,6 @@ fn install_managed_blocking(
     }
 
     pb.finish_and_clear();
-    println!("  {} Installation successful", style::success("✓"));
     // LINKING PHASE
     // PEP 405: a venv is identified by a pyvenv.cfg marker next to bin/.
     // Base interpreter files (python, pip, activate) in a venv are environment
@@ -1244,7 +1135,16 @@ fn install_managed_blocking(
     // the shared bin dir where they would shadow system Python/pip.
     // https://peps.python.org/pep-0405/
     let is_venv = install_dir.join("pyvenv.cfg").is_file();
-    if let Err(error) = link_binaries(&install_dir, bin_dir, is_venv) {
+    let activation = npm_admission
+        .as_ref()
+        .map_or(Ok(()), |admission| admission.verify(&install_dir))
+        .and_then(|()| {
+            tool_admission
+                .as_ref()
+                .map_or(Ok(()), |admission| admission.verify(&install_dir))
+        })
+        .and_then(|()| link_binaries(&install_dir, bin_dir, is_venv));
+    if let Err(error) = activation {
         let failed_dir = tools_dir.join(manager).join(format!(
             ".{install_name}.failed-{}",
             unique_install_suffix()
@@ -1271,6 +1171,7 @@ fn install_managed_blocking(
         tracing::warn!(path = %backup.display(), %error, "failed to remove previous tool backup");
     }
 
+    println!("  {} Installation successful", style::success("✓"));
     Ok(())
 }
 
@@ -1702,6 +1603,7 @@ pub fn registry() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use self::install_managed_fixture as install_managed;
     use super::*;
 
     #[cfg(target_os = "linux")]
@@ -1844,8 +1746,10 @@ mod tests {
         if crate::core::testing::run_isolated_test(test_name) {
             return;
         }
-        use std::os::unix::fs::PermissionsExt as _;
-        let directory = tempfile::tempdir().expect("offline pip fixture");
+        let directory = tempfile::Builder::new()
+            .prefix("omg-pip-")
+            .tempdir_in("/tmp")
+            .expect("short private offline pip fixture");
         let root = directory.path().join(if with_spaces {
             "path with spaces and an apostrophe's value"
         } else {
@@ -1881,40 +1785,54 @@ with zipfile.ZipFile(sys.argv[1], 'w') as archive:
             "{}",
             String::from_utf8_lossy(&wheel_output.stderr)
         );
-        let wrapper = managers.join("python3");
-        let python_literal = serde_json::to_string(&python).expect("Python literal");
-        let wheel_literal = serde_json::to_string(&wheel).expect("wheel literal");
-        let source = format!(
-            r"#!{python_path}
-import pathlib, shlex, subprocess, sys
-python = {python_literal}
-if sys.argv[1:] == ['--version']:
-    raise SystemExit(subprocess.call([python, '--version']))
-result = subprocess.call([python, *sys.argv[1:3], '--copies', *sys.argv[3:]])
-if result:
-    raise SystemExit(result)
-venv = pathlib.Path(sys.argv[-1])
-pip = venv / 'bin/pip'
-command = shlex.join([str(venv / 'bin/python3'), '-m', 'pip', 'install', '--no-index', '--no-deps', {wheel_literal}])
-pip.write_text('#!/bin/sh\nexec ' + command + '\n')
-pip.chmod(0o755)
-",
-            python_path = python.display()
+        // This fixture exercises genuine pip-generated interpreter headers at
+        // the publication boundary; registry admission has separate owner tests.
+        let manager = tools.join("pip");
+        fs::create_dir_all(&manager).expect("manager directory");
+        let staging = manager.join(".black.staging-offline");
+        let installed = manager.join("black");
+        let created = Command::new(&python)
+            .args(["-I", "-B", "-m", "venv", "--copies"])
+            .arg(&staging)
+            .output()
+            .expect("real offline venv");
+        let stdout = String::from_utf8_lossy(&created.stdout);
+        let stderr = String::from_utf8_lossy(&created.stderr);
+        assert!(
+            created.status.success(),
+            "stdout: {stdout}\nstderr: {stderr}"
         );
-        fs::write(&wrapper, source).expect("private offline manager redirect");
-        fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755))
-            .expect("wrapper executable");
-        let mut paths = vec![managers];
-        paths.extend(std::env::split_paths(TOOL_SYSTEM_PATH));
-        let path = std::env::join_paths(paths).expect("fixture PATH");
-        with_managed_fixture_environment(&path, || {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("runtime")
-                .block_on(install_managed("pip", "black", "black", &tools, &bin))
-                .expect("actual pip installation must publish a runnable entry point");
-        });
+        let installed_wheel = Command::new(staging.join("bin/python"))
+            .args([
+                "-I",
+                "-B",
+                "-m",
+                "pip",
+                "install",
+                "--no-index",
+                "--no-deps",
+            ])
+            .arg(&wheel)
+            .output()
+            .expect("genuine offline wheel installation");
+        let stderr = String::from_utf8_lossy(&installed_wheel.stderr);
+        assert!(installed_wheel.status.success(), "{stderr}");
+        validate_tool_binary_containment(&staging).expect("real pip payload is contained");
+        relocate_venv_entry_points(&staging, &installed)
+            .expect("production entry point relocation");
+        write_security_receipt(&staging, "pip", "black").expect("production executable receipt");
+        fs::rename(&staging, &installed).expect("promote genuine installed wheel");
+        link_binaries(&installed, &bin, true).expect("production shared-bin activation");
+        assert!(
+            !staging.exists(),
+            "the old staging interpreter path must disappear"
+        );
+        let entry = fs::read_to_string(bin.join("black")).expect("installed console script");
+        assert_eq!(
+            entry.starts_with("#!/bin/sh\n'''exec' "),
+            with_spaces,
+            "exercise a direct interpreter header without spaces and a shell trampoline with spaces"
+        );
         let output = Command::new(bin.join("black"))
             .output()
             .expect("promoted pip console entry point must execute after staging disappears");
@@ -1951,6 +1869,171 @@ pip.chmod(0o755)
     }
 
     #[cfg(unix)]
+    #[test]
+    fn npm_review_identity_rejects_changes_to_imported_manager_code_and_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let tools = temp.path().join("tools");
+        let managers = temp.path().join("managers");
+        fs::create_dir_all(&managers).unwrap();
+        let npm = managers.join("npm");
+        fs::write(&npm, b"#!/bin/sh\nexit 0\n").unwrap();
+        prepare_managed_npm_fixture(&tools, &npm);
+        let version = temp.path().join("versions/node/24.22.3");
+        fs::create_dir_all(version.join("lib/node_modules/npm/lib")).unwrap();
+        let imported = version.join("lib/node_modules/npm/lib/cli.js");
+        fs::write(&imported, b"module.exports = 'reviewed';\n").unwrap();
+        let runtime = ManagedNpm::open(&tools).unwrap();
+        fs::write(&imported, b"module.exports = 'modified';\n").unwrap();
+        assert!(
+            runtime.verify().is_err(),
+            "changing an imported npm module must invalidate reviewed manager identity"
+        );
+        fs::write(&imported, b"module.exports = 'reviewed';\n").unwrap();
+        runtime.verify().unwrap();
+        fs::write(
+            version.join("lib/node_modules/npm/package.json"),
+            br#"{"version":"11.16.0"}"#,
+        )
+        .unwrap();
+        assert!(
+            runtime.verify().is_err(),
+            "changing npm package metadata must invalidate reviewed manager identity"
+        );
+    }
+
+    async fn install_managed_fixture(
+        manager: &str,
+        package: &str,
+        name: &str,
+        tools: &Path,
+        bin: &Path,
+    ) -> Result<()> {
+        install_managed_with_advisories(
+            manager,
+            package,
+            name,
+            tools,
+            bin,
+            std::sync::Arc::new(TestNpmAdvisories::default()),
+            crate::runtimes::security::RuntimeSecurity::fixture(),
+        )
+        .await
+    }
+
+    #[cfg(unix)]
+    fn prepare_managed_registry_fixture(tools: &Path, runtime: &str, programs: &[(&str, &Path)]) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let versions = tools.parent().unwrap().join("versions").join(runtime);
+        let version = versions.join("1.78.0");
+        fs::create_dir_all(version.join("bin")).expect("managed runtime directory");
+        for (name, source) in programs {
+            let target = version.join("bin").join(name);
+            fs::copy(source, &target).expect("contained synthetic manager implementation");
+            fs::set_permissions(target, fs::Permissions::from_mode(0o755))
+                .expect("managed command executable");
+        }
+        crate::runtimes::security::fixture_prepare(runtime, "1.78.0", &version, &version)
+            .expect("explicit real fixture admission");
+        symlink(&version, versions.join("current")).expect("selected owned fixture runtime");
+    }
+
+    #[cfg(unix)]
+    fn prepare_managed_npm_fixture(tools: &Path, npm: &Path) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let versions = tools.parent().unwrap().join("versions/node");
+        let version = versions.join("24.22.3");
+        fs::create_dir_all(version.join("bin")).unwrap();
+        fs::create_dir_all(version.join("lib/node_modules/npm/bin")).unwrap();
+        let node = version.join("bin/node");
+        let executable = npm.to_string_lossy().replace('\'', "'\\''");
+        fs::write(&node, format!("#!/bin/sh\nshift\nwhile [ \"${{1#--}}\" != \"$1\" ]; do shift; done\nexec '{executable}' \"$@\"\n")).unwrap();
+        fs::set_permissions(&node, fs::Permissions::from_mode(0o755)).unwrap();
+        let cli = version.join("lib/node_modules/npm/bin/npm-cli.js");
+        fs::write(
+            &cli,
+            b"// A fake managed Node dispatches to the owned shell fixture.\n",
+        )
+        .unwrap();
+        fs::set_permissions(&cli, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(
+            version.join("lib/node_modules/npm/package.json"),
+            br#"{"version":"11.15.0"}"#,
+        )
+        .unwrap();
+        fs::write(
+            version.join("lib/node_modules/npm/imported.js"),
+            b"module.exports = 1;\n",
+        )
+        .unwrap();
+        symlink(&cli, version.join("bin/npm")).unwrap();
+        symlink(&version, versions.join("current")).unwrap();
+        crate::runtimes::security::fixture_install_identity("node", &version).unwrap();
+        write_npm_lock_fixture(npm.parent().unwrap());
+    }
+
+    fn write_npm_lock_fixture(directory: &Path) {
+        let lock = serde_json::json!({"lockfileVersion":3,"packages":{
+            "":{"dependencies":{"fixture-tool":"1.0.0"}},
+            "node_modules/fixture-tool":{"version":"1.0.0","resolved":"https://registry.npmjs.org/fixture-tool/-/fixture-tool-1.0.0.tgz","integrity":"sha512-AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+Pw=="}
+        }});
+        fs::write(
+            directory.join("lock.fixture.json"),
+            serde_json::to_vec(&lock).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[derive(Default)]
+    struct TestNpmAdvisories {
+        findings: Vec<crate::core::security::scan::Vulnerability>,
+        replacement: Option<Vec<crate::core::security::scan::Vulnerability>>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl crate::core::security::vulnerability::VulnerabilitySource for TestNpmAdvisories {
+        fn assess_packages<'a>(
+            &'a self,
+            packages: &'a [crate::package_managers::types::SecurityPackage],
+            _use_case: crate::core::security::vulnerability::AssessmentUse,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = std::result::Result<
+                            Vec<crate::core::security::vulnerability::PackageAssessment>,
+                            crate::core::security::vulnerability::VulnerabilityError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async move {
+                let previous = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let findings = if previous > 0 {
+                    self.replacement.as_ref().unwrap_or(&self.findings)
+                } else {
+                    &self.findings
+                };
+                Ok(packages
+                    .iter()
+                    .map(
+                        |package| crate::core::security::vulnerability::PackageAssessment {
+                            package: package.clone(),
+                            coverage:
+                                crate::core::security::vulnerability::PackageCoverage::Assessed {
+                                    provenance:
+                                        crate::core::security::scan::AdvisoryProvenance::Osv {
+                                            ecosystem: "npm".into(),
+                                        },
+                                },
+                            findings: findings.clone(),
+                        },
+                    )
+                    .collect())
+            })
+        }
+    }
+
+    #[cfg(unix)]
     fn with_managed_fixture_environment(path: &std::ffi::OsStr, test: impl FnOnce()) {
         temp_env::with_vars(
             [
@@ -1965,6 +2048,354 @@ pip.chmod(0o755)
             ],
             test,
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn language_installs_refuse_ambient_managers_before_execution() {
+        if crate::core::testing::run_isolated_test(
+            "cli::tool::tests::language_installs_refuse_ambient_managers_before_execution",
+        ) {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt as _;
+        for (manager, package, executable) in [
+            ("cargo", "fixture-crate", "cargo"),
+            ("go", "example.org/fixture", "go"),
+            ("pip", "fixture-python", "python3"),
+        ] {
+            let owner = tempfile::tempdir().unwrap();
+            let managers = owner.path().join("managers");
+            let tools = owner.path().join("tools");
+            let bin = owner.path().join("bin");
+            fs::create_dir_all(&managers).unwrap();
+            let marker = owner.path().join("ambient-executed");
+            let program = managers.join(executable);
+            fs::write(
+                &program,
+                format!(
+                    "#!/bin/sh\nprintf attempted > '{}'\nexit 1\n",
+                    marker.display()
+                ),
+            )
+            .unwrap();
+            fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+            let old = tools.join(manager).join("fixture-tool/bin/fixture-tool");
+            fs::create_dir_all(old.parent().unwrap()).unwrap();
+            fs::write(&old, b"previous version").unwrap();
+            let mut paths = vec![managers];
+            paths.extend(std::env::split_paths(TOOL_SYSTEM_PATH));
+            let path = std::env::join_paths(paths).unwrap();
+            with_managed_fixture_environment(&path, || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                assert!(
+                    runtime
+                        .block_on(install_managed(
+                            manager,
+                            package,
+                            "fixture-tool",
+                            &tools,
+                            &bin
+                        ))
+                        .is_err()
+                );
+                assert!(
+                    !marker.exists(),
+                    "{manager} executed an ambient manager before managed-runtime admission"
+                );
+                assert_eq!(fs::read(&old).unwrap(), b"previous version");
+            });
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn npm_advisory_refusal_precedes_materialization_and_preserves_previous_tool() {
+        let name = "cli::tool::tests::npm_advisory_refusal_precedes_materialization_and_preserves_previous_tool";
+        if crate::core::testing::run_isolated_test(name) {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt as _;
+        nix::unistd::setsid().expect("disposable fixture owns a session without a terminal");
+        let temp = tempfile::tempdir().unwrap();
+        let managers = temp.path().join("managers");
+        let tools = temp.path().join("tools");
+        let bin = temp.path().join("bin");
+        fs::create_dir_all(&managers).unwrap();
+        let npm = managers.join("npm");
+        fs::write(
+            &npm,
+            br#"#!/bin/sh
+fixture=$(dirname "$0")
+printf '%s\n' "$1" >> "$fixture/phases"
+case "$1" in
+install) cp "$fixture/lock.fixture.json" "$3/package-lock.json" ;;
+*) mkdir -p "$3/node_modules"; exit 1 ;;
+esac
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&npm, fs::Permissions::from_mode(0o755)).unwrap();
+        prepare_managed_npm_fixture(&tools, &npm);
+        let old = tools.join("npm/fixture-tool/bin/fixture-tool");
+        fs::create_dir_all(old.parent().unwrap()).unwrap();
+        fs::write(&old, b"previous tool").unwrap();
+        fs::create_dir_all(&bin).unwrap();
+        symlink(&old, bin.join("fixture-tool")).unwrap();
+        let source = TestNpmAdvisories {
+            findings: vec![crate::core::security::scan::Vulnerability {
+                id: "CVE-2021-23337".into(),
+                summary: "Synthetic affected-package fixture".into(),
+                applicability: crate::core::security::scan::FindingApplicability::Applicable,
+                score: None,
+                advisory_severity: None,
+                native_advisory: None,
+                affected_installed: Vec::new(),
+            }],
+            ..TestNpmAdvisories::default()
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let error = runtime
+            .block_on(install_managed_with_advisories(
+                "npm",
+                "fixture-tool@1.0.0",
+                "fixture-tool",
+                &tools,
+                &bin,
+                std::sync::Arc::new(source),
+                crate::runtimes::security::RuntimeSecurity::fixture(),
+            ))
+            .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("SECURITY WARNING")
+                && message.contains("CVE-2021-23337")
+                && message.contains("https://www.cve.org/CVERecord?id=CVE-2021-23337"),
+            "{message}"
+        );
+        assert!(
+            message.contains("attended controlling terminal"),
+            "{message}"
+        );
+        assert_eq!(
+            fs::read_to_string(managers.join("phases")).unwrap(),
+            "install\n"
+        );
+        assert_eq!(
+            fs::read(bin.join("fixture-tool")).unwrap(),
+            b"previous tool"
+        );
+        assert_eq!(fs::read_dir(tools.join("npm")).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn npm_requires_managed_node_and_supported_resolver_before_any_manager_executes() {
+        let name = "cli::tool::tests::npm_requires_managed_node_and_supported_resolver_before_any_manager_executes";
+        if crate::core::testing::run_isolated_test(name) {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt as _;
+        let temp = tempfile::tempdir().unwrap();
+        let tools = temp.path().join("tools");
+        let bin = temp.path().join("bin");
+        let managers = temp.path().join("managers");
+        fs::create_dir_all(&managers).unwrap();
+        let npm = managers.join("npm");
+        fs::write(
+            &npm,
+            b"#!/bin/sh\nprintf executed > \"$(dirname \"$0\")/executed\"\nexit 1\n",
+        )
+        .unwrap();
+        fs::set_permissions(&npm, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut paths = vec![managers.clone()];
+        paths.extend(std::env::split_paths(TOOL_SYSTEM_PATH));
+        let path = std::env::join_paths(paths).unwrap();
+        with_managed_fixture_environment(&path, || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let error = runtime
+                .block_on(install_managed(
+                    "npm",
+                    "fixture-tool",
+                    "fixture-tool",
+                    &tools,
+                    &bin,
+                ))
+                .unwrap_err();
+            assert!(format!("{error:#}").contains("active OMG-managed Node"));
+            assert!(!managers.join("executed").exists());
+            prepare_managed_npm_fixture(&tools, &npm);
+            fs::write(
+                temp.path()
+                    .join("versions/node/24.22.3/lib/node_modules/npm/package.json"),
+                br#"{"version":"10.9.0"}"#,
+            )
+            .unwrap();
+            let error = runtime
+                .block_on(install_managed(
+                    "npm",
+                    "fixture-tool",
+                    "fixture-tool",
+                    &tools,
+                    &bin,
+                ))
+                .unwrap_err();
+            assert!(format!("{error:#}").contains("npm >=11.15.0"));
+            assert!(!managers.join("executed").exists());
+            assert_eq!(fs::read_dir(tools.join("npm")).unwrap().count(), 0);
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn npm_terminal_consent_binds_the_transaction_and_keeps_signatures_mandatory() {
+        const NAME: &str = "cli::tool::tests::npm_terminal_consent_binds_the_transaction_and_keeps_signatures_mandatory";
+        if crate::core::testing::run_isolated_test_with_timeout(
+            NAME,
+            std::time::Duration::from_secs(90),
+        ) {
+            return;
+        }
+        let Ok(case) = std::env::var("OMG_NPM_ADVISORY_CASE") else {
+            let output = Command::new(
+                crate::core::privilege::root_controlled_program_path("python3").unwrap(),
+            )
+            .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/test-npm-advisory-consent.py"))
+            .arg("--unit")
+            .arg(std::env::current_exe().unwrap())
+            .output()
+            .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(output.status.success(), "{stdout}\n{stderr}");
+            let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(result["passed"], 16);
+            assert_eq!(result["cases"].as_array().unwrap().len(), 16);
+            println!("{}", String::from_utf8_lossy(&output.stdout));
+            return;
+        };
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = PathBuf::from(std::env::var_os("OMG_NPM_ADVISORY_ROOT").unwrap());
+        assert!(
+            root.is_absolute() && root.is_dir() && fs::read_dir(&root).unwrap().count() == 0,
+            "the terminal driver must supply an empty owned case directory"
+        );
+        let managers = root.join("managers");
+        let tools = root.join("tools");
+        let bin = root.join("bin");
+        fs::create_dir_all(&managers).unwrap();
+        fs::create_dir_all(&bin).unwrap();
+        let npm = managers.join("npm");
+        fs::write(
+            &npm,
+            br#"#!/bin/sh
+fixture=$(dirname "$0")
+printf '%s\n' "$1" >> "$fixture/phases"
+case "$1" in
+install) cp "$fixture/lock.fixture.json" "$3/package-lock.json" ;;
+ci)
+  mkdir -p "$3/node_modules/.bin"
+  mkdir -p "$3/node_modules/fixture-tool"
+  printf '%s' '{"name":"fixture-tool","version":"1.0.0"}' > "$3/node_modules/fixture-tool/package.json"
+  printf '#!/bin/sh\necho accepted-version\n' > "$3/node_modules/.bin/fixture-tool"
+  chmod 755 "$3/node_modules/.bin/fixture-tool"
+  ;;
+audit) test ! -f "$fixture/reject-signature" ;;
+rebuild) test -f "$fixture/allow-rebuild" ;;
+*) exit 1 ;;
+esac
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&npm, fs::Permissions::from_mode(0o755)).unwrap();
+        prepare_managed_npm_fixture(&tools, &npm);
+        if case == "signature-reject" {
+            fs::write(managers.join("reject-signature"), b"reject").unwrap();
+        }
+        if case == "scripts-permitted" {
+            fs::write(managers.join("allow-rebuild"), b"allow").unwrap();
+        }
+        let old = tools.join("npm/fixture-tool/bin/fixture-tool");
+        fs::create_dir_all(old.parent().unwrap()).unwrap();
+        fs::write(&old, b"previous tool").unwrap();
+        symlink(&old, bin.join("fixture-tool")).unwrap();
+        let finding = crate::core::security::scan::Vulnerability {
+            id: "CVE-2021-23337".into(),
+            summary: "Synthetic affected-package fixture".into(),
+            applicability: crate::core::security::scan::FindingApplicability::Applicable,
+            score: None,
+            advisory_severity: None,
+            native_advisory: None,
+            affected_installed: Vec::new(),
+        };
+        let mut source = TestNpmAdvisories {
+            findings: vec![finding.clone()],
+            ..TestNpmAdvisories::default()
+        };
+        if case == "evidence-change" {
+            let mut changed = finding;
+            changed.id = "CVE-2026-12345".into();
+            source.replacement = Some(vec![changed]);
+        }
+        let mut paths = vec![managers];
+        paths.extend(std::env::split_paths(TOOL_SYSTEM_PATH));
+        let path = std::env::join_paths(paths).unwrap();
+        with_managed_fixture_environment(&path, || {
+            temp_env::with_var(
+                ALLOW_NPM_SCRIPTS_ENV,
+                if case == "scripts-permitted" {
+                    Some("fixture-tool@1.0.0")
+                } else {
+                    None
+                },
+                || {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap();
+                    let result = runtime.block_on(install_managed_with_advisories(
+                        "npm",
+                        "fixture-tool@1.0.0",
+                        "fixture-tool",
+                        &tools,
+                        &bin,
+                        std::sync::Arc::new(source),
+                        crate::runtimes::security::RuntimeSecurity::fixture(),
+                    ));
+                    let expected = matches!(case.as_str(), "accept" | "scripts-permitted");
+                    assert_eq!(result.is_ok(), expected, "{case}: {result:?}");
+                    if let Err(error) = &result {
+                        let message = format!("{error:#}");
+                        let expected = match case.as_str() {
+                            "lock-change"
+                            | "runtime-change"
+                            | "manager-library-change"
+                            | "manager-metadata-change"
+                            | "evidence-change" => "changed",
+                            "signature-reject" => "signature/provenance",
+                            "no-tty" => "attended controlling terminal",
+                            "eof" => "terminal closed",
+                            _ => "declined",
+                        };
+                        assert!(message.contains(expected), "{case}: {message}");
+                        println!("{message}");
+                    }
+                    println!(
+                        "OMG_NPM_ADVISORY_RESULT={}",
+                        serde_json::json!({"case":case,"installed":result.is_ok()})
+                    );
+                },
+            );
+        });
     }
 
     #[cfg(unix)]
@@ -1990,7 +2421,12 @@ pip.chmod(0o755)
 fixture=$(dirname "$0")
 case "$1" in
   install)
+    printf '%s' '{"lockfileVersion":3,"packages":{"":{"dependencies":{"fixture-tool":"1.0.0"}},"node_modules/fixture-tool":{"version":"1.0.0","resolved":"https://registry.npmjs.org/fixture-tool/-/fixture-tool-1.0.0.tgz","integrity":"sha512-AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+Pw=="}}}' > "$3/package-lock.json"
+    ;;
+  ci)
     mkdir -p "$3/node_modules/.bin"
+    mkdir -p "$3/node_modules/fixture-tool"
+    printf '%s' '{"name":"fixture-tool","version":"1.0.0"}' > "$3/node_modules/fixture-tool/package.json"
     printf '#!/bin/sh\necho new-version\n' > "$3/node_modules/.bin/fixture-tool"
     chmod 755 "$3/node_modules/.bin/fixture-tool"
     printf started > "$fixture/started"
@@ -2011,6 +2447,7 @@ esac
         )
         .expect("disposable manager");
         fs::set_permissions(&npm, fs::Permissions::from_mode(0o755)).expect("manager permissions");
+        prepare_managed_npm_fixture(&tools, &npm);
         let install_dir = tools.join("npm/fixture-tool");
         let previous = install_dir.join("bin/fixture-tool");
         fs::create_dir_all(previous.parent().expect("previous directory"))
@@ -2062,6 +2499,50 @@ esac
                 assert_eq!(fs::read_link(bin.join("fixture-tool")).expect("new link"), install_dir.join("node_modules/.bin/fixture-tool"));
             });
         });
+        assert_fresh_owned_npm_publication(temp.path(), &path);
+    }
+
+    #[cfg(unix)]
+    fn assert_fresh_owned_npm_publication(root: &Path, path: &std::ffi::OsStr) {
+        with_managed_fixture_environment(path, || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("current-thread runtime");
+            let fresh_tools = root.join("fresh-tools");
+            let fresh_bin = root.join("fresh-bin");
+            let fresh_install = fresh_tools.join("npm/fixture-tool");
+            fs::create_dir(&fresh_bin).expect("fresh shared bin directory");
+            assert!(
+                !fresh_install.exists(),
+                "fixture has no previous installation"
+            );
+            runtime
+                .block_on(install_managed_fixture(
+                    "npm",
+                    "fixture-tool",
+                    "fixture-tool",
+                    &fresh_tools,
+                    &fresh_bin,
+                ))
+                .expect("publish and activate a first installation");
+            let installed_command = fresh_bin.join("fixture-tool");
+            assert_eq!(
+                fs::read_link(&installed_command).expect("fresh tool activation"),
+                fresh_install.join("node_modules/.bin/fixture-tool")
+            );
+            assert_eq!(
+                fs::read(&installed_command).expect("published fresh tool"),
+                b"#!/bin/sh\necho new-version\n"
+            );
+            assert_eq!(
+                fs::read_dir(fresh_tools.join("npm"))
+                    .expect("fresh manager directory")
+                    .count(),
+                1,
+                "successful first installation leaves only the published tool"
+            );
+        });
     }
 
     #[cfg(unix)]
@@ -2098,6 +2579,7 @@ exit 1
         )
         .expect("disposable manager");
         fs::set_permissions(&npm, fs::Permissions::from_mode(0o755)).expect("manager permissions");
+        prepare_managed_npm_fixture(&tools, &npm);
         let previous = tools.join("npm/fixture-tool/bin/fixture-tool");
         fs::create_dir_all(previous.parent().expect("previous directory"))
             .expect("previous installation");
@@ -2184,16 +2666,35 @@ exit 1
         let tools = temp.path().join("tools");
         let bin = temp.path().join("bin");
         fs::create_dir_all(&managers).expect("manager directory");
+        let marker = managers
+            .join("started")
+            .to_string_lossy()
+            .replace('\'', "'\\''");
         for executable in ["npm", "cargo", "python3", "go"] {
             let program = managers.join(executable);
             fs::write(
                 &program,
-                b"#!/bin/sh\nif [ \"$1\" = --version ]; then exit 0; fi\nprintf started > \"$(dirname \"$0\")/started\"\nsleep 1\nexit 1\n",
+                format!("#!/bin/sh\nif [ \"$1\" = --version ]; then exit 0; fi\nprintf started > '{marker}'\nsleep 1\nexit 1\n"),
             )
             .expect("disposable manager");
             fs::set_permissions(&program, fs::Permissions::from_mode(0o755))
                 .expect("manager permissions");
         }
+        prepare_managed_npm_fixture(&tools, &managers.join("npm"));
+        prepare_managed_registry_fixture(
+            &tools,
+            "rust",
+            &[
+                ("cargo", managers.join("cargo").as_path()),
+                ("rustc", managers.join("cargo").as_path()),
+            ],
+        );
+        prepare_managed_registry_fixture(
+            &tools,
+            "python",
+            &[("python3", managers.join("python3").as_path())],
+        );
+        prepare_managed_registry_fixture(&tools, "go", &[("go", managers.join("go").as_path())]);
         fs::create_dir_all(&bin).expect("shared bin directory");
 
         let mut paths = vec![managers.clone()];
@@ -2207,9 +2708,9 @@ exit 1
             let mut starved_managers = Vec::new();
             for (manager, expected_error) in [
                 ("npm", "NPM install"),
-                ("cargo", "Cargo install"),
-                ("pip", "Failed to create python venv"),
-                ("go", "Go install"),
+                ("cargo", "Cargo metadata resolution"),
+                ("pip", "Create isolated managed-Python installer"),
+                ("go", "Go public module metadata"),
             ] {
                 let previous = tools.join(manager).join("fixture-tool/bin/fixture-tool");
                 fs::create_dir_all(previous.parent().expect("previous tool directory"))
@@ -2217,9 +2718,14 @@ exit 1
                 fs::write(&previous, b"previous version").expect("previous tool");
                 runtime.block_on(async {
                     let started = Instant::now();
+                    let request = if manager == "go" {
+                        "example.com/fixture-tool"
+                    } else {
+                        "fixture-tool"
+                    };
                     let (outcome, tick_elapsed) = tokio::join!(
                         biased;
-                        install_managed(manager, "fixture-tool", "fixture-tool", &tools, &bin),
+                        install_managed(manager, request, "fixture-tool", &tools, &bin),
                         async {
                             tokio::time::sleep(Duration::from_millis(50)).await;
                             started.elapsed()
@@ -2231,6 +2737,10 @@ exit 1
                         "{manager}: {error:#}"
                     );
                     assert!(managers.join("started").is_file(), "fixture must run");
+                    assert!(
+                        started.elapsed() >= Duration::from_millis(900),
+                        "the slow owned manager must actually execute its delay"
+                    );
                     fs::remove_file(managers.join("started")).expect("reset manager marker");
                     assert_eq!(
                         fs::read(&previous).expect("previous tool"),
@@ -2298,6 +2808,9 @@ exit 1
             ("npm", "@scope/name/extra"),
             ("pip", "relative/package"),
             ("cargo", "relative/crate"),
+            ("pacman", "core/fixture-tool"),
+            ("pacman", "fixture-tool@stable"),
+            ("unknown-manager", "eslint"),
         ] {
             assert!(
                 validate_managed_package(manager, package).is_err(),
@@ -2309,6 +2822,7 @@ exit 1
             ("npm", "@angular/cli"),
             ("pip", "yt-dlp"),
             ("cargo", "cargo-audit"),
+            ("pacman", "fixture-tool++"),
             ("go", "github.com/rakyll/hey"),
             ("go", "github.com/rakyll/hey@v0.1.4"),
         ] {
@@ -2467,6 +2981,50 @@ exit 1
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn secured_commands_resolve_owned_path_and_report_missing_manager() {
+        if crate::core::testing::run_isolated_test(
+            "cli::tool::tests::secured_commands_resolve_owned_path_and_report_missing_manager",
+        ) {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let fixture = tempfile::tempdir().expect("manager fixture directory");
+        let executable = fixture.path().join("omg-managed-fixture");
+        fs::write(&executable, b"fixture").expect("create owned manager");
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755))
+            .expect("make the owned fixture executable");
+        let staging = tempfile::tempdir().expect("staging directory");
+        with_managed_fixture_environment(fixture.path().as_os_str(), || {
+            let command = secured_manager_command(
+                "omg-managed-fixture",
+                staging.path(),
+                "npm",
+                "lookup-fixture",
+            )
+            .expect("resolve the owned manager");
+            #[cfg(target_os = "linux")]
+            assert_eq!(command.get_args().last(), Some(executable.as_os_str()));
+            #[cfg(not(target_os = "linux"))]
+            assert_eq!(command.get_program(), executable.as_os_str());
+
+            let error = secured_manager_command(
+                "omg-missing-manager",
+                staging.path(),
+                "npm",
+                "lookup-fixture",
+            )
+            .expect_err("unavailable manager must be rejected");
+            let diagnostic = format!("{error:#}");
+            assert!(
+                diagnostic.contains("Failed to resolve npm executable 'omg-missing-manager'"),
+                "{diagnostic}"
+            );
+        });
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn secured_commands_close_stdin_and_forbid_new_privileges() {
@@ -2602,6 +3160,161 @@ exit 1
         assert!(!names.contains(&"diesel_cli".to_string()));
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reviewed_go_tool_publishes_payload_and_receipts() -> Result<()> {
+        let (fixture, advisories) =
+            crate::runtimes::tool_artifacts::managed_go_publication_fixture()?;
+        let tools = fixture.path().join("tools");
+        let bin = fixture.path().join("bin");
+        fs::create_dir(&bin)?;
+        install_managed_with_advisories(
+            "go",
+            "example.com/tool@v1.2.3",
+            "fixture-tool",
+            &tools,
+            &bin,
+            advisories,
+            crate::runtimes::security::RuntimeSecurity::fixture(),
+        )
+        .await?;
+
+        let destination = tools.join("go/fixture-tool");
+        let launcher = bin.join("fixture-tool");
+        let installed_binary = destination.join("bin/fixture-tool");
+        let advisory_receipt = destination.join(".omg-package-advisory-review.json");
+        assert_eq!(fs::read_link(&launcher)?, installed_binary);
+        let launcher_bytes = fs::read(launcher)?;
+        assert_eq!(launcher_bytes, b"#!/bin/sh\necho reviewed-tool-success\n");
+        assert!(advisory_receipt.is_file());
+        assert!(destination.join(".omg-security-receipt.json").is_file());
+        assert_eq!(fs::read_dir(tools.join("go"))?.count(), 1);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn managed_tool_reports_success_only_after_activation() -> Result<()> {
+        const NAME: &str = "cli::tool::tests::managed_tool_reports_success_only_after_activation";
+        const CASE: &str = "OMG_TEST_TOOL_ACTIVATION_OUTPUT";
+        if let Ok(case) = std::env::var(CASE) {
+            let (fixture, advisories) =
+                crate::runtimes::tool_artifacts::managed_go_publication_fixture()?;
+            let bin = fixture.path().join("bin");
+            let expect_success = case == "available";
+            if expect_success {
+                fs::create_dir(&bin)?;
+            } else {
+                fs::write(&bin, b"keep this entry")?;
+            }
+            let result = install_managed_with_advisories(
+                "go",
+                "example.com/tool@v1.2.3",
+                "fixture-tool",
+                &fixture.path().join("tools"),
+                &bin,
+                advisories,
+                crate::runtimes::security::RuntimeSecurity::fixture(),
+            )
+            .await;
+            if expect_success {
+                result?;
+                assert!(bin.join("fixture-tool").is_file());
+            } else {
+                let error = result.expect_err("a file cannot contain a command symlink");
+                assert!(
+                    format!("{error:#}").contains("Failed to symlink binary"),
+                    "{error:#}"
+                );
+                assert_eq!(fs::read(&bin)?, b"keep this entry");
+                assert!(!fixture.path().join("tools/go/fixture-tool").exists());
+            }
+            return Ok(());
+        }
+
+        for (case, expect_success) in [("available", true), ("blocked", false)] {
+            let mut command = tokio::process::Command::new(std::env::current_exe()?);
+            command
+                .args(["--exact", NAME, "--nocapture"])
+                .env(CASE, case)
+                .kill_on_drop(true);
+            let output = tokio::time::timeout(std::time::Duration::from_secs(20), command.output())
+                .await??;
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success() && stdout.contains("1 passed"),
+                "{stdout}\n{stderr}"
+            );
+            assert_eq!(
+                stdout.contains("Installation successful"),
+                expect_success,
+                "{stdout}"
+            );
+            if expect_success {
+                let linked = stdout
+                    .find("Linked fixture-tool")
+                    .context("missing launcher announcement")?;
+                let success = stdout
+                    .find("Installation successful")
+                    .context("missing success announcement")?;
+                assert!(linked < success, "{stdout}");
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_tool_receipt_write_preserves_previous_install() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let fixture = tempfile::tempdir()?;
+        let tools = fixture.path().join("tools");
+        let bin = fixture.path().join("bin");
+        let previous = tools.join("npm/fixture-tool/bin/fixture-tool");
+        fs::create_dir_all(previous.parent().context("previous tool directory")?)?;
+        fs::write(&previous, b"previous tool fixture")?;
+        fs::create_dir(&bin)?;
+        symlink(&previous, bin.join("fixture-tool"))?;
+
+        let npm = fixture.path().join("npm");
+        let script = br#"#!/bin/sh
+set -eu
+fixture=$(dirname "$0")
+case "$1" in
+  install) cp "$fixture/lock.fixture.json" "$3/package-lock.json" ;;
+  ci)
+    mkdir -p "$3/node_modules/.bin" "$3/node_modules/fixture-tool" "$3/.omg-security-receipt.json"
+    printf '%s' '{"name":"fixture-tool","version":"1.0.0"}' > "$3/node_modules/fixture-tool/package.json"
+    printf '#!/bin/sh\nexit 0\n' > "$3/node_modules/.bin/fixture-tool"
+    chmod 755 "$3/node_modules/.bin/fixture-tool"
+    ;;
+  audit)
+    test -f "$4/node_modules/.bin/fixture-tool"
+    printf verified > "$fixture/verified"
+    ;;
+  *) exit 1 ;;
+esac
+"#;
+        fs::write(&npm, script)?;
+        fs::set_permissions(&npm, fs::Permissions::from_mode(0o755))?;
+        prepare_managed_npm_fixture(&tools, &npm);
+
+        let error = install_managed_fixture("npm", "fixture-tool", "fixture-tool", &tools, &bin)
+            .await
+            .expect_err("receipt write failure must stop publication");
+        let diagnostic = format!("{error:#}");
+        let refused_receipt = diagnostic.contains("Write tool security receipt");
+        assert!(refused_receipt, "{diagnostic}");
+        assert_eq!(fs::read(fixture.path().join("verified"))?, b"verified");
+        assert_eq!(fs::read_link(bin.join("fixture-tool"))?, previous);
+        let unchanged_launcher = fs::read(bin.join("fixture-tool"))?;
+        assert_eq!(unchanged_launcher, b"previous tool fixture");
+        assert_eq!(fs::read_dir(tools.join("npm"))?.count(), 1);
+        Ok(())
+    }
+
     /// W4-A-01 regression: a failed install must leave the previously working
     /// tool in place and runnable instead of deleting it before reinstalling.
     #[tokio::test]
@@ -2613,12 +3326,25 @@ exit 1
         fs::create_dir_all(install_dir.join("bin")).expect("tool fixture");
         let tool_binary = install_dir.join("bin").join("fake-tool");
         fs::write(&tool_binary, "#!/bin/sh\necho previous-tool-ok\n").expect("tool fixture");
+        let manager = temp.path().join("failing-cargo");
+        fs::write(
+            &manager,
+            b"#!/bin/sh\necho controlled Cargo metadata failure >&2\nexit 77\n",
+        )
+        .expect("controlled failing manager");
 
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&tool_binary, fs::Permissions::from_mode(0o755))
                 .expect("tool fixture");
+            fs::set_permissions(&manager, fs::Permissions::from_mode(0o755))
+                .expect("manager executable");
+            prepare_managed_registry_fixture(
+                &tools_dir,
+                "rust",
+                &[("cargo", manager.as_path()), ("rustc", manager.as_path())],
+            );
         }
 
         let error = install_managed(
@@ -2630,10 +3356,10 @@ exit 1
         )
         .await
         .expect_err("installing a nonexistent crate must fail");
-        assert!(
-            error.to_string().contains("Cargo install"),
-            "error: {error}"
-        );
+        let diagnostic = error.to_string();
+        let metadata_resolution = diagnostic.contains("Cargo metadata resolution");
+        let resolver_stderr = diagnostic.contains("controlled Cargo metadata failure");
+        assert!(metadata_resolution && resolver_stderr, "{diagnostic}");
 
         // The previous install survived the failed update...
         assert!(

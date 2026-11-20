@@ -37,9 +37,12 @@ allow = [
 # Confidence threshold for license detection
 confidence-threshold = 0.8
 
-# Copyleft dependencies are restricted to the package-management and PGP
-# implementations that require them; OMG itself is MIT-licensed.
+# Additional licenses are scoped to the implementations that require them;
+# OMG itself is MIT-licensed.
 exceptions = [
+  { allow = [
+    "bzip2-1.0.6",
+  ], crate = "libbz2-rs-sys@0.2.6" },
   { allow = [
     "GPL-3.0",
   ], crate = "alpm" },

@@ -50,3 +50,201 @@ pub(super) fn zip(root: &str, launcher: &str, kind: Launcher) -> Result<Vec<u8>>
     }
     Ok(archive.finish()?.into_inner())
 }
+
+fn tar_entries(root: &str, entries: &[(&str, &[u8])]) -> Result<Vec<u8>> {
+    let mut archive = tar::Builder::new(Vec::new());
+    for (name, bytes) in entries {
+        let mut header = tar::Header::new_gnu();
+        header.set_mode(0o755);
+        header.set_size(bytes.len() as u64);
+        header.set_cksum();
+        archive.append_data(&mut header, format!("{root}/{name}"), *bytes)?;
+    }
+    Ok(archive
+        .into_inner()
+        .expect("finish controlled in-memory tar fixture"))
+}
+
+pub(super) fn tar_gz_entries(root: &str, entries: &[(&str, &[u8])]) -> Result<Vec<u8>> {
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    encoder
+        .write_all(&tar_entries(root, entries)?)
+        .expect("encode controlled in-memory gzip fixture");
+    Ok(encoder.finish().expect("finish controlled gzip fixture"))
+}
+
+pub(super) fn tar_xz_entries(root: &str, entries: &[(&str, &[u8])]) -> Result<Vec<u8>> {
+    let mut compressed = Vec::new();
+    lzma_rs::xz_compress(
+        &mut Cursor::new(tar_entries(root, entries)?),
+        &mut compressed,
+    )
+    .expect("encode controlled in-memory XZ fixture");
+    Ok(compressed)
+}
+
+pub(super) struct PublicationFixture {
+    pub(super) owner: tempfile::TempDir,
+    pub(super) versions: std::path::PathBuf,
+    pub(super) archive: std::path::PathBuf,
+    launcher: std::path::PathBuf,
+    runtime: String,
+}
+
+impl PublicationFixture {
+    pub(super) fn new(runtime: &str, launcher: &str) -> Self {
+        Self::with_owner(
+            runtime,
+            launcher,
+            tempfile::tempdir().expect("private archive publication fixture"),
+        )
+    }
+
+    #[cfg(all(target_os = "linux", feature = "pgp"))]
+    pub(super) fn new_in(runtime: &str, launcher: &str, parent: &std::path::Path) -> Self {
+        Self::with_owner(
+            runtime,
+            launcher,
+            tempfile::tempdir_in(parent).expect("budgeted private archive publication fixture"),
+        )
+    }
+
+    fn with_owner(runtime: &str, launcher: &str, owner: tempfile::TempDir) -> Self {
+        use std::{fs, os::unix::fs::symlink};
+        let versions = owner.path().join("versions").join(runtime);
+        let previous = versions.join("1.0.0");
+        let binary = previous.join(launcher);
+        fs::create_dir_all(binary.parent().expect("controlled launcher parent"))
+            .expect("previous runtime directory");
+        fs::write(&binary, b"previous reviewed runtime").expect("previous runtime bytes");
+        super::security::fixture_prepare(runtime, "1.0.0", &previous, &previous)
+            .expect("admit the previous owned runtime");
+        symlink("1.0.0", versions.join("current")).expect("select previous runtime");
+        let archive = owner.path().join("runtime.archive");
+        Self {
+            owner,
+            versions,
+            archive,
+            launcher: launcher.into(),
+            runtime: runtime.into(),
+        }
+    }
+
+    pub(super) fn write(&self, bytes: &[u8]) {
+        std::fs::write(&self.archive, bytes)
+            .expect("write private authenticated-archive phase input");
+    }
+
+    pub(super) fn assert_previous(&self) {
+        assert_eq!(
+            std::fs::read_link(self.versions.join("current")).expect("prior selection"),
+            std::path::Path::new("1.0.0")
+        );
+        let previous = self.versions.join("1.0.0");
+        assert_eq!(
+            std::fs::read(previous.join(&self.launcher)).expect("prior launcher"),
+            b"previous reviewed runtime"
+        );
+        super::security::admit_installed(
+            &self.runtime,
+            &previous,
+            super::security::ReviewMode::CachedOnly,
+        )
+        .expect("prior admission survives failed publication")
+        .verify(&previous)
+        .expect("prior content remains bound");
+        for entry in std::fs::read_dir(&self.versions).expect("fixture versions") {
+            let entry = entry.expect("owned fixture entry");
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let Some(suffix) = name.strip_prefix(".install-") else {
+                continue;
+            };
+            assert!(
+                suffix.strip_suffix(".lock").is_some_and(|version| {
+                    crate::core::security::validate_runtime_version(version).is_ok()
+                }) && entry
+                    .file_type()
+                    .expect("owned fixture entry type")
+                    .is_file(),
+                "unexpected temporary publication path: {}",
+                entry.path().display()
+            );
+        }
+    }
+
+    pub(super) fn identity_path(&self, version: &str) -> std::path::PathBuf {
+        use sha2::{Digest as _, Sha256};
+        let root = self
+            .versions
+            .join(version)
+            .canonicalize()
+            .expect("published runtime root");
+        let key = hex::encode(Sha256::digest(
+            serde_json::to_vec(&root).expect("exact fixture destination"),
+        ));
+        self.versions
+            .join(".security")
+            .join(format!("{key}.identity.json"))
+    }
+
+    pub(super) fn corrupt_identity(&self, version: &str) {
+        std::fs::write(self.identity_path(version), b"invalid publisher identity")
+            .expect("controlled publisher corruption");
+    }
+}
+
+pub(super) fn mutation_security(versions: &std::path::Path) -> super::security::RuntimeSecurity {
+    struct Mutation(std::path::PathBuf);
+    impl super::security::RuntimeEvidenceSource for Mutation {
+        fn read(&self, query: &super::security::RuntimeQuery) -> Result<Vec<u8>> {
+            let stage = std::fs::read_dir(&self.0)
+                .expect("inspect controlled mutation source root")
+                .map(|entry| entry.expect("inspect only the controlled publication fixture"))
+                .find(|entry| {
+                    entry.file_name().to_string_lossy().starts_with(".install-")
+                        && entry.path().is_dir()
+                })
+                .expect("mutation source may target only its owned staging directory");
+            std::fs::write(
+                stage.path().join("changed-after-content-review"),
+                b"controlled concurrent change",
+            )
+            .expect("mutate only the controlled owned staging tree");
+            Ok(super::security::fixture_runtime_report(query)
+                .expect("encode controlled exact runtime evidence"))
+        }
+    }
+    super::security::RuntimeSecurity::with_source(std::sync::Arc::new(Mutation(
+        versions.to_path_buf(),
+    )))
+}
+
+#[test]
+fn publication_fixture_allows_install_lease_but_rejects_staging_leftovers() -> Result<()> {
+    let fixture = PublicationFixture::new("swift", "usr/bin/swift");
+    let lease = super::common::try_lock_runtime_install(&fixture.versions, "6.0.3")?;
+    drop(lease);
+    let lock = fixture.versions.join(".install-6.0.3.lock");
+    assert!(lock.is_file(), "released leases keep a stable lock path");
+    fixture.assert_previous();
+
+    let stage = super::common::begin_staged_install(&fixture.versions)?;
+    assert!(std::panic::catch_unwind(|| fixture.assert_previous()).is_err());
+    stage.close()?;
+
+    let linked_lock = fixture.versions.join(".install-6.0.4.lock");
+    std::os::unix::fs::symlink(&lock, &linked_lock)?;
+    assert!(std::panic::catch_unwind(|| fixture.assert_previous()).is_err());
+    std::fs::remove_file(linked_lock)?;
+    fixture.assert_previous();
+    Ok(())
+}
+
+#[test]
+fn publication_fixture_archives_reject_escaping_member_paths() {
+    for (root, member) in [("runtime", "../outside"), ("", "absolute")] {
+        assert!(tar_gz_entries(root, &[(member, b"controlled")]).is_err());
+        assert!(tar_xz_entries(root, &[(member, b"controlled")]).is_err());
+    }
+}

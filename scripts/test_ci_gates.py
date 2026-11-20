@@ -101,7 +101,10 @@ class NativePhaseMatrixTests(unittest.TestCase):
             with self.subTest(step=name):
                 self.assertIn(f"        if: {condition}\n", self.steps[name])
         clippy = self.steps["Platform clippy"]
-        self.assertIn("cargo clippy --all-targets --no-default-features --features ${{ matrix.features }} \\\n            --locked -- -D warnings", clippy)
+        self.assertIn("cargo clippy --all-targets --no-default-features --features ${{ matrix.features }} \\\n"
+                      '            "${cargo_source[@]}" --locked -- -D warnings', clippy)
+        self.assertIn("if [ '${{ matrix.platform }}' = debian ]; then\n", clippy)
+        self.assertIn('cargo_source=(--config "$RUNNER_TEMP/omg-alpm-source/cargo-config.toml")', clippy)
         for name, command in {
             "Run unit tests": "python3 scripts/run-native-contracts.py --features ${{ matrix.features }}",
             "Run serial library and binary contracts": "--locked --no-fail-fast -- --test-threads=1",

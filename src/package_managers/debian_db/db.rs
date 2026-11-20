@@ -2138,6 +2138,7 @@ fn parse_security_inventory(
             None
         };
         packages.push(crate::package_managers::types::SecurityPackage {
+            origin: crate::package_managers::types::SecurityOrigin::DistributionPackage,
             name,
             version,
             advisory_source,

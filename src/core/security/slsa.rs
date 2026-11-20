@@ -478,17 +478,15 @@ fn verify_x509_signature(
     match algorithm_oid {
         "1.2.840.113549.1.1.11" => {
             use rsa::pkcs8::DecodePublicKey as _;
-            use rsa::signature::DigestVerifier as _;
-            let Ok(key) = rsa::RsaPublicKey::from_public_key_der(issuer_spki_der) else {
+            use rsa::signature::Verifier as _;
+            let Ok(key) = rsa::PublicKey::from_public_key_der(issuer_spki_der) else {
                 return false;
             };
-            let verifying = rsa::pkcs1v15::VerifyingKey::<sha2::Sha256>::new(key);
+            let verifying = rsa::pkcs1v15::VerifyingKey::<rsa::sha2::Sha256>::new(key);
             let Ok(sig) = rsa::pkcs1v15::Signature::try_from(signature_bits) else {
                 return false;
             };
-            let mut hasher = sha2::Sha256::new();
-            sha2::Digest::update(&mut hasher, tbs);
-            verifying.verify_digest(hasher, &sig).is_ok()
+            verifying.verify(tbs, &sig).is_ok()
         }
         "1.2.840.10045.4.3.2" => {
             use p256::ecdsa::signature::hazmat::PrehashVerifier as _;
@@ -988,9 +986,9 @@ impl SlsaVerifier {
         // through a second hash would make every genuine entry fail.
         {
             use rsa::pkcs8::DecodePublicKey as _;
-            if let Ok(key) = rsa::RsaPublicKey::from_public_key_der(issuer_spki_der) {
+            if let Ok(key) = rsa::PublicKey::from_public_key_der(issuer_spki_der) {
                 use rsa::signature::hazmat::PrehashVerifier;
-                let verifying = rsa::pkcs1v15::VerifyingKey::<sha2::Sha256>::new(key);
+                let verifying = rsa::pkcs1v15::VerifyingKey::<rsa::sha2::Sha256>::new(key);
                 let Ok(sig) = rsa::pkcs1v15::Signature::try_from(signature) else {
                     return false;
                 };
@@ -1459,6 +1457,7 @@ mod tests {
     }
     #[test]
     fn rekor_entry_verification_roundtrips_rsa_and_p256() {
+        const RSA_SHA256: &str = "1.2.840.113549.1.1.11";
         use base64::Engine as _;
         let artifact_bytes = b"omg release artifact bytes (wave-12 fixture)".to_vec();
         let mut fixture_hasher = sha2::Sha256::new();
@@ -1481,9 +1480,9 @@ mod tests {
         };
 
         // --- RSA roundtrip ---
-        let mut rng = rsa::rand_core::OsRng;
-        let private = rsa::RsaPrivateKey::new(&mut rng, 2048).expect("rsa keygen");
-        let public = rsa::RsaPublicKey::from(&private);
+        use rsa::Generate as _;
+        let private = rsa::PrivateKey::generate();
+        let public = private.to_public_key();
         let pem = {
             use rsa::pkcs8::EncodePublicKey as _;
             public
@@ -1494,7 +1493,7 @@ mod tests {
             use rsa::pkcs8::EncodePublicKey as _;
             public.to_public_key_der().expect("rsa spki der")
         };
-        let signing = rsa::pkcs1v15::SigningKey::<sha2::Sha256>::new(private);
+        let signing = rsa::pkcs1v15::SigningKey::<rsa::sha2::Sha256>::new(private);
         use rsa::signature::SignatureEncoding as _;
         use rsa::signature::hazmat::PrehashSigner as _;
         // Rekor hashedrekord signatures cover the artifact bytes; the
@@ -1507,6 +1506,31 @@ mod tests {
         };
         let good_sig: rsa::pkcs1v15::Signature = signing.sign_prehash(&prehash).unwrap();
         let bad_sig: rsa::pkcs1v15::Signature = signing.sign_prehash(&[0u8; 32]).unwrap();
+
+        assert!(!verify_x509_signature(
+            b"invalid SPKI",
+            &artifact_bytes,
+            &good_sig.to_bytes(),
+            RSA_SHA256
+        ));
+        assert!(!verify_x509_signature(
+            rsa_spki_der.as_bytes(),
+            &artifact_bytes,
+            &[0; rsa::pkcs1v15::Signature::MAX_LEN + 1],
+            RSA_SHA256
+        ));
+        assert!(verify_x509_signature(
+            rsa_spki_der.as_bytes(),
+            &artifact_bytes,
+            &good_sig.to_bytes(),
+            RSA_SHA256
+        ));
+        assert!(!verify_x509_signature(
+            rsa_spki_der.as_bytes(),
+            &artifact_bytes,
+            &bad_sig.to_bytes(),
+            RSA_SHA256
+        ));
 
         for (sig, integrity_expected) in
             [(&good_sig.to_bytes(), true), (&bad_sig.to_bytes(), false)]

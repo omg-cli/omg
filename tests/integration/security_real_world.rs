@@ -5,10 +5,14 @@
 //! - Real OSV/ALSA vulnerability databases
 //! - Real Arch Linux package cache for PGP verification
 //!
-//! No mocks, no stubs - only production-ready integration tests.
+//! Live tests are ignored by default and require their matching backend.
 
 use omg_lib::core::security::slsa::SlsaVerifier;
 use omg_lib::core::security::vulnerability::VulnerabilityScanner;
+#[cfg(any(feature = "arch", feature = "debian", feature = "debian-pure"))]
+use omg_lib::core::security::vulnerability::{AssessmentUse, VulnerabilitySource};
+#[cfg(any(feature = "arch", feature = "debian", feature = "debian-pure"))]
+use omg_lib::package_managers::types::{SecurityOrigin, SecurityPackage};
 use std::time::Duration;
 
 #[cfg(feature = "arch")]
@@ -18,18 +22,38 @@ async fn arch_candidate_grading_uses_native_advisories() {
     let scanner = VulnerabilityScanner::new();
     // A historical installed candidate must still be detected after its
     // advisory is marked Fixed. This also exercises the policy scanner path.
-    let version = omg_lib::package_managers::types::parse_version("1.1.1.o-1").unwrap();
-    let findings = scanner.scan_package("openssl", &version).await.unwrap();
+    let candidate = SecurityPackage {
+        origin: SecurityOrigin::ArchRepository {
+            repository: "core".into(),
+        },
+        name: "openssl".into(),
+        version: "1.1.1.o-1".into(),
+        architecture: Some("x86_64".into()),
+        advisory_source: None,
+        description: String::new(),
+        licenses: vec![],
+    };
+    let assessments = scanner
+        .assess_packages(&[candidate], AssessmentUse::Review)
+        .await
+        .unwrap();
+    assert_eq!(assessments.len(), 1);
+    let findings = &assessments[0].findings;
     assert!(
         !findings.is_empty(),
         "Historical OpenSSL candidate lost advisory evidence"
     );
     assert!(findings.iter().all(|finding| finding.score.is_none()));
-    let grade = omg_lib::core::security::SecurityPolicy::default()
-        .assign_grade(&scanner, "openssl", &version, true)
-        .await
-        .unwrap();
-    assert_eq!(grade, omg_lib::core::security::SecurityGrade::Risk);
+    let error = omg_lib::core::security::SecurityPolicy::default()
+        .check_assessments(&assessments)
+        .expect_err("applicable historical findings must fail the default minimum");
+    assert!(matches!(
+        error,
+        omg_lib::core::security::policy::PolicyError::GradeTooLow {
+            grade: omg_lib::core::security::SecurityGrade::Risk,
+            ..
+        }
+    ));
 }
 
 /// Test SLSA verification against real Rekor transparency log
@@ -150,6 +174,10 @@ async fn test_vulnerability_scanner_alsa_real() {
 ///
 /// Queries the actual OSV (Open Source Vulnerabilities) database
 /// to verify our scanner can look up CVEs for real packages.
+#[cfg(all(
+    not(feature = "arch"),
+    any(feature = "debian", feature = "debian-pure")
+))]
 #[tokio::test]
 #[ignore = "Run with --ignored flag to test against real external services"]
 async fn test_vulnerability_scanner_osv_real() {
@@ -158,12 +186,20 @@ async fn test_vulnerability_scanner_osv_real() {
     // Test with a real package version
     // Using a deliberately old version that likely has known CVEs
     let package = "openssl";
-    let version = omg_lib::package_managers::types::parse_version("1.0.0")
-        .expect("The historical OpenSSL candidate must be a valid version");
+    let version = "1.0.0";
 
+    let subjects = [SecurityPackage {
+        origin: SecurityOrigin::DistributionPackage,
+        name: package.to_owned(),
+        version: version.into(),
+        architecture: None,
+        advisory_source: None,
+        description: String::new(),
+        licenses: vec![],
+    }];
     let result = tokio::time::timeout(
         Duration::from_secs(15),
-        scanner.scan_package(package, &version),
+        scanner.assess_packages(&subjects, AssessmentUse::Review),
     )
     .await;
 
@@ -176,7 +212,9 @@ async fn test_vulnerability_scanner_osv_real() {
     let vulns = result.unwrap();
     assert!(vulns.is_ok(), "Failed to query OSV: {:?}", vulns.err());
 
-    let vulns = vulns.unwrap();
+    let assessments = vulns.unwrap();
+    assert_eq!(assessments.len(), 1);
+    let vulns = &assessments[0].findings;
 
     // Transport success or an empty response is not detection evidence.
     assert!(
@@ -191,7 +229,7 @@ async fn test_vulnerability_scanner_osv_real() {
     );
 
     // Validate structure of returned vulnerabilities
-    for vuln in &vulns {
+    for vuln in vulns {
         // Should have an ID (CVE or similar)
         assert!(!vuln.id.is_empty(), "Vulnerability missing ID");
 

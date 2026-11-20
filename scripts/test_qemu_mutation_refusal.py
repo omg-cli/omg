@@ -21,6 +21,8 @@ class MutationRefusalTests(unittest.TestCase):
             for source in (ROOT / 'scripts').iterdir():
                 if source.is_file() and source.suffix in ('.py', '.sh'):
                     shutil.copyfile(source, scripts / source.name)
+            shutil.copyfile(ROOT / 'tests/runtime_advisory_fixture.py',
+                            scripts / 'runtime_advisory_fixture.py')
             if fault == 'gate-enabled':
                 runner = scripts / 'qemu-inventory.sh'
                 text = runner.read_text()

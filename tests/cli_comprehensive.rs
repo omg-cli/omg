@@ -2167,6 +2167,10 @@ fn prepare_owned_contract(project: &TestProject, raw: &str, environment: &[(&str
         ".qemu-local-oracle.py",
         include_str!("../scripts/qemu-local-oracle.py"),
     );
+    project.create_file(
+        "runtime_advisory_fixture.py",
+        include_str!("runtime_advisory_fixture.py"),
+    );
     if let Some(case) = raw.strip_prefix("local:") {
         if case == "init" {
             project
@@ -2581,6 +2585,18 @@ fn behavior_inventory_runs_in_hermetic_state() {
                 std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o700))
                     .expect("make task-runner stub executable");
             }
+            project.create_file(".node-version", "24.0.0\n");
+            let managed_bin = project.data_dir.path().join("versions/node/24.0.0/bin");
+            std::fs::create_dir_all(&managed_bin).expect("create managed task runtime fixture");
+            for executable in ["node", "npm"] {
+                std::fs::copy(
+                    project.path().join("bin").join(executable),
+                    managed_bin.join(executable),
+                )
+                .expect("copy owned task runtime executable");
+            }
+            common::seed_runtime_advisory_fixture(project, "node", "24.0.0")
+                .expect("seed reviewed managed task runtime");
         }
         let privacy_case = matches!(
             case.id.as_str(),
@@ -2880,11 +2896,30 @@ fn behavior_inventory_runs_in_hermetic_state() {
         if expected_exit != 0 && result.stderr.trim().is_empty() {
             issues.push("failure did not explain itself on stderr".to_string());
         }
+        if case.id == "new" {
+            let scaffold = project.path().join("smoke-app");
+            let cargo = std::fs::read_to_string(scaffold.join("Cargo.toml"))
+                .ok()
+                .and_then(|manifest| toml::from_str::<toml::Value>(&manifest).ok());
+            if !cargo.is_some_and(|manifest| {
+                manifest
+                    .get("package")
+                    .and_then(|package| package.get("name"))
+                    .and_then(toml::Value::as_str)
+                    == Some("smoke-app")
+            }) || !scaffold.join("src/main.rs").is_file()
+                || !scaffold.join(".git").is_dir()
+            {
+                issues.push("new did not write the Rust starter and Git repository".to_string());
+            }
+        }
         let audit_success = match case.id.as_str() {
             "audit" | "audit-scan" | "audit-scan-fail-on-findings-offline" => {
-                Some("No vulnerabilities found in scanned packages.")
+                Some("No vulnerabilities found in assessed packages.")
             }
-            "audit-fix" | "audit-fix-flags" => Some("No vulnerabilities found!"),
+            "audit-fix" | "audit-fix-flags" => {
+                Some("No vulnerabilities found in assessed packages!")
+            }
             _ => None,
         };
         if let Some(expected) = audit_success
@@ -4212,6 +4247,31 @@ mod project_tests {
             result.success || output.to_lowercase().contains("no tools"),
             "Tool list should succeed or explain that no tools are installed: {output}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn removing_a_managed_tool_preserves_unrelated_dangling_links() {
+        use std::os::unix::fs::symlink;
+
+        let project = TestProject::new();
+        let data = project.data_dir.path();
+        let bin = data.join("bin");
+        let tool = data.join("tools/cargo/omg-removal-fixture");
+        let installed = tool.join("bin/managed");
+        std::fs::create_dir_all(installed.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(&installed, b"managed tool fixture").unwrap();
+        symlink(&installed, bin.join("managed")).unwrap();
+        let unrelated = data.join("tools/cargo/omg-removal-fixture-other/bin/foreign");
+        symlink(&unrelated, bin.join("foreign")).unwrap();
+
+        let result = project.run(&["tool", "remove", "omg-removal-fixture"]);
+        result.assert_success();
+        assert!(!tool.exists());
+        assert!(std::fs::symlink_metadata(bin.join("managed")).is_err());
+        assert_eq!(std::fs::read_link(bin.join("foreign")).unwrap(), unrelated);
+        project.close_checked();
     }
 }
 

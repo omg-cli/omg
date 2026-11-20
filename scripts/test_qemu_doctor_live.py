@@ -168,6 +168,8 @@ exit 1
                     if source.is_file() and source.suffix in ('.py', '.sh'):
                         shutil.copyfile(source, controller / 'scripts' / source.name)
                 shutil.copyfile(ROOT / 'tests/man_page_inventory.txt', controller / 'tests/man_page_inventory.txt')
+                shutil.copyfile(ROOT / 'tests/runtime_advisory_fixture.py',
+                                controller / 'tests/runtime_advisory_fixture.py')
                 if altered_controller:
                     helper = controller / 'scripts/qemu-doctor-live-oracle.py'
                     text = helper.read_text(encoding='utf-8')

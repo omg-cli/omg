@@ -38,6 +38,7 @@ pub(crate) struct PythonVersion {
 }
 
 pub(crate) struct PythonManager {
+    security: super::security::RuntimeSecurity,
     versions_dir: PathBuf,
     client: &'static reqwest::Client,
 }
@@ -45,6 +46,7 @@ pub(crate) struct PythonManager {
 impl PythonManager {
     pub fn new() -> Self {
         Self {
+            security: super::security::RuntimeSecurity::default(),
             versions_dir: super::DATA_DIR.join("versions/python"),
             client: download_client(),
         }
@@ -285,13 +287,23 @@ impl PythonManager {
         .await?;
 
         println!("{} Extracting (pure Rust)...", style::informative("→"));
-        let staging = begin_staged_install(&self.versions_dir)?;
-        extract_tar_gz(&download_path, staging.path(), 1).await?;
-        self.publish_install(&staging, &version)?;
+        self.publish_download(&download_path, &download.url, &version)
+            .await?;
 
         print_installed("Python", &version);
         self.use_version(&version)?;
 
+        Ok(())
+    }
+
+    async fn publish_download(&self, download_path: &Path, url: &str, version: &str) -> Result<()> {
+        let version_dir = self.versions_dir.join(version);
+        let publisher =
+            super::security::record_download("python", version, &version_dir, download_path, url)?;
+        let staging = begin_staged_install(&self.versions_dir)?;
+        extract_tar_gz(download_path, staging.path(), 1).await?;
+        self.publish_install(&staging, version)?;
+        publisher.commit();
         Ok(())
     }
 
@@ -349,6 +361,12 @@ impl PythonManager {
 
     fn publish_install(&self, staging: &tempfile::TempDir, version: &str) -> Result<()> {
         super::common::require_internal_runtime_binary(staging.path(), Path::new("bin/python3"))?;
+        let _admission = self.security.prepare_staged(
+            "python",
+            version,
+            staging.path(),
+            &self.versions_dir.join(version),
+        )?;
         complete_staged_install(staging, &self.versions_dir.join(version), version)
     }
 
@@ -386,6 +404,17 @@ impl PythonManager {
     /// Switch to a specific version
     pub fn use_version(&self, version: &str) -> Result<()> {
         let version = normalize_version(version);
+        crate::core::security::validate_runtime_version(&version)?;
+        super::common::require_internal_runtime_binary(
+            &self.versions_dir.join(&version),
+            Path::new("bin/python3"),
+        )?;
+        let admission = self.security.installed(
+            "python",
+            &self.versions_dir.join(&version),
+            super::security::ReviewMode::FreshAttended,
+        )?;
+        admission.verify(&self.versions_dir.join(&version))?;
         activate_version_with_linked_binary(
             &self.versions_dir,
             &version,
@@ -419,6 +448,76 @@ fn python_target() -> Result<String> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires the isolated fixed-public TLS native fixture"]
+    async fn native_public_install_preserves_authenticated_download_boundary() {
+        use super::super::test_archive::{PublicationFixture, tar_gz_entries};
+        use sha2::{Digest as _, Sha256};
+
+        let version = "3.12.0";
+        let archive = tar_gz_entries(
+            "python",
+            &[
+                ("bin/python3", b"fixture launcher"),
+                ("lib/owned.data", b"complete Python implementation"),
+            ],
+        )
+        .unwrap();
+        let target = python_target().unwrap();
+        let filename =
+            format!("cpython-{version}%2B20260901-{target}-install_only_stripped.tar.gz");
+        let path =
+            format!("/astral-sh/python-build-standalone/releases/download/20260901/{filename}");
+        let key = format!("cpython-{version}-linux-{}-gnu", std::env::consts::ARCH);
+        let metadata = serde_json::to_vec(&serde_json::json!({key: {
+            "name":"cpython", "arch":{"family":std::env::consts::ARCH,"variant":null},
+            "os":"linux", "libc":"gnu", "major":3,"minor":12,"patch":0,
+            "prerelease":"", "variant":null, "build":"20260901",
+            "url":format!("https://github.com{path}"), "sha256":hex::encode(Sha256::digest(&archive))
+        }})).unwrap();
+        super::super::test_https::fixed_public_routes(&[
+            (
+                "raw.githubusercontent.com",
+                "/astral-sh/uv/main/crates/uv-python-managed/download-metadata.json",
+                &metadata,
+            ),
+            ("github.com", &path, &archive),
+        ]);
+
+        let fixture = PublicationFixture::new("python", "bin/python3");
+        let manager = PythonManager {
+            security: super::super::security::RuntimeSecurity::fixture(),
+            versions_dir: fixture.versions.clone(),
+            client: download_client(),
+        };
+        manager
+            .install(version)
+            .await
+            .expect("complete authenticated public installation");
+        let installed = fixture.versions.join(version);
+        assert_eq!(
+            fs::read(fixture.versions.join("current").join("bin/python3")).unwrap(),
+            b"fixture launcher"
+        );
+        assert_eq!(
+            fs::read(installed.join("lib/owned.data")).unwrap(),
+            b"complete Python implementation"
+        );
+        assert_eq!(
+            fs::read(fixture.versions.join("1.0.0/bin/python3")).unwrap(),
+            b"previous reviewed runtime"
+        );
+        super::super::security::admit_installed(
+            "python",
+            &installed,
+            super::super::security::ReviewMode::CachedOnly,
+        )
+        .expect("retain exact authenticated publisher authority")
+        .verify(&installed)
+        .expect("complete published tree matches its admission");
+    }
+
     use super::*;
 
     #[tokio::test]
@@ -985,6 +1084,7 @@ mod tests {
     fn python_publication_rejects_missing_and_external_launchers() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let manager = PythonManager {
+            security: crate::runtimes::security::RuntimeSecurity::fixture(),
             versions_dir: directory.path().to_path_buf(),
             client: download_client(),
         };
@@ -1004,7 +1104,21 @@ mod tests {
         fs::remove_file(&launcher)?;
         fs::write(staging.path().join("bin/python3.12"), "fixture")?;
         std::os::unix::fs::symlink("python3.12", &launcher)?;
+        crate::runtimes::security::fixture_bind_candidate(
+            "python",
+            "3.12.0",
+            staging.path(),
+            &manager.versions_dir.join("3.12.0"),
+        )
+        .expect("seed controlled publisher authority");
         manager.publish_install(&staging, "3.12.0")?;
+        crate::runtimes::security::fixture_bind_candidate(
+            "python",
+            "3.12.0",
+            &manager.versions_dir.join("3.12.0"),
+            &manager.versions_dir.join("3.12.0"),
+        )
+        .expect("seed controlled publisher authority");
         manager.use_version("3.12.0")?;
         assert_eq!(manager.list_installed()?, vec!["3.12.0"]);
         Ok(())
@@ -1020,10 +1134,18 @@ mod tests {
         std::os::unix::fs::symlink("python3.12", version_dir.join("bin/python3"))
             .expect("vendor launcher link");
         let manager = PythonManager {
+            security: crate::runtimes::security::RuntimeSecurity::fixture(),
             versions_dir: temp.path().to_path_buf(),
             client: download_client(),
         };
 
+        crate::runtimes::security::fixture_bind_candidate(
+            "python",
+            "3.12.0",
+            &version_dir,
+            &version_dir,
+        )
+        .unwrap();
         manager
             .use_version("3.12.0")
             .expect("vendor layout must activate");
@@ -1072,5 +1194,96 @@ mod tests {
                 &target,
             ));
         }
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn downloaded_publication_preserves_prior_authority_and_rejects_changed_reviewed_content()
+    {
+        use super::super::test_archive::{Launcher, tar_gz};
+        use super::super::test_archive::{PublicationFixture, mutation_security};
+        let fixture = PublicationFixture::new("python", "bin/python3");
+        let mut manager = PythonManager {
+            security: super::super::security::RuntimeSecurity::fixture(),
+            versions_dir: fixture.versions.clone(),
+            client: download_client(),
+        };
+        let url = "https://github.com/astral-sh/python-build-standalone/releases/download/fixture/python.tar.gz";
+        assert!(
+            manager
+                .publish_download(&fixture.archive, url, "3.12.0")
+                .await
+                .is_err()
+        );
+        fixture.assert_previous();
+        fixture.write(b"not an archive");
+        assert!(
+            manager
+                .publish_download(&fixture.archive, url, "3.12.0")
+                .await
+                .is_err()
+        );
+        fixture.assert_previous();
+        let bytes = tar_gz("runtime", "bin/python3", Launcher::Regular)
+            .expect("controlled publisher archive");
+        fixture.write(&bytes);
+        manager.security = mutation_security(&fixture.versions);
+        let error = manager
+            .publish_download(&fixture.archive, url, "3.12.0")
+            .await
+            .expect_err("changed reviewed payload must not publish");
+        assert!(
+            format!("{error:#}").contains("Runtime content changed after advisory review"),
+            "{error:#}"
+        );
+        assert!(!fixture.versions.join("3.12.0").exists());
+        fixture.assert_previous();
+        manager.security = super::super::security::RuntimeSecurity::fixture();
+        manager
+            .publish_download(&fixture.archive, url, "3.12.0")
+            .await
+            .expect("publish complete reviewed publisher tree");
+        fixture.assert_previous();
+        manager
+            .use_version("3.12.0")
+            .expect("activate admitted publisher tree");
+        assert_eq!(
+            fs::read(fixture.versions.join("current/bin/python3"))
+                .expect("selected reviewed launcher"),
+            b"fixture launcher"
+        );
+        fs::remove_file(fixture.versions.join("current"))
+            .expect("restore controlled prior selection");
+        std::os::unix::fs::symlink("1.0.0", fixture.versions.join("current"))
+            .expect("restore prior selection");
+        let launcher = fixture.versions.join("3.12.0/bin/python3");
+        let original = fs::read(&launcher).expect("published controlled launcher");
+        let permissions = fs::metadata(&launcher)
+            .expect("published controlled launcher mode")
+            .permissions();
+        fs::remove_file(&launcher).expect("remove only the candidate launcher");
+        let error = manager
+            .use_version("3.12.0")
+            .expect_err("a missing candidate launcher must fail before advisory review");
+        assert!(format!("{error:#}").contains("Failed to inspect runtime binary"));
+        fixture.assert_previous();
+        let outside = fixture.versions.join("outside-python");
+        fs::write(&outside, b"outside controlled runtime bytes")
+            .expect("outside candidate payload");
+        std::os::unix::fs::symlink(&outside, &launcher).expect("escaping candidate alias");
+        let error = manager
+            .use_version("3.12.0")
+            .expect_err("an escaping candidate launcher must not replace the active runtime");
+        assert!(format!("{error:#}").contains("Runtime binary symlink escapes version directory"));
+        fixture.assert_previous();
+        assert_eq!(
+            fs::read(&outside).unwrap(),
+            b"outside controlled runtime bytes"
+        );
+        fs::remove_file(&launcher).expect("remove only the escaping candidate alias");
+        fs::write(&launcher, original).expect("restore the controlled launcher");
+        fs::set_permissions(&launcher, permissions).expect("restore its exact published mode");
+        fixture.corrupt_identity("3.12.0");
+        assert!(manager.use_version("3.12.0").is_err());
+        fixture.assert_previous();
     }
 }

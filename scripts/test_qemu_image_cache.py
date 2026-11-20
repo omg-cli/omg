@@ -206,6 +206,24 @@ class ImageCacheBudgetTests(unittest.TestCase):
                     self.publish(source, destination, digest, 0)
             self.assertFalse(destination.exists())
 
+    def test_writer_counts_files_published_while_waiting_for_lock(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, destination, digest = self.image(root, b'1234')
+            previous = destination.parent / 'previous-writer.qcow2'
+            real_flock = cache.fcntl.flock
+
+            def finish_previous_writer(lock_fd, operation):
+                previous.write_bytes(b'5678')
+                real_flock(lock_fd, operation)
+
+            with mock.patch.object(cache.fcntl, 'flock', side_effect=finish_previous_writer):
+                with self.assertRaises(cache.CacheQuotaExceeded):
+                    self.publish(source, destination, digest, 4)
+            self.assertEqual(previous.read_bytes(), b'5678')
+            self.assertFalse(destination.exists())
+            self.assertFalse(list(destination.parent.glob('.image-cache-tmp-*')))
+
     def test_writer_waits_for_existing_local_lock_before_creating_copy(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

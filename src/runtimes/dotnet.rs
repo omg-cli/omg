@@ -9,6 +9,7 @@
 //! - Flat SDK layout with a root `dotnet` binary (Bun-style activation)
 
 use anyhow::{Context, Result};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -34,6 +35,7 @@ pub(crate) struct DotnetVersion {
 }
 
 pub(crate) struct DotnetManager {
+    security: super::security::RuntimeSecurity,
     versions_dir: PathBuf,
     client: &'static reqwest::Client,
 }
@@ -41,6 +43,7 @@ pub(crate) struct DotnetManager {
 impl DotnetManager {
     pub fn new() -> Self {
         Self {
+            security: super::security::RuntimeSecurity::default(),
             versions_dir: super::DATA_DIR.join("versions/dotnet"),
             client: download_client(),
         }
@@ -145,7 +148,7 @@ impl DotnetManager {
             style::caution(&version)
         );
 
-        let (url, checksum) = self.sdk_artifact(&version).await?;
+        let (url, checksum, components) = self.sdk_artifact(&version).await?;
         let filename = url
             .rsplit('/')
             .next()
@@ -163,13 +166,25 @@ impl DotnetManager {
         download_with_progress_sha512(self.client, &url, &download_path, &checksum).await?;
 
         println!("{} Extracting (pure Rust)...", style::informative("→"));
+        let publisher = super::security::record_download(
+            "dotnet",
+            &version,
+            &version_dir,
+            &download_path,
+            &url,
+        )?;
+        super::security::record_exact_release(&version_dir, &version, &version, components)?;
         let staging = begin_staged_install(&self.versions_dir)?;
         // SDK tarballs extract flat (no top-level directory).
         extract_tar_gz(&download_path, staging.path(), 0).await?;
         let binary = staging.path().join("dotnet");
         require_staged_dotnet(&binary)?;
         make_staged_executable(&binary)?;
+        let _admission =
+            self.security
+                .prepare_staged("dotnet", &version, staging.path(), &version_dir)?;
         complete_staged_install(&staging, &version_dir, &version)?;
+        publisher.commit();
 
         remove_file_best_effort(&download_path, "runtime archive");
 
@@ -180,7 +195,10 @@ impl DotnetManager {
     }
 
     /// Locate the SDK tarball URL and validated SHA-512 for one version.
-    async fn sdk_artifact(&self, version: &str) -> Result<(String, String)> {
+    async fn sdk_artifact(
+        &self,
+        version: &str,
+    ) -> Result<(String, String, BTreeMap<String, String>)> {
         let index = self.fetch_metadata(DOTNET_RELEASE_INDEX_URL).await?;
         let channels = index
             .get("releases-index")
@@ -202,7 +220,7 @@ impl DotnetManager {
                 continue;
             };
             let releases = self.fetch_metadata(channel_url).await?;
-            let Some(matching) = channel_sdks(&releases).find(|sdk| {
+            let Some((release, matching)) = channel_sdks(&releases).find(|(_, sdk)| {
                 sdk.get("version").and_then(serde_json::Value::as_str) == Some(version)
             }) else {
                 continue;
@@ -213,7 +231,21 @@ impl DotnetManager {
                 .cloned()
                 .unwrap_or_default();
             if let Some((url, checksum)) = select_sdk_file(&files, dotnet_rid()?) {
-                return Ok((url, checksum));
+                let mut components = BTreeMap::from([("sdk".to_owned(), version.to_owned())]);
+                for (key, component) in [
+                    ("runtime", "runtime"),
+                    ("aspnetcore", "aspnetcore-runtime"),
+                    ("windowsdesktop", "windowsdesktop"),
+                ] {
+                    if let Some(value) = release
+                        .get(key)
+                        .and_then(|value| value.get("version"))
+                        .and_then(serde_json::Value::as_str)
+                    {
+                        components.insert(component.to_owned(), value.to_owned());
+                    }
+                }
+                return Ok((url, checksum, components));
             }
         }
         anyhow::bail!(
@@ -224,6 +256,14 @@ impl DotnetManager {
     /// Switch to a specific version
     pub fn use_version(&self, version: &str) -> Result<()> {
         let version = normalize_version(version);
+        crate::core::security::validate_runtime_version(&version)?;
+        super::common::require_regular_file(&self.versions_dir.join(&version).join("dotnet"))?;
+        let admission = self.security.installed(
+            "dotnet",
+            &self.versions_dir.join(&version),
+            super::security::ReviewMode::FreshAttended,
+        )?;
+        admission.verify(&self.versions_dir.join(&version))?;
         activate_version(&self.versions_dir, &version, Path::new("dotnet"))?;
         print_using(".NET", &version, &self.versions_dir.join("current"));
         Ok(())
@@ -250,27 +290,33 @@ fn dotnet_rid() -> Result<&'static str> {
     }
 }
 
-fn channel_sdks(channel: &serde_json::Value) -> impl Iterator<Item = &serde_json::Value> {
+fn channel_sdks(
+    channel: &serde_json::Value,
+) -> impl Iterator<Item = (&serde_json::Value, &serde_json::Value)> {
     channel
         .get("releases")
         .and_then(serde_json::Value::as_array)
         .into_iter()
         .flatten()
         .flat_map(|release| {
-            release.get("sdk").into_iter().chain(
-                release
-                    .get("sdks")
-                    .and_then(serde_json::Value::as_array)
-                    .into_iter()
-                    .flatten(),
-            )
+            release
+                .get("sdk")
+                .into_iter()
+                .chain(
+                    release
+                        .get("sdks")
+                        .and_then(serde_json::Value::as_array)
+                        .into_iter()
+                        .flatten(),
+                )
+                .map(move |sdk| (release, sdk))
         })
 }
 
 /// Collect every SDK feature band from one channel document.
 fn parse_channel_sdks(channel: &serde_json::Value, prerelease: bool) -> Vec<DotnetVersion> {
     let mut versions: Vec<_> = channel_sdks(channel)
-        .filter_map(|sdk| {
+        .filter_map(|(_, sdk)| {
             sdk.get("version")
                 .and_then(serde_json::Value::as_str)
                 .filter(|version| !version.is_empty())
@@ -339,6 +385,172 @@ fn make_staged_executable(_path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires the isolated fixed-public TLS native fixture"]
+    async fn native_public_install_preserves_authenticated_download_boundary() -> Result<()> {
+        use super::super::security::{
+            ReviewMode, RuntimeEvidenceSource, RuntimeQuery, RuntimeSecurity, admit_installed,
+            fixture_runtime_report,
+        };
+        use super::super::test_archive::{PublicationFixture, tar_gz_entries};
+        use sha2::{Digest as _, Sha512};
+
+        const HOST: &str = "builds.dotnet.microsoft.com";
+        const INDEX: &str = "/dotnet/release-metadata/releases-index.json";
+        const CHANNEL: &str = "/dotnet/release-metadata/9.0/releases.json";
+        const AFFECTED_SDK: &str = "9.0.315";
+        const CVE: &str = "CVE-2099-9000";
+        const ADVISORY: &str = "https://www.cve.org/CVERecord?id=CVE-2099-9000";
+        struct Advisories;
+        impl RuntimeEvidenceSource for Advisories {
+            fn read(&self, query: &RuntimeQuery) -> Result<Vec<u8>> {
+                let mut report: serde_json::Value =
+                    serde_json::from_slice(&fixture_runtime_report(query)?)?;
+                if query.version == AFFECTED_SDK {
+                    report["findings"] = json!([{
+                        "id": CVE, "summary": "Controlled .NET advisory",
+                        "applicability": "applicable", "severity": "high", "urls": [ADVISORY]
+                    }]);
+                }
+                Ok(serde_json::to_vec(&report)?)
+            }
+        }
+        let entries: &[(&str, &[u8])] = &[
+            ("dotnet", b"fixture .NET launcher"),
+            ("sdk/payload", b"fixture SDK"),
+        ];
+        let archive = tar_gz_entries(".", entries)?;
+        let artifact_path = |version| format!("/dotnet/Sdk/{version}/dotnet-sdk.tar.gz");
+        let rid = dotnet_rid()?;
+        let sdk = |version, digest| {
+            json!({
+                "version": version,
+                "files": [{
+                    "name": format!("dotnet-sdk-{rid}.tar.gz"),
+                    "rid": rid,
+                    "url": format!("https://{HOST}{}", artifact_path(version)),
+                    "hash": digest,
+                }]
+            })
+        };
+        let index = serde_json::to_vec(&json!({
+            "releases-index": [{
+                "support-phase": "active",
+                "releases.json": format!("https://{HOST}{CHANNEL}"),
+            }]
+        }))?;
+        let installed_sdk = "9.0.317";
+        let rejected_sdk = "9.0.316";
+        let channel = serde_json::to_vec(&json!({
+            "channel-version": "9.0",
+            "releases": [
+                {
+                    "sdk": {"version": "9.0.318"},
+                    "sdks": [sdk(installed_sdk, hex::encode(Sha512::digest(&archive)))],
+                    "runtime": {"version": "9.0.19"},
+                    "aspnetcore": {"version": "9.0.18"},
+                },
+                {
+                    "sdk": sdk(rejected_sdk, hex::encode(Sha512::digest(b"different bytes"))),
+                    "runtime": {"version": "9.0.17"},
+                },
+                {
+                    "sdk": sdk(AFFECTED_SDK, hex::encode(Sha512::digest(&archive))),
+                    "runtime": {"version": "9.0.16"},
+                },
+            ]
+        }))?;
+        super::super::test_https::fixed_public_routes(&[
+            (HOST, INDEX, &index),
+            (HOST, CHANNEL, &channel),
+            (HOST, &artifact_path(installed_sdk), &archive),
+            (HOST, INDEX, &index),
+            (HOST, CHANNEL, &channel),
+            (HOST, &artifact_path(rejected_sdk), &archive),
+            (HOST, INDEX, &index),
+            (HOST, CHANNEL, &channel),
+            (HOST, &artifact_path(AFFECTED_SDK), &archive),
+            (HOST, INDEX, &index),
+            (HOST, CHANNEL, &channel),
+            (HOST, &artifact_path(AFFECTED_SDK), &archive),
+        ]);
+
+        let fixture = PublicationFixture::new("dotnet", "dotnet");
+        let manager = DotnetManager {
+            security: RuntimeSecurity::with_source(std::sync::Arc::new(Advisories)),
+            versions_dir: fixture.versions.clone(),
+            client: download_client(),
+        };
+        manager.install(installed_sdk).await?;
+        let installed = fixture.versions.join(installed_sdk);
+        assert_eq!(
+            fs::read(fixture.versions.join("current/dotnet"))?,
+            b"fixture .NET launcher"
+        );
+        assert_eq!(fs::read(installed.join("sdk/payload"))?, b"fixture SDK");
+
+        let error = manager
+            .install(rejected_sdk)
+            .await
+            .expect_err("a checksum mismatch must refuse publication");
+        assert!(
+            format!("{error:#}").contains("Checksum mismatch"),
+            "{error:#}"
+        );
+        assert!(!fixture.versions.join(rejected_sdk).exists());
+        let publisher_state = || -> std::io::Result<BTreeMap<_, _>> {
+            fs::read_dir(fixture.versions.join(".security"))?
+                .map(|entry| {
+                    let entry = entry?;
+                    Ok((entry.file_name(), fs::read(entry.path())?))
+                })
+                .collect()
+        };
+        let previous_state = publisher_state()?;
+        let lease_name = format!(".admission-{AFFECTED_SDK}.lock");
+        let lease = super::super::common::try_lock_runtime_file(&fixture.versions, &lease_name)?;
+        let error = manager
+            .install(AFFECTED_SDK)
+            .await
+            .expect_err("a competing publication must refuse the authenticated download");
+        assert!(
+            format!("{error:#}").contains("Another runtime mutation or active use conflicts"),
+            "{error:#}"
+        );
+        assert!(!fixture.versions.join(AFFECTED_SDK).exists());
+        assert_eq!(publisher_state()?, previous_state);
+        assert_eq!(fs::read_link(fixture.versions.join("current"))?, installed);
+        drop(lease);
+        let error = manager
+            .install(AFFECTED_SDK)
+            .await
+            .expect_err("unattended install must refuse the reported CVE");
+        let warning = format!("{error:#}");
+        assert!(
+            warning.contains(CVE) && warning.contains(ADVISORY),
+            "{warning}"
+        );
+        assert!(
+            warning.contains("requires an attended controlling terminal"),
+            "{warning}"
+        );
+        assert!(!fixture.versions.join(AFFECTED_SDK).exists());
+        assert_eq!(publisher_state()?, previous_state);
+        assert_eq!(fs::read_link(fixture.versions.join("current"))?, installed);
+        let admission = admit_installed("dotnet", &installed, ReviewMode::CachedOnly)?;
+        admission.verify(&installed)?;
+        let identity: serde_json::Value =
+            serde_json::from_slice(&fs::read(fixture.identity_path(installed_sdk))?)?;
+        assert_eq!(
+            identity["components"],
+            json!({
+                "sdk": installed_sdk, "runtime": "9.0.19", "aspnetcore-runtime": "9.0.18"
+            })
+        );
+        Ok(())
+    }
 
     #[tokio::test]
     async fn release_metadata_refuses_private_target_before_connecting() {
@@ -433,7 +645,8 @@ mod tests {
     fn secondary_sdk_feature_bands_are_listed_and_resolvable() {
         let channel = serde_json::json!({"releases":[{
             "sdk":{"version":"9.0.317"},
-            "sdks":[{"version":"9.0.317"},{"version":"9.0.120","files":[]}]
+            "sdks":[{"version":"9.0.317"},{"version":"9.0.120","files":[]}],
+            "runtime":{"version":"9.0.19"}
         }]});
         let versions = parse_channel_sdks(&channel, false);
         assert_eq!(
@@ -443,7 +656,10 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["9.0.317", "9.0.120"]
         );
-        assert!(channel_sdks(&channel).any(|sdk| sdk["version"] == "9.0.120"));
+        let (release, _) = channel_sdks(&channel)
+            .find(|(_, sdk)| sdk["version"] == "9.0.120")
+            .expect("secondary feature band retains its enclosing release");
+        assert_eq!(release["runtime"]["version"], "9.0.19");
     }
 
     #[test]
@@ -455,6 +671,41 @@ mod tests {
             "hash": "not-a-hash",
         })];
         assert!(select_sdk_file(&files, "linux-x64").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn invalid_installed_publisher_receipt_preserves_selected_sdk() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let versions_dir = fixture.path().join("dotnet");
+        let previous = versions_dir.join("9.0.316");
+        let candidate = versions_dir.join("9.0.317");
+        fs::create_dir_all(&previous)?;
+        fs::create_dir_all(&candidate)?;
+        fs::write(previous.join("dotnet"), b"previous SDK fixture")?;
+        fs::write(candidate.join("dotnet"), b"candidate SDK fixture")?;
+        let current = versions_dir.join("current");
+        std::os::unix::fs::symlink(&previous, &current)?;
+
+        crate::runtimes::security::fixture_install_identity("dotnet", &candidate)?;
+        let mut receipts = fs::read_dir(versions_dir.join(".security"))?;
+        let receipt = receipts.next().context("candidate publisher receipt")??;
+        let receipt_name = receipt.file_name();
+        assert!(receipt_name.to_string_lossy().ends_with(".identity.json"));
+        assert!(receipts.next().is_none());
+        fs::write(receipt.path(), b"{}")?;
+
+        let manager = DotnetManager {
+            versions_dir,
+            security: crate::runtimes::security::RuntimeSecurity::fixture(),
+            client: download_client(),
+        };
+        let error = manager
+            .use_version("9.0.317")
+            .expect_err("invalid publisher receipt must refuse activation");
+        assert!(format!("{error:#}").contains("Invalid runtime publisher identity"));
+        assert_eq!(fs::read_link(current)?, previous);
+        Ok(())
     }
 
     #[test]

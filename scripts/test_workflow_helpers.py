@@ -480,11 +480,12 @@ class HelperAdmissionTests(unittest.TestCase):
 
     def test_metadata_retry_reuses_native_transport_and_does_not_retry_rate_limits(self):
         api = self.module.GitHub(time.monotonic() + 20)
-        def request(arguments, *, stdout, check, timeout):
+        def request(arguments, *, stdout, stderr, check, timeout):
             calls.append(timeout)
             status = responses.pop(0)
             stdout.write(f'HTTP/2.0 {status} response\ncontent-type: application/json\n\n{{"ok":true}}'.encode())
             if status != 200:
+                stderr.write(f'fixture HTTP {status}\n'.encode())
                 raise subprocess.CalledProcessError(1, arguments)
         calls, responses = [], [502, 200]
         with patch.object(self.module.subprocess, 'run', side_effect=request), patch.object(self.module.time, 'sleep'):
@@ -493,9 +494,10 @@ class HelperAdmissionTests(unittest.TestCase):
         self.assertTrue(all(0 < timeout <= 20 for timeout in calls))
         calls, responses = [], [429]
         with patch.object(self.module.subprocess, 'run', side_effect=request):
-            with self.assertRaises(subprocess.CalledProcessError):
+            with self.assertRaises(subprocess.CalledProcessError) as rejected:
                 api.request('fixture')
         self.assertEqual(len(calls), 1)
+        self.assertEqual(rejected.exception.stderr, b'fixture HTTP 429\n')
 
     def test_current_pr_run_binds_api_head_and_actual_merge_source_separately(self):
         event = self.root / 'event.json'

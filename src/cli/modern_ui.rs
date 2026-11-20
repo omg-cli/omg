@@ -129,15 +129,14 @@ pub(crate) fn register_spinner(bar: ProgressBar) -> ProgressBar {
 
 /// Print `line`, or buffer it while a terminal quiesce is active.
 ///
-/// In interactive mode the line goes through the shared `MultiProgress`,
-/// which suspends live spinners for the write; raw `println!` would splice
-/// mid-frame and read as spinner spam under parallel builds.
+/// Visible interactive progress suspends live spinners for the write;
+/// hidden draw targets use plain output so messages remain visible.
 pub(crate) fn emit_or_defer(line: String) {
     if quiesce_active() {
         lock_deferred_lines().push(line);
         return;
     }
-    if output_mode() == OutputMode::Interactive {
+    if output_mode() == OutputMode::Interactive && !progress_registry().is_hidden() {
         let _ = progress_registry().println(&line);
     } else {
         println!("{line}");
@@ -845,6 +844,96 @@ pub(crate) mod tests {
         progress.set_message(message.to_string());
         progress.tick();
         (progress, terminal)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn hidden_progress_messages_fixture() {
+        if std::env::var_os("OMG_HIDDEN_PROGRESS_MESSAGES_FIXTURE").is_none() {
+            return;
+        }
+        assert!(std::io::stderr().is_terminal());
+        configure_output(0, false);
+
+        print_warning("fixture snapshot warning");
+        print_error("fixture operation error");
+        print_info("fixture operation information");
+        let guard = quiesce_terminal();
+        print_warning("fixture deferred warning");
+        println!("fixture prompt released");
+        drop(guard);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn hidden_progress_preserves_messages_in_real_terminals() {
+        use std::fs::File;
+        use std::io::Read;
+        use std::process::{Command, Stdio};
+
+        let launcher = crate::core::privilege::root_controlled_program_path("setsid")
+            .expect("trusted terminal fixture launcher");
+        let executable = std::env::current_exe().expect("current UI test executable");
+        for term in [None, Some("dumb")] {
+            let pty = nix::pty::openpty(None, None).expect("private UI fixture terminal");
+            for descriptor in [&pty.master, &pty.slave] {
+                nix::fcntl::fcntl(
+                    descriptor,
+                    nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC),
+                )
+                .expect("close private terminal descriptors on exec");
+            }
+            let mut master = File::from(pty.master);
+            let slave = File::from(pty.slave);
+            let mut command = Command::new(&launcher);
+            command
+                .args(["--ctty", "--"])
+                .arg(&executable)
+                .args([
+                    "--exact",
+                    "cli::modern_ui::tests::hidden_progress_messages_fixture",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env("OMG_HIDDEN_PROGRESS_MESSAGES_FIXTURE", "1")
+                .env_remove("TERM")
+                .stdin(Stdio::from(slave.try_clone().expect("fixture stdin")))
+                .stdout(Stdio::from(slave.try_clone().expect("fixture stdout")))
+                .stderr(Stdio::from(slave));
+            if let Some(term) = term {
+                command.env("TERM", term);
+            }
+            let status = command.status().expect("run isolated terminal UI fixture");
+            drop(command);
+            let mut captured = Vec::new();
+            let terminal_closed = master
+                .read_to_end(&mut captured)
+                .expect_err("a closed Linux PTY reports EIO after its output is drained");
+            assert_eq!(terminal_closed.raw_os_error(), Some(nix::libc::EIO));
+            let captured = String::from_utf8(captured).expect("UTF-8 terminal UI messages");
+            assert!(status.success(), "TERM={term:?}: {captured}");
+            for message in [
+                "fixture snapshot warning",
+                "fixture operation error",
+                "fixture operation information",
+                "fixture deferred warning",
+            ] {
+                assert_eq!(
+                    captured.matches(message).count(),
+                    1,
+                    "TERM={term:?} must display each message once: {captured}"
+                );
+            }
+            assert!(
+                captured
+                    .find("fixture prompt released")
+                    .expect("prompt marker")
+                    < captured
+                        .find("fixture deferred warning")
+                        .expect("deferred warning"),
+                "quiesced warning must wait until the prompt releases the terminal: {captured}"
+            );
+        }
     }
 
     #[test]

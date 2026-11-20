@@ -28,6 +28,7 @@ pub(crate) struct RubyVersion {
 }
 
 pub(crate) struct RubyManager {
+    security: super::security::RuntimeSecurity,
     versions_dir: PathBuf,
     client: &'static reqwest::Client,
 }
@@ -35,6 +36,7 @@ pub(crate) struct RubyManager {
 impl RubyManager {
     pub fn new() -> Self {
         Self {
+            security: super::security::RuntimeSecurity::default(),
             versions_dir: super::DATA_DIR.join("versions/ruby"),
             client: download_client(),
         }
@@ -149,9 +151,8 @@ impl RubyManager {
             })?;
 
         println!("{} Extracting (pure Rust)...", style::informative("→"));
-        let staging = begin_staged_install(&self.versions_dir)?;
-        extract_tar_gz(&download_path, staging.path(), 1).await?;
-        self.publish_install(&staging, &version)?;
+        self.publish_download(&download_path, download_url, &version)
+            .await?;
 
         print_installed("Ruby", &version);
         self.use_version(&version)?;
@@ -159,8 +160,25 @@ impl RubyManager {
         Ok(())
     }
 
+    async fn publish_download(&self, download_path: &Path, url: &str, version: &str) -> Result<()> {
+        let version_dir = self.versions_dir.join(version);
+        let publisher =
+            super::security::record_download("ruby", version, &version_dir, download_path, url)?;
+        let staging = begin_staged_install(&self.versions_dir)?;
+        extract_tar_gz(download_path, staging.path(), 1).await?;
+        self.publish_install(&staging, version)?;
+        publisher.commit();
+        Ok(())
+    }
+
     fn publish_install(&self, staging: &tempfile::TempDir, version: &str) -> Result<()> {
         super::common::require_regular_file(&staging.path().join("bin/ruby"))?;
+        let _admission = self.security.prepare_staged(
+            "ruby",
+            version,
+            staging.path(),
+            &self.versions_dir.join(version),
+        )?;
         complete_staged_install(staging, &self.versions_dir.join(version), version)
     }
 
@@ -181,6 +199,14 @@ impl RubyManager {
     /// Switch to a specific version
     pub fn use_version(&self, version: &str) -> Result<()> {
         let version = normalize_version(version);
+        crate::core::security::validate_runtime_version(&version)?;
+        super::common::require_regular_file(&self.versions_dir.join(&version).join("bin/ruby"))?;
+        let admission = self.security.installed(
+            "ruby",
+            &self.versions_dir.join(&version),
+            super::security::ReviewMode::FreshAttended,
+        )?;
+        admission.verify(&self.versions_dir.join(&version))?;
         activate_version(&self.versions_dir, &version, Path::new("bin/ruby"))?;
         print_using("Ruby", &version, &self.versions_dir.join("current/bin"));
         Ok(())
@@ -221,6 +247,75 @@ fn ruby_platform() -> Result<&'static str> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires the isolated fixed-public TLS native fixture"]
+    async fn native_public_install_preserves_authenticated_download_boundary() {
+        use super::super::test_archive::{PublicationFixture, tar_gz_entries};
+        use sha2::{Digest as _, Sha256};
+
+        let version = "3.4.2";
+        let archive = tar_gz_entries(
+            "ruby",
+            &[
+                ("bin/ruby", b"fixture launcher"),
+                ("lib/owned.data", b"complete Ruby implementation"),
+            ],
+        )
+        .unwrap();
+        let arch = [("x86_64", "x64"), ("aarch64", "arm64")]
+            .into_iter()
+            .find(|(host, _)| *host == std::env::consts::ARCH)
+            .expect("supported native fixture architecture")
+            .1;
+        let filename = format!("ruby-{version}-{}-{arch}.tar.gz", ruby_platform().unwrap());
+        let path = format!("/ruby/ruby-builder/releases/download/ruby-{version}/{filename}");
+        let metadata = serde_json::to_vec(&serde_json::json!({
+            "tag_name":format!("ruby-{version}"), "prerelease":false,
+            "assets":[{"name":filename,"browser_download_url":format!("https://github.com{path}"),"digest":format!("sha256:{}",hex::encode(Sha256::digest(&archive)))}]
+        })).unwrap();
+        super::super::test_https::fixed_public_routes(&[
+            (
+                "api.github.com",
+                "/repos/ruby/ruby-builder/releases/tags/ruby-3.4.2",
+                &metadata,
+            ),
+            ("github.com", &path, &archive),
+        ]);
+
+        let fixture = PublicationFixture::new("ruby", "bin/ruby");
+        let manager = RubyManager {
+            security: super::super::security::RuntimeSecurity::fixture(),
+            versions_dir: fixture.versions.clone(),
+            client: download_client(),
+        };
+        manager
+            .install(version)
+            .await
+            .expect("complete authenticated public installation");
+        let installed = fixture.versions.join(version);
+        assert_eq!(
+            fs::read(fixture.versions.join("current").join("bin/ruby")).unwrap(),
+            b"fixture launcher"
+        );
+        assert_eq!(
+            fs::read(installed.join("lib/owned.data")).unwrap(),
+            b"complete Ruby implementation"
+        );
+        assert_eq!(
+            fs::read(fixture.versions.join("1.0.0/bin/ruby")).unwrap(),
+            b"previous reviewed runtime"
+        );
+        super::super::security::admit_installed(
+            "ruby",
+            &installed,
+            super::super::security::ReviewMode::CachedOnly,
+        )
+        .expect("retain exact authenticated publisher authority")
+        .verify(&installed)
+        .expect("complete published tree matches its admission");
+    }
+
     use super::*;
 
     #[tokio::test]
@@ -239,6 +334,7 @@ mod tests {
         use super::super::test_archive::{Launcher, tar_gz};
         let versions = tempfile::tempdir()?;
         let manager = RubyManager {
+            security: crate::runtimes::security::RuntimeSecurity::fixture(),
             versions_dir: versions.path().to_path_buf(),
             client: download_client(),
         };
@@ -264,7 +360,21 @@ mod tests {
             tar_gz("runtime", "bin/ruby", Launcher::Regular)?,
         )?;
         extract_tar_gz(&archive_path, staging.path(), 1).await?;
+        crate::runtimes::security::fixture_bind_candidate(
+            "ruby",
+            "3.4.10",
+            staging.path(),
+            &manager.versions_dir.join("3.4.10"),
+        )
+        .expect("seed controlled publisher authority");
         manager.publish_install(&staging, "3.4.10")?;
+        crate::runtimes::security::fixture_bind_candidate(
+            "ruby",
+            "3.4.10",
+            &manager.versions_dir.join("3.4.10"),
+            &manager.versions_dir.join("3.4.10"),
+        )
+        .expect("seed controlled publisher authority");
         manager.use_version("3.4.10")?;
         assert_eq!(manager.list_installed()?, vec!["3.4.10"]);
         assert_eq!(manager.current_version().as_deref(), Some("3.4.10"));
@@ -342,5 +452,69 @@ mod tests {
         let platform = ruby_platform().expect("host platform should be supported");
         let expected = EXPECTED.expect("unsupported test host");
         assert_eq!(platform, expected);
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn downloaded_publication_preserves_prior_authority_and_rejects_changed_reviewed_content()
+    {
+        use super::super::test_archive::{Launcher, tar_gz};
+        use super::super::test_archive::{PublicationFixture, mutation_security};
+        let fixture = PublicationFixture::new("ruby", "bin/ruby");
+        let mut manager = RubyManager {
+            security: super::super::security::RuntimeSecurity::fixture(),
+            versions_dir: fixture.versions.clone(),
+            client: download_client(),
+        };
+        let url = "https://github.com/ruby/ruby-builder/releases/download/ruby-3.4.2/ruby.tar.gz";
+        assert!(
+            manager
+                .publish_download(&fixture.archive, url, "3.4.2")
+                .await
+                .is_err()
+        );
+        fixture.assert_previous();
+        fixture.write(b"not an archive");
+        assert!(
+            manager
+                .publish_download(&fixture.archive, url, "3.4.2")
+                .await
+                .is_err()
+        );
+        fixture.assert_previous();
+        let bytes =
+            tar_gz("runtime", "bin/ruby", Launcher::Regular).expect("controlled publisher archive");
+        fixture.write(&bytes);
+        manager.security = mutation_security(&fixture.versions);
+        let error = manager
+            .publish_download(&fixture.archive, url, "3.4.2")
+            .await
+            .expect_err("changed reviewed payload must not publish");
+        assert!(
+            format!("{error:#}").contains("Runtime content changed after advisory review"),
+            "{error:#}"
+        );
+        assert!(!fixture.versions.join("3.4.2").exists());
+        fixture.assert_previous();
+        manager.security = super::super::security::RuntimeSecurity::fixture();
+        manager
+            .publish_download(&fixture.archive, url, "3.4.2")
+            .await
+            .expect("publish complete reviewed publisher tree");
+        fixture.assert_previous();
+        manager
+            .use_version("3.4.2")
+            .expect("activate admitted publisher tree");
+        assert_eq!(
+            fs::read(fixture.versions.join("current/bin/ruby"))
+                .expect("selected reviewed launcher"),
+            b"fixture launcher"
+        );
+        fs::remove_file(fixture.versions.join("current"))
+            .expect("restore controlled prior selection");
+        std::os::unix::fs::symlink("1.0.0", fixture.versions.join("current"))
+            .expect("restore prior selection");
+        fixture.corrupt_identity("3.4.2");
+        assert!(manager.use_version("3.4.2").is_err());
+        fixture.assert_previous();
     }
 }

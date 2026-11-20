@@ -25,6 +25,7 @@ pub(crate) fn run_isolated_test_with_timeout(name: &str, timeout: std::time::Dur
         .args([
             "--exact",
             name,
+            "--include-ignored",
             "--nocapture",
             "--color",
             "never",

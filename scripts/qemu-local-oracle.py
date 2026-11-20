@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Prepare private fixtures and verify selected local OMG command contracts."""
 import hashlib
+import importlib.util
 import datetime
 import json
 import os
@@ -94,9 +95,25 @@ def runtime_fixture(data):
         for version in versions:
             executable = 'python3' if runtime == 'python' else runtime
             write(data / f'versions/{runtime}/{version}/bin/{executable}', '#!/bin/sh\nexit 0\n', 0o755)
+            seed_runtime_fixture(data, runtime, version)
         current = data / f'versions/{runtime}/current'
         if absent(current):
             current.symlink_to(versions[0], target_is_directory=True)
+
+
+def seed_runtime_fixture(data, runtime, requested):
+    helper = Path(__file__).with_name('runtime_advisory_fixture.py')
+    if not helper.is_file():
+        helper = Path(__file__).resolve().parents[1] / 'tests/runtime_advisory_fixture.py'
+    spec = importlib.util.spec_from_file_location('runtime_advisory_fixture', helper)
+    fixture = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(fixture)
+    config = Path(os.environ['OMG_CONFIG_DIR'])
+    config.mkdir(parents=True, mode=0o700, exist_ok=True)
+    if absent(config / 'policy.toml'):
+        write(config / 'policy.toml', fixture.DEFAULT_POLICY_TOML)
+    fixture.seed_runtime_advisory_fixture(Path(data) / 'versions' / runtime / requested,
+                                         runtime, requested, config, accept_unknown=True)
 
 
 def golden_templates(path):
@@ -533,6 +550,8 @@ def main():
         prepare(case)
     elif action == 'check':
         check(case, int(sys.argv[3]), regular_text(sys.argv[4]), regular_text(sys.argv[5]))
+    elif action == 'seed-runtime':
+        seed_runtime_fixture(Path(os.environ['OMG_DATA_DIR']), case, sys.argv[3])
     else:
         raise ValueError('unknown local oracle action')
 

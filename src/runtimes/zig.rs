@@ -28,6 +28,7 @@ pub(crate) struct ZigVersion {
 }
 
 pub(crate) struct ZigManager {
+    security: super::security::RuntimeSecurity,
     versions_dir: PathBuf,
     client: &'static reqwest::Client,
 }
@@ -35,6 +36,7 @@ pub(crate) struct ZigManager {
 impl ZigManager {
     pub fn new() -> Self {
         Self {
+            security: super::security::RuntimeSecurity::default(),
             versions_dir: super::DATA_DIR.join("versions/zig"),
             client: download_client(),
         }
@@ -127,9 +129,8 @@ impl ZigManager {
         download_with_progress(self.client, &url, &download_path, &checksum).await?;
 
         println!("{} Extracting (pure Rust)...", style::informative("→"));
-        let staging = begin_staged_install(&self.versions_dir)?;
-        stage_zig_tree(&download_path, staging.path()).await?;
-        complete_staged_install(&staging, &version_dir, &version)?;
+        self.publish_download(&download_path, &url, &version)
+            .await?;
 
         remove_file_best_effort(&download_path, "runtime archive");
 
@@ -139,9 +140,31 @@ impl ZigManager {
         Ok(())
     }
 
+    async fn publish_download(&self, download_path: &Path, url: &str, version: &str) -> Result<()> {
+        let version_dir = self.versions_dir.join(version);
+        let publisher =
+            super::security::record_download("zig", version, &version_dir, download_path, url)?;
+        let staging = begin_staged_install(&self.versions_dir)?;
+        stage_zig_tree(download_path, staging.path()).await?;
+        let _admission =
+            self.security
+                .prepare_staged("zig", version, staging.path(), &version_dir)?;
+        complete_staged_install(&staging, &version_dir, version)?;
+        publisher.commit();
+        Ok(())
+    }
+
     /// Switch to a specific version
     pub fn use_version(&self, version: &str) -> Result<()> {
         let version = normalize_version(version);
+        crate::core::security::validate_runtime_version(&version)?;
+        super::common::require_regular_file(&self.versions_dir.join(&version).join("bin/zig"))?;
+        let admission = self.security.installed(
+            "zig",
+            &self.versions_dir.join(&version),
+            super::security::ReviewMode::FreshAttended,
+        )?;
+        admission.verify(&self.versions_dir.join(&version))?;
         activate_version(&self.versions_dir, &version, Path::new("bin/zig"))?;
         print_using("Zig", &version, &self.versions_dir.join("current/bin"));
         Ok(())
@@ -264,6 +287,65 @@ fn make_staged_executable(_path: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires the isolated fixed-public TLS native fixture"]
+    async fn native_public_install_preserves_authenticated_download_boundary() {
+        use super::super::test_archive::{PublicationFixture, tar_xz_entries};
+        use sha2::{Digest as _, Sha256};
+
+        let version = "0.15.0";
+        let archive = tar_xz_entries(
+            "zig",
+            &[
+                ("zig", b"fixture launcher"),
+                ("lib/owned.data", b"complete Zig implementation"),
+            ],
+        )
+        .unwrap();
+        let target = zig_target().unwrap();
+        let path = format!("/download/{version}/zig-{target}-{version}.tar.xz");
+        let metadata = serde_json::to_vec(&serde_json::json!({version:{target:{
+            "tarball":format!("https://ziglang.org{path}"),"shasum":hex::encode(Sha256::digest(&archive))
+        }}})).unwrap();
+        super::super::test_https::fixed_public_routes(&[
+            ("ziglang.org", "/download/index.json", &metadata),
+            ("ziglang.org", &path, &archive),
+        ]);
+
+        let fixture = PublicationFixture::new("zig", "bin/zig");
+        let manager = ZigManager {
+            security: super::super::security::RuntimeSecurity::fixture(),
+            versions_dir: fixture.versions.clone(),
+            client: download_client(),
+        };
+        manager
+            .install(version)
+            .await
+            .expect("complete authenticated public installation");
+        let installed = fixture.versions.join(version);
+        assert_eq!(
+            fs::read(fixture.versions.join("current").join("bin/zig")).unwrap(),
+            b"fixture launcher"
+        );
+        assert_eq!(
+            fs::read(installed.join("lib/owned.data")).unwrap(),
+            b"complete Zig implementation"
+        );
+        assert_eq!(
+            fs::read(fixture.versions.join("1.0.0/bin/zig")).unwrap(),
+            b"previous reviewed runtime"
+        );
+        super::super::security::admit_installed(
+            "zig",
+            &installed,
+            super::super::security::ReviewMode::CachedOnly,
+        )
+        .expect("retain exact authenticated publisher authority")
+        .verify(&installed)
+        .expect("complete published tree matches its admission");
+    }
+
     use super::*;
     use serde_json::json;
 
@@ -311,5 +393,68 @@ mod tests {
             target.contains(std::env::consts::OS),
             "{target} should name the host OS"
         );
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn downloaded_publication_preserves_prior_authority_and_rejects_changed_reviewed_content()
+    {
+        use super::super::test_archive::tar_xz_entries;
+        use super::super::test_archive::{PublicationFixture, mutation_security};
+        let fixture = PublicationFixture::new("zig", "bin/zig");
+        let mut manager = ZigManager {
+            security: super::super::security::RuntimeSecurity::fixture(),
+            versions_dir: fixture.versions.clone(),
+            client: download_client(),
+        };
+        let url = "https://ziglang.org/download/0.15.0/zig.tar.xz";
+        assert!(
+            manager
+                .publish_download(&fixture.archive, url, "0.15.0")
+                .await
+                .is_err()
+        );
+        fixture.assert_previous();
+        fixture.write(b"not an archive");
+        assert!(
+            manager
+                .publish_download(&fixture.archive, url, "0.15.0")
+                .await
+                .is_err()
+        );
+        fixture.assert_previous();
+        let bytes = tar_xz_entries("runtime", &[("zig", b"fixture launcher")])
+            .expect("controlled publisher archive");
+        fixture.write(&bytes);
+        manager.security = mutation_security(&fixture.versions);
+        let error = manager
+            .publish_download(&fixture.archive, url, "0.15.0")
+            .await
+            .expect_err("changed reviewed payload must not publish");
+        assert!(
+            format!("{error:#}").contains("Runtime content changed after advisory review"),
+            "{error:#}"
+        );
+        assert!(!fixture.versions.join("0.15.0").exists());
+        fixture.assert_previous();
+        manager.security = super::super::security::RuntimeSecurity::fixture();
+        manager
+            .publish_download(&fixture.archive, url, "0.15.0")
+            .await
+            .expect("publish complete reviewed publisher tree");
+        fixture.assert_previous();
+        manager
+            .use_version("0.15.0")
+            .expect("activate admitted publisher tree");
+        assert_eq!(
+            fs::read(fixture.versions.join("current/bin/zig")).expect("selected reviewed launcher"),
+            b"fixture launcher"
+        );
+        fs::remove_file(fixture.versions.join("current"))
+            .expect("restore controlled prior selection");
+        std::os::unix::fs::symlink("1.0.0", fixture.versions.join("current"))
+            .expect("restore prior selection");
+        fixture.corrupt_identity("0.15.0");
+        assert!(manager.use_version("0.15.0").is_err());
+        fixture.assert_previous();
     }
 }

@@ -42,9 +42,10 @@ use std::path::{Path, PathBuf};
 
 use super::common::{
     GithubRelease, activate_version_with_linked_binary, begin_staged_install,
-    complete_staged_install, download_to_temp_for_signature, extract_tar_gz, fetch_github_releases,
-    is_valid_version_dir, normalize_version, print_already_installed, print_installed, print_using,
-    remove_file_best_effort, uninstall_version, validate_download_filename,
+    complete_staged_install, download_to_temp_for_signature, extract_tar_gz_with_budget,
+    fetch_github_releases, is_valid_version_dir, normalize_version, print_already_installed,
+    print_installed, print_using, remove_file_best_effort, uninstall_version,
+    validate_download_filename,
 };
 
 // Published at https://www.swift.org/keys/active/. Keep this list explicit so
@@ -75,6 +76,11 @@ const SWIFT_DOWNLOAD_BASE: &str = "https://download.swift.org";
 /// probe and the smoke-test target.
 const SWIFT_BINARY: &str = "usr/bin/swift";
 
+// The signed Swift 6.0.3 Ubuntu archive expands to 2,652,651,520 bytes including
+// TAR headers and padding. This finite SDK-specific budget is available only
+// after the existing pinned vendor-signature verification succeeds.
+const MAX_SWIFT_DECOMPRESSED_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
 /// A stable upstream Swift release. `prerelease` is always false today (the
 /// parser drops prerelease entries); the field mirrors sibling managers so a
 /// future prerelease channel needs no API change.
@@ -87,6 +93,7 @@ pub(crate) struct SwiftVersion {
 }
 
 pub(crate) struct SwiftManager {
+    security: super::security::RuntimeSecurity,
     versions_dir: PathBuf,
     keyring_path: PathBuf,
     client: &'static reqwest::Client,
@@ -226,7 +233,7 @@ async fn verify_and_extract_tarball(
     println!("{} Extracting (pure Rust)...", style::informative("→"));
     let staging = begin_staged_install(versions_dir)?;
     // Strip only the vendor's top directory, preserving its usr/ tree.
-    extract_tar_gz(tarball, staging.path(), 1).await?;
+    extract_tar_gz_with_budget(tarball, staging.path(), 1, MAX_SWIFT_DECOMPRESSED_BYTES).await?;
     Ok(staging)
 }
 
@@ -267,6 +274,7 @@ fn verify_tarball_signature(keyring: &Path, tarball: &Path, signature: &Path) ->
 impl SwiftManager {
     pub fn new() -> Self {
         Self {
+            security: super::security::RuntimeSecurity::default(),
             versions_dir: super::DATA_DIR.join("versions/swift"),
             keyring_path: super::DATA_DIR.join("swift/all-keys.asc"),
             client: download_client(),
@@ -276,6 +284,7 @@ impl SwiftManager {
     #[cfg(test)]
     fn with_paths(versions_dir: PathBuf, keyring_path: PathBuf) -> Self {
         Self {
+            security: crate::runtimes::security::RuntimeSecurity::fixture(),
             versions_dir,
             keyring_path,
             client: download_client(),
@@ -363,7 +372,15 @@ impl SwiftManager {
             .tempdir_in(parent)?;
         let candidate = candidate_dir.path().join("keyring.asc");
         let refreshed = async {
-            download_file(self.client, SWIFT_KEYS_URL, &candidate).await?;
+            let response = crate::core::http::fetch_public_download_fresh(
+                SWIFT_KEYS_URL,
+                super::common::GITHUB_USER_AGENT,
+                Some(std::time::Duration::from_secs(30)),
+            )
+            .await?
+            .error_for_status()?;
+            let keys = crate::core::http::bounded_metadata_body(response).await?;
+            fs::write(&candidate, keys)?;
             publish_keyring(&candidate, &self.keyring_path)
         }
         .await;
@@ -453,17 +470,7 @@ impl SwiftManager {
         let staging =
             verify_and_extract_tarball(&keyring, &download_path, &sig_path, &self.versions_dir)
                 .await?;
-        if !staging.path().join(SWIFT_BINARY).is_file() {
-            remove_file_best_effort(&download_path, "runtime archive");
-            anyhow::bail!(
-                "Installed Swift archive but found no `{SWIFT_BINARY}` inside; \
-                 refusing to publish an incomplete toolchain"
-            );
-        }
-        make_staged_executable(&staging.path().join(SWIFT_BINARY))?;
-        println!("{} Verifying installation...", style::informative("→"));
-        smoke_swift(staging.path(), &version)?;
-        complete_staged_install(&staging, &version_dir, &version)?;
+        self.publish_install(&staging, &version, &download_path, &url)?;
         remove_file_best_effort(&download_path, "runtime archive");
 
         print_installed("Swift", &version);
@@ -472,9 +479,49 @@ impl SwiftManager {
         Ok(())
     }
 
+    fn publish_install(
+        &self,
+        staging: &tempfile::TempDir,
+        version: &str,
+        download_path: &Path,
+        url: &str,
+    ) -> Result<()> {
+        let version_dir = self.versions_dir.join(version);
+        if !staging.path().join(SWIFT_BINARY).is_file() {
+            remove_file_best_effort(download_path, "runtime archive");
+            anyhow::bail!(
+                "Installed Swift archive but found no `{SWIFT_BINARY}` inside; \
+                 refusing to publish an incomplete toolchain"
+            );
+        }
+        make_staged_executable(&staging.path().join(SWIFT_BINARY))?;
+        let publisher =
+            super::security::record_download("swift", version, &version_dir, download_path, url)?;
+        let admission =
+            self.security
+                .prepare_staged("swift", version, staging.path(), &version_dir)?;
+        admission.before_execution(staging.path())?;
+        println!("{} Verifying installation...", style::informative("→"));
+        smoke_swift(staging.path(), version)?;
+        complete_staged_install(staging, &version_dir, version)?;
+        publisher.commit();
+        Ok(())
+    }
+
     /// Switch to a specific version.
     pub fn use_version(&self, version: &str) -> Result<()> {
         let version = normalize_version(version);
+        crate::core::security::validate_runtime_version(&version)?;
+        super::common::require_internal_runtime_binary(
+            &self.versions_dir.join(&version),
+            Path::new("usr/bin/swift"),
+        )?;
+        let admission = self.security.installed(
+            "swift",
+            &self.versions_dir.join(&version),
+            super::security::ReviewMode::FreshAttended,
+        )?;
+        admission.verify(&self.versions_dir.join(&version))?;
         activate_version_with_linked_binary(&self.versions_dir, &version, Path::new(SWIFT_BINARY))?;
         print_using(
             "Swift",
@@ -515,36 +562,25 @@ fn smoke_swift(version_dir: &Path, expected: &str) -> Result<()> {
     let swift = version_dir.join(SWIFT_BINARY);
     let mut command = std::process::Command::new(&swift);
     super::common::harden_untrusted_runtime_command(&mut command, version_dir);
-    let output = command
-        .arg("--version")
-        .output()
-        .with_context(|| format!("Failed to run smoke test: {}", swift.display()))?;
-    if output.status.success() {
-        let text =
-            std::str::from_utf8(&output.stdout).context("Swift version output is not UTF-8")?;
-        let actual = text
-            .lines()
-            .find_map(|line| {
-                line.split_once("Swift version ")
-                    .and_then(|(_, rest)| rest.split_whitespace().next())
-            })
-            .context("Swift did not report its version")?;
-        anyhow::ensure!(
-            is_stable_version(actual) && super::common::version_cmp(actual, expected).is_eq(),
-            "Swift artifact version {actual} does not match requested {expected}"
-        );
-        Ok(())
-    } else {
-        let stderr =
-            crate::cli::style::sanitize_terminal_text(&String::from_utf8_lossy(&output.stderr));
-        let stderr: String = stderr.chars().take(300).collect();
-        anyhow::bail!(
-            "Swift smoke test failed with status {}: {}: {}",
-            output.status,
-            swift.display(),
-            stderr.trim()
-        )
-    }
+    command.arg("--version");
+    let output = super::tool_artifacts::run_with_timeout(
+        command,
+        "Swift smoke test",
+        std::time::Duration::from_secs(30),
+    )?;
+    let text = std::str::from_utf8(&output).context("Swift version output is not UTF-8")?;
+    let actual = text
+        .lines()
+        .find_map(|line| {
+            line.split_once("Swift version ")
+                .and_then(|(_, rest)| rest.split_whitespace().next())
+        })
+        .context("Swift did not report its version")?;
+    anyhow::ensure!(
+        is_stable_version(actual) && super::common::version_cmp(actual, expected).is_eq(),
+        "Swift artifact version {actual} does not match requested {expected}"
+    );
+    Ok(())
 }
 
 /// Ensure the installed `swift` is executable (tarballs may drop modes).
@@ -572,6 +608,116 @@ fn make_staged_executable(_path: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    fn fixture_signing_keys(wire: Vec<u8>, compressed: bool) -> Result<Vec<u8>> {
+        use std::io::Read as _;
+
+        if !compressed {
+            return Ok(wire);
+        }
+        const KEY_LIMIT: usize = 1024 * 1024;
+        let mut decoded = Vec::new();
+        flate2::read::GzDecoder::new(wire.as_slice())
+            .take(KEY_LIMIT as u64 + 1)
+            .read_to_end(&mut decoded)?;
+        anyhow::ensure!(
+            decoded.len() <= KEY_LIMIT,
+            "Swift key fixture exceeds its decoded size limit"
+        );
+        Ok(decoded)
+    }
+
+    #[test]
+    fn swift_fixture_decodes_gzip_keys_with_a_strict_output_limit() -> Result<()> {
+        use std::io::Write as _;
+
+        let compress = |bytes: &[u8]| -> std::io::Result<Vec<u8>> {
+            let mut writer = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+            writer.write_all(bytes)?;
+            writer.finish()
+        };
+        let keys = b"controlled Swift public key input";
+        assert_eq!(fixture_signing_keys(keys.to_vec(), false)?, keys);
+        assert_eq!(fixture_signing_keys(compress(keys)?, true)?, keys);
+        assert!(fixture_signing_keys(keys.to_vec(), true).is_err());
+        assert!(fixture_signing_keys(compress(&vec![b'x'; 1024 * 1024 + 1])?, true).is_err());
+        Ok(())
+    }
+
+    #[cfg(all(target_os = "linux", feature = "pgp"))]
+    #[tokio::test]
+    #[ignore = "requires budgeted genuine Swift vendor inputs and isolated native namespaces"]
+    async fn genuine_public_install_refuses_changed_signed_content() {
+        use super::super::test_archive::{PublicationFixture, mutation_security};
+        let version = "6.0.3";
+        assert_eq!(ubuntu_release().unwrap(), "24.04");
+        let metadata = serde_json::to_vec(&serde_json::json!([{
+            "tag_name":"swift-6.0.3-RELEASE", "prerelease":false, "assets":[]
+        }]))
+        .unwrap();
+        super::super::test_https::fixed_public_routes(&[(
+            "api.github.com",
+            "/repos/swiftlang/swift/releases?per_page=100&page=1",
+            &metadata,
+        )]);
+        let directory = Path::new("/swift-authenticated-inputs");
+        let inputs: serde_json::Value = serde_json::from_slice(
+            &fs::read(directory.join("manifest.json"))
+                .expect("owned genuine vendor input manifest"),
+        )
+        .expect("decode genuine Swift input identities");
+        let plan_path = Path::new("/tmp/omg-runtime-public-fixture/routes.json");
+        let mut plan: Vec<serde_json::Value> =
+            serde_json::from_slice(&fs::read(plan_path).unwrap()).unwrap();
+        let archive_url = tarball_url(version, "24.04", host_arch_suffix().unwrap());
+        for (filename, url) in [
+            ("all-keys.asc", SWIFT_KEYS_URL.to_owned()),
+            ("swift.tar.gz", archive_url.clone()),
+            ("swift.tar.gz.sig", format!("{archive_url}.sig")),
+        ] {
+            let url = reqwest::Url::parse(&url).unwrap();
+            let identity = &inputs["files"][filename];
+            plan.push(serde_json::json!({
+                "host":url.host_str().unwrap(), "path":url.path(), "status":200,
+                "file":directory.join(filename),
+                "bytes":identity["bytes"].as_u64().expect("genuine bounded vendor byte count"),
+                "sha256":identity["sha256"].as_str().expect("genuine vendor input digest"),
+            }));
+        }
+        fs::write(plan_path, serde_json::to_vec(&plan).unwrap()).unwrap();
+        let fixture =
+            PublicationFixture::new_in("swift", "usr/bin/swift", Path::new("/swift-runtime-work"));
+        let owner: serde_json::Value = serde_json::from_slice(
+            &fs::read(directory.join("owner.json")).expect("genuine input representation receipt"),
+        )
+        .unwrap();
+        let keys = fixture_signing_keys(
+            fs::read(directory.join("all-keys.asc")).unwrap(),
+            owner["sources"]["all-keys.asc"]["content_encoding"] == "gzip",
+        )
+        .expect("decode the bounded genuine Swift keys");
+        let manager = SwiftManager {
+            security: mutation_security(&fixture.versions),
+            versions_dir: fixture.versions.clone(),
+            keyring_path: fixture.owner.path().join("keys/all-keys.asc"),
+            client: download_client(),
+        };
+        let error = manager
+            .install(version)
+            .await
+            .expect_err("changed genuine signed content must refuse before SDK execution");
+        assert!(
+            format!("{error:#}").contains("Runtime content changed after advisory review"),
+            "{error:#}"
+        );
+        assert!(!fixture.versions.join(version).exists());
+        assert_eq!(
+            fs::read(fixture.owner.path().join("keys/all-keys.asc")).unwrap(),
+            keys,
+            "published signing metadata must match the decoded genuine HTTP representation"
+        );
+        fixture.assert_previous();
+    }
+
     use super::*;
 
     async fn wait_for_prefix(directory: &Path, prefix: &[u8]) -> Result<()> {
@@ -875,6 +1021,14 @@ mod tests {
         )
         .unwrap();
         assert!(smoke_swift(dir.path(), "6.1").is_err());
+        fs::write(
+            &binary,
+            "#!/bin/sh\nprintf 'Swift version 6.1.2 (release)\\n'\nprintf 'fixture failed\\n' >&2\nexit 7\n",
+        )
+        .expect("write a Swift fixture that reports a version before failing");
+        let error = smoke_swift(dir.path(), "6.1.2")
+            .expect_err("a failed smoke command cannot establish the installed version");
+        assert_eq!(error.to_string(), "Swift smoke test failed: fixture failed");
     }
 
     #[test]
@@ -999,5 +1153,82 @@ mod tests {
             "aarch64" => assert_eq!(suffix, "-aarch64"),
             arch => panic!("unexpected test host arch: {arch}"),
         }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn verified_swift_publication_refuses_changed_content_before_execution_and_keeps_prior_version()
+    {
+        use super::super::test_archive::{PublicationFixture, mutation_security};
+        // Signature authentication remains at install's sole call site; this
+        // exercises its following private publication phase with owned inputs.
+        let fixture = PublicationFixture::new("swift", SWIFT_BINARY);
+        let mut manager = SwiftManager::with_paths(
+            fixture.versions.clone(),
+            fixture.owner.path().join("keys.asc"),
+        );
+        let error = manager
+            .use_version("6.2.0")
+            .expect_err("refuse selection without the internal Swift launcher");
+        assert!(
+            format!("{error:#}").contains("Failed to inspect runtime binary"),
+            "{error:#}"
+        );
+        fixture.assert_previous();
+        let url = "https://download.swift.org/swift-6.2.0-release/ubuntu2404/swift-6.2.0-RELEASE/swift-6.2.0-RELEASE-ubuntu24.04.tar.gz";
+        for case in [
+            "missing-archive",
+            "missing-binary",
+            "tamper",
+            "wrong-version",
+            "success",
+        ] {
+            if case != "missing-archive" {
+                fixture.write(b"controlled already-authenticated archive");
+            }
+            let staging = begin_staged_install(&fixture.versions).expect("owned Swift staging");
+            if case != "missing-binary" {
+                let binary = staging.path().join(SWIFT_BINARY);
+                fs::create_dir_all(binary.parent().expect("Swift binary parent"))
+                    .expect("Swift vendor layout");
+                let script = if case == "wrong-version" {
+                    b"#!/bin/sh\nprintf 'Swift version 6.1.0\\n'\n".as_slice()
+                } else {
+                    b"#!/bin/sh\nprintf 'Swift version 6.2.0\\n'\n".as_slice()
+                };
+                fs::write(binary, script).expect("controlled Swift interpreter");
+            }
+            manager.security = if case == "tamper" {
+                mutation_security(&fixture.versions)
+            } else {
+                super::super::security::RuntimeSecurity::fixture()
+            };
+            let result = manager.publish_install(&staging, "6.2.0", &fixture.archive, url);
+            drop(staging);
+            if case == "success" {
+                result.expect("publish exact reviewed Swift version");
+            } else {
+                let error = result.expect_err("unreviewed or incorrect Swift cannot publish");
+                if case == "tamper" {
+                    assert!(
+                        format!("{error:#}")
+                            .contains("Runtime content changed after advisory review")
+                    );
+                }
+                if case == "wrong-version" {
+                    assert!(format!("{error:#}").contains("does not match requested"));
+                }
+                assert!(!fixture.versions.join("6.2.0").exists());
+            }
+            fixture.assert_previous();
+        }
+        manager
+            .use_version("6.2.0")
+            .expect("select reviewed Swift version");
+        fs::remove_file(fixture.versions.join("current")).expect("restore prior Swift selection");
+        std::os::unix::fs::symlink("1.0.0", fixture.versions.join("current"))
+            .expect("prior Swift selection");
+        fixture.corrupt_identity("6.2.0");
+        assert!(manager.use_version("6.2.0").is_err());
+        fixture.assert_previous();
     }
 }

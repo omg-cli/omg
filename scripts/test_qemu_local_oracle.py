@@ -10,6 +10,7 @@ OMG_TEST_LEGACY_LOCAL_ORACLE_CLI to bind it to the actual released binary.
 import hashlib
 import importlib.util
 import os
+import re
 from pathlib import Path
 import subprocess
 import tempfile
@@ -174,6 +175,49 @@ class HookEnvironmentOracleTests(unittest.TestCase):
         current.symlink_to("22.16.0", target_is_directory=True)
         with self.assertRaisesRegex(ValueError, "modified active links"):
             self.check()
+
+
+class EmbeddedRuntimeCarrierTests(unittest.TestCase):
+    def resources(self):
+        repository = Path(__file__).resolve().parents[1]
+        source = (repository / 'tests/cli_comprehensive.rs').read_text()
+        owner = source.split('fn prepare_owned_contract(', 1)[1].split('fn check_owned_contract(', 1)[0]
+        declarations = re.findall(r'project\.create_file\(\s*"([^"]+)",\s*include_str!\("([^"]+)"\),\s*\)', owner)
+        self.assertEqual({name for name, _ in declarations},
+                         {'.qemu-local-oracle.py', 'runtime_advisory_fixture.py'})
+        self.assertNotIn('common::seed_runtime_advisory_fixture', owner,
+                         'Python owns the create-exclusive seed; a second writer must not replace it')
+        return {name: (repository / 'tests' / included).read_bytes()
+                for name, included in declarations}
+
+    def prepare(self, root, missing=None):
+        resources = self.resources()
+        for name, payload in resources.items():
+            if name != missing:
+                (root / name).write_bytes(payload)
+                self.assertEqual((root / name).read_bytes(), payload)
+        for name in ('Makefile', 'project/README.md', 'project/Makefile'):
+            path = root / name; path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text('owned fixture\n')
+        environment = dict(os.environ, HOME=str(root / 'home'), OMG_DATA_DIR=str(root / 'data'),
+                           OMG_CONFIG_DIR=str(root / 'config'), OMG_CACHE_DIR=str(root / 'cache'),
+                           PYTHONDONTWRITEBYTECODE='1')
+        return subprocess.run(['python3', str(root / '.qemu-local-oracle.py'), 'prepare', 'hook-env'],
+                              cwd=root, env=environment, capture_output=True, text=True, timeout=10)
+
+    def test_embedded_rust_carrier_prepares_all_exact_runtime_resources_once(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            result = self.prepare(root)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            authority = list((root / 'data/versions').glob('*/.security/*.json'))
+            self.assertEqual(len(authority), 6, 'each of the three synthetic versions needs one identity and admission')
+
+    def test_missing_embedded_runtime_resources_cannot_prepare_a_passing_fixture(self):
+        for missing in ('.qemu-local-oracle.py', 'runtime_advisory_fixture.py'):
+            with self.subTest(resource=missing), tempfile.TemporaryDirectory() as directory:
+                result = self.prepare(Path(directory), missing=missing)
+                self.assertNotEqual(result.returncode, 0)
 
 
 if __name__ == "__main__":

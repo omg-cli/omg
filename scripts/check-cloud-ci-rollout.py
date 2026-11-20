@@ -1,19 +1,28 @@
 """Admit the settled OMG container target before starting expensive cloud CI."""
 import argparse
+from contextlib import closing
 from datetime import datetime, timezone
 import hashlib
+import http.client
 import json
 import os
 from pathlib import Path
 import re
 import time
 import tomllib
-import urllib.error
-import urllib.request
 
 ACCOUNT = "f1e95b3e1b502cf366dfc81a863695fa"
 APPLICATION = "a03f931a-ff51-44cb-b808-de83537d368f"
 REGISTRY = f"registry.cloudflare.com/{ACCOUNT}/omg-cloud-ci@"
+APP_PATH = f"/applications/{APPLICATION}"
+ROLLOUT_PATH = APP_PATH + "/rollouts?limit=10"
+MAX_API_RESPONSE = 1_048_576
+
+
+class CloudflareHttpError(OSError):
+    def __init__(self, status):
+        super().__init__(f"Cloudflare HTTP {status}")
+        self.status = status
 
 
 def require(condition, message):
@@ -65,12 +74,25 @@ def admit(application, rollouts, expected_digest):
 
 
 def readiness(fetch, expected_digest):
-    app_path = f"/applications/{APPLICATION}"
-    rollout_path = app_path + "/rollouts?limit=10"
-    before = admit(fetch(app_path), fetch(rollout_path), expected_digest)
-    after = admit(fetch(app_path), fetch(rollout_path), expected_digest)
+    before = admit(fetch(APP_PATH), fetch(ROLLOUT_PATH), expected_digest)
+    after = admit(fetch(APP_PATH), fetch(ROLLOUT_PATH), expected_digest)
     require(before == after, "Deployment changed during readiness readback")
     return after
+
+
+def read_cloudflare(path, token):
+    require(path in {APP_PATH, ROLLOUT_PATH}, "Unexpected Cloudflare API route")
+    resource = f"/client/v4/accounts/{ACCOUNT}/containers{path}"
+    with closing(http.client.HTTPSConnection("api.cloudflare.com", timeout=30)) as connection:
+        connection.request("GET", resource,
+                           headers={"Authorization": "Bearer " + token,
+                                    "User-Agent": "omg-ci-courier/1.0"})
+        with connection.getresponse() as response:
+            if not 200 <= response.status < 300:
+                raise CloudflareHttpError(response.status)
+            body = response.read(MAX_API_RESPONSE + 1)
+    require(len(body) <= MAX_API_RESPONSE, "Cloudflare response exceeds evidence budget")
+    return body
 
 
 def main():
@@ -89,12 +111,7 @@ def main():
     reads = []
 
     def fetch(path):
-        request = urllib.request.Request(
-            f"https://api.cloudflare.com/client/v4/accounts/{ACCOUNT}/containers{path}",
-            headers={"Authorization": "Bearer " + token, "User-Agent": "omg-ci-courier/1.0"})
-        with urllib.request.urlopen(request, timeout=30) as response:
-            body = response.read(1_048_577)
-        require(len(body) <= 1_048_576, "Cloudflare response exceeds evidence budget")
+        body = read_cloudflare(path, token)
         value = json.loads(body)
         require(isinstance(value, dict) and value.get("success") is True, "Cloudflare API rejected readback")
         reads.append({"path": path, "sha256": hashlib.sha256(body).hexdigest()})
@@ -108,9 +125,9 @@ def main():
         try:
             result = readiness(fetch, args.image_digest)
             break
-        except (ValueError, urllib.error.URLError) as error:
-            result["reason"] = f"Cloudflare HTTP {error.code}" if isinstance(error, urllib.error.HTTPError) else str(error)
-            if isinstance(error, urllib.error.HTTPError) and error.code not in {429, 500, 502, 503, 504}:
+        except (ValueError, OSError, http.client.HTTPException) as error:
+            result["reason"] = str(error)
+            if isinstance(error, CloudflareHttpError) and error.status not in {429, 500, 502, 503, 504}:
                 break
         remaining = deadline - time.monotonic()
         if remaining <= 0:

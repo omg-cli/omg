@@ -5,7 +5,7 @@ use crate::cli::{modern_ui, style, ui};
 use crate::core::security::{PolicyError, SecurityPolicy};
 use crate::package_managers::{
     get_package_manager,
-    types::{UpdateInfo, Version},
+    types::{SecurityOrigin, UpdateInfo, Version},
 };
 
 /// Hard bounds for `OMG_AUR_PARALLEL`: builds are process-heavy (makepkg
@@ -64,6 +64,12 @@ enum AurCheck {
     Failed(anyhow::Error),
 }
 
+#[derive(Clone, Copy)]
+enum AurUpdateMode {
+    Standard,
+    Omarchy,
+}
+
 /// AUR update candidates split by the user's security policy.
 struct ScreenedAurUpdates {
     allowed: Vec<(String, Version, Version)>,
@@ -85,7 +91,7 @@ fn screen_aur_updates_against_policy(
         skipped: Vec::new(),
     };
     for (name, old_version, new_version) in candidates {
-        if let Err(violation) = policy.check_source(&name, true, None) {
+        if let Err(violation) = policy.check_source(&name, &SecurityOrigin::AurArchive, None) {
             tracing::warn!("Security policy blocks AUR update for {name}: {violation}");
             screened.skipped.push((name, violation));
             continue;
@@ -139,6 +145,7 @@ const fn should_sync(no_sync: bool, check_only: bool, dry_run: bool) -> bool {
 }
 
 pub async fn update_fast() -> Result<()> {
+    super::omarchy::ensure_native_update_scope()?;
     modern_ui::print_phase_header("⚡", "Fast System Update", "sync + upgrade");
     crate::package_managers::arch::run_privileged_operation(
         "fullupdate",
@@ -182,6 +189,7 @@ async fn run_sysupgrade() -> anyhow::Result<()> {
 }
 
 pub async fn update_turbo() -> Result<()> {
+    super::omarchy::ensure_native_update_scope()?;
     modern_ui::print_phase_header("🚀", "TURBO System Update", "cached, no sync");
     println!(
         "  {} Checking for updates (cached, no sync)...",
@@ -244,6 +252,45 @@ pub async fn update(
     dry_run: bool,
     no_sync: bool,
     aur_only: bool,
+) -> Result<()> {
+    let intent = if aur_only {
+        super::omarchy::UpdateIntent::AurOnly
+    } else if check_only {
+        super::omarchy::UpdateIntent::Check
+    } else if dry_run {
+        super::omarchy::UpdateIntent::DryRun
+    } else {
+        super::omarchy::UpdateIntent::Standard { yes, no_sync }
+    };
+    if super::omarchy::maybe_coordinate(intent).await? {
+        return Ok(());
+    }
+    update_packages(
+        check_only,
+        yes,
+        dry_run,
+        no_sync,
+        aur_only,
+        AurUpdateMode::Standard,
+    )
+    .await
+}
+
+pub(super) async fn update_omarchy_aur(yes: bool) -> Result<()> {
+    update_packages(false, yes, false, true, true, AurUpdateMode::Omarchy).await
+}
+
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "Existing CLI flags enter the shared update implementation"
+)]
+async fn update_packages(
+    check_only: bool,
+    yes: bool,
+    dry_run: bool,
+    no_sync: bool,
+    aur_only: bool,
+    aur_mode: AurUpdateMode,
 ) -> Result<()> {
     let pm = get_package_manager()?;
 
@@ -330,6 +377,14 @@ pub async fn update(
         Err(error) => return Err(error),
         Ok(AurCheck::Skipped) => Vec::new(),
         Ok(AurCheck::Failed(error)) => {
+            if matches!(aur_mode, AurUpdateMode::Omarchy)
+                && crate::package_managers::aur::update_source_unavailable(&error)
+            {
+                modern_ui::print_warning(&format!(
+                    "AUR is unavailable. Skipping AUR updates and continuing to Omarchy boot verification: {error:#}"
+                ));
+                return Ok(());
+            }
             if official_count == 0 {
                 return Err(error).context("Failed to check AUR updates");
             }
@@ -338,7 +393,10 @@ pub async fn update(
             ));
             Vec::new()
         }
-        Ok(AurCheck::Ready { policy, raw }) => {
+        Ok(AurCheck::Ready { policy, mut raw }) => {
+            if matches!(aur_mode, AurUpdateMode::Omarchy) {
+                raw.retain(|(name, _, _)| !matches!(name.as_str(), "gcc14" | "gcc14-libs"));
+            }
             let aur_elapsed = check_start.elapsed();
             let count = raw.len();
             let ScreenedAurUpdates { allowed, skipped } =

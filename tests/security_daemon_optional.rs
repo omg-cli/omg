@@ -20,6 +20,8 @@ fn audit_policy_reports_configuration_and_rejects_corruption_without_rewriting_i
         require_pgp: true,
         allowed_licenses: vec!["MIT".to_owned()],
         banned_packages: vec!["fixture-banned-package".to_owned()],
+        advisory_requirement: omg_lib::core::security::policy::AdvisoryRequirement::Review,
+        ..SecurityPolicy::default()
     };
     let original = toml::to_string(&policy)?;
     std::fs::write(&path, &original)?;
@@ -254,7 +256,7 @@ fn security_scan_without_daemon_preserves_inventory_errors_and_recovers() -> any
     assert!(
         result
             .stdout
-            .contains("No vulnerabilities found in scanned packages.")
+            .contains("No vulnerabilities found in assessed packages.")
     );
     assert_eq!(std::fs::read(&path)?, clean, "scan changed the inventory");
     let audit_path = project.data_dir.path().join("audit/audit.jsonl");

@@ -586,24 +586,29 @@ pub fn native_arch_fixture_available() -> bool {
     let ordinary = false;
     // Read the real host identity: init_test_env intentionally sets mock mode
     // in this test process, so library distro detection would select the mock.
-    let arch = fs::read_to_string("/etc/os-release").is_ok_and(|contents| {
-        contents.lines().any(|line| {
-            line.strip_prefix("ID=")
-                .is_some_and(|id| id.trim().trim_matches(['\'', '"']) == "arch")
-        })
-    });
-    let available = cfg!(target_os = "linux") && ordinary && arch;
+    let identity = fs::read_to_string("/etc/os-release")
+        .ok()
+        .and_then(|contents| {
+            contents.lines().find_map(|line| {
+                line.strip_prefix("ID=")
+                    .map(|id| id.trim().trim_matches(['\'', '"']).to_owned())
+            })
+        });
+    let available = cfg!(target_os = "linux")
+        && ordinary
+        && matches!(identity.as_deref(), Some("arch" | "omarchy"));
     if env::var_os("OMG_CONTRACT_REQUIRE_NATIVE_ARCH").is_some() {
         assert!(
-            available,
+            available && identity.as_deref() == Some("arch"),
             "native Arch contract requires actual Arch and an ordinary UID"
         );
     }
     if available {
         #[cfg(unix)]
         eprintln!(
-            "[native-arch-fixture] uid={} actual_id=arch",
-            nix::unistd::Uid::effective().as_raw()
+            "[native-arch-fixture] uid={} actual_id={}",
+            nix::unistd::Uid::effective().as_raw(),
+            identity.as_deref().unwrap()
         );
     } else {
         eprintln!("[native-arch-fixture-skip] requires actual Arch and an ordinary UID");
@@ -619,6 +624,470 @@ pub struct TestProject {
     pub config_dir: TempDir,
     pub pacman_root: TempDir,
     pub config: TestConfig,
+}
+
+/// Seed the real owned runtime cache format for a synthetic installed fixture.
+///
+/// This establishes controlled test evidence only; downloaded runtimes must use
+/// the production publisher and advisory providers.
+#[cfg(unix)]
+pub fn seed_runtime_advisory_fixture(
+    project: &TestProject,
+    runtime: &str,
+    requested: &str,
+) -> Result<()> {
+    seed_runtime_advisory_fixture_at(
+        project.data_dir.path(),
+        project.config_dir.path(),
+        runtime,
+        requested,
+    )
+}
+
+#[cfg(unix)]
+pub fn seed_runtime_advisory_fixture_at(
+    data_dir: &Path,
+    config_dir: &Path,
+    runtime: &str,
+    requested: &str,
+) -> Result<()> {
+    use serde::Serialize;
+    use sha2::{Digest as _, Sha256};
+    use std::collections::BTreeMap;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    #[derive(Serialize)]
+    struct Identity<'a> {
+        schema_version: u32,
+        runtime: &'a str,
+        requested: &'a str,
+        version: String,
+        vendor: &'a str,
+        build: &'a str,
+        source_url: &'a str,
+        artifact_sha256: String,
+        components: BTreeMap<String, String>,
+    }
+
+    #[derive(Serialize)]
+    struct Query<'a> {
+        runtime: &'a str,
+        vendor: &'a str,
+        version: &'a str,
+        os: &'a str,
+        arch: &'a str,
+    }
+
+    let root = data_dir
+        .join("versions")
+        .join(runtime)
+        .join(requested)
+        .canonicalize()?;
+    let mut pending = vec![root.clone()];
+    let mut rows: BTreeMap<PathBuf, (&str, u32, String, u64)> = BTreeMap::new();
+    let mut total = 0_u64;
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(directory)? {
+            let path = entry?.path();
+            let relative = path.strip_prefix(&root)?.to_path_buf();
+            if relative.components().count() == 1
+                && matches!(
+                    relative.to_str(),
+                    Some(".omg-install-complete" | ".omg-installing")
+                )
+            {
+                continue;
+            }
+            anyhow::ensure!(
+                rows.len() < 4096,
+                "Synthetic runtime fixture exceeds entry bound"
+            );
+            let metadata = fs::symlink_metadata(&path)?;
+            let mode = metadata.permissions().mode() & 0o777;
+            if metadata.is_dir() {
+                rows.insert(relative, ("directory", mode, String::new(), 0));
+                pending.push(path);
+            } else if metadata.is_file() {
+                if relative == Path::new(".omg-npm-advisory-review.json") {
+                    let mut value: serde_json::Value = serde_json::from_slice(&fs::read(&path)?)?;
+                    let checked: jiff::Timestamp = value
+                        .as_object_mut()
+                        .and_then(|object| object.remove("reviewed_at"))
+                        .and_then(|value| value.as_str().map(str::to_owned))
+                        .ok_or_else(|| anyhow::anyhow!("Missing synthetic npm review timestamp"))?
+                        .parse()?;
+                    let now = jiff::Timestamp::now();
+                    anyhow::ensure!(
+                        checked <= now && now.as_second() - checked.as_second() <= 1800,
+                        "Stale synthetic npm review"
+                    );
+                    let bytes = serde_json::to_vec(&value)?;
+                    rows.insert(
+                        relative,
+                        (
+                            "file",
+                            mode,
+                            hex::encode(Sha256::digest(&bytes)),
+                            bytes.len() as u64,
+                        ),
+                    );
+                    continue;
+                }
+                anyhow::ensure!(
+                    metadata.len() <= 256 * 1024 * 1024,
+                    "Synthetic runtime fixture file exceeds bound"
+                );
+                let mut file = fs::File::open(&path)?;
+                let mut digest = Sha256::new();
+                let mut bytes = 0_u64;
+                let mut buffer = vec![0_u8; 65536];
+                loop {
+                    let count = file.read(&mut buffer)?;
+                    if count == 0 {
+                        break;
+                    }
+                    bytes += count as u64;
+                    total += count as u64;
+                    anyhow::ensure!(
+                        total <= 512 * 1024 * 1024,
+                        "Synthetic runtime fixture exceeds byte bound"
+                    );
+                    digest.update(&buffer[..count]);
+                }
+                anyhow::ensure!(
+                    bytes == metadata.len(),
+                    "Synthetic runtime fixture changed while hashing"
+                );
+                rows.insert(
+                    relative,
+                    ("file", mode, hex::encode(digest.finalize()), bytes),
+                );
+            } else if metadata.is_symlink() {
+                anyhow::ensure!(
+                    path.canonicalize()?.starts_with(&root),
+                    "Synthetic runtime fixture link escapes its version"
+                );
+                rows.insert(
+                    relative,
+                    (
+                        "symlink",
+                        mode,
+                        fs::read_link(path)?
+                            .to_str()
+                            .ok_or_else(|| anyhow::anyhow!("Non-UTF8 fixture link"))?
+                            .to_owned(),
+                        0,
+                    ),
+                );
+            } else {
+                anyhow::bail!("Synthetic runtime fixture contains a special file");
+            }
+        }
+    }
+    let content_sha256 = hex::encode(Sha256::digest(serde_json::to_vec(&rows)?));
+    let vendor = match runtime {
+        "node" => "nodejs",
+        "python" => "cpython",
+        "go" => "golang",
+        "rust" => "rust-lang",
+        "ruby" => "ruby-lang",
+        "java" => "temurin",
+        "bun" => "oven-sh",
+        "pi" => "earendil-works",
+        "deno" => "denoland",
+        "zig" => "ziglang",
+        "dotnet" => "microsoft",
+        "erlang" => "erlang",
+        "php" => "php",
+        "swift" => "swiftlang",
+        _ => "unmapped",
+    };
+    let mut exact = requested
+        .trim_start_matches('v')
+        .split('-')
+        .next()
+        .unwrap_or(requested)
+        .to_owned();
+    while exact.split('.').count() < 3 {
+        exact.push_str(".0");
+    }
+    let identity = Identity {
+        schema_version: 1,
+        runtime,
+        requested,
+        version: exact.clone(),
+        vendor,
+        build: "controlled integration fixture",
+        source_url: "https://github.com/omg-cli/omg",
+        artifact_sha256: content_sha256.clone(),
+        components: BTreeMap::new(),
+    };
+    let identity_bytes = serde_json::to_vec(&identity)?;
+    let identity_sha256 = hex::encode(Sha256::digest(&identity_bytes));
+    let policy = omg_lib::core::security::policy::SecurityPolicy::load_optional(
+        config_dir.join("policy.toml"),
+    )?;
+    let policy_sha256 = hex::encode(Sha256::digest(serde_json::to_vec(&policy)?));
+    let now = jiff::Timestamp::now();
+    let (os, arch) = if runtime == "rust" {
+        if requested.ends_with("x86_64-unknown-linux-gnu")
+            || requested.ends_with("x86_64-unknown-linux-musl")
+        {
+            ("linux", "x86_64")
+        } else if requested.ends_with("aarch64-unknown-linux-gnu")
+            || requested.ends_with("aarch64-unknown-linux-musl")
+        {
+            ("linux", "aarch64")
+        } else if requested.ends_with("x86_64-apple-darwin") {
+            ("macos", "x86_64")
+        } else if requested.ends_with("aarch64-apple-darwin") {
+            ("macos", "aarch64")
+        } else {
+            (std::env::consts::OS, std::env::consts::ARCH)
+        }
+    } else {
+        (std::env::consts::OS, std::env::consts::ARCH)
+    };
+    let query = Query {
+        runtime,
+        vendor,
+        version: &exact,
+        os,
+        arch,
+    };
+    let assessed = vendor != "unmapped";
+    let coverage = if assessed { "assessed" } else { "unknown" };
+    let gaps = if assessed {
+        vec![]
+    } else {
+        vec![format!(
+            "No supported runtime advisory product mapping exists for {runtime}"
+        )]
+    };
+    let source_hash = hex::encode(Sha256::digest(b"controlled integration fixture"));
+    let report = serde_json::json!({"schema_version":1,"identity":query,"checked_at":now,"coverage":coverage,"findings":[],"gaps":gaps,"sources":[{
+        "name":"controlled-integration-fixture","url":"https://github.com/omg-cli/omg","revision":"fixture-v1",
+        "payload_sha256":source_hash,"checked_at":now,"complete":assessed
+    }]});
+    let uid = nix::unistd::getuid().as_raw();
+    let euid = nix::unistd::geteuid().as_raw();
+    let accepted_review = if assessed {
+        None
+    } else {
+        let semantic = serde_json::to_vec(&(
+            coverage,
+            Vec::<serde_json::Value>::new(),
+            &gaps,
+            vec![(
+                "controlled-integration-fixture",
+                "https://github.com/omg-cli/omg",
+                Some("fixture-v1"),
+                &source_hash,
+                false,
+            )],
+        ))?;
+        let provenance = serde_json::json!({"runtime":runtime,"source":"https://omg-advisories.latham.workers.dev/v1/runtimes/","payload_sha256":hex::encode(Sha256::digest(semantic))});
+        let origin = omg_lib::package_managers::types::SecurityOrigin::RuntimeVendor {
+            runtime: runtime.into(),
+            vendor: vendor.into(),
+        };
+        let identity = (
+            runtime,
+            &exact,
+            &origin,
+            Some(arch),
+            Option::<(String, String)>::None,
+            Vec::<String>::new(),
+        );
+        let record = serde_json::to_string(&(
+            identity,
+            Some(omg_lib::core::security::vulnerability::UnknownCoverage::EvidenceUnavailable),
+            provenance,
+        ))?;
+        let context = serde_json::to_string(&(
+            "omg-runtime-admission-v1",
+            &root,
+            &query,
+            &content_sha256,
+            &identity_sha256,
+            &policy_sha256,
+            uid,
+            euid,
+        ))?;
+        Some(hex::encode(Sha256::digest(serde_json::to_vec(&(
+            "omg-advisory-risk-with-coverage-v1",
+            context,
+            Option::<&str>::None,
+            vec![record],
+        ))?)))
+    };
+    let record = serde_json::json!({"schema_version":1,"destination":root,"query":query,"content_sha256":content_sha256,
+        "identity_sha256":identity_sha256,"policy_sha256":policy_sha256,"local_gaps":gaps,"uid":uid,"euid":euid,"report":report,"accepted_review":accepted_review});
+    let directory = root
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("Fixture has no versions parent"))?
+        .join(".security");
+    fs::create_dir_all(&directory)?;
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
+    let key = hex::encode(Sha256::digest(serde_json::to_vec(&root)?));
+    for (suffix, bytes) in [
+        ("identity", identity_bytes),
+        ("admission", serde_json::to_vec(&record)?),
+    ] {
+        let path = directory.join(format!("{key}.{suffix}.json"));
+        fs::write(&path, bytes)?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+/// Build an owned Pi/npm/Node fixture with a frozen complete local inventory.
+#[cfg(unix)]
+pub fn seed_pi_runtime_fixture(
+    project: &TestProject,
+    version: &str,
+    node_version: &str,
+) -> Result<()> {
+    use sha2::{Digest as _, Sha256};
+    use std::collections::BTreeMap;
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, symlink};
+    let package = "@earendil-works/pi-coding-agent";
+    let node_root = project
+        .data_dir
+        .path()
+        .join("versions/node")
+        .join(node_version)
+        .canonicalize()?;
+    let node = node_root.join("bin/node");
+    fs::write(
+        &node,
+        format!(
+            "#!/bin/sh\nif [ \"${{1:-}}\" = '--version' ]; then printf '%s\\n' 'v{node_version}';\nelif [ \"$#\" -ge 1 ] && [ -f \"$1\" ]; then exec \"$@\";\nelse printf '%s\\n' 'fixture-node-{node_version}'; fi\n"
+        ),
+    )?;
+    fs::set_permissions(&node, fs::Permissions::from_mode(0o755))?;
+    let npm_root = node_root.join("lib/node_modules/npm");
+    fs::create_dir_all(npm_root.join("bin"))?;
+    fs::write(npm_root.join("package.json"), br#"{"version":"11.15.0"}"#)?;
+    let npm_cli = npm_root.join("bin/npm-cli.js");
+    fs::write(
+        &npm_cli,
+        "#!/bin/sh\necho 'cached Pi selection must not run npm' >&2\nexit 97\n",
+    )?;
+    fs::set_permissions(&npm_cli, fs::Permissions::from_mode(0o755))?;
+    symlink(
+        "../lib/node_modules/npm/bin/npm-cli.js",
+        node_root.join("bin/npm"),
+    )?;
+    let mut pending = vec![npm_root, node_root.join("bin/npm"), node.clone()];
+    let mut identity = BTreeMap::new();
+    while let Some(path) = pending.pop() {
+        let relative = path
+            .strip_prefix(&node_root)?
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("Non-UTF8 npm fixture path"))?
+            .to_owned();
+        let target = path.canonicalize()?;
+        let metadata = fs::symlink_metadata(&target)?;
+        identity.insert(
+            format!("metadata:{relative}"),
+            hex::encode(Sha256::digest(
+                format!("{}:{}:{}", metadata.mode(), metadata.uid(), metadata.gid()).as_bytes(),
+            )),
+        );
+        if fs::symlink_metadata(&path)?.is_symlink() {
+            identity.insert(
+                format!("link:{relative}"),
+                hex::encode(Sha256::digest(
+                    target
+                        .strip_prefix(&node_root)?
+                        .to_str()
+                        .ok_or_else(|| anyhow::anyhow!("Non-UTF8 npm fixture link"))?
+                        .as_bytes(),
+                )),
+            );
+        }
+        if metadata.is_dir() {
+            identity.insert(
+                format!("directory:{relative}"),
+                hex::encode(Sha256::digest([])),
+            );
+            for child in fs::read_dir(&path)? {
+                pending.push(child?.path());
+            }
+        } else {
+            identity.insert(relative, hex::encode(Sha256::digest(fs::read(path)?)));
+        }
+    }
+    let runtime_content_sha256 = hex::encode(Sha256::digest(serde_json::to_vec(&identity)?));
+    let prefix = project
+        .data_dir
+        .path()
+        .join("versions/pi")
+        .join(version)
+        .canonicalize()?;
+    let payload = prefix.join("node_modules").join(package);
+    fs::create_dir_all(payload.join("dist"))?;
+    fs::create_dir_all(prefix.join("node_modules/.bin"))?;
+    fs::create_dir_all(prefix.join("node_modules/pi-fixture-dependency"))?;
+    fs::write(
+        payload.join("package.json"),
+        serde_json::to_vec(
+            &serde_json::json!({"name":package,"version":version,"bin":{"pi":"dist/cli.js"}}),
+        )?,
+    )?;
+    let entrypoint = payload.join("dist/cli.js");
+    fs::write(
+        &entrypoint,
+        format!("#!/bin/sh\nprintf '%s\\n' 'fixture-pi-{version}'\n"),
+    )?;
+    fs::set_permissions(&entrypoint, fs::Permissions::from_mode(0o755))?;
+    fs::write(
+        prefix.join("node_modules/pi-fixture-dependency/package.json"),
+        br#"{"name":"pi-fixture-dependency","version":"1.0.0"}"#,
+    )?;
+    symlink(
+        "../@earendil-works/pi-coding-agent/dist/cli.js",
+        prefix.join("node_modules/.bin/pi"),
+    )?;
+    let integrity = "sha512-AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+Pw==";
+    let lock = serde_json::json!({"lockfileVersion":3,"packages":{
+        "":{"dependencies":{package:version}},
+        format!("node_modules/{package}"):{"version":version,"resolved":format!("https://registry.npmjs.org/{package}/-/pi-coding-agent-{version}.tgz"),"integrity":integrity,"dependencies":{"pi-fixture-dependency":"1.0.0"}},
+        "node_modules/pi-fixture-dependency":{"version":"1.0.0","resolved":"https://registry.npmjs.org/pi-fixture-dependency/-/pi-fixture-dependency-1.0.0.tgz","integrity":integrity}
+    }});
+    let lock_bytes = serde_json::to_vec(&lock)?;
+    fs::write(prefix.join("package-lock.json"), &lock_bytes)?;
+    fs::write(
+        prefix.join("package.json"),
+        br#"{"name":"omg-managed-tool","version":"0.0.0","private":true}"#,
+    )?;
+    let quote = |path: &Path| -> Result<String> {
+        Ok(format!(
+            "'{}'",
+            path.to_str()
+                .ok_or_else(|| anyhow::anyhow!("Non-UTF8 Pi fixture path"))?
+                .replace('\'', "'\\''")
+        ))
+    };
+    fs::write(
+        prefix.join("bin/pi"),
+        format!(
+            "#!/bin/sh\nexec {} {} \"$@\"\n",
+            quote(&node)?,
+            quote(&entrypoint)?
+        ),
+    )?;
+    fs::set_permissions(prefix.join("bin/pi"), fs::Permissions::from_mode(0o755))?;
+    let assessments = [(package,version),("pi-fixture-dependency","1.0.0")].iter().map(|(name,version)| serde_json::json!({"name":name,"version":version,"source":{"kind":"osv","ecosystem":"npm"},"findings":[]})).collect::<Vec<_>>();
+    let receipt = serde_json::json!({"schema_version":2,"package":format!("{package}@{version}"),"lock_sha256":hex::encode(Sha256::digest(&lock_bytes)),
+        "node_version":node_version,"node_path":node,"node_root":node_root,"runtime_content_sha256":runtime_content_sha256,"reviewed_at":jiff::Timestamp::now(),
+        "review_id":null,"risk_accepted":false,"coverage":"assessed","security_overrides":[],"lifecycle_scripts_ran":false,"npm_signatures_verified":true,"assessments":assessments});
+    fs::write(
+        prefix.join(".omg-npm-advisory-review.json"),
+        serde_json::to_vec_pretty(&receipt)?,
+    )?;
+    Ok(())
 }
 
 impl TestProject {
@@ -737,6 +1206,23 @@ impl TestProject {
                 ("TERM", "dumb"),
                 ("SHELL", "/bin/bash"),
                 ("OMG_TEST_COMMAND_TIMEOUT_SECS", "20"),
+            ],
+        )
+    }
+
+    #[cfg(feature = "arch")]
+    pub fn run_native_arch_status(&self, socket: &Path, args: &[&str]) -> CommandResult {
+        assert!(matches!(
+            args,
+            ["status" | "daemon-status"] | ["status", "--fast"]
+        ));
+        self.run_native_arch_readonly_report(
+            args,
+            &[
+                ("OMG_DISABLE_DAEMON", "0"),
+                ("OMG_SOCKET_PATH", Self::utf8_path(socket)),
+                ("OMG_NO_UPDATE_CHECK", "1"),
+                ("OMG_TEST_COMMAND_TIMEOUT_SECS", "10"),
             ],
         )
     }
@@ -1043,7 +1529,7 @@ pub fn assert_empty_daemon_status(response: omg_lib::daemon::protocol::Response,
                 (0, 0, 0, 0)
             );
             assert!(!status.vulnerabilities_scanned);
-            assert_eq!(status.scanned_vulnerability_count(), None);
+            assert_eq!(status.scanned_vulnerability_summary(), None);
             assert!(status.runtime_versions.is_empty());
         }
         other => panic!("empty isolated status returned {other:?}"),

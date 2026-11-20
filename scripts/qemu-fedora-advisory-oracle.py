@@ -7,6 +7,22 @@ Authentication: https://dnf5.readthedocs.io/en/latest/dnf5.conf.5.html
 import re
 import xml.etree.ElementTree as ET
 
+MAX_REPOSITORY_XML_BYTES = 8 * 1024 * 1024
+
+
+def parse_repository_xml(data):
+    if len(data) > MAX_REPOSITORY_XML_BYTES:
+        raise ValueError("Repository XML exceeds byte limit")
+    try:
+        document = data.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ValueError("Repository XML must be UTF-8") from error
+    if "\0" in document:
+        raise ValueError("Repository XML must be UTF-8 text")
+    if "<!DOCTYPE" in document or "<!ENTITY" in document:
+        raise ValueError("Repository XML declarations are refused")
+    return ET.fromstring(document)
+
 
 def _require(condition, message):
     if not condition:
@@ -158,12 +174,13 @@ def main():
     # catalogue cache used at daemon startup. Import through native DNF in both.
     # https://dnf5.readthedocs.io/en/latest/dnf5.conf.5.html#repo-gpgcheck
     command('dnf-default-key-admission', ['dnf', '--setopt=*.skip_if_unavailable=false', '--refresh', '-y', 'makecache'], ordinary=True)
-    metadata = ET.fromstring(repomd.read_bytes()).find("{http://linux.duke.edu/metadata/repo}data[@type='updateinfo']")
+    with repomd.open("rb") as source:
+        original_repomd = source.read(MAX_REPOSITORY_XML_BYTES + 1)
+    metadata = parse_repository_xml(original_repomd).find("{http://linux.duke.edu/metadata/repo}data[@type='updateinfo']")
     location = metadata.find('{http://linux.duke.edu/metadata/repo}location').attrib['href']
     compressed = (repo/location).resolve(strict=True)
     _require(compressed.is_relative_to(repo.resolve()) and compressed.name.endswith('-updateinfo.xml.gz'), 'native Fedora advisory fixture check failed')
     (logs/'updateinfo.xml.gz').write_bytes(compressed.read_bytes())
-    original_repomd = repomd.read_bytes()
     new_nevra = 'glibc-'+(identity['epoch']+':' if identity['epoch']!='0' else '')+identity['version']+'-'+identity['release']+'.omgqemu616.'+identity['arch']
     selected = command('native-advisory-list', common+['--refresh', 'advisory', 'list', '--available', '--security', '--json'], ordinary=True)
     selected_rows = json.loads(selected.stdout)

@@ -495,7 +495,7 @@ pub enum Commands {
         to: Option<String>,
     },
 
-    /// Roll back to a previous system state
+    /// Restore a recorded package removal or upgrade
     Rollback {
         /// Transaction ID to roll back to (selects most recent if not specified)
         id: Option<String>,

@@ -1,4 +1,4 @@
-# Fedora 44 SQLite WAL baseline supplement
+# Fedora 44 SQLite baseline supplement
 
 This review covers only the Fedora QEMU baseline. The publisher image pins,
 image signature verifier, native/KVM requirements and other distro gates stay
@@ -17,7 +17,7 @@ The retained WAL backport is combined with the exact upstream `walrestart.test`
 from [SQLite commit fe57e14](https://github.com/sqlite/sqlite/commit/fe57e14b49f9189b56da8233ab3415ce5ff6b1ff),
 plus its upstream callback cleanup described below.
 The added test is discovered by the original complete test suite. The package
-release is `2.omgci.walreset2.fc44` to distinguish it from the earlier privately
+release is `2.omgci.walreset3.fc44` to distinguish it from the earlier privately
 verified fixture. Its source, patch, key and pinned builder image are recorded
 in `fedora-sqlite.json`.
 
@@ -80,7 +80,7 @@ all 81,795 committed rows recovered, matching exact IDs and passing integrity
 before and after reopening. DNF5/libdnf5 remained `5.4.1.0-1.fc44`.
 
 That evidence supports the WAL-code change, but it does not substitute for the
-new `walreset2` supply build and candidate CI. Those must pass before this change
+current supply build and candidate CI. Those must pass before this change
 lands. ARM receives no runtime credit without its existing real native ARM/KVM
 runner gate and guest evidence. This review does not establish the historical
 cause of #626 or #623. The separate compatible dependency blocker #996 still
@@ -121,3 +121,60 @@ merge these archives into one parent; each attempt retains its own directory.
 Single and multiple downloads then have the same layout. The existing latest
 attempt selector, exact source admission and pinned action's fatal digest
 verification stay intact. No custom downloader or fallback to bad older supply.
+
+## Reference-counted table formatting
+
+The `eba415af` full RPM check failed in `fts5integrity.test:382` when Tcl 9
+refused invalid Unicode in an EXPLAIN diagnostic. Native Fedora 44 SQLite 3.51.2
+independently reproduces the underlying defect: the VCheck row's P4 contains
+pointer bytes instead of the virtual table's name.
+
+The pinned [pragma generator](https://github.com/sqlite/sqlite/blob/version-3.51.2/src/pragma.c)
+uses `P4_TABLEREF` for VCheck. Its
+[opcode implementation](https://github.com/sqlite/sqlite/blob/version-3.51.2/src/vdbe.c)
+reads a `Table*`, and `vdbe.h` defines this tag as reference-counted `P4_TABLE`.
+The [P4 formatter](https://github.com/sqlite/sqlite/blob/version-3.51.2/src/vdbeaux.c)
+handles only `P4_TABLE`, so the reference-counted pointer falls through to the
+string case. The supplement adds `P4_TABLEREF` to that existing table-name case.
+It changes neither table ownership nor opcode execution.
+
+The existing FTS5 file gains `fts5integrity-12.2.1`, asserting the actual VCheck
+P4 table name after reopening the database read-only. Admission requires this
+assertion exactly once. All existing assertions, original file inventories,
+Tcl encoding behavior, RPM checks and limits remain. Older `walreset2` bundles
+are refused under the new package identity and patch digest. Native full RPM
+checking and fresh pinned-container CI remain required for this supplement.
+
+### Native Fedora WSL evidence
+
+On November 15, the complete source build at `c53b367f` passed the original
+`rpmbuild -ba` checks on Fedora 44 WSL: 393,842 assertions and 46,391 fuzz cases,
+zero errors. All 1,218 required test files retain the recorded inventory hash.
+FD exhaustion, every WAL assertion and `fts5integrity-12.2.1` executed with their
+required counts. The source signature, reviewed material hashes and resulting
+package bundle passed the existing verifier.
+
+The extracted built library has SHA-256
+`e07afe6ae51f49e85faf6f577eae81bb207d86dc89658c9b83f335e833353050`.
+A fresh Python process verified that exact mapped library, correct VCheck names
+for ASCII, Unicode and quoted identifiers, and successful integrity checks.
+The library was used only through a private process environment; the custom RPM
+was not installed into the WSL system. This local WSL environment is not the
+pinned CI container. Its bundle is not substituted for trusted workflow supply,
+and it grants no ARM, KVM, guest lifecycle or product-release acceptance.
+
+### Pinned hosted build
+
+The [full RPM job at `8cec97cc`](https://github.com/omg-cli/omg/actions/runs/43754963552/job/132936970217)
+passed in the policy's pinned Fedora image. Its PR merge commit is
+`626d04ded85c04c4b7c8f8ccaafa902bdf3793b1`; its Git tree equals the PR head's
+`be4f4b1c0c3db85e3aef79637a5c4d69cd0bfcfc`.
+
+The [bundle artifact](https://github.com/omg-cli/omg/actions/runs/43754963552/artifacts/14178660473)
+has SHA-256 `56388f00550d18b800ee2a2e41a387c80d7e1fb8a64f5eb1009e5b66fcb65115`.
+After digest verification, the existing bundle verifier admitted it against
+that exact merge revision and current policy. Its 393,842 assertions, 46,391
+fuzz cases, 1,218-file inventory and required assertion counts all pass. The
+built library hash equals the independently built WSL library hash above.
+This closes the pinned source-build check; product guest execution, ARM and
+release acceptance remain separate requirements.

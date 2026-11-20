@@ -51,6 +51,7 @@ async fn test_metrics_endpoint_returns_valid_data() {
         metrics.requests_total >= 1,
         "the metrics request itself must be counted"
     );
+    omg_lib::core::security::audit::flush_pending_audit_events().unwrap();
 }
 
 #[tokio::test]
@@ -72,6 +73,7 @@ async fn test_suggest_endpoint_handles_empty_query() {
             result: ResponseResult::Suggest(ref suggestions),
         } if suggestions.is_empty()
     ));
+    omg_lib::core::security::audit::flush_pending_audit_events().unwrap();
 }
 
 #[tokio::test]
@@ -141,6 +143,7 @@ async fn test_cache_clear_invalidates_cache() {
         misses_after_clear > misses_after_repeat,
         "search after CacheClear must be a cache miss again"
     );
+    omg_lib::core::security::audit::flush_pending_audit_events().unwrap();
 }
 
 // ============================================================================
@@ -180,6 +183,7 @@ async fn test_invalid_package_name_returns_helpful_error() {
             }
         }
     }
+    omg_lib::core::security::audit::flush_pending_audit_events().unwrap();
 }
 
 #[tokio::test]
@@ -208,6 +212,7 @@ async fn test_oversized_query_is_rejected() {
         }
         Response::Success { .. } => unreachable!("Should reject oversized query"),
     }
+    omg_lib::core::security::audit::flush_pending_audit_events().unwrap();
 }
 
 #[tokio::test]
@@ -238,6 +243,20 @@ async fn test_state_recovery_after_error() {
             result: ResponseResult::Ping(ref message),
         } if message == "pong"
     ));
+    omg_lib::core::security::audit::flush_pending_audit_events().unwrap();
+    let body = std::fs::read_to_string(_temp.path().join("audit/audit.jsonl"))
+        .expect("rejected IPC input must leave a durable audit record");
+    let entries = body
+        .lines()
+        .map(|line| {
+            serde_json::from_str::<omg_lib::core::security::audit::AuditEntry>(line).unwrap()
+        })
+        .collect::<Vec<_>>();
+    assert!(entries.iter().any(|entry| {
+        entry.resource == "daemon_handler"
+            && entry.event_type == omg_lib::core::security::audit::AuditEventType::PolicyViolation
+    }));
+    assert!(entries.iter().all(|entry| entry.verify()));
 }
 
 // ============================================================================
@@ -261,6 +280,7 @@ async fn test_health_status_reflects_cache_size() {
     };
     assert_eq!(health.cache_size, 0);
     assert_eq!(health.status, "healthy");
+    omg_lib::core::security::audit::flush_pending_audit_events().unwrap();
 }
 
 #[tokio::test]
@@ -304,4 +324,5 @@ async fn test_metrics_increment_on_requests() {
         initial_metrics.requests_total + 6,
         "five pings and the final metrics request must be counted"
     );
+    omg_lib::core::security::audit::flush_pending_audit_events().unwrap();
 }

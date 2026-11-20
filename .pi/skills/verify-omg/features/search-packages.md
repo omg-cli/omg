@@ -20,7 +20,7 @@ Users search configured package repositories by name and receive ranked package 
 
 Preconditions: the helper doctor passes and the host pacman database contains official repositories.
 
-- Official bounded search: `./.pi/skills/verify-omg/bin/verify-omg drive search-official -- search zsh --no-aur --limit 3`; require exit zero, the `Search Results` heading, at least one package containing `zsh`, an `Official` source label, and no more than three displayed package rows before any `(+N more packages...)` summary.
+- Official bounded search: `./.pi/skills/verify-omg/bin/verify-omg drive search-official -- search zsh --no-aur --limit 3`; require exit zero, the `Search` heading, at least one package containing `zsh`, an `Official` source label, and no more than three displayed package rows before any `(+N more packages...)` summary.
 - Detailed search: `./.pi/skills/verify-omg/bin/verify-omg drive search-detailed -- search zsh --no-aur --detailed --limit 3`; require exit zero and additional source/version metadata beyond the compact view.
 - AUR-inclusive search: `./.pi/skills/verify-omg/bin/verify-omg drive search-aur -- search visual-studio-code --limit 5`; require exit zero and matching results. Record network/AUR unavailability as a blocked entry point, not an official-search pass.
 - Empty search: `./.pi/skills/verify-omg/bin/verify-omg drive search-empty -- search omg-verification-no-such-package-9f67a4 --no-aur --limit 3`; require an explicit no-results state and no fabricated package row.

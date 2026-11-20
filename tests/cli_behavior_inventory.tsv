@@ -79,7 +79,7 @@ audit-fix	["audit","fix","--dry-run"]	read	1	pass	-	hermetic	hermetic:pass	audit
 audit-export	["audit","export","--output","${ROOT}/audit-evidence"]	isolated-write	1	pass	-	hermetic	hermetic:pass	local:audit-export	tempdir-drop
 audit-eol	["audit","eol"]	read	0	pass	-	hermetic	hermetic:pass	audit-eol-state	tempdir-drop
 run	["run","smoke","--using","make"]	read	0	pass	-	hermetic	hermetic:pass	task-executed	tempdir-drop
-new	["new","rust","smoke-app"]	isolated-write	1	pass	-	hermetic	hermetic:pass	-	tempdir-drop
+new	["new","rust","smoke-app"]	isolated-write	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 tool-install	["tool","install","--help"]	help-boundary	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 tool-list	["tool","list"]	read	0	pass	-	hermetic	hermetic:pass	local:tool-list	tempdir-drop
 tool-remove	["tool","remove","--help"]	help-boundary	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop

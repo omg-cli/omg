@@ -30,6 +30,7 @@ pub(crate) struct BunVersion {
 }
 
 pub(crate) struct BunManager {
+    security: super::security::RuntimeSecurity,
     versions_dir: PathBuf,
     client: &'static reqwest::Client,
 }
@@ -37,6 +38,7 @@ pub(crate) struct BunManager {
 impl BunManager {
     pub fn new() -> Self {
         Self {
+            security: super::security::RuntimeSecurity::default(),
             versions_dir: super::DATA_DIR.join("versions/bun"),
             client: download_client(),
         }
@@ -106,9 +108,8 @@ impl BunManager {
         download_with_progress(self.client, &url, &download_path, &checksum).await?;
 
         println!("{} Extracting (pure Rust)...", style::informative("→"));
-        let staging = begin_staged_install(&self.versions_dir)?;
-        extract_zip(&download_path, staging.path(), 1).await?;
-        self.publish_install(&staging, &version)?;
+        self.publish_download(&download_path, &url, &version)
+            .await?;
 
         print_installed("Bun", &version);
         self.use_version(&version)?;
@@ -116,8 +117,25 @@ impl BunManager {
         Ok(())
     }
 
+    async fn publish_download(&self, download_path: &Path, url: &str, version: &str) -> Result<()> {
+        let version_dir = self.versions_dir.join(version);
+        let publisher =
+            super::security::record_download("bun", version, &version_dir, download_path, url)?;
+        let staging = begin_staged_install(&self.versions_dir)?;
+        extract_zip(download_path, staging.path(), 1).await?;
+        self.publish_install(&staging, version)?;
+        publisher.commit();
+        Ok(())
+    }
+
     fn publish_install(&self, staging: &tempfile::TempDir, version: &str) -> Result<()> {
         super::common::require_regular_file(&staging.path().join("bun"))?;
+        let _admission = self.security.prepare_staged(
+            "bun",
+            version,
+            staging.path(),
+            &self.versions_dir.join(version),
+        )?;
         complete_staged_install(staging, &self.versions_dir.join(version), version)
     }
 
@@ -167,6 +185,14 @@ impl BunManager {
     /// Switch to a specific version
     pub fn use_version(&self, version: &str) -> Result<()> {
         let version = normalize_version(version);
+        crate::core::security::validate_runtime_version(&version)?;
+        super::common::require_regular_file(&self.versions_dir.join(&version).join("bun"))?;
+        let admission = self.security.installed(
+            "bun",
+            &self.versions_dir.join(&version),
+            super::security::ReviewMode::FreshAttended,
+        )?;
+        admission.verify(&self.versions_dir.join(&version))?;
         activate_version(&self.versions_dir, &version, Path::new("bun"))?;
         print_using("Bun", &version, &self.versions_dir.join("current"));
         Ok(())
@@ -233,6 +259,64 @@ fn bun_platform() -> Result<String> {
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires isolated fixed-public TLS native fixture"]
+    async fn native_public_install_preserves_authenticated_download_boundary() {
+        use super::super::test_archive::{Launcher, PublicationFixture, zip};
+        use sha2::{Digest as _, Sha256};
+
+        let version = "1.4.0";
+        let filename = format!(
+            "bun-{}.zip",
+            bun_platform().expect("supported native Bun host")
+        );
+        let archive = zip("runtime", "bun", Launcher::Regular).expect("owned Bun vendor ZIP");
+        let metadata = serde_json::to_vec(&serde_json::json!({
+            "tag_name": format!("bun-v{version}"), "prerelease": false,
+            "assets": [{"name": filename, "digest": format!("sha256:{}", hex::encode(Sha256::digest(&archive)))}]
+        })).expect("controlled Bun publisher metadata");
+        let metadata_path = format!("/repos/oven-sh/bun/releases/tags/bun-v{version}");
+        let archive_path = format!("/oven-sh/bun/releases/download/bun-v{version}/{filename}");
+        super::super::test_https::fixed_public_routes(&[
+            ("api.github.com", &metadata_path, &metadata),
+            ("github.com", &archive_path, &archive),
+        ]);
+
+        let fixture = PublicationFixture::new("bun", "bun");
+        let manager = BunManager {
+            security: super::super::security::RuntimeSecurity::fixture(),
+            versions_dir: fixture.versions.clone(),
+            client: download_client(),
+        };
+        manager
+            .install(version)
+            .await
+            .expect("public verified Bun installation");
+        let installed = fixture.versions.join(version);
+        assert!(super::super::common::is_valid_version_dir(&installed));
+        assert_eq!(
+            fs::read(installed.join("bun")).expect("complete Bun launcher"),
+            b"fixture launcher"
+        );
+        assert_eq!(
+            fs::canonicalize(fixture.versions.join("current")).unwrap(),
+            fs::canonicalize(&installed).unwrap()
+        );
+        super::super::security::admit_installed(
+            "bun",
+            &installed,
+            super::super::security::ReviewMode::CachedOnly,
+        )
+        .expect("exact public Bun admission")
+        .verify(&installed)
+        .expect("published Bun tree remains bound");
+        assert_eq!(
+            fs::read(fixture.versions.join("1.0.0/bun")).unwrap(),
+            b"previous reviewed runtime"
+        );
+    }
+
     #[tokio::test]
     async fn incomplete_bun_archive_is_not_published_and_can_be_retried() -> Result<()> {
         check_archive_publication(super::super::test_archive::Launcher::Missing).await
@@ -249,6 +333,7 @@ mod tests {
         use super::super::test_archive::{Launcher, zip};
         let versions = tempfile::tempdir()?;
         let manager = BunManager {
+            security: crate::runtimes::security::RuntimeSecurity::fixture(),
             versions_dir: versions.path().to_path_buf(),
             client: download_client(),
         };
@@ -271,7 +356,21 @@ mod tests {
         let staging = begin_staged_install(versions.path())?;
         fs::write(&archive_path, zip("runtime", "bun", Launcher::Regular)?)?;
         extract_zip(&archive_path, staging.path(), 1).await?;
+        crate::runtimes::security::fixture_bind_candidate(
+            "bun",
+            "1.4.0",
+            staging.path(),
+            &manager.versions_dir.join("1.4.0"),
+        )
+        .expect("seed controlled publisher authority");
         manager.publish_install(&staging, "1.4.0")?;
+        crate::runtimes::security::fixture_bind_candidate(
+            "bun",
+            "1.4.0",
+            &manager.versions_dir.join("1.4.0"),
+            &manager.versions_dir.join("1.4.0"),
+        )
+        .expect("seed controlled publisher authority");
         manager.use_version("1.4.0")?;
         assert_eq!(manager.list_installed()?, vec!["1.4.0"]);
         assert_eq!(manager.current_version().as_deref(), Some("1.4.0"));
@@ -395,5 +494,67 @@ mod tests {
         assert_eq!(pick_latest_stable(versions), Some("1.1.5".to_string()));
         assert_eq!(pick_latest_stable(Vec::new()), None);
         assert_eq!(pick_latest_stable(vec![ver("1.2.0-rc.1", true)]), None);
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn downloaded_publication_preserves_prior_authority_and_rejects_changed_reviewed_content()
+    {
+        use super::super::test_archive::{Launcher, zip};
+        use super::super::test_archive::{PublicationFixture, mutation_security};
+        let fixture = PublicationFixture::new("bun", "bun");
+        let mut manager = BunManager {
+            security: super::super::security::RuntimeSecurity::fixture(),
+            versions_dir: fixture.versions.clone(),
+            client: download_client(),
+        };
+        let url = "https://github.com/oven-sh/bun/releases/download/bun-v1.4.0/bun-linux-x64.zip";
+        assert!(
+            manager
+                .publish_download(&fixture.archive, url, "1.4.0")
+                .await
+                .is_err()
+        );
+        fixture.assert_previous();
+        fixture.write(b"not an archive");
+        assert!(
+            manager
+                .publish_download(&fixture.archive, url, "1.4.0")
+                .await
+                .is_err()
+        );
+        fixture.assert_previous();
+        let bytes = zip("runtime", "bun", Launcher::Regular).expect("controlled publisher archive");
+        fixture.write(&bytes);
+        manager.security = mutation_security(&fixture.versions);
+        let error = manager
+            .publish_download(&fixture.archive, url, "1.4.0")
+            .await
+            .expect_err("changed reviewed payload must not publish");
+        assert!(
+            format!("{error:#}").contains("Runtime content changed after advisory review"),
+            "{error:#}"
+        );
+        assert!(!fixture.versions.join("1.4.0").exists());
+        fixture.assert_previous();
+        manager.security = super::super::security::RuntimeSecurity::fixture();
+        manager
+            .publish_download(&fixture.archive, url, "1.4.0")
+            .await
+            .expect("publish complete reviewed publisher tree");
+        fixture.assert_previous();
+        manager
+            .use_version("1.4.0")
+            .expect("activate admitted publisher tree");
+        assert_eq!(
+            fs::read(fixture.versions.join("current/bun")).expect("selected reviewed launcher"),
+            b"fixture launcher"
+        );
+        fs::remove_file(fixture.versions.join("current"))
+            .expect("restore controlled prior selection");
+        std::os::unix::fs::symlink("1.0.0", fixture.versions.join("current"))
+            .expect("restore prior selection");
+        fixture.corrupt_identity("1.4.0");
+        assert!(manager.use_version("1.4.0").is_err());
+        fixture.assert_previous();
     }
 }

@@ -22,7 +22,7 @@ opts=(-i client-key -p 2222 -o BatchMode=yes -o ConnectTimeout=5
   -o UserKnownHostsFile=known_hosts)
 scp_opts=(-i client-key -P 2222 -o BatchMode=yes -o ConnectTimeout=5
   -o StrictHostKeyChecking=yes -o UserKnownHostsFile=known_hosts)
-bin="/home/bench/omg-${tag}-${arch}-linux-${distro}/omg"
+bin="/opt/omg-qemu/omg-${tag}-${arch}-linux-${distro}/omg"
 # Same bounded setup/readiness/cloud-init/identity contract as initial boot.
 source /work/qemu-boot-budget.sh
 clone_boot_timeout=$CLONE_BOOT_TIMEOUT
@@ -180,6 +180,11 @@ start_clone() {
   # before the next trial can overwrite the evidence for a failed boot.
   if [[ -f qemu-startup.log && ! -L qemu-startup.log ]]; then
     cp -- qemu-startup.log "${log%.log}.qemu-startup.log" || return 3
+  fi
+  if [[ "$rc" == 0 ]]; then
+    remote_argv timeout --kill-after=5s 90s sudo -n python3 \
+      /home/bench/provision-qemu-crash-channel.py \
+      > "${log%.log}.crash-channel.json" 2> "${log%.log}.crash-channel.log" || rc=$?
   fi
   return "$rc"
 }

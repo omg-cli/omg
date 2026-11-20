@@ -32,6 +32,11 @@ fn node_bin(data: &std::path::Path, version: &str) -> PathBuf {
     data.join("versions/node").join(version).join("bin")
 }
 
+fn review_owned_fixture(data: &std::path::Path, runtime: &str, version: &str) {
+    seed_runtime_advisory_fixture_at(data, &omg_lib::core::paths::config_dir(), runtime, version)
+        .expect("seed explicit controlled runtime authority");
+}
+
 // ══════════════════════════════════════════════════════════════════════════
 // Native resolution branches of build_path_additions
 // ══════════════════════════════════════════════════════════════════════════
@@ -44,6 +49,7 @@ fn node_pin_resolves_to_exact_installed_bin_dir() {
     let tmp = tempfile::tempdir().unwrap();
     let data = tmp.path();
     std::fs::create_dir_all(node_bin(data, "20.11.1")).expect("create fixture directory");
+    review_owned_fixture(data, "node", "20.11.1");
     with_test_env(
         &[
             ("OMG_DATA_DIR", data.to_str().unwrap()),
@@ -69,6 +75,7 @@ fn v_prefixed_node_pin_normalizes_before_lookup() {
     let tmp = tempfile::tempdir().unwrap();
     let data = tmp.path();
     std::fs::create_dir_all(node_bin(data, "20.11.0")).expect("create fixture directory");
+    review_owned_fixture(data, "node", "20.11.0");
     with_test_env(
         &[
             ("OMG_DATA_DIR", data.to_str().unwrap()),
@@ -95,6 +102,7 @@ fn caret_requirement_resolves_highest_matching_installed_version() {
     let data = tmp.path();
     for v in ["18.19.0", "20.11.1", "20.12.0"] {
         std::fs::create_dir_all(node_bin(data, v)).expect("create fixture directory");
+        review_owned_fixture(data, "node", v);
     }
     with_test_env(
         &[
@@ -122,6 +130,7 @@ fn unsupported_runtime_pins_never_reach_path() {
     let data = tmp.path();
     std::fs::create_dir_all(data.join("versions/deno/1.40.0/bin"))
         .expect("create fixture directory");
+    review_owned_fixture(data, "deno", "1.40.0");
     std::fs::create_dir_all(data.join("versions/omg-test-unsupported-runtime/0.11.0/bin"))
         .expect("create fixture directory");
     with_test_env(
@@ -169,6 +178,7 @@ fn validated_runtime_pins_resolve_for_all_native_runtimes() {
                     .join(directory)
                     .join("bin");
                 std::fs::create_dir_all(&expected).expect("create fixture directory");
+                review_owned_fixture(data, runtime, directory);
                 let additions =
                     build_path_additions(&pin_map(&[(runtime, version)])).expect("resolution");
                 assert_eq!(
@@ -200,6 +210,7 @@ fn rust_channel_pin_resolves_to_toolchain_bin_dir() {
         .join(format!("stable-{host}"))
         .join("bin");
     std::fs::create_dir_all(&expected).expect("create fixture directory");
+    review_owned_fixture(data, "rust", &format!("stable-{host}"));
     with_test_env(
         &[
             ("OMG_DATA_DIR", data.to_str().unwrap()),
@@ -227,6 +238,7 @@ fn bun_pin_resolves_to_version_root_without_bin_suffix() {
     let data = tmp.path();
     let expected = data.join("versions/bun/1.1.4");
     std::fs::create_dir_all(&expected).expect("create fixture directory");
+    review_owned_fixture(data, "bun", "1.1.4");
     with_test_env(
         &[
             ("OMG_DATA_DIR", data.to_str().unwrap()),
@@ -252,12 +264,11 @@ fn bun_pin_resolves_to_version_root_without_bin_suffix() {
 // nvm_node_bin: alias fallback and traversal guards
 // ══════════════════════════════════════════════════════════════════════════
 
-/// Contract: when no native install matches, a non-numeric pin falls back to
-/// `$NVM_DIR`: `alias/default` is resolved to a concrete version and the
-/// nvm-managed bin dir is placed on PATH.
+/// An external NVM alias without advisory authority never reaches PATH.
+/// A separately reviewed owned installation remains eligible.
 #[test]
 #[serial]
-fn nvm_alias_pin_falls_back_to_nvm_managed_install() {
+fn nvm_alias_pin_requires_review_before_it_reaches_path() {
     let tmp = tempfile::tempdir().unwrap();
     let data = tmp.path();
     let nvm = tmp.path().join("nvm-home");
@@ -273,19 +284,30 @@ fn nvm_alias_pin_falls_back_to_nvm_managed_install() {
         || {
             let additions =
                 build_path_additions(&pin_map(&[("node", "default")])).expect("resolution");
+            assert!(
+                additions.is_empty(),
+                "unreviewed external NVM alias reached PATH"
+            );
+            review_owned_fixture(&nvm, "node", "v20.10.0");
             assert_eq!(
-                additions,
+                build_path_additions(&pin_map(&[("node", "default")])).unwrap(),
                 vec![nvm_bin.display().to_string()],
-                "`default` alias must resolve through $NVM_DIR"
+                "an explicitly reviewed NVM alias retains its normal resolution"
+            );
+            let managed = node_bin(data, "20.10.0");
+            std::fs::create_dir_all(&managed).unwrap();
+            review_owned_fixture(data, "node", "20.10.0");
+            assert_eq!(
+                build_path_additions(&pin_map(&[("node", "20.10.0")])).unwrap(),
+                vec![managed.display().to_string()],
+                "reviewed owned Node remains usable"
             );
         },
     );
 }
 
-/// Contract (audit sec14 F1, validator layer): a repo-supplied pin containing
-/// parent-directory components is refused outright, even though the escape
-/// target really exists inside the nvm tree — i.e. if the validation guard
-/// were removed, this test would see the escaped dir placed on PATH.
+/// A repo-supplied traversal pin remains refused when its external NVM target
+/// exists. Reviewed managed versions provide the valid-pin control.
 #[test]
 #[serial]
 fn nvm_hostile_multicomponent_pin_refused_by_validator() {
@@ -293,8 +315,7 @@ fn nvm_hostile_multicomponent_pin_refused_by_validator() {
     let data = tmp.path();
     let nvm = tmp.path().join("nvm-home");
     // Make the unguarded traversal fully resolvable: intermediate dir exists
-    // and the final target is a real dir inside the nvm tree, so ONLY the
-    // validator stands between the pin and PATH.
+    // and the final target is a real, reviewed dir inside the nvm tree.
     std::fs::create_dir_all(nvm.join("versions/node/v20.11.1")).expect("create fixture directory");
     let inner_target = nvm.join("versions/node/v20.12.0/bin");
     std::fs::create_dir_all(&inner_target).expect("create fixture directory");
@@ -320,10 +341,23 @@ fn nvm_hostile_multicomponent_pin_refused_by_validator() {
         || {
             let valid = build_path_additions(&pin_map(&[("node", "20.12.0")]))
                 .expect("resolve valid nvm pin");
+            assert!(
+                valid.is_empty(),
+                "unreviewed external NVM target must remain refused"
+            );
+            review_owned_fixture(&nvm, "node", "v20.12.0");
             assert_eq!(
-                valid,
+                build_path_additions(&pin_map(&[("node", "20.12.0")])).unwrap(),
                 vec![inner_target.display().to_string()],
-                "the target must be accepted through a valid pin"
+                "the traversal target must resolve when explicitly reviewed and addressed by a valid pin"
+            );
+            let managed = node_bin(data, "20.12.0");
+            std::fs::create_dir_all(&managed).unwrap();
+            review_owned_fixture(data, "node", "20.12.0");
+            assert_eq!(
+                build_path_additions(&pin_map(&[("node", "20.12.0")])).unwrap(),
+                vec![managed.display().to_string()],
+                "valid reviewed managed pin must resolve"
             );
             let additions =
                 build_path_additions(&pin_map(&[("node", hostile_pin)])).expect("resolution");
@@ -402,13 +436,7 @@ fn nearest_version_file_wins_over_parent_directory() {
 // Shell emission (end-to-end through the real binary)
 // ══════════════════════════════════════════════════════════════════════════
 
-fn assert_hook_env_path_round_trip(shell: &str, script: &str, bin: &std::path::Path) {
-    let executable = which::which(shell).unwrap_or_else(|error| {
-        panic!("{shell} is required to execute the hook quoting contract: {error}")
-    });
-    let fixture = tempfile::tempdir().unwrap();
-    let script_path = fixture.path().join("hook-env");
-    std::fs::write(&script_path, script).unwrap();
+fn write_quoted_node_fixture(bin: &std::path::Path) {
     let node = bin.join("node");
     std::fs::write(&node, "#!/bin/sh\nprintf 'quoted-runtime-executed\\n'\n").unwrap();
     #[cfg(unix)]
@@ -416,6 +444,15 @@ fn assert_hook_env_path_round_trip(shell: &str, script: &str, bin: &std::path::P
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&node, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
+}
+
+fn assert_hook_env_path_round_trip(shell: &str, script: &str, bin: &std::path::Path) {
+    let executable = which::which(shell).unwrap_or_else(|error| {
+        panic!("{shell} is required to execute the hook quoting contract: {error}")
+    });
+    let fixture = tempfile::tempdir().unwrap();
+    let script_path = fixture.path().join("hook-env");
+    std::fs::write(&script_path, script).unwrap();
     let base = "user's added tools:/usr/bin:/bin";
     let prefix = "virtual environment's bin";
     let (startup, commands) = match shell {
@@ -461,13 +498,20 @@ fn hook_env_zsh_quotes_apostrophe_data_dir_posix_style() {
     let data = tmp.path().join("omg's da'ta");
     let bin = data.join("versions/node/20.11.1/bin");
     std::fs::create_dir_all(&bin).expect("create fixture directory");
+    write_quoted_node_fixture(&bin);
+    let config = tempfile::tempdir().unwrap();
+    seed_runtime_advisory_fixture_at(&data, config.path(), "node", "20.11.1")
+        .expect("review quoted runtime fixture");
     let project = tempfile::tempdir().unwrap();
     std::fs::write(project.path().join(".nvmrc"), "20.11.1").unwrap();
 
     let result = run_omg_with_options(
         &["hook-env", "-s", "zsh"],
         Some(project.path()),
-        &[("OMG_DATA_DIR", data.to_str().unwrap())],
+        &[
+            ("OMG_DATA_DIR", data.to_str().unwrap()),
+            ("OMG_CONFIG_DIR", config.path().to_str().unwrap()),
+        ],
     );
     result.assert_success();
 
@@ -482,13 +526,20 @@ fn hook_env_fish_emits_fish_quoted_add_path() {
     let data = tmp.path().join("omg's data");
     let bin = data.join("versions/node/20.11.1/bin");
     std::fs::create_dir_all(&bin).expect("create fixture directory");
+    write_quoted_node_fixture(&bin);
+    let config = tempfile::tempdir().unwrap();
+    seed_runtime_advisory_fixture_at(&data, config.path(), "node", "20.11.1")
+        .expect("review quoted runtime fixture");
     let project = tempfile::tempdir().unwrap();
     std::fs::write(project.path().join(".nvmrc"), "20.11.1").unwrap();
 
     let result = run_omg_with_options(
         &["hook-env", "-s", "fish"],
         Some(project.path()),
-        &[("OMG_DATA_DIR", data.to_str().unwrap())],
+        &[
+            ("OMG_DATA_DIR", data.to_str().unwrap()),
+            ("OMG_CONFIG_DIR", config.path().to_str().unwrap()),
+        ],
     );
     result.assert_success();
 

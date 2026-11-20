@@ -273,7 +273,9 @@ impl DaemonClient {
     pub async fn security_audit(&mut self) -> Result<SecurityAuditResult> {
         let id = self.request_id.fetch_add(1, Ordering::SeqCst);
         let response = self.call(Request::SecurityAudit { id }).await?;
-        extract_response(response, id, as_audit)
+        let result = extract_response(response, id, as_audit)?;
+        result.validate().context("Invalid daemon security audit")?;
+        Ok(result)
     }
 
     /// Get fuzzy suggestions for a package name
@@ -489,6 +491,50 @@ impl SyncDaemonClient {
 #[cfg(test)]
 mod tests {
     use super::is_truthy_env_value;
+
+    #[tokio::test]
+    async fn security_audit_refuses_inconsistent_totals_from_a_valid_frame() {
+        use super::{SinkExt, StreamExt};
+        for (total, high, valid) in [
+            (0, 0, false),
+            (2, 1, false),
+            (1, 0, false),
+            (1, 2, false),
+            (1, 1, true),
+        ] {
+            let identity =
+                serde_json::json!({"name":"fixture", "version":"1-1", "architecture":null});
+            let audit = serde_json::from_value(serde_json::json!({
+                "coverage": { "status": "reported", "assessed": [identity], "unassessed": [],
+                    "sources": [{"kind":"osv", "ecosystem":"Arch Linux:fixture"}] },
+                "total_vulnerabilities": total, "high_severity": high,
+                "vulnerabilities": [["fixture", [{ "id": "CVE-2026-1234", "summary": "known issue", "score": "9.8", "affected_installed": [identity] }]]]
+            })).expect("valid audit wire shape");
+            let (mut client, mut server) = stream_pair();
+            let responder = async move {
+                let frame = server.next().await.unwrap().unwrap();
+                let (_, payload) = crate::daemon::protocol::split_frame(&frame).unwrap();
+                let request: super::Request = bitcode::deserialize(payload).unwrap();
+                assert!(matches!(request, super::Request::SecurityAudit { id: 1 }));
+                let response = crate::daemon::protocol::encode_frame(&super::Response::Success {
+                    id: 1,
+                    result: super::ResponseResult::SecurityAudit(audit),
+                })
+                .unwrap();
+                server.send(response.into()).await.unwrap();
+            };
+            let (answer, ()) = tokio::join!(client.security_audit(), responder);
+            if valid {
+                let audit = answer.expect("consistent audit must remain readable");
+                assert_eq!(audit.total_vulnerabilities, 1);
+                assert_eq!(audit.high_severity, 1);
+            } else {
+                let error =
+                    answer.expect_err("inconsistent totals must not become a successful scan");
+                assert!(format!("{error:#}").contains("mismatch"), "{error:#}");
+            }
+        }
+    }
 
     fn stream_pair() -> (
         super::DaemonClient,

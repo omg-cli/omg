@@ -487,17 +487,18 @@ class GitHub:
         spec = importlib.util.spec_from_file_location('helper_native_transport', Path(__file__).with_name('native-build-artifact.py'))
         transport = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(transport)
+        metadata_limit = 1024 * 1024
         for attempt in range(3):
             remaining = self.deadline - time.monotonic()
             require(remaining > 0, 'helper admission deadline exhausted')
             try:
-                content = transport.api(endpoint, MAX_RECEIPT if binary else 1024 * 1024 + 65536,
+                content = transport.api(endpoint, MAX_RECEIPT if binary else metadata_limit + transport.MAX_HTTP_HEADERS,
                                         include_status=not binary, timeout=min(60, remaining))
             except (subprocess.TimeoutExpired, subprocess.CalledProcessError) as error:
                 if isinstance(error, subprocess.CalledProcessError):
                     if binary or not error.output or not error.output.startswith(b'HTTP/'):
                         raise
-                    status, _, retry_after = transport.metadata_response(error.output)
+                    status, _, retry_after = transport.http_response(error.output, metadata_limit)
                     if status not in (502, 503, 504) or retry_after:
                         raise
                 delay = 2 ** attempt
@@ -507,7 +508,7 @@ class GitHub:
             else:
                 if binary:
                     return content
-                status, content, _ = transport.metadata_response(content)
+                status, content, _ = transport.http_response(content, metadata_limit)
                 require(200 <= status < 300, 'unsuccessful helper metadata response')
                 return read_json(content)
 

@@ -336,10 +336,13 @@ def run(state, context):
             'admitted binary changed')
     script = ROOT / 'scripts/test-runtime-usage.sh'
     before = digest(script)
+    terminal_owner = ROOT / 'scripts/qemu-runtime-advisory-oracle.py'
+    terminal_before = digest(terminal_owner)
     environment = product_environment(state)
     start = time.monotonic()
     result = dict(actualUID=os.getuid(), osRelease=release, environment=environment,
-                  CLI_SHA256_before=expected, scriptSHA256_before=before, runBoundSeconds=770)
+                  CLI_SHA256_before=expected, scriptSHA256_before=before,
+                  terminalOwnerSHA256_before=terminal_before, runBoundSeconds=770)
     try:
         linkage = subprocess.run(['ldd', str(binary)], env=environment, capture_output=True, text=True, timeout=10)
         (state / 'evidence/linkage.stdout').write_text(linkage.stdout)
@@ -368,9 +371,11 @@ def run(state, context):
     finally:
         result['telemetryCounters'] = collect(state)
         result.update(CLI_SHA256_after=digest(binary), scriptSHA256_after=digest(script),
+                      terminalOwnerSHA256_after=digest(terminal_owner),
                       elapsedSeconds=time.monotonic() - start)
         write_json(state / 'evidence/result.json', result)
-        require(result['CLI_SHA256_after'] == expected and result['scriptSHA256_after'] == before,
+        require(result['CLI_SHA256_after'] == expected and result['scriptSHA256_after'] == before
+                and result['terminalOwnerSHA256_after'] == terminal_before,
                 'regression inputs changed during execution')
 
 

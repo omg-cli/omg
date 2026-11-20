@@ -53,6 +53,10 @@ RUN cargo build --release --locked -j 2
 
 FROM native AS runtime
 COPY --from=builder /opt/omg/target/release/omg /usr/local/bin/omg
+COPY scripts/qemu-aur-fixture.py /usr/local/libexec/omg/qemu_aur_fixture.py
+COPY scripts/docker-info-fixture.py /usr/local/libexec/omg/docker-info-fixture.py
+COPY scripts/attend-unknown-fixture.py /usr/local/libexec/omg/attend_unknown_fixture.py
+COPY scripts/docker-install-fixture.py /usr/local/libexec/omg/docker-install-fixture.py
 RUN chmod 0755 /usr/local/bin/omg
 
 RUN useradd -m -G wheel -s /bin/bash testuser && \

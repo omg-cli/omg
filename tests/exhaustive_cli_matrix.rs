@@ -321,6 +321,280 @@ mod runtime_matrix {
         res.assert_stdout_contains("running tests");
         res.assert_no_ansi();
     }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn new_scaffolds_without_ambient_package_managers_or_runtimes() {
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::os::unix::fs::symlink;
+
+        let project = TestProject::new();
+        let fake_bin = project.path().join("fake-bin");
+        std::fs::create_dir(&fake_bin).unwrap();
+        for command in ["npm", "node", "cargo", "rustc", "poetry", "python", "go"] {
+            let path = fake_bin.join(command);
+            std::fs::write(
+                &path,
+                "#!/bin/sh\nprintf '%s\\n' \"$0\" >> \"$OMG_SCAFFOLD_MARKER\"\nexit 73\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let marker = project.path().join("ambient-executed");
+        let path = format!("{}:/usr/bin:/bin", fake_bin.display());
+        let data = project.path().join("runtime-state");
+        let node = data.join("versions/node");
+        std::fs::create_dir_all(node.join("26.13.1")).unwrap();
+        symlink("26.13.1", node.join("current")).unwrap();
+        let env = [
+            ("PATH", path.as_str()),
+            ("OMG_SCAFFOLD_MARKER", marker.to_str().unwrap()),
+            ("OMG_DATA_DIR", data.to_str().unwrap()),
+            ("OMG_NATIVE_TEST_DATA_DIR", "1"),
+        ];
+        for (stack, manifest) in [
+            ("rust", "Cargo.toml"),
+            ("react", "package.json"),
+            ("node", "package.json"),
+            ("python", "pyproject.toml"),
+            ("go", "go.mod"),
+        ] {
+            let name = format!("samples/{stack}-starter");
+            project
+                .run_with_env(&["new", stack, &name], &env)
+                .assert_success();
+            let target = project.path().join(name);
+            assert!(target.join(manifest).is_file(), "{stack}");
+            assert!(target.join(".git").is_dir(), "{stack}");
+            assert!(!target.join("node_modules").exists(), "{stack}");
+            assert!(!target.join(".venv").exists(), "{stack}");
+            let lock = target.join(".tool-versions");
+            if matches!(stack, "react" | "node") {
+                assert_eq!(std::fs::read_to_string(lock).unwrap(), "node 26.13.1\n");
+            } else {
+                assert!(!lock.exists(), "{stack} locked an unselected runtime");
+            }
+        }
+        assert!(
+            !marker.exists(),
+            "scaffold executed an ambient manager or runtime"
+        );
+        assert!(
+            project
+                .path()
+                .join("samples/react-starter/src/main.tsx")
+                .is_file()
+        );
+        let package: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(project.path().join("samples/react-starter/package.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(package["name"], "react-starter");
+        assert_eq!(package["scripts"]["dev"], "vite");
+        assert_eq!(
+            std::fs::read_to_string(project.path().join("samples/go-starter/go.mod")).unwrap(),
+            "module samples/go-starter\n\ngo 1.21.0\n"
+        );
+        for (stack, name) in [
+            ("rust", "invalid/with.dot"),
+            ("react", "invalid/Uppercase"),
+            ("node", "invalid/with+plus"),
+            ("python", "invalid/trailing_"),
+            ("go", "invalid@module/go-starter"),
+        ] {
+            let result = project.run_with_env(&["new", stack, name], &env);
+            result.assert_failure();
+            assert!(result.combined_output().contains("project manifest name"));
+            assert!(!project.path().join(name).exists(), "{stack} wrote files");
+        }
+        assert!(!project.path().join("invalid").exists());
+        project.create_file("blocked-parent", "existing file\n");
+        let blocked = project.run_with_env(&["new", "rust", "blocked-parent/starter"], &env);
+        blocked.assert_failure();
+        blocked.assert_stdout_contains("Creating new rust project");
+        assert!(
+            blocked
+                .combined_output()
+                .contains("Failed to create project parent directories")
+        );
+        assert_eq!(
+            std::fs::read_to_string(project.path().join("blocked-parent")).unwrap(),
+            "existing file\n"
+        );
+        std::fs::remove_file(node.join("current")).unwrap();
+        std::fs::create_dir(node.join("1~2")).unwrap();
+        symlink("1~2", node.join("current")).unwrap();
+        let invalid_lock = project.run_with_env(&["new", "node", "unsafe-lock"], &env);
+        invalid_lock.assert_failure();
+        assert!(
+            invalid_lock
+                .combined_output()
+                .contains("unsafe for filesystem paths")
+        );
+        assert!(!project.path().join("unsafe-lock/.tool-versions").exists());
+        assert!(
+            !marker.exists(),
+            "rejected scaffold executed an ambient command"
+        );
+    }
+
+    #[cfg(all(target_os = "linux", debug_assertions))]
+    #[test]
+    fn attended_tool_sources_require_a_reviewed_runtime() -> anyhow::Result<()> {
+        use std::process::Command;
+
+        let driver = r#"
+import contextlib, errno, fcntl, os, pty, select, signal, struct, sys, termios, time
+
+binary, moves, source, package, expected = sys.argv[1:]
+pacman = moves == "0"
+pid, terminal = pty.fork()
+if pid == 0:
+    os.execv(binary, [binary, 'tool', 'install', package])
+
+transcript = bytearray()
+status = None
+selected = False
+declined = False
+deadline = time.monotonic() + 20
+try:
+    fcntl.ioctl(terminal, termios.TIOCSWINSZ, struct.pack('HHHH', 30, 120, 0, 0))
+    while time.monotonic() < deadline:
+        if terminal in select.select([terminal], [], [], 0.1)[0]:
+            try:
+                text = os.read(terminal, 8192)
+            except OSError as error:
+                if error.errno != errno.EIO:
+                    raise
+                text = b''
+            transcript.extend(text)
+            assert len(transcript) <= 128 * 1024, 'tool output exceeded its fixture bound'
+            if not selected and b'Source?' in transcript and source.encode() in transcript:
+                os.write(terminal, b'\x1b[B' * int(moves) + b'\r')
+                selected = True
+            elif selected and pacman and not declined and b'Proceed with installation of 1 package(s)?' in transcript:
+                os.write(terminal, b'\r')
+                declined = True
+            if not text:
+                child, value = os.waitpid(pid, os.WNOHANG)
+                if child:
+                    status = value
+                    break
+    assert status is not None, 'tool process exceeded its fixture deadline'
+    assert selected and (not pacman or declined)
+    assert os.waitstatus_to_exitcode(status) == (0 if pacman else 1)
+    assert expected.encode() in transcript
+finally:
+    os.close(terminal)
+    if status is None:
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(pid, signal.SIGKILL)
+        os.waitpid(pid, 0)
+    sys.stdout.buffer.write(transcript)
+"#;
+        for (moves, source, runtime, package, expected) in [
+            (
+                "0",
+                "Pacman (System)",
+                "",
+                "omg-tool-source-fixture",
+                "Installation cancelled",
+            ),
+            (
+                "1",
+                "Cargo (Isolated)",
+                "rust",
+                "omg-tool-source-fixture",
+                "Package installation requires a selected OMG-managed rust",
+            ),
+            (
+                "2",
+                "NPM (Isolated)",
+                "node",
+                "omg-tool-source-fixture",
+                "NPM admission requires an active OMG-managed Node runtime",
+            ),
+            (
+                "3",
+                "Pip (Isolated)",
+                "python",
+                "omg-tool-source-fixture",
+                "Package installation requires a selected OMG-managed python",
+            ),
+            (
+                "4",
+                "Go (Isolated)",
+                "go",
+                "example.invalid/omg-tool-source-fixture",
+                "Package installation requires a selected OMG-managed go",
+            ),
+        ] {
+            if moves == "0"
+                && !(cfg!(feature = "arch") && std::path::Path::new("/etc/arch-release").is_file())
+            {
+                continue;
+            }
+            let owner = tempfile::tempdir_in("/var/tmp")?;
+            let home = owner.path();
+            let data = home.join("data/omg");
+            std::fs::create_dir_all(data.join("versions").join(runtime))?;
+            let mut command = Command::new("/usr/bin/python3");
+            command
+                .args([
+                    "-I",
+                    "-c",
+                    driver,
+                    env!("CARGO_BIN_EXE_omg"),
+                    moves,
+                    source,
+                    package,
+                    expected,
+                ])
+                .env_clear()
+                .env("HOME", home)
+                .env("XDG_DATA_HOME", home.join("data"))
+                .env("XDG_CONFIG_HOME", home.join("config"))
+                .env("XDG_CACHE_HOME", home.join("cache"))
+                .env("TERM", "xterm")
+                .env("PATH", "/usr/bin:/bin")
+                .env("OMG_DISABLE_DAEMON", "1")
+                .env("OMG_NATIVE_TEST_DATA_DIR", "1")
+                .env("OMG_DATA_DIR", &data)
+                .current_dir(home);
+            if moves == "0" {
+                command
+                    .env("OMG_PACMAN_ROOT", home.join("pacman-root"))
+                    .env("OMG_PACMAN_CONF", home.join("absent-pacman.conf"));
+            }
+            for key in ["LLVM_PROFILE_FILE", "LD_LIBRARY_PATH"] {
+                if let Some(value) = std::env::var_os(key) {
+                    command.env(key, value);
+                }
+            }
+            let output = command.output()?;
+            assert!(
+                output.status.success(),
+                "{source} PTY install guard failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(std::fs::read_dir(data.join("bin"))?.next().is_none());
+            let mut directories = vec![data.join("tools")];
+            while let Some(directory) = directories.pop() {
+                for entry in std::fs::read_dir(directory)? {
+                    let entry = entry?;
+                    assert!(
+                        entry.file_type()?.is_dir(),
+                        "{source} left installed content"
+                    );
+                    assert!(!entry.file_name().to_string_lossy().contains(".staging-"));
+                    directories.push(entry.path());
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

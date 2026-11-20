@@ -999,8 +999,8 @@ fn execute_process_in(
                 }
             }
         }
-        // When all system executables are rustup proxies, rustup owns project
-        // toolchain switching and OMG must not install a competing toolchain.
+        // Runtime selection below still requires reviewed managed bytes when
+        // rustup owns PATH; do not silently install a competing toolchain here.
     }
     let mut versions = hooks::detect_versions(current_dir)?;
     if let Some((runtime, default_version)) = detect_js_runtime(current_dir)? {
@@ -1024,8 +1024,26 @@ fn execute_process_in(
             versions.insert((*runtime_name).to_string(), resolved);
         }
     }
-    let mut path_additions = hooks::build_path_additions(&versions)?;
-    drop(setup_guard);
+    let mut selected_paths = hooks::selected_runtime_paths(&versions)?;
+    for runtime in versions.keys() {
+        anyhow::ensure!(
+            !crate::runtimes::SUPPORTED_RUNTIMES.contains(&runtime.as_str())
+                || selected_paths
+                    .iter()
+                    .any(|(selected, _)| selected == runtime),
+            "Requested {runtime} has no selected installation with advisory authority; run omg use {runtime} <version> before this task"
+        );
+    }
+    let mut runtime_admissions = Vec::with_capacity(selected_paths.len());
+    let mut path_additions = Vec::with_capacity(selected_paths.len());
+    for (runtime, bin_path) in &selected_paths {
+        runtime_admissions.push(crate::runtimes::security::admit_selected_path(
+            runtime,
+            bin_path,
+            crate::runtimes::security::ReviewMode::FreshAttended,
+        )?);
+        path_additions.push(bin_path.display().to_string());
+    }
 
     // Auto-activate python virtual environment if present
     // Check for .venv or venv in current directory
@@ -1050,9 +1068,21 @@ fn execute_process_in(
     command.args(extra_args);
 
     // Inject virtual env
-    if let Some(venv) = venv_path {
+    if let Some(venv) = &venv_path {
         let bin_path = venv.join("bin");
-        if bin_path.exists() {
+        if bin_path.is_dir() {
+            let selected = selected_paths
+                .iter()
+                .find(|(runtime, _)| runtime == "python");
+            let base = validate_venv_python(venv, selected.map(|(_, bin)| bin.as_path()))?;
+            runtime_admissions.push(crate::runtimes::security::admit_selected_path(
+                "python",
+                &base,
+                crate::runtimes::security::ReviewMode::FreshAttended,
+            )?);
+            if selected.is_none() {
+                selected_paths.push(("python".to_owned(), base));
+            }
             // Prepend venv/bin to path additions (higher priority)
             path_additions.insert(0, bin_path.display().to_string());
 
@@ -1090,6 +1120,44 @@ fn execute_process_in(
         apply_resolved_environment(&mut command, &resolved)?;
     }
 
+    if let Some(venv) = venv_path.as_ref().filter(|path| path.join("bin").is_dir()) {
+        let selected = selected_paths
+            .iter()
+            .find(|(runtime, _)| runtime == "python");
+        validate_venv_python(venv, selected.map(|(_, bin)| bin.as_path()))?;
+    }
+    if let Some((executable, argv0, admission)) =
+        admitted_runtime_for_command(&command, &selected_paths, venv_path.as_deref())?
+    {
+        let mut pinned = Command::new(executable);
+        #[cfg(unix)]
+        if let Some(argv0) = argv0 {
+            use std::os::unix::process::CommandExt as _;
+            pinned.arg0(argv0);
+        }
+        #[cfg(not(unix))]
+        anyhow::ensure!(
+            argv0.is_none(),
+            "Virtualenv invocation requires Unix argument support"
+        );
+        pinned.args(command.get_args());
+        if let Some(directory) = command.get_current_dir() {
+            pinned.current_dir(directory);
+        }
+        for (key, value) in command.get_envs() {
+            if let Some(value) = value {
+                pinned.env(key, value);
+            } else {
+                pinned.env_remove(key);
+            }
+        }
+        command = pinned;
+        runtime_admissions.push(admission);
+    }
+    for admission in &runtime_admissions {
+        admission.verify_before_execution()?;
+    }
+    drop(setup_guard);
     let status = command
         .status()
         .with_context(|| format!("Failed to execute '{cmd}'"))?;
@@ -1099,6 +1167,152 @@ fn execute_process_in(
     }
 
     Ok(())
+}
+
+fn admitted_runtime_for_command(
+    command: &Command,
+    selected_paths: &[(String, PathBuf)],
+    venv: Option<&Path>,
+) -> Result<
+    Option<(
+        PathBuf,
+        Option<PathBuf>,
+        crate::runtimes::security::RuntimeAdmission,
+    )>,
+> {
+    let name = command
+        .get_program()
+        .to_str()
+        .context("Task command is not UTF-8")?;
+    // Explicit scripts and paths remain intentional user commands.
+    if Path::new(name).components().count() != 1 || name.contains(['/', '\\']) {
+        return Ok(None);
+    }
+    let runtime = match name {
+        "node" | "nodejs" => "node",
+        "python" | "python3" => "python",
+        "rustc" | "cargo" => "rust",
+        "java" | "javac" => "java",
+        "erl" | "erlc" => "erlang",
+        "swift" | "swiftc" => "swift",
+        "go" | "ruby" | "bun" | "pi" | "deno" | "zig" | "dotnet" | "php" => name,
+        _ => return Ok(None),
+    };
+    let environment = command_environment(command)?;
+    let directory = command
+        .get_current_dir()
+        .context("Task runtime executable has no working directory")?;
+    let resolved =
+        which::which_in(name, environment.get("PATH"), directory).with_context(|| {
+            format!("Task runtime executable {name} is missing from its final PATH")
+        })?;
+    let mut executable = resolved.canonicalize()?;
+    let selected = selected_paths
+        .iter()
+        .find(|(selected, _)| selected == runtime)
+        .map(|(_, bin)| bin.as_path());
+    let mut binary_dir = resolved
+        .parent()
+        .context("Task runtime executable has no containing directory")?
+        .canonicalize()?;
+    let copied_venv = if runtime == "python"
+        && let Some(venv) = venv
+        && venv.join("bin").is_dir()
+        && binary_dir == venv.join("bin").canonicalize()?
+    {
+        let base = validate_venv_python(venv, selected)?;
+        let original = [name, "python3", "python"]
+            .into_iter()
+            .map(|name| base.join(name))
+            .find(|path| path.is_file())
+            .context("Task runtime executable has no reviewed virtualenv base")?
+            .canonicalize()?;
+        let runtime_root = base
+            .parent()
+            .context("Task virtualenv base has no reviewed runtime root")?;
+        anyhow::ensure!(
+            original.starts_with(runtime_root),
+            "Task virtualenv base Python executable escapes its reviewed runtime"
+        );
+        anyhow::ensure!(
+            same_executable_file(&executable, &original)
+                || crate::runtimes::security::file_digest(&executable, 512 * 1024 * 1024)?.0
+                    == crate::runtimes::security::file_digest(&original, 512 * 1024 * 1024)?.0,
+            "Task runtime executable differs from its reviewed virtualenv base"
+        );
+        executable = original;
+        binary_dir = base;
+        true
+    } else {
+        false
+    };
+    if let Some(selected) = selected
+        && !copied_venv
+    {
+        let expected = selected.join(if name == "nodejs" { "node" } else { name });
+        anyhow::ensure!(
+            same_executable_file(&executable, &expected),
+            "Task runtime executable {name} differs from the selected reviewed {runtime}; adjust task PATH or select that runtime explicitly"
+        );
+        binary_dir = selected.canonicalize()?;
+    }
+    let admission = crate::runtimes::security::admit_selected_path(
+        runtime,
+        &binary_dir,
+        crate::runtimes::security::ReviewMode::FreshAttended,
+    )
+    .with_context(|| format!("Task runtime executable {name} lacks managed advisory authority"))?;
+    admission.verify_before_execution()?;
+    // Keep virtualenv discovery in argv[0] while the kernel executes the
+    // reviewed base, independently of later replacement of the venv entry.
+    Ok(Some((
+        executable,
+        copied_venv.then_some(resolved),
+        admission,
+    )))
+}
+
+fn validate_venv_python(venv: &Path, selected: Option<&Path>) -> Result<PathBuf> {
+    let config = read_optional_file(&venv.join("pyvenv.cfg"))?.context(
+        "Virtualenv has no base interpreter metadata; recreate it from a reviewed OMG Python",
+    )?;
+    let mut homes = config.lines().filter_map(|line| {
+        let (key, value) = line.split_once('=')?;
+        (key.trim() == "home").then_some(value.trim())
+    });
+    let home = Path::new(homes.next().context("Virtualenv has no base Python home")?);
+    anyhow::ensure!(
+        home.is_absolute() && homes.next().is_none(),
+        "Virtualenv base Python home is invalid or ambiguous"
+    );
+    let base = home
+        .canonicalize()
+        .context("Virtualenv base Python is unavailable")?;
+    if let Some(selected) = selected {
+        anyhow::ensure!(
+            base == selected.canonicalize()?,
+            "Virtualenv base differs from the selected reviewed Python; recreate the virtualenv with that version"
+        );
+    }
+    let interpreter = ["python3", "python"]
+        .into_iter()
+        .map(|name| venv.join("bin").join(name))
+        .find(|path| path.is_file())
+        .context("Virtualenv Python interpreter is missing")?
+        .canonicalize()?;
+    let original = ["python3", "python"]
+        .into_iter()
+        .map(|name| base.join(name))
+        .find(|path| path.is_file())
+        .context("Virtualenv base Python interpreter is missing")?
+        .canonicalize()?;
+    anyhow::ensure!(
+        same_executable_file(&interpreter, &original)
+            || crate::runtimes::security::file_digest(&interpreter, 512 * 1024 * 1024)?.0
+                == crate::runtimes::security::file_digest(&original, 512 * 1024 * 1024)?.0,
+        "Virtualenv interpreter differs from its reviewed base Python; recreate the virtualenv"
+    );
+    Ok(base)
 }
 
 #[cfg(unix)]
@@ -1215,7 +1429,30 @@ fn ensure_bun_runtime(version: &str) -> Result<String> {
 }
 
 fn system_runtime_satisfies(command: &str, requested: &str) -> bool {
-    let Ok(output) = Command::new(command).arg("--version").output() else {
+    let Some(executable) = which::which(command)
+        .ok()
+        .and_then(|path| path.canonicalize().ok())
+    else {
+        return false;
+    };
+    let checked = executable
+        .parent()
+        .context("Runtime executable has no containing directory")
+        .and_then(|binary_dir| {
+            crate::runtimes::security::admit_selected_path(
+                command,
+                binary_dir,
+                crate::runtimes::security::ReviewMode::CachedOnly,
+            )
+        })
+        .and_then(|admission| {
+            admission.verify_before_execution()?;
+            Ok(admission)
+        });
+    let Ok(_admission) = checked else {
+        return false;
+    };
+    let Ok(output) = Command::new(executable).arg("--version").output() else {
         return false;
     };
     if !output.status.success() {
@@ -1308,19 +1545,9 @@ fn ensure_js_package_manager(command: &str) -> Result<()> {
         );
     }
 
-    let prompt = format!("{command} is missing. Enable via corepack now?");
-    if confirm_interactively(&prompt)? {
-        let status = Command::new("corepack")
-            .args(["prepare", "--", &format!("{command}@latest"), "--activate"])
-            .status()
-            .with_context(|| format!("Failed to run corepack for {command}"))?;
-        if !status.success() {
-            anyhow::bail!("corepack failed to activate {command}");
-        }
-        Ok(())
-    } else {
-        anyhow::bail!("{command} setup cancelled");
-    }
+    anyhow::bail!(
+        "{command} is missing. Install it through the reviewed npm tool path: omg tool install {command}. Automatic corepack bootstrap cannot establish package advisory or signature admission."
+    )
 }
 
 // Runtime resolution functions moved to core::runtime_resolver module
@@ -1542,6 +1769,891 @@ pub async fn run_tasks_parallel(tasks_str: &str, extra_args: &[String]) -> Resul
 #[cfg(test)]
 #[expect(clippy::unwrap_used)] // Idiomatic in tests: panics on failure with clear error context
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn task_runtime_cannot_be_replaced_by_final_environment_paths() {
+        const NAME: &str =
+            "core::task_runner::tests::task_runtime_cannot_be_replaced_by_final_environment_paths";
+        if crate::core::testing::run_isolated_test(NAME) {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt as _;
+        let owner = tempfile::tempdir().unwrap();
+        let data = owner.path().join("data");
+        let config = owner.path().join("config");
+        let runtime = data.join("versions/node/24.22.3");
+        let bin = runtime.join("bin");
+        let alternate = owner.path().join("alternate");
+        let reviewed_marker = owner.path().join("reviewed");
+        let alternate_marker = owner.path().join("unreviewed");
+        fs::create_dir_all(&bin).unwrap();
+        fs::create_dir(&config).unwrap();
+        fs::create_dir(&alternate).unwrap();
+        for (path, program) in [
+            (
+                bin.join("node"),
+                format!(
+                    "#!/bin/sh\nif [ \"${{1:-}}\" = --version ]; then printf 'v24.22.3\\n'; else [ \"${{KEPT:-}}\" = task-value ] || exit 9; printf reviewed > '{}'; fi\n",
+                    reviewed_marker.display()
+                ),
+            ),
+            (
+                alternate.join("node"),
+                format!(
+                    "#!/bin/sh\nprintf unreviewed > '{}'\n",
+                    alternate_marker.display()
+                ),
+            ),
+        ] {
+            fs::write(&path, program).unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        fs::write(owner.path().join(".node-version"), "24.22.3\n").unwrap();
+        let script = owner.path().join("explicit-script");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf explicit > '{}'\n",
+                alternate_marker.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let system_path = format!("{}:/usr/bin:/bin", bin.display());
+        temp_env::with_vars(
+            [
+                ("PATH", Some(std::ffi::OsStr::new(&system_path))),
+                ("OMG_DATA_DIR", Some(data.as_os_str())),
+                ("OMG_CONFIG_DIR", Some(config.as_os_str())),
+                ("OMG_NATIVE_TEST_DATA_DIR", Some(std::ffi::OsStr::new("1"))),
+                ("OMG_TEST_MODE", Some(std::ffi::OsStr::new("0"))),
+            ],
+            || {
+                drop(
+                    crate::runtimes::security::fixture_prepare(
+                        "node", "24.22.3", &runtime, &runtime,
+                    )
+                    .unwrap(),
+                );
+                let path = format!("{}:/usr/bin:/bin", alternate.display());
+                fs::write(
+                    owner.path().join("overlay.sh"),
+                    format!("export PATH='{path}'\n"),
+                )
+                .unwrap();
+                let overlays = [
+                    format!("[env]\nPATH = '{path}'\n"),
+                    "[env._]\npath = ['alternate']\n".to_owned(),
+                    "[env._]\nsource = 'overlay.sh'\n".to_owned(),
+                ];
+                for overlay in &overlays {
+                    let document: toml::Value = toml::from_str(overlay).unwrap();
+                    let parsed =
+                        crate::config::mise_env::parse_mise_env(&document, owner.path()).unwrap();
+                    let error = execute_process_in(
+                        "node",
+                        &[],
+                        &[],
+                        Some(&parsed),
+                        owner.path(),
+                        owner.path(),
+                        owner.path(),
+                    )
+                    .expect_err("task environment must not replace the admitted Node");
+                    assert!(
+                        format!("{error:#}").contains("Task runtime executable"),
+                        "{error:#}"
+                    );
+                    assert!(
+                        !alternate_marker.exists(),
+                        "task environment executed unreviewed Node"
+                    );
+                    assert!(!reviewed_marker.exists());
+                }
+                for overlay in &overlays {
+                    fs::write(owner.path().join("mise.toml"), overlay).unwrap();
+                    let error = execute_process_in(
+                        "node",
+                        &[],
+                        &[],
+                        None,
+                        owner.path(),
+                        owner.path(),
+                        owner.path(),
+                    )
+                    .expect_err("project environment must not replace the admitted Node");
+                    assert!(
+                        format!("{error:#}").contains("Task runtime executable"),
+                        "{error:#}"
+                    );
+                    assert!(
+                        !alternate_marker.exists(),
+                        "project environment executed unreviewed Node"
+                    );
+                    fs::remove_file(owner.path().join("mise.toml")).unwrap();
+                }
+                let document: toml::Value = toml::from_str(&format!(
+                    "[env]\nPATH = '{system_path}'\nKEPT = 'task-value'\n"
+                ))
+                .unwrap();
+                let parsed =
+                    crate::config::mise_env::parse_mise_env(&document, owner.path()).unwrap();
+                execute_process_in(
+                    "node",
+                    &[],
+                    &[],
+                    Some(&parsed),
+                    owner.path(),
+                    owner.path(),
+                    owner.path(),
+                )
+                .unwrap();
+                assert_eq!(fs::read(&reviewed_marker).unwrap(), b"reviewed");
+                let missing: toml::Value = toml::from_str(&format!(
+                    "[env]\nPATH = '{}'\n",
+                    owner.path().join("missing-bin").display(),
+                ))
+                .unwrap();
+                let missing =
+                    crate::config::mise_env::parse_mise_env(&missing, owner.path()).unwrap();
+                let error = execute_process_in(
+                    "node",
+                    &[],
+                    &[],
+                    Some(&missing),
+                    owner.path(),
+                    owner.path(),
+                    owner.path(),
+                )
+                .expect_err("missing final runtime must not fall back to ambient PATH");
+                assert!(format!("{error:#}").contains("missing from its final PATH"));
+                fs::remove_file(owner.path().join(".node-version")).unwrap();
+                let document: toml::Value = toml::from_str(&overlays[0]).unwrap();
+                let parsed =
+                    crate::config::mise_env::parse_mise_env(&document, owner.path()).unwrap();
+                for name in [
+                    "node", "nodejs", "python", "python3", "rustc", "cargo", "java", "javac",
+                    "erl", "erlc", "swift", "swiftc", "go", "ruby", "bun", "pi", "deno", "zig",
+                    "dotnet", "php",
+                ] {
+                    let executable = alternate.join(name);
+                    fs::write(
+                        &executable,
+                        format!(
+                            "#!/bin/sh\nprintf unreviewed > '{}'\n",
+                            alternate_marker.display(),
+                        ),
+                    )
+                    .unwrap();
+                    fs::set_permissions(executable, fs::Permissions::from_mode(0o755)).unwrap();
+                    let error = execute_process_in(
+                        name,
+                        &[],
+                        &[],
+                        Some(&parsed),
+                        owner.path(),
+                        owner.path(),
+                        owner.path(),
+                    )
+                    .expect_err(
+                        "unpinned runtime or alias still requires managed advisory authority",
+                    );
+                    assert!(
+                        format!("{error:#}").contains("lacks managed advisory authority"),
+                        "{name}: {error:#}"
+                    );
+                    assert!(
+                        !alternate_marker.exists(),
+                        "unreviewed runtime alias {name} executed"
+                    );
+                }
+                let ordinary = alternate.join("omg-ordinary-fixture");
+                fs::write(
+                    &ordinary,
+                    format!(
+                        "#!/bin/sh\nprintf ordinary > '{}'\n",
+                        alternate_marker.display(),
+                    ),
+                )
+                .unwrap();
+                fs::set_permissions(ordinary, fs::Permissions::from_mode(0o755)).unwrap();
+                execute_process_in(
+                    "omg-ordinary-fixture",
+                    &[],
+                    &[],
+                    Some(&parsed),
+                    owner.path(),
+                    owner.path(),
+                    owner.path(),
+                )
+                .unwrap();
+                assert_eq!(fs::read(&alternate_marker).unwrap(), b"ordinary");
+                fs::remove_file(&alternate_marker).unwrap();
+                execute_process_in(
+                    script.to_str().unwrap(),
+                    &[],
+                    &[],
+                    Some(&parsed),
+                    owner.path(),
+                    owner.path(),
+                    owner.path(),
+                )
+                .unwrap();
+                assert_eq!(fs::read(&alternate_marker).unwrap(), b"explicit");
+            },
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn task_preserves_real_python_virtualenv_prefix_and_local_packages() {
+        const NAME: &str = "core::task_runner::tests::task_preserves_real_python_virtualenv_prefix_and_local_packages";
+        if crate::core::testing::run_isolated_test(NAME) {
+            return;
+        }
+        let owner = tempfile::tempdir().unwrap();
+        let data = owner.path().join("data");
+        let config = owner.path().join("config");
+        fs::create_dir(&config).unwrap();
+        #[cfg(target_os = "macos")]
+        let (version, major_minor, runtime) = {
+            // Apple framework images depend on their original relative library
+            // layout. Extract the complete pinned relocatable distribution.
+            const SIZE: u64 = 16_617_745;
+            const SHA256: &str = "7f5ec658219bdb1d1142c6abab89680322166c78350a017fb0af3c869dceee41";
+            let archive = PathBuf::from(
+                std::env::var_os("OMG_MACOS_PYTHON_FIXTURE_ARCHIVE")
+                    .expect("provision the pinned macOS CPython archive before this test"),
+            );
+            assert!(archive.is_absolute(), "fixture archive must be absolute");
+            let (digest, size) = crate::runtimes::security::file_digest(&archive, SIZE)
+                .expect("fixture archive must be a bounded regular file");
+            assert_eq!((digest.as_str(), size), (SHA256, SIZE));
+            let runtime = data.join("versions/python/3.13.7");
+            crate::runtimes::common::extract_component_tar_gz(
+                &archive,
+                &runtime,
+                256 * 1024 * 1024,
+                &|path| crate::core::archive::stripped_archive_path(path, 1),
+            )
+            .expect("extract the complete authenticated relocatable CPython fixture");
+            crate::runtimes::common::require_internal_runtime_binary(
+                &runtime,
+                std::path::Path::new("bin/python3"),
+            )
+            .expect("relocatable fixture must contain its Python executable");
+            let output = Command::new(runtime.join("bin/python3"))
+                .env_remove("PYTHONEXECUTABLE")
+                .env_remove("__PYVENV_LAUNCHER__")
+                .args([
+                    "-I",
+                    "-B",
+                    "-c",
+                    "import sys; print('.'.join(map(str, sys.version_info[:3])))",
+                ])
+                .output()
+                .expect("execute the owned relocatable interpreter");
+            assert!(
+                output.status.success(),
+                "Python identity probe failed: {output:?}"
+            );
+            assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), "3.13.7");
+            ("3.13.7".to_owned(), "3.13".to_owned(), runtime)
+        };
+        #[cfg(not(target_os = "macos"))]
+        let (version, major_minor, runtime) = {
+            let python = crate::core::privilege::root_controlled_program_path("python3").unwrap();
+            const PYTHON_IDENTITY: &str = r"
+import json, os, sys
+image = sys.executable
+assert os.path.isabs(image)
+print(json.dumps(('.'.join(map(str, sys.version_info[:3])),
+                  '.'.join(map(str, sys.version_info[:2])),
+                  os.path.realpath(image))))
+";
+            let output = Command::new(&python)
+                .env_remove("PYTHONEXECUTABLE")
+                .env_remove("__PYVENV_LAUNCHER__")
+                .args(["-I", "-B", "-c", PYTHON_IDENTITY])
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "Python identity probe failed: {output:?}"
+            );
+            let (version, major_minor, image): (String, String, PathBuf) =
+                serde_json::from_slice(&output.stdout).unwrap();
+            assert!(image.is_absolute() && fs::symlink_metadata(&image).unwrap().is_file());
+            let runtime = data.join("versions/python").join(&version);
+            let bin = runtime.join("bin");
+            fs::create_dir_all(&bin).unwrap();
+            fs::copy(&image, bin.join("python3")).unwrap();
+            (version, major_minor, runtime)
+        };
+        let bin = runtime.join("bin");
+        let venv = owner.path().join(".venv");
+        // Bind stock venv construction to the owned interpreter path.
+        const CREATE_VENV: &str = "import sys,venv\nsys._base_executable=sys.argv[1]\nvenv.EnvBuilder(with_pip=False,symlinks=True).create(sys.argv[2])\n";
+        let status = Command::new(bin.join("python3"))
+            .env_remove("PYTHONEXECUTABLE")
+            .env_remove("__PYVENV_LAUNCHER__")
+            .args(["-B", "-c", CREATE_VENV])
+            .arg(bin.join("python3"))
+            .arg(&venv)
+            .status()
+            .unwrap();
+        assert!(
+            status.success(),
+            "owned Python must create the no-download virtualenv"
+        );
+        let venv_config = venv.join("pyvenv.cfg");
+        let original_config = fs::read_to_string(&venv_config).unwrap();
+        let expected_base = bin.canonicalize().unwrap();
+        let actual_base = validate_venv_python(&venv, Some(&bin));
+        assert_eq!(
+            actual_base.as_ref().ok(),
+            Some(&expected_base),
+            "owned venv base mismatch with config {original_config:?}: {actual_base:#?}"
+        );
+        let external_base = owner.path().join("external-base");
+        fs::create_dir(&external_base).unwrap();
+        let wrong_config = original_config
+            .lines()
+            .map(|line| {
+                if line.starts_with("home =") {
+                    format!("home = {}", external_base.display())
+                } else {
+                    line.to_owned()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&venv_config, wrong_config).unwrap();
+        let error = validate_venv_python(&venv, Some(&bin))
+            .expect_err("external framework base cannot stand in for the selected owned base");
+        assert!(format!("{error:#}").contains("differs from the selected reviewed Python"));
+        fs::write(&venv_config, &original_config).unwrap();
+        let packages = venv.join(format!("lib/python{major_minor}/site-packages"));
+        fs::create_dir_all(&packages).unwrap();
+        fs::write(
+            packages.join("omg_local_venv_probe.py"),
+            "VALUE = 'local-package'\n",
+        )
+        .unwrap();
+        fs::write(owner.path().join(".python-version"), &version).unwrap();
+        let observed = owner.path().join("prefix-and-package");
+        let program = format!(
+            r"
+import os, pathlib, sys
+assert sys.dont_write_bytecode, 'fixture execution must not modify the reviewed Python tree'
+try:
+    import omg_local_venv_probe
+except ImportError:
+    print('venv import failed', sys.executable, sys._base_executable,
+          sys.prefix, sys.path, os.getenv('PYTHONEXECUTABLE'),
+          os.getenv('__PYVENV_LAUNCHER__'), file=sys.stderr)
+    raise
+pathlib.Path({}).write_text(sys.prefix + '|' + omg_local_venv_probe.VALUE)
+",
+            serde_json::to_string(&observed).unwrap(),
+        );
+        let path = format!("{}:/usr/bin:/bin", bin.display());
+        temp_env::with_vars(
+            [
+                ("PATH", Some(std::ffi::OsStr::new(&path))),
+                ("OMG_DATA_DIR", Some(data.as_os_str())),
+                ("OMG_CONFIG_DIR", Some(config.as_os_str())),
+                ("OMG_NATIVE_TEST_DATA_DIR", Some(std::ffi::OsStr::new("1"))),
+                ("OMG_TEST_MODE", Some(std::ffi::OsStr::new("0"))),
+                ("PYTHONEXECUTABLE", None),
+                ("__PYVENV_LAUNCHER__", None),
+            ],
+            || {
+                // Keep the original full-content authority so every execution
+                // must leave the reviewed base tree unchanged, including caches.
+                let base_admission = crate::runtimes::security::fixture_prepare(
+                    "python", &version, &runtime, &runtime,
+                )
+                .unwrap();
+                execute_process_in(
+                    "python3",
+                    &["-B".into(), "-c".into(), program.clone()],
+                    &[],
+                    None,
+                    owner.path(),
+                    owner.path(),
+                    owner.path(),
+                )
+                .expect("virtualenv task must run with its reviewed Python");
+                assert_eq!(
+                    fs::read_to_string(&observed).unwrap(),
+                    format!("{}|local-package", venv.display())
+                );
+                base_admission
+                    .verify_before_execution()
+                    .expect("venv task must not change the reviewed base Python tree");
+                use std::os::unix::{
+                    fs::{PermissionsExt as _, symlink},
+                    process::CommandExt as _,
+                };
+                let replaced = owner.path().join("replaced-venv-entry");
+                let replacement = owner.path().join("replacement-python");
+                fs::write(
+                    &replacement,
+                    format!("#!/bin/sh\nprintf replaced > '{}'\n", replaced.display()),
+                )
+                .unwrap();
+                fs::set_permissions(&replacement, fs::Permissions::from_mode(0o755)).unwrap();
+                for copied in [false, true] {
+                    let entry = venv.join("bin/python3");
+                    fs::remove_file(&entry).unwrap();
+                    if copied {
+                        fs::copy(bin.join("python3"), &entry).unwrap();
+                    } else {
+                        symlink(bin.join("python3"), &entry).unwrap();
+                    }
+                    let mut command = Command::new("python3");
+                    command
+                        .current_dir(owner.path())
+                        .env("PATH", venv.join("bin"));
+                    let (kernel, argv0, admission) = admitted_runtime_for_command(
+                        &command,
+                        &[("python".into(), bin.clone())],
+                        Some(&venv),
+                    )
+                    .unwrap()
+                    .unwrap();
+                    assert_eq!(kernel, bin.join("python3").canonicalize().unwrap());
+                    fs::remove_file(&entry).unwrap();
+                    symlink(&replacement, &entry).unwrap();
+                    admission.verify_before_execution().unwrap();
+                    let status = Command::new(kernel)
+                        .arg0(argv0.unwrap())
+                        .args(["-B", "-c", &program])
+                        .status()
+                        .unwrap();
+                    assert!(status.success());
+                    base_admission
+                        .verify_before_execution()
+                        .expect("retargeted venv execution must not change the reviewed base tree");
+                    assert!(
+                        !replaced.exists(),
+                        "replaced virtualenv entry executed after admission"
+                    );
+                    assert_eq!(
+                        fs::read_to_string(&observed).unwrap(),
+                        format!("{}|local-package", venv.display())
+                    );
+                }
+            },
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn virtualenv_binding_accepts_the_same_base_symlink_or_copy_and_rejects_changes() {
+        let owner = tempfile::tempdir().unwrap();
+        let base = owner.path().join("base/bin");
+        let venv = owner.path().join(".venv");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::create_dir_all(venv.join("bin")).unwrap();
+        let original = base.join("python3");
+        let interpreter = venv.join("bin/python3");
+        std::fs::write(&original, b"same controlled Python implementation").unwrap();
+        std::fs::write(
+            venv.join("pyvenv.cfg"),
+            format!("home = {}\n", base.display()),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&original, &interpreter).unwrap();
+        assert_eq!(
+            validate_venv_python(&venv, Some(&base)).unwrap(),
+            base.canonicalize().unwrap()
+        );
+        std::fs::remove_file(&interpreter).unwrap();
+        std::fs::copy(&original, &interpreter).unwrap();
+        assert_eq!(
+            validate_venv_python(&venv, Some(&base)).unwrap(),
+            base.canonicalize().unwrap()
+        );
+        std::fs::write(&interpreter, b"different unreviewed Python").unwrap();
+        assert!(validate_venv_python(&venv, Some(&base)).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn automatic_venv_cannot_replace_the_reviewed_python_interpreter() {
+        const NAME: &str = "core::task_runner::tests::automatic_venv_cannot_replace_the_reviewed_python_interpreter";
+        if crate::core::testing::run_isolated_test(NAME) {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt as _;
+        let project = tempfile::tempdir().unwrap();
+        let data = project.path().join("data");
+        let runtime = data.join("versions/python/3.12.0");
+        std::fs::create_dir_all(runtime.join("bin")).unwrap();
+        std::fs::write(runtime.join("bin/python3"), b"#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(
+            runtime.join("bin/python3"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        crate::runtimes::security::fixture_prepare("python", "3.12.0", &runtime, &runtime).unwrap();
+        let venv = project.path().join(".venv");
+        std::fs::create_dir_all(venv.join("bin")).unwrap();
+        let marker = project.path().join("unreviewed-python-executed");
+        std::fs::write(
+            venv.join("bin/python3"),
+            format!("#!/bin/sh\nprintf executed > '{}'\n", marker.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            venv.join("bin/python3"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        std::fs::write(
+            venv.join("pyvenv.cfg"),
+            "home = /unreviewed/python/bin\nversion = 3.11.0\n",
+        )
+        .unwrap();
+        std::fs::write(project.path().join(".python-version"), "3.12.0\n").unwrap();
+        let result = temp_env::with_vars(
+            [
+                ("OMG_DATA_DIR", Some(data.as_os_str())),
+                ("OMG_NATIVE_TEST_DATA_DIR", Some(std::ffi::OsStr::new("1"))),
+                ("OMG_TEST_MODE", Some(std::ffi::OsStr::new("0"))),
+            ],
+            || {
+                execute_process_in(
+                    "python3",
+                    &[],
+                    &[],
+                    None,
+                    project.path(),
+                    project.path(),
+                    project.path(),
+                )
+            },
+        );
+        assert!(
+            !marker.exists(),
+            "automatic virtualenv executed a different unreviewed Python"
+        );
+        assert!(
+            result.is_err(),
+            "mismatched virtualenv base must require recreation or review"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_manager_cannot_bootstrap_through_unreviewed_corepack() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let directory = tempfile::tempdir().unwrap();
+        let binary = directory.path().join("corepack");
+        let marker = directory.path().join("unreviewed-corepack-executed");
+        std::fs::write(
+            &binary,
+            format!("#!/bin/sh\nprintf executed > '{}'\n", marker.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let result = temp_env::with_var("PATH", Some(directory.path()), || {
+            ensure_js_package_manager("pnpm")
+        });
+        let error = result.expect_err("unreviewed corepack must not install a package manager");
+        assert!(!marker.exists());
+        assert!(
+            error.to_string().contains("omg tool install pnpm"),
+            "bootstrap must direct users through reviewed npm installation: {error:#}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_version_probe_refuses_to_execute_without_advisory_authority() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let directory = tempfile::tempdir().unwrap();
+        let binary = directory.path().join("node");
+        let marker = directory.path().join("executed-unreviewed-runtime");
+        std::fs::write(
+            &binary,
+            format!(
+                "#!/bin/sh\nprintf executed > '{}'\nprintf 'v24.22.3\\n'\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let satisfied = temp_env::with_var("PATH", Some(directory.path()), || {
+            system_runtime_satisfies("node", "24.22.3")
+        });
+        assert!(
+            !marker.exists(),
+            "unreviewed runtime executed during automatic version discovery"
+        );
+        assert!(
+            !satisfied,
+            "unreviewed runtime was admitted by a version string"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reviewed_path_runtime_satisfies_its_pin_and_content_changes_refuse_probing() {
+        const NAME: &str = "core::task_runner::tests::reviewed_path_runtime_satisfies_its_pin_and_content_changes_refuse_probing";
+        if crate::core::testing::run_isolated_test(NAME) {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt as _;
+        let owner = tempfile::tempdir().unwrap();
+        let data = owner.path().join("data");
+        let config = owner.path().join("config");
+        let runtime = data.join("versions/node/24.22.3");
+        let bin = runtime.join("bin");
+        let marker = owner.path().join("reviewed-probe-executed");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir(&config).unwrap();
+        let executable = bin.join("node");
+        std::fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\nprintf reviewed > '{}'\nprintf 'v24.22.3\\n'\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        temp_env::with_vars(
+            [
+                ("PATH", Some(bin.as_os_str())),
+                ("OMG_DATA_DIR", Some(data.as_os_str())),
+                ("OMG_CONFIG_DIR", Some(config.as_os_str())),
+                ("OMG_NATIVE_TEST_DATA_DIR", Some(std::ffi::OsStr::new("1"))),
+                ("OMG_TEST_MODE", Some(std::ffi::OsStr::new("0"))),
+            ],
+            || {
+                drop(
+                    crate::runtimes::security::fixture_prepare(
+                        "node", "24.22.3", &runtime, &runtime,
+                    )
+                    .unwrap(),
+                );
+                assert!(system_runtime_satisfies("node", "24.22.3"));
+                assert!(system_runtime_satisfies("node", "latest"));
+                assert_eq!(ensure_node_runtime("v24.22.3").unwrap(), "24.22.3");
+                assert_eq!(std::fs::read(&marker).unwrap(), b"reviewed");
+                assert!(!system_runtime_satisfies("node", "24.22.4"));
+                std::fs::remove_file(&marker).unwrap();
+                std::fs::write(
+                    &executable,
+                    format!(
+                        "#!/bin/sh\nprintf changed > '{}'\nprintf 'v24.22.3\\n'\n",
+                        marker.display()
+                    ),
+                )
+                .unwrap();
+                assert!(!system_runtime_satisfies("node", "24.22.3"));
+                assert!(
+                    !marker.exists(),
+                    "changed runtime executed without renewed review"
+                );
+                let missing_interpreter = owner.path().join("missing-interpreter");
+                assert!(!missing_interpreter.exists());
+                for invalid_executable in [
+                    b"invalid executable image".to_vec(),
+                    b"#!/bin/sh\nexit 7\n".to_vec(),
+                    format!("#!{}\n", missing_interpreter.display()).into_bytes(),
+                    b"#!/bin/sh\nprintf '\\377'\n".to_vec(),
+                ] {
+                    std::fs::write(&executable, invalid_executable).unwrap();
+                    drop(
+                        crate::runtimes::security::fixture_prepare(
+                            "node", "24.22.3", &runtime, &runtime,
+                        )
+                        .unwrap(),
+                    );
+                    assert!(!system_runtime_satisfies("node", "24.22.3"));
+                    assert!(!marker.exists());
+                }
+            },
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn task_executes_only_the_reviewed_virtualenv_base_with_or_without_a_project_pin() {
+        const NAME: &str = "core::task_runner::tests::task_executes_only_the_reviewed_virtualenv_base_with_or_without_a_project_pin";
+        if crate::core::testing::run_isolated_test(NAME) {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt as _;
+        for pinned in [false, true] {
+            let owner = tempfile::tempdir().unwrap();
+            let data = owner.path().join("data");
+            let config = owner.path().join("config");
+            let runtime = data.join("versions/python/3.12.0");
+            let base = runtime.join("bin");
+            let venv = owner.path().join(".venv");
+            let marker = owner.path().join("reviewed-python-executed");
+            std::fs::create_dir_all(&base).unwrap();
+            std::fs::create_dir(&config).unwrap();
+            std::fs::create_dir_all(venv.join("bin")).unwrap();
+            let executable = base.join("python3.12");
+            std::fs::write(
+                &executable,
+                format!("#!/bin/sh\nprintf reviewed > '{}'\n", marker.display()),
+            )
+            .unwrap();
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::os::unix::fs::symlink("python3.12", base.join("python3")).unwrap();
+            std::os::unix::fs::symlink(&executable, venv.join("bin/python3")).unwrap();
+            std::fs::write(
+                venv.join("pyvenv.cfg"),
+                format!("home = {}\n", base.display()),
+            )
+            .unwrap();
+            if pinned {
+                std::fs::write(owner.path().join(".python-version"), "3.12.0\n").unwrap();
+            }
+            temp_env::with_vars(
+                [
+                    ("PATH", Some(base.as_os_str())),
+                    ("OMG_DATA_DIR", Some(data.as_os_str())),
+                    ("OMG_CONFIG_DIR", Some(config.as_os_str())),
+                    ("OMG_NATIVE_TEST_DATA_DIR", Some(std::ffi::OsStr::new("1"))),
+                    ("OMG_TEST_MODE", Some(std::ffi::OsStr::new("0"))),
+                ],
+                || {
+                    drop(
+                        crate::runtimes::security::fixture_prepare(
+                            "python", "3.12.0", &runtime, &runtime,
+                        )
+                        .unwrap(),
+                    );
+                    execute_process_in(
+                        "python3",
+                        &[],
+                        &[],
+                        None,
+                        owner.path(),
+                        owner.path(),
+                        owner.path(),
+                    )
+                    .unwrap();
+                    assert_eq!(std::fs::read(&marker).unwrap(), b"reviewed");
+                    std::fs::remove_file(&marker).unwrap();
+                    std::fs::remove_file(venv.join("bin/python3")).unwrap();
+                    std::fs::copy(&executable, venv.join("bin/python3")).unwrap();
+                    execute_process_in(
+                        "python3",
+                        &[],
+                        &[],
+                        None,
+                        owner.path(),
+                        owner.path(),
+                        owner.path(),
+                    )
+                    .unwrap();
+                    assert_eq!(std::fs::read(&marker).unwrap(), b"reviewed");
+                    std::fs::remove_file(&marker).unwrap();
+                    let metadata = venv.join("pyvenv.cfg");
+                    let original_metadata = std::fs::read(&metadata).unwrap();
+                    std::fs::remove_file(&metadata).unwrap();
+                    let error = execute_process_in(
+                        "python3",
+                        &[],
+                        &[],
+                        None,
+                        owner.path(),
+                        owner.path(),
+                        owner.path(),
+                    )
+                    .expect_err("a reviewed interpreter cannot replace missing venv metadata");
+                    assert!(
+                        format!("{error:#}")
+                            .contains("Virtualenv has no base interpreter metadata"),
+                        "pinned={pinned}: {error:#}"
+                    );
+                    assert!(
+                        !marker.exists(),
+                        "virtualenv without base metadata executed Python"
+                    );
+                    assert!(!metadata.exists(), "refusal must not invent venv metadata");
+                    std::fs::write(&metadata, original_metadata).unwrap();
+                    let error = execute_process_in(
+                        "omg-missing-reviewed-task-fixture",
+                        &[],
+                        &[],
+                        None,
+                        owner.path(),
+                        owner.path(),
+                        owner.path(),
+                    )
+                    .expect_err("a missing command must fail after runtime checks");
+                    assert!(format!("{error:#}").contains("Failed to execute"));
+                    assert!(
+                        !marker.exists(),
+                        "the failed command unexpectedly ran Python"
+                    );
+                    if !pinned {
+                        let _mutation = crate::runtimes::common::try_lock_runtime_file(
+                            &data.join("versions/python"),
+                            ".mutation.lock",
+                        )
+                        .unwrap();
+                        let error = execute_process_in(
+                            "python3",
+                            &[],
+                            &[],
+                            None,
+                            owner.path(),
+                            owner.path(),
+                            owner.path(),
+                        )
+                        .expect_err("an implicit virtualenv must respect the base mutation lease");
+                        assert!(format!("{error:#}").contains("runtime mutation or active use"));
+                        assert!(!marker.exists(), "locked runtime unexpectedly executed");
+                    }
+                    let external = owner.path().join("external-python");
+                    std::fs::copy(&executable, &external).unwrap();
+                    let alias = base.join("python3");
+                    std::fs::remove_file(&alias).unwrap();
+                    std::os::unix::fs::symlink(&external, &alias).unwrap();
+                    let mut command = Command::new("python3");
+                    command
+                        .current_dir(owner.path())
+                        .env("PATH", venv.join("bin"));
+                    let selected = if pinned {
+                        vec![("python".to_owned(), base.clone())]
+                    } else {
+                        vec![]
+                    };
+                    let error = admitted_runtime_for_command(&command, &selected, Some(&venv))
+                        .expect_err("same-byte external base alias cannot become a pinned kernel");
+                    assert!(
+                        format!("{error:#}").contains("escapes its reviewed runtime"),
+                        "{error:#}"
+                    );
+                    execute_process_in(
+                        "python3",
+                        &[],
+                        &[],
+                        None,
+                        owner.path(),
+                        owner.path(),
+                        owner.path(),
+                    )
+                    .expect_err("live full-tree authority must also refuse the escaping alias");
+                    assert!(!marker.exists(), "escaping base alias executed Python");
+                    std::fs::remove_file(&alias).unwrap();
+                    std::os::unix::fs::symlink("python3.12", &alias).unwrap();
+                },
+            );
+        }
+    }
+
     use super::*;
     use std::fs;
     use tempfile::TempDir;

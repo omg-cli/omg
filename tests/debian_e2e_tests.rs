@@ -934,7 +934,8 @@ fn test_cli_status_shows_debian_info() {
     result.assert_success();
     result.assert_stdout_contains("2 packages installed");
     result.assert_stdout_contains("2 explicit");
-    result.assert_stdout_contains("Not scanned");
+    result.assert_stdout_contains("Advisory coverage unreported");
+    assert!(!result.stdout.contains("No reported findings"));
     let updates = result
         .stdout
         .lines()

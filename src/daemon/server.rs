@@ -284,14 +284,14 @@ async fn run_with_status_path(
             let previous_vulns = state
                 .cache
                 .get_status()
-                .and_then(|status| status.scanned_vulnerability_count());
+                .and_then(|status| status.scanned_vulnerability_summary());
             let scan = tokio::select! {
                 biased;
                 () = shutdown.cancelled() => {
                     tracing::debug!("Cancelled background security refresh during shutdown");
                     return;
                 }
-                result = state.scan_security() => result.map(|scan| scan.total_vulnerabilities),
+                result = state.scan_security() => result.and_then(super::status_policy::reported_vulnerability_counts),
             };
             if let Err(error) = &scan {
                 tracing::warn!("Vulnerability scan failed during status refresh: {error}");
@@ -302,7 +302,7 @@ async fn run_with_status_path(
                 tracing::warn!("No prior vulnerability count; not publishing a zero-vuln status");
                 return;
             };
-            let res = super::status_policy::status_snapshot(
+            let mut res = super::status_policy::status_snapshot(
                 total,
                 explicit,
                 orphans,
@@ -311,6 +311,9 @@ async fn run_with_status_path(
                 Some(vuln_count),
             )
             .0;
+            if scan.is_err() {
+                res.invalidate_security_scope();
+            }
             let res_arc = Arc::new(res);
             // The in-memory cache is authoritative, so persistence is best-effort.
             state.with_current_index(&index, || {
@@ -864,18 +867,19 @@ mod tests {
     struct PausedAdvisorySource {
         started: tokio::sync::Notify,
         resume: tokio::sync::Notify,
+        fail_scan: std::sync::atomic::AtomicBool,
     }
 
     impl crate::core::security::vulnerability::VulnerabilitySource for PausedAdvisorySource {
-        fn scan_package<'a>(
+        fn assess_packages<'a>(
             &'a self,
-            _name: &'a str,
-            _version: &'a crate::package_managers::types::Version,
+            packages: &'a [crate::package_managers::types::SecurityPackage],
+            _evidence_use: crate::core::security::vulnerability::AssessmentUse,
         ) -> std::pin::Pin<
             Box<
                 dyn std::future::Future<
                         Output = std::result::Result<
-                            Vec<crate::core::security::vulnerability::VulnerabilityReport>,
+                            Vec<crate::core::security::vulnerability::PackageAssessment>,
                             crate::core::security::vulnerability::VulnerabilityError,
                         >,
                     > + Send
@@ -885,7 +889,30 @@ mod tests {
             Box::pin(async move {
                 self.started.notify_one();
                 self.resume.notified().await;
-                Ok(vec![])
+                if self.fail_scan.load(std::sync::atomic::Ordering::Acquire) {
+                    return Err(
+                        crate::core::security::vulnerability::VulnerabilityError::Unavailable {
+                            reason: "fixture advisory provider failed".into(),
+                        },
+                    );
+                }
+                Ok(packages
+                    .iter()
+                    .cloned()
+                    .map(
+                        |package| crate::core::security::vulnerability::PackageAssessment {
+                            package,
+                            coverage:
+                                crate::core::security::vulnerability::PackageCoverage::Assessed {
+                                    provenance:
+                                        crate::core::security::scan::AdvisoryProvenance::Osv {
+                                            ecosystem: "fixture".into(),
+                                        },
+                                },
+                            findings: Vec::new(),
+                        },
+                    )
+                    .collect())
             })
         }
     }
@@ -906,6 +933,7 @@ mod tests {
         let source = Arc::new(PausedAdvisorySource {
             started: tokio::sync::Notify::new(),
             resume: tokio::sync::Notify::new(),
+            fail_scan: std::sync::atomic::AtomicBool::new(false),
         });
         let mut state = DaemonState::new_isolated_with_scanner(
             directory.path(),
@@ -913,6 +941,9 @@ mod tests {
             backend,
             source.clone(),
         )?;
+        let previous =
+            crate::daemon::status_policy::status_snapshot(1, 1, 0, 0, vec![], Some((3, 1))).0;
+        state.cache.update_status(Arc::new(previous));
         state.background_security_scans = true;
         let state = Arc::new(state);
         let socket = directory.path().join("held.sock");
@@ -972,6 +1003,35 @@ mod tests {
                 .is_none(),
             "old inventory must not survive refresh on disk"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn daemon_scan_error_marks_previous_vulnerabilities_stale() -> Result<()> {
+        let (_directory, state, source, _socket, server) = daemon_with_paused_scan().await?;
+        source
+            .fail_scan
+            .store(true, std::sync::atomic::Ordering::Release);
+        source.resume.notify_one();
+        let result = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(status) = state
+                    .cache
+                    .get_status()
+                    .filter(|status| !status.vulnerabilities_scanned)
+                {
+                    break status;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        server.abort();
+        let status = result.expect("failed refresh must publish the previous count as stale");
+        assert_eq!(status.security_vulnerabilities, 3);
+        assert_eq!(status.scanned_vulnerability_summary(), None);
+        assert_eq!(status.security_unknown_packages, None);
         Ok(())
     }
 
@@ -1057,6 +1117,7 @@ mod tests {
     #[test]
     fn oversized_security_audit_is_not_reported_as_complete() {
         let vulnerability = super::super::protocol::Vulnerability {
+            applicability: crate::core::security::scan::FindingApplicability::Possible,
             id: "CVE-fixture".into(),
             summary: "x".repeat(16_000),
             score: Some("9.8".into()),
@@ -1067,6 +1128,7 @@ mod tests {
         let response = Response::Success {
             id: 91,
             result: ResponseResult::SecurityAudit(SecurityAuditResult {
+                coverage: crate::core::security::scan::AuditCoverage::Unreported,
                 total_vulnerabilities: 600,
                 high_severity: 600,
                 vulnerabilities: (0..600)
@@ -1138,11 +1200,13 @@ mod tests {
         use super::super::protocol::{ExplicitResult, UpdateEntry};
         let results = [
             ResponseResult::SecurityAudit(SecurityAuditResult {
+                coverage: crate::core::security::scan::AuditCoverage::Unreported,
                 total_vulnerabilities: 1,
                 high_severity: 1,
                 vulnerabilities: vec![(
                     "package".into(),
                     vec![super::super::protocol::Vulnerability {
+                        applicability: crate::core::security::scan::FindingApplicability::Possible,
                         id: "CVE-fixture".into(),
                         summary: "fixture".into(),
                         score: Some("9.8".into()),

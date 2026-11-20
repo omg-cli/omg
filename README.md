@@ -26,8 +26,8 @@ omg run test                    # run the task this project already defines
 omg audit scan                  # fetch advisories and show vulnerability evidence
 ```
 
-The daemon is optional for package operations and vulnerability scanning in
-published v0.1.224. It keeps package indexes, vulnerability results, and status
+The daemon is optional for package operations and vulnerability scanning.
+It keeps package indexes, vulnerability results, and status
 snapshots warm; `omg audit scan` scans directly when the daemon is absent.
 
 ## Why OMG
@@ -36,7 +36,7 @@ snapshots warm; `omg audit scan` scans directly when the daemon is absent.
 | :--- | :--- |
 | **One workflow across systems** | Manage packages and project tasks through a common CLI on Arch, Debian, Ubuntu, Fedora, macOS, and supported Linux distributions inside WSL. [Security capabilities vary by backend](docs/security.md). |
 | **Security during the operation** | Verify downloads, constrain developer-tool installers, review and sandbox AUR builds, inspect produced archives, and record mutations as they happen. |
-| **The whole development environment** | Manage system packages, 14 native runtime managers, 54 curated developer tools, project tasks, environment records, and security evidence from one CLI. |
+| **The whole development environment** | Manage system packages, 13 language runtimes, the Pi coding harness, 54 curated developer tools, project tasks, environment records, and security evidence from one CLI. |
 | **Fast paths without a hard daemon dependency** | Read ALPM, APT, and RPM state in process where supported. Run `omgd` for warm caches and background refreshes, or leave it off. |
 | **Evidence instead of promises** | CI exercises real Linux guests through QEMU, preserves per-command receipts, and files detailed issues when a gate fails. Benchmark claims require comparable recorded work. |
 
@@ -55,7 +55,7 @@ review, dependency, sandbox, and archive-inspection pipeline.
 | :--- | :--- | :--- |
 | Find and change packages | `search`, `info`, `why`, `install`, `remove`, `update`, `clean` | One interface, previews, backend-aware policy, history |
 | Use the AUR | `search`, `install`, `update` | Source review, offline Bubblewrap builds, output inspection, attended approval for privileged content |
-| Manage runtimes | `use`, `list`, `which`, `use --uninstall` | Native managers for Node.js, Python, Go, Rust, Ruby, Java, Bun, Pi, Deno, Zig, .NET, Erlang, PHP, and Swift |
+| Manage runtimes | `use`, `list`, `which`, `use --uninstall` | Native managers for Node.js, Python, Go, Rust, Ruby, Java, Bun, Deno, Zig, .NET, Erlang, PHP, and Swift; Pi uses the managed npm tool path |
 | Install developer tools | `tool search`, `tool install`, `tool list` | Curated registry and ecosystem-specific install policy for npm, Python, Cargo, Go, and system packages |
 | Run project tasks | `run` | Detects the task system the project already uses and forwards arguments |
 | Record environment intent | `env capture`, `env check`, `env share`, `env sync` | Inventory, portable intent, and drift reporting without pretending to rebuild the machine |
@@ -71,7 +71,8 @@ only in a separate report.
 | :--- | :--- |
 | **OMG releases** | The installer verifies the release digest and GitHub build attestation before copying binaries. Self-update replaces `omg` and `omgd` from the same verified archive. |
 | **Runtime downloads** | Each provider's available checksum or signature policy is applied before extraction. Staging is bounded, path-safe, and published only after validation. |
-| **Developer tools** | npm lifecycle scripts are disabled by default and signatures are checked; Python tools use isolated environments and wheels by default; Cargo requests locked installs; Go disables automatic toolchain downloads and CGO. |
+| **Developer tools** | npm, Cargo, Go and Python tools review exact resolved registry versions before installation. Frozen artifacts retain their integrity checks; npm scripts require separate permission, Python accepts wheels, and Go disables automatic toolchain downloads and CGO. |
+| **Install-time risk** | Known vulnerabilities show advisory links and require an exact foreground-terminal acceptance. Missing coverage is disclosed as Unknown and also requires acceptance; generic `--yes` cannot acknowledge either risk. |
 | **AUR source** | Recipes and source declarations are reviewed before execution. Builds use Bubblewrap with an isolated home, a cleared environment, and no network by default. |
 | **AUR output** | Archive paths, links, metadata, hooks, capabilities, and setuid/setgid files are inspected. High-risk output requires explicit approval bound to the inspected archive. |
 | **Vulnerability evidence** | Direct and daemon-backed scans share the same inventory and scoring code. OMG preserves published CVSS or advisory severity and does not invent a numeric score when upstream provides none. |
@@ -87,7 +88,7 @@ Read the [security model](docs/security.md), [AUR policy](docs/aur.md), and
 flowchart LR
     User[Developer] --> CLI[omg CLI]
     CLI --> Packages[System packages]
-    CLI --> Runtimes[14 runtime managers]
+    CLI --> Runtimes[13 language runtimes]
     CLI --> Tools[Developer tools]
     CLI --> Tasks[Project tasks]
     CLI --> Security[Vulnerability and audit engine]
@@ -105,7 +106,7 @@ flowchart LR
 `omg` remains the product entry point and owns direct execution. `omgd` keeps
 derived state warm and serves the same shared security engine over local Unix IPC.
 Stopping the daemon does not disable ordinary package operations or
-`omg audit scan` in published v0.1.224.
+`omg audit scan`.
 
 ## Install
 

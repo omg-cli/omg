@@ -63,7 +63,7 @@ pub async fn install(packages: &[String]) -> Result<()> {
             &vulnerability_scanner,
             &selected_name,
             &selected_version,
-            false,
+            crate::package_managers::types::SecurityOrigin::DistributionPackage,
             None,
         )
         .await?;

@@ -1,0 +1,496 @@
+import {
+    LIMITS,
+    SOURCES,
+    boundedBody,
+    cveId,
+    object,
+    date,
+    parseCve,
+    sha256,
+} from "./domain";
+import { ingestCveGroups, parseBatch, refreshSource } from "./ingestion";
+import { Store, type Checkpoint, type RecordRow } from "./storage";
+import { recentCves } from "./recent";
+import { epss } from "./epss";
+import { runtimeReport, refreshRuntime } from "./runtime";
+import { type Fetcher } from "./ingestion";
+import { publicResponse } from "./cache";
+import { BaselineBusyError, baselineImportCommands, verifyBaseline } from "./baseline";
+async function authorized(
+    request: Request,
+    token: string | undefined,
+): Promise<boolean> {
+    if (!token || token.length < 32) return false;
+    const provided =
+        request.headers.get("authorization")?.replace(/^Bearer /, "") ?? "";
+    if (provided.length > 1024) return false;
+    const encoder = new TextEncoder();
+    const algorithm = { name: "HMAC", hash: "SHA-256" };
+    const expected = await crypto.subtle.importKey(
+        "raw",
+        encoder.encode(token),
+        algorithm,
+        false,
+        ["verify"],
+    );
+    const supplied = await crypto.subtle.importKey(
+        "raw",
+        encoder.encode(provided || "missing"),
+        algorithm,
+        false,
+        ["sign"],
+    );
+    const message = encoder.encode("omg-advisories-ingest-v1");
+    const signature = await crypto.subtle.sign("HMAC", supplied, message);
+    return crypto.subtle.verify("HMAC", expected, signature, message);
+}
+type BaselineSession = {
+    digest: string;
+    instance_id: string;
+    session_id: string;
+    endpoint: string;
+    baseline_at: string;
+};
+async function baselineSession(
+    store: Store,
+    binding: Record<string, unknown>,
+    endpoint: string,
+): Promise<BaselineSession> {
+    const row = await store.sql.first<BaselineSession>(
+        "SELECT * FROM baseline_receipt WHERE digest=?",
+        [typeof binding.digest === "string" ? binding.digest : ""],
+    );
+    const active = await store.checkpoint("cve");
+    if (
+        !row ||
+        row.instance_id !== binding.instance_id ||
+        row.session_id !== binding.session_id ||
+        row.endpoint !== endpoint ||
+        binding.endpoint !== endpoint ||
+        active?.baseline_digest !== row.digest
+    )
+        throw new Error("invalid baseline session binding");
+    return row;
+}
+function fresh(checkpoint: Checkpoint, now: string) {
+    return (
+        checkpoint.checked_at !== null &&
+        Date.parse(now) - Date.parse(checkpoint.checked_at) <= 30 * 60_000
+    );
+}
+export async function handle(
+    request: Request,
+    store: Store,
+    token?: string,
+    now = new Date().toISOString(),
+    fetcher: Fetcher = (url, init) => fetch(url, init),
+    runtimeRefreshSecret?: string,
+): Promise<Response> {
+    return publicResponse(request, await route(request, store, token, now, fetcher, runtimeRefreshSecret), now);
+}
+async function route(
+    request: Request,
+    store: Store,
+    token: string | undefined,
+    now: string,
+    fetcher: Fetcher,
+    runtimeRefreshSecret: string | undefined,
+): Promise<Response> {
+    const url = new URL(request.url);
+    try {
+        if (url.pathname === "/internal/cve-refresh") {
+            if (request.method !== "POST") return Response.json({ error: "method not allowed" }, { status: 405 });
+            if (!await authorized(request, token)) return Response.json({ error: "unauthorized" }, { status: 401 });
+            const input = object(JSON.parse(await boundedBody(request.body, 1024)));
+            if (Object.keys(input).length) throw new Error("invalid CVE refresh fields");
+            if (!await refreshSource(store, "cve", fetcher, now, 32)) return Response.json({ error: "ingestion busy" }, { status: 409 });
+            const checkpoint = await store.checkpoint("cve");
+            if (!checkpoint) throw new Error("missing migration");
+            return Response.json({ schema_version: 1, source: "cve", complete: !!checkpoint.complete && !checkpoint.error,
+                cursor: checkpoint.cursor, checked_at: checkpoint.checked_at, bootstrap_complete: checkpoint.bootstrap_complete === 1,
+                error: checkpoint.error }, { status: checkpoint.error ? 503 : 200 });
+        }
+        if (url.pathname === "/internal/baseline/verify") {
+            if (request.method !== "POST") return Response.json({ error: "method not allowed" }, { status: 405 });
+            if (!await authorized(request, runtimeRefreshSecret)) return Response.json({ error: "unauthorized" }, { status: 401 });
+            const input: unknown = JSON.parse(await boundedBody(request.body, 4096));
+            return Response.json(await verifyBaseline(input, store, url.origin, now, fetcher));
+        }
+        if (url.pathname === "/internal/runtime-refresh") {
+            if (request.method !== "POST") return Response.json({ error: "method not allowed" }, { status: 405 });
+            if (!await authorized(request, runtimeRefreshSecret)) return Response.json({ error: "unauthorized" }, { status: 401 });
+            const input: unknown = JSON.parse(await boundedBody(request.body, 4096));
+            return Response.json(await refreshRuntime(input, store, now, fetcher));
+        }
+        if (url.pathname === "/internal/ingest") {
+            if (request.method !== "POST")
+                return Response.json(
+                    { error: "method not allowed" },
+                    { status: 405 },
+                );
+            if (!(await authorized(request, token)))
+                return Response.json(
+                    { error: "unauthorized" },
+                    { status: 401 },
+                );
+            const input = object(
+                JSON.parse(await boundedBody(request.body, LIMITS.batch)),
+            );
+            const records = parseBatch(input, input.baseline === undefined ? LIMITS.records : 64);
+            const binding =
+                input.baseline === undefined ? null : object(input.baseline);
+            const owner = crypto.randomUUID();
+            if (!(await store.lease("cve", owner, now)))
+                return Response.json(
+                    { error: "ingestion busy" },
+                    { status: 409 },
+                );
+            try {
+                const writer = store.writer("cve", owner);
+                const baseline = binding
+                    ? await baselineSession(writer, binding, url.origin)
+                    : null;
+                const parsed = records.map((raw) => {
+                    const record = parseCve(raw);
+                    return { id: record.id, supported: record.supported, raw };
+                });
+                if (baseline && new Set(parsed.map((record) => record.id)).size === parsed.length && parsed.every((record) => record.supported)) {
+                    const after = await baselineImportCommands(writer, baseline.session_id, parsed);
+                    await writer.cveBatch(parsed, now, after, "packed");
+                } else {
+                    if (records.length > LIMITS.records) throw new Error("invalid duplicate or unsupported large ingest batch");
+                    await ingestCveGroups(
+                        parsed,
+                        async ({ id, raw }) => {
+                            const after = baseline ? await baselineImportCommands(writer, baseline.session_id, [{ id, raw }]) : [];
+                            await writer.cve(raw, now);
+                            if (after.length) await writer.sql.batch(after);
+                        },
+                    );
+                }
+            } finally {
+                await store.release("cve", owner);
+            }
+            return Response.json({ accepted: records.length });
+        }
+        if (url.pathname === "/internal/baseline/start") {
+            if (request.method !== "POST")
+                return Response.json(
+                    { error: "method not allowed" },
+                    { status: 405 },
+                );
+            if (!(await authorized(request, token)))
+                return Response.json(
+                    { error: "unauthorized" },
+                    { status: 401 },
+                );
+            const receipt = object(
+                JSON.parse(await boundedBody(request.body, 4096)),
+            );
+            if (
+                typeof receipt.digest !== "string" ||
+                !/^[a-f0-9]{64}$/.test(receipt.digest)
+            )
+                throw new Error("invalid baseline digest");
+            const baseline = date(receipt.baseline_at);
+            const existing = await store.sql.first<BaselineSession>(
+                "SELECT * FROM baseline_receipt WHERE digest=?",
+                [receipt.digest],
+            );
+            if (existing) {
+                await baselineSession(
+                    store,
+                    {
+                        ...receipt,
+                        instance_id: receipt.instance_id ?? existing.instance_id,
+                        session_id: receipt.session_id ?? existing.session_id,
+                        endpoint: receipt.endpoint ?? existing.endpoint,
+                    },
+                    url.origin,
+                );
+                return Response.json({ started: true, ...existing });
+            }
+            if (receipt.instance_id !== undefined || receipt.session_id !== undefined)
+                throw new Error("invalid baseline resume instance");
+            const instance = await store.sql.first<{ id: string }>(
+                "SELECT id FROM database_instance",
+            );
+            if (!instance) throw new Error("missing database instance");
+            const session = crypto.randomUUID();
+            const owner = crypto.randomUUID();
+            if (!(await store.lease("cve", owner, now)))
+                return Response.json(
+                    { error: "ingestion busy" },
+                    { status: 409 },
+                );
+            try {
+                await store.writer("cve", owner).sql.batch([
+                    {
+                        sql: "INSERT INTO baseline_receipt(digest,instance_id,session_id,endpoint,baseline_at,accepted,exhausted) VALUES(?,?,?,?,?,0,0)",
+                        values: [receipt.digest, instance.id, session, url.origin, baseline],
+                    },
+                    {
+                        sql: "UPDATE source_checkpoint SET cursor=?,baseline_digest=?,complete=0,bootstrap_complete=0,error=NULL,etag=NULL WHERE source=?",
+                        values: [
+                            JSON.stringify({ event: baseline, offset: 0 }),
+                            receipt.digest,
+                            "cve",
+                        ],
+                    },
+                ]);
+            } finally {
+                await store.release("cve", owner);
+            }
+            return Response.json({
+                started: true,
+                digest: receipt.digest,
+                instance_id: instance.id,
+                session_id: session,
+                endpoint: url.origin,
+            });
+        }
+        if (url.pathname === "/internal/baseline") {
+            if (request.method !== "POST")
+                return Response.json(
+                    { error: "method not allowed" },
+                    { status: 405 },
+                );
+            if (!(await authorized(request, token)))
+                return Response.json(
+                    { error: "unauthorized" },
+                    { status: 401 },
+                );
+            const receipt = object(
+                JSON.parse(await boundedBody(request.body, 4096)),
+            );
+            if (
+                typeof receipt.digest !== "string" ||
+                !/^[a-f0-9]{64}$/.test(receipt.digest) ||
+                !Number.isSafeInteger(receipt.accepted) ||
+                typeof receipt.accepted !== "number" ||
+                receipt.accepted < 1 ||
+                receipt.exhausted !== true
+            )
+                throw new Error("invalid baseline receipt");
+            const baseline = date(receipt.baseline_at);
+            const finished = date(receipt.finished_at);
+            const started = await baselineSession(store, receipt, url.origin);
+            if (!started || started.baseline_at !== baseline)
+                throw new Error("invalid baseline receipt");
+            const owner = crypto.randomUUID();
+            if (!(await store.lease("cve", owner, now)))
+                return Response.json(
+                    { error: "ingestion busy" },
+                    { status: 409 },
+                );
+            try {
+                await baselineSession(store, receipt, url.origin);
+                const checkpoint = await store.checkpoint("cve");
+                if (
+                    !checkpoint?.complete ||
+                    checkpoint.baseline_digest !== receipt.digest ||
+                    !checkpoint.checked_at ||
+                    checkpoint.error ||
+                    !fresh(checkpoint, now) ||
+                    checkpoint.checked_at < finished ||
+                    !checkpoint.cursor
+                )
+                    throw new Error("delta catchup required");
+                const cursor = object(JSON.parse(checkpoint.cursor));
+                if (date(cursor.event) < baseline)
+                    throw new Error("delta precedes baseline");
+                const unsupported = await store.sql.first<{ count: number }>(
+                    "SELECT COUNT(*) AS count FROM source_record WHERE supported=0",
+                );
+                if (unsupported?.count)
+                    throw new Error("unsupported records prevent completeness");
+                const imported = await store.sql.first<{
+                    count: number;
+                    accepted: number;
+                }>(
+                    "SELECT COUNT(*) AS count,(SELECT accepted FROM baseline_receipt WHERE session_id=?) AS accepted FROM baseline_member WHERE session_id=?",
+                    [started.session_id, started.session_id],
+                );
+                if (
+                    !imported ||
+                    imported.count !== receipt.accepted ||
+                    imported.count !== imported.accepted
+                )
+                    throw new Error("invalid baseline member count");
+                const proof = await store.sql.first<{ phase: string }>("SELECT phase FROM baseline_publisher_proof WHERE session_id=?", [started.session_id]);
+                const verified = proof?.phase === "verified";
+                await store.writer("cve", owner).sql.batch([
+                    {
+                        sql: "UPDATE baseline_receipt SET accepted=?,exhausted=1,caught_up=1,completed_at=? WHERE session_id=?",
+                        values: [imported.count, now, started.session_id],
+                    },
+                    {
+                        sql: "UPDATE source_checkpoint SET bootstrap_complete=? WHERE source=?",
+                        values: [Number(verified), "cve"],
+                    },
+                ]);
+                return Response.json({
+                    bootstrap_complete: verified,
+                    archive_verified: verified,
+                    imported: imported.count,
+                    caught_up: true,
+                });
+            } finally {
+                await store.release("cve", owner);
+            }
+        }
+        if (request.method !== "GET")
+            return Response.json(
+                { error: "method not allowed" },
+                { status: 405 },
+            );
+        if (url.pathname === "/v1/status") {
+            const checkpoints = await store.sql.all<Checkpoint>(
+                "SELECT * FROM source_checkpoint ORDER BY source",
+            );
+            const baseline = await store.sql.first<{
+                imported: number;
+                caught_up: number;
+                archive_verified: number;
+            }>(
+                "SELECT r.accepted AS imported,r.caught_up,CASE WHEN p.phase='verified' AND p.verified_at IS NOT NULL THEN 1 ELSE 0 END AS archive_verified FROM baseline_receipt r JOIN source_checkpoint c ON c.baseline_digest=r.digest LEFT JOIN baseline_publisher_proof p ON p.session_id=r.session_id WHERE c.source='cve'",
+            );
+            return Response.json({
+                schema_version: 1,
+                baseline: {
+                    imported: baseline?.imported ?? 0,
+                    caught_up: baseline?.caught_up === 1,
+                    archive_verified: baseline?.archive_verified === 1,
+                },
+                bootstrap_complete:
+                    checkpoints.find((c) => c.source === "cve")
+                        ?.bootstrap_complete === 1,
+                feeds: checkpoints.map((c) => ({
+                    ...c,
+                    complete:
+                        !!c.complete &&
+                        !!c.bootstrap_complete &&
+                        !c.error &&
+                        fresh(c, now),
+                    fresh: fresh(c, now),
+                })),
+                package_applicability: "Arch feed only; AUR mapping unknown",
+            });
+        }
+        if (url.pathname.startsWith("/v1/runtimes/")) {
+            const force = /(?:^|,)\s*(?:no-cache|max-age\s*=\s*0)\s*(?:,|$)/i.test(request.headers.get("cache-control") ?? "");
+            return Response.json(await runtimeReport(url, store, now, fetcher, force));
+        }
+        const epssMatch = /^\/v1\/epss\/(CVE-\d{4}-\d{4,19})$/.exec(url.pathname);
+        if (epssMatch?.[1]) {
+            if (url.search) throw new Error("invalid EPSS query");
+            if (!await store.sql.first("SELECT id FROM source_record WHERE id=?", [epssMatch[1]]))
+                return Response.json({ error: "CVE unavailable", status: "unavailable" }, { status: 404 });
+            return Response.json(await epss(store, epssMatch[1], now, fetcher));
+        }
+        if (url.pathname === "/v1/arch/advisories") {
+            const checkpoint = await store.checkpoint("arch");
+            if (!checkpoint?.object_key)
+                return Response.json(
+                    { error: "snapshot unavailable", complete: false },
+                    { status: 503 },
+                );
+            const raw = await store.raw.get(checkpoint.object_key);
+            if (!raw) throw new Error("snapshot object missing");
+            return Response.json({
+                schema_version: 1,
+                source: "arch-security",
+                source_url: SOURCES.arch,
+                fetched_at: checkpoint.fetched_at,
+                checked_at: checkpoint.checked_at,
+                complete:
+                    !!checkpoint.complete &&
+                    !checkpoint.error &&
+                    fresh(checkpoint, now),
+                payload_sha256: checkpoint.payload_sha256,
+                payload_json: await raw.text(),
+            });
+        }
+        if (url.pathname === "/v1/cves/recent") {
+            const page = await recentCves(url, store.sql, now);
+            const checkpoint = await store.checkpoint("cve");
+            return Response.json({
+                schema_version: 1, ...page,
+                checked_at: checkpoint?.checked_at ?? null,
+                complete: !!checkpoint?.complete && !!checkpoint.bootstrap_complete &&
+                    !checkpoint.error && fresh(checkpoint, now),
+                package_applicability: "unknown",
+            });
+        }
+        const match = /^\/v1\/cves\/(CVE-\d{4}-\d{4,19})$/.exec(url.pathname);
+        if (match?.[1]) {
+            const id = cveId(match[1]);
+            const record = await store.sql.first<RecordRow>(
+                "SELECT * FROM source_record WHERE id=?",
+                [id],
+            );
+            if (!record)
+                return Response.json(
+                    { error: "CVE unavailable", complete: false },
+                    { status: 404 },
+                );
+            const raw = await store.raw.get(record.object_key).catch((cause: unknown) => {
+                throw new Error("CVE storage unavailable", { cause });
+            });
+            if (!raw) throw new Error("CVE object missing");
+            const payload = await raw.text();
+            if (await sha256(payload) !== record.payload_sha256)
+                throw new Error("CVE stored payload failed integrity");
+            const kev = await store.checkpoint("kev");
+            const cve = await store.checkpoint("cve");
+            const annotation = await store.sql.first<{ payload_json: string }>(
+                "SELECT payload_json FROM kev_annotation WHERE cve_id=?",
+                [id],
+            );
+            return Response.json({
+                schema_version: 1,
+                payload_json: payload,
+                provenance: record,
+                cve_checked_at: cve?.checked_at ?? null,
+                cve_complete: !!cve?.complete && !!cve.bootstrap_complete &&
+                    !cve.error && fresh(cve, now),
+                kev: annotation ? JSON.parse(annotation.payload_json) : null,
+                kev_checked_at: kev?.checked_at,
+                kev_complete: kev
+                    ? !!kev.complete && !kev.error && fresh(kev, now)
+                    : false,
+                package_applicability: "unknown",
+            });
+        }
+        return Response.json({ error: "not found" }, { status: 404 });
+    } catch (error) {
+        if (error instanceof BaselineBusyError) return Response.json({ error: "ingestion busy" }, { status: 409 });
+        const invalid =
+            error instanceof Error &&
+            /invalid|expected|exceeds|missing publication|mismatch|catchup|baseline|completeness/.test(
+                error.message,
+            );
+        if (!invalid && url.pathname.startsWith("/internal/")) {
+            const reasons: string[] = [];
+            let cause: unknown = error;
+            for (let depth = 0; depth < 3 && cause instanceof Error; depth++) {
+                let message = cause.message;
+                for (const secret of [token, runtimeRefreshSecret]) {
+                    if (secret) message = message.replaceAll(secret, "[redacted]");
+                }
+                reasons.push(message.replace(/ghs_[A-Za-z0-9]{20,255}/g, "[redacted]").slice(0, 300));
+                cause = cause.cause;
+            }
+            console.error(JSON.stringify({ event: "internal_advisory_failure", path: url.pathname, reasons }));
+        }
+        return Response.json(
+            {
+                error: invalid
+                    ? "invalid or incomplete input"
+                    : "service unavailable",
+                complete: false,
+            },
+            { status: invalid ? 400 : 503 },
+        );
+    }
+}

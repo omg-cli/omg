@@ -5,19 +5,26 @@ All notable changes to OMG are documented here.
 OMG is the fastest unified package manager for Linux, replacing pacman, yay, nvm, pyenv, rustup, and more with a single tool.
 
 **Performance**: 22x faster searches than pacman, 59-483x faster than apt-cache on Debian/Ubuntu
-**Unified**: System packages + 8 language runtimes in one CLI
+**Unified**: System packages + 13 language runtimes and managed tools in one CLI
 **Secure**: Built-in SLSA, PGP, SBOM, and audit logs
 
 ---
 
 ## [Unreleased]
 
-### Arch and AUR
+## [0.1.225] - 2026-11-16
 
-- Update the Rust ALPM parser family together to types 0.14.0, SRCINFO 0.7.0, local database 0.3.0 and repository database 0.2.0. Keep C libalpm for transactions and remaining native queries; package counts use Rust by default.
-- Honor pacman's default local hooks and configured download user. Reject unsupported repository `Usage` restrictions explicitly.
-- Isolate AUR build IPC, bound source downloads to fifteen minutes, escape filenames in review and approval, reject source symlinks that resolve outside the checkout, and require attended approval for inspected privileged integration paths.
-- Bound persisted package-cache reads and recheck local source identity while loading. Compare AUR updates against one installed-version snapshot across index and RPC results.
+See the [beta release overview, security coverage and upgrade notes](releases/v0.1.225.md), plus the [complete changes since v0.1.224](https://github.com/omg-cli/omg/compare/v0.1.224...v0.1.225).
+
+- Require a separate transaction-bound decision for disclosed CVE/watch-list risk in native Arch admission and managed npm tools; preserve signature, source and artifact checks.
+- Resolve and review exact npm dependencies before materialization, then verify the frozen install and preserve the old tool on failure.
+- Authenticate Node release manifests with pinned active publisher keys before downloading or executing candidate archives.
+- Require fresh, content-bound advisory admission for 13 runtimes and route the Pi coding harness through shared npm tool checks.
+- Preserve prior runtime authority on failed updates, retain shared use leases for parallel tasks, and bind virtualenv activation to its reviewed Python base.
+- Serve indexed recent CVE revisions and cached FIRST EPSS history through Cloudflare with explicit incomplete/unavailable states.
+- Refresh vendor feeds with an ephemeral read-only Actions token; compare genuine Ruby versions and exact .NET SDK components.
+- Include the accumulated native package, daemon, runtime/environment, QEMU and CI fixes since the previous release.
+- Add Sponsors, governance, a code of conduct, OpenSSF Scorecard and downloadable Sigstore provenance bundles.
 
 ## [0.1.223] - 2026-09-16
 

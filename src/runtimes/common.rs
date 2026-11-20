@@ -154,9 +154,9 @@ pub(crate) struct BudgetedReader<R> {
 }
 
 impl<R> BudgetedReader<R> {
-    /// Explicit budget: production callers pass [`MAX_DECOMPRESSED_BYTES`],
-    /// tests pass a small budget so the abort path is exercisable without
-    /// gigabyte allocations.
+    /// Explicit finite budget: ordinary archives use [`MAX_DECOMPRESSED_BYTES`].
+    /// Authenticated larger components can select a separate bound; tests use
+    /// small budgets without gigabyte allocations.
     pub(crate) fn new(inner: R, budget: u64) -> Self {
         Self {
             inner,
@@ -1029,6 +1029,23 @@ pub(crate) async fn extract_tar_gz(
     dest_dir: &Path,
     strip_components: usize,
 ) -> Result<()> {
+    extract_tar_gz_with_budget(
+        archive_path,
+        dest_dir,
+        strip_components,
+        MAX_DECOMPRESSED_BYTES,
+    )
+    .await
+}
+
+/// Extract through the same bounded archive owner with an explicit expansion limit.
+/// Callers selecting a larger limit must authenticate the archive first.
+pub(crate) async fn extract_tar_gz_with_budget(
+    archive_path: &Path,
+    dest_dir: &Path,
+    strip_components: usize,
+    max_bytes: u64,
+) -> Result<()> {
     let archive_path = archive_path.to_path_buf();
     let dest_dir = dest_dir.to_path_buf();
 
@@ -1037,8 +1054,7 @@ pub(crate) async fn extract_tar_gz(
             stripped_archive_path(path, strip_components)
         };
         let task = extract_task(&archive_path);
-        let result =
-            extract_component_tar_gz(&archive_path, &dest_dir, MAX_DECOMPRESSED_BYTES, &select);
+        let result = extract_component_tar_gz(&archive_path, &dest_dir, max_bytes, &select);
         task.finish(Outcome::Done);
         result
     })
@@ -1334,6 +1350,7 @@ pub(crate) fn complete_staged_install_with_lease(
     version: &str,
     _mutation_lease: &RuntimeLease,
 ) -> Result<()> {
+    super::security::require_prepared(staging.path(), version_dir)?;
     write_install_marker(staging.path(), version)?;
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
@@ -1382,6 +1399,7 @@ pub(crate) fn replace_staged_install_with_lease(
     version: &str,
     _mutation_lease: &RuntimeLease,
 ) -> Result<()> {
+    super::security::require_prepared(staging.path(), version_dir)?;
     write_install_marker(staging.path(), version)?;
     if !is_valid_version_dir(version_dir) {
         anyhow::bail!(
@@ -1413,7 +1431,11 @@ pub(crate) fn replace_staged_install_with_lease(
 ///
 /// Symlinks and special files are rejected so a staged replacement cannot
 /// inherit a link that later escapes the published version directory.
-pub(crate) fn copy_regular_tree(src: &Path, dest: &Path) -> Result<()> {
+pub(crate) fn copy_regular_tree(
+    src: &Path,
+    dest: &Path,
+    preserve_directory_modes: bool,
+) -> Result<()> {
     let metadata = fs::symlink_metadata(src)
         .with_context(|| format!("Failed to inspect source path: {}", src.display()))?;
     if !metadata.is_dir() {
@@ -1421,10 +1443,14 @@ pub(crate) fn copy_regular_tree(src: &Path, dest: &Path) -> Result<()> {
     }
     fs::create_dir_all(dest)
         .with_context(|| format!("Failed to create destination directory: {}", dest.display()))?;
-    copy_regular_tree_contents(src, dest)
+    copy_regular_tree_contents(src, dest, preserve_directory_modes)
 }
 
-fn copy_regular_tree_contents(src: &Path, dest: &Path) -> Result<()> {
+fn copy_regular_tree_contents(
+    src: &Path,
+    dest: &Path,
+    preserve_directory_modes: bool,
+) -> Result<()> {
     for entry in
         fs::read_dir(src).with_context(|| format!("Failed to read directory: {}", src.display()))?
     {
@@ -1437,7 +1463,10 @@ fn copy_regular_tree_contents(src: &Path, dest: &Path) -> Result<()> {
         if file_type.is_dir() {
             fs::create_dir_all(&dest_path)
                 .with_context(|| format!("Failed to create directory: {}", dest_path.display()))?;
-            copy_regular_tree_contents(&entry.path(), &dest_path)?;
+            copy_regular_tree_contents(&entry.path(), &dest_path, preserve_directory_modes)?;
+            if preserve_directory_modes {
+                fs::set_permissions(&dest_path, entry.metadata()?.permissions())?;
+            }
         } else if file_type.is_file() {
             fs::copy(entry.path(), &dest_path).with_context(|| {
                 format!(
@@ -1490,6 +1519,11 @@ impl RuntimeLease {
         file.try_lock()?;
         Ok(Self { file })
     }
+
+    fn try_lock_shared(file: File) -> std::result::Result<Self, fs::TryLockError> {
+        file.try_lock_shared()?;
+        Ok(Self { file })
+    }
 }
 
 impl Drop for RuntimeLease {
@@ -1507,6 +1541,24 @@ pub(crate) fn try_lock_runtime_install(versions_dir: &Path, version: &str) -> Re
 }
 
 pub(crate) fn try_lock_runtime_file(versions_dir: &Path, name: &str) -> Result<RuntimeLease> {
+    lock_runtime_file(versions_dir, name, RuntimeLockMode::Mutation)
+}
+
+pub(crate) fn try_lock_runtime_use(versions_dir: &Path) -> Result<RuntimeLease> {
+    lock_runtime_file(versions_dir, ".mutation.lock", RuntimeLockMode::Use)
+}
+
+#[derive(Clone, Copy)]
+enum RuntimeLockMode {
+    Mutation,
+    Use,
+}
+
+fn lock_runtime_file(
+    versions_dir: &Path,
+    name: &str,
+    mode: RuntimeLockMode,
+) -> Result<RuntimeLease> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     crate::core::paths::create_private_data_directory(versions_dir)?;
     let lock = fs::OpenOptions::new()
@@ -1522,8 +1574,10 @@ pub(crate) fn try_lock_runtime_file(versions_dir: &Path, name: &str) -> Result<R
         metadata.is_file() && metadata.nlink() == 1,
         "Unsafe runtime install lock"
     );
-    RuntimeLease::try_lock(lock)
-        .context("Another runtime mutation is in progress; retry when it finishes")
+    match mode {
+        RuntimeLockMode::Mutation => RuntimeLease::try_lock(lock),
+        RuntimeLockMode::Use => RuntimeLease::try_lock_shared(lock),
+    }.context("Another runtime mutation or active use conflicts with this operation; retry when it finishes")
 }
 
 /// Return whether a runtime version path is a real production directory.
@@ -1732,13 +1786,14 @@ pub(crate) fn uninstall_version_with_lease(
 }
 
 /// Create or update the "current" symlink
+#[cfg(test)]
 pub(crate) fn set_current_version(versions_dir: &Path, version: &str) -> Result<()> {
     crate::core::security::validate_runtime_version(version)?;
     let mutation_lease = try_lock_runtime_file(versions_dir, ".mutation.lock")?;
     set_current_version_with_lease(versions_dir, version, &mutation_lease)
 }
 
-/// [`set_current_version`] for a caller that already holds the mutation lease.
+/// Create or update the current symlink while holding the mutation lease.
 pub(crate) fn set_current_version_with_lease(
     versions_dir: &Path,
     version: &str,
@@ -1754,6 +1809,8 @@ pub(crate) fn set_current_version_with_lease(
             "Version {version} is not installed as a valid directory. Install it first with: omg use <runtime>@{version}"
         );
     }
+
+    super::security::require_prepared(&version_dir, &version_dir)?;
 
     #[cfg(not(unix))]
     anyhow::bail!("Runtime version switching is unsupported on this platform");
@@ -2215,6 +2272,15 @@ where
 #[cfg(test)]
 #[expect(clippy::unwrap_used, clippy::expect_used)] // Idiomatic in tests: panics on failure with clear error context
 mod tests {
+    fn prepare_runtime_fixture(
+        tree: &std::path::Path,
+        destination: &std::path::Path,
+        version: &str,
+    ) -> anyhow::Result<()> {
+        crate::runtimes::security::fixture_prepare("node", version, tree, destination)?;
+        Ok(())
+    }
+
     #[tokio::test]
     async fn runtime_download_reports_stalled_body_without_exposing_urls() -> anyhow::Result<()> {
         if crate::core::testing::run_isolated_test(
@@ -2462,6 +2528,8 @@ mod tests {
     #[tokio::test]
     async fn runtime_download_recovers_from_transient_status_without_error_body()
     -> anyhow::Result<()> {
+        use rustix::fs::{Mode, OFlags, openat};
+
         for status in [408, 429, 500, 502, 503, 504] {
             let directory = tempfile::tempdir()?;
             let dest = directory.path().join("archive.tar.gz");
@@ -2471,7 +2539,18 @@ mod tests {
             let (temporary, actual) = result?;
             let expected = b"verified runtime archive fixture";
             assert_eq!(actual, hex::encode(Sha256::digest(expected)));
-            assert_eq!(fs::read(&temporary)?, expected);
+            assert_eq!(temporary.parent(), Some(directory.path()));
+            let root = File::open(directory.path())?;
+            let name = temporary.file_name().context("Download lacks a filename")?;
+            let handle = openat(
+                &root,
+                name,
+                OFlags::RDONLY | OFlags::NOFOLLOW,
+                Mode::empty(),
+            )?;
+            let mut written = Vec::new();
+            File::from(handle).read_to_end(&mut written)?;
+            assert_eq!(written, expected);
             assert!(
                 !dest.exists(),
                 "unverified downloads must remain unpublished"
@@ -3988,6 +4067,7 @@ mod tests {
         assert!(uninstall_version(temp.path(), "1.0.0").is_err());
         assert!(version.exists());
         drop(lease);
+        prepare_runtime_fixture(&version, &version, "1.0.0")?;
         set_current_version(temp.path(), "1.0.0")?;
         assert!(uninstall_version(temp.path(), "1.0.0").is_err());
         assert!(version.exists());
@@ -4060,6 +4140,37 @@ mod tests {
         assert!(try_lock_runtime_install(temp.path(), "1.0.0").is_err());
         drop(lease);
         let _next = try_lock_runtime_install(temp.path(), "1.0.0")?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn gzip_explicit_budget_covers_the_complete_decompressed_stream() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let raw = tar_archive(tar::EntryType::Regular);
+        let length = u64::try_from(raw.len())?;
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        std::io::Write::write_all(&mut encoder, &raw)?;
+        let archive = temp.path().join("runtime.tar.gz");
+        fs::write(&archive, encoder.finish()?)?;
+        for (name, budget, accepted) in [
+            ("below", length - 1, false),
+            ("exact", length, true),
+            ("above", length + 1, true),
+        ] {
+            let output = temp.path().join(name);
+            let result = extract_tar_gz_with_budget(&archive, &output, 1, budget).await;
+            if accepted {
+                result.expect("complete archive within its finite budget");
+                assert_eq!(fs::read(output.join("bin/tool"))?, b"tool");
+            } else {
+                let error = result.expect_err("even one byte beyond the stream budget must refuse");
+                assert!(format!("{error:#}").contains("configured limit"));
+            }
+        }
+        assert_eq!(MAX_DECOMPRESSED_BYTES, 2 * 1024 * 1024 * 1024);
+        let default_output = temp.path().join("default");
+        extract_tar_gz(&archive, &default_output, 1).await?;
+        assert_eq!(fs::read(default_output.join("bin/tool"))?, b"tool");
         Ok(())
     }
 
@@ -4558,6 +4669,7 @@ mod tests {
 
         let staging = begin_staged_install(&versions_dir)?;
         fs::write(staging.path().join("bin"), "binary")?;
+        prepare_runtime_fixture(staging.path(), &version_dir, "1.0.0")?;
         complete_staged_install(&staging, &version_dir, "1.0.0")?;
 
         assert!(version_dir.join("bin").is_file());
@@ -4602,6 +4714,7 @@ mod tests {
         fs::create_dir_all(&version_dir)?;
 
         let staging = begin_staged_install(&versions_dir)?;
+        prepare_runtime_fixture(staging.path(), &version_dir, "1.0.0")?;
         let error = complete_staged_install(&staging, &version_dir, "1.0.0")
             .expect_err("must refuse to publish over an existing version");
         assert_eq!(
@@ -4624,6 +4737,7 @@ mod tests {
 
         let staging = begin_staged_install(&versions_dir)?;
         fs::write(staging.path().join("bin"), "new")?;
+        prepare_runtime_fixture(staging.path(), &version_dir, "1.0.0")?;
         replace_staged_install(&staging, &version_dir, "1.0.0")?;
 
         assert_eq!(fs::read_to_string(staging.path().join("bin"))?, "old");
@@ -4651,6 +4765,7 @@ mod tests {
         fs::write(version_dir.join("bin"), "old")?;
         let staging = begin_staged_install(&version_dir)?;
         fs::write(staging.path().join("bin"), "new")?;
+        prepare_runtime_fixture(staging.path(), &version_dir, "1.0.0")?;
 
         replace_staged_install(&staging, &version_dir, "1.0.0")
             .expect_err("cannot exchange a directory with its descendant");
@@ -4669,7 +4784,7 @@ mod tests {
         fs::create_dir_all(src.join("nested/deeper"))?;
         fs::write(src.join("root.bin"), b"root\0payload")?;
         fs::write(src.join("nested/deeper/tool"), b"nested\xffpayload")?;
-        copy_regular_tree(&src, &dest)?;
+        copy_regular_tree(&src, &dest, false)?;
         assert_eq!(fs::read(dest.join("root.bin"))?, b"root\0payload");
         assert_eq!(
             fs::read(dest.join("nested/deeper/tool"))?,
@@ -4677,7 +4792,7 @@ mod tests {
         );
         std::os::unix::fs::symlink("/tmp", src.join("link"))?;
 
-        let error = copy_regular_tree(&src, &dest).expect_err("symlinks must be rejected");
+        let error = copy_regular_tree(&src, &dest, false).expect_err("symlinks must be rejected");
         assert!(error.to_string().contains("symlink or special file"));
         Ok(())
     }
@@ -4863,6 +4978,9 @@ mod tests {
         fs::create_dir(&first_version).unwrap();
         fs::create_dir(&second_version).unwrap();
 
+        prepare_runtime_fixture(&first_version, &first_version, "1.0.0").unwrap();
+        prepare_runtime_fixture(&second_version, &second_version, "2.0.0").unwrap();
+
         set_current_version(temp.path(), "1.0.0").unwrap();
         set_current_version(temp.path(), "2.0.0").unwrap();
 
@@ -4880,6 +4998,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let installed_version = temp.path().join("1.0.0");
         fs::create_dir(&installed_version).unwrap();
+        prepare_runtime_fixture(&installed_version, &installed_version, "1.0.0").unwrap();
         set_current_version(temp.path(), "1.0.0").unwrap();
 
         let error = set_current_version(temp.path(), "2.0.0").unwrap_err();
@@ -4898,6 +5017,8 @@ mod tests {
         fs::create_dir(temp.path().join("1.0.0")).unwrap();
         let current_path = temp.path().join("current");
         fs::write(&current_path, "sentinel").unwrap();
+        let version = temp.path().join("1.0.0");
+        prepare_runtime_fixture(&version, &version, "1.0.0").unwrap();
 
         let error = set_current_version(temp.path(), "1.0.0").unwrap_err();
 
@@ -4914,6 +5035,24 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let error = set_current_version(temp.path(), "1.0.0").unwrap_err();
         assert!(error.to_string().contains("is not installed"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn activation_without_advisory_authority_preserves_current_link() -> Result<()> {
+        let root = TempDir::new()?;
+        let versions = root.path().join("versions/node");
+        let previous = versions.join("20.0.0");
+        let candidate = versions.join("24.22.3");
+        fs::create_dir_all(previous.join("bin"))?;
+        fs::create_dir_all(candidate.join("bin"))?;
+        fs::write(candidate.join("bin/node"), b"unreviewed executable bytes")?;
+        std::os::unix::fs::symlink(&previous, versions.join("current"))?;
+        let error = set_current_version(&versions, "24.22.3")
+            .expect_err("an installation without advisory authority must not become active");
+        assert!(format!("{error:#}").to_lowercase().contains("advisory"));
+        assert_eq!(fs::read_link(versions.join("current"))?, previous);
+        Ok(())
     }
 
     #[cfg(unix)]
@@ -4961,6 +5100,7 @@ mod tests {
         }
 
         fs::write(version_dir.join("bin/node"), b"node").unwrap();
+        prepare_runtime_fixture(&version_dir, &version_dir, "1.0.0").unwrap();
         activate_version(temp.path(), "1.0.0", Path::new("bin/node")).unwrap();
         #[cfg(unix)]
         assert_eq!(
@@ -4977,6 +5117,7 @@ mod tests {
         fs::create_dir_all(version_dir.join("bin")).unwrap();
         fs::write(version_dir.join("bin/python3.12"), b"python").unwrap();
         std::os::unix::fs::symlink("python3.12", version_dir.join("bin/python3")).unwrap();
+        prepare_runtime_fixture(&version_dir, &version_dir, "3.12.0").unwrap();
 
         activate_version_with_linked_binary(temp.path(), "3.12.0", Path::new("bin/python3"))
             .expect("an internal vendor symlink is safe");
@@ -5056,6 +5197,54 @@ mod tests {
         );
         // Allocation stopped at the budget instead of expanding to 64 MiB.
         assert!(sink.len() <= 1024 * 1024 + 64 * 1024);
+    }
+
+    #[test]
+    fn file_gzip_budget_refuses_excess_and_preserves_exact_limit() -> anyhow::Result<()> {
+        let owner = TempDir::new()?;
+        let archive = owner.path().join("bounded.gz");
+        fs::write(&archive, gzip_bomb(4096))?;
+        for budget in [4095, 4096] {
+            let decoder = flate2::read::GzDecoder::new(File::open(&archive)?);
+            let mut reader = BudgetedReader::new(decoder, budget);
+            let mut output = Vec::new();
+            let result = reader.read_to_end(&mut output);
+            if budget == 4096 {
+                assert_eq!(result?, 4096);
+                assert_eq!(output, vec![0; 4096]);
+            } else {
+                let error = result.expect_err("File-backed gzip must reject the first excess byte");
+                assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+                assert!(error.to_string().contains("configured limit of 4095 bytes"));
+                assert!(output.len() <= usize::try_from(budget)?);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn file_zstd_budget_refuses_excess_and_preserves_exact_limit() -> anyhow::Result<()> {
+        let owner = TempDir::new()?;
+        let archive = owner.path().join("bounded.zst");
+        let payload = vec![b'z'; 4096];
+        fs::write(&archive, zstd::stream::encode_all(payload.as_slice(), 1)?)?;
+        for budget in [4095, 4096] {
+            let decoder = ruzstd::decoding::StreamingDecoder::new(File::open(&archive)?)
+                .expect("owned tiny Zstd fixture must decode");
+            let mut reader = BudgetedReader::new(decoder, budget);
+            let mut output = Vec::new();
+            let result = reader.read_to_end(&mut output);
+            if budget == 4096 {
+                assert_eq!(result?, 4096);
+                assert_eq!(output, payload);
+            } else {
+                let error = result.expect_err("File-backed Zstd must reject the first excess byte");
+                assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+                assert!(error.to_string().contains("configured limit of 4095 bytes"));
+                assert!(output.len() <= usize::try_from(budget)?);
+            }
+        }
+        Ok(())
     }
 
     #[test]

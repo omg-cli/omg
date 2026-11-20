@@ -645,6 +645,9 @@ pub fn init_with_installer_digests(base_image: Option<String>, entries: &[String
     execute_cmd(Cmd::batch([
         Cmd::success("Created Dockerfile.omg"),
         Cmd::card("Configuration", details),
+        Cmd::info(
+            "Generated image package and runtime CVE coverage is unknown. Building it requires an explicit security review.",
+        ),
         Cmd::println("\n  Build with:"),
         Cmd::println("    omg container build -f Dockerfile.omg -t myapp"),
     ]))?;

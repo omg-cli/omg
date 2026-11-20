@@ -5,6 +5,290 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
+/// Require an exact, bounded decision from the owning foreground terminal.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn confirm_security_review(
+    details: &str,
+    digest: &str,
+    invoking_uid: u32,
+    check_cancelled: &dyn Fn() -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+    use std::fmt::Write as _;
+    use std::os::unix::fs::OpenOptionsExt;
+    check_cancelled()?;
+    let tty = std::fs::OpenOptions::new().read(true).write(true)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC | nix::libc::O_NONBLOCK | nix::libc::O_NOCTTY)
+        .open("/dev/tty").with_context(|| format!("{details}\nSecurity review requires an attended controlling terminal; --yes cannot accept advisory risk or unknown coverage"))?;
+    anyhow::ensure!(
+        nix::unistd::tcgetpgrp(&tty)? == nix::unistd::getpgrp(),
+        "Security acknowledgement must run in the terminal foreground"
+    );
+    verify_review_terminal(&tty, invoking_uid)?;
+    let mut prompt = details.to_owned();
+    let _ = write!(
+        prompt,
+        "\nType accept {digest} within 60 seconds to continue (default: cancel): "
+    );
+    anyhow::ensure!(
+        prompt.len() <= 64 * 1024,
+        "Security acknowledgement display exceeds limit"
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_mins(1);
+    read_security_review(&tty, &prompt, digest, deadline, check_cancelled)
+}
+
+#[cfg(target_os = "linux")]
+fn verify_review_terminal(tty: &std::fs::File, invoking_uid: u32) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let mut session: nix::libc::pid_t = 0;
+    // SAFETY: TIOCGSID writes one session identifier into this valid stack value.
+    #[expect(
+        unsafe_code,
+        reason = "the acknowledgement must use this process's controlling terminal session"
+    )]
+    let status =
+        unsafe { nix::libc::ioctl(tty.as_raw_fd(), nix::libc::TIOCGSID, &raw mut session) };
+    nix::errno::Errno::result(status)
+        .map_err(std::io::Error::from)
+        .context("Cannot establish acknowledgement terminal session")?;
+    anyhow::ensure!(
+        nix::unistd::getsid(None)?.as_raw() == session,
+        "Security acknowledgement terminal belongs to another session"
+    );
+    let mut device: nix::libc::c_uint = 0;
+    // SAFETY: TIOCGDEV writes one kernel device number into this valid stack value.
+    #[expect(
+        unsafe_code,
+        reason = "kernel terminal identity must be resolved independently of the /dev/tty alias"
+    )]
+    let status = unsafe { nix::libc::ioctl(tty.as_raw_fd(), nix::libc::TIOCGDEV, &raw mut device) };
+    nix::errno::Errno::result(status)
+        .map_err(std::io::Error::from)
+        .context("Cannot establish acknowledgement terminal identity")?;
+    let path = review_terminal_device_path(device)?;
+    let metadata = std::fs::symlink_metadata(path)?;
+    anyhow::ensure!(
+        metadata.file_type().is_char_device()
+            && metadata.rdev() == u64::from(device)
+            && (metadata.uid() == invoking_uid || metadata.uid() == 0),
+        "Security acknowledgement terminal is not owned by root or the invoking user"
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn review_terminal_device_path(device: u32) -> anyhow::Result<String> {
+    let major = (device >> 8) & 0xfff;
+    let minor = (device & 0xff) | ((device >> 12) & 0xfff00);
+    Ok(if (136..=143).contains(&major) {
+        format!("/dev/pts/{minor}")
+    } else if major == 4 && (1..=63).contains(&minor) {
+        format!("/dev/tty{minor}")
+    } else {
+        anyhow::bail!("Unsupported terminal identity for Security acknowledgement");
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn verify_review_terminal(_tty: &std::fs::File, invoking_uid: u32) -> anyhow::Result<()> {
+    use nix::libc;
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+    let size = std::mem::size_of::<libc::proc_bsdinfo>();
+    // SAFETY: the kernel receives a writable typed buffer of the supplied size.
+    #[expect(
+        unsafe_code,
+        reason = "Darwin exposes controlling-terminal identity through proc_pidinfo"
+    )]
+    let actual = unsafe {
+        libc::proc_pidinfo(
+            nix::unistd::getpid().as_raw(),
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            i32::try_from(size)?,
+        )
+    };
+    anyhow::ensure!(
+        usize::try_from(actual).ok() == Some(size),
+        "Cannot establish acknowledgement terminal identity"
+    );
+    // SAFETY: only an exact-sized successful BSDINFO response is read.
+    #[expect(
+        unsafe_code,
+        reason = "the kernel initialized the complete BSDINFO response"
+    )]
+    let info = unsafe { info.assume_init() };
+    anyhow::ensure!(
+        info.pbi_pid == nix::unistd::getpid().as_raw().cast_unsigned()
+            && info.pbi_pgid == nix::unistd::getpgrp().as_raw().cast_unsigned()
+            && info.e_tpgid == info.pbi_pgid
+            && info.e_tdev != u32::MAX,
+        "Security acknowledgement terminal identity changed"
+    );
+    // /dev/tty is an alias; bind ownership to the kernel's actual device instead.
+    for (index, entry) in std::fs::read_dir("/dev")?.enumerate() {
+        anyhow::ensure!(
+            index < 8192,
+            "Acknowledgement terminal device inventory exceeds limit"
+        );
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.as_encoded_bytes();
+        if !name.starts_with(b"tty") && name != b"console" {
+            continue;
+        }
+        let metadata = std::fs::symlink_metadata(entry.path())?;
+        if metadata.file_type().is_char_device() && metadata.rdev() == u64::from(info.e_tdev) {
+            anyhow::ensure!(
+                metadata.uid() == invoking_uid || metadata.uid() == 0,
+                "Security acknowledgement terminal is not owned by root or the invoking user"
+            );
+            return Ok(());
+        }
+    }
+    anyhow::bail!("Cannot resolve acknowledgement terminal device")
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn review_io_count(result: std::io::Result<usize>) -> anyhow::Result<Option<usize>> {
+    match result {
+        Ok(0) => anyhow::bail!("Security acknowledgement terminal closed"),
+        Ok(count) => Ok(Some(count)),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn read_security_review(
+    tty: &std::fs::File,
+    prompt: &str,
+    digest: &str,
+    deadline: std::time::Instant,
+    check_cancelled: &dyn Fn() -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+    use std::io::{Read, Write};
+    fn ready(
+        tty: &std::fs::File,
+        writing: bool,
+        deadline: std::time::Instant,
+        check_cancelled: &dyn Fn() -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        use rustix::event::{FdSetElement, Timespec, fd_set_insert, fd_set_num_elements, select};
+        use std::os::fd::AsRawFd;
+        let descriptor = tty.as_raw_fd();
+        let bound = descriptor
+            .checked_add(1)
+            .context("Invalid terminal descriptor")?;
+        loop {
+            check_cancelled()?;
+            anyhow::ensure!(
+                nix::unistd::tcgetpgrp(tty)? == nix::unistd::getpgrp(),
+                "Security terminal foreground changed during acknowledgement"
+            );
+            let remaining = deadline
+                .checked_duration_since(std::time::Instant::now())
+                .context("Security acknowledgement timed out")?;
+            let timeout = Timespec::try_from(remaining.min(std::time::Duration::from_millis(100)))
+                .context("Invalid acknowledgement timeout")?;
+            // Darwin cannot poll /dev/tty; select supports the controlling-terminal alias.
+            let mut descriptors = vec![FdSetElement::default(); fd_set_num_elements(1, bound)];
+            fd_set_insert(&mut descriptors, descriptor);
+            // SAFETY: the only selected descriptor belongs to tty, borrowed for this entire call.
+            #[expect(
+                unsafe_code,
+                reason = "select requires proof that every selected descriptor remains open"
+            )]
+            let result = unsafe {
+                if writing {
+                    select(bound, None, Some(&mut descriptors), None, Some(&timeout))
+                } else {
+                    select(bound, Some(&mut descriptors), None, None, Some(&timeout))
+                }
+            }
+            .context("Security acknowledgement interrupted")?;
+            check_cancelled()?;
+            anyhow::ensure!(
+                nix::unistd::tcgetpgrp(tty)? == nix::unistd::getpgrp(),
+                "Security terminal foreground changed during acknowledgement"
+            );
+            if result == 0 {
+                continue;
+            }
+            return Ok(());
+        }
+    }
+    fn foreground_io<T>(
+        tty: &std::fs::File,
+        operation: impl FnOnce(&std::fs::File) -> std::io::Result<T>,
+    ) -> anyhow::Result<std::io::Result<T>> {
+        use nix::sys::signal::{SigSet, SigmaskHow, Signal, pthread_sigmask};
+        // Foreground ownership can change between the check and the syscall.
+        // Blocking job-control signals makes that race return EIO rather than
+        // suspending the privileged transaction with its database lock held.
+        let mut blocked = SigSet::empty();
+        blocked.add(Signal::SIGTTIN);
+        blocked.add(Signal::SIGTTOU);
+        let mut previous = SigSet::empty();
+        pthread_sigmask(SigmaskHow::SIG_BLOCK, Some(&blocked), Some(&mut previous))?;
+        let result = operation(tty);
+        previous.thread_set_mask()?;
+        anyhow::ensure!(
+            nix::unistd::tcgetpgrp(tty)? == nix::unistd::getpgrp(),
+            "Security terminal foreground changed during acknowledgement"
+        );
+        Ok(result)
+    }
+    let mut remaining = prompt.as_bytes();
+    while !remaining.is_empty() {
+        ready(tty, true, deadline, check_cancelled)?;
+        let count =
+            review_io_count(foreground_io(tty, |mut tty| tty.write(remaining))?)?.unwrap_or(0);
+        remaining = &remaining[count..];
+    }
+    let mut answer = Vec::new();
+    loop {
+        ready(tty, false, deadline, check_cancelled)?;
+        let mut buffer = [0_u8; 128];
+        let count =
+            review_io_count(foreground_io(tty, |mut tty| tty.read(&mut buffer))?)?.unwrap_or(0);
+        answer.extend_from_slice(&buffer[..count]);
+        anyhow::ensure!(
+            answer.len() <= 96,
+            "Security acknowledgement input exceeds limit"
+        );
+        if answer.contains(&b'\n') {
+            break;
+        }
+    }
+    anyhow::ensure!(
+        nix::unistd::tcgetpgrp(tty)? == nix::unistd::getpgrp(),
+        "Security terminal foreground changed during acknowledgement"
+    );
+    anyhow::ensure!(
+        answer == format!("accept {digest}\n").as_bytes()
+            || answer == format!("accept {digest}\r\n").as_bytes(),
+        "Security acknowledgement declined"
+    );
+    check_cancelled()?;
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn confirm_security_review(
+    details: &str,
+    _digest: &str,
+    _invoking_uid: u32,
+    _check_cancelled: &dyn Fn() -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    anyhow::bail!("{details}\nSecurity acknowledgement requires a supported foreground terminal")
+}
+
 /// Privileged command lookup never consults the invoking user's PATH.
 pub const SYSTEM_PATH: &str = "/usr/sbin:/usr/bin:/sbin:/bin";
 
@@ -710,12 +994,8 @@ pub fn elevate_for_operation(operation: &str, args: &[String]) -> std::io::Resul
     elevate_if_needed(args).map_err(std::io::Error::other)
 }
 
-/// Run the current executable with sudo and specific arguments asynchronously
 /// Build a scrubbed sudo command that re-executes the current binary.
-///
-/// Note: We set `OMG_ELEVATED=1` as an environment variable for the child
-/// process. This prevents infinite recursion when the elevated process checks
-/// this flag.
+/// Authenticated elevation and history ownership travel as positional markers.
 ///
 /// CRITICAL: Remove CARGO_* environment variables to prevent the elevated
 /// process from writing to the user's target directory as root (causing
@@ -729,7 +1009,7 @@ fn payload_command(
     exe: &std::path::Path,
     args: &[&str],
     non_interactive: bool,
-) -> tokio::process::Command {
+) -> anyhow::Result<tokio::process::Command> {
     let parent_records = args.last().copied() == Some(FLOW_PARENT_RECORDS);
     let payload_args = if parent_records {
         &args[..args.len() - 1]
@@ -749,13 +1029,23 @@ fn payload_command(
         .env("OMG_ELEVATED", "1");
     scrub_privileged_env(&mut command);
     command
-        // Inherit terminal so output and any password prompt stay attached
         .stdin(std::process::Stdio::inherit())
         .stdout(std::process::Stdio::inherit())
         .stderr(std::process::Stdio::inherit())
-        .arg("--")
-        .arg(exe)
-        .arg(crate::core::privilege::ELEVATED_MARKER);
+        .arg("--");
+    let verb = payload_args
+        .first()
+        .copied()
+        .filter(|argument| !argument.starts_with(crate::core::security::policy::POLICY_MARKER))
+        .or_else(|| payload_args.get(1).copied());
+    if verb == Some("omarchy-native") {
+        // Package hooks can reexecute the user manager. Keep our worker in a
+        // system scope while retaining this invocation's namespaces and TTY.
+        command
+            .arg(root_controlled_program_path("systemd-run")?)
+            .args(["--scope", "--quiet", "--collect", "--"]);
+    }
+    command.arg(exe).arg(ELEVATED_MARKER);
     if parent_records {
         // Internal flow ownership is positional protocol metadata, never a
         // package-list token. The root child accepts it only immediately
@@ -763,7 +1053,31 @@ fn payload_command(
         command.arg(FLOW_PARENT_RECORDS);
     }
     command.args(payload_args);
-    command
+    Ok(command)
+}
+
+/// Build a supervised, fixed native package stage after Omarchy authorization.
+#[cfg(feature = "arch")]
+pub(crate) fn native_omarchy_command(
+    operation: crate::package_managers::arch::NativeOmarchyOperation,
+    interaction: crate::package_managers::arch::NativeOmarchyInteraction,
+) -> anyhow::Result<tokio::process::Command> {
+    let policy = crate::core::security::policy::policy_handoff()?;
+    let mut arguments = vec![
+        "omarchy-native",
+        "--",
+        operation.argument(),
+        interaction.argument(),
+    ];
+    if let Some(policy) = &policy {
+        arguments.insert(0, policy);
+    }
+    payload_command(
+        &root_controlled_program_path("sudo")?,
+        &elevation_executable()?,
+        &arguments,
+        true,
+    )
 }
 
 /// Run the omg payload under sudo exactly once and return its exit status
@@ -803,7 +1117,14 @@ async fn sudo_payload_status(args: &[&str]) -> anyhow::Result<std::process::Exit
 /// Privileged re-exec verbs that are not clap user commands. `update --fast`
 /// and `update --turbo` elevate as `fullupdate` / `turboupdate`; the elevated
 /// child also accepts `upgrade`. See `try_fast_elevated` in `src/bin/omg.rs`.
-const INTERNAL_PRIVILEGED_ENTRYPOINTS: &[&str] = &["upgrade", "fullupdate", "turboupdate"];
+const INTERNAL_PRIVILEGED_ENTRYPOINTS: &[&str] = &[
+    "upgrade",
+    "fullupdate",
+    "turboupdate",
+    "install-plan",
+    "omarchy-native",
+    "dnf-native",
+];
 
 fn snapshot_install_inputs(
     args: &[String],
@@ -912,7 +1233,7 @@ async fn sudo_payload_status_in(
         // terminal instead of spawning a GUI askpass dialog. The user can
         // Ctrl+C if needed. Runs exactly once.
         tracing::debug!("Password required, running interactive sudo");
-        return payload_command(sudo_program, &exe, args, false)
+        return payload_command(sudo_program, &exe, args, false)?
             .status()
             .await
             .map_err(|e| {
@@ -928,7 +1249,7 @@ async fn sudo_payload_status_in(
     // Authenticated non-interactively: run the payload exactly once and
     // propagate its result. Never retried — a failing elevated command must
     // surface its own error, not trigger a second execution.
-    payload_command(sudo_program, &exe, args, true)
+    payload_command(sudo_program, &exe, args, true)?
         .status()
         .await
         .map_err(|e| {
@@ -967,8 +1288,167 @@ pub async fn run_privileged_child(args: &[&str]) -> anyhow::Result<()> {
     anyhow::bail!("Elevated command failed with exit code: {status}")
 }
 
+/// Re-enter OMG so its root owner resolves, reviews and replays the DNF plan.
+/// A caller can supply package names and fixed internal modes, never a replay path.
+#[cfg(feature = "fedora")]
+pub(crate) async fn run_privileged_dnf(args: &[String]) -> anyhow::Result<()> {
+    crate::package_managers::dnf::DnfPackageManager::validate_admission_args(args)?;
+    let mut payload = vec!["dnf-native", "--"];
+    payload.extend(args.iter().map(String::as_str));
+    payload.push(FLOW_PARENT_RECORDS);
+    run_privileged_child(&payload).await
+}
+
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn review_terminal_device_paths_accept_only_kernel_pts_and_virtual_terminals() {
+        for (major, minor, expected) in [
+            (136, 0, "/dev/pts/0"),
+            (143, 0x12345, "/dev/pts/74565"),
+            (4, 1, "/dev/tty1"),
+            (4, 63, "/dev/tty63"),
+        ] {
+            let device = u32::try_from(nix::sys::stat::makedev(major, minor)).unwrap();
+            assert_eq!(
+                super::review_terminal_device_path(device).unwrap(),
+                expected
+            );
+        }
+        for (major, minor) in [(0, 0), (4, 0), (4, 64), (135, 1), (144, 1)] {
+            let device = u32::try_from(nix::sys::stat::makedev(major, minor)).unwrap();
+            assert!(
+                super::review_terminal_device_path(device)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("Unsupported terminal identity")
+            );
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn review_io_preserves_nonblocking_progress_closure_and_kernel_errors() {
+        use std::io::{Read, Write};
+        use std::net::Shutdown;
+        use std::os::unix::net::UnixStream;
+        let (mut sender, mut receiver) = UnixStream::pair().unwrap();
+        sender.set_nonblocking(true).unwrap();
+        receiver.set_nonblocking(true).unwrap();
+        let mut byte = [0_u8; 1];
+        assert_eq!(
+            super::review_io_count(receiver.read(&mut byte)).unwrap(),
+            None
+        );
+        assert_eq!(super::review_io_count(sender.write(b"x")).unwrap(), Some(1));
+        assert_eq!(
+            super::review_io_count(receiver.read(&mut byte)).unwrap(),
+            Some(1)
+        );
+        assert_eq!(byte, *b"x");
+        let payload = vec![0_u8; 64 * 1024];
+        let pending = (0..1024)
+            .find_map(|_| sender.write(&payload).err())
+            .expect("the bounded real socket buffer must apply backpressure");
+        assert_eq!(super::review_io_count(Err(pending)).unwrap(), None);
+        // Local write shutdown makes the kernel error independent of peer
+        // closure timing and queued data.
+        sender.shutdown(Shutdown::Write).unwrap();
+        let error = super::review_io_count(sender.write(b"closed")).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::BrokenPipe
+        );
+        let (sender, mut receiver) = UnixStream::pair().unwrap();
+        sender.shutdown(Shutdown::Write).unwrap();
+        drop(sender);
+        assert!(
+            super::review_io_count(receiver.read(&mut byte))
+                .unwrap_err()
+                .to_string()
+                .contains("terminal closed")
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn review_terminal_rejects_a_real_non_terminal_and_preserves_ioctl_errno() {
+        let file = std::fs::File::open("/dev/null").unwrap();
+        let error =
+            super::verify_review_terminal(&file, nix::unistd::geteuid().as_raw()).unwrap_err();
+        assert!(error.to_string().contains("terminal session"));
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .unwrap()
+                .raw_os_error(),
+            Some(nix::libc::ENOTTY)
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn security_review_requires_exact_foreground_terminal_consent() {
+        let Ok(case) = std::env::var("OMG_TERMINAL_REVIEW_CASE") else {
+            let output =
+                std::process::Command::new(super::root_controlled_program_path("python3").unwrap())
+                    .arg(
+                        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                            .join("scripts/test-security-review-terminal.py"),
+                    )
+                    .arg("--unit")
+                    .arg(std::env::current_exe().unwrap())
+                    .output()
+                    .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(output.status.success(), "{stdout}\n{stderr}");
+            let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(result["passed"], 11);
+            return;
+        };
+        assert!(
+            [
+                "accept",
+                "generic-yes",
+                "blank",
+                "wrong-review",
+                "eof",
+                "no-tty",
+                "interrupt",
+                "terminate",
+                "hangup",
+                "cancelled"
+            ]
+            .contains(&case.as_str())
+        );
+        let result = super::confirm_security_review(
+            "fixture-runtime 1.2.3 has CVE-2021-23337\nhttps://www.cve.org/CVERecord?id=CVE-2021-23337",
+            &"a".repeat(64),
+            nix::unistd::geteuid().as_raw(),
+            &|| {
+                anyhow::ensure!(case != "cancelled", "fixture cancellation");
+                Ok(())
+            },
+        );
+        assert_eq!(result.is_ok(), case == "accept", "{result:?}");
+        if case == "no-tty" {
+            let error = result.unwrap_err().to_string();
+            assert!(
+                error.contains("CVE-2021-23337") && error.contains("--yes"),
+                "{error}"
+            );
+        } else if case == "cancelled" {
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("fixture cancellation")
+            );
+        }
+    }
+
     #[test]
     fn install_snapshot_preserves_flow_markers_and_rejects_invalid_argv() {
         for args in [
@@ -1104,6 +1584,213 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(feature = "arch", target_os = "linux"))]
+    fn native_omarchy_payload_runs_our_binary_in_a_system_scope() {
+        let command = payload_command(
+            std::path::Path::new("sudo"),
+            std::path::Path::new("/usr/bin/omg"),
+            &[
+                "__omg_policy=fixture",
+                "omarchy-native",
+                "--",
+                "repository-upgrade",
+                "unattended",
+            ],
+            true,
+        )
+        .expect("construct privileged payload");
+        let args = command.as_std().get_args().collect::<Vec<_>>();
+        assert_eq!(args[2], std::ffi::OsStr::new("/usr/bin/systemd-run"));
+        let marker = args
+            .iter()
+            .position(|arg| *arg == ELEVATED_MARKER)
+            .expect("elevation marker");
+        assert_eq!(
+            &args[3..marker],
+            &["--scope", "--quiet", "--collect", "--", "/usr/bin/omg"]
+        );
+        assert_eq!(args[marker + 1], "__omg_policy=fixture");
+        assert_eq!(args[marker + 2], "omarchy-native");
+    }
+
+    #[test]
+    fn native_omarchy_operation_is_not_parsed_as_a_public_clap_command() {
+        let args = ["omarchy-native", "--", "repository-upgrade", "unattended"].map(str::to_owned);
+        assert!(
+            super::snapshot_install_inputs(&args)
+                .expect("closed private operation")
+                .is_none()
+        );
+    }
+
+    #[test]
+    #[cfg(all(feature = "arch", target_os = "linux"))]
+    fn command_constructors_preserve_policy_and_refuse_invalid_handoffs() {
+        use crate::core::security::policy::{
+            POLICY_MARKER, PolicyError, SecurityGrade, SecurityPolicy,
+        };
+        use crate::package_managers::arch::{NativeOmarchyInteraction, NativeOmarchyOperation};
+
+        const TEST: &str = "core::privilege::tests::command_constructors_preserve_policy_and_refuse_invalid_handoffs";
+        if crate::core::testing::run_isolated_test(TEST)
+            || crate::config::Settings::rerun_test_unprivileged(TEST)
+        {
+            return;
+        }
+        assert!(!is_root(), "policy receiver must be unprivileged");
+        let directory = tempfile::tempdir_in("/var/tmp").expect("private policy fixture");
+        let config = directory.path().join("config");
+        let home = directory.path().join("home");
+        std::fs::create_dir(&config).expect("private config directory");
+        std::fs::create_dir(&home).expect("private home directory");
+        temp_env::with_vars(
+            [
+                ("OMG_CONFIG_DIR", Some(config.as_os_str())),
+                ("HOME", Some(home.as_os_str())),
+                ("OMG_TEST_MODE", None),
+                ("OMG_TEST_DISTRO", None),
+                ("CARGO_PRIMARY_PACKAGE", Some(std::ffi::OsStr::new("1"))),
+                ("SUDO_USER", None),
+                ("SUDO_HOME", None),
+                ("DOAS_USER", None),
+            ],
+            || {
+                assert_eq!(crate::core::paths::config_dir(), config);
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("policy command test runtime");
+                let policy = SecurityPolicy {
+                    minimum_grade: SecurityGrade::Verified,
+                    allow_aur: false,
+                    require_pgp: true,
+                    allowed_licenses: vec!["MIT".into()],
+                    banned_packages: vec!["blocked-fixture-package".into()],
+                    ..SecurityPolicy::default()
+                };
+                let file = config.join("policy.toml");
+                for explicit in [false, true] {
+                    if explicit {
+                        std::fs::write(
+                            &file,
+                            toml::to_string(&policy).expect("serialize explicit policy"),
+                        )
+                        .expect("write explicit policy");
+                    }
+                    let command = native_omarchy_command(
+                        NativeOmarchyOperation::UpgradeRepositories,
+                        NativeOmarchyInteraction::Unattended,
+                    )
+                    .expect("construct native command");
+                    let args: Vec<_> = command
+                        .as_std()
+                        .get_args()
+                        .map(|arg| arg.to_str().expect("UTF-8 fixture argument").to_owned())
+                        .collect();
+                    assert_eq!(
+                        &args[..7],
+                        [
+                            "-n",
+                            "--",
+                            "/usr/bin/systemd-run",
+                            "--scope",
+                            "--quiet",
+                            "--collect",
+                            "--"
+                        ]
+                    );
+                    assert_eq!(
+                        args[7],
+                        elevation_executable()
+                            .expect("current elevation executable")
+                            .to_str()
+                            .expect("UTF-8 fixture executable")
+                    );
+                    assert_eq!(args[8], ELEVATED_MARKER);
+                    let payload = &args[9..];
+                    if explicit {
+                        assert_eq!(payload.len(), 5, "explicit policy must precede operation");
+                        let encoded = payload[0]
+                            .strip_prefix(POLICY_MARKER)
+                            .expect("policy precedes private operation");
+                        let decoded: SecurityPolicy = serde_json::from_slice(
+                            &hex::decode(encoded).expect("hex policy handoff"),
+                        )
+                        .expect("decode policy handoff");
+                        assert_eq!(decoded, policy);
+                    }
+                    let offset = usize::from(explicit);
+                    assert_eq!(
+                        &payload[offset..],
+                        ["omarchy-native", "--", "repository-upgrade", "unattended"]
+                    );
+                    let refusal = runtime
+                        .block_on(sudo_payload_status(&["fullupdate", "--"]))
+                        .expect_err("development mode must refuse elevation")
+                        .to_string();
+                    assert!(
+                        refusal
+                            .starts_with("Privilege elevation not supported in development mode.")
+                    );
+                    let mut proposed = vec!["fullupdate".to_owned(), "--".to_owned()];
+                    if explicit {
+                        proposed.insert(0, payload[0].clone());
+                    }
+                    assert!(
+                        refusal.ends_with(&format!("{proposed:?}")),
+                        "development refusal must preserve policy and operation"
+                    );
+                }
+                std::fs::write(&file, "require_pgp = 'not-a-boolean'")
+                    .expect("write malformed policy");
+                for error in [
+                    native_omarchy_command(
+                        NativeOmarchyOperation::UpgradeRepositories,
+                        NativeOmarchyInteraction::Unattended,
+                    )
+                    .expect_err("malformed policy must refuse command construction"),
+                    runtime
+                        .block_on(sudo_payload_status(&["fullupdate", "--"]))
+                        .expect_err("malformed policy must refuse ordinary elevation"),
+                ] {
+                    let parse_error = error
+                        .downcast_ref::<PolicyError>()
+                        .expect("malformed handoff must preserve the parse error");
+                    assert!(
+                        matches!(parse_error, PolicyError::Parse { .. }),
+                        "malformed handoff must preserve the parse error"
+                    );
+                }
+                let oversized = SecurityPolicy {
+                    banned_packages: vec!["x".repeat(32769)],
+                    ..policy
+                };
+                std::fs::write(
+                    &file,
+                    toml::to_string(&oversized).expect("serialize oversized policy"),
+                )
+                .expect("write oversized policy");
+                for error in [
+                    native_omarchy_command(
+                        NativeOmarchyOperation::UpgradeRepositories,
+                        NativeOmarchyInteraction::Unattended,
+                    )
+                    .expect_err("oversized policy must refuse command construction"),
+                    runtime
+                        .block_on(sudo_payload_status(&["fullupdate", "--"]))
+                        .expect_err("oversized policy must refuse ordinary elevation"),
+                ] {
+                    assert!(
+                        error
+                            .to_string()
+                            .contains("Security policy exceeds elevation handoff limit")
+                    );
+                }
+            },
+        );
+    }
+
+    #[test]
     fn payload_command_transmits_elevation_via_argv_marker() {
         // Regression: OMG_ELEVATED=1 in the child environment is stripped by
         // sudo's env_reset, which killed every fast-elevated path. The marker
@@ -1114,7 +1801,8 @@ mod tests {
             &exe,
             &["fullupdate", "--"],
             true,
-        );
+        )
+        .expect("construct privileged payload");
         let argv = command.as_std().get_args().collect::<Vec<_>>();
         let marker_pos = argv
             .iter()
@@ -1134,7 +1822,8 @@ mod tests {
             &exe,
             &["install", "--", "ripgrep", FLOW_PARENT_RECORDS],
             true,
-        );
+        )
+        .expect("construct privileged payload");
         let argv = command
             .as_std()
             .get_args()
@@ -1166,7 +1855,8 @@ mod tests {
             &exe,
             &["install", "--", "ripgrep"],
             true,
-        );
+        )
+        .expect("construct privileged payload");
         let removed: std::collections::HashSet<String> = command
             .as_std()
             .get_envs()
@@ -1538,6 +2228,60 @@ mod tests {
             "-n -v\n",
             "failed preflight must not execute the payload"
         );
+    }
+
+    #[tokio::test]
+    async fn payload_spawn_failure_keeps_context_without_retry() {
+        const TEST: &str =
+            "core::privilege::tests::payload_spawn_failure_keeps_context_without_retry";
+        if crate::core::testing::run_isolated_test(TEST)
+            || crate::config::Settings::rerun_test_unprivileged(TEST)
+        {
+            return;
+        }
+        assert!(!is_root(), "spawn fixture must be unprivileged");
+        set_yes_flag(false);
+        let _reset = YesFlagReset;
+        for (validation_exit, context) in [
+            (1, "Failed to run with sudo privileges:"),
+            (0, "Failed to elevate privileges:"),
+        ] {
+            let (_directory, sudo, log) =
+                temp_env::with_var("TMPDIR", Some("/var/tmp"), || fake_sudo(validation_exit, 0));
+            let script = format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nrm -- \"$0\"\nexit {validation_exit}\n",
+                log.display()
+            );
+            std::fs::write(&sudo, script).expect("write disappearing sudo fixture");
+            let error = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                sudo_payload_status_in(
+                    &sudo,
+                    std::path::PathBuf::from("/usr/bin/omg"),
+                    false,
+                    &["fullupdate"],
+                ),
+            )
+            .await
+            .expect("failed spawn must not wait for authentication")
+            .expect_err("disappeared payload program must not become success");
+            let message = error.to_string();
+            assert!(
+                message.starts_with(context),
+                "missing spawn context: {message}"
+            );
+            assert!(message.contains("omg doctor --turbo"));
+            assert!(
+                message.contains(&std::io::Error::from_raw_os_error(nix::libc::ENOENT).to_string()),
+                "original spawn error must survive: {message}"
+            );
+            assert!(!sudo.exists(), "validation must remove its own fixture");
+            assert_eq!(
+                std::fs::read_to_string(log).expect("read invocation log"),
+                "-n -v\n",
+                "failed spawn must not retry authentication or execute a payload"
+            );
+        }
     }
 
     #[test]

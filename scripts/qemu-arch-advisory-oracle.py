@@ -5,6 +5,17 @@ Feed format: https://security.archlinux.org/issues/all.json
 Native version identities: https://man.archlinux.org/man/pacman.8.en
 """
 import re
+from datetime import datetime, timedelta, timezone
+
+ARCH_HOST = "omg-advisories.latham.workers.dev"
+ARCH_PATH = "/v1/arch/advisories"
+ARCH_UPSTREAM = "https://security.archlinux.org/issues/all.json"
+SNAPSHOT_REFUSALS = {
+    "tampered-payload": "Arch snapshot SHA-256 mismatch",
+    "stale-snapshot": "invalid or stale Arch snapshot timestamps",
+    "future-snapshot": "invalid or stale Arch snapshot timestamps",
+    "reversed-times": "invalid or stale Arch snapshot timestamps",
+}
 
 
 def arch_feed(version):
@@ -16,21 +27,84 @@ def arch_feed(version):
             dict(common, name="AVG-OMG-QEMU-NOT-AFFECTED", status="Not affected", fixed=None)]
 
 
-def verify_native_result(result, fail=False):
+def verify_native_result(result, fail=False, *, expected_possible=False):
+    assert type(expected_possible) is bool, "expected applicability mode must be boolean"
     assert result.returncode == int(fail), "wrong actual native audit exit"
     text = re.sub(r"\x1b\[[0-9;]*m", "", result.stdout)
     assert re.findall(r"^  (\S+) \(1 issues\):$", text, re.M) == ["glibc"]
     assert "Found 1 vulnerabilities (1 high severity)" in text
-    assert re.findall(r"^    → (\S+) - .*\[Advisory severity: (\S+)\]$", text, re.M) == [("AVG-OMG-QEMU-616", "Critical")]
+    suffix = r" \[possible match; applicability unverified\]" if expected_possible else ""
+    assert re.findall(r"^    → (\S+) - .*\[Advisory severity: (\S+)\]" + suffix + r"$", text, re.M) == [("AVG-OMG-QEMU-616", "Critical")]
+    if expected_possible:
+        scopes = re.findall(r"^  ⚠ Advisory scope: 0 assessed package\(s\), ([1-9][0-9]*) package\(s\) with unknown coverage; absence of findings does not establish safety\.$", text, re.M)
+        assert len(scopes) == 1, "installed Unknown inventory requires its explicit incomplete coverage warning"
+        assert text.count("Advisory scope:") == 1, "ambiguous advisory scope warning"
+    else:
+        assert "[possible match; applicability unverified]" not in text, "unexpected possible applicability"
+        assert "Advisory scope:" not in text, "unexpected incomplete advisory scope"
     assert "[Score:" not in text and "AVG-OMG-QEMU-FIXED" not in text and "AVG-OMG-QEMU-NOT-AFFECTED" not in text
     assert result.stderr.strip() == ("Error: Vulnerability scan found 1 finding(s)" if fail else "")
 
 
-def verify_arch_requests(events, version, minimum, maximum):
-    assert minimum <= len(events) <= maximum, "native feed request phase incomplete or repeated"
-    expected = {"kind": "request", "method": "GET", "path": "/issues/all.json", "status": 200, "response": arch_feed(version)}
-    assert all(event == expected for event in events), "native feed transport or identity mismatch"
+def utc_timestamp(value):
+    assert isinstance(value, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z", value), "missing UTC request observation"
+    parsed = datetime.fromisoformat(value[:-1] + "+00:00")
+    return parsed
+
+
+def iso_timestamp(value):
+    return value.isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+
+def arch_snapshot(version, observed_at, mode="valid"):
+    observed = utc_timestamp(observed_at)
+    payload = json.dumps(arch_feed(version), ensure_ascii=False, indent=2) + "\n"
+    envelope = {"schema_version": 1, "source": "arch-security", "source_url": ARCH_UPSTREAM,
+                "fetched_at": observed_at, "checked_at": observed_at, "complete": True,
+                "payload_sha256": hashlib.sha256(payload.encode("utf-8")).hexdigest(), "payload_json": payload}
+    if mode == "tampered-payload":
+        envelope["payload_json"] += " "
+    elif mode == "stale-snapshot":
+        envelope["fetched_at"] = envelope["checked_at"] = iso_timestamp(observed - timedelta(minutes=31))
+    elif mode == "future-snapshot":
+        envelope["fetched_at"] = envelope["checked_at"] = iso_timestamp(observed + timedelta(minutes=5))
+    elif mode == "reversed-times":
+        envelope["fetched_at"] = iso_timestamp(observed + timedelta(seconds=1))
+    else:
+        assert mode == "valid", "unknown snapshot control"
+    return envelope
+
+
+def snapshot_response(host, path, version, observed_at, mode="valid"):
+    if host != ARCH_HOST or path != ARCH_PATH:
+        return 404, {"error": "unexpected native snapshot destination"}
+    return 200, arch_snapshot(version, observed_at, mode)
+
+
+def verify_snapshot_refusal(result, mode):
+    assert type(result.returncode) is int and result.returncode == 1, "invalid snapshot did not fail closed"
+    assert isinstance(result.stdout, str) and isinstance(result.stderr, str), "snapshot refusal output missing"
+    assert "Failed to query native security advisories" in result.stderr
+    assert SNAPSHOT_REFUSALS[mode] in result.stderr, "wrong snapshot refusal reason"
+    assert "No vulnerabilities found" not in result.stdout and "Found 1 vulnerabilities" not in result.stdout
+    assert "Vulnerability scan found" not in result.stderr
+
+
+def verify_arch_requests(events, version, minimum, maximum, mode="valid"):
+    assert minimum <= len(events) <= maximum, "native snapshot request phase incomplete or repeated"
+    for event in events:
+        observed = event.get("observed_at")
+        expected = {"kind": "request", "method": "GET", "host": ARCH_HOST, "path": ARCH_PATH,
+                    "status": 200, "observed_at": observed, "response": arch_snapshot(version, observed, mode)}
+        actual_json = json.dumps(event, sort_keys=True, ensure_ascii=False, allow_nan=False)
+        expected_json = json.dumps(expected, sort_keys=True, ensure_ascii=False, allow_nan=False)
+        assert actual_json == expected_json, "native snapshot transport, provenance or byte integrity mismatch"
     return len(events)
+
+
+def private_hosts(text):
+    assert not re.search(r"(^|\s)" + re.escape(ARCH_HOST) + r"(\s|$)", text), "snapshot hostname already mapped"
+    return text + "\n127.0.0.1 " + ARCH_HOST + "\n"
 
 import hashlib
 import http.server
@@ -85,8 +159,7 @@ def main():
     nss = pathlib.Path('/etc/nsswitch.conf')
     assert hosts.is_file() and bundle.is_file() and nss.is_file()
     original_files = {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in (hosts, bundle, nss)}
-    assert not re.search('(^|\\s)security\\.archlinux\\.org(\\s|$)', hosts.read_text())
-    (root / 'hosts').write_bytes(hosts.read_bytes() + b'\n127.0.0.1 security.archlinux.org\n')
+    (root / 'hosts').write_text(private_hosts(hosts.read_text()))
     subprocess.run(['mount', '--bind', str(root / 'hosts'), str(hosts)], check=True, timeout=10, capture_output=True)
     # nss-resolve reaches the parent service through an AF_UNIX socket.
     # Confine hostname resolution to the private hosts file before any lookup.
@@ -97,8 +170,8 @@ def main():
     subprocess.run(['mount', '--bind', str(private_nss), str(nss)], check=True, timeout=10, capture_output=True)
     (logs / 'private-nss.conf').write_bytes(nss.read_bytes())
     import socket
-    resolved = {row[4][0] for row in socket.getaddrinfo('security.archlinux.org', 443, type=socket.SOCK_STREAM)}
-    (logs / 'dns-isolation.json').write_text(json.dumps({'resolved_addresses': sorted(resolved)}) + '\n')
+    resolved = {row[4][0] for row in socket.getaddrinfo(ARCH_HOST, 443, type=socket.SOCK_STREAM)}
+    (logs / 'dns-isolation.json').write_text(json.dumps({'hostname': ARCH_HOST, 'resolved_addresses': sorted(resolved)}) + '\n')
     assert resolved == {'127.0.0.1'}, ('fixture hostname must resolve exclusively to local IPv4 loopback', sorted(resolved))
     routes = json.loads(subprocess.check_output(['ip', '-j', 'route', 'show', 'table', 'all'], text=True))
     assert all((row.get('dev') == 'lo' for row in routes)), 'fixture namespace must have no external route'
@@ -132,13 +205,14 @@ def main():
         r = subprocess.run(command, capture_output=True, timeout=30)
         assert r.returncode == 0, r.stderr.decode(errors='replace')
     setup(['openssl', 'req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '1', '-subj', '/CN=OMG Arch advisory fixture CA', '-addext', 'basicConstraints=critical,CA:TRUE', '-addext', 'keyUsage=critical,keyCertSign,cRLSign', '-keyout', str(root / 'ca.key'), '-out', str(ca)])
-    setup(['openssl', 'req', '-newkey', 'rsa:2048', '-nodes', '-subj', '/CN=security.archlinux.org', '-keyout', str(key), '-out', str(root / 'server.csr')])
-    (root / 'server.ext').write_text('subjectAltName=DNS:security.archlinux.org\nbasicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\n')
+    setup(['openssl', 'req', '-newkey', 'rsa:2048', '-nodes', '-subj', '/CN=' + ARCH_HOST, '-keyout', str(key), '-out', str(root / 'server.csr')])
+    (root / 'server.ext').write_text('subjectAltName=DNS:' + ARCH_HOST + '\nbasicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\n')
     setup(['openssl', 'x509', '-req', '-in', str(root / 'server.csr'), '-CA', str(ca), '-CAkey', str(root / 'ca.key'), '-CAcreateserial', '-days', '1', '-extfile', str(root / 'server.ext'), '-out', str(cert)])
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.minimum_version = ssl.TLSVersion.TLSv1_2
     context.load_cert_chain(cert, key)
     events = []
+    snapshot_mode = 'valid'
     lock = threading.Lock()
 
     def event(value):
@@ -166,9 +240,11 @@ def main():
 
         def do_GET(self):
             assert self.client_address[0] == '127.0.0.1', 'fixture peer must stay local'
-            status, response = (200, feed) if self.path == '/issues/all.json' else (404, {'error': 'unexpected native feed path'})
+            observed = iso_timestamp(datetime.now(timezone.utc))
+            host = self.headers.get('Host')
+            status, response = snapshot_response(host, self.path, version, observed, snapshot_mode)
             encoded = json.dumps(response).encode()
-            event({'kind': 'request', 'method': 'GET', 'path': self.path, 'status': status, 'response': response})
+            event({'kind': 'request', 'method': 'GET', 'host': host, 'path': self.path, 'status': status, 'observed_at': observed, 'response': response})
             self.send_response(status)
             self.send_header('Content-Type', 'application/json')
             self.send_header('Content-Length', str(len(encoded)))
@@ -180,19 +256,23 @@ def main():
     env = {k: v for k, v in os.environ.items() if k.lower() not in ('http_proxy', 'https_proxy', 'all_proxy', 'no_proxy') and k not in ('SSL_CERT_FILE', 'SSL_CERT_DIR')}
     env.pop('OMG_TEST_DISTRO', None)
     env.pop('OMG_TEST_BACKEND', None)
-    env.update(HOME=str(private), XDG_RUNTIME_DIR=str(private), NO_COLOR='1', NO_PROXY='security.archlinux.org,127.0.0.1', OMG_TEST_MODE='0', OMG_DISABLE_TELEMETRY='1', OMG_DISABLE_DAEMON='1', OMG_DATA_DIR=str(private / 'data'), OMG_CACHE_DIR=str(private / 'cache'), OMG_CONFIG_DIR=str(private / 'config'), OMG_DAEMON_DATA_DIR=str(private / 'daemon'), OMG_SOCKET_PATH=str(private / 'omg.sock'))
+    env.update(HOME=str(private), XDG_RUNTIME_DIR=str(private), NO_COLOR='1', NO_PROXY=ARCH_HOST + ',127.0.0.1', OMG_TEST_MODE='0', OMG_DISABLE_TELEMETRY='1', OMG_DISABLE_DAEMON='1', OMG_DATA_DIR=str(private / 'data'), OMG_CACHE_DIR=str(private / 'cache'), OMG_CONFIG_DIR=str(private / 'config'), OMG_DAEMON_DATA_DIR=str(private / 'daemon'), OMG_SOCKET_PATH=str(private / 'omg.sock'))
 
-    def run(label, args, environment=None, expected=0):
+    def run(label, args, environment=None, expected=0, embedded=False):
         r = subprocess.run([binary] + args, env=env if environment is None else environment, user=uid, group=gid, extra_groups=[], capture_output=True, text=True, timeout=60)
-        (logs / (label + '.stdout')).write_text(r.stdout)
-        (logs / (label + '.stderr')).write_text(r.stderr)
-        receipt['product_results'][label] = {'argv': args, 'exit_code': r.returncode}
+        result = {'argv': args, 'exit_code': r.returncode}
+        if embedded:
+            receipt['snapshot_controls'][label] = dict(result, stdout=r.stdout, stderr=r.stderr)
+        else:
+            (logs / (label + '.stdout')).write_text(r.stdout)
+            (logs / (label + '.stderr')).write_text(r.stderr)
+            receipt['product_results'][label] = result
         assert r.returncode == expected, (label, r.returncode, r.stderr[-1000:])
         assert state() == before
         return r
 
     daemon = None
-    receipt = {'schema_version': 1, 'scope': 'local native Arch advisory experiment; not hosted inventory acceptance', 'source_sha': os.environ.get('OMG_CONTRACT_SOURCE_SHA'), 'boot_id': pathlib.Path('/proc/sys/kernel/random/boot_id').read_text().strip(), 'fixture_sha256': hashlib.sha256(pathlib.Path(__file__).read_bytes()).hexdigest(), 'omg_sha256': hashlib.sha256(pathlib.Path(binary).read_bytes()).hexdigest(), 'omgd_sha256': hashlib.sha256(pathlib.Path(daemon_binary).read_bytes()).hexdigest(), 'ordinary_user_uid': uid, 'isolated_vm_mount_and_network': True, 'original_system_files': original_files, 'native_glibc_version': version, 'affected_binaries': targets, 'fixture_id': fixture_id, 'expected_native_severity': 'Critical', 'accepted': False, 'native_archive_sha256': args.archive_sha256, 'native_state_before': before, 'product_results': {}}
+    receipt = {'schema_version': 1, 'scope': 'local native Arch advisory experiment; not hosted inventory acceptance', 'source_sha': os.environ.get('OMG_CONTRACT_SOURCE_SHA'), 'boot_id': pathlib.Path('/proc/sys/kernel/random/boot_id').read_text().strip(), 'fixture_sha256': hashlib.sha256(pathlib.Path(__file__).read_bytes()).hexdigest(), 'omg_sha256': hashlib.sha256(pathlib.Path(binary).read_bytes()).hexdigest(), 'omgd_sha256': hashlib.sha256(pathlib.Path(daemon_binary).read_bytes()).hexdigest(), 'ordinary_user_uid': uid, 'isolated_vm_mount_and_network': True, 'original_system_files': original_files, 'native_glibc_version': version, 'affected_binaries': targets, 'fixture_id': fixture_id, 'expected_native_severity': 'Critical', 'accepted': False, 'native_archive_sha256': args.archive_sha256, 'native_state_before': before, 'product_results': {}, 'snapshot_controls': {}}
     try:
         untrusted = run('untrusted-tls', ['audit', 'scan'], expected=1)
         assert 'Failed to query native security advisories' in untrusted.stderr and 'No vulnerabilities found' not in untrusted.stdout and ('Vulnerability scan found' not in untrusted.stderr)
@@ -201,10 +281,16 @@ def main():
         trusted_bundle.write_bytes(bundle.read_bytes() + b'\n' + ca.read_bytes())
         os.chmod(trusted_bundle, 0o644)
         setup(['mount', '--bind', str(trusted_bundle), str(bundle)])
+        for snapshot_mode in SNAPSHOT_REFUSALS:
+            start = len(events)
+            result = run(snapshot_mode, ['audit', 'scan'], expected=1, embedded=True)
+            verify_snapshot_refusal(result, snapshot_mode)
+            receipt['snapshot_controls'][snapshot_mode]['requests'] = verify_arch_requests(events[start:], version, 1, 1, snapshot_mode)
+        snapshot_mode = 'valid'
         for label, args, expected in [('direct-plain', ['audit', 'scan'], 0), ('direct-findings', ['audit', 'scan', '--fail-on-findings'], 1)]:
             start = len(events)
             result = run(label, args, expected=expected)
-            verify_native_result(result, expected == 1)
+            verify_native_result(result, expected == 1, expected_possible=True)
             receipt[label + '_requests'] = verify_arch_requests(events[start:], version, 1, 1)
         daemon_env = dict(env)
         daemon_env.pop('OMG_DISABLE_DAEMON')
@@ -231,7 +317,7 @@ def main():
             initial = counter('daemon-before')
             for label, args, expected in [('daemon-plain', ['audit', 'scan'], 0), ('daemon-findings', ['audit', 'scan', '--fail-on-findings'], 1)]:
                 result = run(label, args, environment=daemon_env, expected=expected)
-                verify_native_result(result, expected == 1)
+                verify_native_result(result, expected == 1, expected_possible=True)
             final = counter('daemon-after')
             assert final - initial == 2
             receipt['daemon_requests_delta'] = final - initial

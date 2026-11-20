@@ -36,7 +36,14 @@
     "@ai-sdk/openai-compatible@2.0.37>@ai-sdk/provider-utils": "4.0.33",
     "gitlab-ai-provider@6.23.1>zod": "4.6.7",
     "glob": "14.0.2",
-    "minimatch": "11.0.1"
+    "minimatch": "11.0.1",
+    "gray-matter": "file:vendor/safe-frontmatter",
+    "miniflare@5.20261023.0-beta>undici": "7.30.2",
+    "@effect/platform-node@4.0.1>undici": "8.12.4",
+    "@hono/node-server": "2.1.6",
+    "express-rate-limit": "8.7.2",
+    "hono": "4.13.16",
+    "qs": "6.16.2"
   },
   "patchedDependencies": {
     "gitlab-ai-provider@6.23.1": "patches/gitlab-ai-provider@6.23.1.patch"

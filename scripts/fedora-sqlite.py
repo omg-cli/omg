@@ -145,7 +145,7 @@ def verify_bundle(directory, policy, arch, revision, context=None):
     details = (directory/'test-details.txt').read_text(encoding='utf-8')
     passed = Counter(re.findall(r'^(\S+)\.\.\. Ok$', details, re.M))
     if any(passed[name] != count for name, count in policy['required_assertions'].items()):
-        raise ValueError('required FD-exhaustion or WAL assertions did not execute and pass')
+        raise ValueError('required SQLite regression assertions did not execute and pass')
     signature = (directory/'source-signature.txt').read_text(encoding='utf-8')
     if not re.search(r'RSA.*6d9f90a6.*OK', signature, re.I):
         raise ValueError('signed Fedora source verification is missing')

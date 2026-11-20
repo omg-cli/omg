@@ -5,6 +5,7 @@ set -euo pipefail
 [[ $# == 1 && $1 == /* && -x $1 ]] || { echo 'usage: test-runtime-usage.sh /absolute/path/to/omg' >&2; exit 2; }
 [[ $(id -u) != 0 ]] || { echo 'requires an unprivileged user' >&2; exit 2; }
 binary=$1
+here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 root=$(mktemp -d "$HOME/omg-runtime-usage.XXXXXX")
 printf 'Evidence: %s\n' "$root"
 # Preserve artifacts on failure; cleanup can follow investigation.
@@ -16,7 +17,13 @@ for telemetry in 0 1; do
     export OMG_TELEMETRY=$telemetry OMG_DISABLE_TELEMETRY=0
     for count in 1 2; do
       mkdir -p "$root/$telemetry"
-      timeout --kill-after=5s 180 "$binary" use node 24.21.0 > "$root/$telemetry/use-$count.stdout" 2> "$root/$telemetry/use-$count.stderr"
+      if [[ "$count" == 1 ]]; then
+        timeout --kill-after=5s 180 python3 "$here/qemu-runtime-advisory-oracle.py" \
+          --runtime node --version 24.21.0 --timeout 180 --accept-only -- \
+          "$binary" use node 24.21.0 > "$root/$telemetry/use-$count.stdout" 2> "$root/$telemetry/use-$count.stderr"
+      else
+        timeout --kill-after=5s 180 "$binary" use node 24.21.0 > "$root/$telemetry/use-$count.stdout" 2> "$root/$telemetry/use-$count.stderr"
+      fi
       python3 - "$OMG_DATA_DIR" "$count" <<'PY'
 import json, pathlib, stat, sys
 root=pathlib.Path(sys.argv[1]); count=int(sys.argv[2])

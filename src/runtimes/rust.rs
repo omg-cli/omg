@@ -11,7 +11,7 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -99,6 +99,7 @@ struct RustToolchainMetadata {
 }
 
 pub(crate) struct RustManager {
+    security: super::security::RuntimeSecurity,
     versions_dir: PathBuf,
     client: &'static reqwest::Client,
 }
@@ -106,6 +107,7 @@ pub(crate) struct RustManager {
 impl RustManager {
     pub fn new() -> Self {
         Self {
+            security: super::security::RuntimeSecurity::default(),
             versions_dir: super::DATA_DIR.join("versions/rust"),
             client: download_client(),
         }
@@ -376,6 +378,16 @@ impl RustManager {
         mutation_lease: &RuntimeLease,
     ) -> Result<()> {
         let toolchain_name = toolchain.name();
+        let version_dir = self.toolchain_dir(toolchain);
+        let admission = self
+            .security
+            .installed(
+                "rust",
+                &version_dir,
+                super::security::ReviewMode::FreshAttended,
+            )
+            .context("Failed to review installed Rust toolchain")?;
+        admission.verify(&version_dir)?;
         activate_version_with_lease(
             &self.versions_dir,
             &toolchain_name,
@@ -491,6 +503,25 @@ impl RustManager {
             .extend(required_components.iter().cloned());
         metadata.targets.extend(targets.iter().cloned());
         Self::write_metadata(dest_dir, &metadata)?;
+        let publisher = super::security::record_manifest(
+            "rust",
+            &toolchain.name(),
+            &version_dir,
+            "https://static.rust-lang.org/dist/",
+            &serde_json::to_vec(manifest)?,
+        )
+        .context("Failed to record Rust manifest publisher identity")?;
+        super::security::record_exact_release(
+            &version_dir,
+            &manifest_version(manifest).context("Rust manifest has no exact release")?,
+            &manifest_release(manifest)?,
+            BTreeMap::new(),
+        )
+        .context("Failed to record exact Rust release metadata")?;
+        let _admission = self
+            .security
+            .prepare_staged("rust", &toolchain.name(), dest_dir, &version_dir)
+            .context("Failed to review staged Rust toolchain")?;
         match publication {
             ToolchainPublication::Create => {
                 complete_staged_install_with_lease(
@@ -510,6 +541,7 @@ impl RustManager {
             }
         }
 
+        publisher.commit();
         print_installed("Rust", &toolchain.name());
 
         Ok(())
@@ -552,7 +584,11 @@ impl RustManager {
         mutation_lease: &RuntimeLease,
     ) -> Result<()> {
         let version_dir = self.toolchain_dir(toolchain);
-        let mut metadata = Self::read_metadata(&version_dir)?;
+        let staging = begin_staged_install(&self.versions_dir)?;
+        copy_regular_tree(&version_dir, staging.path(), true)?;
+        let base = super::security::require_incremental_base(staging.path(), &version_dir)
+            .context("Rust component update requires an unchanged reviewed base")?;
+        let mut metadata = Self::read_metadata(staging.path())?;
         let installed_release = metadata
             .release
             .as_deref()
@@ -562,9 +598,6 @@ impl RustManager {
             installed_release == manifest_release(manifest)?,
             "Rust manifest release identity does not match the installed toolchain; retry setup before adding components or targets"
         );
-        let staging = begin_staged_install(&self.versions_dir)?;
-        copy_regular_tree(&version_dir, staging.path())?;
-
         for component in components {
             self.install_component(staging.path(), component, &toolchain.host, manifest)
                 .await?;
@@ -579,7 +612,34 @@ impl RustManager {
         metadata.components.extend(components.iter().cloned());
         metadata.targets.extend(targets.iter().cloned());
         Self::write_metadata(staging.path(), &metadata)?;
-        replace_staged_install_with_lease(&staging, &version_dir, &toolchain.name(), mutation_lease)
+        let publisher = super::security::record_manifest(
+            "rust",
+            &toolchain.name(),
+            &version_dir,
+            "https://static.rust-lang.org/dist/",
+            &serde_json::to_vec(manifest)?,
+        )
+        .context("Failed to record Rust manifest publisher identity")?;
+        super::security::record_exact_release(
+            &version_dir,
+            &manifest_version(manifest).context("Rust manifest has no exact release")?,
+            &manifest_release(manifest)?,
+            BTreeMap::new(),
+        )
+        .context("Failed to record exact Rust release metadata")?;
+        let _admission = self
+            .security
+            .prepare_incremental(&base, &toolchain.name(), staging.path())
+            .context("Failed to review staged Rust component update")?;
+        replace_staged_install_with_lease(
+            &staging,
+            &version_dir,
+            &toolchain.name(),
+            mutation_lease,
+        )
+        .context("Failed to publish reviewed Rust component update")?;
+        publisher.commit();
+        Ok(())
     }
 
     async fn install_component(
@@ -868,6 +928,122 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn available_channels_require_a_concrete_stable_release_without_installing() -> Result<()>
+    {
+        let path = "/dist/channel-rust-stable.toml";
+        let fixture = super::super::test_https::HttpsFixture::new(
+            "static.rust-lang.org",
+            vec![
+                (
+                    path.into(),
+                    b"[pkg.rustc]\nversion = '1.93.1 (owned fixture)'\n".to_vec(),
+                ),
+                (path.into(), b"manifest-version = '2'\n".to_vec()),
+            ],
+        )
+        .await?;
+        let directory = TempDir::new()?;
+        let manager = RustManager {
+            security: crate::runtimes::security::RuntimeSecurity::fixture(),
+            versions_dir: directory.path().to_path_buf(),
+            client: Box::leak(Box::new(fixture.client(true)?)),
+        };
+
+        let channels = manager.list_available().await?;
+        let actual = channels
+            .iter()
+            .map(|entry| (entry.version.as_str(), entry.channel.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actual,
+            [
+                ("1.93.1", "stable"),
+                ("beta", "beta"),
+                ("nightly", "nightly")
+            ]
+        );
+        let error = manager
+            .list_available()
+            .await
+            .expect_err("missing stable rustc identity must fail");
+        assert_eq!(
+            error.to_string(),
+            "Stable Rust channel manifest is missing a rustc version"
+        );
+        assert_eq!(
+            fixture.finish().await?,
+            vec![format!("GET {path} HTTP/1.1"); 2]
+        );
+        assert_eq!(
+            fs::read_dir(directory.path())?.count(),
+            0,
+            "listing must not create installation state"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pinned_install_refuses_invalid_publisher_identity_without_changing_current() {
+        let fixture = super::super::test_archive::PublicationFixture::new("rust", "bin/rustc");
+        let manager = RustManager {
+            security: crate::runtimes::security::RuntimeSecurity::fixture(),
+            versions_dir: fixture.versions.clone(),
+            client: download_client(),
+        };
+        let toolchain = RustToolchainSpec::parse("1.93.1").expect("exact pinned Rust coordinate");
+        let candidate = manager.toolchain_dir(&toolchain);
+        fs::create_dir_all(candidate.join("bin")).expect("create owned installed Rust fixture");
+        fs::write(
+            candidate.join("bin/rustc"),
+            b"owned inert candidate compiler",
+        )
+        .expect("candidate Rust compiler");
+        RustManager::write_metadata(
+            &candidate,
+            &RustToolchainMetadata {
+                release: Some("1.93.1".to_owned()),
+                components: BTreeSet::from(["rustc".to_owned()]),
+                targets: BTreeSet::new(),
+            },
+        )
+        .expect("installed Rust component identity");
+        crate::runtimes::security::fixture_prepare(
+            "rust",
+            &toolchain.name(),
+            &candidate,
+            &candidate,
+        )
+        .expect("admit the controlled installed Rust tree before corrupting identity");
+        fixture.corrupt_identity(&toolchain.name());
+        let identity =
+            fs::read(fixture.identity_path(&toolchain.name())).expect("corrupted identity");
+        let binary = fs::read(candidate.join("bin/rustc")).expect("original candidate bytes");
+
+        let error = manager
+            .install("1.93.1")
+            .await
+            .expect_err("unreviewable pinned Rust must not activate");
+
+        assert_eq!(
+            error.to_string(),
+            "Failed to review installed Rust toolchain"
+        );
+        assert!(format!("{error:#}").contains("Invalid runtime publisher identity"));
+        assert!(error.downcast_ref::<serde_json::Error>().is_some());
+        assert_eq!(
+            fs::read(candidate.join("bin/rustc")).expect("candidate unchanged"),
+            binary
+        );
+        assert_eq!(
+            fs::read(fixture.identity_path(&toolchain.name()))
+                .expect("publisher evidence unchanged"),
+            identity
+        );
+        fixture.assert_previous();
+    }
+
+    #[tokio::test]
     async fn metadata_retry_recovers_rust_manifest_without_publishing_toolchain() -> Result<()> {
         let path = "/dist/channel-rust-1.85.0.toml";
         let fixture = super::super::test_https::HttpsFixture::new_with_statuses(
@@ -880,6 +1056,7 @@ mod tests {
         .await?;
         let directory = tempfile::tempdir()?;
         let manager = RustManager {
+            security: crate::runtimes::security::RuntimeSecurity::fixture(),
             versions_dir: directory.path().to_path_buf(),
             client: Box::leak(Box::new(fixture.client(true)?)),
         };
@@ -903,6 +1080,7 @@ mod tests {
         .await?;
         let directory = tempfile::tempdir()?;
         let manager = RustManager {
+            security: crate::runtimes::security::RuntimeSecurity::fixture(),
             versions_dir: directory.path().to_path_buf(),
             client: Box::leak(Box::new(fixture.client(true)?)),
         };
@@ -1056,6 +1234,7 @@ mod tests {
         .await?;
         let versions = TempDir::new()?;
         let manager = RustManager {
+            security: crate::runtimes::security::RuntimeSecurity::fixture(),
             versions_dir: versions.path().to_path_buf(),
             client: Box::leak(Box::new(fixture.client(true)?)),
         };
@@ -1148,9 +1327,25 @@ mod tests {
             names,
             BTreeSet::from([
                 ".mutation.lock".into(),
+                format!(".admission-{}.lock", toolchain.name()).into(),
+                ".security".into(),
                 "current".into(),
                 toolchain.name().into()
             ])
+        );
+        manager
+            .security
+            .installed(
+                "rust",
+                &directory,
+                crate::runtimes::security::ReviewMode::CachedOnly,
+            )
+            .context("Published Rust fixture must retain cached advisory authority")?
+            .verify(&directory)?;
+        assert_eq!(
+            fs::read_dir(versions.path().join(".security"))?.count(),
+            2,
+            "published identity and admission must be durable without leaked temporary evidence"
         );
         Ok(())
     }
@@ -1299,6 +1494,7 @@ mod tests {
         .await?;
         let versions = TempDir::new()?;
         let manager = RustManager {
+            security: crate::runtimes::security::RuntimeSecurity::fixture(),
             versions_dir: versions.path().to_path_buf(),
             client: Box::leak(Box::new(fixture.client(true)?)),
         };
@@ -1322,6 +1518,13 @@ mod tests {
             },
         )?;
         let lease = manager.lock_mutations()?;
+        crate::runtimes::security::fixture_bind_candidate(
+            "rust",
+            &previous.name(),
+            &previous_dir,
+            &previous_dir,
+        )
+        .context("Bind the previous Rust source-installation fixture")?;
         manager.activate_toolchain(&previous, &lease)?;
         drop(lease);
         let metadata_before = fs::read(previous_dir.join(RUST_METADATA_FILE))?;
@@ -1689,6 +1892,7 @@ mod tests {
     async fn ensure_toolchain_locks_before_reading_and_releases_after_error() -> Result<()> {
         let versions = TempDir::new()?;
         let manager = RustManager {
+            security: crate::runtimes::security::RuntimeSecurity::fixture(),
             versions_dir: versions.path().to_path_buf(),
             client: download_client(),
         };
@@ -1726,6 +1930,7 @@ mod tests {
     fn mutation_lock_rejects_symlinks_without_changing_the_target() -> Result<()> {
         let versions = TempDir::new()?;
         let manager = RustManager {
+            security: crate::runtimes::security::RuntimeSecurity::fixture(),
             versions_dir: versions.path().to_path_buf(),
             client: download_client(),
         };
@@ -1765,19 +1970,22 @@ mod tests {
             b"candidate component",
         )?)?;
         let checksum = format!("{:x}", Sha256::digest(&archive));
-        for (installed, candidate, compatible) in [
+        for (installed, candidate, tampered, compatible) in [
             (
                 Some("1.95.0-nightly (aaaa 2026-01-01)"),
                 "1.95.0-nightly (bbbb 2026-01-02)",
                 false,
+                false,
             ),
-            (Some("1.93.1"), "1.94.0", false),
-            (None, "1.93.1", false),
-            (Some(""), "", false),
-            (Some("1.93.1"), "1.93.1", true),
+            (Some("1.93.1"), "1.94.0", false, false),
+            (None, "1.93.1", false, false),
+            (Some(""), "", false, false),
+            (Some("1.93.1"), "1.93.1", false, true),
+            (Some("1.93.1"), "1.93.1", true, false),
         ] {
             let versions = TempDir::new()?;
             let manager = RustManager {
+                security: crate::runtimes::security::RuntimeSecurity::fixture(),
                 versions_dir: versions.path().to_path_buf(),
                 client: download_client(),
             };
@@ -1793,6 +2001,19 @@ mod tests {
                     targets: BTreeSet::new(),
                 },
             )?;
+            super::super::security::fixture_prepare(
+                "rust",
+                &toolchain.name(),
+                &version_dir,
+                &version_dir,
+            )
+            .expect("bind advisory evidence to the installed fixture compiler");
+            let compiler = if tampered {
+                fs::write(version_dir.join("bin/rustc"), b"changed compiler")?;
+                b"changed compiler".as_slice()
+            } else {
+                b"installed compiler".as_slice()
+            };
             let original_metadata = fs::read(version_dir.join(RUST_METADATA_FILE))?;
             let mutation_lock = manager.lock_mutations()?;
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
@@ -1842,10 +2063,7 @@ mod tests {
                 version_dir.join("bin/cargo-clippy").exists()
             );
             assert_eq!(result.is_ok(), compatible, "{result:?}");
-            assert_eq!(
-                fs::read(version_dir.join("bin/rustc"))?,
-                b"installed compiler"
-            );
+            assert_eq!(fs::read(version_dir.join("bin/rustc"))?, compiler);
             if compatible {
                 assert_eq!(
                     fs::read(version_dir.join("bin/cargo-clippy"))?,
@@ -1862,7 +2080,11 @@ mod tests {
                     result
                         .expect_err("incompatible identity")
                         .to_string()
-                        .contains("release identity")
+                        .contains(if tampered {
+                            "reviewed base"
+                        } else {
+                            "release identity"
+                        })
                 );
                 assert!(!version_dir.join("bin/cargo-clippy").exists());
                 assert_eq!(
@@ -1879,30 +2101,54 @@ mod tests {
         const NAME: &str = "runtimes::rust::tests::incremental_fixture_child_respects_its_deadline";
         if std::env::var("OMG_ISOLATED_FIXTURE_TEST").as_deref() == Ok(NAME) {
             let ready = std::env::var_os("OMG_RUST_DEADLINE_READY").expect("ready marker path");
+            let delay_ms = std::env::var("OMG_RUST_DEADLINE_DELAY_MS")
+                .expect("child delay in milliseconds")
+                .parse::<u64>()
+                .expect("numeric child delay");
             std::fs::write(ready, b"child ready").expect("write ready marker");
-            std::thread::sleep(std::time::Duration::from_secs(30));
+            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
         } else {
             let directory = tempfile::tempdir().expect("deadline fixture directory");
-            let ready = directory.path().join("ready");
-            temp_env::with_var("OMG_RUST_DEADLINE_READY", Some(ready.as_os_str()), || {
-                let failure = std::panic::catch_unwind(|| {
-                    crate::core::testing::run_isolated_test_with_timeout(
-                        NAME,
-                        std::time::Duration::from_secs(5),
-                    );
-                })
-                .expect_err("the stalled child must exceed its deadline");
-                let message = failure
-                    .downcast_ref::<String>()
-                    .map(String::as_str)
-                    .or_else(|| failure.downcast_ref::<&str>().copied())
-                    .expect("deadline failure must carry a message");
-                assert!(message.contains("exceeded its time or capture bound"));
-                assert_eq!(
-                    std::fs::read(&ready).expect("child became ready"),
-                    b"child ready"
+            for (delay_ms, expect_timeout, label) in
+                [("0", false, "completed"), ("30000", true, "stalled")]
+            {
+                let ready = directory.path().join(label);
+                temp_env::with_vars(
+                    [
+                        ("OMG_RUST_DEADLINE_READY", Some(ready.as_os_str())),
+                        (
+                            "OMG_RUST_DEADLINE_DELAY_MS",
+                            Some(std::ffi::OsStr::new(delay_ms)),
+                        ),
+                    ],
+                    || {
+                        let result = std::panic::catch_unwind(|| {
+                            crate::core::testing::run_isolated_test_with_timeout(
+                                NAME,
+                                std::time::Duration::from_secs(5),
+                            )
+                        });
+                        if expect_timeout {
+                            let failure =
+                                result.expect_err("the stalled child must exceed its deadline");
+                            let message = failure
+                                .downcast_ref::<String>()
+                                .map(String::as_str)
+                                .or_else(|| failure.downcast_ref::<&str>().copied())
+                                .expect("deadline failure must carry a message");
+                            assert!(message.contains("exceeded its time or capture bound"));
+                        } else {
+                            assert!(
+                                result.expect("the ready child must complete before its deadline")
+                            );
+                        }
+                        assert_eq!(
+                            std::fs::read(&ready).expect("child became ready"),
+                            b"child ready"
+                        );
+                    },
                 );
-            });
+            }
         }
     }
 
@@ -1962,6 +2208,13 @@ mod tests {
         assert!(!version_dir.exists());
         assert!(crate::runtimes::common::list_installed_versions(versions.path())?.is_empty());
 
+        crate::runtimes::security::fixture_prepare(
+            "rust",
+            "stable-x86_64-unknown-linux-gnu",
+            staging.path(),
+            &version_dir,
+        )
+        .context("Admit initial Rust staging fixture before publication")?;
         crate::runtimes::common::complete_staged_install(
             &staging,
             &version_dir,
@@ -1991,11 +2244,18 @@ mod tests {
         )?;
 
         let staging = begin_staged_install(versions.path())?;
-        copy_regular_tree(&version_dir, staging.path())?;
+        copy_regular_tree(&version_dir, staging.path(), true)?;
         fs::write(staging.path().join("bin/clippy"), b"new")?;
         let mut metadata = RustManager::read_metadata(staging.path())?;
         metadata.components.insert("clippy".to_string());
         RustManager::write_metadata(staging.path(), &metadata)?;
+        crate::runtimes::security::fixture_prepare(
+            "rust",
+            "stable-x86_64-unknown-linux-gnu",
+            staging.path(),
+            &version_dir,
+        )
+        .context("Admit incremental Rust staging fixture before replacement")?;
         crate::runtimes::common::replace_staged_install(
             &staging,
             &version_dir,

@@ -138,7 +138,7 @@ pub(crate) async fn fetch_public_download(
     raw: &str,
     user_agent: &str,
 ) -> anyhow::Result<reqwest::Response> {
-    fetch_public_download_with_options(raw, user_agent, None, None, true).await
+    fetch_public_download_with_options(raw, user_agent, None, None, true, false).await
 }
 
 pub(crate) async fn fetch_public_download_with_timeout(
@@ -146,7 +146,28 @@ pub(crate) async fn fetch_public_download_with_timeout(
     user_agent: &str,
     total_timeout: Option<Duration>,
 ) -> anyhow::Result<reqwest::Response> {
-    fetch_public_download_with_options(raw, user_agent, total_timeout, None, false).await
+    fetch_public_download_with_options(raw, user_agent, total_timeout, None, false, false).await
+}
+
+/// Revalidate public metadata through the same pinned-DNS download boundary.
+pub(crate) async fn fetch_public_download_fresh(
+    raw: &str,
+    user_agent: &str,
+    total_timeout: Option<Duration>,
+) -> anyhow::Result<reqwest::Response> {
+    let request =
+        || fetch_public_download_with_options(raw, user_agent, total_timeout, None, false, true);
+    match request().await {
+        // A transient timeout could invalidate a review already accepted by the user.
+        Err(error)
+            if error
+                .downcast_ref::<reqwest::Error>()
+                .is_some_and(reqwest::Error::is_timeout) =>
+        {
+            request().await
+        }
+        result => result,
+    }
 }
 
 /// Request the remaining bytes of a public archive using a strong entity tag.
@@ -157,7 +178,15 @@ pub(crate) async fn fetch_public_download_with_range(
     offset: u64,
     validator: reqwest::header::HeaderValue,
 ) -> anyhow::Result<reqwest::Response> {
-    fetch_public_download_with_options(raw, user_agent, None, Some((offset, validator)), true).await
+    fetch_public_download_with_options(
+        raw,
+        user_agent,
+        None,
+        Some((offset, validator)),
+        true,
+        false,
+    )
+    .await
 }
 
 async fn fetch_public_download_with_options(
@@ -166,6 +195,7 @@ async fn fetch_public_download_with_options(
     total_timeout: Option<Duration>,
     range: Option<(u64, reqwest::header::HeaderValue)>,
     binary_transfer: bool,
+    fresh: bool,
 ) -> anyhow::Result<reqwest::Response> {
     let mut url = Url::parse(raw).map_err(|_| anyhow::anyhow!("Invalid download URL"))?;
     for hop in 0..=MAX_REDIRECTS {
@@ -207,6 +237,9 @@ async fn fetch_public_download_with_options(
         let mut request = client
             .get(url.clone())
             .header(reqwest::header::USER_AGENT, user_agent);
+        if fresh {
+            request = request.header(reqwest::header::CACHE_CONTROL, "no-cache");
+        }
         if binary_transfer {
             request = request.header(reqwest::header::ACCEPT_ENCODING, "identity");
         }
@@ -703,22 +736,43 @@ pub(crate) async fn fetch_metadata_text(client: &Client, url: &str) -> anyhow::R
     fetch_metadata_text_with_budget(client, url, Duration::from_secs(30)).await
 }
 
+const DEFAULT_METADATA_BODY_LIMIT: usize = 16 * 1024 * 1024;
+
+#[cfg(any(feature = "pgp", test))]
+pub(crate) async fn fetch_metadata_text_limited(
+    client: &Client,
+    url: &str,
+    limit: usize,
+) -> anyhow::Result<String> {
+    fetch_metadata_text_with_limits(client, url, Duration::from_secs(30), limit).await
+}
+
 async fn fetch_metadata_text_with_budget(
     client: &Client,
     url: &str,
     total: Duration,
 ) -> anyhow::Result<String> {
+    fetch_metadata_text_with_limits(client, url, total, DEFAULT_METADATA_BODY_LIMIT).await
+}
+
+async fn fetch_metadata_text_with_limits(
+    client: &Client,
+    url: &str,
+    total: Duration,
+    limit: usize,
+) -> anyhow::Result<String> {
     tokio::time::timeout(total, async {
         for attempt in 0..3 {
             let result = async {
-                client
+                let response = client
                     .get(url)
                     .timeout(total)
                     .send()
                     .await?
-                    .error_for_status()?
-                    .bounded_text()
-                    .await
+                    .error_for_status()?;
+                Ok::<_, anyhow::Error>(String::from_utf8(
+                    bounded_metadata_body_with_limit(response, limit).await?,
+                )?)
             }
             .await;
             match result {
@@ -744,23 +798,29 @@ async fn fetch_metadata_text_with_budget(
     .map_err(|_| anyhow::anyhow!("Metadata request exceeded its total deadline"))?
 }
 
-pub(crate) async fn bounded_metadata_body(
+pub(crate) async fn bounded_metadata_body(response: reqwest::Response) -> anyhow::Result<Vec<u8>> {
+    bounded_metadata_body_with_limit(response, DEFAULT_METADATA_BODY_LIMIT).await
+}
+
+async fn bounded_metadata_body_with_limit(
     mut response: reqwest::Response,
+    limit: usize,
 ) -> anyhow::Result<Vec<u8>> {
-    const LIMIT: usize = 16 * 1024 * 1024;
+    let limit_error = if limit == DEFAULT_METADATA_BODY_LIMIT {
+        "Metadata exceeds 16 MiB limit".to_owned()
+    } else {
+        format!("Metadata exceeds {limit}-byte limit")
+    };
     tokio::time::timeout(Duration::from_secs(30), async move {
         anyhow::ensure!(
             response
                 .content_length()
-                .is_none_or(|length| length <= LIMIT as u64),
-            "Metadata exceeds 16 MiB limit"
+                .is_none_or(|length| length <= limit as u64),
+            "{limit_error}"
         );
         let mut bytes = Vec::new();
         while let Some(chunk) = response.chunk().await? {
-            anyhow::ensure!(
-                chunk.len() <= LIMIT - bytes.len(),
-                "Metadata exceeds 16 MiB limit"
-            );
+            anyhow::ensure!(chunk.len() <= limit - bytes.len(), "{limit_error}");
             bytes.extend_from_slice(&chunk);
         }
         Ok(bytes)
@@ -813,7 +873,15 @@ mod metadata_limit_tests {
                     let request = String::from_utf8(headers)?;
                     let line = request.lines().next().unwrap().to_owned();
                     anyhow::ensure!(line == "GET /manifest HTTP/1.1", "unexpected request");
-                    requests.push(line);
+                    requests.push(request);
+                    if response.is_empty() {
+                        let closed = stream
+                            .read_u8()
+                            .await
+                            .expect_err("timed-out client must close");
+                        assert_eq!(closed.kind(), std::io::ErrorKind::UnexpectedEof);
+                        continue;
+                    }
                     let header_end = response
                         .windows(4)
                         .position(|bytes| bytes == b"\r\n\r\n")
@@ -853,6 +921,50 @@ mod metadata_limit_tests {
 
     fn metadata_client() -> Client {
         Client::builder().no_proxy().build().unwrap()
+    }
+
+    #[test]
+    #[expect(unsafe_code)] // Process-wide environment is changed only in the isolated child.
+    fn fresh_public_download_revalidates_every_redirect_without_changing_ordinary_requests()
+    -> anyhow::Result<()> {
+        const NAME: &str = "core::http::metadata_limit_tests::fresh_public_download_revalidates_every_redirect_without_changing_ordinary_requests";
+        if crate::core::testing::run_isolated_test(NAME) {
+            return Ok(());
+        }
+        // SAFETY: this is a fresh single-test child with no concurrent environment users.
+        unsafe {
+            std::env::set_var("OMG_TEST_MODE", "1");
+        }
+        tokio::runtime::Builder::new_current_thread().enable_all().build()?.block_on(async {
+            let redirect = b"HTTP/1.1 302 Found\r\nLocation: /manifest\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec();
+            let success = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec();
+            let fixture = RetryFixture::new(vec![redirect.clone(), success.clone(), redirect, success], false).await?;
+            let fresh = fetch_public_download_fresh(&fixture.url, "omg-runtime-security-fixture", Some(Duration::from_secs(5))).await?;
+            assert_eq!(fresh.text().await?, "ok");
+            let ordinary = fetch_public_download_with_timeout(&fixture.url, "omg-runtime-security-fixture", Some(Duration::from_secs(5))).await?;
+            assert_eq!(ordinary.text().await?, "ok");
+            let requests = fixture.finish().await?;
+            assert_eq!(requests.len(), 4, "both requests must follow the real redirect");
+            for (index, request) in requests.iter().enumerate() {
+                let headers = request.to_ascii_lowercase();
+                assert!(headers.lines().any(|line| line == "user-agent: omg-runtime-security-fixture"));
+                assert_eq!(headers.lines().filter(|line| line.starts_with("cache-control:")).collect::<Vec<_>>(), if index < 2 { vec!["cache-control: no-cache"] } else { Vec::new() }, "request {index} must preserve its cache policy across redirects");
+            }
+            let success = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec();
+            let retry = RetryFixture::new(vec![Vec::new(), success], false).await?;
+            let timeout = Some(Duration::from_millis(250));
+            let fresh = fetch_public_download_fresh(&retry.url, "omg-runtime-security-fixture", timeout).await?;
+            assert_eq!(fresh.text().await?, "ok");
+            let requests = retry.finish().await?;
+            assert_eq!(requests.len(), 2, "fresh advisory reads recover from one silent timeout");
+            assert!(requests.iter().all(|request| request.to_ascii_lowercase().contains("cache-control: no-cache\r\n")));
+            let exhausted = RetryFixture::new(vec![Vec::new(), Vec::new()], false).await?;
+            let error = fetch_public_download_fresh(&exhausted.url, "omg-runtime-security-fixture", timeout)
+                .await.expect_err("a second timeout must remain an error");
+            assert!(error.downcast_ref::<reqwest::Error>().is_some_and(reqwest::Error::is_timeout));
+            assert_eq!(exhausted.finish().await?.len(), 2);
+            Ok(())
+        })
     }
 
     #[tokio::test]
@@ -996,6 +1108,47 @@ mod metadata_limit_tests {
                 .to_string()
                 .contains("16 MiB")
         );
+    }
+
+    #[tokio::test]
+    async fn metadata_supports_smaller_signed_manifest_bounds_without_retries() -> anyhow::Result<()>
+    {
+        for header in ["Content-Length: 9\r\n", ""] {
+            let fixture = RetryFixture::new_with_body_delay(
+                vec![
+                    format!("HTTP/1.1 200 OK\r\n{header}Connection: close\r\n\r\n123456789")
+                        .into_bytes(),
+                ],
+                false,
+                Duration::ZERO,
+            )
+            .await?;
+            let result = fetch_metadata_text_limited(&metadata_client(), &fixture.url, 4).await;
+            assert!(
+                result.is_err(),
+                "a smaller signed-input cap must reject the body"
+            );
+            assert_eq!(
+                fixture.finish().await?.len(),
+                1,
+                "an excessive body is not retryable"
+            );
+        }
+        let fixture = RetryFixture::new_with_body_delay(
+            vec![
+                b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\nConnection: close\r\n\r\n123456789"
+                    .to_vec(),
+            ],
+            false,
+            Duration::ZERO,
+        )
+        .await?;
+        assert_eq!(
+            fetch_metadata_text_limited(&metadata_client(), &fixture.url, 9).await?,
+            "123456789"
+        );
+        assert_eq!(fixture.finish().await?.len(), 1);
+        Ok(())
     }
 
     #[test]

@@ -7,6 +7,90 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, UnixListener, UnixStream};
 use tokio::time::{Duration, timeout};
 
+struct DistributionFixtureManager(MockPackageManager);
+
+impl PackageManager for DistributionFixtureManager {
+    fn name(&self) -> &'static str {
+        self.0.name()
+    }
+
+    fn security_inventory(
+        &self,
+    ) -> futures::future::BoxFuture<
+        '_,
+        anyhow::Result<Vec<crate::package_managers::types::SecurityPackage>>,
+    > {
+        Box::pin(async move {
+            let mut packages = self.0.security_inventory().await?;
+            for package in &mut packages {
+                package.origin =
+                    crate::package_managers::types::SecurityOrigin::DistributionPackage;
+            }
+            Ok(packages)
+        })
+    }
+
+    fn search(
+        &self,
+        query: &str,
+    ) -> futures::future::BoxFuture<'_, anyhow::Result<Vec<crate::core::Package>>> {
+        self.0.search(query)
+    }
+
+    fn install(&self, packages: &[String]) -> futures::future::BoxFuture<'_, anyhow::Result<()>> {
+        self.0.install(packages)
+    }
+
+    fn remove(&self, packages: &[String]) -> futures::future::BoxFuture<'_, anyhow::Result<()>> {
+        self.0.remove(packages)
+    }
+
+    fn update(&self) -> futures::future::BoxFuture<'_, anyhow::Result<()>> {
+        self.0.update()
+    }
+
+    fn sync(&self) -> futures::future::BoxFuture<'_, anyhow::Result<()>> {
+        self.0.sync()
+    }
+
+    fn info(
+        &self,
+        name: &str,
+    ) -> futures::future::BoxFuture<'_, anyhow::Result<Option<crate::core::Package>>> {
+        self.0.info(name)
+    }
+
+    fn list_installed(
+        &self,
+    ) -> futures::future::BoxFuture<'_, anyhow::Result<Vec<crate::core::Package>>> {
+        self.0.list_installed()
+    }
+
+    fn get_status(
+        &self,
+        fast: bool,
+    ) -> futures::future::BoxFuture<'_, anyhow::Result<(usize, usize, usize, usize)>> {
+        self.0.get_status(fast)
+    }
+
+    fn list_explicit(&self) -> futures::future::BoxFuture<'_, anyhow::Result<Vec<String>>> {
+        self.0.list_explicit()
+    }
+
+    fn list_updates(
+        &self,
+    ) -> futures::future::BoxFuture<
+        '_,
+        anyhow::Result<Vec<crate::package_managers::types::UpdateInfo>>,
+    > {
+        self.0.list_updates()
+    }
+
+    fn is_installed(&self, name: &str) -> futures::future::BoxFuture<'_, anyhow::Result<bool>> {
+        self.0.is_installed(name)
+    }
+}
+
 struct RunningTask(tokio::task::JoinHandle<anyhow::Result<()>>);
 impl Drop for RunningTask {
     fn drop(&mut self) {
@@ -22,7 +106,7 @@ async fn cancelled_active_and_waiting_scans_release_the_lock_without_caching() -
     let package = format!("cancel-scan-{}", uuid::Uuid::new_v4());
     let state_path = temp.path().join("mock_state_pacman.json");
     let inventory = serde_json::to_vec(&serde_json::json!({
-        "installed": {package.clone(): "1.0.0"}, "available": {}
+        "installed": {package.clone(): "1.0.0"}, "available": {package.clone(): "1.0.0"}
     }))?;
     std::fs::write(&state_path, &inventory)?;
     let listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -65,7 +149,14 @@ async fn cancelled_active_and_waiting_scans_release_the_lock_without_caching() -
             .await?;
         anyhow::Ok(())
     }));
-    let manager = Arc::new(MockPackageManager::new_in("arch", temp.path()));
+    let manager = Arc::new(DistributionFixtureManager(MockPackageManager::new_in(
+        "arch",
+        temp.path(),
+    )));
+    let catalog = manager.package_index().await?;
+    assert!(catalog.iter().any(|entry| {
+        entry.name == package && entry.installed && entry.version.to_string() == "1.0.0"
+    }));
     let mut state = DaemonState::new_isolated(temp.path(), PackageIndex::empty(), manager)?;
     state.vulnerability_scanner = Arc::new(VulnerabilityScanner::with_osv_endpoint(
         endpoint,
@@ -260,7 +351,10 @@ async fn real_server_fetches_scores_and_rejects_failed_scans_before_recovery() -
         }
         anyhow::Ok(())
     }));
-    let manager = Arc::new(MockPackageManager::new_in("arch", temp.path()));
+    let manager = Arc::new(DistributionFixtureManager(MockPackageManager::new_in(
+        "arch",
+        temp.path(),
+    )));
     let mut state = temp_env::with_vars(
         [("OMG_DAEMON_DATA_DIR", Some(temp.path().as_os_str()))],
         || {

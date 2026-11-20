@@ -401,6 +401,419 @@ fn async_ping_roundtrip_pins_framing_ids_and_payloads() {
     );
 }
 
+#[test]
+#[serial]
+fn security_audit_rejects_false_clean_totals_without_losing_the_connection() {
+    let mut daemon = MockDaemon::spawn(Box::new(|request| {
+        assert!(matches!(request, Request::SecurityAudit { .. }));
+        let count = u64::from(request.id() == 2);
+        let audit = serde_json::from_value(serde_json::json!({
+            "coverage": { "status": "reported", "assessed": [{"name":"fixture","version":"1-1","architecture":null}], "unassessed": [], "sources": [{"kind":"osv","ecosystem":"Arch Linux:fixture"}] },
+            "total_vulnerabilities": count, "high_severity": count,
+            "vulnerabilities": [["fixture", [{ "id": "CVE-2026-1234", "summary": "known issue", "score": "9.8", "affected_installed":[{"name":"fixture","version":"1-1","architecture":null}] }]]]
+        })).expect("valid audit wire shape");
+        Some(echo_frame(request, &ResponseResult::SecurityAudit(audit)))
+    }));
+    let sock = daemon.socket_path.clone();
+    with_client_env(None, None, Some(&sock), || {
+        block(async {
+            let mut client = DaemonClient::connect_to(sock.clone())
+                .await
+                .expect("connect to audit fixture");
+            let error = client
+                .security_audit()
+                .await
+                .expect_err("false clean totals");
+            assert!(format!("{error:#}").contains("mismatch"), "{error:#}");
+            let audit = client.security_audit().await.expect("next valid audit");
+            assert_eq!(audit.total_vulnerabilities, 1);
+            assert_eq!(audit.high_severity, 1);
+            assert_eq!(audit.vulnerabilities[0].1[0].id, "CVE-2026-1234");
+            drop(client);
+        });
+    });
+    let requests = daemon.take_requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].id(), 1);
+    assert_eq!(requests[1].id(), 2);
+}
+
+#[test]
+#[serial]
+fn security_audit_rejects_conflicting_reported_scope_without_losing_the_connection() {
+    let identity = serde_json::json!({"name":"fixture", "version":"1-1", "architecture":"x86_64"});
+    let valid = serde_json::json!({
+        "coverage":{"status":"reported", "assessed":[identity], "unassessed":[],
+            "sources":[{"kind":"osv", "ecosystem":"Arch Linux:fixture"}]},
+        "total_vulnerabilities":1, "high_severity":1,
+        "vulnerabilities":[["fixture", [{"id":"CVE-2026-1234", "summary":"fixture issue", "score":"9.8",
+            "applicability":"applicable", "affected_installed":[identity]}]]]
+    });
+    let mut duplicate = valid.clone();
+    duplicate["coverage"]["assessed"] = serde_json::json!([identity, identity]);
+    let mut orphan = valid.clone();
+    orphan["vulnerabilities"][0][1][0]["affected_installed"][0]["version"] = "2-1".into();
+    let mut missing_source = valid.clone();
+    missing_source["coverage"]["sources"] = serde_json::json!([]);
+    let replies: Vec<omg_lib::core::security::scan::SecurityAuditResult> =
+        [duplicate, orphan, missing_source, valid]
+            .into_iter()
+            .map(|value| serde_json::from_value(value).expect("valid audit wire shape"))
+            .collect();
+    let mut daemon = MockDaemon::spawn(Box::new(move |request| {
+        assert!(matches!(request, Request::SecurityAudit { .. }));
+        let index = usize::try_from(request.id() - 1).expect("small fixture request id");
+        Some(echo_frame(
+            request,
+            &ResponseResult::SecurityAudit(replies[index].clone()),
+        ))
+    }));
+    let socket = daemon.socket_path.clone();
+    with_client_env(None, None, Some(&socket), || {
+        block(async {
+            let mut client = DaemonClient::connect_to(socket.clone())
+                .await
+                .expect("private audit peer");
+            for name in ["duplicate scope", "unbound finding", "missing provenance"] {
+                let error = client.security_audit().await.expect_err(name);
+                assert!(
+                    format!("{error:#}").contains("Audit coverage"),
+                    "case={name}: {error:#}"
+                );
+            }
+            assert_eq!(
+                client
+                    .security_audit()
+                    .await
+                    .expect("valid following audit")
+                    .total_vulnerabilities,
+                1
+            );
+            drop(client);
+        });
+    });
+    let requests = daemon.take_requests();
+    assert_eq!(
+        requests.iter().map(Request::id).collect::<Vec<_>>(),
+        [1, 2, 3, 4]
+    );
+}
+
+#[cfg(feature = "arch")]
+#[test]
+#[serial]
+#[ignore = "requires native Arch; mandatory in the native coverage VM"]
+fn native_audit_fix_dry_runs_preserve_unknown_scope_and_inert_advisory_text() {
+    assert!(
+        native_arch_fixture_available(),
+        "real native Arch fixture required"
+    );
+    let _colors = pin_env(&[("NO_COLOR", None)]);
+    for colors in ["never", "always"] {
+        for case in ["empty", "partial", "possible", "applicable"] {
+            let finding = matches!(case, "possible" | "applicable");
+            let identity = serde_json::json!({"name":"omg-security-fixture", "version":"1-1", "architecture":"x86_64"});
+            let audit: omg_lib::core::security::scan::SecurityAuditResult = serde_json::from_value(serde_json::json!({
+                "coverage":{"status":"reported",
+                    "assessed": if case=="applicable" {serde_json::json!([identity])} else {serde_json::json!([])},
+                    "unassessed": if matches!(case,"partial"|"possible") {serde_json::json!([{"package":identity, "reason":"origin_unestablished"}])} else {serde_json::json!([])},
+                    "sources": if case=="applicable" {serde_json::json!([{"kind":"osv","ecosystem":"Arch Linux:fixture"}])} else {serde_json::json!([])}},
+                "total_vulnerabilities": usize::from(finding), "high_severity":usize::from(finding),
+                "vulnerabilities": if finding {serde_json::json!([["omg-security-fixture", [{
+                    "id":"CVE-2026-1234\u{1b}]OMG-FIXTURE\u{7}", "summary":"review fixture", "score":"9.8",
+                    "applicability":if case=="possible" {"possible"} else {"applicable"},
+                    "affected_installed":[identity]}]]])} else {serde_json::json!([])}
+            })).expect("valid audit fixture");
+            let mut daemon = MockDaemon::spawn(Box::new(move |request| {
+                assert!(matches!(request, Request::SecurityAudit { .. }));
+                Some(echo_frame(
+                    request,
+                    &ResponseResult::SecurityAudit(audit.clone()),
+                ))
+            }));
+            let project = TestProject::new();
+            let root = project.pacman_root.path();
+            let database = root.join("db");
+            let local = database.join("local");
+            let sync = database.join("sync");
+            let cache = root.join("cache");
+            for path in [&local, &sync, &cache] {
+                std::fs::create_dir_all(path).expect("private native fixture directories");
+            }
+            std::fs::write(local.join("ALPM_DB_VERSION"), "9\n").expect("native database marker");
+            let conf = root.join("pacman.conf");
+            let configuration = format!(
+                "[options]\nRootDir = {}\nDBPath = {}\nCacheDir = {}\nLogFile = {}\nArchitecture = auto\nSigLevel = Required TrustedOnly\n",
+                root.display(),
+                database.display(),
+                cache.display(),
+                root.join("pacman.log").display()
+            );
+            std::fs::write(&conf, &configuration).expect("private native configuration");
+            let result = project.run_with_env(
+                &[
+                    "audit",
+                    "fix",
+                    "--dry-run",
+                    "--yes",
+                    "--min-severity",
+                    "high",
+                ],
+                &[
+                    ("OMG_TEST_MODE", "0"),
+                    ("OMG_DISABLE_DAEMON", "0"),
+                    ("OMG_COLORS", colors),
+                    ("RUST_LOG", "off"),
+                    (
+                        "OMG_SOCKET_PATH",
+                        daemon.socket_path.to_str().expect("socket path"),
+                    ),
+                    (
+                        "OMG_PACMAN_CONF",
+                        conf.to_str().expect("configuration path"),
+                    ),
+                    (
+                        "OMG_PACMAN_DB_DIR",
+                        database.to_str().expect("database path"),
+                    ),
+                    ("OMG_PACMAN_LOCAL_DIR", local.to_str().expect("local path")),
+                    ("OMG_PACMAN_SYNC_DIR", sync.to_str().expect("sync path")),
+                    ("OMG_PACMAN_CACHE_DIR", cache.to_str().expect("cache path")),
+                ],
+            );
+            drop(std::os::unix::net::UnixStream::connect(&daemon.socket_path));
+            assert_eq!(daemon.take_requests().len(), 1, "case={case}: {result:?}");
+            result.assert_success();
+            let text = console::strip_ansi_codes(&result.stdout);
+            assert_eq!(
+                text.contains("No vulnerabilities found in assessed packages!"),
+                case == "empty",
+                "{result:?}"
+            );
+            assert_eq!(
+                text.contains("advisory coverage is incomplete"),
+                case == "partial",
+                "{result:?}"
+            );
+            if finding {
+                assert!(text.contains("No packages can be auto-fixed"), "{result:?}");
+                assert!(
+                    text.contains("OMG-FIXTURE"),
+                    "advisory identity must remain visible: {result:?}"
+                );
+                assert_eq!(
+                    text.contains("manual package-source review"),
+                    case == "possible",
+                    "{result:?}"
+                );
+                assert!(
+                    !result.stdout.contains("\u{1b}]"),
+                    "remote advisory text must remain inert: {result:?}"
+                );
+                assert!(
+                    !result.stdout.contains('\u{7}'),
+                    "remote advisory text must not ring a bell: {result:?}"
+                );
+            }
+            assert_eq!(
+                std::fs::read_to_string(&conf).expect("preserved configuration"),
+                configuration
+            );
+            assert_eq!(
+                std::fs::read_to_string(local.join("ALPM_DB_VERSION")).expect("preserved database"),
+                "9\n"
+            );
+            assert_eq!(std::fs::read_dir(&local).expect("local entries").count(), 1);
+            assert_eq!(std::fs::read_dir(&sync).expect("sync entries").count(), 0);
+            assert!(
+                !database.join("db.lck").exists(),
+                "dry run must not acquire a package transaction lock"
+            );
+            project.close_checked();
+        }
+    }
+}
+
+#[test]
+#[serial]
+fn tui_audit_refuses_incomplete_scope_and_keeps_reported_findings() {
+    use omg_lib::cli::tui::app::App;
+    use omg_lib::core::security::scan::SecurityAuditResult;
+    let identity = serde_json::json!({"name":"fixture","version":"1-1","architecture":null});
+    for (unknown, findings) in [(false, 0), (false, 1), (true, 0), (true, 1)] {
+        let audit: SecurityAuditResult = serde_json::from_value(serde_json::json!({
+            "coverage":{"status":"reported",
+                "assessed":if unknown {serde_json::json!([])} else {serde_json::json!([identity])},
+                "unassessed":if unknown {serde_json::json!([{"package":identity,"reason":"origin_unestablished"}])} else {serde_json::json!([])},
+                "sources":[{"kind":"osv","ecosystem":"Arch Linux:fixture"}]},
+            "total_vulnerabilities":findings,"high_severity":0,
+            "vulnerabilities":if findings == 0 {serde_json::json!([])} else {serde_json::json!([["fixture",[{
+                "id":"CVE-2026-1234","summary":"fixture advisory",
+                "applicability":if unknown {"possible"} else {"applicable"},"affected_installed":[identity]}]]])}
+        })).expect("valid audit wire result");
+        let mut daemon = MockDaemon::spawn(Box::new(move |request| {
+            assert!(matches!(request, Request::SecurityAudit { .. }));
+            Some(echo_frame(
+                request,
+                &ResponseResult::SecurityAudit(audit.clone()),
+            ))
+        }));
+        with_client_env(Some("0"), Some("0"), Some(&daemon.socket_path), || {
+            block(async {
+                let result = App::run_security_audit().await;
+                if unknown {
+                    let error =
+                        result.expect_err("unknown advisory scope must fail the TUI action");
+                    let message = error.to_string();
+                    assert!(message.contains("1 package(s) with unknown coverage"));
+                    assert!(message.contains(&format!("Reported findings: {findings}")));
+                } else {
+                    assert_eq!(result.expect("complete advisory scope"), findings);
+                }
+            });
+        });
+        assert_eq!(daemon.take_requests().len(), 1);
+    }
+}
+
+#[test]
+#[serial]
+fn audit_scan_cli_reports_findings_and_refuses_false_clean_daemon_results() {
+    use omg_lib::core::security::scan::{
+        AdvisorySeverity, FindingApplicability, SecurityAuditResult,
+    };
+    let _colors = pin_env(&[("NO_COLOR", None)]);
+    let identity = serde_json::json!({"name":"fixture\u{1b}]52;c;PKG\u{7}","version":"1-1","architecture":null});
+    let findings = serde_json::json!([["fixture\u{1b}]52;c;PKG\u{7}", [
+        {"id":"CVE-2026-1234\u{1b}]52;c;ID\u{7}", "summary":"issue\u{1b}]52;c;SUMMARY\u{7}", "score":"9.8", "applicability":FindingApplicability::Applicable,"affected_installed":[identity]},
+        {"id":"CVE-2026-1235", "summary":"published severity", "advisory_severity":AdvisorySeverity::Important,"affected_installed":[identity]},
+        {"id":"CVE-2026-1236", "summary":"possible issue", "applicability":FindingApplicability::Possible,"affected_installed":[identity]}
+    ]]]);
+    for colors in ["never", "always"] {
+        for case in [
+            "findings",
+            "fail-on-findings",
+            "empty",
+            "partial",
+            "false-clean",
+            "legacy-unreported",
+            "daemon-unavailable",
+        ] {
+            let partial = case == "partial";
+            let has_findings = matches!(case, "findings" | "fail-on-findings" | "false-clean");
+            let audit: SecurityAuditResult = serde_json::from_value(serde_json::json!({
+                "coverage": if case == "legacy-unreported" { serde_json::json!({"status":"unreported"}) } else { serde_json::json!({ "status":"reported", "assessed":if has_findings {serde_json::json!([identity])} else {serde_json::json!([])}, "sources":if has_findings {serde_json::json!([{"kind":"osv","ecosystem":"Arch Linux:fixture"}])} else {serde_json::json!([])},
+                    "unassessed": if partial { serde_json::json!([{
+                        "package":{"name":"custom","version":"1-1","architecture":null},
+                        "reason":omg_lib::core::security::vulnerability::UnknownCoverage::OriginUnestablished
+                    }]) } else { serde_json::json!([]) }
+                }) },
+                "total_vulnerabilities": if has_findings && case != "false-clean" {3} else {0},
+                "high_severity": if has_findings && case != "false-clean" {2} else {0},
+                "vulnerabilities": if has_findings {findings.clone()} else {serde_json::json!([])}
+            })).expect("valid audit wire shape");
+            let mut daemon = MockDaemon::spawn(Box::new(move |request| {
+                assert!(matches!(request, Request::SecurityAudit { .. }));
+                Some(echo_frame(
+                    request,
+                    &ResponseResult::SecurityAudit(audit.clone()),
+                ))
+            }));
+            let project = TestProject::new();
+            let missing_conf = project.pacman_root.path().join("missing-pacman.conf");
+            let missing_socket = project.path().join("missing.sock");
+            let socket = if case == "daemon-unavailable" {
+                &missing_socket
+            } else {
+                &daemon.socket_path
+            };
+            let mut args = vec!["audit", "scan"];
+            if case == "fail-on-findings" {
+                args.push("--fail-on-findings");
+            }
+            let result = project.run_with_env(
+                &args,
+                &[
+                    ("OMG_TEST_MODE", "0"),
+                    ("OMG_DISABLE_DAEMON", "0"),
+                    (
+                        "OMG_SOCKET_PATH",
+                        socket.to_str().expect("UTF-8 fixture path"),
+                    ),
+                    ("OMG_COLORS", colors),
+                    ("RUST_LOG", if colors == "always" { "warn" } else { "off" }),
+                    (
+                        "OMG_PACMAN_CONF",
+                        missing_conf.to_str().expect("UTF-8 fixture path"),
+                    ),
+                ],
+            );
+            // Wake the private accept loop if the CLI failed before connecting.
+            drop(std::os::unix::net::UnixStream::connect(&daemon.socket_path));
+            let requests = daemon.take_requests();
+            assert_eq!(
+                requests.len(),
+                usize::from(case != "daemon-unavailable"),
+                "case={case}: {result:?}"
+            );
+            let text = console::strip_ansi_codes(&result.stdout);
+            assert_eq!(
+                result.success,
+                !matches!(
+                    case,
+                    "fail-on-findings" | "false-clean" | "legacy-unreported" | "daemon-unavailable"
+                ),
+                "case={case}: {result:?}"
+            );
+            assert_eq!(
+                text.contains("No vulnerabilities found in assessed packages."),
+                case == "empty",
+                "case={case}: {result:?}"
+            );
+            if case == "false-clean" {
+                assert!(result.stderr.contains("mismatch"), "{result:?}");
+            } else if matches!(case, "legacy-unreported" | "daemon-unavailable") {
+                assert_eq!(
+                    result
+                        .stderr
+                        .contains("Daemon audit omitted coverage; using the native audit instead"),
+                    case == "legacy-unreported" && colors == "always",
+                    "explicit logging mode must control fallback diagnostics: {result:?}"
+                );
+                assert!(
+                    !result.stderr.is_empty(),
+                    "missing native evidence must explain the refusal"
+                );
+                assert!(
+                    !missing_conf.exists(),
+                    "read-only fallback must preserve the missing configuration"
+                );
+            } else if has_findings {
+                assert!(text.contains("Found 3 vulnerabilities (2 high severity)"));
+                assert!(text.contains("[Score: 9.8]"));
+                assert!(text.contains("[Advisory severity: Important]"));
+                assert_eq!(
+                    text.matches("[possible match; applicability unverified]")
+                        .count(),
+                    2
+                );
+                for marker in ["PKG", "ID", "SUMMARY"] {
+                    assert!(text.contains(marker));
+                }
+                assert!(!result.stdout.contains("\u{1b}]"));
+                assert!(!result.stdout.contains('\u{7}'));
+                assert_eq!(result.stdout.contains('\u{1b}'), colors == "always");
+            } else if partial {
+                assert!(text.contains("1 package(s) with unknown coverage"));
+                assert!(
+                    text.contains("No findings were reported; advisory coverage is incomplete.")
+                );
+            }
+            project.close_checked();
+        }
+    }
+}
+
 /// Contract: a Success response carrying a foreign id is rejected with the
 /// exact message naming both ids.
 #[test]

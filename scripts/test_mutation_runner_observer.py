@@ -19,6 +19,19 @@ SPEC.loader.exec_module(OBSERVER)
 
 
 class MutationRunnerObserver(unittest.TestCase):
+    def test_inode_samples_distinguish_unreported_capacity_from_exhaustion(self):
+        filesystem = list(os.statvfs(Path.cwd()))
+        for total, free, availability in ((0, 0, "not-reported"), (100, 0, "observed"),
+                                          (100, 37, "observed")):
+            filesystem[5], filesystem[6], filesystem[7] = total, free, free
+            with self.subTest(total=total, free=free), patch.object(
+                OBSERVER.os, "statvfs", return_value=os.statvfs_result(filesystem)
+            ):
+                row = OBSERVER.snapshot()
+                self.assertEqual(row["workspace_free_inodes"], free)
+                self.assertEqual(row["workspace_total_inodes"], total)
+                self.assertEqual(row["workspace_inode_availability"], availability)
+
     def test_invalid_scoped_and_unowned_records_do_not_fabricate_complete_rss(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -213,7 +226,12 @@ class MutationRunnerObserver(unittest.TestCase):
                 self.assertLessEqual(row["memory_available_kib"], row["memory_total_kib"])
                 self.assertGreaterEqual(row["kernel_oom_kills"], 0)
                 self.assertGreater(row["workspace_free_bytes"], 0)
-                self.assertGreater(row["workspace_free_inodes"], 0)
+                filesystem = os.statvfs(Path.cwd())
+                self.assertEqual(row["workspace_total_inodes"], filesystem.f_files)
+                self.assertGreaterEqual(row["workspace_free_inodes"], 0)
+                self.assertLessEqual(row["workspace_free_inodes"], row["workspace_total_inodes"])
+                self.assertEqual(row["workspace_inode_availability"],
+                                 "observed" if filesystem.f_files else "not-reported")
             plain = [line for line in result.stdout.splitlines() if not line.startswith(PREFIX)]
             self.assertEqual(plain, ["child-out"])
             self.assertEqual(result.stderr, "child-error\n")

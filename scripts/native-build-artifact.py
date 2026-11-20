@@ -22,6 +22,7 @@ import zipfile
 
 MAX_DOWNLOAD = 128 * 1024 * 1024
 MAX_EXPANDED = 256 * 1024 * 1024
+MAX_HTTP_HEADERS = 64 * 1024
 FEATURES = {'arch': 'arch,pgp,license', 'debian': 'debian,pgp,license',
             'debian-trixie': 'debian,pgp,license',
             'ubuntu': 'debian,pgp,license', 'fedora': 'fedora,pgp,license'}
@@ -147,10 +148,14 @@ def api(path, limit=1024 * 1024, *, include_status=False, timeout=90):
     command = ['gh', 'api', path]
     if include_status:
         command.append('--include')
-    with tempfile.TemporaryFile() as output:
+    with tempfile.TemporaryFile() as output, tempfile.TemporaryFile() as diagnostic:
         try:
-            subprocess.run(command, stdout=output, check=True, timeout=timeout)
+            subprocess.run(command, stdout=output, stderr=diagnostic, check=True, timeout=timeout)
         except subprocess.CalledProcessError as error:
+            diagnostic.seek(0)
+            error.stderr = diagnostic.read(4097)
+            if error.stderr:
+                print(error.stderr[:4096].decode(errors='replace').rstrip(), file=sys.stderr)
             if include_status:
                 require(output.tell() <= limit, 'GitHub response exceeds limit')
                 output.seek(0)
@@ -161,56 +166,58 @@ def api(path, limit=1024 * 1024, *, include_status=False, timeout=90):
         return output.read(limit + 1)
 
 
-def metadata_response(data):
+def http_response(data, body_limit):
     parts = re.split(rb'\r?\n\r?\n', data, maxsplit=1)
-    require(len(parts) == 2 and len(parts[0]) <= 64 * 1024, 'invalid GitHub response headers')
+    require(len(parts) == 2 and len(parts[0]) <= MAX_HTTP_HEADERS, 'invalid GitHub response headers')
     headers, body = parts
     status_line, *fields = headers.splitlines()
     status = re.fullmatch(rb'HTTP/(?:1\.[01]|2(?:\.0)?|3(?:\.0)?) ([1-5][0-9]{2})(?: [^\r\n]*)?', status_line)
     require(status is not None and all(b':' in field for field in fields), 'invalid GitHub response headers')
-    require(len(body) <= 1024 * 1024, 'GitHub response exceeds limit')
+    require(len(body) <= body_limit, 'GitHub response exceeds limit')
     retry_after = any(field.split(b':', 1)[0].lower() == b'retry-after' for field in fields)
     return int(status[1]), body, retry_after
 
 
-def api_json(path):
-    # Metadata GETs share one deadline and attempt budget across transport failures.
-    # A fresh temporary output prevents partial/error bodies from entering admission.
-    deadline = time.monotonic() + 90
+def request_body(path, body_limit, timeout, kind):
+    # Each retry starts a fresh request and cannot reuse a partial response.
+    deadline = time.monotonic() + timeout
     for attempt in range(3):
         remaining = deadline - time.monotonic()
-        require(remaining > 0, 'GitHub metadata request deadline exhausted')
+        require(remaining > 0, 'GitHub ' + kind + ' request deadline exhausted')
         try:
-            data = api(path, 1024 * 1024 + 64 * 1024, include_status=True, timeout=remaining)
+            data = api(path, body_limit + MAX_HTTP_HEADERS, include_status=True, timeout=min(remaining, 90))
         except (subprocess.TimeoutExpired, subprocess.CalledProcessError) as error:
             if isinstance(error, subprocess.CalledProcessError):
-                if not error.output or not error.output.startswith(b'HTTP/'):
-                    raise
-                status, _, retry_after = metadata_response(error.output)
+                status, retry_after = None, False
+                if error.output:
+                    if not error.output.startswith(b'HTTP/'):
+                        raise
+                    status, _, retry_after = http_response(error.output, body_limit)
+                incomplete_metadata = (
+                    kind == 'metadata' and error.returncode == 1
+                    and (error.stderr or b'').strip() == b'unexpected end of JSON input'
+                    and (status is None or 200 <= status < 300)
+                )
                 # Leave rate limits and server-directed delays as explicit failures.
-                if status not in (502, 503, 504) or retry_after:
+                if retry_after or (status not in (502, 503, 504) and not incomplete_metadata):
                     raise
             delay = 2 ** attempt
             if attempt == 2 or deadline - time.monotonic() <= delay:
                 raise
             time.sleep(delay)
         else:
-            status, body, _ = metadata_response(data)
-            require(200 <= status < 300, 'unsuccessful GitHub metadata response')
-            return json.loads(body, object_pairs_hook=unique_object, parse_constant=reject_constant)
+            status, body, _ = http_response(data, body_limit)
+            require(200 <= status < 300, 'unsuccessful GitHub ' + kind + ' response')
+            return body
+
+
+def api_json(path):
+    return json.loads(request_body(path, 1024 * 1024, 90, 'metadata'),
+                      object_pairs_hook=unique_object, parse_constant=reject_constant)
 
 
 def download_artifact(path):
-    # Each request obtains a new short-lived redirect from GitHub. Never reuse a
-    # partial response after a transport timeout; admission still checks the
-    # server digest and the complete bundle below.
-    for attempt in range(3):
-        try:
-            return api(path, MAX_DOWNLOAD)
-        except subprocess.TimeoutExpired:
-            if attempt == 2:
-                raise
-            time.sleep(2 ** attempt)
+    return request_body(path, MAX_DOWNLOAD, 270, 'artifact')
 
 
 class ArtifactUnavailable(ValueError):
@@ -324,12 +331,27 @@ def native_lookup_context(root, context, event, *, allow_manual=False):
     return repository, head, event_name, expected_run
 
 
+def read_native_artifact_listing(repository, run_id, *, deadline=None):
+    path = f'repos/{repository}/actions/runs/{run_id}/artifacts?per_page=100'
+    for attempt in range(3):
+        listing = api_json(path)
+        require(isinstance(listing, dict)
+                and type(listing.get('total_count')) is int and 0 <= listing['total_count'] <= 100
+                and isinstance(listing.get('artifacts'), list) and len(listing['artifacts']) <= 100
+                and all(isinstance(row, dict) for row in listing['artifacts']),
+                'invalid or excessive producer artifact list')
+        if len(listing['artifacts']) == listing['total_count']:
+            return listing
+        delay = 2 ** attempt
+        if attempt == 2 or (deadline is not None and time.monotonic() + delay >= deadline):
+            raise ValueError('inconsistent producer artifact list after refresh')
+        # The count and rows can change during concurrent artifact uploads.
+        # Never admit a candidate or infer absence from an incomplete listing.
+        time.sleep(delay)
+
+
 def select_native_artifact(repository, run, expected_run, distro, listing, family='native-release'):
     current_attempt = run['run_attempt']
-    require(type(listing.get('total_count')) is int and 0 <= listing['total_count'] <= 100
-            and isinstance(listing.get('artifacts'), list)
-            and len(listing['artifacts']) == listing['total_count'],
-            'excessive producer artifact list')
     artifacts = [row for row in listing['artifacts']
                  if row.get('name') == f'{family}-{distro}-{current_attempt}']
     print(f'Native artifact lookup: run={run["id"]} attempt={current_attempt} '
@@ -376,8 +398,7 @@ def find_native_artifact(root, distro, context, event, timeout=1500):
         # A started attempt may already have uploaded a native lane's output
         # while another job is waiting. Keep timestamp and byte admission intact.
         if run.get('run_started_at') is not None:
-            current_attempt = run['run_attempt']
-            listing = api_json(f'repos/{repository}/actions/runs/{selected_id}/artifacts?per_page=100')
+            listing = read_native_artifact_listing(repository, selected_id, deadline=deadline)
             selected = select_native_artifact(repository, run, expected_run, distro, listing)
             if selected is not None:
                 artifact, producer_attempt = selected
@@ -406,7 +427,7 @@ def native_readiness(root, destination, context, event, timeout):
                 'readiness run or attempt changed')
         selected = {}
         if run.get('run_started_at') is not None:
-            listing = api_json(f'repos/{repository}/actions/runs/{run_id}/artifacts?per_page=100')
+            listing = read_native_artifact_listing(repository, run_id, deadline=deadline)
             for distro in FEATURES:
                 found = select_native_artifact(repository, run, expected_run, distro, listing)
                 if found is not None:
@@ -481,7 +502,7 @@ def verify_clippy(root, destination, context, event):
     validate_producer_run(run, expected_run)
     require(run['id'] == int(run_id) and run['run_attempt'] == int(attempt),
             'Clippy run or attempt changed')
-    listing = api_json(f'repos/{repository}/actions/runs/{run_id}/artifacts?per_page=100')
+    listing = read_native_artifact_listing(repository, run_id)
     proofs = {}
     for platform in CLIPPY_PLATFORMS:
         selected = select_native_artifact(repository, run, expected_run, platform, listing,

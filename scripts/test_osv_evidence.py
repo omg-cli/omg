@@ -94,6 +94,17 @@ class PositiveEvidenceTests(unittest.TestCase):
     def test_complete_bound_native_evidence_is_admitted(self):
         self.assertEqual(self.admit(), self.receipt)
 
+    def test_archive_rejects_unknown_distro_identifiers(self):
+        archive_path = self.root / "unknown-distro.tar.gz"
+        with tarfile.open(archive_path, "w:gz") as archive:
+            for name in ("omg", "omgd"):
+                data = name.encode()
+                member = tarfile.TarInfo(f"omg-v0.1.224-x86_64-linux-bookworm/{name}")
+                member.size = len(data)
+                archive.addfile(member, io.BytesIO(data))
+        with self.assertRaisesRegex(ValueError, "unsupported native archive distro"):
+            checker.archive_binary_hashes(archive_path, "bookworm")
+
     def test_duplicate_raw_daemon_counters_are_refused(self):
         self.assertEqual(self.admit(), self.receipt)
         duplicates = (

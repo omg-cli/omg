@@ -507,6 +507,24 @@ pub fn build_path_additions<S: std::hash::BuildHasher>(
     versions: &HashMap<String, String, S>,
 ) -> Result<Vec<String>> {
     let mut paths = Vec::new();
+    for (runtime, bin_path) in selected_runtime_paths(versions)? {
+        match crate::runtimes::security::require_selected_path(&runtime, &bin_path) {
+            Ok(_admission) => paths.push(bin_path.display().to_string()),
+            Err(error) => eprintln!(
+                "omg: {} advisory review required: {}; run omg use {} <version> to refresh and review",
+                runtime,
+                crate::cli::style::sanitize_terminal_text(&format!("{error:#}")),
+                runtime
+            ),
+        }
+    }
+    Ok(paths)
+}
+
+pub(crate) fn selected_runtime_paths<S: std::hash::BuildHasher>(
+    versions: &HashMap<String, String, S>,
+) -> Result<Vec<(String, PathBuf)>> {
+    let mut paths = Vec::new();
 
     let data_dir = paths::data_dir();
 
@@ -566,7 +584,7 @@ pub fn build_path_additions<S: std::hash::BuildHasher>(
         };
 
         if crate::runtimes::common::is_trusted_runtime_bin_dir(&bin_path) {
-            paths.push(bin_path.display().to_string());
+            paths.push((runtime.clone(), bin_path));
         }
     }
 
@@ -1196,6 +1214,34 @@ mod tests {
     use std::fs;
     use tempfile::tempdir;
 
+    /// Resolution fixtures establish explicit authority before exercising PATH
+    /// formatting. The unreviewed-selection regression calls the production
+    /// function directly and does not use this fixture owner.
+    fn build_path_additions<S: std::hash::BuildHasher>(
+        versions: &HashMap<String, String, S>,
+    ) -> Result<Vec<String>> {
+        for (runtime, bin) in super::selected_runtime_paths(versions)? {
+            let root = match runtime.as_str() {
+                "bun" | "dotnet" => bin.clone(),
+                "swift" => bin
+                    .parent()
+                    .and_then(Path::parent)
+                    .context("Missing Swift fixture root")?
+                    .to_path_buf(),
+                _ => bin
+                    .parent()
+                    .context("Missing runtime fixture root")?
+                    .to_path_buf(),
+            };
+            let version = root
+                .file_name()
+                .and_then(|name| name.to_str())
+                .context("Missing runtime fixture version")?;
+            crate::runtimes::security::fixture_prepare(&runtime, version, &root, &root)?;
+        }
+        super::build_path_additions(versions)
+    }
+
     fn emitted_hook_output(shell: &str, name: &str) -> Option<String> {
         const CHILD: &str = "OMG_PRINTED_HOOK_TEST";
         const SHELL: &str = "OMG_PRINTED_HOOK_SHELL";
@@ -1262,9 +1308,25 @@ mod tests {
             let data = directory.path().join(dirname);
             let selected = data.join("versions/python/3.12.0/bin");
             fs::create_dir_all(&selected)?;
-            let emitted = temp_env::with_var("OMG_DATA_DIR", Some(&data), || {
-                hook_env_output("fish", &project)
-            })?;
+            let version_root = selected.parent().context("Python fixture version root")?;
+            let config = directory.path().join("config");
+            let emitted = temp_env::with_vars(
+                [
+                    ("OMG_DATA_DIR", Some(data.as_os_str())),
+                    ("OMG_CONFIG_DIR", Some(config.as_os_str())),
+                ],
+                || {
+                    crate::runtimes::security::fixture_prepare(
+                        "python",
+                        "3.12.0",
+                        version_root,
+                        version_root,
+                    )
+                    .expect("prepare reviewed Python path fixture");
+                    hook_env_output("fish", &project)
+                },
+            )
+            .expect("render the reviewed Python Fish hook");
             anyhow::ensure!(
                 emitted.contains("_OMG_PATH_ADDITIONS"),
                 "fixture must emit a path"
@@ -1531,6 +1593,30 @@ path = "hostile"
     }
 
     #[test]
+    fn automatic_selection_does_not_emit_an_unreviewed_runtime_path() {
+        const NAME: &str =
+            "hooks::tests::automatic_selection_does_not_emit_an_unreviewed_runtime_path";
+        if crate::config::Settings::rerun_test_unprivileged(NAME)
+            || crate::core::testing::run_isolated_test(NAME)
+        {
+            return;
+        }
+        let data = tempdir().unwrap();
+        let bin = data.path().join("versions/python/3.12.0/bin");
+        fs::create_dir_all(&bin).unwrap();
+        temp_env::with_var("OMG_DATA_DIR", Some(data.path()), || {
+            assert!(crate::runtimes::common::is_trusted_runtime_bin_dir(&bin));
+            let versions = HashMap::from([("python".to_string(), "3.12.0".to_string())]);
+            let paths = super::build_path_additions(&versions)
+                .expect("an unreviewed exact pin must refuse softly in the automatic hook");
+            assert!(
+                paths.is_empty(),
+                "unreviewed runtime reached PATH: {paths:?}"
+            );
+        });
+    }
+
+    #[test]
     fn python_version_file_wins_over_same_directory_pyproject() {
         let dir = tempdir().unwrap();
         fs::write(dir.path().join(".python-version"), "3.11.9").unwrap();
@@ -1779,6 +1865,7 @@ path = "hostile"
             ("python", "3.12.0", "bin", "python3", "pip"),
             ("bun", "1.2.0", "", "bun", "bunx"),
             ("deno", "2.9.6", "bin", "deno", "deno-lsp"),
+            ("swift", "6.2.0", "usr/bin", "swift", "swiftc"),
         ] {
             let selected = if relative_bin.is_empty() {
                 data.path().join("versions").join(runtime).join(version)

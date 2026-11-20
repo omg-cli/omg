@@ -292,17 +292,32 @@ identity and verifies supported Rekor artifact signatures, not in-toto build
 provenance. Even successful checks return SLSA level `None`. A valid signature
 from an arbitrary signer is insufficient.
 
-AUR review hashes the local source manifest, including `.SRCINFO`, patches and
-install hooks, excluding Git administration data. The default display previews
-the PKGBUILD and names supporting files; hashing does not mean every file's
-contents were displayed or read. Source symlinks must resolve within the checkout;
-dangling links and escaping link chains are rejected. All cached, fresh, dependency and rollback archives
+AUR review binds the complete captured source manifest, including `.SRCINFO`,
+patches and install hooks. PKGBUILD and .SRCINFO symlinks are rejected.
+Auxiliary symlinks must resolve inside the checkout. The manifest records their
+target strings. Filenames and review diagnostics escape terminal controls and
+invisible formatting. Cached, fresh, dependency and rollback archives
 must match the reviewed output identity and exact install-hook bytes. Package
 archives are snapshotted into sealed Linux files before approval and copied into
 private root staging for the complete privileged transaction.
 
-Bubblewrap builds are offline by default and use separate PID and IPC namespaces.
-Source fetches have a fifteen-minute total deadline. The host prefetcher accepts only public
+Archive admission checks raw extension headers before interpreting file entries.
+Ambiguous or unsupported PAX metadata, conflicting GNU/PAX paths, NUL paths or
+attribute names, duplicate canonical attribute names, unequal raw/PAX sizes and
+nonregular entries carrying data are rejected. Capability classification follows
+libarchive's percent-decoded LIBARCHIVE attribute names, and link privilege
+metadata is included in exceptional approval.
+
+The optional `aur.security_profile = "hardened"` setting requires offline
+Bubblewrap, secure makepkg and attended source confirmation even with `--yes`.
+It rejects hooks, privilege-bearing files, system configuration and classified
+privileged integration paths, then requires matching archives from two builds
+with separate invocation storage for every accepted output. The host toolchain
+and checkout are shared. Matching builds do not prove code safety or independent
+provenance. This setting governs OMG AUR operations, not other package managers.
+
+Bubblewrap builds are offline by default and isolate PID and IPC namespaces.
+Source prefetch has a fifteen-minute deadline. The host prefetcher accepts only public
 HTTPS destinations, checks every redirect and pins resolved addresses. Sources
 that require build-time networking (including unsupported VCS prefetches) require
 an explicit `[aur] allow_network = true` setting. That setting exposes local and
@@ -318,8 +333,8 @@ rebuilds do not waive this approval. `--yes` does not approve these exceptions.
 An accepted package can still execute malicious code after installation.
 
 Arch transactions honor configured `DownloadUser` and the default local pacman
-hook directory. Repository `Usage` settings other than `All` fail explicitly
-until OMG can enforce them across every query and transaction path.
+hook directory. Repository `Usage` limits access for the relevant queries and
+transactions, and invalid usage settings fail closed.
 
 Explicit package policies are enforced again against ALPM's prepared install or
 upgrade plan, including dependencies. Native APT/DNF/Homebrew install and upgrade paths

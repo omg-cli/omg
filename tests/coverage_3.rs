@@ -338,9 +338,8 @@ fn normal_remove_records_known_version_once() {
 }
 
 #[test]
-fn rollback_install_removes_packages_and_records_rollback_history() {
+fn rollback_install_refuses_unproven_removal_without_changing_state() {
     let project = TestProject::for_distro("arch");
-    // Seed mock backend state so the Remove path has something recorded.
     project.mock_install("example", "1.0-1").unwrap();
     seed_history(
         &project,
@@ -351,42 +350,26 @@ fn rollback_install_removes_packages_and_records_rollback_history() {
             &change_json("example", None, "aur"),
         )],
     );
-
+    let history_path = project.data_dir.path().join("history.json");
+    let state_path = project.data_dir.path().join("mock_state_pacman.json");
+    let before_history = std::fs::read(&history_path).unwrap();
+    let before_state = std::fs::read(&state_path).unwrap();
     let result = project.run(&["rollback", INSTALL_TXN_ID, "--yes"]);
-
-    result.assert_success();
-    result.assert_stdout_contains("Removing 1 package(s)");
-    result.assert_stdout_contains("Rollback completed successfully");
-
-    // Exact state change: the rollback itself is recorded as a successful
-    // Remove transaction whose single change names the package and is
-    // sourced "rollback" (not misattributed to a user remove).
-    let history = std::fs::read_to_string(project.data_dir.path().join("history.json")).unwrap();
-    let parsed: serde_json::Value = serde_json::from_str(&history).unwrap();
-    let entries = parsed.as_array().expect("history.json must stay an array");
-    assert_eq!(
-        entries.len(),
-        2,
-        "rollback must append exactly one entry: {history}"
-    );
-    let entry = &entries[1];
-    assert_eq!(entry["transaction_type"], "Remove");
-    assert_eq!(entry["success"], true);
-    assert_eq!(entry["changes"][0]["name"], "example");
-    assert_eq!(entry["changes"][0]["source"], "rollback");
-    assert_eq!(entry["changes"][0]["new_version"], serde_json::Value::Null);
-
-    // The mock backend state must reflect the removal too.
-    let mock_state: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(project.data_dir.path().join("mock_state_pacman.json")).unwrap(),
-    )
-    .unwrap();
-    let installed = mock_state["installed"]
-        .as_object()
-        .expect("mock state must keep its installed map");
+    result.assert_failure();
     assert!(
-        !installed.contains_key("example"),
-        "rollback must remove 'example' from installed mock state: {installed:?}"
+        result.stderr.contains("newly installed"),
+        "{}",
+        result.stderr
+    );
+    assert_eq!(
+        std::fs::read(history_path).unwrap(),
+        before_history,
+        "a refused rollback cannot append a removal transaction"
+    );
+    assert_eq!(
+        std::fs::read(state_path).unwrap(),
+        before_state,
+        "a refused rollback cannot remove an existing package"
     );
 }
 

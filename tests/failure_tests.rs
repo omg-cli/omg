@@ -20,10 +20,10 @@ fn test_conflicting_packages_fails_gracefully() -> Result<()> {
     let harness = AlpmHarness::new()?;
 
     // Create two conflicting packages
-    let mut pkg_a = HarnessPkg::new("pkg-a", "1.0.0");
+    let mut pkg_a = HarnessPkg::new("pkg-a", "1.0.0-1");
     pkg_a.desc.push_str("%CONFLICTS%\npkg-b\n\n");
 
-    let mut pkg_b = HarnessPkg::new("pkg-b", "1.0.0");
+    let mut pkg_b = HarnessPkg::new("pkg-b", "1.0.0-1");
     pkg_b.desc.push_str("%CONFLICTS%\npkg-a\n\n");
 
     harness.add_sync_pkg("core", &pkg_a)?;
@@ -51,14 +51,16 @@ fn test_conflicting_packages_fails_gracefully() -> Result<()> {
         Some(&mut alpm),
     );
 
-    assert!(result.is_err(), "Transaction should fail due to conflicts");
-    let err = result.unwrap_err().to_string();
-    assert!(
-        err.contains("conflicting packages")
-            || err.contains("Transaction failed")
-            || err.contains("pkg-a"),
-        "Error message should mention conflicts or transaction failure, got: {}",
-        err
+    let err = result.expect_err("conflicting packages must refuse preparation");
+    assert_eq!(
+        err.to_string().lines().next(),
+        Some(
+            format!(
+                "✗ Transaction preparation failed: {}",
+                alpm::Error::ConflictingDeps
+            )
+            .as_str()
+        )
     );
 
     Ok(())
@@ -129,13 +131,82 @@ fn test_unwritable_database_dir_fails_gracefully() -> Result<()> {
 #[test]
 #[serial]
 fn test_missing_dependency_fails_gracefully() -> Result<()> {
+    if omg_lib::core::privilege::is_root() {
+        common::report_skip("private pacman configuration requires an ordinary UID");
+        return Ok(());
+    }
+    assert_transaction_refusal(HandleSource::Injected, TransactionFault::MissingDependency)
+}
+
+#[test]
+#[serial]
+fn test_owned_handle_missing_dependency_fails_gracefully() -> Result<()> {
+    if omg_lib::core::privilege::is_root() {
+        common::report_skip("private pacman configuration requires an ordinary UID");
+        return Ok(());
+    }
+    assert_transaction_refusal(HandleSource::Owned, TransactionFault::MissingDependency)
+}
+
+#[test]
+#[serial]
+fn test_missing_repository_target_with_injected_handle() -> Result<()> {
+    if omg_lib::core::privilege::is_root() {
+        common::report_skip("private pacman configuration requires an ordinary UID");
+        return Ok(());
+    }
+    assert_transaction_refusal(HandleSource::Injected, TransactionFault::MissingTarget)
+}
+
+#[test]
+#[serial]
+fn test_missing_repository_target_with_owned_handle() -> Result<()> {
+    if omg_lib::core::privilege::is_root() {
+        common::report_skip("private pacman configuration requires an ordinary UID");
+        return Ok(());
+    }
+    assert_transaction_refusal(HandleSource::Owned, TransactionFault::MissingTarget)
+}
+
+#[derive(Clone, Copy, Debug)]
+enum HandleSource {
+    Injected,
+    Owned,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum TransactionFault {
+    MissingTarget,
+    MissingDependency,
+}
+
+fn assert_transaction_refusal(source: HandleSource, fault: TransactionFault) -> Result<()> {
+    assert!(
+        !omg_lib::core::privilege::is_root(),
+        "private pacman configuration requires an unprivileged caller"
+    );
     let harness = AlpmHarness::new()?;
 
-    // Create a package with a missing dependency
-    let mut pkg_a = HarnessPkg::new("pkg-a", "1.0.0");
-    pkg_a.desc.push_str("%DEPENDS%\nnon-existent-dep\n\n");
+    let mut pkg_a = HarnessPkg::new("pkg-a", "1.0.0-1");
+    if matches!(fault, TransactionFault::MissingDependency) {
+        pkg_a.desc.push_str("%DEPENDS%\nnon-existent-dep\n\n");
+    }
 
     harness.add_sync_pkg("core", &pkg_a)?;
+    let conf = harness.root().join("pacman.conf");
+    std::fs::write(
+        &conf,
+        format!(
+            "[options]\nSigLevel = Never\nArchitecture = x86_64\n[core]\nServer = file://{}/missing\n",
+            harness.root().display()
+        ),
+    )?;
+    let config = harness.root().join("omg-config");
+    let data = harness.root().join("omg-data");
+    let cache = harness.root().join("omg-cache");
+    for directory in [&config, &data, &cache] {
+        std::fs::create_dir_all(directory)?;
+    }
 
     paths::set_test_overrides(
         Some(harness.root().to_path_buf()),
@@ -146,29 +217,66 @@ fn test_missing_dependency_fails_gracefully() -> Result<()> {
         paths::reset_test_overrides();
     }
 
-    let mut alpm = harness.alpm()?;
-    alpm.register_syncdb("core", alpm::SigLevel::NONE)?;
+    temp_env::with_vars(
+        [
+            ("OMG_PACMAN_CONF", Some(conf.as_os_str())),
+            ("OMG_CONFIG_DIR", Some(config.as_os_str())),
+            ("OMG_DATA_DIR", Some(data.as_os_str())),
+            ("OMG_CACHE_DIR", Some(cache.as_os_str())),
+        ],
+        || {
+            let mut alpm = harness.alpm()?;
+            alpm.register_syncdb("core", alpm::SigLevel::NONE)?;
+            let handle = match source {
+                HandleSource::Injected => Some(&mut alpm),
+                HandleSource::Owned => None,
+            };
+            let target = match fault {
+                TransactionFault::MissingTarget => "does-not-exist",
+                TransactionFault::MissingDependency => "pkg-a",
+            };
+            let result = alpm_ops::execute_transaction(
+                vec![target.to_string()],
+                TransactionKind::Install,
+                handle,
+            );
+            let err =
+                result.expect_err("an invalid private transaction must fail before installation");
+            let diagnostic = err.to_string();
+            match fault {
+                TransactionFault::MissingTarget => {
+                    assert_eq!(
+                        diagnostic.lines().next(),
+                        Some("✗ Package 'does-not-exist' not found in any configured repository.")
+                    );
+                    assert!(diagnostic.contains("Run 'omg sync'"), "{diagnostic}");
+                    assert!(
+                        diagnostic.contains("omg search does-not-exist"),
+                        "{diagnostic}"
+                    );
+                }
+                TransactionFault::MissingDependency => {
+                    for required in [
+                        "ALPM transaction aborted",
+                        "unconfirmed package mutation",
+                        "drop unresolvable package(s) from the transaction: pkg-a",
+                        "resolve the conflict explicitly and retry",
+                    ] {
+                        assert!(diagnostic.contains(required), "{diagnostic}");
+                    }
+                }
+            }
+            let observed = harness.alpm()?;
+            assert_eq!(
+                observed.localdb().pkg("pkg-a").err(),
+                Some(alpm::Error::PkgNotFound),
+                "the independent observer must report package absence"
+            );
+            assert!(!harness.db_path().join("db.lck").exists());
 
-    let result = alpm_ops::execute_transaction(
-        vec!["pkg-a".to_string()],
-        TransactionKind::Install,
-        Some(&mut alpm),
-    );
-
-    assert!(
-        result.is_err(),
-        "Transaction should fail due to missing dependency"
-    );
-    let err = result.unwrap_err().to_string();
-    assert!(
-        err.contains("could not satisfy dependencies")
-            || err.contains("Preparation Error")
-            || err.contains("not found"),
-        "Error message should mention dependency failure, got: {}",
-        err
-    );
-
-    Ok(())
+            Ok(())
+        },
+    )
 }
 
 #[test]

@@ -4,7 +4,7 @@
 //!
 //! Features:
 //! - Automatic LTS detection
-//! - Checksum verification (SHASUMS256.txt)
+//! - Publisher-authenticated checksums (SHASUMS256.txt.asc)
 //! - Pure Rust XZ extraction
 //! - Version aliasing (latest, lts, lts/iron, etc.)
 
@@ -16,12 +16,45 @@ use std::path::{Path, PathBuf};
 
 use super::common::{
     activate_version_with_lease, begin_download, begin_staged_install, complete_staged_install,
-    download_with_progress, extract_tar_xz, normalize_version, parse_sha256_digest,
-    print_already_installed, print_installed, print_using,
+    download_with_progress, extract_tar_xz, normalize_version, print_already_installed,
+    print_installed, print_using,
 };
 use crate::{cli::style, core::http::download_client};
 
+#[cfg(feature = "pgp")]
+use super::common::parse_sha256_digest;
+
 const NODE_DIST_URL: &str = "https://nodejs.org/dist";
+
+#[cfg(feature = "pgp")]
+const NODE_RELEASE_FINGERPRINTS: [&str; 8] = [
+    "108F52B48DB57BB0CC439B2997B01419BD92F80A",
+    "5BE8A3F6C8A5C01D106C0AD820B1A390B168D356",
+    "655F3B5C1FB3FA8D1A0CA6BDE4A7D232B936D2FD",
+    "890C08DB8579162FEE0DF9DB8BEAB4DFCF555EF4",
+    "A363A499291CBBC940DD62E41F10027AF002F8B0",
+    "C82FA3AE1CBEDC6BE46B9360C43CEC45C17AB93C",
+    "CC68F5A3106FF448322E48ED27F5E38D5B0A215F",
+    "DD792F5973C6DE52C432CBDAC77ABFA00DDBF2B7",
+];
+
+#[cfg(feature = "pgp")]
+fn node_release_verifier() -> Result<crate::core::security::pgp::PgpVerifier> {
+    crate::core::security::pgp::PgpVerifier::from_public_key_bytes(
+        include_bytes!("keys/node-release-keys.asc"),
+        &NODE_RELEASE_FINGERPRINTS,
+    )
+    .context("Cannot load pinned Node release certificates")
+}
+
+#[cfg(feature = "pgp")]
+fn checksum_for_filename(text: &str, filename: &str, source: &str) -> Result<String> {
+    let line = text
+        .lines()
+        .find(|line| line.split_whitespace().nth(1) == Some(filename))
+        .ok_or_else(|| anyhow::anyhow!("Checksum not found for {filename}"))?;
+    parse_sha256_digest(line, source)
+}
 
 /// Node.js version info from nodejs.org.
 ///
@@ -80,6 +113,7 @@ impl LtsStatus {
 
 /// Node.js runtime manager
 pub(crate) struct NodeManager {
+    security: super::security::RuntimeSecurity,
     versions_dir: PathBuf,
     client: &'static reqwest::Client,
 }
@@ -87,6 +121,7 @@ pub(crate) struct NodeManager {
 impl NodeManager {
     pub fn new() -> Self {
         Self {
+            security: super::security::RuntimeSecurity::default(),
             versions_dir: super::DATA_DIR.join("versions/node"),
             client: download_client(),
         }
@@ -177,9 +212,12 @@ impl NodeManager {
         download_with_progress(self.client, &url, &download_path, &checksum).await?;
 
         println!("{} Extracting (pure Rust)...", style::informative("→"));
+        let publisher =
+            super::security::record_download("node", &version, &version_dir, &download_path, &url)?;
         let staging = begin_staged_install(&self.versions_dir)?;
         extract_tar_xz(&download_path, staging.path(), 1).await?;
         self.publish_install(&staging, &version)?;
+        publisher.commit();
 
         print_installed("Node.js", &version);
         self.use_version(&version)?;
@@ -189,6 +227,16 @@ impl NodeManager {
 
     fn publish_install(&self, staging: &tempfile::TempDir, version: &str) -> Result<()> {
         super::common::require_regular_file(&staging.path().join("bin/node"))?;
+        let admission = self
+            .security
+            .prepare_staged(
+                "node",
+                version,
+                staging.path(),
+                &self.versions_dir.join(version),
+            )
+            .context("Failed to review staged Node.js runtime")?;
+        admission.before_execution(staging.path())?;
         smoke_node(staging.path(), version)?;
         complete_staged_install(staging, &self.versions_dir.join(version), version)
     }
@@ -209,17 +257,31 @@ impl NodeManager {
         ))
     }
 
-    /// Fetch SHA256 checksum from nodejs.org
+    /// Authenticate the publisher before selecting its exact archive checksum.
+    #[cfg(feature = "pgp")]
     async fn fetch_checksum(&self, version: &str, filename: &str) -> Result<String> {
-        let url = format!("{NODE_DIST_URL}/v{version}/SHASUMS256.txt");
-        let text = crate::core::http::fetch_metadata_text(self.client, &url)
+        let verifier = node_release_verifier()?;
+        let url = format!("{NODE_DIST_URL}/v{version}/SHASUMS256.txt.asc");
+        let signed = crate::core::http::fetch_metadata_text_limited(self.client, &url, 1024 * 1024)
             .await
             .context("Failed to fetch Node.js checksum manifest")?;
-        let digest_line = text
-            .lines()
-            .find(|line| line.split_whitespace().nth(1) == Some(filename))
-            .ok_or_else(|| anyhow::anyhow!("Checksum not found for {filename}"))?;
-        parse_sha256_digest(digest_line, &url)
+        let plaintext = verifier.verify_cleartext_memory(signed.as_bytes(), 1024 * 1024)
+            .context("Node checksum manifest is not authenticated by a currently trusted releaser; update OMG's reviewed release keys if the signing authority changed")?;
+        let text =
+            std::str::from_utf8(&plaintext).context("Authenticated Node manifest is not UTF-8")?;
+        checksum_for_filename(text, filename, &url)
+    }
+
+    #[cfg(not(feature = "pgp"))]
+    fn fetch_checksum(
+        &self,
+        _version: &str,
+        _filename: &str,
+    ) -> std::future::Ready<Result<String>> {
+        std::future::ready(Err(anyhow::anyhow!(
+            "Authenticated Node installation requires an OMG build with PGP support (installation root: {})",
+            self.versions_dir.display()
+        )))
     }
 
     /// Switch to a specific version
@@ -233,6 +295,15 @@ impl NodeManager {
             "Node.js version {version} is not installed as a valid directory"
         );
         super::common::require_regular_file(&version_dir.join("bin/node"))?;
+        let admission = self
+            .security
+            .installed(
+                "node",
+                &self.versions_dir.join(&version),
+                super::security::ReviewMode::FreshAttended,
+            )
+            .context("Failed to review installed Node.js runtime")?;
+        admission.verify(&self.versions_dir.join(&version))?;
         smoke_node(&version_dir, &version)?;
         activate_version_with_lease(&self.versions_dir, &version, Path::new("bin/node"), &lease)?;
         print_using("Node.js", &version, &self.versions_dir.join("current/bin"));
@@ -816,6 +887,147 @@ pub(crate) fn get_lts_name(version: &NodeVersion) -> Option<&str> {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "pgp")]
+    const SIGNED_NODE_MANIFEST: &[u8] = include_bytes!(
+        "../../tests/fixtures/node-release-authentication/SHASUMS256-v24.22.3.txt.asc"
+    );
+    #[cfg(feature = "pgp")]
+    const SIGNED_NODE_ARCHIVE_SHA256: &str =
+        "4f2b175a6d53a5c617a80dba2676238a0688cef28c6da4eba35c7d844e66fcfb";
+
+    #[test]
+    #[cfg(feature = "pgp")]
+    fn node_manifest_interoperates_with_exact_pinned_public_authorities() -> Result<()> {
+        use sequoia_openpgp::parse::Parse as _;
+        let pinned = include_bytes!("keys/node-release-keys.asc");
+        let certs = sequoia_openpgp::cert::CertParser::from_bytes(pinned)
+            .context("Pinned Node release certificates must parse")?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        assert_eq!(certs.len(), NODE_RELEASE_FINGERPRINTS.len());
+        assert!(certs.iter().all(|cert| !cert.is_tsk()));
+        let mut fingerprints = certs
+            .iter()
+            .map(|cert| cert.fingerprint().to_hex())
+            .collect::<Vec<_>>();
+        fingerprints.sort();
+        assert_eq!(fingerprints, NODE_RELEASE_FINGERPRINTS);
+        let plaintext =
+            node_release_verifier()?.verify_cleartext_memory(SIGNED_NODE_MANIFEST, 1024 * 1024)?;
+        assert!(
+            std::str::from_utf8(&plaintext)?.lines().any(|line| line
+                == format!("{SIGNED_NODE_ARCHIVE_SHA256}  node-v24.22.3-linux-x64.tar.xz"))
+        );
+        let text = std::str::from_utf8(&plaintext)?;
+        assert_eq!(
+            checksum_for_filename(text, "node-v24.22.3-linux-x64.tar.xz", "fixture")?,
+            SIGNED_NODE_ARCHIVE_SHA256
+        );
+        assert!(checksum_for_filename(text, "node-v24.22.4-linux-x64.tar.xz", "fixture").is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "pgp")]
+    async fn node_install_authenticates_the_signed_manifest_before_selecting_a_checksum()
+    -> Result<()> {
+        let filename = "node-v24.22.3-linux-x64.tar.xz";
+        let fixture = super::super::test_https::HttpsFixture::new(
+            "nodejs.org",
+            vec![(
+                "/dist/v24.22.3/SHASUMS256.txt.asc".into(),
+                SIGNED_NODE_MANIFEST.to_vec(),
+            )],
+        )
+        .await?;
+        let directory = tempfile::tempdir()?;
+        let manager = NodeManager {
+            security: crate::runtimes::security::RuntimeSecurity::fixture(),
+            versions_dir: directory.path().to_path_buf(),
+            client: Box::leak(Box::new(fixture.client(true)?)),
+        };
+        assert_eq!(
+            manager.fetch_checksum("24.22.3", filename).await?,
+            SIGNED_NODE_ARCHIVE_SHA256
+        );
+        assert_eq!(
+            fixture.finish().await?,
+            ["GET /dist/v24.22.3/SHASUMS256.txt.asc HTTP/1.1"]
+        );
+        assert_eq!(fs::read_dir(directory.path())?.count(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "pgp")]
+    async fn node_install_refuses_a_tampered_signature_before_any_archive_request() -> Result<()> {
+        let tampered = std::str::from_utf8(SIGNED_NODE_MANIFEST)?
+            .replace(SIGNED_NODE_ARCHIVE_SHA256, &"a".repeat(64));
+        assert_ne!(tampered.as_bytes(), SIGNED_NODE_MANIFEST);
+        refused_node_manifest(tampered.into_bytes()).await
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "pgp")]
+    async fn node_install_refuses_a_valid_foreign_signature_before_any_archive_request()
+    -> Result<()> {
+        let filename = format!("node-v24.22.3-{}.tar.xz", node_platform()?);
+        let (_, signed) = crate::core::security::pgp::tests::cleartext_fixture(
+            format!("{}  {filename}\n", "a".repeat(64)).as_bytes(),
+            sequoia_openpgp::types::HashAlgorithm::SHA256,
+            std::time::SystemTime::now(),
+            std::time::Duration::from_hours(1),
+            std::time::Duration::from_hours(48),
+            false,
+        );
+        refused_node_manifest(signed).await
+    }
+
+    #[cfg(feature = "pgp")]
+    async fn refused_node_manifest(signed: Vec<u8>) -> Result<()> {
+        let fixture = super::super::test_https::HttpsFixture::new(
+            "nodejs.org",
+            vec![("/dist/v24.22.3/SHASUMS256.txt.asc".into(), signed)],
+        )
+        .await?;
+        let directory = tempfile::tempdir()?;
+        let manager = NodeManager {
+            security: crate::runtimes::security::RuntimeSecurity::fixture(),
+            versions_dir: directory.path().to_path_buf(),
+            client: Box::leak(Box::new(fixture.client(true)?)),
+        };
+        let error = manager
+            .install("24.22.3")
+            .await
+            .expect_err("an untrusted signature must prevent installation");
+        assert!(format!("{error:#}").contains("Node checksum manifest is not authenticated"));
+        assert_eq!(
+            fixture.finish().await?,
+            ["GET /dist/v24.22.3/SHASUMS256.txt.asc HTTP/1.1"]
+        );
+        assert_eq!(fs::read_dir(directory.path())?.count(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[cfg(not(feature = "pgp"))]
+    async fn node_install_without_pgp_refuses_before_contacting_the_publisher() -> Result<()> {
+        let fixture = super::super::test_https::HttpsFixture::new("nodejs.org", vec![]).await?;
+        let directory = tempfile::tempdir()?;
+        let manager = NodeManager {
+            security: crate::runtimes::security::RuntimeSecurity::fixture(),
+            versions_dir: directory.path().to_path_buf(),
+            client: Box::leak(Box::new(fixture.client(true)?)),
+        };
+        let error = manager
+            .install("24.22.3")
+            .await
+            .expect_err("PGP-free builds cannot authenticate a release");
+        assert!(format!("{error:#}").contains("requires an OMG build with PGP support"));
+        assert!(fixture.finish().await?.is_empty());
+        assert_eq!(fs::read_dir(directory.path())?.count(), 0);
+        Ok(())
+    }
+
     mod terminal_group_tests {
         use super::super::terminal_group::{self, Identity, Member, State};
         use anyhow::Result;
@@ -1177,29 +1389,27 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(feature = "pgp")]
     async fn metadata_retry_recovers_node_checksum_without_skipping_integrity() -> Result<()> {
-        let filename = "node-v24.21.0-linux-x64.tar.xz";
-        let digest = "a".repeat(64);
-        let path = "/dist/v24.21.0/SHASUMS256.txt";
+        let filename = "node-v24.22.3-linux-x64.tar.xz";
+        let digest = SIGNED_NODE_ARCHIVE_SHA256;
+        let path = "/dist/v24.22.3/SHASUMS256.txt.asc";
         let fixture = super::super::test_https::HttpsFixture::new_with_statuses(
             "nodejs.org",
             vec![
                 (path.into(), 503, b"temporarily unavailable".to_vec()),
-                (
-                    path.into(),
-                    200,
-                    format!("{digest}  {filename}\n").into_bytes(),
-                ),
+                (path.into(), 200, SIGNED_NODE_MANIFEST.to_vec()),
             ],
         )
         .await?;
         let directory = tempfile::tempdir()?;
         let client = fixture.client(true)?;
         let manager = NodeManager {
+            security: crate::runtimes::security::RuntimeSecurity::fixture(),
             versions_dir: directory.path().to_path_buf(),
             client: Box::leak(Box::new(client)),
         };
-        assert_eq!(manager.fetch_checksum("24.21.0", filename).await?, digest);
+        assert_eq!(manager.fetch_checksum("24.22.3", filename).await?, digest);
         assert_eq!(
             fixture.finish().await?,
             vec![format!("GET {path} HTTP/1.1"); 2]
@@ -1209,24 +1419,34 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(feature = "pgp")]
     async fn metadata_retry_does_not_retry_invalid_node_checksum() -> Result<()> {
-        let path = "/dist/v24.21.0/SHASUMS256.txt";
+        assert!(
+            checksum_for_filename(
+                "invalid node-v24.22.3-linux-x64.tar.xz\n",
+                "node-v24.22.3-linux-x64.tar.xz",
+                "fixture"
+            )
+            .is_err()
+        );
+        let path = "/dist/v24.22.3/SHASUMS256.txt.asc";
         let fixture = super::super::test_https::HttpsFixture::new(
             "nodejs.org",
             vec![(
                 path.into(),
-                b"invalid node-v24.21.0-linux-x64.tar.xz\n".to_vec(),
+                b"invalid node-v24.22.3-linux-x64.tar.xz\n".to_vec(),
             )],
         )
         .await?;
         let directory = tempfile::tempdir()?;
         let manager = NodeManager {
+            security: crate::runtimes::security::RuntimeSecurity::fixture(),
             versions_dir: directory.path().to_path_buf(),
             client: Box::leak(Box::new(fixture.client(true)?)),
         };
         assert!(
             manager
-                .fetch_checksum("24.21.0", "node-v24.21.0-linux-x64.tar.xz")
+                .fetch_checksum("24.22.3", "node-v24.22.3-linux-x64.tar.xz")
                 .await
                 .is_err()
         );
@@ -1236,8 +1456,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(feature = "pgp")]
     async fn metadata_retry_recovers_real_connection_interruption() -> Result<()> {
-        let path = "/dist/v24.21.0/SHASUMS256.txt";
+        let path = "/dist/v24.22.3/SHASUMS256.txt.asc";
         let interrupted = super::super::test_https::HttpsFixture::new_with_statuses(
             "nodejs.org",
             vec![(path.into(), 0, vec![])],
@@ -1258,26 +1479,23 @@ mod tests {
             ["CONNECT nodejs.org:443 HTTP/1.1"]
         );
 
-        let filename = "node-v24.21.0-linux-x64.tar.xz";
-        let digest = "b".repeat(64);
+        let filename = "node-v24.22.3-linux-x64.tar.xz";
+        let digest = SIGNED_NODE_ARCHIVE_SHA256;
         let fixture = super::super::test_https::HttpsFixture::new_with_statuses(
             "nodejs.org",
             vec![
                 (path.into(), 0, vec![]),
-                (
-                    path.into(),
-                    200,
-                    format!("{digest}  {filename}\n").into_bytes(),
-                ),
+                (path.into(), 200, SIGNED_NODE_MANIFEST.to_vec()),
             ],
         )
         .await?;
         let directory = tempfile::tempdir()?;
         let manager = NodeManager {
+            security: crate::runtimes::security::RuntimeSecurity::fixture(),
             versions_dir: directory.path().to_path_buf(),
             client: Box::leak(Box::new(fixture.client(true)?)),
         };
-        assert_eq!(manager.fetch_checksum("24.21.0", filename).await?, digest);
+        assert_eq!(manager.fetch_checksum("24.22.3", filename).await?, digest);
         assert_eq!(
             fixture.finish().await?,
             [
@@ -1289,10 +1507,75 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn installed_node_fast_path_refuses_invalid_identity_before_execution() {
+        let fixture = super::super::test_archive::PublicationFixture::new("node", "bin/node");
+        let candidate = fixture.versions.join("24.22.3");
+        let marker = fixture.owner.path().join("node-probe-invoked");
+        let quoted_marker = format!("'{}'", marker.display().to_string().replace('\'', "'\\''"));
+        write_node_probe(
+            &candidate,
+            &format!("printf invoked > {quoted_marker}; printf 'v24.22.3\\n'"),
+            true,
+        )
+        .expect("create executable owned Node candidate");
+        crate::runtimes::security::fixture_prepare("node", "24.22.3", &candidate, &candidate)
+            .expect("admit exact installed Node fixture");
+        let manager = NodeManager {
+            security: crate::runtimes::security::RuntimeSecurity::fixture(),
+            versions_dir: fixture.versions.clone(),
+            client: download_client(),
+        };
+        manager
+            .install("24.22.3")
+            .await
+            .expect("existing exact Node installation activates without a download");
+        assert_eq!(
+            fs::read(&marker).expect("valid Node candidate was probed"),
+            b"invoked"
+        );
+        assert_eq!(manager.current_version().as_deref(), Some("24.22.3"));
+
+        fs::remove_file(&marker).expect("clear the first probe marker");
+        fs::remove_file(fixture.versions.join("current")).expect("restore prior selection");
+        std::os::unix::fs::symlink("1.0.0", fixture.versions.join("current"))
+            .expect("reselect previously reviewed Node");
+        fixture.corrupt_identity("24.22.3");
+        let identity = fs::read(fixture.identity_path("24.22.3")).expect("corrupted identity");
+        let binary = fs::read(candidate.join("bin/node")).expect("candidate launcher");
+
+        let error = manager
+            .install("24.22.3")
+            .await
+            .expect_err("invalid installed identity must stop the existing-version fast path");
+
+        assert_eq!(
+            error.to_string(),
+            "Failed to review installed Node.js runtime"
+        );
+        assert!(format!("{error:#}").contains("Invalid runtime publisher identity"));
+        assert!(error.downcast_ref::<serde_json::Error>().is_some());
+        assert!(
+            !marker.exists(),
+            "unreviewed Node must never reach the version probe"
+        );
+        assert_eq!(
+            fs::read(candidate.join("bin/node")).expect("preserved launcher"),
+            binary
+        );
+        assert_eq!(
+            fs::read(fixture.identity_path("24.22.3")).expect("preserved evidence"),
+            identity
+        );
+        fixture.assert_previous();
+    }
+
     #[test]
     fn incomplete_node_install_is_not_published_and_can_be_retried() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let manager = NodeManager {
+            security: crate::runtimes::security::RuntimeSecurity::fixture(),
             versions_dir: directory.path().to_path_buf(),
             client: download_client(),
         };
@@ -1305,6 +1588,13 @@ mod tests {
         let staging = begin_staged_install(directory.path())?;
         fs::create_dir(staging.path().join("bin"))?;
         write_node_probe(staging.path(), "printf 'v22.0.0\\n'", true)?;
+        crate::runtimes::security::fixture_bind_candidate(
+            "node",
+            "22.0.0",
+            staging.path(),
+            &manager.versions_dir.join("22.0.0"),
+        )
+        .context("Bind complete Node publication retry fixture")?;
         manager.publish_install(&staging, "22.0.0")?;
         assert_eq!(manager.list_installed()?, vec!["22.0.0"]);
         Ok(())
@@ -1369,11 +1659,19 @@ mod tests {
         }
         let directory = tempfile::tempdir()?;
         let manager = NodeManager {
+            security: crate::runtimes::security::RuntimeSecurity::fixture(),
             versions_dir: directory.path().to_path_buf(),
             client: download_client(),
         };
         let previous = directory.path().join("20.0.0");
         write_node_probe(&previous, "printf 'v20.0.0\\n'", true)?;
+        crate::runtimes::security::fixture_bind_candidate(
+            "node",
+            "20.0.0",
+            &manager.versions_dir.join("20.0.0"),
+            &manager.versions_dir.join("20.0.0"),
+        )
+        .context("Bind previous Node refusal-control runtime")?;
         manager.use_version("20.0.0")?;
         let original = fs::read(previous.join("bin/node"))?;
         let staging = begin_staged_install(directory.path())?;
@@ -1383,6 +1681,13 @@ mod tests {
             directory.path().join("22.0.0")
         };
         write_node_probe(&candidate, body, executable)?;
+        crate::runtimes::security::fixture_bind_candidate(
+            "node",
+            "22.0.0",
+            &candidate,
+            &directory.path().join("22.0.0"),
+        )
+        .context("Bind candidate Node refusal-control runtime")?;
         let candidate_bytes = fs::read(candidate.join("bin/node"))?;
         let result = if publication {
             manager.publish_install(&staging, "22.0.0")
@@ -1846,28 +2151,43 @@ mod tests {
     fn node_activation_holds_the_mutation_lease_during_execution_validation() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let manager = NodeManager {
+            security: crate::runtimes::security::RuntimeSecurity::fixture(),
             versions_dir: directory.path().to_path_buf(),
             client: download_client(),
         };
         let previous = directory.path().join("20.0.0");
         write_node_probe(&previous, "printf 'v20.0.0\\n'", true)?;
+        crate::runtimes::security::fixture_bind_candidate(
+            "node",
+            "20.0.0",
+            &manager.versions_dir.join("20.0.0"),
+            &manager.versions_dir.join("20.0.0"),
+        )
+        .context("Bind previous Node lease-control runtime")?;
         manager.use_version("20.0.0")?;
         let candidate = directory.path().join("22.0.0");
+        let control = tempfile::tempdir()?;
         write_node_probe(
             &candidate,
-            "printf ready > ready; while [ ! -f release ]; do /bin/sleep 0.01; done; printf 'v22.0.0\\n'",
+            &format!(
+                "printf ready > '{}/ready'; while [ ! -f '{}/release' ]; do /bin/sleep 0.01; done; printf 'v22.0.0\\n'",
+                control.path().display(),
+                control.path().display()
+            ),
             true,
         )?;
+        crate::runtimes::security::fixture_bind_candidate("node", "22.0.0", &candidate, &candidate)
+            .context("Bind Node lease-control candidate")?;
         let worker = std::thread::spawn(move || manager.use_version("22.0.0"));
         let start = std::time::Instant::now();
-        while !candidate.join("ready").try_exists()?
+        while !control.path().join("ready").try_exists()?
             && start.elapsed() < std::time::Duration::from_secs(2)
         {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        let ready = candidate.join("ready").is_file();
+        let ready = control.path().join("ready").is_file();
         let refusal = super::super::common::uninstall_version(directory.path(), "22.0.0");
-        fs::write(candidate.join("release"), "continue")?;
+        fs::write(control.path().join("release"), "continue")?;
         let activation = worker.join().expect("activation worker panicked");
         assert!(ready, "candidate execution never reached held probe");
         assert!(format!("{:#}", refusal.unwrap_err()).contains("Another runtime mutation"));
@@ -1887,6 +2207,7 @@ mod tests {
     -> Result<()> {
         let directory = tempfile::tempdir()?;
         let manager = NodeManager {
+            security: crate::runtimes::security::RuntimeSecurity::fixture(),
             versions_dir: directory.path().to_path_buf(),
             client: download_client(),
         };
@@ -1895,6 +2216,13 @@ mod tests {
             "printf 'v20.0.0\\n'",
             true,
         )?;
+        crate::runtimes::security::fixture_bind_candidate(
+            "node",
+            "20.0.0",
+            &manager.versions_dir.join("20.0.0"),
+            &manager.versions_dir.join("20.0.0"),
+        )
+        .context("Bind previous Node unsafe-path control runtime")?;
         manager.use_version("20.0.0")?;
         let outside = tempfile::tempdir()?;
         write_node_probe(
@@ -1916,12 +2244,27 @@ mod tests {
     async fn node_sync_activation_works_inside_current_thread_runtime() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let manager = NodeManager {
+            security: crate::runtimes::security::RuntimeSecurity::fixture(),
             versions_dir: directory.path().to_path_buf(),
             client: download_client(),
         };
         let staging = begin_staged_install(directory.path())?;
         write_node_probe(staging.path(), "printf 'v22.0.0\\n'", true)?;
+        crate::runtimes::security::fixture_bind_candidate(
+            "node",
+            "22.0.0",
+            staging.path(),
+            &manager.versions_dir.join("22.0.0"),
+        )
+        .context("Bind Node staging fixture before current-thread publication")?;
         manager.publish_install(&staging, "22.0.0")?;
+        crate::runtimes::security::fixture_bind_candidate(
+            "node",
+            "22.0.0",
+            &manager.versions_dir.join("22.0.0"),
+            &manager.versions_dir.join("22.0.0"),
+        )
+        .context("Bind published Node fixture before current-thread activation")?;
         manager.use_version("22.0.0")?;
         assert_eq!(manager.current_version(), Some("22.0.0".to_owned()));
         Ok(())
@@ -2015,13 +2358,14 @@ mod tests {
         let body = br#"[{"version":"v21.0.0","lts":false},{"version":"v20.10.0","lts":"Iron"},{"version":"v18.19.0","lts":"Hydrogen"}]"#;
         let fixture = super::super::test_https::HttpsFixture::new(
             "nodejs.org",
-            (0..4)
+            (0..6)
                 .map(|_| ("/dist/index.json".into(), body.to_vec()))
                 .collect(),
         )
         .await?;
         let versions = tempfile::TempDir::new()?;
         let manager = NodeManager {
+            security: crate::runtimes::security::RuntimeSecurity::fixture(),
             versions_dir: versions.path().to_path_buf(),
             client: Box::leak(Box::new(fixture.client(true)?)),
         };
@@ -2030,9 +2374,11 @@ mod tests {
         assert_eq!(manager.resolve_alias("lts/iron").await?, "20.10.0");
         assert!(manager.resolve_alias("lts/missing").await.is_err());
         assert_eq!(manager.resolve_alias("v20.10.0").await?, "20.10.0");
+        assert_eq!(manager.resolve_requested_version("20").await?, "20.10.0");
+        assert_eq!(manager.resolve_requested_version("20.10").await?, "20.10.0");
         assert_eq!(
             fixture.finish().await?,
-            vec!["GET /dist/index.json HTTP/1.1"; 4]
+            vec!["GET /dist/index.json HTTP/1.1"; 6]
         );
         assert_eq!(std::fs::read_dir(versions.path())?.count(), 0);
         Ok(())

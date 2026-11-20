@@ -24,6 +24,7 @@ pub fn get(key: &str) -> Result<()> {
         "aur.enable_ccache" => settings.aur.enable_ccache.to_string(),
         "aur.enable_sccache" => settings.aur.enable_sccache.to_string(),
         "aur.secure_makepkg" => settings.aur.secure_makepkg.to_string(),
+        "aur.security_profile" => settings.aur.security_profile.as_str().to_owned(),
         "aur.makeflags" => settings
             .aur
             .makeflags
@@ -46,6 +47,9 @@ pub fn set(key: &str, value: &str) -> Result<()> {
     let mut settings = Settings::load().context("Failed to load OMG settings")?;
 
     match key {
+        "aur.security_profile" => {
+            settings.aur.security_profile = value.parse()?;
+        }
         "telemetry.enabled" => {
             settings.telemetry_enabled = value.parse().context("Invalid boolean value")?;
         }
@@ -77,7 +81,7 @@ pub fn set(key: &str, value: &str) -> Result<()> {
             anyhow::bail!(
                 "Unknown config key: '{key}'. \
                  Writable keys: telemetry.enabled, aur.build_concurrency, aur.enable_ccache, \
-                 aur.enable_sccache, aur.secure_makepkg, aur.makeflags"
+                 aur.enable_sccache, aur.secure_makepkg, aur.security_profile, aur.makeflags"
             );
         }
     }
@@ -119,6 +123,11 @@ pub fn list() -> Result<()> {
     // AUR settings
     println!();
     println!("  {}", style::dim("AUR Build:"));
+    println!(
+        "    {} = {}",
+        style::info("aur.security_profile"),
+        settings.aur.security_profile.as_str()
+    );
     println!(
         "    {} = {}",
         style::info("aur.build_concurrency"),
@@ -231,18 +240,20 @@ pub fn validate() -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        if let Ok(meta) = std::fs::metadata(&config_file) {
-            let mode = meta.permissions().mode();
-            if mode & 0o077 != 0 {
-                let perm_str = format!("{:o}", mode & 0o777);
-                println!(
-                    "  {} Config file has loose permissions ({perm_str})",
-                    style::warning("⚠")
-                );
-                println!("    Consider running: chmod 600 {config_file}");
-            } else {
-                println!("  {} File permissions are secure", style::success("✓"));
-            }
+        let mode = std::fs::metadata(&config_file)
+            .context("Failed to inspect configuration permissions")?
+            .permissions()
+            .mode();
+        if mode & 0o077 != 0 {
+            let perm_str = format!("{:o}", mode & 0o777);
+            println!(
+                "  {} Config file has loose permissions ({perm_str})",
+                style::warning("⚠")
+            );
+            println!("    Consider running: chmod 600 {config_file}");
+            issues += 1;
+        } else {
+            println!("  {} File permissions are secure", style::success("✓"));
         }
     }
 

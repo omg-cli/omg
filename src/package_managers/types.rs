@@ -7,10 +7,70 @@ pub struct RemovalPackage {
     pub version: String,
 }
 
+/// Advisory coordinate origin, independent of signing or publisher provenance.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SecurityOrigin {
+    /// Prepared repository coordinates explicitly declared in the effective policy.
+    /// This is not evidence of publisher identity or historical installed origin.
+    ArchRepository {
+        repository: String,
+    },
+    OtherRepository {
+        repository: String,
+    },
+    AurArchive,
+    LocalArchive,
+    DistributionPackage,
+    /// Exact coordinates from a validated public npm registry lock.
+    NpmRegistry,
+    CargoRegistry,
+    PyPiRegistry,
+    GoModule,
+    /// Vendor runtime coordinates are independent of registry package names.
+    RuntimeVendor {
+        runtime: String,
+        vendor: String,
+    },
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RegistryEcosystem {
+    Npm,
+    Cargo,
+    PyPi,
+    Go,
+}
+
+impl RegistryEcosystem {
+    pub(crate) const fn osv_name(self) -> &'static str {
+        match self {
+            Self::Npm => "npm",
+            Self::Cargo => "crates.io",
+            Self::PyPi => "PyPI",
+            Self::Go => "Go",
+        }
+    }
+}
+
+impl SecurityOrigin {
+    pub(crate) const fn registry_ecosystem(&self) -> Option<RegistryEcosystem> {
+        match self {
+            Self::NpmRegistry => Some(RegistryEcosystem::Npm),
+            Self::CargoRegistry => Some(RegistryEcosystem::Cargo),
+            Self::PyPiRegistry => Some(RegistryEcosystem::PyPi),
+            Self::GoModule => Some(RegistryEcosystem::Go),
+            _ => None,
+        }
+    }
+}
+
 /// Installed identity for security exports. Native versions are opaque strings;
 /// absent metadata remains absent rather than being inferred from the host.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SecurityPackage {
+    pub origin: SecurityOrigin,
     pub name: String,
     pub version: String,
     /// Debian/Ubuntu source identity used by OSV, when distinct from the
@@ -324,6 +384,9 @@ impl VersionDisplay for String {
 #[must_use]
 #[inline]
 pub fn parse_version(s: &str) -> Option<Version> {
+    if s.as_bytes().contains(&0) {
+        return None;
+    }
     AlpmVersion::from_str(s).ok()
 }
 
@@ -354,6 +417,71 @@ pub fn parse_version_or_zero(s: &str) -> Version {
     parse_version(s).unwrap_or_else(zero_version)
 }
 
+#[cfg(feature = "arch")]
+pub(crate) fn provision_satisfies(dependency: &str, provision: &str) -> bool {
+    use alpm_types::{PackageRelation, SonameV2, VersionComparison};
+    if dependency.as_bytes().contains(&0) || provision.as_bytes().contains(&0) {
+        return false;
+    }
+    let (Ok(dependency), Ok(provision)) = (
+        dependency.parse::<PackageRelation>(),
+        provision.parse::<PackageRelation>(),
+    ) else {
+        // A v2 soname is a literal virtual dependency name, including its ABI suffix.
+        return dependency == provision && dependency.parse::<SonameV2>().is_ok();
+    };
+    if dependency.name != provision.name {
+        return false;
+    }
+    let provided_version = match provision.version_requirement {
+        None => None,
+        Some(requirement) if requirement.comparison == VersionComparison::Equal => {
+            Some(requirement.version)
+        }
+        Some(_) => return false,
+    };
+    let Some(requirement) = dependency.version_requirement else {
+        return true;
+    };
+    provided_version
+        .as_ref()
+        .is_some_and(|candidate| matches_version_requirement(&requirement, candidate))
+}
+
+#[cfg(feature = "arch")]
+pub(crate) fn dependency_version_satisfies(dependency: &str, candidate: &str) -> bool {
+    use alpm_types::{PackageRelation, SonameV2};
+    if dependency.as_bytes().contains(&0) {
+        return false;
+    }
+    let Some(candidate) = parse_version(candidate) else {
+        return false;
+    };
+    let Ok(dependency) = dependency.parse::<PackageRelation>() else {
+        return dependency.parse::<SonameV2>().is_ok();
+    };
+    dependency
+        .version_requirement
+        .as_ref()
+        .is_none_or(|requirement| matches_version_requirement(requirement, &candidate))
+}
+
+#[cfg(feature = "arch")]
+fn matches_version_requirement(
+    requirement: &alpm_types::VersionRequirement,
+    candidate: &AlpmVersion,
+) -> bool {
+    use alpm_types::VersionComparison;
+    let ordering = compare_versions(candidate, &requirement.version);
+    match requirement.comparison {
+        VersionComparison::Equal => ordering.is_eq(),
+        VersionComparison::Less => ordering.is_lt(),
+        VersionComparison::LessOrEqual => !ordering.is_gt(),
+        VersionComparison::Greater => ordering.is_gt(),
+        VersionComparison::GreaterOrEqual => !ordering.is_lt(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -362,6 +490,178 @@ mod tests {
     fn version_display_is_borrowed_and_backend_independent() {
         let version = parse_version("1:2.3.4-5").expect("valid version must parse");
         assert_eq!(version.version_string(), "1:2.3.4-5");
+    }
+
+    #[cfg(feature = "arch")]
+    #[test]
+    fn version_parser_rejects_nul_before_native_comparison() {
+        for raw in ["1\0-1", "0:2\0-1", "1.18446744073709551616\0-1"] {
+            assert!(
+                parse_version(raw).is_none(),
+                "invalid C-string version {raw:?}"
+            );
+        }
+        assert!(parse_version("0:2-1").is_some());
+    }
+
+    #[cfg(feature = "arch")]
+    #[test]
+    fn version_comparison_preserves_optional_epoch_and_release_semantics() {
+        use std::cmp::Ordering;
+
+        for (left, right, expected) in [
+            ("0:1.0-1", "1.0-1", Ordering::Equal),
+            ("0:2.0-1", "3.0-1", Ordering::Less),
+            ("0:3.0-1", "2.0-1", Ordering::Greater),
+            ("0:1.0-1", "1.0-2", Ordering::Less),
+            ("1:1.0-1", "9.0-1", Ordering::Greater),
+            ("1:1.0-1", "0:9.0-1", Ordering::Greater),
+            ("1.0", "1.0-1", Ordering::Equal),
+            ("1.0", "2.0-1", Ordering::Less),
+            ("2.0", "1.0-1", Ordering::Greater),
+        ] {
+            let left_version = parse_version(left).expect("valid comparison version must parse");
+            let right_version = parse_version(right).expect("valid comparison version must parse");
+            assert_eq!(
+                compare_versions(&left_version, &right_version),
+                expected,
+                "{left} vs {right}"
+            );
+            assert_eq!(
+                compare_versions(&right_version, &left_version),
+                expected.reverse(),
+                "{right} vs {left}"
+            );
+        }
+    }
+
+    #[cfg(feature = "arch")]
+    #[test]
+    fn versionless_virtual_requirements_accept_only_same_name_provisions() {
+        for provision in ["virtual-api", "virtual-api=2"] {
+            assert!(provision_satisfies("virtual-api", provision), "{provision}");
+            assert!(
+                !provision_satisfies("other-api", provision),
+                "a different virtual name must reject {provision}"
+            );
+            assert!(
+                !provision_satisfies("virtual-api>=3", provision),
+                "a versioned requirement must reject {provision}"
+            );
+        }
+        assert!(provision_satisfies("virtual-api>=2", "virtual-api=2"));
+        assert!(!provision_satisfies("virtual-api>=2", "virtual-api>=2"));
+    }
+
+    #[cfg(feature = "arch")]
+    #[test]
+    fn dependency_versions_preserve_unconstrained_and_ordered_relations() {
+        for candidate in ["0", "1:2.0-1", "999-9"] {
+            assert!(
+                dependency_version_satisfies("widget", candidate),
+                "{candidate}"
+            );
+        }
+        for (relation, accepted, rejected) in [
+            ("widget=2", "2", "3"),
+            ("widget>=2", "2", "1"),
+            ("widget<=2", "2", "3"),
+            ("widget>2", "3", "2"),
+            ("widget<2", "1", "2"),
+        ] {
+            assert!(
+                dependency_version_satisfies(relation, accepted),
+                "{relation} with {accepted}"
+            );
+            assert!(
+                !dependency_version_satisfies(relation, rejected),
+                "{relation} with {rejected}"
+            );
+        }
+    }
+
+    #[cfg(feature = "arch")]
+    #[test]
+    fn dependency_and_provision_relations_reject_invalid_pacman_syntax() {
+        for invalid in ["widget>=", "widget=1=2", "widget >=2", "widget/path"] {
+            assert!(!dependency_version_satisfies(invalid, "2"), "{invalid}");
+        }
+        assert!(!provision_satisfies("virtual-api", "virtual-api>=2"));
+        assert!(!provision_satisfies("virtual-api", "virtual-api=1=2"));
+    }
+
+    #[cfg(feature = "arch")]
+    #[test]
+    fn dependency_and_provision_relations_preserve_pacman_optional_components() {
+        for (relation, version) in [
+            ("widget=0:1", "1"),
+            ("widget=1-1", "1"),
+            ("widget=1", "1-2"),
+            ("widget<1.999999999999999999999999999", "1.2"),
+        ] {
+            assert!(
+                dependency_version_satisfies(relation, version),
+                "{relation} {version}"
+            );
+        }
+        assert!(provision_satisfies("virtual-api=1-1", "virtual-api=1"));
+        assert!(provision_satisfies("virtual-api=0:1", "virtual-api=1"));
+    }
+
+    #[cfg(feature = "arch")]
+    #[test]
+    fn dependency_and_provision_relations_preserve_shared_library_names() {
+        assert!(provision_satisfies("libexample.so", "libexample.so=1-64"));
+        assert!(provision_satisfies(
+            "libexample.so>=1",
+            "libexample.so=1-64"
+        ));
+        assert!(provision_satisfies(
+            "lib:libexample.so.1",
+            "lib:libexample.so.1"
+        ));
+        assert!(!provision_satisfies(
+            "lib:libexample.so.1",
+            "lib:libexample.so.2"
+        ));
+        assert!(!provision_satisfies(
+            "lib:libexample.so.1",
+            "lib:libexample.so.01"
+        ));
+        assert!(!provision_satisfies(
+            "lib:libexample.so.1",
+            "lib32:libexample.so.1"
+        ));
+        assert!(!provision_satisfies(
+            "lib:libexample.so.1",
+            "libexample.so=1-64"
+        ));
+        assert!(!provision_satisfies(
+            "lib:libexample.so.1",
+            "lib:libexample.so.1\0"
+        ));
+        assert!(dependency_version_satisfies("lib:libexample.so.1", "2-1"));
+    }
+
+    #[cfg(feature = "arch")]
+    #[test]
+    fn native_relation_helpers_refuse_nul_dependencies() {
+        assert!(!dependency_version_satisfies("widget>=1\0", "2"));
+        assert!(!provision_satisfies("virtual>=1\0", "virtual=2"));
+    }
+
+    #[cfg(feature = "arch")]
+    #[test]
+    fn native_relation_helpers_refuse_nul_candidates() {
+        assert!(!dependency_version_satisfies("widget>=1", "2\0"));
+        assert!(!dependency_version_satisfies("widget", "2\0"));
+    }
+
+    #[cfg(feature = "arch")]
+    #[test]
+    fn native_relation_helpers_refuse_nul_provisions() {
+        assert!(!provision_satisfies("virtual>=1", "virtual=2\0"));
+        assert!(!provision_satisfies("virtual", "virtual\0"));
     }
 
     /// ARCH-R14 regression: a version string that fails the strict parser
@@ -505,15 +805,16 @@ pub fn zero_version() -> Version {
 /// `AurIndex::updates_for`, and `AurClient::{get_update_list,query_aur_updates}`.
 /// All version ordering on update-check paths must go through this helper.
 ///
-/// Versions without an overflowing numeric segment keep the exact upstream
-/// ordering (`Ord::cmp`). Versions carrying an overflowing segment fall back
-/// to libalpm's `alpm::vercmp` on the rendered version string: pacman
-/// semantics, deterministic, and it compares numeric runs by length and
-/// text, so it cannot overflow.
+/// Native comparison also preserves pacman's optional-component semantics:
+/// an omitted epoch is zero, and pkgrel is compared only when both versions
+/// include it. The pinned Rust comparator orders optional fields directly.
+/// Matching component presence and non-overflowing numeric runs use Rust.
 #[cfg(feature = "arch")]
 #[must_use]
 pub fn compare_versions(a: &AlpmVersion, b: &AlpmVersion) -> std::cmp::Ordering {
-    if pkgver_has_overflowing_numeric_segment(a.pkgver.as_ref())
+    if a.epoch.is_some() != b.epoch.is_some()
+        || a.pkgrel.is_some() != b.pkgrel.is_some()
+        || pkgver_has_overflowing_numeric_segment(a.pkgver.as_ref())
         || pkgver_has_overflowing_numeric_segment(b.pkgver.as_ref())
     {
         // `Display` renders the canonical `epoch:pkgver-pkgrel` form.

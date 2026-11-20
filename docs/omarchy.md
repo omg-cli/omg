@@ -12,26 +12,50 @@ This page explains where OMG can fit and which update steps should stay with Oma
 > New to the terminal? Read [Getting started](./getting-started.md) and keep
 > [the glossary](./glossary.md) open while you work.
 
-OMG can manage developer tools and AUR packages on Arch. Its managed tool installers
-apply the checks described below. Those checks do not apply to every direct use of npm,
-pip, Cargo, Go, or pacman. Omarchy should continue to own operating-system updates,
-migrations, and recovery.
+OMG coordinates Omarchy's update lifecycle while managing Arch repository and AUR
+package operations through its own Rust backend. The transaction engine retains
+libalpm where the official Rust ALPM components do not provide transaction support.
+This integration is under review in [PR #1057](https://github.com/omg-cli/omg/pull/1057);
+check your installed build before relying on it. It is not an Omarchy endorsement.
 
-This is a proposal for evaluation, not an announcement of Omarchy adoption or endorsement.
+## Updating with OMG
 
-## Before you try an integration
+Use an Arch-enabled build and run:
 
-Use a build that includes the Arch backend. Keep Omarchy's updater as the owner of
-system upgrades. To inspect AUR updates without installing them, run:
+```bash
+omg update
+```
+
+On Omarchy, OMG preserves preflight, confirmation, snapshot, sleep inhibition,
+migration, restart, post-update and boot-verification stages. Cache pruning,
+signing-key package refresh, repository upgrades and orphan removal use native
+OMG/ALPM operations. The configured repository set supplies the Omarchy repository;
+OMG does not hardcode a replacement mirror or run yay, Aura, paru, pacman,
+pacman-key or paccache to implement these package stages. AUR discovery and updates
+run after the post-update hooks through OMG's existing review and build path.
+
+Signing-key refresh requires an initialized trust store and mandatory trusted
+package signatures. Unknown signing keys are refused; OMG does not bootstrap
+trust automatically. Repository overwrite permission is limited to paths beneath
+`usr/share/omarchy` within the configured package root. Unattended updates do not
+approve removal of conflicting packages.
+
+The remaining Omarchy helpers, migrations and installed package hooks execute
+vendor or administrator code. The pending-migration check refuses known package
+helper references; it does not certify arbitrary shell programs. AUR builds still
+use build tools such as makepkg and compilers. These boundaries are described in
+[the Arch audit](arch-audit-2026-11-11.md).
+
+Read-only checks, dry runs and AUR-only requests retain their narrower native
+scope. For example:
 
 ```bash
 omg update --aur-only --check
 ```
 
-You should see AUR update candidates or an up-to-date message. This command skips the
-official update lane. An Omarchy integration should place `omg update --aur-only` only
-where its updater already delegates AUR work; it should retain Omarchy's surrounding
-preflight checks, migrations, snapshots, and recovery steps.
+A mutating Omarchy update with `--fast`, `--turbo` or `--no-sync` is refused because
+it would omit lifecycle stages. An update can commit an earlier stage before a
+later stage fails; the full workflow is not a single rollback transaction.
 
 ## What Omarchy already provides
 
@@ -92,20 +116,21 @@ On Linux, managed installer subprocesses use `no_new_privs` to prevent execution
 
 ## How it should fit into Omarchy
 
-The proposed first integration is optional managed developer-tool installation and delegation of Omarchy's existing AUR-update step to `omg update --aur-only`. System upgrade ownership stays with Omarchy.
+The current integration preserves Omarchy's lifecycle order and repository
+configuration while replacing its package-manager handoffs with native OMG
+operations. Managed developer-tool installation remains a separate evaluation.
 
-| Area | Proposed responsibility |
+| Area | Responsibility |
 | --- | --- |
-| OS upgrades, mirror/channel selection, migrations, snapshots | Omarchy's existing update workflow. Do not substitute unrestricted `omg update` or bypass Omarchy's upgrade guard. |
-| Existing mise projects | Reuse supported `[tools]`, `[tasks]`, and `[env]` declarations directly in OMG. Keep mise for unsupported features and choose one active shell runtime selector. |
-| Managed developer CLIs | Evaluate OMG's defaults, exceptions, activation behavior, and removal experience on a defined set of tools. |
-| AUR updates | Omarchy may optionally call `omg update --aur-only` where its updater currently invokes the AUR helper. This mode cannot refresh official databases, query the official update lane, or perform a system upgrade; every selected AUR update retains OMG's normal review, build, archive-inspection, and privileged-install gates. |
-| AUR installation | Evaluate the complete transaction, including dependency installation and compatibility with Omarchy's selected repository channel. |
-| Recovery | Preserve native package tools and Omarchy recovery. OMG tool activation rollback is not a whole-system snapshot. |
+| Repository and AUR package changes | OMG's native Arch backend and AUR policy, using the configured Omarchy/Arch repositories. |
+| Migrations, snapshots, restart and boot handling | Selected trusted Omarchy helpers within the coordinated lifecycle. |
+| Existing mise projects | Reuse supported `[tools]`, `[tasks]`, and `[env]` declarations; keep mise for unsupported features. |
+| Managed developer CLIs | OMG's defaults, explicit exceptions, staged activation, and rollback. |
+| Recovery | Preserve system recovery options; tool activation rollback is not a whole-system snapshot. |
 
-These are integration requirements, not a claim that Omarchy-specific compatibility has already been tested. In particular, an Arch backend alone does not establish that every package transaction respects Omarchy's additional update coordination. Omarchy's stable mirror also intentionally trails current Arch packages; AUR dependency availability must be assessed against the selected channel. [Update channels and guards](https://omarchy.org/manual/updates/)
-
-The delegation point is deliberately narrow. Omarchy's update transaction remains responsible for its preflight checks, migrations, official package upgrade, snapshots, restart handling, and recovery. Its documented update sequence already separates the AUR helper from those stages, so an integration should replace only that helper call and preserve its position in the transaction. [Omarchy update process](https://github.com/omacom/omarchy/blob/quattro/docs/update-process.md)
+Local tests cover real signed ALPM changes and lifecycle coordination in a
+disposable Arch guest with controlled Omarchy helpers. They do not establish
+compatibility with every Omarchy version, channel, migration or platform.
 
 `--aur-only` narrows package selection; it is not a reduced-security mode. AUR recipes still use the same policy and build path as a normal OMG update. Arch's `makepkg` verifies the integrity arrays declared by a PKGBUILD, but a recipe can declare `SKIP`, so checksum presence alone is not publisher authentication. OMG continues to surface and enforce its recipe policy around that boundary. [PKGBUILD integrity fields](https://man.archlinux.org/man/PKGBUILD.5.en#cksums_(array))
 
@@ -145,6 +170,6 @@ This document does not report those integration tests as completed. OMG's [CI ev
 | On main | Merged changes; release inclusion still needs checking. |
 | Released | Included in an identified tagged build users can install. |
 
-For the current work, start with [PR #399](https://github.com/omg-cli/omg/pull/399), the [public security timeline](https://getomg.xyz/security/), and the [security model](security.md). Individual changes include [manager configuration isolation](https://github.com/omg-cli/omg/commit/7b0749d2), [managed entrypoint hashing](https://github.com/omg-cli/omg/commit/8bb84cbc), and [activation rollback](https://github.com/omg-cli/omg/commit/8e44e924).
+For the current Arch integration, start with [PR #1057](https://github.com/omg-cli/omg/pull/1057). Earlier managed-tool work is recorded in [PR #399](https://github.com/omg-cli/omg/pull/399), the [public security timeline](https://getomg.xyz/security/), and the [security model](security.md). Individual changes include [manager configuration isolation](https://github.com/omg-cli/omg/commit/7b0749d2), [managed entrypoint hashing](https://github.com/omg-cli/omg/commit/8bb84cbc), and [activation rollback](https://github.com/omg-cli/omg/commit/8e44e924).
 
 **The proposal:** give Omarchy users an approachable installation workflow that applies additional controls at the point they need them, with public evidence explaining what those controls do. Evaluate that fit on real Omarchy systems, then use the results to decide whether broader adoption is warranted.

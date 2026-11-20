@@ -130,6 +130,8 @@ def snapshot():
             "kernel_oom_kills": oom, "cgroup_memory": group,
             "workspace_free_bytes": disk.free,
             "workspace_free_inodes": filesystem.f_favail,
+            "workspace_total_inodes": filesystem.f_files,
+            "workspace_inode_availability": "observed" if filesystem.f_files else "not-reported",
             "load_average": list(os.getloadavg())}
 
 

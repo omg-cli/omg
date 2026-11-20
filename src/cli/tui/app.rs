@@ -105,6 +105,12 @@ pub struct App {
     pub search_query: String,
     pub search_mode: bool,
     pub daemon_connected: bool,
+    pub(crate) security_policy: Option<
+        std::result::Result<
+            crate::core::security::SecurityPolicy,
+            crate::core::security::PolicyError,
+        >,
+    >,
 
     // Search results
     pub search_results: Vec<crate::package_managers::SyncPackage>,
@@ -161,6 +167,7 @@ impl App {
             search_query: String::new(),
             search_mode: false,
             daemon_connected: false,
+            security_policy: None,
             search_results: Vec::new(),
             search_error: None,
             action_error: None,
@@ -201,6 +208,8 @@ impl App {
         if !self.external_refresh_enabled {
             return Ok(());
         }
+
+        self.security_policy = Some(crate::core::security::SecurityPolicy::load_default());
 
         // 1. Fetch history. Daemon I/O is scheduled separately by the event
         // loop so its request timeout can never freeze input or rendering.
@@ -487,9 +496,14 @@ impl App {
     }
 
     pub async fn run_security_audit() -> Result<usize> {
-        Ok(crate::cli::security::security_audit_result()
-            .await?
-            .total_vulnerabilities)
+        let audit = crate::cli::security::security_audit_result().await?;
+        if let Some(warning) = crate::cli::security::audit_coverage_warning(&audit.coverage) {
+            anyhow::bail!(
+                "{warning} Reported findings: {}",
+                audit.total_vulnerabilities
+            );
+        }
+        Ok(audit.total_vulnerabilities)
     }
 
     /// Whether pressing Enter should open the install-confirmation popup.
@@ -681,12 +695,13 @@ impl App {
         0
     }
 
-    pub fn get_security_vulnerabilities(&self) -> Option<usize> {
+    /// Findings and uncovered package counts from a reported daemon scan.
+    pub fn get_security_findings_summary(&self) -> Option<(usize, usize)> {
         #[cfg(unix)]
         return self
             .status
             .as_ref()
-            .and_then(crate::daemon::protocol::StatusResult::scanned_vulnerability_count);
+            .and_then(StatusResult::scanned_vulnerability_summary);
         #[cfg(not(unix))]
         None
     }

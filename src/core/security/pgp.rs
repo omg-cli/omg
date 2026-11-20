@@ -90,6 +90,22 @@ pub enum PgpError {
     },
     #[error("No valid signature found")]
     NoValidSignature,
+    #[error("Expected a cleartext-signed OpenPGP message")]
+    CleartextFormat,
+    #[error("Cleartext {kind} exceeds the {limit}-byte limit")]
+    CleartextLimit { kind: &'static str, limit: usize },
+    #[error("Cleartext signature authentication failed")]
+    CleartextVerification {
+        #[source]
+        source: SequoiaSource,
+    },
+    #[error("Failed to parse the embedded public certificate bundle")]
+    PublicKeyBundleParse {
+        #[source]
+        source: SequoiaSource,
+    },
+    #[error("The public certificate bundle contains secret material or no allowed certificates")]
+    PublicKeyBundleRejected,
 }
 
 /// PGP verification engine using Sequoia
@@ -174,7 +190,39 @@ impl PgpVerifier {
         let path = path.as_ref();
         let path_text = path.display().to_string();
         let mut verifier = Self::from_keyring(path)?;
-        verifier.certs.retain(|cert| {
+        verifier.retain_allowed_fingerprints(allowed);
+        if verifier.certs.is_empty() {
+            return Err(PgpError::KeyringNoAllowedFingerprint { path: path_text });
+        }
+        Ok(verifier)
+    }
+
+    pub(crate) fn from_public_key_bytes(bytes: &[u8], allowed: &[&str]) -> Result<Self, PgpError> {
+        let parser =
+            CertParser::from_bytes(bytes).map_err(|source| PgpError::PublicKeyBundleParse {
+                source: source.into(),
+            })?;
+        let certs = parser.collect::<Result<Vec<_>, _>>().map_err(|source| {
+            PgpError::PublicKeyBundleParse {
+                source: source.into(),
+            }
+        })?;
+        if certs.iter().any(Cert::is_tsk) {
+            return Err(PgpError::PublicKeyBundleRejected);
+        }
+        let mut verifier = Self {
+            policy: StandardPolicy::new(),
+            certs,
+        };
+        verifier.retain_allowed_fingerprints(allowed);
+        if verifier.certs.is_empty() {
+            return Err(PgpError::PublicKeyBundleRejected);
+        }
+        Ok(verifier)
+    }
+
+    fn retain_allowed_fingerprints(&mut self, allowed: &[&str]) {
+        self.certs.retain(|cert| {
             let fingerprint = cert.fingerprint().to_hex().to_ascii_uppercase();
             allowed.iter().any(|allowed| {
                 allowed
@@ -185,10 +233,122 @@ impl PgpVerifier {
                     == fingerprint
             })
         });
-        if verifier.certs.is_empty() {
-            return Err(PgpError::KeyringNoAllowedFingerprint { path: path_text });
+    }
+
+    /// Authenticate a bounded cleartext signature before returning its plaintext.
+    pub fn verify_cleartext_memory(
+        &self,
+        signed: &[u8],
+        max_plaintext: usize,
+    ) -> Result<Vec<u8>, PgpError> {
+        const LIMIT: usize = 1024 * 1024;
+        if signed.len() > LIMIT {
+            return Err(PgpError::CleartextLimit {
+                kind: "signed input",
+                limit: LIMIT,
+            });
         }
-        Ok(verifier)
+        if !signed.starts_with(b"-----BEGIN PGP SIGNED MESSAGE-----") {
+            return Err(PgpError::CleartextFormat);
+        }
+        self.verify_cleartext_message(signed, max_plaintext)
+    }
+
+    fn verify_cleartext_message(
+        &self,
+        signed: &[u8],
+        max_plaintext: usize,
+    ) -> Result<Vec<u8>, PgpError> {
+        use openpgp::parse::stream::{
+            MessageLayer, MessageStructure, VerificationHelper, VerifierBuilder,
+        };
+        use openpgp::types::RevocationStatus;
+
+        struct Helper<'a>(&'a PgpVerifier);
+        impl VerificationHelper for Helper<'_> {
+            fn get_certs(&mut self, _ids: &[openpgp::KeyHandle]) -> openpgp::Result<Vec<Cert>> {
+                Ok(self.0.certs.clone())
+            }
+
+            fn check(&mut self, structure: MessageStructure<'_>) -> openpgp::Result<()> {
+                let trusted =
+                    structure.iter().any(|layer| {
+                        let MessageLayer::SignatureGroup { results } = layer else {
+                            return false;
+                        };
+                        results.iter().any(|result| {
+                            let Ok(good) = result else {
+                                return false;
+                            };
+                            if good
+                                .sig
+                                .signature_alive(None, Some(std::time::Duration::ZERO))
+                                .is_err()
+                                || self
+                                    .0
+                                    .policy
+                                    .signature(good.sig, HashAlgoSecurity::CollisionResistance)
+                                    .is_err()
+                            {
+                                return false;
+                            }
+                            self.0.certs.iter().any(|cert| {
+                                if cert.fingerprint() != good.ka.cert().fingerprint() {
+                                    return false;
+                                }
+                                let Ok(current) = cert.with_policy(&self.0.policy, None) else {
+                                    return false;
+                                };
+                                current.alive().is_ok()
+                                    && !matches!(
+                                        current.revocation_status(),
+                                        RevocationStatus::Revoked(_)
+                                    )
+                                    && current.keys().alive().revoked(false).for_signing().any(
+                                        |key| {
+                                            key.key().fingerprint() == good.ka.key().fingerprint()
+                                        },
+                                    )
+                            })
+                        })
+                    });
+                anyhow::ensure!(trusted, "No currently valid trusted cleartext signature");
+                Ok(())
+            }
+        }
+        let mut verifier = VerifierBuilder::from_bytes(signed)
+            .and_then(|builder| builder.with_policy(&self.policy, None, Helper(self)))
+            .map_err(|source| PgpError::CleartextVerification {
+                source: source.into(),
+            })?;
+        let plaintext = Self::read_cleartext_plaintext(&mut verifier, max_plaintext)?;
+        if verifier.processing_csf_message() != Some(true) {
+            return Err(PgpError::CleartextFormat);
+        }
+        Ok(plaintext)
+    }
+
+    fn read_cleartext_plaintext(
+        reader: &mut impl std::io::Read,
+        max_plaintext: usize,
+    ) -> Result<Vec<u8>, PgpError> {
+        use std::io::Read as _;
+        let limit = max_plaintext.min(1024 * 1024);
+        let mut plaintext = Vec::new();
+        reader
+            .by_ref()
+            .take((limit + 1) as u64)
+            .read_to_end(&mut plaintext)
+            .map_err(|source| PgpError::CleartextVerification {
+                source: SequoiaSource(source.into()),
+            })?;
+        if plaintext.len() > limit {
+            return Err(PgpError::CleartextLimit {
+                kind: "plaintext",
+                limit,
+            });
+        }
+        Ok(plaintext)
     }
 
     /// Verify a file against a detached signature using the loaded keyring.
@@ -358,7 +518,7 @@ pub fn require_detached_signature_files(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::NamedTempFile;
@@ -498,6 +658,461 @@ mod tests {
         assert!(matches!(
             verifier.verify_detached(data_file.path(), sig_file.path()),
             Err(PgpError::NoValidSignature)
+        ));
+    }
+
+    pub(crate) fn cleartext_fixture(
+        data: &[u8],
+        hash: openpgp::types::HashAlgorithm,
+        created: std::time::SystemTime,
+        signature_validity: std::time::Duration,
+        certificate_validity: std::time::Duration,
+        revoked: bool,
+    ) -> (PgpVerifier, Vec<u8>) {
+        use openpgp::cert::prelude::CertBuilder;
+        use openpgp::packet::signature::SignatureBuilder;
+        use openpgp::serialize::stream::{Message, Signer};
+        use openpgp::types::SignatureType;
+
+        let (cert, revocation) = CertBuilder::general_purpose(Some("cleartext@example.invalid"))
+            .set_cipher_suite(openpgp::cert::CipherSuite::Cv25519)
+            .set_profile(openpgp::Profile::RFC4880)
+            .expect("certificate profile")
+            .set_creation_time(std::time::SystemTime::now() - std::time::Duration::from_hours(24))
+            .set_validity_period(certificate_validity)
+            .generate()
+            .expect("cleartext certificate");
+        let signer = cert
+            .keys()
+            .secret()
+            .with_policy(&StandardPolicy::new(), created)
+            .for_signing()
+            .next()
+            .expect("cleartext signing key")
+            .key()
+            .clone()
+            .into_keypair()
+            .expect("cleartext keypair");
+        let template = SignatureBuilder::new(SignatureType::Text)
+            .set_hash_algo(hash)
+            .set_signature_creation_time(created)
+            .expect("cleartext creation time")
+            .set_signature_validity_period(signature_validity)
+            .expect("cleartext validity");
+        let mut signed = Vec::new();
+        let mut writer = Signer::with_template(Message::new(&mut signed), signer, template)
+            .expect("cleartext signer")
+            .hash_algo(hash)
+            .expect("cleartext hash")
+            .creation_time(created)
+            .cleartext()
+            .build()
+            .expect("cleartext writer");
+        writer.write_all(data).expect("cleartext write");
+        writer.finalize().expect("cleartext finalization");
+        let cert = if revoked {
+            cert.insert_packets([revocation])
+                .expect("revoke certificate")
+                .0
+        } else {
+            cert
+        };
+        (
+            PgpVerifier {
+                policy: StandardPolicy::new(),
+                certs: vec![cert.strip_secret_key_material()],
+            },
+            signed,
+        )
+    }
+
+    #[test]
+    fn cleartext_authenticates_lines_and_enforces_plaintext_bounds() {
+        for data in [
+            b"first\n- dash escaped\nlast\n".as_slice(),
+            b"first\r\n- dash escaped\r\nlast\r\n",
+        ] {
+            let (verifier, signed) = cleartext_fixture(
+                data,
+                openpgp::types::HashAlgorithm::SHA256,
+                std::time::SystemTime::now(),
+                std::time::Duration::from_hours(1),
+                std::time::Duration::from_hours(48),
+                false,
+            );
+            let plaintext = verifier
+                .verify_cleartext_memory(&signed, 1024)
+                .expect("valid cleartext");
+            assert_eq!(
+                std::str::from_utf8(&plaintext)
+                    .unwrap()
+                    .lines()
+                    .collect::<Vec<_>>(),
+                ["first", "- dash escaped", "last"]
+            );
+            assert_eq!(
+                verifier
+                    .verify_cleartext_memory(&signed, plaintext.len())
+                    .unwrap(),
+                plaintext
+            );
+            assert!(
+                verifier
+                    .verify_cleartext_memory(&signed, plaintext.len() - 1)
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn cleartext_refuses_tampering_foreign_trust_unsigned_truncated_and_excessive_input() {
+        let fixture = || {
+            cleartext_fixture(
+                b"authenticated manifest\n",
+                openpgp::types::HashAlgorithm::SHA256,
+                std::time::SystemTime::now(),
+                std::time::Duration::from_hours(1),
+                std::time::Duration::from_hours(48),
+                false,
+            )
+        };
+        let (verifier, signed) = fixture();
+        assert!(verifier.verify_cleartext_memory(&signed, 1024).is_ok());
+        let (foreign, _) = fixture();
+        assert!(foreign.verify_cleartext_memory(&signed, 1024).is_err());
+        assert!(
+            PgpVerifier::empty()
+                .verify_cleartext_memory(&signed, 1024)
+                .is_err()
+        );
+        let tampered = String::from_utf8(signed.clone())
+            .unwrap()
+            .replace("authenticated manifest", "altered manifest");
+        for invalid in [
+            tampered.into_bytes(),
+            signed[..signed.len() / 2].to_vec(),
+            b"unsigned manifest\n".to_vec(),
+            vec![b'x'; 1024 * 1024 + 1],
+        ] {
+            assert!(verifier.verify_cleartext_memory(&invalid, 1024).is_err());
+        }
+    }
+
+    #[test]
+    fn cleartext_refuses_weak_expired_and_future_signatures() {
+        let now = std::time::SystemTime::now();
+        for (hash, created) in [
+            (openpgp::types::HashAlgorithm::SHA1, now),
+            (
+                openpgp::types::HashAlgorithm::SHA256,
+                now - std::time::Duration::from_hours(2),
+            ),
+            (
+                openpgp::types::HashAlgorithm::SHA256,
+                now + std::time::Duration::from_hours(1),
+            ),
+        ] {
+            let (verifier, signed) = cleartext_fixture(
+                b"manifest\n",
+                hash,
+                created,
+                std::time::Duration::from_hours(1),
+                std::time::Duration::from_hours(48),
+                false,
+            );
+            assert!(
+                verifier.verify_cleartext_memory(&signed, 1024).is_err(),
+                "{hash:?} {created:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cleartext_requires_current_alive_nonrevoked_authorities() {
+        for (revoked, certificate_validity) in [
+            (true, std::time::Duration::from_hours(48)),
+            (false, std::time::Duration::from_hours(23)),
+        ] {
+            let (verifier, signed) = cleartext_fixture(
+                b"manifest\n",
+                openpgp::types::HashAlgorithm::SHA256,
+                std::time::SystemTime::now() - std::time::Duration::from_hours(2),
+                std::time::Duration::from_hours(4),
+                certificate_validity,
+                revoked,
+            );
+            assert!(verifier.verify_cleartext_memory(&signed, 1024).is_err());
+        }
+    }
+
+    #[test]
+    fn cleartext_bounds_even_a_valid_signed_input() {
+        let mut data = vec![b'x'; 1024 * 1024 - 100];
+        data.push(b'\n');
+        let (verifier, signed) = cleartext_fixture(
+            &data,
+            openpgp::types::HashAlgorithm::SHA256,
+            std::time::SystemTime::now(),
+            std::time::Duration::from_hours(1),
+            std::time::Duration::from_hours(48),
+            false,
+        );
+        assert!(data.len() < 1024 * 1024 && signed.len() > 1024 * 1024);
+        assert!(matches!(
+            verifier.verify_cleartext_memory(&signed, 1024 * 1024),
+            Err(PgpError::CleartextLimit {
+                kind: "signed input",
+                limit: 1_048_576
+            })
+        ));
+    }
+
+    #[test]
+    fn cleartext_inner_authentication_refuses_real_attached_messages_and_compression_containers() {
+        use openpgp::cert::prelude::CertBuilder;
+        use openpgp::serialize::stream::{Armorer, Compressor, LiteralWriter, Message, Signer};
+        let (certificate, _) =
+            CertBuilder::general_purpose(Some("format-boundary@example.invalid"))
+                .set_cipher_suite(openpgp::cert::CipherSuite::Cv25519)
+                .generate()
+                .expect("controlled signing certificate");
+        let verifier = PgpVerifier {
+            policy: StandardPolicy::new(),
+            certs: vec![certificate.clone().strip_secret_key_material()],
+        };
+        for compressed in [false, true] {
+            let signing_key = certificate
+                .keys()
+                .secret()
+                .with_policy(&verifier.policy, None)
+                .for_signing()
+                .next()
+                .expect("controlled valid signing authority")
+                .key()
+                .clone()
+                .into_keypair()
+                .expect("controlled private signing key");
+            let mut encoded = Vec::new();
+            let message = Armorer::new(Message::new(&mut encoded))
+                .kind(openpgp::armor::Kind::Message)
+                .build()
+                .expect("actual attached-message armor");
+            // Algorithm 0 is a real OpenPGP compression container without an optional codec.
+            let message = if compressed {
+                Compressor::new(message)
+                    .algo(openpgp::types::CompressionAlgorithm::Uncompressed)
+                    .build()
+                    .expect("actual OpenPGP compression container")
+            } else {
+                message
+            };
+            let message = Signer::new(message, signing_key)
+                .expect("actual message signer")
+                .hash_algo(openpgp::types::HashAlgorithm::SHA256)
+                .expect("strong message digest")
+                .build()
+                .expect("actual signed message");
+            let mut writer = LiteralWriter::new(message)
+                .build()
+                .expect("actual literal payload");
+            writer
+                .write_all(b"authenticated but not cleartext framed\n")
+                .expect("controlled signed payload");
+            writer.finalize().expect("complete attached signature");
+            assert!(matches!(
+                verifier.verify_cleartext_memory(&encoded, 1024),
+                Err(PgpError::CleartextFormat)
+            ));
+            let error = verifier
+                .verify_cleartext_message(&encoded, 1024)
+                .expect_err("a valid signature cannot replace the inner cleartext format boundary");
+            assert!(matches!(error, PgpError::CleartextFormat));
+        }
+    }
+
+    #[test]
+    fn bounded_cleartext_reader_keeps_real_io_failure_typed_and_never_returns_plaintext() {
+        let file = NamedTempFile::new().expect("owned plaintext source");
+        let mut write_only = std::fs::OpenOptions::new()
+            .write(true)
+            .open(file.path())
+            .expect("real write-only source descriptor");
+        let error = PgpVerifier::read_cleartext_plaintext(&mut write_only, 1024)
+            .expect_err("reading an invalid source descriptor must refuse plaintext");
+        assert!(matches!(&error, PgpError::CleartextVerification { .. }));
+        let source = std::error::Error::source(&error)
+            .expect("typed cleartext refusal must expose its public error source")
+            .downcast_ref::<SequoiaSource>()
+            .expect("public error source must retain the typed Sequoia bridge");
+        assert!(
+            source.0.downcast_ref::<std::io::Error>().is_some(),
+            "the underlying OS read failure must remain inspectable"
+        );
+    }
+
+    #[test]
+    fn bounded_cleartext_reader_discards_plaintext_before_a_later_os_read_failure() {
+        use std::io::Read as _;
+        let file = NamedTempFile::new().expect("owned failing plaintext source");
+        let write_only = std::fs::OpenOptions::new()
+            .write(true)
+            .open(file.path())
+            .expect("real write-only descriptor for the later read");
+        let prefix = b"plaintext read before the OS failure\n";
+        let mut reader = Cursor::new(prefix.as_slice()).chain(write_only);
+        let error = PgpVerifier::read_cleartext_plaintext(&mut reader, 1024)
+            .expect_err("partial plaintext must not escape after a later source read fails");
+        assert_eq!(
+            reader.get_ref().0.position(),
+            u64::try_from(prefix.len()).expect("bounded fixture prefix length"),
+            "the failure must follow a successful plaintext read"
+        );
+        assert!(matches!(&error, PgpError::CleartextVerification { .. }));
+        let source = std::error::Error::source(&error)
+            .expect("partial-read refusal must expose its public error source")
+            .downcast_ref::<SequoiaSource>()
+            .expect("public source must remain the typed Sequoia bridge");
+        let io = source
+            .0
+            .downcast_ref::<std::io::Error>()
+            .expect("the real OS read cause must survive the public error chain");
+        assert!(io.raw_os_error().is_some());
+    }
+
+    #[test]
+    fn embedded_bundle_rejects_a_truncated_certificate_after_a_valid_pinned_one() {
+        use openpgp::serialize::Serialize as _;
+        let (verifier, _) = signed_fixture(openpgp::types::HashAlgorithm::SHA256);
+        let certificate = &verifier.certs[0];
+        let mut encoded = Vec::new();
+        certificate
+            .serialize(&mut encoded)
+            .expect("serialize controlled public certificate");
+        let fingerprint = certificate.fingerprint().to_hex();
+        for end in [encoded.len() / 2, encoded.len() - 1] {
+            let mut bundle = encoded.clone();
+            bundle.extend_from_slice(&encoded[..end]);
+            let error = PgpVerifier::from_public_key_bytes(&bundle, &[&fingerprint])
+                .err()
+                .expect("a partial trailing certificate must invalidate the complete bundle");
+            assert!(
+                matches!(error, PgpError::PublicKeyBundleParse { .. }),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn cleartext_refuses_a_future_signature_inside_the_upstream_clock_tolerance() {
+        let (verifier, signed) = cleartext_fixture(
+            b"exact publisher manifest\n",
+            openpgp::types::HashAlgorithm::SHA256,
+            std::time::SystemTime::now() + std::time::Duration::from_mins(1),
+            std::time::Duration::from_hours(1),
+            std::time::Duration::from_hours(48),
+            false,
+        );
+        assert!(matches!(
+            verifier.verify_cleartext_memory(&signed, 1024),
+            Err(PgpError::CleartextVerification { .. })
+        ));
+    }
+
+    #[test]
+    fn cleartext_uses_a_policy_valid_certificate_among_same_fingerprint_variants() {
+        let (mut verifier, signed) = cleartext_fixture(
+            b"same primary fingerprint is not a certificate policy decision\n",
+            openpgp::types::HashAlgorithm::SHA256,
+            std::time::SystemTime::now(),
+            std::time::Duration::from_hours(1),
+            std::time::Duration::from_hours(48),
+            false,
+        );
+        let bare = Cert::from_packets(verifier.certs[0].clone().into_packets().take(1))
+            .expect("parse the real public primary packet without certification bindings");
+        assert_eq!(bare.fingerprint(), verifier.certs[0].fingerprint());
+        assert!(bare.with_policy(&verifier.policy, None).is_err());
+        let unbound = PgpVerifier {
+            policy: StandardPolicy::new(),
+            certs: vec![bare.clone()],
+        };
+        assert!(unbound.verify_cleartext_memory(&signed, 1024).is_err());
+        verifier.certs.insert(0, bare);
+        assert_eq!(
+            verifier.verify_cleartext_memory(&signed, 1024).expect(
+                "valid authority must remain usable beside an unbound same-fingerprint copy"
+            ),
+            b"same primary fingerprint is not a certificate policy decision\n"
+        );
+    }
+
+    #[test]
+    fn large_cleartext_payload_authentication_never_returns_tampered_or_truncated_plaintext() {
+        let data = b"authenticated manifest row\n".repeat(20_000);
+        let (verifier, signed) = cleartext_fixture(
+            &data,
+            openpgp::types::HashAlgorithm::SHA256,
+            std::time::SystemTime::now(),
+            std::time::Duration::from_hours(1),
+            std::time::Duration::from_hours(48),
+            false,
+        );
+        assert!(signed.len() < 1024 * 1024);
+        assert_eq!(
+            verifier
+                .verify_cleartext_memory(&signed, data.len())
+                .expect("complete bounded publisher manifest"),
+            data
+        );
+        let mut tampered = signed.clone();
+        let offset = tampered
+            .windows(b"authenticated manifest row".len())
+            .rposition(|bytes| bytes == b"authenticated manifest row")
+            .expect("owned manifest plaintext before its signature");
+        tampered[offset] = b'u';
+        let signature_start = signed
+            .windows(b"-----BEGIN PGP SIGNATURE-----".len())
+            .position(|bytes| bytes == b"-----BEGIN PGP SIGNATURE-----")
+            .expect("controlled signature framing");
+        let truncated_at = signature_start + (signed.len() - signature_start) / 2;
+        for invalid in [tampered.as_slice(), &signed[..truncated_at]] {
+            assert!(matches!(
+                verifier.verify_cleartext_memory(invalid, data.len()),
+                Err(PgpError::CleartextVerification { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn embedded_public_key_loading_preserves_the_fingerprint_boundary() {
+        use openpgp::serialize::Serialize as _;
+        let (verifier, signature) = signed_fixture(openpgp::types::HashAlgorithm::SHA256);
+        let fingerprint = verifier.certs[0].fingerprint().to_hex();
+        let mut bytes = Vec::new();
+        verifier.certs[0].serialize(&mut bytes).unwrap();
+        let loaded = PgpVerifier::from_public_key_bytes(&bytes, &[&fingerprint]).unwrap();
+        loaded.verify_memory(b"test data", &signature).unwrap();
+        assert!(PgpVerifier::from_public_key_bytes(&bytes, &[]).is_err());
+        assert!(
+            PgpVerifier::from_public_key_bytes(
+                &bytes,
+                &["0000000000000000000000000000000000000000"]
+            )
+            .is_err()
+        );
+        assert!(
+            PgpVerifier::from_public_key_bytes(b"invalid certificate", &[&fingerprint]).is_err()
+        );
+        assert!(PgpVerifier::from_public_key_bytes(b"", &[&fingerprint]).is_err());
+        let (secret, _) =
+            openpgp::cert::prelude::CertBuilder::general_purpose(Some("ephemeral@example.invalid"))
+                .generate()
+                .unwrap();
+        let mut secret_bytes = Vec::new();
+        secret.as_tsk().serialize(&mut secret_bytes).unwrap();
+        assert!(matches!(
+            PgpVerifier::from_public_key_bytes(&secret_bytes, &[&secret.fingerprint().to_hex()]),
+            Err(PgpError::PublicKeyBundleRejected)
         ));
     }
 

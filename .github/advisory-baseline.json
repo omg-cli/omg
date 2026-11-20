@@ -1,0 +1,17 @@
+{
+  "digest": "d8fa82e95fdb59244e2f635e667ba17f0796ca0a4f1f4bb8cc31febcd660b76c",
+  "next_entry": 0,
+  "accepted": 0,
+  "exhausted": false,
+  "finished_at": null,
+  "baseline": {
+    "digest": "d8fa82e95fdb59244e2f635e667ba17f0796ca0a4f1f4bb8cc31febcd660b76c",
+    "endpoint": "https://omg-advisories.latham.workers.dev",
+    "instance_id": "139c3e51b07f91d448128b043bd22fa0",
+    "session_id": "afb732ac-68e4-4549-98ec-e89224449b75"
+  },
+  "publisher": {
+    "release_tag": "cve_2026-11-13_0000Z",
+    "asset": "2026-11-13_all_CVEs_at_midnight.zip.zip"
+  }
+}

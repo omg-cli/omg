@@ -576,6 +576,11 @@ if [[ "$GUEST_MODE" == true ]]; then
         verify_tree_identity before
         if [[ "$GUEST_TOOL" == omg ]]; then
             transaction=("${privileged[@]}" "$OMG" "$GUEST_TRANSACTION" --yes tree)
+            if [[ "$GUEST_TRANSACTION" == install ]]; then
+                consent="$REPO_ROOT/attend-unknown-fixture.py"
+                [[ -f "$consent" && ! -L "$consent" ]] || { echo 'Missing actual native security-consent driver.' >&2; exit 120; }
+                transaction=(python3 "$consent" --timeout 120 --receipt "$EXPORT_DIR/security-review.json" -- "${transaction[@]}")
+            fi
             transaction_label=OMG
         else
             transaction=("${privileged[@]}" "${transaction_args[@]}")
@@ -618,6 +623,10 @@ if [[ "$GUEST_MODE" == true ]]; then
           .results | length == 1 and .[0].command == $label_name and
           .[0].exit_codes == [0] and (.[0].times|length == 1)
         ' "$EXPORT_DIR/$GUEST_TRANSACTION.json" >/dev/null
+        if [[ "$GUEST_TOOL" == omg && "$GUEST_TRANSACTION" == install ]]; then
+            jq -e '.cli_exit_code==0 and (.reviews|type=="array" and length<=64 and all(.[]; type=="string" and test("^[a-f0-9]{64}$")))' \
+                "$EXPORT_DIR/security-review.json" >/dev/null
+        fi
         cmp "$EXPORT_DIR/installed-expected.tsv" "$EXPORT_DIR/installed-after.tsv"
         cmp "$EXPORT_DIR/manual-expected.names" "$EXPORT_DIR/manual-after.names"
         if [[ "$GUEST_TRANSACTION" == install ]]; then
@@ -633,6 +642,7 @@ if [[ "$GUEST_MODE" == true ]]; then
            operation:$operation,tool:$tool,package:"tree",expected_version:$version,
            state_change_verified:true,manual_state_change_verified:true,samples:1,warmup:0,daemon:"disabled",
            preparation:"metadata queries and cache-file hashes warm caches before timing; not a cold-cache claim",
+           security_review:"OMG installs include the Unknown-only foreground terminal fixture and its entire review overhead in the measured wall time; decisions are retained in security-review.json. Native and remove samples do not use the fixture.",
            reset_evidence:"coordinator-required",
            boot_id:($boot_id|rtrimstr("\n")),command:$command[0]}
         ' > "$EXPORT_DIR/summary.json"

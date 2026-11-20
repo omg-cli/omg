@@ -338,6 +338,7 @@ fn names_foreign_arch(name: &str) -> bool {
 
 /// Generic manager for one [`RegistryTool`].
 pub(crate) struct GenericToolManager {
+    security: super::security::RuntimeSecurity,
     spec: &'static RegistryTool,
     versions_dir: PathBuf,
     client: &'static reqwest::Client,
@@ -348,6 +349,7 @@ impl GenericToolManager {
     pub fn for_spec(spec: &'static RegistryTool) -> Self {
         let versions_dir = super::DATA_DIR.join("versions").join(spec.name);
         Self {
+            security: super::security::RuntimeSecurity::default(),
             spec,
             versions_dir,
             client: download_client(),
@@ -564,17 +566,40 @@ impl GenericToolManager {
             .tempdir_in(&self.versions_dir)?;
         let download_path = downloads.path().join(&asset.name);
         download_with_progress(self.client, &url, &download_path, &checksum).await?;
-
-        println!("{} Extracting (pure Rust)...", style::informative("→"));
-        let staging = begin_staged_install(&self.versions_dir)?;
-        self.populate_staging(&download_path, kind, staging.path())
+        self.publish_download(&download_path, &url, &version, kind)
             .await?;
-        complete_staged_install(&staging, &version_dir, &version)?;
-
-        remove_file_best_effort(&download_path, "tool archive");
 
         print_installed(&self.display(), &version);
         self.use_version(&version)?;
+        Ok(())
+    }
+
+    async fn publish_download(
+        &self,
+        download_path: &Path,
+        url: &str,
+        version: &str,
+        kind: ArchiveKind,
+    ) -> Result<()> {
+        let version_dir = self.versions_dir.join(version);
+        println!("{} Extracting (pure Rust)...", style::informative("→"));
+        let staging = begin_staged_install(&self.versions_dir)?;
+        self.populate_staging(download_path, kind, staging.path())
+            .await?;
+        let publisher = super::security::record_download(
+            self.spec.name,
+            version,
+            &version_dir,
+            download_path,
+            url,
+        )?;
+        let _admission =
+            self.security
+                .prepare_staged(self.spec.name, version, staging.path(), &version_dir)?;
+        complete_staged_install(&staging, &version_dir, version)?;
+        publisher.commit();
+
+        remove_file_best_effort(download_path, "tool archive");
         Ok(())
     }
 
@@ -679,6 +704,12 @@ impl GenericToolManager {
     /// Switch to an installed version.
     pub fn use_version(&self, version: &str) -> Result<()> {
         let version = normalize_version(version);
+        let admission = self.security.installed(
+            self.spec.name,
+            &self.versions_dir.join(&version),
+            super::security::ReviewMode::FreshAttended,
+        )?;
+        admission.verify(&self.versions_dir.join(&version))?;
         let expected = Path::new("bin").join(self.spec.binary);
         activate_version_with_linked_binary(&self.versions_dir, &version, &expected)?;
         print_using(
@@ -824,6 +855,363 @@ fn pathdiff_relative(target: &Path, base: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires isolated fixed-public TLS native fixture"]
+    async fn native_public_install_preserves_authenticated_download_boundary() {
+        use super::super::test_archive::{PublicationFixture, tar_gz_entries};
+        use sha2::{Digest as _, Sha256};
+
+        let version = "1.2.3";
+        let filename = format!("fixture-tool-linux-{}.tar.gz", std::env::consts::ARCH);
+        let archive = tar_gz_entries(
+            "owned-tool",
+            &[
+                ("bin/fixture-tool", b"#!/bin/sh\nexit 0\n"),
+                ("lib/owned.data", b"complete tool implementation"),
+            ],
+        )
+        .expect("complete owned generic tool archive");
+        let archive_path =
+            format!("/omg-fixtures/registry/releases/download/v{version}/{filename}");
+        let metadata = serde_json::to_vec(&serde_json::json!([{
+            "tag_name": format!("v{version}"), "prerelease": false,
+            "assets": [{"name": filename, "browser_download_url": format!("https://github.com{archive_path}"),
+                "digest": format!("sha256:{}", hex::encode(Sha256::digest(&archive)))}]
+        }])).expect("controlled generic publisher metadata");
+        super::super::test_https::fixed_public_routes(&[
+            (
+                "api.github.com",
+                "/repos/omg-fixtures/registry/releases?per_page=30&page=1",
+                &metadata,
+            ),
+            ("github.com", &archive_path, &archive),
+        ]);
+
+        let fixture = PublicationFixture::new("node", "bin/fixture-tool");
+        let manager = GenericToolManager {
+            security: super::super::security::RuntimeSecurity::fixture(),
+            spec: &INSTALL_FIXTURE,
+            versions_dir: fixture.versions.clone(),
+            client: download_client(),
+        };
+        manager
+            .install(version)
+            .await
+            .expect("full public generic tool installation");
+        let installed = fixture.versions.join(version);
+        assert!(super::super::common::is_valid_version_dir(&installed));
+        assert_eq!(
+            fs::read(installed.join("bin/fixture-tool")).expect("complete generic launcher"),
+            b"#!/bin/sh\nexit 0\n"
+        );
+        assert_eq!(
+            fs::read(installed.join("owned-tool/lib/owned.data"))
+                .expect("complete generic support tree"),
+            b"complete tool implementation"
+        );
+        assert_eq!(
+            fs::canonicalize(fixture.versions.join("current")).unwrap(),
+            fs::canonicalize(&installed).unwrap()
+        );
+        super::super::security::admit_installed(
+            "node",
+            &installed,
+            super::super::security::ReviewMode::CachedOnly,
+        )
+        .expect("exact generic publication admission")
+        .verify(&installed)
+        .expect("published generic tree remains bound");
+        assert_eq!(
+            fs::read(fixture.versions.join("1.0.0/bin/fixture-tool")).unwrap(),
+            b"previous reviewed runtime"
+        );
+    }
+
+    // An explicit mapped fixture product exercises this generic owner without inventing
+    // advisory coverage for the unsupported public registry products.
+    static INSTALL_FIXTURE: RegistryTool = RegistryTool {
+        name: "node",
+        repo: "omg-fixtures/registry",
+        binary: "fixture-tool",
+        description: "Controlled registry publication fixture",
+        asset_must_contain: None,
+        asset_must_not_contain: None,
+    };
+
+    async fn registry_publication_fixture(
+        versions: &Path,
+        invalid_digest: bool,
+        mutate_candidate: bool,
+    ) -> Result<(GenericToolManager, super::super::test_https::HttpsFixture)> {
+        use sha2::{Digest as _, Sha256};
+        let archive = super::super::test_archive::tar_gz_entries(
+            "owned-tool",
+            &[
+                ("bin/fixture-tool", b"#!/bin/sh\nexit 0\n"),
+                ("lib/owned.data", b"complete tool implementation"),
+            ],
+        )
+        .expect("build the controlled GitHub tool archive");
+        #[cfg(target_arch = "aarch64")]
+        let architecture = "aarch64";
+        #[cfg(not(target_arch = "aarch64"))]
+        let architecture = "x86_64";
+        #[cfg(target_os = "macos")]
+        let platform = "darwin";
+        #[cfg(not(target_os = "macos"))]
+        let platform = "linux";
+        let asset_name = format!("fixture-tool-{platform}-{architecture}.tar.gz");
+        let asset_path = format!("/omg-fixtures/registry/releases/download/v1.2.3/{asset_name}");
+        let digest = if invalid_digest {
+            "not-a-sha256".to_owned()
+        } else {
+            hex::encode(Sha256::digest(&archive))
+        };
+        let release = serde_json::to_vec(&serde_json::json!([{
+            "tag_name":"v1.2.3", "prerelease":false,
+            "assets":[{"name":asset_name,"browser_download_url":format!("https://api.github.com{asset_path}"),"digest":format!("sha256:{digest}")}]
+        }]))?;
+        let mut responses = vec![(
+            "/repos/omg-fixtures/registry/releases?per_page=30&page=1".into(),
+            release,
+        )];
+        if !invalid_digest {
+            responses.push((asset_path, archive));
+        }
+        let fixture =
+            super::super::test_https::HttpsFixture::new("api.github.com", responses).await?;
+        fs::create_dir_all(versions)?;
+        let security = if mutate_candidate {
+            super::super::test_archive::mutation_security(versions)
+        } else {
+            super::super::security::RuntimeSecurity::fixture()
+        };
+        Ok((
+            GenericToolManager {
+                security,
+                spec: &INSTALL_FIXTURE,
+                versions_dir: versions.to_path_buf(),
+                client: Box::leak(Box::new(fixture.client(true)?)),
+            },
+            fixture,
+        ))
+    }
+
+    // The public downloader deliberately owns its transport; this fixture exercises
+    // TLS metadata and the shared publication owner after authenticating fixture bytes.
+    async fn authenticated_registry_archive(
+        manager: &GenericToolManager,
+        owner: &Path,
+    ) -> Result<(PathBuf, String, ArchiveKind)> {
+        use sha2::{Digest as _, Sha256};
+        let release = manager.release_for_version("1.2.3").await?;
+        let (asset, kind) =
+            select_asset(&release.assets, None, None).expect("host-compatible fixture archive");
+        let checksum = manager.checksum_for_asset(&release, asset).await?;
+        let url = asset
+            .browser_download_url
+            .clone()
+            .expect("fixture archive URL");
+        let archive = manager
+            .client
+            .get(&url)
+            .send()
+            .await
+            .expect("fixture archive response")
+            .error_for_status()
+            .expect("successful fixture archive")
+            .bytes()
+            .await
+            .expect("complete fixture archive");
+        assert_eq!(hex::encode(Sha256::digest(&archive)), checksum);
+        let path = owner.join("authenticated-runtime.archive");
+        fs::write(&path, archive).expect("owned authenticated archive");
+        Ok((path, url, kind))
+    }
+
+    #[tokio::test]
+    async fn tls_registry_metadata_and_authenticated_archive_publish_reviewed_complete_content() {
+        let owner = tempfile::tempdir().expect("owned registry publication root");
+        let versions = owner.path().join("versions/node");
+        let (manager, transport) = registry_publication_fixture(&versions, false, false)
+            .await
+            .expect("real fixed-origin TLS registry fixture");
+        let (archive, url, kind) = authenticated_registry_archive(&manager, owner.path())
+            .await
+            .expect("authenticated TLS fixture archive");
+        manager
+            .publish_download(&archive, &url, "1.2.3", kind)
+            .await
+            .expect("verified and admitted generic publication");
+        manager
+            .use_version("1.2.3")
+            .expect("activate reviewed publication");
+        let installed = versions.join("1.2.3");
+        assert_eq!(
+            fs::read(installed.join("bin/fixture-tool")).expect("published contained launcher"),
+            b"#!/bin/sh\nexit 0\n"
+        );
+        assert_eq!(
+            fs::read(installed.join("owned-tool/lib/owned.data"))
+                .expect("published supporting implementation"),
+            b"complete tool implementation"
+        );
+        assert_eq!(
+            versions
+                .join("current")
+                .canonicalize()
+                .expect("activated reviewed version"),
+            installed.canonicalize().unwrap()
+        );
+        super::super::security::admit_installed(
+            "node",
+            &installed,
+            super::super::security::ReviewMode::CachedOnly,
+        )
+        .expect("publication retained its exact source authority")
+        .verify(&installed)
+        .expect("complete published content still matches");
+        assert_eq!(
+            transport
+                .finish()
+                .await
+                .expect("all expected HTTPS requests settled")
+                .len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn registry_checksum_and_candidate_changes_never_publish_or_activate() {
+        for (corrupt, mutate) in [(true, false), (false, true)] {
+            let owner = tempfile::tempdir().expect("owned refused registry root");
+            let versions = owner.path().join("versions/node");
+            let (manager, transport) = registry_publication_fixture(&versions, corrupt, mutate)
+                .await
+                .expect("real refused registry TLS fixture");
+            let candidate = authenticated_registry_archive(&manager, owner.path()).await;
+            let error = if corrupt {
+                candidate.expect_err("malformed publisher digest must refuse before download")
+            } else {
+                let (archive, url, kind) = candidate.expect("authenticated fixture archive");
+                manager
+                    .publish_download(&archive, &url, "1.2.3", kind)
+                    .await
+                    .expect_err("changed candidate must refuse publication")
+            };
+            let detail = format!("{error:#}");
+            assert!(
+                detail.contains(if corrupt {
+                    "Invalid SHA-256 digest"
+                } else {
+                    "changed"
+                }),
+                "{detail}"
+            );
+            assert!(!versions.join("1.2.3").exists());
+            assert!(!versions.join("current").exists());
+            assert!(
+                !fs::read_dir(&versions)
+                    .expect("owned transaction directory")
+                    .any(|entry| {
+                        let name = entry.expect("owned transaction entry").file_name();
+                        name.to_string_lossy().starts_with(".install-")
+                            || name.to_string_lossy().starts_with(".download-")
+                    })
+            );
+            assert_eq!(
+                transport
+                    .finish()
+                    .await
+                    .expect("refusal settled real TLS transport")
+                    .len(),
+                if corrupt { 1 } else { 2 }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn registry_publication_cannot_replace_another_live_candidate_owner() {
+        let owner = tempfile::tempdir().expect("owned competing registry candidates");
+        let versions = owner.path().join("versions/node");
+        fs::create_dir_all(&versions).expect("owned versions parent");
+        let destination = versions.join("1.2.3");
+        let prior = super::super::security::record_manifest(
+            "node",
+            "1.2.3",
+            &destination,
+            "https://api.github.com/omg-fixtures/registry/owned-manifest",
+            b"first live publisher candidate",
+        )
+        .expect("retain the first candidate admission lease");
+        let identity = fs::read_dir(versions.join(".security"))
+            .expect("owned candidate state")
+            .map(|entry| entry.expect("candidate state entry").path())
+            .find(|path| path.to_string_lossy().ends_with(".identity.json"))
+            .expect("first candidate identity");
+        let before = fs::read(&identity).expect("first candidate publisher bytes");
+        let (manager, transport) = registry_publication_fixture(&versions, false, false)
+            .await
+            .expect("real competing registry TLS fixture");
+        let (archive, url, kind) = authenticated_registry_archive(&manager, owner.path())
+            .await
+            .expect("authenticated competing fixture archive");
+        let error = manager
+            .publish_download(&archive, &url, "1.2.3", kind)
+            .await
+            .expect_err("a second candidate must not overwrite live authority");
+        assert!(format!("{error:#}").contains("conflicts"));
+        assert_eq!(fs::read(&identity).unwrap(), before);
+        assert!(!destination.exists());
+        assert!(!versions.join("current").exists());
+        drop(prior);
+        assert!(
+            !identity.exists(),
+            "cancelling the original owner must restore its absent prior identity"
+        );
+        assert_eq!(
+            transport
+                .finish()
+                .await
+                .expect("competing candidate transport settled")
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn registry_selection_refuses_corrupt_authority_before_changing_current() {
+        let owner = tempfile::tempdir().expect("owned registry selection root");
+        let spec =
+            super::super::tool_registry::find_tool("ripgrep").expect("real registered product");
+        let versions = owner.path().join("versions/ripgrep");
+        let version = versions.join("1.2.3");
+        fs::create_dir_all(version.join("bin")).expect("owned registry launcher directory");
+        fs::write(version.join("bin/rg"), b"controlled launcher").expect("owned registry launcher");
+        super::super::security::fixture_install_identity("ripgrep", &version)
+            .expect("controlled real registry product identity");
+        let identity = fs::read_dir(versions.join(".security"))
+            .expect("owned registry metadata")
+            .map(|entry| entry.expect("owned metadata entry").path())
+            .find(|path| path.to_string_lossy().ends_with(".identity.json"))
+            .expect("exact publisher identity file");
+        fs::write(identity, b"invalid publisher authority")
+            .expect("controlled authority corruption");
+        let manager = GenericToolManager {
+            security: super::super::security::RuntimeSecurity::fixture(),
+            spec,
+            versions_dir: versions.clone(),
+            client: download_client(),
+        };
+        assert!(manager.use_version("1.2.3").is_err());
+        assert!(!versions.join("current").exists());
+        assert_eq!(
+            fs::read(version.join("bin/rg")).unwrap(),
+            b"controlled launcher"
+        );
+    }
 
     fn asset(name: &str) -> GithubAsset {
         GithubAsset {

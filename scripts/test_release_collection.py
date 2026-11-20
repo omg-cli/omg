@@ -18,6 +18,27 @@ PLATFORMS = ('x86_64-linux-arch', 'x86_64-linux-debian',
 
 
 class ReleaseCollection(unittest.TestCase):
+    def test_signature_bundle_must_exist_before_publication(self):
+        workflow = (ROOT / '.github/workflows/release.yml').read_text(encoding='utf-8')
+        script = step_script(workflow, 'Attach release signature bundle')
+        for content in (None, b'', b'{"mediaType":"application/vnd.dev.sigstore.bundle.v0.3+json"}'):
+            with self.subTest(content=content), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                (root / 'release').mkdir()
+                bundle = root / 'attestation.json'
+                if content is not None:
+                    bundle.write_bytes(content)
+                result = subprocess.run([BASH, '-eu', '-c', script], cwd=root,
+                                        env=dict(os.environ, ATTESTATION_BUNDLE=str(bundle)),
+                                        capture_output=True, text=True, timeout=10)
+                published = root / 'release/omg-release.sigstore.json'
+                if content:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(published.read_bytes(), content)
+                else:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertFalse(published.exists())
+
     def test_resync_rejects_wrong_platform_even_when_counts_match(self):
         workflow = (ROOT / '.github/workflows/release.yml').read_text(encoding='utf-8')
         script = step_script(workflow, 'Download and verify published release')

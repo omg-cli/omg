@@ -99,6 +99,16 @@ jobs:
           python3 -m unittest discover -s scripts -p 'test_debt*.py'
           python3 -m unittest discover -s scripts -p test_ci_change_scope.py
 
+      - name: Test advisory baseline publication guards
+        if: matrix.shard == 0
+        run: python3 -m unittest discover -s scripts -p test_advisory_baseline.py
+
+      - name: Check Rust ALPM snapshot consistency
+        if: matrix.shard == 0
+        run: |
+          python3 scripts/check-alpm-pins.py
+          python3 scripts/test_alpm_pins.py
+
       - name: Debt ratchet (gating)
         if: matrix.shard == 0
         run: python3 scripts/debt-ratchet.py --ci
@@ -173,6 +183,17 @@ jobs:
           retention-days: 7
           if-no-files-found: warn
 
+      - name: Verify Arch advisory service
+        if: matrix.shard == 0 && (github.event_name == 'push' || needs.quick-gate.outputs.checks-required == 'true')
+        env:
+          WRANGLER_SEND_METRICS: "false"
+          CLOUDFLARE_LOAD_DEV_VARS_FROM_DOT_ENV: "false"
+        run: |
+          bun install --cwd services/advisories --frozen-lockfile --ignore-scripts
+          bun run --cwd services/advisories test
+          bun run --cwd services/advisories check
+          bun run --cwd services/advisories dry-run
+
       - name: Verify installer destination safety
         if: matrix.shard == 0
         run: bash tests/installer_security.sh
@@ -188,15 +209,11 @@ jobs:
         run: cargo-machete
 
   standalone-suites:
-    name: "Standalone suites (${{ matrix.os }})"
+    name: "Standalone suites (ubuntu-24.04)"
     needs: quick-gate
     if: needs.quick-gate.outputs.should-build == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group'
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-24.04, macos-15]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -305,6 +322,12 @@ jobs:
         run: |
           cargo clippy --all-targets --no-default-features \
             --features debian-pure --locked -- -D warnings
+
+      - name: Verify Node authentication fails closed without PGP
+        run: |
+          cargo test --lib --no-default-features --features license --locked \
+            runtimes::node::tests::node_install_without_pgp_refuses_before_contacting_the_publisher \
+            -- --exact --nocapture
 
       - name: Check fuzz targets
         env:
@@ -1345,10 +1368,16 @@ jobs:
       - name: Platform clippy
         id: native-clippy
         if: ${{ !cancelled() }}
+        shell: bash
         run: |
+          set -euo pipefail
+          cargo_source=()
+          if [ '${{ matrix.platform }}' = debian ]; then
+            python3 scripts/check-alpm-pins.py --prepare-cargo-source "$RUNNER_TEMP/omg-alpm-source"
+            cargo_source=(--config "$RUNNER_TEMP/omg-alpm-source/cargo-config.toml")
+          fi
           cargo clippy --all-targets --no-default-features --features ${{ matrix.features }} \
-            --locked -- -D warnings
-
+            "${cargo_source[@]}" --locked -- -D warnings
 
       - name: Record native Clippy execution
         if: always()
@@ -1652,6 +1681,13 @@ jobs:
         with:
           toolchain: "1.95.0"
 
+      # Reuse the ARM64 runner for the independent runtime workspaces.
+      - name: Test mise compatibility
+        run: cargo test --manifest-path tests/mise-compat/Cargo.toml --locked
+
+      - name: Test portable environment planner
+        run: cargo test --manifest-path tests/env-portable/Cargo.toml --locked
+
       - name: Setup cache
         if: inputs.skip-cache != true
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -1695,6 +1731,28 @@ jobs:
 
       - name: Install Fish unit test dependency
         run: brew list fish &>/dev/null || brew install fish
+
+      - name: Provision relocatable Python virtualenv fixture
+        run: |
+          set -euo pipefail
+          umask 077
+          fixture_dir=$(mktemp -d "$RUNNER_TEMP/omg-python-venv.XXXXXX")
+          archive="$fixture_dir/cpython-3.13.7-arm64.tar.gz"
+          # Exact official release asset 294829551; publisher SHA256SUMS agrees
+          # with GitHub's authenticated asset digest. Rust rechecks before extraction.
+          curl --proto '=https' --proto-redir '=https' --tlsv1.2 \
+            --fail --location --retry 3 --connect-timeout 20 --max-time 180 \
+            --max-filesize 16617745 --user-agent 'OMG-CI-Python-fixture/0.1.225' \
+            --output "$archive" \
+            'https://github.com/astral-sh/python-build-standalone/releases/download/20250918/cpython-3.13.7%2B20250918-aarch64-apple-darwin-install_only.tar.gz'
+          python3 - "$archive" <<'PY'
+          import hashlib, pathlib, sys
+          archive = pathlib.Path(sys.argv[1])
+          assert archive.is_absolute() and archive.is_file() and not archive.is_symlink()
+          assert archive.stat().st_size == 16617745
+          assert hashlib.sha256(archive.read_bytes()).hexdigest() == '7f5ec658219bdb1d1142c6abab89680322166c78350a017fb0af3c869dceee41'
+          PY
+          printf 'OMG_MACOS_PYTHON_FIXTURE_ARCHIVE=%s\n' "$archive" >> "$GITHUB_ENV"
 
       - name: Run unit tests
         run: python3 scripts/run-native-contracts.py --features macos,pgp,license
@@ -1748,6 +1806,9 @@ jobs:
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
         with:
           toolchain: "1.95.0"
+
+      - name: Verify nextest installer process ownership
+        run: python3 -B -m unittest scripts.test_install_nextest_macos -v
 
       - name: Build the admitted nextest registry source
         run: |
@@ -2271,6 +2332,8 @@ jobs:
           scripts/require-workflow-success.sh docker-e2e.yml "$GITHUB_SHA" "Docker E2E"
           # CI Success already requires this run's staged QEMU verification.
 
+          # Archive membership comes from the publisher proof, never local counts.
+          python3 scripts/advisory-baseline.py status
           git tag "$TAG" "$GITHUB_SHA"
           git push origin "refs/tags/${TAG}"
           if ! git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null; then

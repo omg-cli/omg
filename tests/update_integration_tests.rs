@@ -4,9 +4,7 @@
 //! and mock implementations to avoid requiring root or system changes.
 
 use omg_lib::core::packages::PackageService;
-use omg_lib::core::security::vulnerability::{
-    VulnerabilityError, VulnerabilityReport, VulnerabilitySource,
-};
+use omg_lib::core::security::vulnerability::{VulnerabilityError, VulnerabilitySource};
 use omg_lib::core::testing::{TestPackageManager, UpdateFixture};
 use omg_lib::package_managers::PackageManager;
 use omg_lib::package_managers::types::UpdateInfo;
@@ -27,14 +25,40 @@ fn version_text(version: &omg_lib::package_managers::types::Version) -> &str {
 struct NoKnownVulnerabilities;
 
 impl VulnerabilitySource for NoKnownVulnerabilities {
-    fn scan_package<'a>(
+    fn assess_packages<'a>(
         &'a self,
-        _name: &'a str,
-        _version: &'a omg_lib::package_managers::types::Version,
+        packages: &'a [omg_lib::package_managers::types::SecurityPackage],
+        _evidence_use: omg_lib::core::security::vulnerability::AssessmentUse,
     ) -> Pin<
-        Box<dyn Future<Output = Result<Vec<VulnerabilityReport>, VulnerabilityError>> + Send + 'a>,
+        Box<
+            dyn Future<
+                    Output = Result<
+                        Vec<omg_lib::core::security::vulnerability::PackageAssessment>,
+                        VulnerabilityError,
+                    >,
+                > + Send
+                + 'a,
+        >,
     > {
-        Box::pin(async { Ok(Vec::new()) })
+        Box::pin(async move {
+            Ok(packages
+                .iter()
+                .cloned()
+                .map(
+                    |package| omg_lib::core::security::vulnerability::PackageAssessment {
+                        package,
+                        coverage:
+                            omg_lib::core::security::vulnerability::PackageCoverage::Assessed {
+                                provenance:
+                                    omg_lib::core::security::scan::AdvisoryProvenance::Osv {
+                                        ecosystem: "fixture".into(),
+                                    },
+                            },
+                        findings: Vec::new(),
+                    },
+                )
+                .collect())
+        })
     }
 }
 
@@ -361,10 +385,8 @@ mod proptest_tests {
             let pm = Arc::new(TestPackageManager::new());
             pm.add_package(&package_name, "1.0.0", "Test package");
 
-            // Inject the no-op vulnerability source: install() grades every
-            // package through the scanner (service.rs assign_grade), and the
-            // default VulnerabilityScanner requires network access that a
-            // unit test must not depend on. Mirrors test_install_package.
+            // Explicit review policies use this fixture source rather than
+            // depending on a live advisory endpoint during package operations.
             let service = PackageService::builder(pm.clone())
                 .vulnerability_source(Arc::new(NoKnownVulnerabilities))
                 .without_history()

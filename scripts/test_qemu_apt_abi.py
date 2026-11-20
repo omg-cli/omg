@@ -1,6 +1,7 @@
 """Require distinct Trixie identity and resolved APT 7 loader evidence."""
 import importlib.util
 import hashlib
+import json
 from pathlib import Path
 import sys
 import tempfile
@@ -44,21 +45,47 @@ class AptAbiTests(unittest.TestCase):
         end = source.index('case "$distro" in', begin)
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            (root / 'evidence').mkdir()
+            commands = root / 'fixture-bin'
+            commands.mkdir()
+            sudo = commands / 'sudo'
+            sudo.write_text('#!' + sys.executable + '\n' + '''
+import json, os, pathlib, subprocess, sys
+args = sys.argv[1:]
+assert args[:2] == ['-n', 'install'], args
+args = args[2:]
+assert args[:1] == ['-d'] or args[:2] == ['-o', 'root'], args
+assert ['-o', 'root', '-g', 'root', '-m', '0755'] == args[int(args[0] == '-d'):int(args[0] == '-d') + 6], args
+root = pathlib.Path(os.environ['HOME'])
+with (root / 'admin-argv.jsonl').open('a') as output: output.write(json.dumps(sys.argv[1:]) + '\\n')
+with (root / 'events').open('a') as output: output.write('install\\n')
+args = [part for index, part in enumerate(args) if part not in ('-o', '-g') and (index == 0 or args[index - 1] not in ('-o', '-g'))]
+raise SystemExit(subprocess.call(['/usr/bin/install', *args]))
+''')
+            sudo.chmod(0o755)
             archive = root / 'release.tar.gz'
             with tarfile.open(archive, 'w:gz') as release:
                 for name in ('omg', 'omgd'):
-                    payload = f'#!/bin/sh\nprintf "{name}\\n" >> "$HOME/executed"\nprintf "{name}0.1.0\\n"\n'.encode()
+                    payload = f'#!/bin/sh\nprintf "{name}\\n" >> "$HOME/executed"\nprintf "{name}\\n" >> "$HOME/events"\nprintf "{name}0.1.0\\n"\n'.encode()
                     member = tarfile.TarInfo(f'omg-v0.1.0-x86_64-linux-debian-trixie/{name}')
                     member.mode, member.size = 0o755, len(payload)
                     release.addfile(member, io.BytesIO(payload))
             (root / SOURCE.name).write_text('import os,sys\nfrom pathlib import Path\n'
                 'Path(os.environ["HOME"], "probe-ran").write_text("yes")\n'
+                'with Path(os.environ["HOME"], "events").open("a") as events: events.write("abi\\n")\n'
                 'sys.exit(int(os.environ["PROBE_STATUS"]))\n')
             environment = dict(os.environ, HOME=directory, distro='debian-trixie',
+                PATH=str(commands) + ':' + os.environ['PATH'],
                 tag='v0.1.0', guest_arch='x86_64', digest=hashlib.sha256(archive.read_bytes()).hexdigest())
+            # Execute the real carrier with its privileged destination relocated
+            # into private scratch. The adapter checks the requested root owner
+            # and mode, then models those administrative copies without sudo.
+            fragment = source[begin:end].replace('/opt/omg-qemu', str(root / 'trusted'))
             for status in ('120', '0'):
                 with self.subTest(probe_status=status):
-                    result = self.probe.subprocess.run(['bash', '-e', '-o', 'pipefail', '-c', source[begin:end]],
+                    for name in ('events', 'probe-ran', 'executed', 'admin-argv.jsonl'):
+                        (root / name).unlink(missing_ok=True)
+                    result = self.probe.subprocess.run(['bash', '-e', '-o', 'pipefail', '-c', fragment],
                         cwd=root, env=dict(environment, PROBE_STATUS=status),
                         capture_output=True, text=True, timeout=10)
                     self.assertEqual(result.returncode, int(status), result.stderr)
@@ -66,8 +93,23 @@ class AptAbiTests(unittest.TestCase):
                     executed = root / 'executed'
                     if status == '120':
                         self.assertFalse(executed.exists(), 'a refused ABI must prevent both entrypoints')
+                        self.assertEqual((root / 'events').read_text().splitlines(), ['abi'],
+                                         'ABI refusal must precede every privileged native-copy operation')
+                        self.assertFalse((root / 'admin-argv.jsonl').exists())
+                        self.assertFalse((root / 'trusted').exists())
                     else:
                         self.assertEqual(executed.read_text().splitlines(), ['omg', 'omgd'])
+                        self.assertEqual((root / 'events').read_text().splitlines(),
+                                         ['abi', 'install', 'install', 'install', 'omg', 'omgd'])
+                        calls = [json.loads(line) for line in (root / 'admin-argv.jsonl').read_text().splitlines()]
+                        self.assertEqual(len(calls), 3)
+                        native = root / 'trusted/omg-v0.1.0-x86_64-linux-debian-trixie'
+                        original = root / 'omg-v0.1.0-x86_64-linux-debian-trixie'
+                        for name in ('omg', 'omgd'):
+                            self.assertEqual((native / name).read_bytes(), (original / name).read_bytes())
+                            self.assertEqual((native / name).stat().st_mode & 0o777, 0o755)
+                        self.assertTrue((root / 'evidence/native-executable-trust.txt').is_file())
+                        self.assertTrue((root / 'evidence/native-executable-sha256.txt').is_file())
 
     @unittest.skipUnless(sys.platform == 'linux', 'controller admission requires POSIX Bash')
     def test_host_controller_refuses_failed_archive_bound_admission(self):

@@ -63,7 +63,7 @@ surface and nested commands easy to audit when a release changes.
 | Surface | Commands or values |
 | --- | --- |
 | Package | `search`, `install`, `remove`, `update`, `info`, `why`, `outdated`, `size`, `blame`, `diff`, `snapshot`, `ci`, `migrate`, `clean`, `explicit`, `ec`, `tc`, `oc`, `uc`, `sync` |
-| Runtime | `use`, `list`, `which`; 14 native runtimes: `node`, `python`, `go`, `rust`, `ruby`, `java`, `bun`, `pi`, `deno`, `zig`, `dotnet`, `erlang`, `php`, `swift` |
+| Runtime | `use`, `list`, `which`; 13 language runtimes: `node`, `python`, `go`, `rust`, `ruby`, `java`, `bun`, `deno`, `zig`, `dotnet`, `erlang`, `php`, `swift`; `pi` selects the npm-installed coding harness |
 | Shell and monorepo | `hook`, `completions`, `hooks install/uninstall/status/run`, `workspace init/add/remove/list/run/diff/check/status` |
 | Diagnostics | `status`, `doctor`, `audit scan/sbom/secrets/log/verify/policy/slsa/licenses/fix/export/eol` |
 | Development | `run`, `new`, `tool install/list/remove/update/search/registry`, `init` |
@@ -295,6 +295,21 @@ omg update --fast
 2. Update official packages first
 3. Build and update AUR packages
 4. Record transaction in history
+
+On Omarchy, a full `omg update` coordinates Omarchy's system update commands,
+including snapshots, keyrings, migrations, service restarts, and boot checks.
+The official package stage uses Omarchy's system updater and the repositories
+already configured in `pacman.conf`, including the selected Omarchy channel.
+AUR updates use OMG's source review, build, and installation pipeline. OMG
+preserves Omarchy's `gcc14` and `gcc14-libs` update exclusions. Run the command
+as your session user; individual system stages request authorization.
+
+Omarchy full updates reject `--fast`, `--turbo`, and mutating `--no-sync`
+requests. `--check`, `--dry-run`, and `--aur-only` retain their scoped behavior.
+Pending Omarchy migrations with known external AUR helper calls stop the full
+update until a native equivalent is available. Omarchy's stage scripts and
+hooks remain trusted system code. The current run's transcript is stored in
+`/tmp/omarchy-update.log` with owner-only permissions.
 
 With `--aur-only`, steps 1 and 2 are omitted. AUR updates still use the normal
 policy screening, source review, sandboxed build, package archive inspection,
@@ -920,6 +935,8 @@ omg audit [SUBCOMMAND]
 
 `scan` prefers the Unix daemon but falls back to the direct package backend and shared scanner; findings only make the command fail with `--fail-on-findings`. The published v0.1.223 scan still requires the daemon. The newer system SBOM supports Arch, Debian, Ubuntu, and Fedora, with native advisory or OSV matching by default; the published release only completes this command on Arch. `--inventory-only` avoids advisory requests and marks the omission in the SBOM, so an empty vulnerability list is not a clean scan. The SBOM does not resolve dependency edges. `licenses` and vulnerability auto-fix require the Arch backend.
 
+Arch audits compare installed names and native versions against Arch tracker snapshots served by the OMG advisory service. The client checks the payload SHA-256, provenance, completeness and freshness before matching packages. Invalid or stale evidence fails the audit. These tracker comparisons do not establish upstream CVE applicability for AUR or local packages. The historical CVE import remains incomplete; missing CVE records do not mean that a package is unaffected.
+
 `omg audit export --framework soc2` requires a supported SBOM backend and advisory source. The newer CLI can scan directly without a daemon; v0.1.223 requires one. Other accepted framework names return unimplemented errors. `--period` labels the export; it does not filter history. Output is plaintext and can be partial on failure. See [security limits](./security.md).
 
 **Options for `log`:**
@@ -1079,6 +1096,8 @@ omg run build,test,lint --parallel
 
 Create new projects from templates.
 
+The templates generate project files locally. React and Node write a dependency manifest for you to review before installing dependencies. Python writes a project manifest and starter script. When OMG has a selected runtime for the stack, the template records its version in `.tool-versions`.
+
 ```bash
 omg new <stack> <name> [aliases: create]
 ```
@@ -1165,7 +1184,7 @@ actionlint hyperfine tokei dust duf procs ruff uv fnm protoc terragrunt packer
 dive golangci-lint delve stylua kotlin scala elixir ghcup
 ```
 
-The registry is separate from the 14 native runtime managers. Together they
+The registry is separate from the 13 language runtimes and the Pi coding harness. Together they
 make 68 registered runtime/tool names, but each publisher may expose only
 some operating systems or architectures.
 
@@ -1591,6 +1610,8 @@ omg team activity --days 30
 ### omg container
 
 Docker/Podman integration.
+
+For OMG-generated recipes, `omg container build` requires attended acceptance of Unknown advisory coverage. The review binds the recipe, declared base images, build options and effective ignore rules. An explicit OMG package policy requires a resolved transaction, so a generated build with that policy stops before launching the builder.
 
 ```bash
 omg container <SUBCOMMAND>

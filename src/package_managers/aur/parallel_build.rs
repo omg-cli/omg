@@ -283,7 +283,7 @@ impl ParallelBuilder {
         max_concurrent.max(1).min(level_len)
     }
 
-    async fn build_level(
+    pub(super) async fn build_level(
         &self,
         level_num: usize,
         total_levels: usize,
@@ -347,7 +347,7 @@ impl ParallelBuilder {
             let failed = build_result.is_err();
             match build_result {
                 Ok(archives) => {
-                    wave_archives.extend(archives);
+                    wave_archives.push(archives);
                     summary.record_job_result(job, Ok(()));
                 }
                 Err(error) => summary.record_job_result(job, Err(error)),
@@ -363,10 +363,14 @@ impl ParallelBuilder {
         }
 
         if !wave_archives.is_empty() {
+            let archive_count = wave_archives
+                .iter()
+                .map(super::client::BuiltPackages::len)
+                .sum::<usize>();
             crate::cli::modern_ui::print_info(&format!(
                 "Installing {} package{}",
-                wave_archives.len(),
-                if wave_archives.len() == 1 { "" } else { "s" }
+                archive_count,
+                if archive_count == 1 { "" } else { "s" }
             ));
             AurClient::install_built_packages(&wave_archives, None).await?;
         }

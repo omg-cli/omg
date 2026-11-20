@@ -249,6 +249,36 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn aur_provenance_reaches_service_admission_without_backend_mutation() -> Result<()> {
+        let backend = std::sync::Arc::new(TestPackageManager::new());
+        backend.add_package("aur-fixture", "1.0.0", "AUR candidate");
+        {
+            let mut packages = backend.packages.lock().expect("packages");
+            packages
+                .get_mut("aur-fixture")
+                .expect("fixture package")
+                .source = PackageSource::Aur;
+        }
+        let service = crate::core::packages::PackageService::builder(backend.clone())
+            .policy(crate::core::security::policy::SecurityPolicy {
+                allow_aur: false,
+                ..crate::core::security::policy::SecurityPolicy::default()
+            })
+            .without_history()
+            .build()?;
+        let error = service
+            .install(&["aur-fixture".into()], true)
+            .await
+            .expect_err("generic backend must preserve AUR source policy");
+        assert!(
+            matches!(error.downcast_ref::<crate::core::security::policy::PolicyError>(),
+            Some(crate::core::security::policy::PolicyError::AurDisabled {name}) if name=="aur-fixture")
+        );
+        assert!(backend.list_installed().await?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_mock_basic_operations() {
         let pm = TestPackageManager::new();
         pm.add_package("test", "1.0.0", "Test package");

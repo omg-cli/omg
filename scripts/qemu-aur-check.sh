@@ -3,7 +3,7 @@
 set -euo pipefail
 [[ $# == 2 && $(id -u) != 0 ]] || exit 2
 source /etc/os-release
-[[ "$ID" == arch ]] || exit 2
+[[ "$ID" == arch || " ${ID_LIKE:-} " == *" arch "* ]] || exit 2
 bin=$(realpath "$1")
 evidence=$(realpath "$2")
 fixture=$(realpath "${BASH_SOURCE[0]%/*}/qemu-aur-fixture.py")

@@ -7,7 +7,7 @@ use crate::cli::packages::common::validate_search_query;
 use crate::cli::{style, ui};
 use crate::core::packages::search::SearchRanker;
 use crate::core::{Package, PackageSource};
-use crate::package_managers::{SearchNameKind, VersionDisplay, get_package_manager};
+use crate::package_managers::{Backend, SearchNameKind, VersionDisplay, get_package_manager};
 
 pub(crate) const DEFAULT_SEARCH_LIMIT: usize = crate::cli::modern_ui::SUMMARY_LIST_CAP;
 
@@ -185,6 +185,15 @@ pub async fn search_with_json(
     search_internal(query, detailed, json, no_aur, limit).await
 }
 
+fn should_search_aur(query: &str, backend: Backend, no_aur: bool) -> Result<bool> {
+    let include = !no_aur && backend == Backend::Arch;
+    if include {
+        crate::core::packages::search::validate_aur_search_length(query)
+            .context("Use --no-aur to search official repositories with a shorter query")?;
+    }
+    Ok(include)
+}
+
 async fn search_internal(
     query: &str,
     detailed: bool,
@@ -193,13 +202,14 @@ async fn search_internal(
     limit: usize,
 ) -> Result<()> {
     validate_search_query(query)?;
-    let name_kind = SearchNameKind::from_backend(crate::package_managers::resolve_backend()?);
+    let backend = crate::package_managers::resolve_backend()?;
+    let name_kind = SearchNameKind::from_backend(backend);
+    let include_aur = should_search_aur(query, backend, no_aur)?;
 
     let official_search = async { search_official_packages(query, limit).await };
 
-    // Skip AUR search if --no-aur flag is set (for benchmarks/official-only searches)
     let aur_search = async {
-        if no_aur {
+        if !include_aur {
             return Ok(Vec::new());
         }
         tokio::time::timeout(
@@ -217,7 +227,8 @@ async fn search_internal(
     let aur_packages = match aur_result {
         Ok(packages) => packages,
         Err(error) if !display_packages.is_empty() => {
-            tracing::debug!("AUR search unavailable; returning official results: {error}");
+            eprintln!("AUR search unavailable. Showing official repository matches.");
+            tracing::debug!(%error, "AUR search failed");
             Vec::new()
         }
         Err(error) => return Err(error).context("Failed to search AUR packages"),
@@ -364,10 +375,6 @@ async fn search_official_packages(
 
 #[cfg(feature = "arch")]
 async fn search_aur_packages(query: &str, detailed: bool) -> Result<Vec<DisplayPackage>> {
-    if crate::package_managers::resolve_backend()? != crate::package_managers::Backend::Arch {
-        return Ok(Vec::new());
-    }
-
     if detailed {
         return crate::package_managers::search_detailed(query)
             .await
@@ -1055,6 +1062,122 @@ mod tests {
         assert!(!search_sync_cli("../passwd", false, true).unwrap());
 
         assert!(!search_sync_cli("test;ls", false, true).unwrap());
+    }
+
+    #[test]
+    fn combined_arch_search_explains_the_aur_minimum_before_querying() -> Result<()> {
+        let error = should_search_aur("x", Backend::Arch, false)
+            .expect_err("the AUR does not support a single-byte query");
+        assert!(error.to_string().contains("--no-aur"));
+        assert!(format!("{error:#}").contains("at least 2 non-whitespace bytes"));
+        assert!(validate_search_query("x").is_ok());
+        assert!(!should_search_aur("x", Backend::Arch, true)?);
+        assert!(!should_search_aur("x", Backend::Debian, false)?);
+        assert!(should_search_aur("é", Backend::Arch, false)?);
+        Ok(())
+    }
+
+    #[cfg(feature = "arch")]
+    #[test]
+    fn native_arch_search_reads_the_local_aur_catalog() -> Result<()> {
+        const TEST: &str =
+            "cli::packages::search::tests::native_arch_search_reads_the_local_aur_catalog";
+        if crate::core::testing::run_isolated_test(TEST)
+            || crate::config::Settings::rerun_test_unprivileged(TEST)
+        {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            !crate::core::is_root(),
+            "search fixture requires an ordinary user"
+        );
+        let fixture = tempfile::tempdir()?;
+        let root = fixture.path().join("root");
+        let database = root.join("var/lib/pacman");
+        std::fs::create_dir_all(database.join("local"))?;
+        std::fs::create_dir(database.join("sync"))?;
+        std::fs::write(database.join("local/ALPM_DB_VERSION"), "9\n")?;
+        let pacman = fixture.path().join("pacman.conf");
+        std::fs::write(&pacman, "[options]\nSigLevel = Never\n[fixture]\n")?;
+        let repository = std::fs::File::create(database.join("sync/fixture.db"))?;
+        let mut official = tar::Builder::new(flate2::write::GzEncoder::new(
+            repository,
+            flate2::Compression::fast(),
+        ));
+        let descriptor = b"%NAME%\nomg-search-fixture-official\n\n%VERSION%\n1-1\n\n%DESC%\nOfficial search fixture\n\n";
+        let mut header = tar::Header::new_gnu();
+        header.set_size(descriptor.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        let path = "omg-search-fixture-official-1-1/desc";
+        official.append_data(&mut header, path, &descriptor[..])?;
+        official.into_inner()?.finish()?;
+        let cache = fixture.path().join("cache");
+        let settings_dir = fixture.path().join("config");
+        let data = fixture.path().join("data");
+        let socket = fixture.path().join("absent.sock");
+        crate::core::paths::set_test_overrides(Some(root), Some(database));
+        temp_env::with_vars(
+            [
+                ("OMG_TEST_MODE", None),
+                ("OMG_TEST_DISTRO", None),
+                ("OMG_PACMAN_CONF", Some(pacman.as_os_str())),
+                ("OMG_CACHE_DIR", Some(cache.as_os_str())),
+                ("OMG_CONFIG_DIR", Some(settings_dir.as_os_str())),
+                ("OMG_DATA_DIR", Some(data.as_os_str())),
+                ("OMG_SOCKET_PATH", Some(socket.as_os_str())),
+            ],
+            || -> Result<()> {
+                assert_eq!(crate::package_managers::resolve_backend()?, Backend::Arch);
+                let mut settings = crate::config::Settings::default();
+                settings.aur.use_metadata_archive = true;
+                settings.aur.metadata_cache_ttl_secs = 3600;
+                settings.save()?;
+                let config = crate::config::Settings::config_path()?;
+                let archive = fixture.path().join("metadata.json.gz");
+                let metadata = br#"[{"Name":"omg-search-fixture","Version":"2-1","Description":"Local AUR result","Maintainer":null,"NumVotes":0,"Popularity":0.0,"OutOfDate":null,"LastModified":1}]"#;
+                let file = std::fs::File::create(&archive)?;
+                let mut compressed =
+                    flate2::write::GzEncoder::new(file, flate2::Compression::fast());
+                compressed.write_all(metadata)?;
+                compressed.finish()?;
+                crate::package_managers::aur_metadata::publish_test_metadata(&archive)?;
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?;
+                runtime.block_on(async {
+                    let matches = super::search_aur_packages("omg-search-fixture", false).await?;
+                    assert_eq!(matches.len(), 1);
+                    assert_eq!(matches[0].name, "omg-search-fixture");
+                    assert_eq!(matches[0].version, "2-1");
+                    super::search_with_json("omg-search-fixture", false, true, false, 10).await?;
+                    super::search_with_json("x", false, true, true, 10).await?;
+
+                    // Both backends read this file. Keep its TOML valid and
+                    // make only the AUR settings invalid.
+                    std::fs::write(config, "[aur]\nmetadata_cache_ttl_secs = 604801\n")?;
+                    crate::package_managers::alpm_direct::clear_alpm_cache();
+                    let error = super::search_aur_packages("omg-search-fixture", false)
+                        .await
+                        .err()
+                        .context("invalid AUR cache lifetime was accepted")?;
+                    assert!(format!("{error:#}").contains("metadata_cache_ttl_secs too large"));
+                    let (source, count) =
+                        super::search_official_packages("omg-search-fixture", 10).await?;
+                    assert_eq!(count, 1);
+                    assert_eq!(source[0].name, "omg-search-fixture-official");
+                    super::search_with_json("omg-search-fixture", false, true, false, 10).await?;
+                    let error =
+                        super::search_with_json("omg-unmatched-fixture", false, true, false, 10)
+                            .await
+                            .expect_err(
+                                "an AUR failure without an official result must fail the search",
+                            );
+                    assert!(error.to_string().contains("Failed to search AUR packages"));
+                    Ok(())
+                })
+            },
+        )
     }
 
     #[test]

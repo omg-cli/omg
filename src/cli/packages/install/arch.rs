@@ -81,7 +81,7 @@ pub async fn install(packages: &[String], yes: bool, replacement_hops: u32) -> R
                 &vulnerability_scanner,
                 pkg,
                 &info.version,
-                false,
+                policy.arch_repository_origin(&info.repo),
                 crate::core::security::policy::combined_license_expression(
                     info.licenses.iter().map(String::as_str),
                 )
@@ -594,7 +594,7 @@ async fn handle_aur_package(aur_pkg: crate::core::Package, yes: bool) -> Result<
         &vulnerability_scanner,
         &aur_pkg.name,
         &aur_pkg.version,
-        true,
+        crate::package_managers::types::SecurityOrigin::AurArchive,
         None,
     )
     .await?;
@@ -728,36 +728,254 @@ mod tests {
     }
 
     impl crate::core::security::vulnerability::VulnerabilitySource for FixtureSource {
-        fn scan_package<'a>(
+        fn assess_packages<'a>(
             &'a self,
-            name: &'a str,
-            version: &'a crate::package_managers::types::Version,
+            packages: &'a [crate::package_managers::types::SecurityPackage],
+            evidence_use: crate::core::security::vulnerability::AssessmentUse,
         ) -> Pin<
             Box<
                 dyn Future<
                         Output = std::result::Result<
-                            Vec<crate::core::security::vulnerability::VulnerabilityReport>,
+                            Vec<crate::core::security::vulnerability::PackageAssessment>,
                             crate::core::security::vulnerability::VulnerabilityError,
                         >,
                     > + Send
                     + 'a,
             >,
         > {
-            assert_eq!(name, "example");
-            assert_eq!(version.to_string(), "1.0-1");
+            assert_eq!(packages.len(), 1);
+            assert_eq!(packages[0].name, "example");
+            assert_eq!(packages[0].version, "1.0-1");
+            assert_eq!(
+                evidence_use,
+                crate::core::security::vulnerability::AssessmentUse::Admission
+            );
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Box::pin(async move {
-                Ok(if self.vulnerable {
-                    vec![crate::core::security::vulnerability::VulnerabilityReport {
-                        id: "CVE-test".to_string(),
-                        summary: "known vulnerability".to_string(),
-                        score: None,
-                    }]
-                } else {
-                    Vec::new()
-                })
+                Ok(packages
+                    .iter()
+                    .cloned()
+                    .map(|package| {
+                        let findings = if self.vulnerable {
+                            vec![crate::core::security::scan::Vulnerability {
+                                id: "CVE-test".into(),
+                                summary: "known vulnerability".into(),
+                                score: None,
+                                advisory_severity: None,
+                                native_advisory: None,
+                                applicability:
+                                    crate::core::security::scan::FindingApplicability::Applicable,
+                                affected_installed: vec![
+                                    crate::core::security::scan::InstalledIdentity::from(&package),
+                                ],
+                            }]
+                        } else {
+                            Vec::new()
+                        };
+                        crate::core::security::vulnerability::PackageAssessment {
+                            package,
+                            coverage:
+                                crate::core::security::vulnerability::PackageCoverage::Assessed {
+                                    provenance:
+                                        crate::core::security::scan::AdvisoryProvenance::Osv {
+                                            ecosystem: "fixture".into(),
+                                        },
+                                },
+                            findings,
+                        }
+                    })
+                    .collect())
             })
         }
+    }
+
+    #[test]
+    fn install_source_denials_precede_advisory_lookups() {
+        use crate::core::security::{PolicyError, SecurityGrade, SecurityPolicy};
+        use crate::package_managers::types::SecurityOrigin;
+        let cases = [
+            (
+                SecurityPolicy {
+                    banned_packages: vec!["example".into()],
+                    ..SecurityPolicy::default()
+                },
+                SecurityOrigin::OtherRepository {
+                    repository: "fixture".into(),
+                },
+                Some("MIT"),
+            ),
+            (
+                SecurityPolicy {
+                    allow_aur: false,
+                    ..SecurityPolicy::default()
+                },
+                SecurityOrigin::AurArchive,
+                None,
+            ),
+            (
+                SecurityPolicy {
+                    minimum_grade: SecurityGrade::Verified,
+                    ..SecurityPolicy::default()
+                },
+                SecurityOrigin::Unknown,
+                Some("MIT"),
+            ),
+            (
+                SecurityPolicy {
+                    allowed_licenses: vec!["MIT".into()],
+                    ..SecurityPolicy::default()
+                },
+                SecurityOrigin::OtherRepository {
+                    repository: "fixture".into(),
+                },
+                None,
+            ),
+        ];
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let version = crate::package_managers::parse_version_or_zero("1.0-1");
+        for (mut policy, origin, license) in cases {
+            policy.advisory_requirement =
+                crate::core::security::policy::AdvisoryRequirement::Review;
+            let scanner = FixtureSource {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                vulnerable: false,
+            };
+            let error = runtime
+                .block_on(enforce_install_policy(
+                    &policy, &scanner, "example", &version, origin, license,
+                ))
+                .expect_err("source policy must reject the package");
+            assert!(error.downcast_ref::<PolicyError>().is_some(), "{error:#}");
+            assert_eq!(
+                scanner.calls.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "source policy denial contacted the advisory provider"
+            );
+        }
+    }
+
+    #[test]
+    fn fresh_snapshot_preflight_requires_prepared_native_admission() {
+        use crate::core::security::policy::AdvisoryRequirement;
+        use crate::core::security::{PolicyError, SecurityPolicy};
+        use crate::package_managers::types::SecurityOrigin;
+
+        const NAME: &str = "cli::packages::install::arch::tests::fresh_snapshot_preflight_requires_prepared_native_admission";
+        if crate::core::testing::run_isolated_test(NAME) {
+            return;
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("private admission runtime");
+        let policy = SecurityPolicy {
+            advisory_requirement: AdvisoryRequirement::FreshSnapshot,
+            ..SecurityPolicy::default()
+        };
+        let version = crate::package_managers::parse_version_or_zero("1.0-1");
+        let scanner = FixtureSource {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            vulnerable: false,
+        };
+        temp_env::with_var("OMG_TEST_MODE", Some("1"), || {
+            let error = runtime
+                .block_on(enforce_install_policy(
+                    &policy,
+                    &scanner,
+                    "example",
+                    &version,
+                    SecurityOrigin::ArchRepository {
+                        repository: "core".into(),
+                    },
+                    Some("MIT"),
+                ))
+                .expect_err("mock backend cannot own fresh native admission");
+            let error = error
+                .downcast::<PolicyError>()
+                .expect("native admission refusal must retain its policy error type");
+            assert!(matches!(error, PolicyError::PreparedAdmissionRequired));
+            assert_eq!(
+                scanner.calls.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "unsupported fresh admission must refuse before contacting a provider"
+            );
+        });
+    }
+
+    #[test]
+    #[ignore = "requires native Arch; mandatory in the native coverage VM"]
+    fn native_fresh_snapshot_preflight_defers_evidence_but_enforces_source_policy() {
+        use crate::core::security::policy::AdvisoryRequirement;
+        use crate::core::security::{PolicyError, SecurityPolicy};
+        use crate::package_managers::types::SecurityOrigin;
+
+        const NAME: &str = "cli::packages::install::arch::tests::native_fresh_snapshot_preflight_defers_evidence_but_enforces_source_policy";
+        if crate::core::testing::run_isolated_test(NAME) {
+            return;
+        }
+        if crate::config::Settings::rerun_test_unprivileged(NAME) {
+            return;
+        }
+        temp_env::with_vars(
+            [("OMG_TEST_MODE", None::<&str>), ("OMG_TEST_DISTRO", None)],
+            || {
+                assert_eq!(
+                    crate::core::env::distro::detect_distro(),
+                    crate::core::env::distro::Distro::Arch,
+                    "native prepared-admission fixture requires the actual Arch backend"
+                );
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("private native admission runtime");
+                let mut policy = SecurityPolicy {
+                    advisory_requirement: AdvisoryRequirement::FreshSnapshot,
+                    ..SecurityPolicy::default()
+                };
+                let scanner = FixtureSource {
+                    calls: std::sync::atomic::AtomicUsize::new(0),
+                    vulnerable: false,
+                };
+                let version = crate::package_managers::parse_version_or_zero("1.0-1");
+                let origin = SecurityOrigin::ArchRepository {
+                    repository: "core".into(),
+                };
+                runtime
+                    .block_on(enforce_install_policy(
+                        &policy,
+                        &scanner,
+                        "example",
+                        &version,
+                        origin.clone(),
+                        Some("MIT"),
+                    ))
+                    .expect("preflight must defer evidence to the prepared native transaction");
+                assert_eq!(
+                    scanner.calls.load(std::sync::atomic::Ordering::SeqCst),
+                    0,
+                    "preflight must not substitute an OSV lookup for fresh transaction evidence"
+                );
+                policy.allowed_licenses = vec!["Apache-2.0".into()];
+                let error = runtime
+                    .block_on(enforce_install_policy(
+                        &policy,
+                        &scanner,
+                        "example",
+                        &version,
+                        origin,
+                        Some("MIT"),
+                    ))
+                    .expect_err("deferred advisory evidence must not bypass license policy");
+                assert!(
+                    matches!(error.downcast_ref::<PolicyError>(), Some(PolicyError::LicenseNotAllowed { name, license }) if name == "example" && license == "MIT"),
+                    "{error:#}"
+                );
+                assert_eq!(scanner.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+            },
+        );
     }
 
     #[test]
@@ -768,7 +986,12 @@ mod tests {
             return;
         }
         temp_env::with_var_unset("OMG_TEST_MODE", || {
-            let policy = crate::core::security::SecurityPolicy::default();
+            use crate::core::security::vulnerability::{AssessmentUse, VulnerabilitySource as _};
+
+            let policy = crate::core::security::SecurityPolicy {
+                advisory_requirement: crate::core::security::policy::AdvisoryRequirement::Review,
+                ..crate::core::security::SecurityPolicy::default()
+            };
             let version = crate::package_managers::parse_version_or_zero("1.0-1");
             let scanner = FixtureSource {
                 calls: std::sync::atomic::AtomicUsize::new(0),
@@ -778,15 +1001,38 @@ mod tests {
                 .enable_all()
                 .build()
                 .expect("private test runtime");
-            let error = runtime
+            runtime
                 .block_on(enforce_install_policy(
                     &policy,
                     &scanner,
                     "example",
                     &version,
-                    false,
+                    crate::package_managers::types::SecurityOrigin::OtherRepository {
+                        repository: "fixture".into(),
+                    },
                     Some("MIT"),
                 ))
+                .expect("valid findings must reach the resolved native consent gate");
+            assert_eq!(scanner.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            let reported = runtime
+                .block_on(scanner.assess_packages(
+                    &[crate::package_managers::types::SecurityPackage {
+                        origin: crate::package_managers::types::SecurityOrigin::OtherRepository {
+                            repository: "fixture".into(),
+                        },
+                        name: "example".into(),
+                        version: "1.0-1".into(),
+                        advisory_source: None,
+                        architecture: None,
+                        description: String::new(),
+                        licenses: vec!["MIT".into()],
+                    }],
+                    AssessmentUse::Admission,
+                ))
+                .expect("complete reported finding");
+            let error = policy
+                .check_assessments(&reported)
+                .map_err(anyhow::Error::from)
                 .expect_err("vulnerable packages must be below the default Community grade");
 
             assert!(error.to_string().contains("below required minimum"));
@@ -798,7 +1044,7 @@ mod tests {
                     minimum: crate::core::security::SecurityGrade::Community,
                 }) if name == "example"
             ));
-            assert_eq!(scanner.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert_eq!(scanner.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
 
             let clean_scanner = FixtureSource {
                 calls: std::sync::atomic::AtomicUsize::new(0),
@@ -810,7 +1056,9 @@ mod tests {
                     &clean_scanner,
                     "example",
                     &version,
-                    false,
+                    crate::package_managers::types::SecurityOrigin::OtherRepository {
+                        repository: "fixture".into(),
+                    },
                     Some("MIT"),
                 ))
                 .expect("clean official package must be accepted");
@@ -871,6 +1119,52 @@ mod tests {
             source: crate::core::PackageSource::Aur,
             installed: false,
         }
+    }
+
+    #[test]
+    fn aur_source_denial_precedes_confirmation_history_and_build() -> Result<()> {
+        const NAME: &str = "cli::packages::install::arch::tests::aur_source_denial_precedes_confirmation_history_and_build";
+        if crate::core::testing::run_isolated_test(NAME) {
+            return Ok(());
+        }
+        if crate::config::Settings::rerun_test_unprivileged(NAME) {
+            return Ok(());
+        }
+        let directory = tempfile::tempdir()?;
+        std::fs::write(directory.path().join("policy.toml"), "allow_aur = false\n")?;
+        let data = directory.path().join("data");
+        let cache = directory.path().join("cache");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        temp_env::with_vars(
+            [
+                ("OMG_CONFIG_DIR", Some(directory.path().as_os_str())),
+                ("OMG_DATA_DIR", Some(data.as_os_str())),
+                ("OMG_CACHE_DIR", Some(cache.as_os_str())),
+            ],
+            || {
+                for yes in [false, true] {
+                    let error = runtime
+                        .block_on(handle_aur_package(aur_package("policy-denied-aur"), yes))
+                        .expect_err("source policy must refuse before confirmation or build");
+                    assert!(
+                        matches!(
+                            error.downcast_ref::<crate::core::security::PolicyError>(),
+                            Some(crate::core::security::PolicyError::AurDisabled { name })
+                                if name == "policy-denied-aur"
+                        ),
+                        "unexpected AUR admission error: {error:#}"
+                    );
+                }
+            },
+        );
+        assert!(
+            !data.exists(),
+            "a denied install must not record a transaction"
+        );
+        assert!(!cache.exists(), "a denied install must not prepare a build");
+        Ok(())
     }
 
     #[test]
@@ -1005,6 +1299,7 @@ mod tests {
                     let runtime = tokio::runtime::Builder::new_current_thread()
                         .enable_all()
                         .build()?;
+                    crate::package_managers::aur_metadata::publish_test_metadata(&archive_path)?;
                     runtime.block_on(async {
                         anyhow::ensure!(!crate::core::paths::test_mode());
                         let client = AurClient::new()?;

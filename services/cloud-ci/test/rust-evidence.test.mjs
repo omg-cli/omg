@@ -116,3 +116,22 @@ test("Rust receipt hashes exact stored raw report bytes without a self-hash cycl
         await rm(directory, { recursive: true, force: true });
     }
 });
+
+test("summary parsing rejects hostile filtered values and malformed elapsed times", () => {
+    const input = {
+        stdout: passed, stderr: "", exitCode: 0, testName: "reproduces_defect", file, source,
+        catalog: parseRustCatalog(catalog, "reproduces_defect"),
+    };
+    for (const filtered of ["(a+)+$", "0|.*", "0", -1, 10000, NaN, Infinity]) {
+        expect(() => parseRustExecution({ ...input, catalog: { ...input.catalog, filtered } }))
+            .toThrow();
+    }
+    for (const duration of [".", "0..0", "0.00s trailing", "9".repeat(100000) + "!"]) {
+        expect(() => parseRustExecution({ ...input, stdout: passed.replace("0.00s", duration + "s") }))
+            .toThrow();
+    }
+    for (const duration of ["0s", "1.234s", "123.00s"]) {
+        expect(parseRustExecution({ ...input, stdout: passed.replace("0.00s", duration) }).failures)
+            .toBe(0);
+    }
+});

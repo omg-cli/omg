@@ -1313,7 +1313,7 @@ mod security {
         let result = project.run(&["audit", "scan"]);
         result.assert_success();
         assert!(
-            result.stdout_contains("No vulnerabilities found in scanned packages."),
+            result.stdout_contains("No vulnerabilities found in assessed packages."),
             "audit scan did not complete: {}",
             result.combined_output()
         );
@@ -2024,7 +2024,7 @@ mod integration_scenarios {
         let result = project.run(&["audit"]);
         assert!(!result.stderr_contains("panicked at"));
         result.assert_success();
-        result.assert_stdout_contains("No vulnerabilities found in scanned packages.");
+        result.assert_stdout_contains("No vulnerabilities found in assessed packages.");
         assert_eq!(project.read_file("omg.lock").unwrap(), lock);
         assert_eq!(std::fs::read(&state_path).unwrap(), state);
         project.close_checked();
@@ -2080,6 +2080,7 @@ mod runtime_management {
         assert_eq!(fixture_program_hash(&binary), expected);
         assert_eq!(fixture_program_hash(&fixture), expected);
         std::fs::write(version_dir.join(".omg-install-complete"), "20.10.0\n").unwrap();
+        super::common::seed_runtime_advisory_fixture(&project, "node", "20.10.0").unwrap();
         let before_pin = std::fs::read(project.path().join(".nvmrc")).unwrap();
         let before_package = std::fs::read(project.path().join("package.json")).unwrap();
 

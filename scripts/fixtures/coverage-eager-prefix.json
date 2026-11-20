@@ -1,0 +1,193 @@
+{
+  "base": {
+    "source": [
+      "    fn payload_command_transmits_elevation_via_argv_marker() {",
+      "        // Regression: OMG_ELEVATED=1 in the child environment is stripped by",
+      "        // sudo's env_reset, which killed every fast-elevated path. The marker",
+      "        // must be part of argv instead.",
+      "        let exe = std::path::PathBuf::from(\"/usr/bin/omg\");",
+      "        let command = payload_command(",
+      "            std::path::Path::new(\"sudo\"),",
+      "            &exe,",
+      "            &[\"fullupdate\", \"--\"],",
+      "            true,",
+      "        );",
+      "        let argv = command.as_std().get_args().collect::<Vec<_>>();",
+      "        let marker_pos = argv",
+      "            .iter()",
+      "            .position(|a| *a == ELEVATED_MARKER)",
+      "            .expect(\"elevation marker missing from sudo payload argv\");",
+      "        // Layout: sudo … --  <exe>  <MARKER>  <payload args…>",
+      "        assert_eq!(argv[marker_pos - 1], \"/usr/bin/omg\");",
+      "        assert_eq!(argv[marker_pos + 1], \"fullupdate\");",
+      "        assert_eq!(argv[marker_pos + 2], \"--\");",
+      "    }"
+    ],
+    "owners": [
+      {
+        "name": "_RNCNvNtNtNtCs40j12eeWnis_7omg_lib4core9privilege5testss_51payload_command_transmits_elevation_via_argv_marker0B9_",
+        "count": 4,
+        "filenames": [
+          "/src/example.rs"
+        ],
+        "regions": [
+          [15, 27, 15, 29, 4, 0, 0, 0],
+          [15, 33, 15, 48, 4, 0, 0, 0]
+        ]
+      },
+      {
+        "name": "_RNvNtNtNtCs40j12eeWnis_7omg_lib4core9privilege5testss_51payload_command_transmits_elevation_via_argv_marker",
+        "count": 1,
+        "filenames": [
+          "/src/example.rs"
+        ],
+        "regions": [
+          [1, 5, 1, 61, 1, 0, 0, 0],
+          [5, 13, 5, 16, 1, 0, 0, 0],
+          [5, 19, 5, 43, 1, 0, 0, 0],
+          [6, 13, 6, 20, 1, 0, 0, 0],
+          [6, 23, 6, 38, 1, 0, 0, 0],
+          [7, 13, 7, 41, 1, 0, 0, 0],
+          [8, 13, 8, 17, 1, 0, 0, 0],
+          [9, 13, 9, 34, 1, 0, 0, 0],
+          [12, 13, 12, 17, 1, 0, 0, 0],
+          [12, 20, 12, 36, 1, 0, 0, 0],
+          [12, 37, 12, 45, 1, 0, 0, 0],
+          [12, 48, 12, 55, 1, 0, 0, 0],
+          [13, 13, 13, 23, 1, 0, 0, 0],
+          [13, 26, 14, 20, 1, 0, 0, 0],
+          [15, 14, 15, 22, 1, 0, 0, 0],
+          [16, 14, 16, 20, 1, 0, 0, 0],
+          [16, 21, 16, 70, 1, 0, 0, 0],
+          [18, 9, 18, 19, 1, 0, 0, 0],
+          [18, 20, 18, 40, 1, 0, 0, 0],
+          [19, 9, 19, 19, 1, 0, 0, 0],
+          [19, 20, 19, 40, 1, 0, 0, 0],
+          [20, 9, 20, 19, 1, 0, 0, 0],
+          [20, 20, 20, 40, 1, 0, 0, 0],
+          [21, 5, 21, 6, 1, 0, 0, 0]
+        ]
+      }
+    ],
+    "counts": [
+      [1, 1],
+      [5, 1],
+      [6, 1],
+      [7, 1],
+      [8, 1],
+      [9, 1],
+      [12, 1],
+      [13, 1],
+      [14, 1],
+      [15, 4],
+      [16, 1],
+      [18, 1],
+      [19, 1],
+      [20, 1],
+      [21, 1]
+    ],
+    "original_source": "src/core/privilege.rs",
+    "commit": "f2413f80ae56978e708cc2f5628b74ddc5fa5f7c",
+    "range": [1107, 1127]
+  },
+  "head": {
+    "source": [
+      "    fn payload_command_transmits_elevation_via_argv_marker() {",
+      "        // Regression: OMG_ELEVATED=1 in the child environment is stripped by",
+      "        // sudo's env_reset, which killed every fast-elevated path. The marker",
+      "        // must be part of argv instead.",
+      "        let exe = std::path::PathBuf::from(\"/usr/bin/omg\");",
+      "        let command = payload_command(",
+      "            std::path::Path::new(\"sudo\"),",
+      "            &exe,",
+      "            &[\"fullupdate\", \"--\"],",
+      "            true,",
+      "        )",
+      "        .expect(\"construct privileged payload\");",
+      "        let argv = command.as_std().get_args().collect::<Vec<_>>();",
+      "        let marker_pos = argv",
+      "            .iter()",
+      "            .position(|a| *a == ELEVATED_MARKER)",
+      "            .expect(\"elevation marker missing from sudo payload argv\");",
+      "        // Layout: sudo … --  <exe>  <MARKER>  <payload args…>",
+      "        assert_eq!(argv[marker_pos - 1], \"/usr/bin/omg\");",
+      "        assert_eq!(argv[marker_pos + 1], \"fullupdate\");",
+      "        assert_eq!(argv[marker_pos + 2], \"--\");",
+      "    }"
+    ],
+    "owners": [
+      {
+        "name": "_RNCNvNtNtNtCsjVdvAHsNP8N_7omg_lib4core9privilege5testss_51payload_command_transmits_elevation_via_argv_marker0B9_",
+        "count": 4,
+        "filenames": [
+          "/src/example.rs"
+        ],
+        "regions": [
+          [16, 27, 16, 29, 4, 0, 0, 0],
+          [16, 33, 16, 48, 4, 0, 0, 0]
+        ]
+      },
+      {
+        "name": "_RNvNtNtNtCsjVdvAHsNP8N_7omg_lib4core9privilege5testss_51payload_command_transmits_elevation_via_argv_marker",
+        "count": 1,
+        "filenames": [
+          "/src/example.rs"
+        ],
+        "regions": [
+          [1, 5, 1, 61, 1, 0, 0, 0],
+          [5, 13, 5, 16, 1, 0, 0, 0],
+          [5, 19, 5, 43, 1, 0, 0, 0],
+          [6, 13, 6, 20, 1, 0, 0, 0],
+          [6, 23, 6, 38, 1, 0, 0, 0],
+          [7, 13, 7, 41, 1, 0, 0, 0],
+          [8, 13, 8, 17, 1, 0, 0, 0],
+          [9, 13, 9, 34, 1, 0, 0, 0],
+          [12, 10, 12, 16, 1, 0, 0, 0],
+          [12, 17, 12, 47, 1, 0, 0, 0],
+          [13, 13, 13, 17, 1, 0, 0, 0],
+          [13, 20, 13, 36, 1, 0, 0, 0],
+          [13, 37, 13, 45, 1, 0, 0, 0],
+          [13, 48, 13, 55, 1, 0, 0, 0],
+          [14, 13, 14, 23, 1, 0, 0, 0],
+          [14, 26, 15, 20, 1, 0, 0, 0],
+          [16, 14, 16, 22, 1, 0, 0, 0],
+          [17, 14, 17, 20, 1, 0, 0, 0],
+          [17, 21, 17, 70, 1, 0, 0, 0],
+          [19, 9, 19, 19, 1, 0, 0, 0],
+          [19, 20, 19, 40, 1, 0, 0, 0],
+          [20, 9, 20, 19, 1, 0, 0, 0],
+          [20, 20, 20, 40, 1, 0, 0, 0],
+          [21, 9, 21, 19, 1, 0, 0, 0],
+          [21, 20, 21, 40, 1, 0, 0, 0],
+          [22, 5, 22, 6, 1, 0, 0, 0]
+        ]
+      }
+    ],
+    "counts": [
+      [1, 1],
+      [5, 1],
+      [6, 1],
+      [7, 1],
+      [8, 1],
+      [9, 1],
+      [12, 1],
+      [13, 1],
+      [14, 1],
+      [15, 1],
+      [16, 4],
+      [17, 1],
+      [19, 1],
+      [20, 1],
+      [21, 1],
+      [22, 1]
+    ],
+    "original_source": "src/core/privilege.rs",
+    "commit": "569c86166d1af45971ec68be4c49d33cdeb31332",
+    "range": [1183, 1204]
+  },
+  "provenance": {
+    "scope": "One-function projection for parser regression only; not global coverage acceptance",
+    "pair_artifact": 14179632934,
+    "pair_zip_sha256": "3bbb5a1285beab8963d71a3c6283921d7d962a0524b399c8c1657a959077a341"
+  }
+}

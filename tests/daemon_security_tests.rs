@@ -31,6 +31,92 @@ fn init_state() -> (TempDir, Arc<DaemonState>) {
 }
 
 #[tokio::test]
+async fn audit_append_failure_marks_the_explicit_daemon_collection_incomplete() -> anyhow::Result<()>
+{
+    const NAME: &str = "audit_append_failure_marks_the_explicit_daemon_collection_incomplete";
+    if common::isolated_fixture::run_isolated_test(NAME) {
+        return Ok(());
+    }
+    use omg_lib::core::security::audit::{
+        AuditEventType, AuditLogger, AuditSeverity, audit_log_nonblocking,
+        ensure_complete_collection, flush_pending_audit_events,
+    };
+
+    let directory = TempDir::new()?;
+    let socket = directory.path().join("omg.sock");
+    let status = directory.path().join("omg.status");
+    let backend = Arc::new(MockPackageManager::new(MockPackageDb::default()));
+    let state = Arc::new(DaemonState::new_isolated(
+        directory.path(),
+        PackageIndex::empty(),
+        backend,
+    )?);
+    let listener = tokio::net::UnixListener::bind(&socket)?;
+    let server = tokio::spawn(omg_lib::daemon::server::run(listener, state, socket));
+    let startup = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !status.try_exists()? {
+            anyhow::ensure!(
+                !server.is_finished(),
+                "isolated daemon exited before publishing status"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        anyhow::Ok(())
+    })
+    .await;
+    server.abort();
+    let stopped = server.await;
+    anyhow::ensure!(
+        matches!(&stopped, Err(error) if error.is_cancelled()),
+        "isolated daemon did not cancel cleanly: {stopped:?}"
+    );
+    startup??;
+
+    let log = directory.path().join("audit/audit.jsonl");
+    let history = directory.path().join("audit/retained.jsonl");
+    let marker = directory.path().join("audit/incomplete");
+    audit_log_nonblocking(
+        AuditEventType::SecurityAudit,
+        AuditSeverity::Info,
+        "fixture",
+        "first retained event",
+    );
+    flush_pending_audit_events()?;
+    let original = std::fs::read(&log)?;
+    ensure_complete_collection(&marker)?;
+    std::fs::rename(&log, &history)?;
+    std::fs::create_dir(&log)?;
+
+    audit_log_nonblocking(
+        AuditEventType::SecurityAudit,
+        AuditSeverity::Error,
+        "fixture",
+        "append must fail into an owned directory",
+    );
+    flush_pending_audit_events()?;
+    let error = ensure_complete_collection(&marker)
+        .expect_err("failed append must mark this collection incomplete");
+    assert!(
+        error.to_string().contains("Audit collection is incomplete"),
+        "{error:#}"
+    );
+    assert!(marker.is_file());
+    assert_eq!(
+        std::fs::read(&history)?,
+        original,
+        "existing audit history must survive the append failure"
+    );
+    let report = AuditLogger::new_in(history)?.verify_integrity()?;
+    assert!(report.is_valid());
+    assert_eq!(report.total_entries, 1);
+    assert!(
+        log.is_dir(),
+        "refusing the append must preserve the conflicting fixture inode"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 #[serial]
 async fn test_global_rate_limiting() {
     let (_temp_dir, state) = init_state();
@@ -51,6 +137,7 @@ async fn test_global_rate_limiting() {
     }
 
     assert!(limit_hit, "Should have hit global rate limit");
+    omg_lib::core::security::audit::flush_pending_audit_events().unwrap();
 }
 
 #[tokio::test]
@@ -82,19 +169,9 @@ async fn test_input_validation_audit() {
     let audit_dir = temp_dir.path().join("audit");
     let audit_file = audit_dir.join("audit.jsonl");
 
-    let content = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        loop {
-            if let Ok(content) = tokio::fs::read_to_string(&audit_file).await
-                && content.contains("policy_violation")
-                && content.contains("Invalid package name")
-            {
-                break content;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap_or_else(|_| panic!("Audit event was not written to {audit_file:?}"));
+    omg_lib::core::security::audit::flush_pending_audit_events().unwrap();
+    let content = std::fs::read_to_string(&audit_file)
+        .unwrap_or_else(|error| panic!("Audit event was not written to {audit_file:?}: {error}"));
 
     assert!(content.contains("policy_violation"));
     assert!(content.contains("Invalid package name"));
@@ -133,6 +210,7 @@ async fn test_health_endpoint_returns_status() {
         }
         Response::Error { message, .. } => unreachable!("Health endpoint failed: {}", message),
     }
+    omg_lib::core::security::audit::flush_pending_audit_events().unwrap();
 }
 
 #[tokio::test]
@@ -154,6 +232,7 @@ async fn test_ping_returns_pong() {
         }
         Response::Error { message, .. } => unreachable!("Ping failed: {}", message),
     }
+    omg_lib::core::security::audit::flush_pending_audit_events().unwrap();
 }
 
 #[tokio::test]
@@ -177,6 +256,7 @@ async fn test_cache_stats_handler() {
         }
         Response::Error { message, .. } => unreachable!("CacheStats failed: {}", message),
     }
+    omg_lib::core::security::audit::flush_pending_audit_events().unwrap();
 }
 
 #[tokio::test]
@@ -248,6 +328,7 @@ async fn test_cache_clear_handler() {
         } => assert_eq!(size, 0, "CacheClear must remove the populated query"),
         other => panic!("Expected cache statistics after clear, got: {other:?}"),
     }
+    omg_lib::core::security::audit::flush_pending_audit_events().unwrap();
 }
 
 #[tokio::test]
@@ -269,4 +350,5 @@ async fn test_explicit_count_handler() {
         }
         Response::Error { message, .. } => unreachable!("ExplicitCount failed: {}", message),
     }
+    omg_lib::core::security::audit::flush_pending_audit_events().unwrap();
 }

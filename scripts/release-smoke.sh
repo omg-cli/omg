@@ -53,7 +53,7 @@ load_distro() {
     arch)
       distro_suffix="-x86_64-linux-arch"
       distro_image="archlinux:latest@sha256:b0deabeb3d283da2c7f7dbf0eea051b7b2cd0554e0b737cc457fd21683bdcdd1"
-      distro_index_cmd="pacman-key --init && pacman-key --populate archlinux && pacman -Syu --noconfirm"
+      distro_index_cmd="pacman-key --init && pacman-key --populate archlinux && pacman -Syu --noconfirm && pacman -S --noconfirm python"
       distro_probe_pkg="tree"
       distro_installed_assert="pacman -Qi tree"
       distro_removed_assert="! pacman -Q tree"
@@ -61,14 +61,14 @@ load_distro() {
     debian)
       distro_suffix="-x86_64-linux-debian"
       distro_image="debian:bookworm@sha256:813017f3d62be4b5891a7acca6a01bdcd4b8513daa81b1ab99d3a50385b26931"
-      distro_index_cmd="apt-get update && apt-get install -y --no-install-recommends ca-certificates"
+      distro_index_cmd="apt-get update && apt-get install -y --no-install-recommends ca-certificates python3"
       distro_installed_assert="dpkg-query -W -f='\${db:Status-Abbrev}' tree | grep -q '^ii'"
       distro_removed_assert="! dpkg-query -W -f='\${db:Status-Abbrev}' tree | grep -q '^ii'"
       ;;
     ubuntu)
       distro_suffix="-x86_64-linux-ubuntu"
       distro_image="ubuntu:24.04@sha256:33ceb71981b602c1a7443a53469e4dba065f7503eab3078a2d7a57a2ab987517"
-      distro_index_cmd="apt-get update && apt-get install -y --no-install-recommends ca-certificates"
+      distro_index_cmd="apt-get update && apt-get install -y --no-install-recommends ca-certificates python3"
       distro_installed_assert="dpkg-query -W -f='\${db:Status-Abbrev}' tree | grep -q '^ii'"
       distro_removed_assert="! dpkg-query -W -f='\${db:Status-Abbrev}' tree | grep -q '^ii'"
       ;;
@@ -347,6 +347,12 @@ bin="${OMG_PROBE_ROOT:-/probe}/${OMG_PROBE_BIN}"
 daemon_bin="${bin%/omg}/omgd"
 if [[ -n "${OMG_PROBE_PHASE_FILE:-}" ]]; then printf 'prerequisite\n' > "$OMG_PROBE_PHASE_FILE"; fi
 bash -c "${OMG_PROBE_INDEX_CMD}" || exit 120
+if [[ "$OMG_SMOKE_PROBE_KIND" == install-tree || "$OMG_SMOKE_PROBE_KIND" == remove-tree ]]; then
+  consent_helper="${OMG_PROBE_ROOT:-/probe}/qemu-runtime-advisory-oracle.py"
+  [[ -f "$consent_helper" && ! -L "$consent_helper" ]] || exit 120
+  command -v python3 >/dev/null || exit 120
+  python3 -c 'import pty, select, signal' || exit 120
+fi
 if [[ -n "${OMG_PROBE_PHASE_FILE:-}" ]]; then printf 'product\n' > "$OMG_PROBE_PHASE_FILE"; fi
 version_line="$(printf '%s\n' "$("$bin" --version)" | head -n 1 | tr -d '[:space:]')"
 [[ "$version_line" == "omg${OMG_PROBE_VERSION_NUM}" ]]
@@ -367,7 +373,7 @@ case "$OMG_SMOKE_PROBE_KIND" in
     ' <<< "$search_output"
     ;;
   install-tree)
-    "$bin" install --yes tree || exit 1
+    python3 "$consent_helper" --native --accept-only --timeout "${OMG_PROBE_CONSENT_TIMEOUT:-300}" -- "$bin" install --yes tree || exit 1
     bash -c "${OMG_PROBE_INSTALLED_ASSERT}"
     ;;
   remove-tree)
@@ -376,7 +382,7 @@ case "$OMG_SMOKE_PROBE_KIND" in
     # expected exit instead of masking it as HARNESS_ERROR (see #277,
     # where "Package not found: tree" from install setup hid a real
     # repository-lookup defect behind exit 120).
-    "$bin" install --yes tree || exit 1
+    python3 "$consent_helper" --native --accept-only --timeout "${OMG_PROBE_CONSENT_TIMEOUT:-300}" -- "$bin" install --yes tree || exit 1
     bash -c "${OMG_PROBE_INSTALLED_ASSERT}" || exit 120
     "$bin" remove --yes tree || exit 1
     bash -c "${OMG_PROBE_REMOVED_ASSERT}"
@@ -496,8 +502,13 @@ run_case() (
   mkdir -p "$evidence_dir"
   args_entry="$(case_field args "$case_id")" || return 3
   probe_kind="$(probe_kind_for_args "$args_entry")" || return 3
-  write_probe "$stage/probe-${case_id}.sh"
-  cp "$stage/probe-${case_id}.sh" "$evidence_dir/probe.sh"
+  if ! write_probe "$stage/probe-${case_id}.sh" ||
+      ! cp "$stage/probe-${case_id}.sh" "$evidence_dir/probe.sh" ||
+      ! cp "$stage/qemu-runtime-advisory-oracle.py" "$evidence_dir/qemu-runtime-advisory-oracle.py"; then
+    printf 'HARNESS_ERROR: failed to preserve the probe and native advisory consent owner\n' > "$evidence_dir/transcript.txt"
+    write_result "$evidence_dir" "$case_id" "$distro" HARNESS_ERROR 3 0 "$expectation"
+    return 3
+  fi
   probe_bin="omg-${tag}${distro_suffix}/omg"
 
   cleanup_container() {
@@ -527,6 +538,7 @@ run_case() (
       OMG_PROBE_INSTALLED_ASSERT="$distro_installed_assert" \
       OMG_PROBE_REMOVED_ASSERT="$distro_removed_assert" \
       OMG_PROBE_ROOT="$stage" \
+      OMG_PROBE_CONSENT_TIMEOUT="$((timeout_seconds > 1500 ? 1500 : timeout_seconds))" \
       "$TIMEOUT_BIN" --kill-after=5s "${timeout_seconds}s" \
       bash -x "$stage/probe-${case_id}.sh" || observed_exit=$?
     trap - INT TERM
@@ -542,6 +554,7 @@ run_case() (
       -e OMG_PROBE_INSTALLED_ASSERT="$distro_installed_assert" \
       -e OMG_PROBE_REMOVED_ASSERT="$distro_removed_assert" \
       -e OMG_PROBE_ROOT=/probe \
+      -e OMG_PROBE_CONSENT_TIMEOUT="$((timeout_seconds > 1500 ? 1500 : timeout_seconds))" \
       -v "$stage:/probe:ro" \
       "$runtime_image" bash -x "/probe/probe-${case_id}.sh" || observed_exit=$?
     cleanup_container || cleanup_ok=false
@@ -624,6 +637,7 @@ prepare_fedora_cache_image() {
   printf 'FROM %s\n' "$distro_image" > "$recipe" || return 1
   cat >> "$recipe" <<'DOCKERFILE' || return 1
 RUN dnf config-manager setopt '*.skip_if_unavailable=False'
+RUN dnf install -y --setopt=install_weak_deps=False python3
 RUN dnf makecache --refresh
 DOCKERFILE
   cp "$recipe" "$run_evidence/fedora-cache-seed.Dockerfile" || return 1
@@ -685,6 +699,11 @@ run_distro() (
   fi
   if [[ ! -f "$stage/omg-${tag}${distro_suffix}/omgd" ]]; then
     record_harness_error "$distro" "release artifact does not contain the expected daemon binary"
+    return 3
+  fi
+  if [[ -e "$stage/qemu-runtime-advisory-oracle.py" || -L "$stage/qemu-runtime-advisory-oracle.py" ]] ||
+      ! cp "$repo_root/scripts/qemu-runtime-advisory-oracle.py" "$stage/qemu-runtime-advisory-oracle.py"; then
+    record_harness_error "$distro" "failed to stage the trusted native advisory consent owner"
     return 3
   fi
   if [[ "$executor" == "native" ]]; then

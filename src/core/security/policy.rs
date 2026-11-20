@@ -3,8 +3,8 @@
 //! Defines security policies for package approval/rejection based on
 //! vulnerabilities, licenses, and trust levels with A-F grading.
 
-use crate::package_managers::types::Version;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::fs;
 use std::io::{self, Read};
 use std::path::Path;
@@ -14,6 +14,7 @@ use thiserror::Error;
 use std::os::unix::fs::OpenOptionsExt;
 
 use crate::core::paths;
+use crate::package_managers::types::SecurityOrigin;
 
 const MAX_POLICY_BYTES: u64 = 1024 * 1024;
 
@@ -83,6 +84,19 @@ pub enum PolicyError {
     LicenseNotAllowed { name: String, license: String },
     #[error("Package '{name}' has unknown license, but allowed list is enforced")]
     LicenseUnknown { name: String },
+    #[error("Invalid Arch advisory repository scope: {reason}")]
+    AdvisoryScope { reason: String },
+    #[error(
+        "Package '{name}' has possible vulnerability matches with unknown applicability; minimum grade '{minimum}' requires review"
+    )]
+    PotentialFinding {
+        name: String,
+        minimum: SecurityGrade,
+    },
+    #[error("Package '{name}' has unknown advisory coverage: {reason}")]
+    UnknownCoverage { name: String, reason: String },
+    #[error("FreshSnapshot requires the private native prepared admission owner")]
+    PreparedAdmissionRequired,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -104,6 +118,15 @@ impl std::fmt::Display for SecurityGrade {
     }
 }
 
+#[derive(Debug, Default, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AdvisoryRequirement {
+    Optional,
+    #[default]
+    Review,
+    FreshSnapshot,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SecurityPolicy {
@@ -117,6 +140,37 @@ pub struct SecurityPolicy {
     pub allowed_licenses: Vec<String>,
     #[serde(default)]
     pub banned_packages: Vec<String>,
+    #[serde(default)]
+    pub advisory_requirement: AdvisoryRequirement,
+    #[serde(default, deserialize_with = "deserialize_advisory_repositories")]
+    pub arch_advisory_repositories: BTreeSet<String>,
+}
+
+fn deserialize_advisory_repositories<'de, D>(deserializer: D) -> Result<BTreeSet<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let repositories = BTreeSet::deserialize(deserializer)?;
+    validate_advisory_repositories(&repositories).map_err(serde::de::Error::custom)?;
+    Ok(repositories)
+}
+
+fn validate_advisory_repositories(repositories: &BTreeSet<String>) -> Result<(), PolicyError> {
+    if repositories.len() > 64
+        || repositories.iter().any(|name| {
+            name.is_empty()
+                || name.len() > 128
+                || !name.as_bytes()[0].is_ascii_alphanumeric()
+                || !name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"._+-".contains(&byte))
+        })
+    {
+        return Err(PolicyError::AdvisoryScope {
+            reason: "use at most 64 repository names of at most 128 ASCII letters, digits, '.', '_', '+' or '-'".into(),
+        });
+    }
+    Ok(())
 }
 
 const fn default_minimum_grade() -> SecurityGrade {
@@ -135,6 +189,8 @@ impl Default for SecurityPolicy {
             require_pgp: false,
             allowed_licenses: Vec::new(),
             banned_packages: Vec::new(),
+            advisory_requirement: AdvisoryRequirement::Optional,
+            arch_advisory_repositories: BTreeSet::new(),
         }
     }
 }
@@ -253,26 +309,94 @@ impl SecurityPolicy {
         Self::load_optional(paths::config_dir().join("policy.toml"))
     }
 
-    /// Assign a security grade to a package based on metadata
-    pub async fn assign_grade(
+    pub(crate) fn load_current() -> anyhow::Result<Self> {
+        let current = Self::load_optional(paths::config_dir().join("policy.toml"))?;
+        if let Some(inherited) = INHERITED_POLICY.get() {
+            anyhow::ensure!(
+                inherited == &current,
+                "Security policy changed after elevation; retry the operation"
+            );
+        }
+        Ok(current)
+    }
+
+    pub(crate) fn validate_advisory_scope(&self) -> Result<(), PolicyError> {
+        validate_advisory_repositories(&self.arch_advisory_repositories)
+    }
+
+    pub fn check_assessments(
         &self,
-        scanner: &dyn super::vulnerability::VulnerabilitySource,
-        name: &str,
-        version: &Version,
-        is_official: bool,
-    ) -> Result<SecurityGrade, super::vulnerability::VulnerabilityError> {
-        // An unavailable evidence source must not be treated as a clean package.
-        if !scanner.scan_package(name, version).await?.is_empty() {
-            return Ok(SecurityGrade::Risk);
+        assessments: &[super::vulnerability::PackageAssessment],
+    ) -> Result<(), PolicyError> {
+        self.validate_advisory_scope()?;
+        if self.advisory_requirement == AdvisoryRequirement::FreshSnapshot {
+            return Err(PolicyError::PreparedAdmissionRequired);
         }
+        self.check_sources_and_findings(assessments)
+    }
 
-        // Official packages are Verified (signed repository metadata). A Locked
-        // grade requires provenance evidence, which this function does not have.
-        if is_official {
-            return Ok(SecurityGrade::Verified);
+    #[must_use]
+    pub(crate) fn arch_repository_origin(&self, repository: &str) -> SecurityOrigin {
+        match repository {
+            "" => SecurityOrigin::Unknown,
+            repository if self.arch_advisory_repositories.contains(repository) => {
+                SecurityOrigin::ArchRepository {
+                    repository: repository.to_owned(),
+                }
+            }
+            repository => SecurityOrigin::OtherRepository {
+                repository: repository.to_owned(),
+            },
         }
+    }
 
-        Ok(SecurityGrade::Community)
+    #[must_use]
+    pub fn source_grade(origin: &crate::package_managers::types::SecurityOrigin) -> SecurityGrade {
+        use crate::package_managers::types::SecurityOrigin;
+        match origin {
+            SecurityOrigin::ArchRepository { .. }
+            | SecurityOrigin::OtherRepository { .. }
+            | SecurityOrigin::DistributionPackage => SecurityGrade::Verified,
+            SecurityOrigin::AurArchive
+            | SecurityOrigin::LocalArchive
+            | SecurityOrigin::NpmRegistry
+            | SecurityOrigin::CargoRegistry
+            | SecurityOrigin::PyPiRegistry
+            | SecurityOrigin::GoModule
+            | SecurityOrigin::RuntimeVendor { .. }
+            | SecurityOrigin::Unknown => SecurityGrade::Community,
+        }
+    }
+
+    pub(crate) fn check_sources_and_findings(
+        &self,
+        assessments: &[super::vulnerability::PackageAssessment],
+    ) -> Result<(), PolicyError> {
+        use crate::core::security::scan::FindingApplicability;
+        use crate::package_managers::types::SecurityOrigin;
+        for assessment in assessments {
+            let package = &assessment.package;
+            let license = combined_license_expression(package.licenses.iter().map(String::as_str));
+            self.check_source(&package.name, &package.origin, license.as_deref())?;
+            if assessment
+                .findings
+                .iter()
+                .any(|finding| finding.applicability == FindingApplicability::Applicable)
+            {
+                self.check_package(
+                    &package.name,
+                    matches!(package.origin, SecurityOrigin::AurArchive),
+                    license.as_deref(),
+                    SecurityGrade::Risk,
+                )?;
+            } else if !assessment.findings.is_empty() && self.minimum_grade > SecurityGrade::Risk {
+                return Err(PolicyError::PotentialFinding {
+                    name: crate::cli::style::sanitize_terminal_text(&package.name),
+                    minimum: self.minimum_grade,
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Check a package using the trust grade supplied by its source.
@@ -282,15 +406,15 @@ impl SecurityPolicy {
     pub fn check_source(
         &self,
         name: &str,
-        is_aur: bool,
+        origin: &SecurityOrigin,
         license: Option<&str>,
     ) -> Result<(), PolicyError> {
-        let grade = if is_aur {
-            SecurityGrade::Community
-        } else {
-            SecurityGrade::Verified
-        };
-        self.check_package(name, is_aur, license, grade)
+        self.check_package(
+            name,
+            matches!(origin, SecurityOrigin::AurArchive),
+            license,
+            Self::source_grade(origin),
+        )
     }
 
     /// Check if a package is allowed by policy
@@ -781,51 +905,313 @@ pub fn require_native_plan_support(backend: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Evaluate all additions after resolution, using actual archive/repository identities.
-pub fn check_prepared_packages(
-    packages: Vec<(String, Version, bool, Option<String>)>,
-) -> anyhow::Result<()> {
-    let policy = SecurityPolicy::load_default()?;
-    if !explicit_policy_exists() {
-        for (name, _, community, license) in packages {
-            policy.check_source(&name, community, license.as_deref())?;
-        }
-        return Ok(());
-    }
-    // ALPM's synchronous callback may run inside a Tokio current-thread runtime.
-    // A separate bounded worker owns its runtime rather than nesting block_on.
-    std::thread::spawn(move || -> anyhow::Result<()> {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?;
-        runtime.block_on(async move {
-            let scanner = super::vulnerability::VulnerabilityScanner::new();
-            check_prepared_with_source(&policy, packages, &scanner).await
-        })
-    })
-    .join()
-    .map_err(|_| anyhow::anyhow!("Prepared transaction policy worker failed"))?
-}
-
-async fn check_prepared_with_source(
-    policy: &SecurityPolicy,
-    packages: Vec<(String, Version, bool, Option<String>)>,
-    scanner: &dyn super::vulnerability::VulnerabilitySource,
-) -> anyhow::Result<()> {
-    for (name, version, community, license) in packages {
-        policy.check_source(&name, community, license.as_deref())?;
-        let grade = policy
-            .assign_grade(scanner, &name, &version, !community)
-            .await?;
-        policy.check_package(&name, community, license.as_deref(), grade)?;
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::core::security::vulnerability::VulnerabilityError;
+
+    #[test]
+    fn coverage17_fresh_public_assessment_requires_private_prepared_owner() {
+        use crate::core::security::scan::AdvisoryProvenance;
+        use crate::core::security::vulnerability::{PackageAssessment, PackageCoverage};
+        use crate::package_managers::types::{SecurityOrigin, SecurityPackage};
+        let policy = SecurityPolicy {
+            advisory_requirement: AdvisoryRequirement::FreshSnapshot,
+            ..SecurityPolicy::default()
+        };
+        let assessment = PackageAssessment {
+            package: SecurityPackage {
+                name: "candidate".into(),
+                version: "1-1".into(),
+                origin: SecurityOrigin::DistributionPackage,
+                advisory_source: None,
+                architecture: None,
+                description: String::new(),
+                licenses: vec!["MIT".into()],
+            },
+            coverage: PackageCoverage::Assessed {
+                provenance: AdvisoryProvenance::Osv {
+                    ecosystem: "Debian".into(),
+                },
+            },
+            findings: Vec::new(),
+        };
+        assert!(matches!(
+            policy.check_assessments(std::slice::from_ref(&assessment)),
+            Err(PolicyError::PreparedAdmissionRequired)
+        ));
+        let mut arch_assessment = assessment;
+        arch_assessment.package.origin = SecurityOrigin::ArchRepository {
+            repository: "core".into(),
+        };
+        arch_assessment.coverage = PackageCoverage::Assessed {
+            provenance: AdvisoryProvenance::ArchSnapshot {
+                payload_sha256: "00".repeat(32),
+                fetched_at: jiff::Timestamp::now(),
+                checked_at: jiff::Timestamp::now(),
+            },
+        };
+        assert!(matches!(
+            policy.check_assessments(&[arch_assessment]),
+            Err(PolicyError::PreparedAdmissionRequired)
+        ));
+        assert!(matches!(
+            policy.check_assessments(&[]),
+            Err(PolicyError::PreparedAdmissionRequired)
+        ));
+    }
+
+    #[test]
+    fn advisory_modes_distinguish_missing_legacy_and_explicit_optional_policy() -> anyhow::Result<()>
+    {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("policy.toml");
+        assert_eq!(
+            SecurityPolicy::load_optional(&path)?.advisory_requirement,
+            AdvisoryRequirement::Optional
+        );
+        let pure: SecurityPolicy = toml::from_str("")?;
+        assert_eq!(
+            pure,
+            SecurityPolicy {
+                advisory_requirement: AdvisoryRequirement::Review,
+                ..SecurityPolicy::default()
+            }
+        );
+        let wire: SecurityPolicy = serde_json::from_str("{}")?;
+        assert_eq!(wire, pure);
+        fs::write(&path, "minimum_grade = 'Community'\n")?;
+        assert_eq!(
+            SecurityPolicy::load(&path)?.advisory_requirement,
+            AdvisoryRequirement::Review
+        );
+        fs::write(&path, "advisory_requirement = 'optional'\n")?;
+        assert_eq!(
+            SecurityPolicy::load(&path)?.advisory_requirement,
+            AdvisoryRequirement::Optional
+        );
+        fs::write(
+            &path,
+            "advisory_requirement = 'fresh_snapshot'\narch_advisory_repositories = ['core', 'extra']\n",
+        )
+        .expect("write the fresh advisory policy fixture");
+        let policy = SecurityPolicy::load(&path)?;
+        assert_eq!(
+            policy.advisory_requirement,
+            AdvisoryRequirement::FreshSnapshot
+        );
+        assert_eq!(
+            policy.arch_advisory_repositories,
+            BTreeSet::from(["core".into(), "extra".into()])
+        );
+        let inherited: SecurityPolicy = serde_json::from_slice(&serde_json::to_vec(&policy)?)?;
+        assert_eq!(inherited, policy);
+        assert!(
+            serde_json::from_str::<SecurityPolicy>(
+                r#"{"arch_advisory_repositories":["core/foreign"]}"#
+            )
+            .is_err()
+        );
+        for invalid in [
+            "advisory_requirement = [",
+            "advisory_requirement = 'unsupported'",
+        ] {
+            fs::write(&path, invalid)?;
+            assert!(matches!(
+                SecurityPolicy::load(&path),
+                Err(PolicyError::Parse { path: reported, .. }) if reported == path.display().to_string()
+            ));
+        }
+        fs::write(&path, "arch_advisory_repositories = ['core\nspoof']\n")?;
+        assert!(SecurityPolicy::load(&path).is_err());
+        fs::write(&path, "arch_advisory_repositories = ['core/foreign']\n")?;
+        let invalid_scope = SecurityPolicy::load(&path).expect_err("invalid repository name");
+        assert!(matches!(
+            invalid_scope,
+            PolicyError::Parse { path: reported, source }
+                if reported == path.display().to_string()
+                    && source.to_string().contains("Invalid Arch advisory repository scope")
+        ));
+        let oversized = SecurityPolicy {
+            arch_advisory_repositories: (0..65).map(|index| format!("repo{index}")).collect(),
+            ..SecurityPolicy::default()
+        };
+        assert!(oversized.validate_advisory_scope().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn unknown_coverage_is_separate_from_source_grade_and_possible_findings() -> anyhow::Result<()>
+    {
+        use super::super::vulnerability::{PackageAssessment, UnknownCoverage};
+        use crate::package_managers::types::{SecurityOrigin, SecurityPackage};
+        let subject = SecurityPackage {
+            name: "candidate".into(),
+            version: "1-1".into(),
+            architecture: Some("x86_64".into()),
+            origin: SecurityOrigin::OtherRepository {
+                repository: "private".into(),
+            },
+            advisory_source: None,
+            description: String::new(),
+            licenses: vec!["MIT".into()],
+        };
+        let mut assessment = PackageAssessment::unknown(subject, UnknownCoverage::NotRequested);
+        let policy = SecurityPolicy {
+            minimum_grade: SecurityGrade::Verified,
+            ..SecurityPolicy::default()
+        };
+        policy.check_assessments(std::slice::from_ref(&assessment))?;
+        let fresh = SecurityPolicy {
+            advisory_requirement: AdvisoryRequirement::FreshSnapshot,
+            ..policy.clone()
+        };
+        assert!(matches!(
+            fresh.check_assessments(std::slice::from_ref(&assessment)),
+            Err(PolicyError::PreparedAdmissionRequired)
+        ));
+        assessment
+            .findings
+            .push(crate::core::security::scan::Vulnerability {
+                id: "AVG-fixture".into(),
+                summary: "Potential tracker match".into(),
+                score: None,
+                advisory_severity: None,
+                native_advisory: None,
+                affected_installed: vec![crate::core::security::scan::InstalledIdentity::from(
+                    &assessment.package,
+                )],
+                applicability: crate::core::security::scan::FindingApplicability::Possible,
+            });
+        assert!(matches!(
+            policy.check_assessments(std::slice::from_ref(&assessment)),
+            Err(PolicyError::PotentialFinding { .. })
+        ));
+        assessment.findings[0].applicability =
+            crate::core::security::scan::FindingApplicability::Applicable;
+        assert!(matches!(
+            policy.check_assessments(&[assessment]),
+            Err(PolicyError::GradeTooLow {
+                grade: SecurityGrade::Risk,
+                ..
+            })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn disabling_aur_does_not_reclassify_local_archives_as_aur() -> anyhow::Result<()> {
+        use super::super::vulnerability::{PackageAssessment, UnknownCoverage};
+        use crate::package_managers::types::{SecurityOrigin, SecurityPackage};
+        let package = |origin| SecurityPackage {
+            name: "fixture".into(),
+            version: "1-1".into(),
+            architecture: None,
+            origin,
+            advisory_source: None,
+            description: String::new(),
+            licenses: Vec::new(),
+        };
+        let policy = SecurityPolicy {
+            allow_aur: false,
+            ..SecurityPolicy::default()
+        };
+        policy.check_assessments(&[PackageAssessment::unknown(
+            package(SecurityOrigin::LocalArchive),
+            UnknownCoverage::NotRequested,
+        )])?;
+        assert!(matches!(
+            policy.check_assessments(&[PackageAssessment::unknown(
+                package(SecurityOrigin::AurArchive),
+                UnknownCoverage::NotRequested
+            )]),
+            Err(PolicyError::AurDisabled { .. })
+        ));
+        Ok(())
+    }
+
+    #[cfg(feature = "arch")]
+    #[tokio::test]
+    async fn prepared_policy_consumes_one_real_arch_snapshot_for_scoped_and_unknown_subjects()
+    -> anyhow::Result<()> {
+        use crate::core::security::vulnerability::{AssessmentUse, VulnerabilityScanner};
+        use crate::package_managers::types::{SecurityOrigin, SecurityPackage};
+        use sha2::{Digest, Sha256};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let payload = r#"[{"name":"AVG-fixture","packages":["fixture"],"status":"Fixed","severity":"High","affected":"1-1","fixed":"2-1","issues":["CVE-2026-1234"],"type":"code execution"}]"#;
+        let now = jiff::Timestamp::now().to_string();
+        let body = serde_json::json!({
+            "schema_version": 1,
+            "source": "arch-security",
+            "source_url": "https://security.archlinux.org/issues/all.json",
+            "fetched_at": now,
+            "checked_at": now,
+            "complete": true,
+            "payload_sha256": hex::encode(Sha256::digest(payload.as_bytes())),
+            "payload_json": payload,
+        })
+        .to_string();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await?;
+            let mut request = [0_u8; 4096];
+            let bytes = socket.read(&mut request).await?;
+            anyhow::ensure!(
+                std::str::from_utf8(&request[..bytes])?.starts_with("GET /v1/arch/advisories "),
+                "unexpected fixture request"
+            );
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await?;
+            socket.write_all(body.as_bytes()).await?;
+            Ok::<_, anyhow::Error>(())
+        });
+        let package = |origin| SecurityPackage {
+            name: "fixture".into(),
+            version: "1-1".into(),
+            architecture: Some("x86_64".into()),
+            origin,
+            advisory_source: None,
+            description: String::new(),
+            licenses: vec!["MIT".into()],
+        };
+        let packages = [
+            package(SecurityOrigin::ArchRepository {
+                repository: "declared".into(),
+            }),
+            package(SecurityOrigin::AurArchive),
+        ];
+        let scanner = VulnerabilityScanner::with_arch_endpoint(format!(
+            "http://{address}/v1/arch/advisories"
+        ));
+        let operation = scanner
+            .assess_arch_operation(&packages, AssessmentUse::Admission)
+            .await?;
+        tokio::time::timeout(std::time::Duration::from_secs(2), server).await???;
+        assert!(operation.assessments()[0].coverage.is_assessed());
+        assert!(!operation.assessments()[1].coverage.is_assessed());
+        operation.validate_now()?;
+        let policy = SecurityPolicy {
+            advisory_requirement: AdvisoryRequirement::Review,
+            ..SecurityPolicy::default()
+        };
+        assert!(matches!(
+            policy.check_assessments(&operation.assessments()[..1]),
+            Err(PolicyError::GradeTooLow { .. })
+        ));
+        assert!(matches!(
+            policy.check_assessments(&operation.assessments()[1..]),
+            Err(PolicyError::PotentialFinding { .. })
+        ));
+        Ok(())
+    }
 
     #[test]
     fn license_assessment_preserves_unknown_operands_and_exception_review() {
@@ -941,19 +1327,31 @@ mod tests {
         let licenses = combined_license_expression(["MIT", "GPL-3.0"]);
         assert!(
             policy
-                .check_source("multi", false, licenses.as_deref())
+                .check_source(
+                    "multi",
+                    &SecurityOrigin::DistributionPackage,
+                    licenses.as_deref()
+                )
                 .is_err()
         );
         let alternatives = combined_license_expression(["MIT OR Apache-2.0", "GPL-3.0"]);
         assert!(
             policy
-                .check_source("multi", false, alternatives.as_deref())
+                .check_source(
+                    "multi",
+                    &SecurityOrigin::DistributionPackage,
+                    alternatives.as_deref()
+                )
                 .is_err()
         );
         let allowed = combined_license_expression(["MIT"]);
         assert!(
             policy
-                .check_source("single", false, allowed.as_deref())
+                .check_source(
+                    "single",
+                    &SecurityOrigin::DistributionPackage,
+                    allowed.as_deref()
+                )
                 .is_ok()
         );
         assert!(combined_license_expression(std::iter::empty()).is_none());
@@ -1231,16 +1629,81 @@ mod tests {
     }
 
     #[test]
+    fn arch_repository_origin_uses_exact_declared_coordinates_and_preserves_unknown() {
+        let policy = SecurityPolicy {
+            arch_advisory_repositories: ["core".to_owned()].into(),
+            ..SecurityPolicy::default()
+        };
+        for (repository, expected) in [
+            ("", SecurityOrigin::Unknown),
+            (
+                "core",
+                SecurityOrigin::ArchRepository {
+                    repository: "core".into(),
+                },
+            ),
+            (
+                "Core",
+                SecurityOrigin::OtherRepository {
+                    repository: "Core".into(),
+                },
+            ),
+            (
+                "extra",
+                SecurityOrigin::OtherRepository {
+                    repository: "extra".into(),
+                },
+            ),
+        ] {
+            assert_eq!(policy.arch_repository_origin(repository), expected);
+        }
+        let invalid_empty_scope = SecurityPolicy {
+            arch_advisory_repositories: [String::new()].into(),
+            ..SecurityPolicy::default()
+        };
+        assert_eq!(
+            invalid_empty_scope.arch_repository_origin(""),
+            SecurityOrigin::Unknown
+        );
+        assert!(invalid_empty_scope.validate_advisory_scope().is_err());
+    }
+
+    #[test]
     fn source_policy_assigns_verified_grade_only_to_official_packages() {
         let policy = SecurityPolicy {
             minimum_grade: SecurityGrade::Verified,
             ..SecurityPolicy::default()
         };
-        assert!(policy.check_source("system", false, None).is_ok());
-        assert!(matches!(
-            policy.check_source("community", true, None),
-            Err(PolicyError::GradeTooLow { .. })
-        ));
+        for origin in [
+            SecurityOrigin::ArchRepository {
+                repository: "core".into(),
+            },
+            SecurityOrigin::OtherRepository {
+                repository: "fixture".into(),
+            },
+            SecurityOrigin::DistributionPackage,
+        ] {
+            assert!(policy.check_source("system", &origin, None).is_ok());
+        }
+        for origin in [
+            SecurityOrigin::AurArchive,
+            SecurityOrigin::LocalArchive,
+            SecurityOrigin::NpmRegistry,
+            SecurityOrigin::RuntimeVendor {
+                runtime: "node".into(),
+                vendor: "nodejs".into(),
+            },
+            SecurityOrigin::Unknown,
+        ] {
+            assert!(matches!(
+                policy.check_source("community", &origin, None),
+                Err(PolicyError::GradeTooLow {
+                    grade: SecurityGrade::Community,
+                    minimum: SecurityGrade::Verified,
+                    ..
+                })
+            ));
+        }
     }
 
     #[test]
@@ -1365,6 +1828,7 @@ mod tests {
             require_pgp: true,
             allowed_licenses: vec!["MIT".to_string()],
             banned_packages: vec!["banned".to_string()],
+            ..SecurityPolicy::default()
         };
         fs::write(&path, toml::to_string(&policy).expect("serialize policy"))
             .expect("write policy");
@@ -1430,40 +1894,60 @@ mod tests {
         ));
     }
 
-    struct EmptyVulns;
-
-    impl super::super::vulnerability::VulnerabilitySource for EmptyVulns {
-        fn scan_package<'a>(
-            &'a self,
-            _name: &'a str,
-            _version: &'a crate::package_managers::types::Version,
-        ) -> std::pin::Pin<
-            Box<
-                dyn std::future::Future<
-                        Output = Result<
-                            Vec<crate::core::security::vulnerability::VulnerabilityReport>,
-                            VulnerabilityError,
-                        >,
-                    > + Send
-                    + 'a,
-            >,
-        > {
-            Box::pin(async { Ok(Vec::new()) })
+    fn assessed_package(
+        name: &str,
+        origin: crate::package_managers::types::SecurityOrigin,
+        license: &str,
+    ) -> super::super::vulnerability::PackageAssessment {
+        super::super::vulnerability::PackageAssessment {
+            package: crate::package_managers::types::SecurityPackage {
+                name: name.into(),
+                version: "1.0.0".into(),
+                architecture: None,
+                advisory_source: None,
+                origin,
+                description: String::new(),
+                licenses: vec![license.into()],
+            },
+            coverage: super::super::vulnerability::PackageCoverage::Assessed {
+                provenance: crate::core::security::scan::AdvisoryProvenance::Osv {
+                    ecosystem: "fixture".into(),
+                },
+            },
+            findings: Vec::new(),
         }
+    }
+
+    fn update_service(
+        policy: SecurityPolicy,
+        source: std::sync::Arc<dyn super::super::vulnerability::VulnerabilitySource>,
+    ) -> anyhow::Result<crate::core::packages::PackageService> {
+        let backend = std::sync::Arc::new(crate::core::testing::TestPackageManager::new());
+        backend.set_updates(vec![crate::package_managers::types::UpdateInfo {
+            name: "candidate".into(),
+            old_version: "0.9".into(),
+            new_version: "1.0.0".into(),
+            repo: "distribution".into(),
+        }]);
+        crate::core::packages::PackageService::builder(backend)
+            .policy(policy)
+            .vulnerability_source(source)
+            .without_history()
+            .build()
     }
 
     struct FailingVulns;
 
     impl super::super::vulnerability::VulnerabilitySource for FailingVulns {
-        fn scan_package<'a>(
+        fn assess_packages<'a>(
             &'a self,
-            _name: &'a str,
-            _version: &'a crate::package_managers::types::Version,
+            _packages: &'a [crate::package_managers::types::SecurityPackage],
+            _use_case: super::super::vulnerability::AssessmentUse,
         ) -> std::pin::Pin<
             Box<
                 dyn std::future::Future<
                         Output = Result<
-                            Vec<crate::core::security::vulnerability::VulnerabilityReport>,
+                            Vec<super::super::vulnerability::PackageAssessment>,
                             VulnerabilityError,
                         >,
                     > + Send
@@ -1472,148 +1956,136 @@ mod tests {
         > {
             Box::pin(async {
                 Err(VulnerabilityError::Unavailable {
-                    reason: "osv unavailable".to_string(),
+                    reason: "osv unavailable".into(),
                 })
             })
         }
     }
 
-    #[tokio::test]
-    async fn prepared_plan_checks_dependencies_and_actual_licenses() {
+    #[test]
+    fn assessments_check_dependencies_and_actual_licenses() {
+        use crate::package_managers::types::SecurityOrigin;
         let mut policy = SecurityPolicy {
             allowed_licenses: vec!["MIT".to_owned()],
             ..SecurityPolicy::default()
         };
-        let package = |name: &str, license: &str| {
-            (
-                name.to_owned(),
-                crate::package_managers::parse_version_or_zero("1.0"),
-                false,
-                Some(license.to_owned()),
-            )
-        };
-        super::check_prepared_with_source(
-            &policy,
-            vec![package("app", "MIT"), package("dependency", "MIT")],
-            &EmptyVulns,
-        )
-        .await
-        .unwrap();
+        let package =
+            |name, license| assessed_package(name, SecurityOrigin::DistributionPackage, license);
+        policy
+            .check_assessments(&[package("app", "MIT"), package("dependency", "MIT")])
+            .unwrap();
         policy.banned_packages.push("dependency".to_owned());
-        assert!(
-            super::check_prepared_with_source(
-                &policy,
-                vec![package("app", "MIT"), package("dependency", "MIT")],
-                &EmptyVulns
-            )
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains("dependency")
-        );
+        assert!(matches!(
+            policy.check_assessments(&[package("app", "MIT"), package("dependency", "MIT")]),
+            Err(PolicyError::Banned { name }) if name == "dependency"
+        ));
         policy.banned_packages.clear();
         assert!(
-            super::check_prepared_with_source(
-                &policy,
-                vec![package("app", "GPL-3.0")],
-                &EmptyVulns
-            )
-            .await
-            .is_err()
+            policy
+                .check_assessments(&[package("app", "GPL-3.0")])
+                .is_err()
         );
     }
 
-    #[tokio::test]
-    async fn known_findings_remain_risky_without_a_numeric_score() {
-        use super::super::vulnerability::{VulnerabilityReport, VulnerabilitySource};
-        use crate::package_managers::types::VersionDisplay;
-        struct Finding(Option<String>);
-        impl VulnerabilitySource for Finding {
-            fn scan_package<'a>(
-                &'a self,
-                name: &'a str,
-                version: &'a Version,
-            ) -> std::pin::Pin<
-                Box<
-                    dyn std::future::Future<
-                            Output = Result<Vec<VulnerabilityReport>, VulnerabilityError>,
-                        > + Send
-                        + 'a,
-                >,
-            > {
-                assert_eq!(name, "candidate");
-                assert_eq!(version.version_string(), "1.0.0");
-                Box::pin(async move {
-                    Ok(vec![VulnerabilityReport {
-                        id: "fixture-advisory".to_owned(),
-                        summary: "Known vulnerable candidate".to_owned(),
-                        score: self.0.clone(),
-                    }])
-                })
-            }
-        }
-        let version = crate::package_managers::parse_version("1.0.0").unwrap();
+    #[test]
+    fn known_findings_remain_risky_without_a_numeric_score() {
+        use crate::package_managers::types::SecurityOrigin;
         let policy = SecurityPolicy {
             minimum_grade: SecurityGrade::Verified,
             ..SecurityPolicy::default()
         };
         for score in [None, Some("0"), Some("9.8")] {
-            for official in [false, true] {
-                let source = Finding(score.map(str::to_owned));
-                let grade = policy
-                    .assign_grade(&source, "candidate", &version, official)
-                    .await
-                    .unwrap();
-                assert_eq!(
-                    grade,
-                    SecurityGrade::Risk,
-                    "score={score:?}, official={official}"
+            for origin in [
+                SecurityOrigin::AurArchive,
+                SecurityOrigin::DistributionPackage,
+            ] {
+                let mut assessment = assessed_package("candidate", origin.clone(), "MIT");
+                assessment
+                    .findings
+                    .push(crate::core::security::scan::Vulnerability {
+                        id: "fixture-advisory".into(),
+                        summary: "Known vulnerable candidate".into(),
+                        score: score.map(str::to_owned),
+                        advisory_severity: None,
+                        native_advisory: None,
+                        affected_installed: vec![
+                            crate::core::security::scan::InstalledIdentity::from(
+                                &assessment.package,
+                            ),
+                        ],
+                        applicability:
+                            crate::core::security::scan::FindingApplicability::Applicable,
+                    });
+                let expected = if origin == SecurityOrigin::AurArchive {
+                    SecurityGrade::Community
+                } else {
+                    SecurityGrade::Risk
+                };
+                assert!(
+                    matches!(
+                        policy.check_assessments(std::slice::from_ref(&assessment)),
+                        Err(PolicyError::GradeTooLow { grade, .. }) if grade == expected
+                    ),
+                    "score={score:?}, origin={origin:?}"
                 );
-                assert!(matches!(
-                    policy.check_package("candidate", !official, Some("MIT"), grade),
-                    Err(PolicyError::GradeTooLow {
-                        grade: SecurityGrade::Risk,
-                        ..
-                    })
-                ));
+                let source_permitted = SecurityPolicy {
+                    minimum_grade: SecurityGrade::Community,
+                    ..policy.clone()
+                };
+                let refusal = source_permitted
+                    .check_assessments(&[assessment])
+                    .expect_err("a known finding must be refused even from a permitted source");
+                let expected_refusal = PolicyError::GradeTooLow {
+                    name: "candidate".into(),
+                    grade: SecurityGrade::Risk,
+                    minimum: SecurityGrade::Community,
+                };
+                let actual = (std::mem::discriminant(&refusal), refusal.to_string());
+                let expected = (
+                    std::mem::discriminant(&expected_refusal),
+                    expected_refusal.to_string(),
+                );
+                assert_eq!(actual, expected, "score={score:?}, origin={origin:?}");
             }
         }
     }
 
-    #[tokio::test]
-    async fn official_packages_are_verified_not_locked_by_name() {
-        let policy = SecurityPolicy::default();
-        let version = crate::package_managers::parse_version_or_zero("2.40");
-        let grade = policy
-            .assign_grade(&EmptyVulns, "glibc", &version, true)
-            .await
-            .expect("empty vuln source");
+    #[test]
+    fn official_packages_are_verified_not_locked_by_name() {
+        use crate::package_managers::types::SecurityOrigin;
+        let package = assessed_package("glibc", SecurityOrigin::DistributionPackage, "MIT");
         assert_eq!(
-            grade,
+            SecurityPolicy::source_grade(&package.package.origin),
             SecurityGrade::Verified,
             "package names must not mint a Locked SLSA grade"
         );
     }
 
-    #[tokio::test]
-    async fn aur_packages_are_community() {
-        let policy = SecurityPolicy::default();
-        let version = crate::package_managers::parse_version_or_zero("1.0");
-        let grade = policy
-            .assign_grade(&EmptyVulns, "yay", &version, false)
-            .await
-            .expect("empty vuln source");
-        assert_eq!(grade, SecurityGrade::Community);
+    #[test]
+    fn aur_packages_are_community() {
+        use crate::package_managers::types::SecurityOrigin;
+        let package = assessed_package("yay", SecurityOrigin::AurArchive, "MIT");
+        assert_eq!(
+            SecurityPolicy::source_grade(&package.package.origin),
+            SecurityGrade::Community
+        );
     }
 
     #[tokio::test]
     async fn unavailable_vuln_source_fails_closed() {
-        let policy = SecurityPolicy::default();
-        let version = crate::package_managers::parse_version_or_zero("1.0");
-        let error = policy
-            .assign_grade(&FailingVulns, "vim", &version, true)
+        let policy = SecurityPolicy {
+            advisory_requirement: AdvisoryRequirement::Review,
+            ..SecurityPolicy::default()
+        };
+        let service = update_service(policy, std::sync::Arc::new(FailingVulns))
+            .expect("build unavailable-source fixture");
+        let error = service
+            .update()
             .await
             .expect_err("missing evidence must not look like a clean package");
+        let error = error
+            .downcast::<VulnerabilityError>()
+            .expect("service must preserve the vulnerability error type");
         assert!(
             matches!(
                 error,
@@ -1811,6 +2283,7 @@ mod tests {
                     require_pgp: true,
                     allowed_licenses: vec!["MIT".into()],
                     banned_packages: vec!["blocked-fixture-package".into()],
+                    ..SecurityPolicy::default()
                 };
                 let file = directory.path().join("policy.toml");
                 fs::write(&file, toml::to_string(&policy)?)?;
@@ -1841,6 +2314,47 @@ mod tests {
                 Ok(())
             },
         )
+    }
+
+    #[test]
+    fn current_policy_refuses_changes_after_handoff() -> anyhow::Result<()> {
+        const TEST: &str =
+            "core::security::policy::tests::current_policy_refuses_changes_after_handoff";
+        if crate::core::testing::run_isolated_test(TEST)
+            || crate::config::Settings::rerun_test_unprivileged(TEST)
+        {
+            return Ok(());
+        }
+
+        assert!(!crate::core::privilege::is_root());
+        let directory = tempfile::tempdir()?;
+        temp_env::with_var("OMG_CONFIG_DIR", Some(directory.path()), || {
+            let inherited = SecurityPolicy {
+                allow_aur: false,
+                ..SecurityPolicy::default()
+            };
+            let file = directory.path().join("policy.toml");
+            fs::write(&file, toml::to_string(&inherited)?)?;
+            validate_inherited_policy(&inherited)?;
+            INHERITED_POLICY
+                .set(inherited.clone())
+                .expect("isolated handoff fixture");
+            assert_eq!(SecurityPolicy::load_current()?, inherited);
+
+            let updated = SecurityPolicy {
+                allow_aur: true,
+                ..inherited
+            };
+            let changed = toml::to_string(&updated)?;
+            fs::write(&file, &changed)?;
+            let error = SecurityPolicy::load_current().expect_err("changed policy must refuse");
+            assert_eq!(
+                error.to_string(),
+                "Security policy changed after elevation; retry the operation"
+            );
+            assert_eq!(fs::read_to_string(&file)?, changed);
+            Ok(())
+        })
     }
 
     #[test]
@@ -1879,12 +2393,13 @@ mod tests {
             !crate::core::privilege::is_root(),
             "fixture must be unprivileged"
         );
-        let policy: SecurityPolicy = toml::from_str("")?;
+        let policy: SecurityPolicy = toml::from_str("advisory_requirement = 'optional'")?;
         assert_eq!(
             policy,
             SecurityPolicy::default(),
             "omitted fields retain defaults"
         );
+        assert_eq!(policy.advisory_requirement, AdvisoryRequirement::Optional);
         assert!(policy.allow_aur, "the default allows AUR");
         let argument = format!(
             "{POLICY_MARKER}{}",
@@ -1991,7 +2506,7 @@ mod tests {
             Some(directory.path()),
             || -> anyhow::Result<()> {
                 require_native_plan_support("fixture-backend")?;
-                check_prepared_packages(Vec::new())?;
+                SecurityPolicy::load_default()?.check_assessments(&[])?;
                 let path = directory.path().join("policy.toml");
                 let policy = SecurityPolicy {
                     banned_packages: vec!["blocked-dependency".into()],
@@ -2006,20 +2521,23 @@ mod tests {
                         .to_string()
                         .contains("fixture-backend cannot enforce an explicit OMG policy")
                 );
-                let error = check_prepared_packages(vec![(
-                    "blocked-dependency".into(),
-                    crate::package_managers::parse_version_or_zero("1.0"),
-                    false,
-                    Some("MIT".into()),
-                )])
-                .expect_err("resolved banned dependencies must refuse before scanning");
+                let loaded = SecurityPolicy::load_default()?;
+                let error = loaded
+                    .check_assessments(&[assessed_package(
+                        "blocked-dependency",
+                        crate::package_managers::types::SecurityOrigin::DistributionPackage,
+                        "MIT",
+                    )])
+                    .expect_err(
+                        "resolved banned dependencies must be refused by the loaded policy",
+                    );
                 assert!(
-                    matches!(error.downcast_ref::<PolicyError>(), Some(PolicyError::Banned { name }) if name == "blocked-dependency")
+                    matches!(error, PolicyError::Banned { name } if name == "blocked-dependency")
                 );
                 assert_eq!(fs::read_to_string(&path)?, bytes);
                 fs::write(&path, "require_pgp = 'invalid'")?;
                 assert!(require_native_plan_support("fixture-backend").is_err());
-                assert!(check_prepared_packages(Vec::new()).is_err());
+                assert!(SecurityPolicy::load_default().is_err());
                 assert_eq!(fs::read_to_string(&path)?, "require_pgp = 'invalid'");
                 Ok(())
             },
@@ -2028,33 +2546,44 @@ mod tests {
 
     #[tokio::test]
     async fn mutation_prepared_grade_preserves_official_identity() -> anyhow::Result<()> {
+        use crate::package_managers::types::SecurityOrigin;
         let policy = SecurityPolicy {
             minimum_grade: SecurityGrade::Verified,
             ..SecurityPolicy::default()
         };
-        let package = |community| {
-            vec![(
-                "candidate".into(),
-                crate::package_managers::parse_version_or_zero("1.0"),
-                community,
-                Some("MIT".into()),
-            )]
-        };
-        check_prepared_with_source(&policy, package(false), &EmptyVulns).await?;
-        let error = check_prepared_with_source(&policy, package(true), &EmptyVulns)
-            .await
+        policy.check_assessments(&[assessed_package(
+            "candidate",
+            SecurityOrigin::DistributionPackage,
+            "MIT",
+        )])?;
+        let error = policy
+            .check_assessments(&[assessed_package(
+                "candidate",
+                SecurityOrigin::AurArchive,
+                "MIT",
+            )])
             .expect_err("community identity cannot become official");
         assert!(matches!(
-            error.downcast_ref::<PolicyError>(),
-            Some(PolicyError::GradeTooLow {
+            error,
+            PolicyError::GradeTooLow {
                 grade: SecurityGrade::Community,
                 ..
-            })
+            }
         ));
+        let service = update_service(
+            SecurityPolicy {
+                advisory_requirement: AdvisoryRequirement::Review,
+                ..policy
+            },
+            std::sync::Arc::new(FailingVulns),
+        )
+        .expect("construct the fake package-service fixture");
+        let error = service
+            .update()
+            .await
+            .expect_err("review must preserve unavailable evidence");
         assert!(
-            check_prepared_with_source(&policy, package(false), &FailingVulns)
-                .await
-                .is_err()
+            matches!(error.downcast_ref::<VulnerabilityError>(), Some(VulnerabilityError::Unavailable { reason }) if reason == "osv unavailable")
         );
         Ok(())
     }
@@ -2071,32 +2600,38 @@ mod tests {
         }
         assert!(!crate::core::privilege::is_root());
         let directory = tempfile::tempdir()?;
+        let data_dir = directory.path().join("data");
         temp_env::with_vars(
             [
                 ("OMG_CONFIG_DIR", Some(directory.path().as_os_str())),
+                ("OMG_DATA_DIR", Some(data_dir.as_os_str())),
                 ("OMG_TEST_MODE", Some(std::ffi::OsStr::new("1"))),
-                ("OMG_TEST_DISTRO", Some(std::ffi::OsStr::new("fedora"))),
             ],
             || -> anyhow::Result<()> {
-                assert_eq!(
-                    crate::core::env::distro::detect_distro(),
-                    crate::core::env::distro::Distro::Fedora
-                );
-                let package = || {
-                    vec![(
-                        "candidate".into(),
-                        crate::package_managers::parse_version_or_zero("1.0"),
-                        false,
-                        Some("MIT".into()),
-                    )]
-                };
-                check_prepared_packages(package())?;
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?;
+                let offline = update_service(
+                    SecurityPolicy::load_default()?,
+                    std::sync::Arc::new(FailingVulns),
+                )
+                .expect("construct the fake offline package-service fixture");
+                runtime.block_on(offline.update())?;
                 let path = directory.path().join("policy.toml");
-                let bytes = toml::to_string(&SecurityPolicy::default())?;
+                let mut legacy = toml::Value::try_from(SecurityPolicy::default())?;
+                legacy
+                    .as_table_mut()
+                    .expect("policy table")
+                    .remove("advisory_requirement");
+                let bytes = toml::to_string(&legacy)?;
                 fs::write(&path, &bytes)?;
-                let error = check_prepared_packages(package()).expect_err("explicit policy requires available advisory evidence even when all fields have their default values");
+                let loaded = SecurityPolicy::load_default()?;
+                assert_eq!(loaded.advisory_requirement, AdvisoryRequirement::Review);
+                let service = update_service(loaded, std::sync::Arc::new(FailingVulns))
+                    .expect("construct the fake policy-enforcing package-service fixture");
+                let error = runtime.block_on(service.update()).expect_err("explicit policy requires available advisory evidence even when all legacy fields have their default values");
                 assert!(
-                    matches!(error.downcast_ref::<VulnerabilityError>(), Some(VulnerabilityError::Unavailable { reason }) if reason == "OSV has no configured ecosystem for the running package backend")
+                    matches!(error.downcast_ref::<VulnerabilityError>(), Some(VulnerabilityError::Unavailable { reason }) if reason == "osv unavailable")
                 );
                 assert_eq!(fs::read_to_string(&path)?, bytes);
                 Ok(())

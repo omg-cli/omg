@@ -49,15 +49,24 @@ omg audit scan
 omg audit scan --fail-on-findings # CI gate: nonzero when findings exist
 ```
 
-Published v0.1.223 requires a running `omgd` for `omg audit scan`. The newer main checkout
-prefers the daemon so repeated scans can reuse its warm cache, but creates the selected
-backend and scanner itself when the daemon is unavailable. In that newer checkout, Arch uses
+OMG prefers the daemon so repeated scans can reuse its warm cache, but creates the selected
+backend and scanner itself when the daemon is unavailable. Arch uses
 Arch Linux Security Advisory data. Fedora uses native DNF advisories. Debian and Ubuntu
 query OSV using their distribution release as the ecosystem. Missing findings are not
 proof that a package is free of vulnerabilities. Do not treat one distribution's
 advisories as coverage for another.
 
+Reports separate advisory coverage from findings. Packages whose advisory applicability is unknown stay visible even when no published record matches. Current Arch installed-package metadata does not prove historical repository origin. An observed repository match is not installation provenance; tracker matches for an unproved origin are reported as possible matches. Possible matches retain their alerts and finding counts, but they are not automatic remediation targets. A legacy JSON report without coverage information is unreported, not a complete scan. The CLI and daemon must both speak IPC protocol 5; mismatched binary frames are rejected before decoding. Update the pair together. The current CLI can perform a direct native audit when an older daemon cannot answer.
+
 The default scan reports findings without failing solely because it found them. Use `--fail-on-findings` when a CI job must fail on any finding. This does not make its human-readable output a documented JSON alert interface. `omg audit fix --dry-run` previews available package updates on the Arch backend; an available update is not proof that every advisory is fixed.
+
+## Install-time vulnerability review
+
+In v0.1.225, OMG checks proposed package versions and managed runtimes before installation or activation. Managed npm, Cargo, Go and Python tools include their resolved public-registry dependencies. Native transaction and provider coverage varies; Homebrew, unresolved sources and incomplete native mappings remain Unknown.
+
+When a review finds a disclosed vulnerability, OMG displays the affected version and advisory links. To proceed, the terminal owner must type the exact `accept <review-id>` response shown by the prompt. Missing coverage also requires explicit risk acceptance. Blank input, generic `--yes` and unattended execution do not accept either risk. Consent is checked again against the reviewed versions, artifacts, policy and caller before installation; it cannot bypass signature or integrity failures.
+
+This covers operations performed through OMG. Public advisory feeds cannot establish the absence of undisclosed zero-days. EPSS scores help prioritize known CVEs; a low score does not prove safety. See the [v0.1.225 release notes](releases/v0.1.225.md) for backend-specific limits and upgrade requirements.
 
 ## Security grades
 
@@ -74,6 +83,35 @@ omg audit policy
 ```
 
 The policy supports minimum grades, AUR restrictions, package bans, PGP requirements, and license allowlists. See [configuration](./configuration.md).
+
+Advisory requirements are separate from source trust and the AUR build profile:
+
+| `advisory_requirement` | Behavior |
+| --- | --- |
+| `optional` | Permit attended installation with unavailable advisory evidence after explicit Unknown-coverage consent. Source and license rules still apply. |
+| `review` | Require advisory evidence for policy review. Validated review-cache reuse is permitted. |
+| `fresh_snapshot` | Require one fresh Arch snapshot for the final prepared operation, after ALPM locking and dependency resolution. Recheck its age and the complete prepared identity before commit. |
+
+When no policy file exists, OMG uses the built-in `optional` behavior. An existing policy file that omits the new field keeps evidence-required `review` behavior. Write `optional` explicitly to opt out of that requirement. Package bans, source restrictions and license rules still apply in every mode.
+
+Arch install and upgrade transactions attempt an advisory lookup even in `optional` mode. Findings and Unknown coverage require an attended security review, including when the feed is unavailable. OMG shows the selected versions, coverage gaps, advisory IDs and available URLs, then asks you to type `accept` followed by the displayed review ID. Blank input, refusal, disconnection and timeout cancel installation. `--yes` does not answer this security prompt. Accepting disclosed advisory risk permits that exact transaction; it does not change the findings, establish missing coverage, or override source, license, package-ban, signature or archive-integrity checks. Changed versions, policy, invoking identity or archive bytes invalidate the review before commit. FreshSnapshot retains its separate exact-archive acknowledgement and requires assessed official packages.
+
+Transaction consent also applies to prepared APT and DNF operations, Homebrew coverage gaps, managed npm/Cargo/Go/pip tools, and the 13 managed runtimes. Coverage varies by provider and exact package identity. DNF's installed-only advisory interface, unresolved local Debian dependencies and Homebrew's unfrozen transaction remain explicitly Unknown. No feed can establish that an undisclosed zero-day does not exist.
+
+For a fresh Arch admission, declare which configured repositories use Arch Linux Security Tracker coordinates. For example, if these repository names have that meaning in your configuration:
+
+```toml
+# ~/.config/omg/policy.toml
+advisory_requirement = "fresh_snapshot"
+arch_advisory_repositories = ["core", "extra", "multilib"]
+```
+
+This declaration supplies coordinate applicability. It does not authenticate an Arch publisher or replace package signature and archive verification. A custom repository does not acquire Arch coverage merely by sharing a package name. Fresh admission refuses a prepared repository or dependency outside the declared scope; an empty scope cannot silently admit repository packages as covered.
+
+AUR and local archives remain outside that distribution feed's proven applicability. Fresh admission requires a bounded, attended confirmation owned by the privileged operation for the exact final archive batch. `--yes` and a parent-supplied approval flag cannot supply that confirmation. Consent permits the disclosed Unknown coverage; it never changes Unknown to assessed or verified. Decline, timeout, stale evidence or changed identities refuse before package commit. Fresh admission also refuses when another component already owns the cancellation signal handlers; it does not replace those handlers. The final check includes resolved dependencies and replacements, not only the names requested at the CLI.
+
+The source's freshness window and published coverage still limit a fresh snapshot. It is not proof that every public CVE applies to every package, or that arbitrary AUR code is safe. The Cloudflare CVE baseline and AUR applicability mapping remain incomplete.
+
 
 A populated legacy `[security]` section in `config.toml` fails both settings and default policy loading, including when `policy.toml` already exists. Manually reconcile its controls into top-level `policy.toml` keys and then remove the legacy section. Validate supported values instead of blindly copying them: `minimum_grade` accepts `Risk`, `Community`, `Verified`, and `Locked`. OMG leaves both files unchanged. An empty legacy section is accepted. Fresh installer configs use the current settings schema.
 

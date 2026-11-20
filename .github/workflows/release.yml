@@ -569,7 +569,9 @@ jobs:
           name: macos-build
           path: staged-release
       - name: Install GNU timeout
-        run: brew install coreutils
+        run: |
+          brew install coreutils python@3.13
+          echo "$(brew --prefix python@3.13)/libexec/bin" >> "$GITHUB_PATH"
       - name: Pin staged macOS archive to builder digest
         env:
           ARCHIVE_SHA256: ${{ needs.build-macos.outputs.archive_sha256 }}
@@ -664,12 +666,21 @@ jobs:
           ./scripts/collect-release-artifacts.sh "$VERSION" artifacts release
 
       - name: Attest release archives and SBOM
+        id: attest
         if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.event.inputs.dry_run == 'false')
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: |
             release/*.tar.gz
             release/*.cdx.json
+
+      - name: Attach release signature bundle
+        if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.event.inputs.dry_run == 'false')
+        env:
+          ATTESTATION_BUNDLE: ${{ steps.attest.outputs.bundle-path }}
+        run: |
+          test -s "$ATTESTATION_BUNDLE"
+          cp -- "$ATTESTATION_BUNDLE" release/omg-release.sigstore.json
 
       - name: Generate Release Notes
         id: release_notes
@@ -710,6 +721,10 @@ jobs:
             echo "::error::Expected $RELEASE_TAG to identify $EXPECTED_COMMIT, got ${tag_commit:-missing}"
             exit 1
           fi
+
+      - name: Require verified advisory baseline before GitHub publication
+        if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.event.inputs.dry_run == 'false')
+        run: python3 scripts/advisory-baseline.py status
 
       - name: Publish GitHub Release
         if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.event.inputs.dry_run == 'false')
@@ -825,6 +840,9 @@ jobs:
       - name: Install pinned wrangler from vendored lockfile
         run: npm ci --prefix .github/deps/release-tools
 
+      - name: Require verified advisory baseline before R2 publication
+        run: python3 scripts/advisory-baseline.py status
+
       - name: Upload release artifacts to R2
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -899,6 +917,7 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
+          python3 scripts/advisory-baseline.py status
           WRANGLER="$PWD/.github/deps/release-tools/node_modules/.bin/wrangler"
           # Keep the bucket-served installer current so a pinned release URL
           # never serves a stale bootstrap script (getomg.xyz/install.sh is

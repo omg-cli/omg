@@ -58,6 +58,31 @@ def bundle(provenance, payload, extra=None):
 
 
 class NativeBuildAdmission(unittest.TestCase):
+    def test_inconsistent_artifact_snapshot_requests_fresh_complete_metadata(self):
+        url = 'repos/omg-cli/omg/actions/runs/10/artifacts?per_page=100'
+        artifact = {'name': 'native-release-arch-1', 'id': 45}
+        complete = {'total_count': 1, 'artifacts': [artifact]}
+        for incomplete in ({'total_count': 1, 'artifacts': []},
+                           {'total_count': 0, 'artifacts': [artifact]}):
+            with self.subTest(incomplete=incomplete), \
+                    patch.object(BUILD, 'api_json', side_effect=[incomplete, complete]) as lookup, \
+                    patch.object(BUILD.time, 'sleep') as sleep:
+                self.assertEqual(BUILD.read_native_artifact_listing('omg-cli/omg', 10), complete)
+                self.assertEqual([call.args for call in lookup.call_args_list], [(url,), (url,)])
+                sleep.assert_called_once_with(1)
+
+    def test_artifact_listing_rejects_malformed_or_unresolved_metadata(self):
+        for listing, requests in (({'total_count': 101, 'artifacts': []}, 1),
+                                  ({'total_count': True, 'artifacts': []}, 1),
+                                  ({'total_count': 1, 'artifacts': [None]}, 1),
+                                  ({'total_count': 1, 'artifacts': []}, 3)):
+            with self.subTest(listing=listing), patch.object(BUILD, 'api_json', return_value=listing) as lookup, \
+                    patch.object(BUILD.time, 'sleep') as sleep:
+                with self.assertRaisesRegex(ValueError, 'artifact list'):
+                    BUILD.read_native_artifact_listing('omg-cli/omg', 10)
+                self.assertEqual(lookup.call_count, requests)
+                self.assertEqual(sleep.call_count, requests - 1)
+
     def test_metadata_attempts_share_the_original_wall_clock_deadline(self):
         clock = [0.0]
         timeouts = []
@@ -65,7 +90,7 @@ class NativeBuildAdmission(unittest.TestCase):
                                            (200, b'{"id":42}')])
         elapsed = iter((30, 20, 1))
 
-        def request(argv, *, stdout, check, timeout):
+        def request(argv, *, stdout, check, timeout, stderr=None):
             timeouts.append(timeout)
             clock[0] += next(elapsed)
             return response(argv, stdout=stdout, check=check, timeout=timeout)
@@ -83,7 +108,7 @@ class NativeBuildAdmission(unittest.TestCase):
             clock = [0.0]
             response = self.metadata_response([(503, b'{}'), (200, b'{"id":42}')])
 
-            def request(argv, *, stdout, check, timeout):
+            def request(argv, *, stdout, check, timeout, stderr=None):
                 clock[0] += elapsed
                 if failure is subprocess.TimeoutExpired:
                     raise subprocess.TimeoutExpired(argv, timeout)
@@ -102,7 +127,7 @@ class NativeBuildAdmission(unittest.TestCase):
     def metadata_response(responses):
         responses = iter(responses)
 
-        def request(argv, *, stdout, check, timeout):
+        def request(argv, *, stdout, check, timeout, stderr=None):
             response = next(responses)
             if isinstance(response, subprocess.TimeoutExpired):
                 stdout.write(b'partial response, never reusable')
@@ -131,6 +156,39 @@ class NativeBuildAdmission(unittest.TestCase):
                 self.assertEqual(actual, {'id': 42})
                 self.assertEqual(request.call_count, 2)
                 sleep.assert_called_once_with(1)
+
+    def test_truncated_github_metadata_retries_without_using_the_partial_response(self):
+        path = 'repos/omg-cli/omg/actions/runs/10/attempts/2/jobs?per_page=100'
+        for header, status, expected_calls in [
+            (b'', None, 2),
+            (b'HTTP/2.0 200\r\nContent-Type: application/json\r\n\r\n', 200, 2),
+            (b'HTTP/2.0 403\r\nRetry-After: 10\r\n\r\n', 403, 1),
+        ]:
+            with self.subTest(status=status):
+                response = self.metadata_response([(200, b'{"total_count":0,"jobs":[]}')])
+                first = True
+
+                def run(argv, *, stdout, check, timeout, stderr=None):
+                    nonlocal first
+                    if not first:
+                        return response(argv, stdout=stdout, check=check, timeout=timeout)
+                    first = False
+                    stdout.write(header)
+                    diagnostic = b'unexpected end of JSON input\n'
+                    if stderr is not None:
+                        stderr.write(diagnostic)
+                    raise subprocess.CalledProcessError(1, argv, stderr=diagnostic)
+
+                with patch.object(BUILD.subprocess, 'run', side_effect=run) as request, \
+                        patch.object(BUILD.time, 'sleep') as sleep:
+                    if expected_calls == 1:
+                        with self.assertRaises(subprocess.CalledProcessError):
+                            BUILD.api_json(path)
+                        sleep.assert_not_called()
+                    else:
+                        self.assertEqual(BUILD.api_json(path), {'total_count': 0, 'jobs': []})
+                        sleep.assert_called_once_with(1)
+                    self.assertEqual(request.call_count, expected_calls)
 
     def test_metadata_timeouts_and_gateway_failures_share_three_attempt_budget(self):
         path = 'repos/omg-cli/omg/actions/workflows/ci.yml'
@@ -183,7 +241,7 @@ class NativeBuildAdmission(unittest.TestCase):
         path = 'repos/omg-cli/omg/actions/workflows/ci.yml'
         for data in (b'', b'HTTP/2.0 200 OK\nContent-Type: application/json\r\n\r\n{}',
                      b'HTTP/2.0 503 Unavailable\nRetry-After: 60\r\n\r\n{}'):
-            def failed_process(argv, *, stdout, check, timeout):
+            def failed_process(argv, *, stdout, check, timeout, stderr=None):
                 stdout.write(data)
                 raise subprocess.CalledProcessError(1, argv)
 
@@ -232,14 +290,34 @@ class NativeBuildAdmission(unittest.TestCase):
             with self.assertRaisesRegex(BUILD.ArtifactUnavailable, 'required native artifact'):
                 BUILD.find_native_artifact(Path(directory), 'debian', context, event)
 
-    def test_artifact_download_retries_only_a_transport_timeout(self):
+    def test_artifact_download_recovers_with_a_fresh_response_after_gateway_failure(self):
+        path = 'repos/omg-cli/omg/actions/artifacts/123/zip'
+        archive = b'PK\x03\x04fixture-bytes\r\n\r\nwith-binary-separators'
+        replies = self.metadata_response([(503, b'service unavailable'), (200, archive)])
+        with patch.object(BUILD.subprocess, 'run', side_effect=replies) as request, \
+                patch.object(BUILD.time, 'sleep') as sleep:
+            self.assertEqual(BUILD.download_artifact(path), archive)
+        self.assertEqual(request.call_count, 2)
+        sleep.assert_called_once_with(1)
+
+        for status in (401, 403, 404, 429):
+            with self.subTest(status=status), patch.object(BUILD.subprocess, 'run',
+                    side_effect=self.metadata_response([(status, b'refused')])) as request:
+                with self.assertRaises(subprocess.CalledProcessError):
+                    BUILD.download_artifact(path)
+                self.assertEqual(request.call_count, 1)
+
+    def test_artifact_download_retries_transport_timeouts(self):
         path = 'repos/omg-cli/omg/actions/artifacts/123/zip'
         timeout = subprocess.TimeoutExpired(['gh', 'api', path], 90)
-        with patch.object(BUILD, 'api', side_effect=[timeout, b'verified bundle']) as request, \
+        response = b'HTTP/1.1 200 OK\r\n\r\nverified bundle'
+        limit = BUILD.MAX_DOWNLOAD + BUILD.MAX_HTTP_HEADERS
+        with patch.object(BUILD, 'api', side_effect=[timeout, response]) as request, \
                 patch.object(BUILD.time, 'sleep') as sleep:
             self.assertEqual(BUILD.download_artifact(path), b'verified bundle')
         self.assertEqual(request.call_count, 2)
-        request.assert_any_call(path, BUILD.MAX_DOWNLOAD)
+        self.assertEqual(request.call_args.args, (path, limit))
+        self.assertTrue(request.call_args.kwargs['include_status'])
         sleep.assert_called_once_with(1)
 
         with patch.object(BUILD, 'api', side_effect=timeout) as request, \
@@ -253,7 +331,8 @@ class NativeBuildAdmission(unittest.TestCase):
         with patch.object(BUILD, 'api', side_effect=rejected) as request:
             with self.assertRaises(subprocess.CalledProcessError):
                 BUILD.download_artifact(path)
-        request.assert_called_once_with(path, BUILD.MAX_DOWNLOAD)
+        self.assertEqual(request.call_count, 1)
+        self.assertEqual(request.call_args.args, (path, limit))
 
     def test_trixie_pair_retains_its_native_abi_recipe_identity(self):
         expected, provenance, payload = fixture('debian-trixie')
@@ -364,6 +443,7 @@ class NativeBuildAdmission(unittest.TestCase):
 
     def test_reuse_checks_live_attempt_and_writes_only_validated_files(self):
         for mode in ('valid', 'in-progress', 'queued', 'queued-artifact', 'waiting-artifact',
+                     'incomplete-listing',
                      'rerun-artifact', 'changed-attempt', 'expired', 'older-attempt',
                      'invalid-artifact-timestamp', 'future-attempt', 'missing'):
             expected, provenance, payload = fixture()
@@ -393,11 +473,15 @@ class NativeBuildAdmission(unittest.TestCase):
             if mode == 'future-attempt':
                 artifact['name'] = 'native-release-debian-2'
             run_lookups = 0
+            artifact_lookups = 0
             def lookup(path):
-                nonlocal run_lookups
+                nonlocal run_lookups, artifact_lookups
                 if path.endswith('/workflows/ci.yml'):
                     return {'id': 42, 'path': '.github/workflows/ci.yml'}
                 if '/artifacts?' in path:
+                    artifact_lookups += 1
+                    if mode == 'incomplete-listing' and artifact_lookups == 1:
+                        return {'total_count': 1, 'artifacts': []}
                     return {'total_count': 0 if mode == 'missing' else 1,
                             'artifacts': [] if mode == 'missing' else [artifact]}
                 if path.endswith('/runs/123'):
@@ -423,13 +507,16 @@ class NativeBuildAdmission(unittest.TestCase):
                                GITHUB_EVENT_NAME='pull_request', GITHUB_RUN_ID='123',
                                GITHUB_RUN_ATTEMPT=str(run['run_attempt']))
                 event = {'number': 440, 'pull_request': {'head': {'sha': 'c'*40}}}
-                with patch.object(BUILD, 'api_json', side_effect=lookup), patch.object(BUILD, 'api', return_value=data), \
+                response = b'HTTP/1.1 200 OK\r\n\r\n' + data
+                with patch.object(BUILD, 'api_json', side_effect=lookup), patch.object(BUILD, 'api', return_value=response), \
                         patch.object(BUILD, 'command_output', return_value='a'*40), patch.object(BUILD.time, 'sleep'), \
                         patch.object(BUILD.time, 'monotonic', side_effect=range(0, 10000, 100)):
                     if mode in ('valid', 'in-progress', 'queued', 'queued-artifact',
-                                'waiting-artifact'):
+                                'waiting-artifact', 'incomplete-listing'):
                         result = BUILD.reuse(root, 'debian', expected['image'], 'debian,pgp,license', destination, context, event)
                         self.assertEqual(result, provenance)
+                        if mode == 'incomplete-listing':
+                            self.assertEqual(artifact_lookups, 2)
                         self.assertEqual({path.name for path in destination.iterdir()},
                                          {provenance['archive'], provenance['archive']+'.sha256', 'native-build.json'})
                         self.assertEqual((destination / provenance['archive']).read_bytes(), payload)
@@ -545,7 +632,8 @@ class NativeBuildAdmission(unittest.TestCase):
                                GITHUB_EVENT_NAME='pull_request', GITHUB_RUN_ID='123',
                                GITHUB_RUN_ATTEMPT=str(selected_run['run_attempt']))
                 event = {'number': 440, 'pull_request': {'head': {'sha': 'c'*40}}}
-                with patch.object(BUILD, 'api_json', side_effect=lookup), patch.object(BUILD, 'api', return_value=data), \
+                response = b'HTTP/1.1 200 OK\r\n\r\n' + data
+                with patch.object(BUILD, 'api_json', side_effect=lookup), patch.object(BUILD, 'api', return_value=response), \
                         patch.object(BUILD, 'command_output', return_value='a'*40), patch.object(BUILD.time, 'sleep'), \
                         patch.object(BUILD.time, 'monotonic', side_effect=range(0, 10000, 100)):
                     if mode == 'valid':
