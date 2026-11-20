@@ -161,10 +161,11 @@ impl PiManager {
             common::set_current_version_with_lease(&self.versions_dir, version, lease)
         })();
         if let Err(error) = activation {
+            let detail = format!(
+                "Failed to restore the previous Pi dependency review after activation failed: {error:#}"
+            );
             crate::core::safe_ops::atomic_write_file_sync(&receipt_path, previous_receipt)
-                .context(
-                    "Failed to restore the previous Pi dependency review after activation failed",
-                )?;
+                .context(detail)?;
             return Err(error);
         }
         print_using("Pi", version, &self.versions_dir.join("current/bin"));
@@ -229,10 +230,8 @@ fn write_launcher(prefix: &Path, destination: &Path, entrypoint: &Path, node: &P
     let bin = prefix.join("bin");
     fs::create_dir(&bin)?;
     let launcher = bin.join("pi");
-    crate::core::safe_ops::atomic_write_file_sync(
-        &launcher,
-        launcher_bytes(destination, entrypoint, node)?,
-    )?;
+    let bytes = launcher_bytes(destination, entrypoint, node)?;
+    crate::core::safe_ops::atomic_write_file_sync(&launcher, bytes)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
@@ -369,6 +368,7 @@ ci)
   printf 'console.log("pi");\n' > "$prefix/node_modules/@earendil-works/pi-coding-agent/dist/cli.js"
   printf '{{"name":"pi-fixture-dependency","version":"1.0.0"}}' > "$prefix/node_modules/pi-fixture-dependency/package.json"
   ln -s ../@earendil-works/pi-coding-agent/dist/cli.js "$prefix/node_modules/.bin/pi"
+  if [ -f "$root/occupied-bin" ]; then mkdir "$prefix/bin"; fi
   ;;
 audit) [ ! -f "$root/signature-reject" ] ;;
 *) exit 21 ;;
@@ -383,10 +383,8 @@ esac
             format!("node_modules/{PI_PACKAGE}"):{"version":version,"resolved":format!("https://registry.npmjs.org/{PI_PACKAGE}/-/pi-coding-agent-{version}.tgz"),"integrity":integrity,"dependencies":{"pi-fixture-dependency":"1.0.0"}},
             "node_modules/pi-fixture-dependency":{"version":"1.0.0","resolved":"https://registry.npmjs.org/pi-fixture-dependency/-/pi-fixture-dependency-1.0.0.tgz","integrity":integrity}
         }});
-        fs::write(
-            directory.join("lock.fixture.json"),
-            serde_json::to_vec(&lock)?,
-        )?;
+        let lock = serde_json::to_vec(&lock).expect("serialize the fixture npm lock");
+        fs::write(directory.join("lock.fixture.json"), lock).expect("write the fixture npm lock");
         Ok(path)
     }
 
@@ -397,14 +395,12 @@ esac
         fs::create_dir_all(version.join("bin"))?;
         fs::create_dir_all(version.join("lib/node_modules/npm/bin"))?;
         let node = version.join("bin/node");
-        fs::write(
-            &node,
-            format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$@\" >> {} || exit 1\nshift\nwhile [ \"${{1#--}}\" != \"$1\" ]; do shift; done\nexec {} \"$@\"\n",
-                shell_path(&root.join("managed-node-args"))?,
-                shell_path(npm)?
-            ),
-        )?;
+        let shim = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" >> {} || exit 1\nshift\nwhile [ \"${{1#--}}\" != \"$1\" ]; do shift; done\nexec {} \"$@\"\n",
+            shell_path(&root.join("managed-node-args"))?,
+            shell_path(npm)?
+        );
+        fs::write(&node, shim).expect("write the managed Node fixture shim");
         fs::set_permissions(&node, fs::Permissions::from_mode(0o755))?;
         let cli = version.join("lib/node_modules/npm/bin/npm-cli.js");
         fs::write(&cli, "// owned managed npm fixture\n")?;
@@ -412,7 +408,8 @@ esac
         fs::write(
             version.join("lib/node_modules/npm/package.json"),
             br#"{"version":"11.15.0"}"#,
-        )?;
+        )
+        .expect("write the managed npm fixture identity");
         symlink(&cli, version.join("bin/npm"))?;
         symlink(&version, versions.join("current"))?;
         super::super::security::fixture_install_identity("node", &version)?;
@@ -493,7 +490,17 @@ esac
         let temp = tempfile::tempdir()?;
         let manager =
             PiManager::with_paths(temp.path().join("versions/pi"), temp.path().join("absent"));
-        assert!(manager.install("../../malicious").await.is_err());
+        let error = manager
+            .install("../../malicious")
+            .await
+            .expect_err("hostile version must be rejected at the boundary");
+        assert!(
+            matches!(
+                error.downcast_ref::<crate::core::security::ValidationError>(),
+                Some(crate::core::security::ValidationError::VersionInvalidChar { character: '/' })
+            ),
+            "{error:#}"
+        );
         assert!(!manager.versions_dir.exists());
         Ok(())
     }
@@ -534,6 +541,22 @@ esac
         assert!(format!("{error:#}").contains("NPM frozen install"));
         assert_eq!(manager.current_version().as_deref(), Some("0.82.0"));
         assert!(!manager.versions_dir.join("0.83.0").exists());
+
+        fake_npm(temp.path(), "0.83.0", true)?;
+        fs::write(temp.path().join("occupied-bin"), "occupied")?;
+        let error = manager
+            .install("0.83.0")
+            .await
+            .expect_err("staging cannot replace an occupied bin directory");
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .map(std::io::Error::kind),
+            Some(std::io::ErrorKind::AlreadyExists),
+            "{error:#}"
+        );
+        assert_eq!(manager.current_version().as_deref(), Some("0.82.0"));
+        assert!(!manager.versions_dir.join("0.83.0").exists());
         Ok(())
     }
 
@@ -568,10 +591,9 @@ esac
             .expect_err("a malformed package identity cannot be activated");
         assert!(error.downcast_ref::<serde_json::Error>().is_some());
 
-        fs::write(
-            &manifest,
-            serde_json::to_vec(&serde_json::json!({"name": PI_PACKAGE, "version": "0.83.0"}))?,
-        )?;
+        let identity = serde_json::json!({"name": PI_PACKAGE, "version": "0.83.0"});
+        fs::write(&manifest, identity.to_string())
+            .expect("write identity for the missing executable fixture");
         let error = validate_pi_install(prefix.path(), "0.83.0")
             .expect_err("an installation without an executable cannot be activated");
         assert!(format!("{error:#}").contains("Pi package has no contained npm executable"));
@@ -727,6 +749,19 @@ esac
         let stale_receipt = serde_json::to_vec_pretty(&stale_receipt)?;
         crate::core::safe_ops::atomic_write_file_sync(&receipt_path, &stale_receipt)?;
 
+        let signature_failure = temp.path().join("signature-reject");
+        fs::write(&signature_failure, "reject")?;
+        let error = manager
+            .use_version("0.83.0")
+            .expect_err("expired reviews must establish signatures again");
+        assert!(
+            format!("{error:#}").contains("NPM signature/provenance"),
+            "{error:#}"
+        );
+        assert_eq!(fs::read(&receipt_path)?, stale_receipt);
+        assert_eq!(manager.current_version().as_deref(), Some("0.83.0"));
+        fs::remove_file(signature_failure)?;
+
         let current = manager.versions_dir.join("current");
         let previous_link = fs::read_link(&current)?;
         fs::remove_file(&current)?;
@@ -776,7 +811,8 @@ esac
         fs::write(
             temp.path().join("signature-reject"),
             "cached selection cannot run a new audit",
-        )?;
+        )
+        .expect("mark signature auditing as unavailable in the cache reuse fixture");
         manager.install("0.83.0").await?;
         manager.use_version("0.83.0")?;
         assert_eq!(advisories.reads.load(Ordering::SeqCst), package_reads);
@@ -806,17 +842,14 @@ esac
         let cloned = manager.clone();
         let caller = tokio::spawn(async move { cloned.install("0.83.0").await });
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while !temp.path().join("started").exists() && std::time::Instant::now() < deadline {
+        let started = temp.path().join("started");
+        while !started.exists() && std::time::Instant::now() < deadline {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
-        if !temp.path().join("started").exists() {
-            fs::write(temp.path().join("release"), "release")?;
-            return Err(anyhow::anyhow!(
-                "Pi child did not reach the owned install phase: {:?}",
-                caller.await?
-            ));
-        }
-        let staging = PathBuf::from(fs::read_to_string(temp.path().join("started"))?);
+        let staging = PathBuf::from(
+            fs::read_to_string(started)
+                .expect("Pi child must reach the owned install phase before the fixture deadline"),
+        );
         caller.abort();
         let _ = caller.await;
         let retained = staging.is_dir();

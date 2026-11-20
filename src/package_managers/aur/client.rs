@@ -9857,11 +9857,13 @@ mod tests {
                         std::fs::write(
                             success_checkout.join("PKGBUILD"),
                             "pkgname=omg-coverage-wave-fixture\npkgver=1\npkgrel=1\npkgdesc='Inert OMG parallel wave fixture'\narch=('any')\nlicense=('MIT')\npackage() { install -Dm644 /dev/null \"$pkgdir/usr/share/omg-coverage-wave-fixture/empty\"; printf 'wave-success-complete\\n' >&2; }\n",
-                        )?;
+                        )
+                        .expect("write the successful parallel-wave fixture recipe");
                         std::fs::write(
                             success_checkout.join(".SRCINFO"),
                             "pkgbase = omg-coverage-wave-fixture\n\tpkgdesc = Inert OMG parallel wave fixture\n\tpkgver = 1\n\tpkgrel = 1\n\tarch = any\n\tlicense = MIT\n\npkgname = omg-coverage-wave-fixture\n",
-                        )?;
+                        )
+                        .expect("write the successful parallel-wave fixture metadata");
                         let client = Arc::new(client);
                         let builder = ParallelBuilder::new(Arc::clone(&client), 2);
                         let empty = builder
@@ -10453,8 +10455,7 @@ finally:
                 let journal = fixture.join("data/audit/audit.jsonl");
                 assert!(
                     journal.is_file(),
-                    "inspection audit journal: {}",
-                    journal.display()
+                    "missing AUR inspection audit journal {journal:?}"
                 );
                 let audit = std::fs::read_to_string(&journal)?;
                 assert!(audit.contains("aur_inspection"), "{audit}");
@@ -10518,8 +10519,7 @@ finally:
                 let journal = fixture.join("data/audit/audit.jsonl");
                 assert!(
                     journal.is_file(),
-                    "inspection audit journal: {}",
-                    journal.display()
+                    "missing AUR inspection audit journal {journal:?}"
                 );
                 let audit = std::fs::read_to_string(&journal)?;
                 assert!(audit.contains("aur_inspection"), "{audit}");
@@ -10641,7 +10641,8 @@ finally:
                 .db
                 .to_str()
                 .context("fixture database is not UTF-8")?,
-        )?;
+        )
+        .expect("open the isolated AUR dependency database");
         let missing = alpm.register_syncdb("missing", alpm::SigLevel::NONE)?;
         missing.set_usage(alpm::Usage::SEARCH)?;
         alpm.register_syncdb("low", alpm::SigLevel::NONE)?;
@@ -10843,7 +10844,8 @@ finally:
         let alpm = alpm::Alpm::new(
             root.to_str().context("fixture root is not UTF-8")?,
             database.to_str().context("fixture database is not UTF-8")?,
-        )?;
+        )
+        .expect("open the versioned AUR dependency fixture database");
         alpm.register_syncdb("high", alpm::SigLevel::NONE)?;
         alpm.register_syncdb("low", alpm::SigLevel::NONE)?;
         for (relation, repository) in [
@@ -10910,7 +10912,8 @@ finally:
                 "[options]\nArchitecture = auto\nSigLevel = Never\n[omg-fixture]\nSigLevel = Never\nServer = file://{}\n",
                 cache.display()
             ),
-        )?;
+        )
+        .expect("write the isolated official-dependency configuration");
         nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWNS)?;
         assert!(
             std::process::Command::new("mount")
@@ -10927,22 +10930,26 @@ finally:
                 .success()
         );
         crate::core::paths::set_test_overrides(Some(root.clone()), Some(database.clone()));
-        let before = alpm::Alpm::new(
-            root.to_str().context("fixture root")?,
-            database.to_str().context("fixture database")?,
-        )?;
+        let open_fixture = || {
+            alpm::Alpm::new(
+                root.to_str().expect("fixture root must be UTF-8"),
+                database
+                    .to_str()
+                    .expect("fixture database path must be UTF-8"),
+            )
+            .expect("open the isolated package database to observe install reasons")
+        };
+        let before = open_fixture();
         assert_eq!(before.localdb().pkgs().len(), 0);
         drop(before);
         let selected = crate::package_managers::alpm_direct::with_handle(|alpm| {
             resolve_official_dependency(alpm, "helper>=2")?
                 .context("fixture helper is absent from sync repositories")
-        })?;
+        })
+        .expect("resolve the official dependency from the isolated repository");
         assert_eq!(selected.repository, "omg-fixture");
         AurClient::install_official_dependencies(std::slice::from_ref(&selected)).await?;
-        let after = alpm::Alpm::new(
-            root.to_str().context("fixture root")?,
-            database.to_str().context("fixture database")?,
-        )?;
+        let after = open_fixture();
         assert_eq!(after.localdb().pkgs().len(), 1);
         assert_eq!(
             after.localdb().pkg("helper")?.reason(),
@@ -10955,10 +10962,7 @@ finally:
             .install(&["omg-fixture/helper".to_owned()])
             .await?;
         AurClient::install_official_dependencies(&[selected]).await?;
-        let promoted = alpm::Alpm::new(
-            root.to_str().context("fixture root")?,
-            database.to_str().context("fixture database")?,
-        )?;
+        let promoted = open_fixture();
         assert_eq!(
             promoted.localdb().pkg("helper")?.reason(),
             alpm::PackageReason::Explicit,
@@ -10981,11 +10985,8 @@ finally:
             requested_outputs: BTreeSet::from(["omg-fixture-app".to_owned()]),
         };
         AurClient::install_built_packages(std::slice::from_ref(&batch), None).await?;
-        let installed = || -> Result<Vec<(String, alpm::PackageReason)>> {
-            let alpm = alpm::Alpm::new(
-                root.to_str().context("fixture root")?,
-                database.to_str().context("fixture database")?,
-            )?;
+        let installed = || {
+            let alpm = open_fixture();
             let mut packages = alpm
                 .localdb()
                 .pkgs()
@@ -10993,11 +10994,11 @@ finally:
                 .map(|package| (package.name().to_owned(), package.reason()))
                 .collect::<Vec<_>>();
             packages.sort_by(|left, right| left.0.cmp(&right.0));
-            Ok(packages)
+            packages
         };
         use alpm::PackageReason::{Depend, Explicit};
         assert_eq!(
-            installed()?,
+            installed(),
             vec![
                 ("helper".to_owned(), Explicit),
                 ("omg-fixture-app".to_owned(), Explicit),
@@ -11008,7 +11009,7 @@ finally:
         batch.requested_outputs.clear();
         AurClient::install_built_packages(std::slice::from_ref(&batch), None).await?;
         assert_eq!(
-            installed()?[1].1,
+            installed()[1].1,
             Explicit,
             "an automatic rebuild must not demote an existing explicit split output"
         );
@@ -11016,7 +11017,7 @@ finally:
             .requested_outputs
             .insert("omg-fixture-libs".to_owned());
         AurClient::install_built_packages(std::slice::from_ref(&batch), None).await?;
-        assert!(installed()?.iter().all(|(_, reason)| *reason == Explicit));
+        assert!(installed().iter().all(|(_, reason)| *reason == Explicit));
         Ok(())
     }
 

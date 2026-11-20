@@ -1380,7 +1380,7 @@ fn open_package_cache_directory(path: &Path, create: bool) -> Result<fs::File> {
 }
 
 fn save_cache_to_disk_in<T: Serialize>(cache: &T, cache_dir: &Path, name: &str) -> Result<()> {
-    use rustix::fs::{AtFlags, Mode, OFlags, openat, renameat, unlinkat};
+    use rustix::fs::{Mode, OFlags, openat, renameat};
 
     let directory = open_package_cache_directory(cache_dir, true)?;
     let data = bitcode::serialize(cache)?;
@@ -1402,13 +1402,18 @@ fn save_cache_to_disk_in<T: Serialize>(cache: &T, cache_dir: &Path, name: &str) 
         directory.sync_all()?;
         Ok(())
     })();
-    if result.is_err()
-        && let Err(error) = unlinkat(&directory, &temporary, AtFlags::empty())
+    if result.is_err() {
+        remove_temporary_package_cache(&directory, &temporary);
+    }
+    result
+}
+
+fn remove_temporary_package_cache(directory: &fs::File, temporary: &str) {
+    if let Err(error) = rustix::fs::unlinkat(directory, temporary, rustix::fs::AtFlags::empty())
         && error != rustix::io::Errno::NOENT
     {
         tracing::warn!("Failed to remove temporary package cache: {error}");
     }
-    result
 }
 
 fn persist_cache_best_effort<T: Serialize>(cache: &T, name: &str) {
@@ -2077,6 +2082,15 @@ pub(crate) fn read_local_package_at(
     name: &str,
 ) -> Result<Option<LocalDbPackage>> {
     let epoch = LocalDbEpoch::from_local_dir(local_dir)?;
+    let package = find_local_package(local_dir, name)?;
+    anyhow::ensure!(
+        epoch == LocalDbEpoch::from_local_dir(local_dir)?,
+        "Local package database changed while querying; retry the operation"
+    );
+    Ok(package)
+}
+
+fn find_local_package(local_dir: &Path, name: &str) -> Result<Option<LocalDbPackage>> {
     let entries = match fs::read_dir(local_dir) {
         Ok(entries) => Some(entries),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
@@ -2107,10 +2121,6 @@ pub(crate) fn read_local_package_at(
             package = Some(parsed);
         }
     }
-    anyhow::ensure!(
-        epoch == LocalDbEpoch::from_local_dir(local_dir)?,
-        "Local package database changed while querying; retry the operation"
-    );
     Ok(package)
 }
 
@@ -3758,35 +3768,21 @@ mod tests {
 
     #[test]
     fn sync_database_fifo_is_refused_without_waiting_for_a_writer() {
-        use std::sync::mpsc::{RecvTimeoutError, channel};
+        const TEST: &str = "package_managers::pacman_db::db::tests::sync_database_fifo_is_refused_without_waiting_for_a_writer";
+        if crate::core::testing::run_isolated_test_with_timeout(
+            TEST,
+            std::time::Duration::from_secs(1),
+        ) {
+            return;
+        }
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("core.db");
         nix::unistd::mkfifo(
             &path,
             nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
         )
-        .unwrap();
-        let (send, receive) = channel();
-        let read_path = path.clone();
-        let reader = std::thread::spawn(move || {
-            send.send(parse_sync_db(&read_path, "core")).unwrap();
-        });
-        let observed = receive.recv_timeout(std::time::Duration::from_secs(1));
-        let blocked = matches!(observed, Err(RecvTimeoutError::Timeout));
-        if blocked {
-            drop(std::fs::OpenOptions::new().write(true).open(&path).unwrap());
-        }
-        let parsed = observed.unwrap_or_else(|_| {
-            receive
-                .recv_timeout(std::time::Duration::from_secs(2))
-                .unwrap()
-        });
-        reader.join().unwrap();
-        assert!(
-            !blocked,
-            "sync database parser blocked waiting for a FIFO writer before rejecting the file type"
-        );
-        let error = parsed.expect_err("a FIFO is not a regular repository database");
+        .expect("create the nonregular repository database fixture");
+        let error = parse_sync_db(&path, "core").expect_err("reject a FIFO with no writer");
         assert!(format!("{error:#}").contains("regular"));
     }
 
@@ -6106,13 +6102,23 @@ mod tests {
     }
 
     #[test]
-    fn read_local_package_returns_absent_for_a_missing_database_or_regular_entry() -> Result<()> {
+    fn read_local_package_distinguishes_missing_records_from_catalog_read_errors() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let local = directory.path().join("local");
         assert!(read_local_package_at(&local, "widget")?.is_none());
         fs::create_dir(&local)?;
-        fs::write(local.join("widget-1-1"), b"regular directory entry")?;
+        let regular_entry = local.join("widget-1-1");
+        fs::write(&regular_entry, b"regular directory entry")?;
         assert!(read_local_package_at(&local, "widget")?.is_none());
+        let error = find_local_package(&regular_entry, "widget")
+            .expect_err("a regular file cannot serve as a local package catalog");
+        assert_eq!(error.to_string(), "Failed to read local package database");
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .map(std::io::Error::kind),
+            Some(std::io::ErrorKind::NotADirectory)
+        );
         Ok(())
     }
 
@@ -6175,6 +6181,9 @@ mod tests {
         fs::create_dir(&existing)?;
         fs::write(existing.join("sentinel"), b"existing cache entry")?;
         assert!(save_cache_to_disk_in(&DbCache::default(), directory.path(), "fixture").is_err());
+        let owner = open_package_cache_directory(directory.path(), false)?;
+        remove_temporary_package_cache(&owner, "already-gone.tmp");
+        remove_temporary_package_cache(&owner, "fixture.bin");
         assert_eq!(
             fs::read(existing.join("sentinel"))?,
             b"existing cache entry"
@@ -6252,6 +6261,13 @@ mod tests {
 
     #[test]
     fn package_cache_refuses_fifo_without_waiting_for_its_writer() -> Result<()> {
+        const TEST: &str = "package_managers::pacman_db::db::tests::package_cache_refuses_fifo_without_waiting_for_its_writer";
+        if crate::core::testing::run_isolated_test_with_timeout(
+            TEST,
+            std::time::Duration::from_secs(5),
+        ) {
+            return Ok(());
+        }
         let owner = tempfile::tempdir()?;
         let path = owner.path().join("fixture.bin");
         nix::unistd::mkfifo(
@@ -6259,46 +6275,10 @@ mod tests {
             nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
         )
         .expect("create the derived cache's nonregular-file fixture");
-        let directory = owner.path().to_owned();
-        let (done, received) = std::sync::mpsc::channel();
-        let reader = std::thread::spawn(move || {
-            let result = load_cache_from_disk_in::<LocalDbCache>(&directory, "fixture");
-            done.send(result.map(|_| ())).unwrap();
-        });
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        let result = loop {
-            if let Ok(result) = received.try_recv() {
-                break result;
-            }
-            match fs::OpenOptions::new()
-                .write(true)
-                .custom_flags(nix::libc::O_NONBLOCK)
-                .open(&path)
-            {
-                Ok(mut writer) => {
-                    // Release a blocked old reader so failing-before proof leaves no live thread.
-                    if let Err(error) =
-                        writer.write_all(&bitcode::serialize(&LocalDbCache::default())?)
-                    {
-                        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
-                    }
-                    drop(writer);
-                    break received.recv_timeout(std::time::Duration::from_secs(5))?;
-                }
-                Err(error) if error.raw_os_error() == Some(nix::libc::ENXIO) => {}
-                Err(error) => return Err(error.into()),
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "FIFO reader did not finish"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        };
-        reader.join().unwrap();
-        assert!(
-            result.is_err(),
-            "cache reader waited for and accepted FIFO bytes"
-        );
+        let error = load_cache_from_disk_in::<LocalDbCache>(owner.path(), "fixture")
+            .err()
+            .context("reject a FIFO with no writer")?;
+        assert!(format!("{error:#}").contains("regular"), "{error:#}");
         Ok(())
     }
 
