@@ -443,6 +443,15 @@ struct Commands {
     inhibitor_attempted: bool,
     active: Option<tokio::process::Child>,
     foreground: Option<nix::unistd::Pid>,
+    #[cfg(test)]
+    native_fixture: Option<NativeMigrationFixture>,
+}
+
+#[cfg(test)]
+struct NativeMigrationFixture {
+    operations: Vec<NativeOmarchyOperation>,
+    failure: Option<NativeOmarchyOperation>,
+    desktop_database_program: &'static str,
 }
 
 fn foreground_group() -> Result<Option<nix::unistd::Pid>> {
@@ -477,6 +486,8 @@ impl Commands {
             inhibitor_attempted: false,
             active: None,
             foreground: None,
+            #[cfg(test)]
+            native_fixture: None,
         }
     }
 
@@ -648,6 +659,15 @@ impl Commands {
     }
 
     async fn run_native_package(&mut self, operation: NativeOmarchyOperation) -> Result<()> {
+        #[cfg(test)]
+        if let Some(fixture) = self.native_fixture.as_mut() {
+            fixture.operations.push(operation);
+            anyhow::ensure!(
+                fixture.failure != Some(operation),
+                "Fixture package operation failed"
+            );
+            return Ok(());
+        }
         use crate::package_managers::arch::NativeOmarchyInteraction;
         let interaction = if self.yes {
             NativeOmarchyInteraction::Unattended
@@ -1015,6 +1035,16 @@ impl MigrationExecutor for Commands {
             );
             return Ok(());
         };
+        self.run_native_migration(native, dirs::home_dir()).await
+    }
+}
+
+impl Commands {
+    async fn run_native_migration(
+        &mut self,
+        native: NativeMigration,
+        home: Option<PathBuf>,
+    ) -> Result<()> {
         let operation = match native {
             NativeMigration::TrayMenuDependency => {
                 NativeOmarchyOperation::InstallTrayMenuDependency
@@ -1042,7 +1072,7 @@ impl MigrationExecutor for Commands {
                 }
                 NativeOmarchyOperation::InstallOmnibookAudio
             }
-            NativeMigration::MediaViewer => return self.replace_media_viewer().await,
+            NativeMigration::MediaViewer => return self.replace_media_viewer(home).await,
         };
         self.run_native_package(operation).await?;
         if native == NativeMigration::OmnibookAudio {
@@ -1058,10 +1088,8 @@ impl MigrationExecutor for Commands {
         }
         Ok(())
     }
-}
 
-impl Commands {
-    async fn replace_media_viewer(&mut self) -> Result<()> {
+    async fn replace_media_viewer(&mut self, home: Option<PathBuf>) -> Result<()> {
         const SHIPPED_LAUNCHERS: &[&str] = &[
             "120d30326a77e1f23d050e52293d0acf1aeb9499bf9cd47b93996d6e2be99480",
             "a7a75999f161c6a409ff4c5da26ad9c79fc1ffdd4e633aac87f972ad72fc85d4",
@@ -1070,12 +1098,17 @@ impl Commands {
         ];
         self.run_native_package(NativeOmarchyOperation::InstallMediaViewer)
             .await?;
-        let applications = dirs::home_dir()
+        let applications = home
             .context("Cannot locate the Omarchy user's home")?
             .join(".local/share/applications");
         if remove_shipped_media_launchers(&applications, SHIPPED_LAUNCHERS)? {
-            let updater =
-                crate::core::privilege::root_controlled_program_path("update-desktop-database")?;
+            let program = "update-desktop-database";
+            #[cfg(test)]
+            let program = self
+                .native_fixture
+                .as_ref()
+                .map_or(program, |fixture| fixture.desktop_database_program);
+            let updater = crate::core::privilege::root_controlled_program_path(program)?;
             let path = applications
                 .to_str()
                 .context("Desktop application directory is not UTF-8")?;
@@ -3279,6 +3312,89 @@ omarchy-pkg-drop imv mpv-mpris
         assert!(remove_shipped_media_launchers(&applications, &[&digest])?);
         assert_eq!(std::fs::read_link(&mpv)?, dotfile);
         assert_eq!(std::fs::read_to_string(dotfile)?, shipped);
+        Ok(())
+    }
+
+    #[test]
+    fn media_launcher_cleanup_refuses_unreadable_locations_and_keeps_non_files() -> Result<()> {
+        let owner = private_directory();
+        let applications = owner.path().join("applications");
+        std::fs::write(&applications, "not a directory")?;
+        assert!(!remove_shipped_media_launchers(&applications, &[])?);
+        assert!(
+            remove_shipped_media_launchers(&applications.join("nested"), &[])
+                .expect_err("path beneath a file must fail")
+                .to_string()
+                .contains("Cannot inspect the desktop application directory")
+        );
+
+        std::fs::remove_file(&applications)?;
+        std::fs::create_dir(&applications)?;
+        let launcher = applications.join("imv.desktop");
+        std::fs::create_dir(&launcher)?;
+        assert!(remove_shipped_media_launchers(&applications, &[])?);
+        assert!(launcher.is_dir());
+        std::fs::remove_dir(&launcher)?;
+
+        let socket = std::os::unix::net::UnixListener::bind(&launcher)?;
+        assert!(
+            remove_shipped_media_launchers(&applications, &[])
+                .expect_err("a launcher socket must not be opened")
+                .to_string()
+                .contains("Cannot inspect imv.desktop")
+        );
+        drop(socket);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn native_media_migration_removes_legacy_packages_only_after_install_and_refresh()
+    -> Result<()> {
+        use NativeOmarchyOperation::{InstallMediaViewer, RemoveLegacyMediaViewers};
+
+        let owner = private_directory();
+        let home = owner.path().join("home");
+        let applications = home.join(".local/share/applications");
+        for (present, updater, failure, expected) in [
+            (
+                false,
+                "true",
+                Some(InstallMediaViewer),
+                &[InstallMediaViewer][..],
+            ),
+            (true, "false", None, &[InstallMediaViewer][..]),
+            (
+                true,
+                "true",
+                None,
+                &[InstallMediaViewer, RemoveLegacyMediaViewers][..],
+            ),
+        ] {
+            if present {
+                std::fs::create_dir_all(&applications)?;
+            }
+            let runtime = OmarchyRuntime {
+                root: owner.path().to_path_buf(),
+                migration_state: owner.path().join("markers"),
+            };
+            let mut commands = Commands::new(false, runtime);
+            commands.native_fixture = Some(NativeMigrationFixture {
+                operations: Vec::new(),
+                failure,
+                desktop_database_program: updater,
+            });
+            let result = commands
+                .run_native_migration(NativeMigration::MediaViewer, Some(home.clone()))
+                .await;
+            assert_eq!(result.is_ok(), failure.is_none() && updater == "true");
+            assert_eq!(
+                commands
+                    .native_fixture
+                    .expect("native fixture is retained")
+                    .operations,
+                expected
+            );
+        }
         Ok(())
     }
 
