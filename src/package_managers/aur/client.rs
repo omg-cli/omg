@@ -10069,6 +10069,7 @@ mod tests {
         let driver = r#"
 import errno, os, pty, select, shutil, signal, subprocess, sys, tempfile, time
 mode, executable, test_name = sys.argv[1:]
+os.environ['OMG_AUR_REVIEW_PTY_MODE'] = mode
 fixture = tempfile.mkdtemp(prefix='omg-review-pty-')
 with open(os.path.join(fixture, 'git'), 'w') as script:
     script.write('''#!/bin/sh
@@ -10089,7 +10090,7 @@ if [ "$#" -ge 4 ] && [ "$1" = -C ]; then
     fi
     if [ "$#" -eq 5 ] && [ "$3" = checkout ] && [ "$4" = --detach ] && [ "$5" = "$sha" ]; then
         printf 'pkgname=demo\\npkgver=1\\npkgrel=1\\narch=(any)\\n' > "$2/PKGBUILD"
-        if [ "${OMG_AUR_REVIEW_PTY_MODE:-}" = history-accept-rebuilt-archive ]; then
+        if [ "$OMG_AUR_REVIEW_PTY_MODE" = history-accept-rebuilt-archive ]; then
             printf 'pkgdesc="Inert historical release fixture"\\nlicense=(MIT)\\npackage() { install -Dm644 /dev/null "$pkgdir/usr/share/demo/empty"; }\\n' >> "$2/PKGBUILD"
         else
             printf 'package() { printf "intentional-history-fixture-failure\\\\n" >&2; return 1; }\\n' >> "$2/PKGBUILD"
@@ -10143,7 +10144,6 @@ if mode == 'git-contract':
     sys.exit(0)
 pid, fd = pty.fork()
 if pid == 0:
-    os.environ['OMG_AUR_REVIEW_PTY_MODE'] = mode
     os.environ['PATH'] = fixture + ':/usr/bin:/bin'
     if mode == 'history-accept-rebuilt-archive':
         os.environ['CARGO_PRIMARY_PACKAGE'] = '1'
