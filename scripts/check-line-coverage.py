@@ -13397,6 +13397,245 @@ _AUR_UPDATE_CONFIG_CALL = (
     'let config = crate::core::pacman_conf::PacmanConfig::parse(paths::pacman_conf_path())'
 )
 _AUR_HISTORY_SOURCE = 'src/package_managers/aur/history.rs'
+_AUR_INSPECTOR_SOURCE = 'src/package_managers/aur/artifact_inspector.rs'
+_AUR_DEPS_SOURCE = 'src/package_managers/aur_deps.rs'
+_ALPM_RELATION_SOURCE = 'src/package_managers/types.rs'
+
+
+def retained_artifact_reason_matrix(name, sides, indexes, work):
+    """Verify every existing case still checks its reason, including overlapping classes."""
+    declaration = 'inspector_requires_paired_build_for_system_integration_payloads'
+    header = tuple(f'# [ test ] fn {declaration} ( ) -> Result < ( ) >'.split())
+    results = []
+    for side, ((_, inventory, counts, line), index) in enumerate(zip(sides, indexes, strict=True)):
+        code, rows = inventory[:2]
+        _construct_charge(work, len(rows) + len(code.starts).bit_length())
+        start = bisect.bisect_left(code.starts, code.offsets[line - 1])
+        loop = code.parents[start]
+        function = code.parents[loop] if loop is not None else None
+        loops = [row for row in rows if row['opening'] == loop and row['kind'] == 'for']
+        functions = [row for row in rows if row['opening'] == function and row['header'] == header]
+        if len(loops) != 1 or len(functions) != 1:
+            return None
+        iteration, = loops
+        owner_scope = _boolean_module(code, {'start': functions[0]['first']})
+        if owner_scope is None or owner_scope[:2] != (['tests'], ['tests']):
+            return None
+        if side:
+            setup = 'let cases : & [ ( & str , & [ & str ] ) ] = & ['.split()
+            array = function + len(setup)
+            if (code.words[function + 1:array + 1] != setup
+                    or code.pairs[array] + 2 != iteration['first']
+                    or code.words[code.pairs[array] + 1] != ';'
+                    or iteration['header'] != tuple('for & ( path , reasons ) in cases'.split())):
+                return None
+        else:
+            setup = 'for ( path , reason ) in ['.split()
+            array = iteration['first'] + len(setup) - 1
+            if (iteration['first'] != function + 1 or code.words[iteration['first']:array + 1] != setup
+                    or code.pairs[array] + 1 != loop):
+                return None
+        _construct_charge(work, start - function + code.pairs[array] - array + 1)
+        cases = _boolean_arguments(code, array)
+        if cases is None or not 1 <= len(cases) <= 16:
+            return None
+        entries = {}
+        for begin, end in cases:
+            if code.words[begin] != '(' or code.pairs.get(begin) != end - 1:
+                return None
+            pair = _boolean_arguments(code, begin)
+            if pair is None or len(pair) != 2:
+                return None
+            (path, stop), (value, finish) = pair
+            if stop != path + 1 or re.fullmatch(r'"[a-z0-9_./-]{1,120}"', code.words[path]) is None:
+                return None
+            if side:
+                if code.words[value:value + 2] != ['&', '['] or code.pairs.get(value + 1) != finish - 1:
+                    return None
+                values = _boolean_arguments(code, value + 1)
+            else:
+                values = [(value, finish)]
+            if (not values or len(values) > 8
+                    or any(end != begin + 1 or re.fullmatch(r'"[a-z-]{1,80}"', code.words[begin]) is None
+                           for begin, end in values)):
+                return None
+            reasons = {code.words[begin] for begin, _ in values}
+            if len(reasons) != len(values) or code.words[path] in entries:
+                return None
+            entries[code.words[path]] = reasons
+        old_prelude = ['let', 'archive', '=', *'fixture_archive ( | builder | append_file ( builder , path ,'.split(),
+                       'b"payload"', *', 0o644 ) ) ? ; let inspection = inspect_archive ( archive . path ( ) ) ? ;'.split()]
+        new_prelude = [
+            *('let mtree = fixture_file_mtree ( & [ ( path , 0o644 , 7 ) ] ) ; '
+              'let archive = fixture_archive_with_mtree ( & mtree , | builder | { append_file ( builder , path ,').split(),
+            'b"payload"',
+            *', 0o644 ) } ) ? ; let inspection = inspect_archive ( archive . path ( ) ) ? . into_inspection ( ) ;'.split(),
+        ]
+        guards = [
+            *'assert ! ( inspection . requires_paired_build ( ) ) ; assert ! ( inspection . requires_exception ( ) ,'.split(),
+            '"{path} needs attended approval"',
+            *') ; assert ! ( inspection . privileged_files . iter ( ) . any ( | file | file . path = = path ) ) ;'.split(),
+        ]
+        prelude = new_prelude if side else old_prelude
+        if code.words[loop + 1:start] not in (prelude, prelude + guards):
+            return None
+        lookup = 'inspection . paired_build_reasons . iter ( ) . any ( | item | item = ='.split()
+        predicate = [*lookup, *('* reason )'.split() if side else 'reason )'.split())]
+        if side:
+            condition = [
+                *'assert ! ( reasons . iter ( ) . all ( | reason | {'.split(),
+                *predicate, '}', ')', ',', '"missing paired build reason for {path}"', ')', ';',
+            ]
+        else:
+            condition = ['assert', '!', '(', *predicate, ')', ';']
+        if code.words[start:iteration['end']] != condition:
+            return None
+        anchor = start + condition.index('inspection')
+        search = start + condition.index('any')
+        expression = (code.region(anchor, anchor + 6), code.region(search, search))
+        equality = start + condition.index('=')
+        children = [(code.region(equality - 1, equality - 1), code.region(equality + 2, equality + (3 if side else 2)))]
+        if side:
+            brace = start + condition.index('{')
+            children.insert(0, (code.region(brace, brace), *expression, code.region(code.pairs[brace], code.pairs[brace])))
+            expression = (code.region(start + 3, start + 7), code.region(start + 9, start + 9))
+        expected = [(code.region(start, start + 1), *expression), *children]
+        hits = [len(entries), *([sum(map(len, entries.values()))] if side else [])]
+        low, high = code.region(start, iteration['end'] - 1)[:2], code.region(start, iteration['end'] - 1)[2:]
+        owners = index.inventories.get(name, ())
+        _construct_charge(work, sum(len(owner['name']) + len(owner['regions']) + 1 for owner in owners))
+        roots = [(owner, shape) for owner in owners
+                 if (shape := plain_rust_function_symbol(owner['name'])) is not None
+                 and shape.identifiers == ('omg_lib', 'package_managers', 'aur', 'artifact_inspector', 'tests', declaration)]
+        touched = [(owner, raw) for owner in owners if (raw := [
+            r for r in owner['regions'] if tuple(r[:2]) < high and low < tuple(r[2:4])])]
+        if len(roots) != 1 or len(touched) != len(expected):
+            return None
+        (root, shape), = roots
+        symbols = []
+        for depth, slots in enumerate(expected):
+            candidates = [(owner, raw) for owner, raw in touched if
+                          (direct_rust_callback_symbol(owner['name'], root['name'], shape.modules, depth)
+                           if depth else owner is root)]
+            if len(candidates) != 1:
+                return None
+            (owner, raw), = candidates
+            expected_count = hits[depth] if depth < len(hits) else owner['count']
+            if (index.name_counts[owner['name']] != 1 or owner.get('branches') or owner.get('mcdc_records')
+                    or len(owner['filenames']) != 1 or index.files.get(owner['filenames'][0]) != name
+                    or not 0 < expected_count < COUNTER_LIMIT
+                    or not depth and owner['count'] != 1
+                    or depth and owner['count'] != expected_count
+                    or depth == len(expected) - 1 and expected_count < hits[-1]
+                    or raw != [[*slot, expected_count, 0, 0, 0] for slot in slots]):
+                return None
+            symbols.append(owner['name'])
+        projection = _owner_line_counts({'regions': [r for _, raw in touched for r in raw]}, _ObserverWork(work))
+        if projection != {n: counts[n] for n in range(low[0], high[0] + 1) if n in counts}:
+            return None
+        results.append((line, entries, symbols))
+    before, after = results
+    if any(not reasons <= after[1].get(path, set()) for path, reasons in before[1].items()):
+        return None
+    return dict(file=name, kind='retained-artifact-reason-matrix', pairs=[[before[0], after[0]]],
+                cases=[len(before[1]), len(after[1])], owners=[before[2], after[2]])
+
+
+def retained_unversioned_aur_dependency(sides, indexes, work):
+    """Observe accepting a valid version with no constraint in both ALPM implementations."""
+    observations = []
+    for side, ((name, inventory, counts), index) in enumerate(zip(sides, indexes, strict=True)):
+        code, rows = inventory[:2]
+        declaration = 'dependency_version_satisfies' if side else 'output_version_satisfies'
+        visibility = ('# [ cfg ( feature = "arch" ) ] pub ( crate )'.split()) if side else []
+        header = (*visibility, *f'fn {declaration} ( dependency : & str , candidate : & str ) -> bool'.split())
+        _construct_charge(work, len(rows))
+        functions = [row for row in rows if row['kind'] == 'fn' and row['header'] == header
+                     and code.parents[row['opening']] is None]
+        if len(functions) != 1:
+            return None
+        function, = functions
+        start = function['opening'] + 1
+        legacy = ('let dependency = alpm :: Depend :: new ( dependency ) ; '
+                  'let Some ( required ) = dependency . version ( ) else { return true ; } ;').split()
+        rust = [
+            *'use alpm_types :: { PackageRelation , SonameV2 } ;'.split(),
+            *('if dependency . as_bytes ( ) . contains ( & 0 ) { return false ; } '
+              'let Some ( candidate ) = parse_version ( candidate ) else { return false ; } ; '
+              'let Ok ( dependency ) = dependency . parse :: < PackageRelation > ( ) else { '
+              'return dependency . parse :: < SonameV2 > ( ) . is_ok ( ) ; } ; '
+              'dependency . version_requirement . as_ref ( ) . is_none_or ( | requirement | '
+              'matches_version_requirement ( requirement , & candidate ) )').split(),
+        ]
+        expression = rust if side else legacy
+        _construct_charge(work, len(expression))
+        if (code.words[start:start + len(expression)] != expression
+                or side and start + len(expression) != function['end']):
+            return None
+        branch = start + expression.index('is_none_or' if side else 'true')
+        marker = code.region(branch, branch)
+        line = marker[0]
+        predicate = ()
+        if side:
+            callee = start + expression.index('matches_version_requirement')
+            predicate = (code.region(callee, callee), code.region(callee + 2, callee + 2),
+                         code.region(callee + 4, callee + 5))
+        owners = index.inventories.get(name, ())
+        _construct_charge(work, sum(len(owner['name']) + len(owner['regions']) + 1 for owner in owners))
+        namespace = ('omg_lib', 'package_managers', 'types' if side else 'aur_deps', declaration)
+        roots = [(owner, shape) for owner in owners
+                 if (shape := plain_rust_function_symbol(owner['name'])) is not None and shape.identifiers == namespace]
+        touched = [(owner, regions) for owner in owners if (regions := [
+            r for r in owner['regions'] if r[0] <= line <= r[2]])]
+        if not 1 <= len(roots) <= 16 or len(touched) != (2 if side else 1) * len(roots):
+            return None
+        states = []; symbols = []; explained = set()
+        for root, shape in roots:
+            raw = [rows for owner, rows in touched if owner is root]
+            if len(raw) != 1 or [tuple(r[:4]) for r in raw[0]] != [marker]:
+                return None
+            (mark,), = raw
+            if not 0 <= mark[4] <= root['count']:
+                return None
+            absence = mark[4]
+            claimed = [root]
+            if side:
+                children = [(owner, rows) for owner, rows in touched
+                            if direct_rust_callback_symbol(owner['name'], root['name'], shape.modules)]
+                if len(children) != 1:
+                    return None
+                (child, child_rows), = children
+                if ([tuple(r[:4]) for r in child_rows] != list(predicate)
+                        or any(r[4:] != [child['count'], 0, 0, 0] for r in child_rows)
+                        or not 0 <= child['count'] <= mark[4]):
+                    return None
+                # Option invokes its predicate once for Some, so the difference
+                # counts the unversioned requirements that reached None.
+                absence -= child['count']
+                claimed.append(child)
+            if (mark[5:] != [0, 0, 0]
+                    or any(index.name_counts[owner['name']] != 1 or owner.get('branches')
+                           or owner.get('mcdc_records') or not 0 <= owner['count'] < COUNTER_LIMIT
+                           or len(owner['filenames']) != 1 or index.files.get(owner['filenames'][0]) != name
+                           for owner in claimed)):
+                return None
+            explained.update(map(id, claimed))
+            states.append((root['count'] > 0, absence > 0))
+            symbols.append([owner['name'] for owner in claimed])
+        if explained != {id(owner) for owner, _ in touched} or not any(state[1] for state in states):
+            return None
+        projection = [r for _, rows in touched for r in rows]
+        if _owner_line_counts({'regions': projection}, _ObserverWork(work)) != {line: counts.get(line)}:
+            return None
+        observations.append((line, states, symbols))
+    before, after = observations
+    _construct_charge(work, 2 * len(before[1]) * len(after[1]))
+    matching = compiled_hit_state_matching(before[1], after[1])
+    if matching is None:
+        return None
+    return dict(file=sides[0][0], head_file=sides[1][0], kind='retained-unversioned-aur-dependency',
+                base_lines=[before[0]], head_lines=[after[0]], owners=[before[2], after[2]],
+                summary_credit=[0, 0], mapped_credit=[0, 0], instance_matching=matching)
 
 
 def retained_aur_metadata_policy(name, sides, indexes, work):
@@ -14359,7 +14598,7 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
             bf, hf, base_files, head_files, construct_work, inventories, grouped)
         anchored.update(construct_pairs); construct_receipts.extend(witnesses)
         retained = {}; gone = set(); unresolved_fragments = []; deferred_fragments = {}; neutral_declarations = {}
-        moved_diagnostic_lines = set()
+        moved_source_lines = set()
         callback_anchors = {}
         declaration_roles = {}
         record_states = {}; record_projections = {}; record_work = _ObserverWork(construct_work)
@@ -14533,6 +14772,17 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
                 if (line, target) in proved_eager_pairs:
                     retained[line] = target
                 elif line not in anchored:
+                    if (name == _AUR_INSPECTOR_SOURCE and inventories is not None
+                            and old[line - 1] == new[target - 1] and old[line - 1].strip() == 'assert!('
+                            and old[line:line + 2] == ['                inspection', '                    .paired_build_reasons']
+                            and new[target:target + 1] == ['                reasons.iter().all(|reason| {']
+                            and (bs[name]['expansions'], hs[name]['expansions']) == ([], [])):
+                        sides = ((old, inventories[0], before, line), (new, inventories[1], after, target))
+                        proof = retained_artifact_reason_matrix(name, sides, source_owner_indexes(), construct_work)
+                        if proof is not None:
+                            anchored[line] = target
+                            obligation_receipts.append(proof)
+                            continue
                     if (name == 'src/package_managers/aur/client.rs' and inventories is not None
                             and old[line - 1] == new[target - 1]
                             and old[line - 1].strip() == _AUR_METADATA_POLICY
@@ -14627,7 +14877,7 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
                 if block.get('retained_statements') and not any(
                         start <= block['base_line'] <= end for start, end in proved_functions):
                     for line in retained_statement_lines(block):
-                        if line in anchored or line in deferred_fragments or line in moved_diagnostic_lines:
+                        if line in anchored or line in deferred_fragments or line in moved_source_lines:
                             continue
                         low, high = block['head_range']
                         _construct_charge(construct_work, high - low + 1)
@@ -14638,17 +14888,25 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
                             target, = candidates
                             sides = ((old, inventories[0], before, line), (new, inventories[1], after, target))
                             proof = retained_callback_statement(name, sides, source_owner_indexes(), construct_work)
+                        moved_target = None
                         if (proof is None and name == 'src/package_managers/aur/client.rs'
-                                and inventories is not None and old[line - 1].strip() == 'format!('
-                                and _AUR_HISTORY_SOURCE in hs and _AUR_HISTORY_SOURCE not in base_sources
-                                and bs[name]['expansions'] == hs[_AUR_HISTORY_SOURCE]['expansions'] == []):
-                            destination = head_constructs(_AUR_HISTORY_SOURCE)
+                                and old[line - 1].strip() == 'format!(' and _AUR_HISTORY_SOURCE not in base_sources):
+                            moved_target = _AUR_HISTORY_SOURCE, retained_aur_history_diagnostic
+                        elif proof is None and name == _AUR_DEPS_SOURCE and old[line - 1].strip() == 'return true;':
+                            _construct_charge(construct_work, len(new))
+                            alias = 'use super::types::{dependency_version_satisfies as output_version_satisfies, provision_satisfies};'
+                            if new.count(alias) == 1:
+                                moved_target = _ALPM_RELATION_SOURCE, retained_unversioned_aur_dependency
+                        if (moved_target is not None and inventories is not None and moved_target[0] in hs
+                                and bs[name]['expansions'] == hs[moved_target[0]]['expansions'] == []):
+                            target_file, describe = moved_target
+                            destination = head_constructs(target_file)
                             if destination is not None:
                                 sides = ((name, inventories[0], before),
-                                         (_AUR_HISTORY_SOURCE, destination, hs[_AUR_HISTORY_SOURCE]['counts']))
-                                moved = retained_aur_history_diagnostic(sides, source_owner_indexes(), construct_work)
+                                         (target_file, destination, hs[target_file]['counts']))
+                                moved = describe(sides, source_owner_indexes(), construct_work)
                                 if moved is not None and line in moved['base_lines']:
-                                    moved_diagnostic_lines.update(moved['base_lines'])
+                                    moved_source_lines.update(moved['base_lines'])
                                     obligation_receipts.append(moved)
                                     continue
                         if proof is None:
@@ -14877,7 +15135,7 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
                         gone.discard(previous)
                     retired_policy_metadata.append(proof)
         gone.difference_update(anchored)
-        gone.difference_update(moved_diagnostic_lines)
+        gone.difference_update(moved_source_lines)
         anchored_new = set(anchored.values())
         paint = []
         final_pairs = {**retained, **anchored}

@@ -1954,6 +1954,174 @@ class RetainedAurHookRenderingTests(unittest.TestCase):
                     self.assertIsNone(proof)
 
 
+class RetainedRustRelationCoverageTests(unittest.TestCase):
+    def test_unversioned_acceptance_requires_a_covered_rust_option_absence(self):
+        filenames = ('src/package_managers/aur_deps.rs', 'src/package_managers/types.rs')
+        for fault in (None, 'no-absent-case', 'changed-predicate', 'missing-copy', 'foreign-owner'):
+            with self.subTest(fault=fault):
+                sides, indexes = [], []
+                work = [coverage.SOURCE_CONSTRUCT_WORK_CAPACITY]
+                for side, filename in enumerate(filenames):
+                    files = {'/artifact/' + filename: filename}
+                    decision = 'another_check' if side and fault == 'changed-predicate' else 'matches_version_requirement'
+                    if side:
+                        source = [
+                            '#[cfg(feature = "arch")]',
+                            'pub(crate) fn dependency_version_satisfies(dependency: &str, candidate: &str) -> bool {',
+                            '    use alpm_types::{PackageRelation, SonameV2};',
+                            '    if dependency.as_bytes().contains(&0) {',
+                            '        return false;',
+                            '    }',
+                            '    let Some(candidate) = parse_version(candidate) else {',
+                            '        return false;',
+                            '    };',
+                            '    let Ok(dependency) = dependency.parse::<PackageRelation>() else {',
+                            '        return dependency.parse::<SonameV2>().is_ok();',
+                            '    };',
+                            '    dependency',
+                            '        .version_requirement',
+                            '        .as_ref()',
+                            f'        .is_none_or(|requirement| {decision}(requirement, &candidate))',
+                            '}',
+                        ]
+                    else:
+                        source = [
+                            'fn output_version_satisfies(dependency: &str, candidate: &str) -> bool {',
+                            '    let dependency = alpm::Depend::new(dependency);',
+                            '    let Some(required) = dependency.version() else {',
+                            '        return true;',
+                            '    };',
+                            '    let comparison = alpm::vercmp(candidate, required.to_string().as_str());',
+                            '    match dependency.depmod() {',
+                            '        alpm::DepMod::Any => true,',
+                            '        alpm::DepMod::Eq => comparison.is_eq(),',
+                            '        alpm::DepMod::Ge => !comparison.is_lt(),',
+                            '        alpm::DepMod::Le => !comparison.is_gt(),',
+                            '        alpm::DepMod::Gt => comparison.is_gt(),',
+                            '        alpm::DepMod::Lt => comparison.is_lt(),',
+                            '    }',
+                            '}',
+                        ]
+                    owners = []
+                    for copy in range(2):
+                        if side and fault == 'missing-copy' and copy == 0:
+                            continue
+                        base = f'NvNtNtCs{side + 1}{copy + 1}_7omg_lib16package_managers'
+                        path = '5types28dependency_version_satisfies' if side else '8aur_deps24output_version_satisfies'
+                        def raw(line, operand, hits):
+                            col = source[line - 1].rindex(operand) + 1
+                            return [line, col, line, col + len(operand), hits, 0, 0, 0]
+                        value = 4 * copy
+                        call = value - copy if side and fault == 'no-absent-case' else value
+                        raw_roots = ([raw(16, 'is_none_or', call)] if side else [raw(4, 'true', copy)])
+                        owners.append(dict(name='_R' + base + path, filenames=list(files), regions=raw_roots, count=value))
+                        if side:
+                            rows = [raw(16, word, value - copy) for word in (decision, 'requirement', '&candidate')]
+                            owners.append(dict(name='_RNC' + base + path + '0B7_', filenames=list(files),
+                                               regions=rows, count=value - copy))
+                    if side and fault == 'foreign-owner':
+                        owners.append(dict(owners[-1], name='foreign'))
+                    counts = coverage._owner_line_counts({'regions': [r for member in owners for r in member['regions']]},
+                                                        coverage._ObserverWork(work))
+                    sides.append((filename, coverage._construct_inventory(source, work), counts))
+                    indexes.append(coverage.index_compiled_owner_sources(owners, files, work, {filename}))
+                proof = coverage.retained_unversioned_aur_dependency(sides, indexes, work)
+                if fault is None:
+                    self.assertIsNotNone(proof)
+                    self.assertEqual(proof['base_lines'], [4])
+                    self.assertEqual(proof['summary_credit'], [0, 0])
+                else:
+                    self.assertIsNone(proof)
+
+
+class RetainedArtifactReasonFixtureTests(unittest.TestCase):
+    def test_overlap_fixture_keeps_all_original_reason_checks(self):
+        filename = 'src/package_managers/aur/artifact_inspector.rs'
+        files = {'/artifact/' + filename: filename}
+        for fault in (None, 'removed-case', 'wrong-reason', 'missing-child', 'cold-marker', 'foreign-owner'):
+            with self.subTest(fault=fault):
+                sides, indexes = [], []
+                work = [coverage.SOURCE_CONSTRUCT_WORK_CAPACITY]
+                for side in range(2):
+                    path = 'etc/different' if side and fault == 'removed-case' else 'etc/main'
+                    reason = 'different-reason' if side and fault == 'wrong-reason' else 'system-configuration'
+                    source = [
+                        '#[cfg(test)]',
+                        'mod tests {',
+                        '    #[test]',
+                        '    fn inspector_requires_paired_build_for_system_integration_payloads() -> Result<()> {',
+                        *(['        let cases: &[(&str, &[&str])] = &[',
+                           f'            ("{path}", &["{reason}"]),',
+                           '            ("etc/systemd/demo", &["system-configuration", "systemd-unit"]),',
+                           '        ];',
+                           '        for &(path, reasons) in cases {'] if side else [
+                           '        for (path, reason) in [',
+                           f'            ("{path}", "{reason}"),',
+                           '        ] {']),
+                        *(['            let mtree = fixture_file_mtree(&[(path, 0o644, 7)]);',
+                           '            let archive = fixture_archive_with_mtree(&mtree, |builder| {',
+                           '                append_file(builder, path, b"payload", 0o644)',
+                           '            })?;',
+                           '            let inspection = inspect_archive(archive.path())?.into_inspection();'] if side else [
+                           '            let archive = fixture_archive(|builder| append_file(builder, path, b"payload", 0o644))?;',
+                           '            let inspection = inspect_archive(archive.path())?;']),
+                        '            assert!(',
+                        *(['                reasons.iter().all(|reason| {',
+                           '                    inspection',
+                           '                        .paired_build_reasons',
+                           '                        .iter()',
+                           '                        .any(|item| item == *reason)',
+                           '                }),',
+                           '                "missing paired build reason for {path}"'] if side else [
+                           '                inspection',
+                           '                    .paired_build_reasons',
+                           '                    .iter()',
+                           '                    .any(|item| item == reason)']),
+                        '            );',
+                        '        }',
+                        '        Ok(())',
+                        '    }',
+                        '}',
+                    ]
+                    line = source.index('            assert!(') + 1
+                    scope = f'NvNtNtNtNtCs{side + 1}1_7omg_lib16package_managers3aur18artifact_inspector5testss_63inspector_requires_paired_build_for_system_integration_payloads'
+                    def region(start, text, hits, end=None, suffix=None):
+                        col = source[start - 1].rindex(text) + 1
+                        last = source[end - 1].rindex(suffix) + 1 + len(suffix) if end else col + len(text)
+                        return [start, col, end or start, last, hits, 0, 0, 0]
+                    def owner(symbol, hits, rows):
+                        return dict(name=symbol, filenames=list(files), count=hits, regions=rows)
+                    count = 2 if side else 1
+                    root_marker = 0 if side and fault == 'cold-marker' else count
+                    root = [region(4, 'fn', 1), region(line, 'assert!', root_marker),
+                            region(len(source) - 1, '}', 1)]
+                    if side:
+                        root[2:2] = [region(line + 1, 'reasons.iter()', count), region(line + 1, 'all', count)]
+                        outer = [region(line + 1, '{', 3), region(line + 2, 'inspection', 3, line + 4, 'iter()'),
+                                 region(line + 5, 'any', 3), region(line + 6, '}', 3)]
+                        inner = [region(line + 5, 'item', 6), region(line + 5, '*reason', 6)]
+                        owners = [owner('_R' + scope, 1, root), owner('_RNC' + scope + 's0_0Bb_', 3, outer)]
+                        if fault != 'missing-child':
+                            owners.append(owner('_RNCNC' + scope + 's0_00Bd_', 6, inner))
+                    else:
+                        root[2:2] = [region(line + 1, 'inspection', 1, line + 3, 'iter()'),
+                                     region(line + 4, 'any', 1)]
+                        inner = [region(line + 4, 'item', 2), region(line + 4, 'reason', 2)]
+                        owners = [owner('_R' + scope, 1, root), owner('_RNC' + scope + 's0_0Bb_', 2, inner)]
+                    if side and fault == 'foreign-owner':
+                        owners.append(owner('foreign', 1, [root[1]]))
+                    counts = coverage._owner_line_counts({'regions': [r for member in owners for r in member['regions']]},
+                                                        coverage._ObserverWork(work))
+                    sides.append((source, coverage._construct_inventory(source, work), counts, line))
+                    indexes.append(coverage.index_compiled_owner_sources(owners, files, work, {filename}))
+                proof = coverage.retained_artifact_reason_matrix(filename, sides, indexes, work)
+                if fault is None:
+                    self.assertIsNotNone(proof)
+                    self.assertEqual(proof['pairs'], [[sides[0][-1], sides[1][-1]]])
+                else:
+                    self.assertIsNone(proof)
+
+
 class RetainedAurGitLimitTests(unittest.TestCase):
     def test_git_mirror_keep_staging_bound_after_supervisor_migration(self):
         filename = 'src/package_managers/aur_sources.rs'
