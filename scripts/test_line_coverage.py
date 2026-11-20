@@ -352,13 +352,14 @@ class PacmanFixtureCoverageTests(unittest.TestCase):
     def test_cached_upgrade_comparison_keeps_the_same_typed_operands(self):
         filename = 'src/package_managers/pacman_db/db.rs'
         files = {'/artifact/' + filename: filename}
-        for fault in (None, 'reversed-operands', 'different-ordering', 'wrong-copy', 'unmapped-predicate'):
+        for fault in (None, 'reversed-operands', 'different-ordering', 'wrong-copy', 'unmapped-predicate', 'wrong-repository'):
             with self.subTest(fault=fault):
                 work = [coverage.SOURCE_CONSTRUCT_WORK_CAPACITY]
                 sides, indexes = [], []
                 for side in range(2):
                     left, right = ('sync_pkg', 'local_pkg') if side and fault == 'reversed-operands' else ('local_pkg', 'sync_pkg')
                     ordering = 'Greater' if side and fault == 'different-ordering' else 'Less'
+                    repository = 'local_pkg' if side and fault == 'wrong-repository' else 'sync_pkg'
                     source = [
                         '#[instrument]', 'pub fn check_updates_cached() -> Result<Vec<CachedUpdate>> {',
                         '    let updates: Vec<_> = local_cache.packages.par_iter().filter_map(|(name, local_pkg)| {',
@@ -366,7 +367,13 @@ class PacmanFixtureCoverageTests(unittest.TestCase):
                         '                    crate::package_managers::types::compare_versions(',
                         f'                        &{left}.version,', f'                        &{right}.version,',
                         f'                    ) == std::cmp::Ordering::{ordering}',
-                        '                })', '    }).collect();', '    Ok(updates)', '}',
+                        '                }).map(|sync_pkg| (name, local_pkg, sync_pkg))',
+                        '    })', '        .map(|(name, local_pkg, sync_pkg)| {',
+                        '            CachedUpdate {', '                name: name.clone(),',
+                        '                old_version: local_pkg.version.clone(),',
+                        '                new_version: sync_pkg.version.clone(),',
+                        f'                repo: {repository}.repo.clone(),',
+                        '            }', '        })', '        .collect();', '    Ok(updates)', '}',
                     ]
                     root = f'NvNtNtNtCs{side + 1}_7omg_lib16package_managers9pacman_db2db20check_updates_cached'
                     inner = root if not (side and fault == 'wrong-copy') else root.replace('Cs2_', 'Cs3_')
@@ -381,8 +388,16 @@ class PacmanFixtureCoverageTests(unittest.TestCase):
                                    regions=[[4, filter_open, 4, filter_open + 1, count, 0, 0, 0],
                                             [5, 21, 5, 69, count, 0, 0, 0],
                                             [5, 21, 8, len(source[7]) + 1, count, 0, 0, 0],
-                                            [9, 17, 9, 18, count, 0, 0, 0]])]
+                                            [9, 17, 9, 18, count, 0, 0, 0]]),
+                              dict(name='_RNC' + root + 's_0B9_', filenames=list(files), count=count,
+                                   regions=[[11, 44, 11, 45, count, 0, 0, 0],
+                                            [12, 13, 17, 14, count, 0, 0, 0],
+                                            [13, 23, 13, 27, count, 0, 0, 0], [13, 28, 13, 33, count, 0, 0, 0],
+                                            [14, 30, 14, 47, count, 0, 0, 0], [14, 48, 14, 53, count, 0, 0, 0],
+                                            [15, 30, 15, 46, count, 0, 0, 0], [15, 47, 15, 52, count, 0, 0, 0],
+                                            [18, 9, 18, 10, count, 0, 0, 0]])]
                     counts = {line: count for line in range(5, 9)}
+                    counts.update({line: count for line in range(13, 17)})
                     if side and fault == 'unmapped-predicate':
                         del counts[6]
                     sides.append((source, coverage._construct_inventory(source, work), counts))
@@ -390,7 +405,7 @@ class PacmanFixtureCoverageTests(unittest.TestCase):
                 proof = coverage.retained_cached_upgrade_comparison(filename, sides, indexes, work)
                 if fault is None:
                     self.assertIsNotNone(proof)
-                    self.assertEqual(proof['pairs'], [[line, line] for line in range(5, 9)])
+                    self.assertEqual(proof['pairs'], [[line, line] for line in [*range(5, 9), *range(13, 17)]])
                 else:
                     self.assertIsNone(proof)
 

@@ -14155,6 +14155,10 @@ def retained_cached_upgrade_comparison(name, sides, indexes, work):
     predicate = [*path, *'( & local_pkg . version , & sync_pkg . version , ) = = std :: cmp :: Ordering :: Less'.split()]
     filter_open = '. filter ( | sync_pkg | {'.split()
     outer_open = '= local_cache . packages . par_iter ( ) . filter_map ( | ( name , local_pkg ) | {'.split()
+    tuple_mapping = '. map ( | sync_pkg | ( name , local_pkg , sync_pkg ) )'.split()
+    result_mapping = '. map ( | ( name , local_pkg , sync_pkg ) | {'.split()
+    record = ('CachedUpdate { name : name . clone ( ) , old_version : local_pkg . version . clone ( ) , '
+              'new_version : sync_pkg . version . clone ( ) , repo : sync_pkg . repo . clone ( ) , }').split()
     observations = []
     for (_, inventory, counts), index in zip(sides, indexes, strict=True):
         code, rows = inventory[:2]
@@ -14181,6 +14185,26 @@ def retained_cached_upgrade_comparison(name, sides, indexes, work):
                 or code.words[outer - len(outer_open) + 1:outer + 1] != outer_open
                 or code.pairs[call] != last + 2 or code.pairs[outer_call] != code.pairs[outer] + 1):
             return None
+        tail = code.pairs[call] + 1
+        start_map = code.pairs[outer_call] + 1
+        mapper = start_map + len(result_mapping) - 1
+        record_at = mapper + 1
+        record_end = record_at + len(record) - 1
+        _construct_charge(work, len(tuple_mapping) + len(result_mapping) + len(record))
+        if (code.words[tail:code.pairs[outer]] != tuple_mapping
+                or code.words[start_map:mapper + 1] != result_mapping
+                or code.words[record_at:record_end + 1] != record
+                or code.pairs[mapper] != record_end + 1):
+            return None
+        mapper_close = record_end + 1
+        fields = [record_at + record.index(field) + 2 for field in ('name', 'old_version', 'new_version', 'repo')]
+        projections = []
+        for first_operand, receiver_parts in zip(fields[:3], (1, 3, 3), strict=True):
+            clone = first_operand + receiver_parts + 1
+            projections.extend((code.region(first_operand, first_operand + receiver_parts - 1), code.region(clone, clone)))
+        output_slots = (code.region(mapper, mapper), code.region(record_at, record_end), *projections,
+                        code.region(mapper_close, mapper_close))
+        output_lines = [code.region(token, token)[0] for token in fields]
         outer_marker = code.region(outer, outer)
         close = code.pairs[inner]
         slots = (code.region(inner, inner), code.region(first, first + len(path) - 1),
@@ -14191,36 +14215,48 @@ def retained_cached_upgrade_comparison(name, sides, indexes, work):
         roots = [(owner, shape) for owner in owners if (shape := plain_rust_function_symbol(owner['name'])) is not None
                  and shape.identifiers == ('omg_lib', 'package_managers', 'pacman_db', 'db', 'check_updates_cached')]
         affected = [owner for owner in owners if any(r[0] <= high and low <= r[2] for r in owner['regions'])]
-        if not 1 <= len(roots) <= 16 or len(affected) != len(roots):
+        _construct_charge(work, sum(len(owner['regions']) + 1 for owner in owners))
+        written = [owner for owner in owners if any(r[0] <= output_lines[-1] and output_lines[0] <= r[2]
+                                                   for r in owner['regions'])]
+        if not 1 <= len(roots) <= 16 or len(affected) != len(roots) or len(written) != len(roots):
             return None
         _construct_charge(work, len(roots) * sum(len(owner['name']) + 1 for owner in owners))
-        matched = []; hits = []; witnesses = []
+        matched = []; mapped = []; hits = []; output_hits = []; witnesses = []
         for root, shape in roots:
             parents = [owner for owner in owners if direct_rust_callback_symbol(owner['name'], root['name'], shape.modules)
                        and [r[4:] for r in owner['regions'] if tuple(r[:4]) == outer_marker] == [[owner['count'], 0, 0, 0]]]
             children = [owner for owner in affected
                         if direct_rust_callback_symbol(owner['name'], root['name'], shape.modules, depth=2)]
-            if len(parents) != 1 or len(children) != 1:
+            builders = [owner for owner in written if direct_rust_callback_symbol(owner['name'], root['name'], shape.modules)]
+            if len(parents) != 1 or len(children) != 1 or len(builders) != 1:
                 return None
             carrier, = parents
             callback, = children
+            builder, = builders
             count = callback['count']
             if (not 0 <= count <= carrier['count'] < COUNTER_LIMIT
                     or callback['regions'] != [[*slot, count, 0, 0, 0] for slot in slots]
+                    or not 0 <= builder['count'] <= count
+                    or builder['regions'] != [[*slot, builder['count'], 0, 0, 0] for slot in output_slots]
                     or any(index.name_counts[owner['name']] != 1 or owner.get('branches') or owner.get('mcdc_records')
                            or len(owner['filenames']) != 1 or index.files.get(owner['filenames'][0]) != name
-                           for owner in (root, carrier, callback))):
+                           for owner in (root, carrier, callback, builder))):
                 return None
             matched.append(id(callback)); hits.append(count)
-            witnesses.append([root['name'], carrier['name'], callback['name'], count])
+            mapped.append(id(builder)); output_hits.append(builder['count'])
+            witnesses.append([root['name'], carrier['name'], callback['name'], count, builder['name'], builder['count']])
         _construct_charge(work, high - low + 1)
         lines = list(range(low, high + 1))
         total = sum(hits)
-        if len(set(matched)) != len(affected) or total <= 0 or any(counts.get(line) != total for line in lines):
+        written_total = sum(output_hits)
+        if (len(set(matched)) != len(affected) or total <= 0 or any(counts.get(line) != total for line in lines)
+                or len(set(mapped)) != len(written) or written_total <= 0
+                or any(counts.get(line) != written_total for line in output_lines)):
             return None
-        observations.append((lines, [[int(count > 0)] for count in hits], slots, witnesses))
+        states = [[int(compare > 0), int(build > 0)] for compare, build in zip(hits, output_hits, strict=True)]
+        observations.append((lines + output_lines, states, (slots, output_slots), witnesses))
     before, after = observations
-    _construct_charge(work, len(before[1]) * len(after[1]))
+    _construct_charge(work, 2 * len(before[1]) * len(after[1]))
     matching = compiled_hit_state_matching(before[1], after[1])
     if matching is None or len(before[0]) != len(after[0]):
         return None
