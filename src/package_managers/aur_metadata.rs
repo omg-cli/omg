@@ -122,7 +122,7 @@ fn lock_metadata(location: &MetadataRoot, access: MetadataAccess) -> Result<Meta
     };
 
     let root = location.path();
-    if let MetadataAccess::Shared = access {
+    if matches!(access, MetadataAccess::Shared) {
         anyhow::ensure!(
             std::fs::metadata(&root)?.is_dir(),
             "AUR metadata root is not a directory"

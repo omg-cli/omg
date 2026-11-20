@@ -195,8 +195,12 @@ fn validate_pi_install(prefix: &Path, version: &str) -> Result<PathBuf> {
         .canonicalize()
         .context("Pi package has no contained npm executable")?;
     ensure!(
-        entrypoint.starts_with(package.canonicalize()?) && fs::metadata(&entrypoint)?.is_file(),
+        entrypoint.starts_with(package.canonicalize()?),
         "Pi executable escapes the selected package"
+    );
+    ensure!(
+        fs::metadata(&entrypoint)?.is_file(),
+        "Pi executable is not a regular file"
     );
     Ok(entrypoint
         .strip_prefix(prefix.canonicalize()?)?
@@ -523,7 +527,11 @@ esac
         let manager = PiManager::with_paths(temp.path().join("versions/pi"), npm);
         manager.install("0.82.0").await?;
         fake_npm(temp.path(), "0.83.0", false)?;
-        assert!(manager.install("0.83.0").await.is_err());
+        let error = manager
+            .install("0.83.0")
+            .await
+            .expect_err("failed npm install must remain unpublished");
+        assert!(format!("{error:#}").contains("NPM frozen install"));
         assert_eq!(manager.current_version().as_deref(), Some("0.82.0"));
         assert!(!manager.versions_dir.join("0.83.0").exists());
         Ok(())
@@ -539,8 +547,11 @@ esac
         let error = manager
             .install("0.83.0")
             .await
-            .expect_err("exact version must match");
-        assert!(format!("{error:#}").contains("requested exact version"));
+            .expect_err("unexpected package version must not be published");
+        assert!(
+            format!("{error:#}").contains("requested exact version"),
+            "mismatch error must name the requested version, got: {error:#}"
+        );
         assert!(!manager.versions_dir.join("0.83.0").exists());
         Ok(())
     }
@@ -564,6 +575,15 @@ esac
         let error = validate_pi_install(prefix.path(), "0.83.0")
             .expect_err("an installation without an executable cannot be activated");
         assert!(format!("{error:#}").contains("Pi package has no contained npm executable"));
+
+        let entrypoint = package.join("dist");
+        fs::create_dir(&entrypoint)?;
+        let bin_dir = prefix.path().join("node_modules/.bin");
+        fs::create_dir(&bin_dir)?;
+        symlink(entrypoint, bin_dir.join("pi"))?;
+        let error = validate_pi_install(prefix.path(), "0.83.0")
+            .expect_err("an executable directory cannot be activated");
+        assert!(format!("{error:#}").contains("Pi executable is not a regular file"));
         Ok(())
     }
 
@@ -698,34 +718,37 @@ esac
             .verify(&prefix)?;
 
         source.refuse_pi.store(false, Ordering::SeqCst);
+        npm_source.revision.store(1, Ordering::SeqCst);
+        // Expire the cache while preserving the exact dependency evidence. A
+        // semantic change would require a separate attended Pi risk review.
+        let receipt_path = prefix.join(".omg-npm-advisory-review.json");
+        let mut stale_receipt: serde_json::Value = serde_json::from_slice(&previous)?;
+        stale_receipt["reviewed_at"] = "2000-01-01T00:00:00Z".into();
+        let stale_receipt = serde_json::to_vec_pretty(&stale_receipt)?;
+        crate::core::safe_ops::atomic_write_file_sync(&receipt_path, &stale_receipt)?;
+
         let current = manager.versions_dir.join("current");
         let previous_link = fs::read_link(&current)?;
         fs::remove_file(&current)?;
         fs::create_dir(&current)?;
-        let error = temp_env::with_var(
-            crate::cli::tool::ALLOW_NPM_SCRIPTS_ENV,
-            Some("@earendil-works/pi-coding-agent@0.83.0"),
-            || manager.use_version("0.83.0"),
-        )
-        .expect_err("must preserve a regular current directory");
-        assert!(format!("{error:#}").contains("Refusing to replace non-symlink"));
-        assert_eq!(
-            fs::read(prefix.join(".omg-npm-advisory-review.json"))?,
-            previous
+        let error = manager
+            .use_version("0.83.0")
+            .expect_err("must preserve a regular current directory");
+        assert!(
+            format!("{error:#}").contains("Refusing to replace non-symlink"),
+            "{error:#}"
         );
+        assert_eq!(fs::read(&receipt_path)?, stale_receipt);
         assert!(fs::symlink_metadata(&current)?.file_type().is_dir());
 
         fs::remove_dir(&current)?;
         symlink(previous_link, &current)?;
-        temp_env::with_var(
-            crate::cli::tool::ALLOW_NPM_SCRIPTS_ENV,
-            Some("@earendil-works/pi-coding-agent@0.83.0"),
-            || manager.use_version("0.83.0"),
-        )?;
-        assert_ne!(
-            fs::read(prefix.join(".omg-npm-advisory-review.json"))?,
-            previous
-        );
+        manager.use_version("0.83.0")?;
+        assert_ne!(fs::read(&receipt_path)?, stale_receipt);
+        manager
+            .security
+            .installed("pi", &prefix, ReviewMode::CachedOnly)?
+            .verify(&prefix)?;
         assert_eq!(manager.current_version().as_deref(), Some("0.83.0"));
         Ok(())
     }
