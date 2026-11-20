@@ -240,18 +240,20 @@ pub fn validate() -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        if let Ok(meta) = std::fs::metadata(&config_file) {
-            let mode = meta.permissions().mode();
-            if mode & 0o077 != 0 {
-                let perm_str = format!("{:o}", mode & 0o777);
-                println!(
-                    "  {} Config file has loose permissions ({perm_str})",
-                    style::warning("⚠")
-                );
-                println!("    Consider running: chmod 600 {config_file}");
-            } else {
-                println!("  {} File permissions are secure", style::success("✓"));
-            }
+        let mode = std::fs::metadata(&config_file)
+            .context("Failed to inspect configuration permissions")?
+            .permissions()
+            .mode();
+        if mode & 0o077 != 0 {
+            let perm_str = format!("{:o}", mode & 0o777);
+            println!(
+                "  {} Config file has loose permissions ({perm_str})",
+                style::warning("⚠")
+            );
+            println!("    Consider running: chmod 600 {config_file}");
+            issues += 1;
+        } else {
+            println!("  {} File permissions are secure", style::success("✓"));
         }
     }
 

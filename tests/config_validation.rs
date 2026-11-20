@@ -6,8 +6,14 @@ use common::TestProject;
 
 fn configured(content: &str) -> TestProject {
     let project = TestProject::new();
-    std::fs::write(project.config_dir.path().join("config.toml"), content)
-        .expect("write isolated configuration");
+    let path = project.config_dir.path().join("config.toml");
+    std::fs::write(&path, content).expect("write isolated configuration");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .expect("set private configuration permissions");
+    }
     project
 }
 
@@ -69,7 +75,7 @@ fn config_validation_keeps_high_concurrency_warning_successful() {
 
 #[cfg(unix)]
 #[test]
-fn config_validation_keeps_loose_permissions_warning_successful() {
+fn config_validation_rejects_loose_permissions_without_rewriting_the_file() {
     use std::os::unix::fs::PermissionsExt;
     let content = "[aur]\nbuild_concurrency = 2\n";
     let project = configured(content);
@@ -77,8 +83,10 @@ fn config_validation_keeps_loose_permissions_warning_successful() {
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
         .expect("set fixture permissions");
     let result = project.run(&["config", "validate"]);
-    result.assert_success();
+    assert_eq!(result.exit_code, 1, "{result:?}");
     result.assert_stdout_contains("Config file has loose permissions (644)");
+    result.assert_stdout_contains("Found 1 issue(s)");
+    assert!(!result.contains("Configuration is valid!"));
     assert_eq!(
         std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
         0o644

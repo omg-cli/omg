@@ -4248,6 +4248,31 @@ mod project_tests {
             "Tool list should succeed or explain that no tools are installed: {output}"
         );
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn removing_a_managed_tool_preserves_unrelated_dangling_links() {
+        use std::os::unix::fs::symlink;
+
+        let project = TestProject::new();
+        let data = project.data_dir.path();
+        let bin = data.join("bin");
+        let tool = data.join("tools/cargo/omg-removal-fixture");
+        let installed = tool.join("bin/managed");
+        std::fs::create_dir_all(installed.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(&installed, b"managed tool fixture").unwrap();
+        symlink(&installed, bin.join("managed")).unwrap();
+        let unrelated = data.join("tools/cargo/omg-removal-fixture-other/bin/foreign");
+        symlink(&unrelated, bin.join("foreign")).unwrap();
+
+        let result = project.run(&["tool", "remove", "omg-removal-fixture"]);
+        result.assert_success();
+        assert!(!tool.exists());
+        assert!(std::fs::symlink_metadata(bin.join("managed")).is_err());
+        assert_eq!(std::fs::read_link(bin.join("foreign")).unwrap(), unrelated);
+        project.close_checked();
+    }
 }
 
 // ====================

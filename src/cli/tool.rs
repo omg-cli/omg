@@ -1128,7 +1128,6 @@ fn install_managed_blocking(
     }
 
     pb.finish_and_clear();
-    println!("  {} Installation successful", style::success("✓"));
     // LINKING PHASE
     // PEP 405: a venv is identified by a pyvenv.cfg marker next to bin/.
     // Base interpreter files (python, pip, activate) in a venv are environment
@@ -1172,6 +1171,7 @@ fn install_managed_blocking(
         tracing::warn!(path = %backup.display(), %error, "failed to remove previous tool backup");
     }
 
+    println!("  {} Installation successful", style::success("✓"));
     Ok(())
 }
 
@@ -3189,6 +3189,78 @@ exit 1
         assert!(advisory_receipt.is_file());
         assert!(destination.join(".omg-security-receipt.json").is_file());
         assert_eq!(fs::read_dir(tools.join("go"))?.count(), 1);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn managed_tool_reports_success_only_after_activation() -> Result<()> {
+        const NAME: &str = "cli::tool::tests::managed_tool_reports_success_only_after_activation";
+        const CASE: &str = "OMG_TEST_TOOL_ACTIVATION_OUTPUT";
+        if let Ok(case) = std::env::var(CASE) {
+            let (fixture, advisories) =
+                crate::runtimes::tool_artifacts::managed_go_publication_fixture()?;
+            let bin = fixture.path().join("bin");
+            let expect_success = case == "available";
+            if expect_success {
+                fs::create_dir(&bin)?;
+            } else {
+                fs::write(&bin, b"keep this entry")?;
+            }
+            let result = install_managed_with_advisories(
+                "go",
+                "example.com/tool@v1.2.3",
+                "fixture-tool",
+                &fixture.path().join("tools"),
+                &bin,
+                advisories,
+                crate::runtimes::security::RuntimeSecurity::fixture(),
+            )
+            .await;
+            if expect_success {
+                result?;
+                assert!(bin.join("fixture-tool").is_file());
+            } else {
+                let error = result.expect_err("a file cannot contain a command symlink");
+                assert!(
+                    format!("{error:#}").contains("Failed to symlink binary"),
+                    "{error:#}"
+                );
+                assert_eq!(fs::read(&bin)?, b"keep this entry");
+                assert!(!fixture.path().join("tools/go/fixture-tool").exists());
+            }
+            return Ok(());
+        }
+
+        for (case, expect_success) in [("available", true), ("blocked", false)] {
+            let mut command = tokio::process::Command::new(std::env::current_exe()?);
+            command
+                .args(["--exact", NAME, "--nocapture"])
+                .env(CASE, case)
+                .kill_on_drop(true);
+            let output = tokio::time::timeout(std::time::Duration::from_secs(20), command.output())
+                .await??;
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success() && stdout.contains("1 passed"),
+                "{stdout}\n{stderr}"
+            );
+            assert_eq!(
+                stdout.contains("Installation successful"),
+                expect_success,
+                "{stdout}"
+            );
+            if expect_success {
+                let linked = stdout
+                    .find("Linked fixture-tool")
+                    .context("missing launcher announcement")?;
+                let success = stdout
+                    .find("Installation successful")
+                    .context("missing success announcement")?;
+                assert!(linked < success, "{stdout}");
+            }
+        }
         Ok(())
     }
 

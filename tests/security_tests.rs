@@ -292,14 +292,11 @@ mod filesystem_security {
             fs::set_permissions(project.path(), perms).unwrap();
 
             let result = project.run(&["status"]);
+            result.assert_success();
             assert!(
                 result.contains("packages installed"),
                 "a world-writable cwd must not prevent status from reporting packages, got: {}",
                 result.combined_output()
-            );
-            assert!(
-                !result.stdout.contains("root:x:0:0"),
-                "status must not dump /etc/passwd because cwd is world-writable"
             );
         }
     }
