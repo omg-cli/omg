@@ -40,7 +40,7 @@ An import processes at most four distinct CVE IDs concurrently. Revisions of the
 
 Apply `0002` before deploying the Worker that reads the maintained counter. It reconciles existing sessions once and installs the triggers in the same migration batch. The already deployed `0001` migration is unchanged. The previous Worker remains compatible after `0002`, while the new Worker requires `0002` for correct counts.
 
-The ingest secret is a trusted operator capability. SHA-256 is computed over the UTF-8 encoding of the exact `payload_json` string. Consumers can encode that string and verify the advertised hash before parsing it; JSON whitespace and key order are preserved. Invalid UTF-8 and UTF-8 BOMs are rejected. The service does not independently download the archive or verify every archive member. An authoritative publisher-bound manifest and exhaustive server membership comparison remain future work.
+The ingest secret is a trusted operator capability. SHA-256 is computed over the UTF-8 encoding of the exact `payload_json` string. Consumers can verify the advertised hash before parsing it. JSON whitespace and key order are preserved. Invalid UTF-8 and UTF-8 BOMs are rejected. For archive certification, the server enumerates the official publisher's Git tree and reconciles each expected CVE ID and original blob identity against the import ledger. The [archive bootstrap procedure](#archive-bootstrap) covers this verification step.
 
 ## Local checks
 
@@ -58,7 +58,7 @@ The migration and service tests use real SQLite. A separate Miniflare test uses 
 
 ## Provisioning and deployment
 
-The dedicated service is deployed at `https://omg-advisories.latham.workers.dev`. The committed configuration binds its dedicated `omg-advisories` D1 database and private `omg-advisories-raw` R2 bucket. Do not substitute the unrelated platform database. The full historical CVE archive remains unimported and independently unverified; check `/v1/status` for current source freshness and progress. The Rust client validates the Arch snapshot separately from global CVE bootstrap status.
+The dedicated service is deployed at `https://omg-advisories.latham.workers.dev`. The committed configuration binds its dedicated `omg-advisories` D1 database and private `omg-advisories-raw` R2 bucket. Do not substitute the unrelated platform database. Check `/v1/status` for the current archive import count, publisher verification, and feed freshness. The Rust client validates the Arch snapshot separately from global CVE bootstrap status.
 
 For an update to this deployment, apply reviewed migrations before deploying code that depends on them:
 

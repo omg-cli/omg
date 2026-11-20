@@ -1861,6 +1861,46 @@ def environment_result_callback(code, function, callback):
         and code.words[callback['end']+1:function['end']]==[',',')'])
 
 
+@dataclass(frozen=True)
+class ResultContextBinding:
+    prefix: tuple[str, ...]
+    body: tuple[str, ...]
+    receiver_line: int
+    width: int
+    binding: tuple[int, int, int, int] | None
+
+
+def result_context_binding(code, function, callback, argument, work):
+    """Recognize a context callback on a direct method result assigned to a local."""
+    dot = argument - 3
+    end = callback['end']
+    if (dot < 1 or code.words[dot:callback['opening']] != ['.', 'with_context', '(', '||']
+            or code.words[end + 1:end + 4] != [')', '?', ';']
+            or code.words[dot - 1] != ')' or code.pairs[dot + 2] != end + 1):
+        return None
+    receiver_line = code.position(code.starts[dot - 1])[0]
+    if code.position(code.starts[dot])[0] != receiver_line + 1:
+        return None
+    first = bisect.bisect_left(code.starts, code.offsets[receiver_line - 1])
+    receiver = first
+    if code.words[first] == 'let' and code.words[first + 2] == '=':
+        receiver += 3
+    invocation = code.pairs[dot - 1]
+    if (invocation != receiver + 3 or code.words[receiver + 1] != '.'
+            or code.parents[first] != code.parents[dot] or code.parents[end + 3] != code.parents[dot]
+            or any(re.fullmatch(r'[A-Za-z_]\w*', code.words[token], re.ASCII) is None
+                   for token in (receiver, receiver + 2))):
+        return None
+    if receiver != first and (code.words[first + 1] == '_'
+            or re.fullmatch(r'[A-Za-z_]\w*', code.words[first + 1], re.ASCII) is None):
+        return None
+    _construct_charge(work, (end - function['opening']) + len(code.starts).bit_length())
+    binding = code.region(first + 1, first + 1) if receiver != first else None
+    width = code.position(code.starts[receiver])[1] - code.position(code.starts[first])[1]
+    prefix = tuple(code.words[function['opening'] + 1:first] + code.words[receiver:callback['opening']])
+    return ResultContextBinding(prefix, tuple(code.words[argument:end + 1]), receiver_line, width, binding)
+
+
 def zero_arg_callback_fragment(source, group, owners, name_counts, first, last, inventory, work,
                                *, caller_entry=False, single_binding=False, phase_cache=None,
                                environment_test=False):
@@ -1968,10 +2008,14 @@ def zero_arg_callback_fragment(source, group, owners, name_counts, first, last, 
         return None
     if code.parents[argument] != code.parents[callback['opening']]:
         return None
+    result_context = None if caller_entry or single_binding or environment_test else result_context_binding(
+        code, function, callback, argument, work)
     if caller_entry:
         _construct_charge(work, 2 * (len(code.starts).bit_length() + 1))
         start = bisect.bisect_left(code.starts, code.offsets[first - 1])
         prefix = tuple(code.words[start:callback['opening'] + 1])
+    elif result_context is not None:
+        prefix = result_context.prefix
     else:
         prefix = tuple(code.words[function['opening'] + 1:callback['opening']])
     _construct_charge(work, len(prefix) + len(header))
@@ -2005,7 +2049,7 @@ def zero_arg_callback_fragment(source, group, owners, name_counts, first, last, 
             assertion_slot = (*code.position(code.starts[token]),*code.position(code.ends[token+1]))
         elif opening[0]!=first or source[first-1].strip()!='|| -> anyhow::Result<()> {':
             return None
-    states = []; line_states = []; identities = []; geometries = []; witnesses = []
+    states = []; line_states = []; identities = []; geometries = []; witnesses = []; child_roles = set()
     bound = {id(parent) for parent in group[2]}; children_bound = set()
     for parent in group[2]:
         shape = plain_rust_function_symbol(parent['name'])
@@ -2074,6 +2118,30 @@ def zero_arg_callback_fragment(source, group, owners, name_counts, first, last, 
                 return None
         else:
             context_geometry, context_states = fragment_region_states(parent, group[0], opening[0], source, work)
+        if result_context is not None:
+            if any(owner.get('branches') or owner.get('mcdc_records') for owner in (parent, child)):
+                return None
+            if any(list(row[4:]) != [0, 0, 0]
+                   for row in (*parent_geometry, *child_geometry, *context_geometry)):
+                return None
+            child_roles.add(child['name'][len('_RNC' + parent['name'][2:]):])
+            binding = result_context.binding
+            if binding is not None:
+                relative = result_context.receiver_line - group[0]
+                slot = (relative, binding[1], relative, binding[3], 0, 0, 0)
+                if context_geometry.count(slot) != 1:
+                    return None
+                normalized = []
+                for row, state in zip(context_geometry, context_states, strict=True):
+                    if row == slot:
+                        continue
+                    if row[0] <= relative <= row[2]:
+                        if row[0] != relative or row[2] != relative or row[1] <= binding[3]:
+                            return None
+                        width = result_context.width
+                        row = (relative, row[1] - width, relative, row[3] - width, *row[4:])
+                    normalized.append((row, state))
+                context_geometry, context_states = map(tuple, zip(*normalized, strict=True))
         if not child_geometry:
             return None
         if assertion_slot is not None and (parent_geometry or child_geometry!=(
@@ -2113,14 +2181,21 @@ def zero_arg_callback_fragment(source, group, owners, name_counts, first, last, 
     kind = 'zero-arg-callback-call-entry' if caller_entry else 'zero-arg-callback-fragment'
     if single_binding:
         kind = 'single-bound-callback-entry' if entry_only else 'single-bound-callback-fragment'
+    if result_context is not None:
+        kind = 'result-context-callback-fragment'
     signature = (kind, identities[0], tuple(header), prefix, geometries[0])
+    if result_context is not None:
+        if len(child_roles) != 1:
+            return None
+        signature += (result_context.body, next(iter(child_roles)))
     if single_binding:
         signature += (tuple(control), fragment_tokens)
     if caller_entry:
         signature += (caller_scope,)
     witness = dict(kind=kind, owners=witnesses,
         callback_span=[list(opening), list(closing)],
-        context_sha256=hashlib.sha256(repr(signature if caller_entry or single_binding else signature[:-1]).encode()).hexdigest(),
+        context_sha256=hashlib.sha256(repr(signature if caller_entry or single_binding or result_context is not None
+                                           else signature[:-1]).encode()).hexdigest(),
         parent_geometry=[list(row) for row in geometries[0][0]],
         child_geometry=[list(row) for row in geometries[0][1]],
         parent_context_geometry=[list(row) for row in geometries[0][2]],
@@ -2128,6 +2203,8 @@ def zero_arg_callback_fragment(source, group, owners, name_counts, first, last, 
     if caller_entry:
         witness['caller_scope'] = caller_scope
         witness['parent_entry_slots'] = entry_slots
+    if result_context is not None:
+        witness['result_binding'] = result_context.binding
     return CallbackFragmentEvidence(tuple(states), tuple(line_states), signature, witness)
 
 

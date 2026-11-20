@@ -7695,6 +7695,60 @@ class SourceAwareCoverageTests(unittest.TestCase):
             with self.subTest(fault=fault), self.assertRaisesRegex(ValueError, 'Ambiguous unchanged work'):
                 self.callback_prefix_compare(fault)
 
+    def result_context_observations(self, fault=None):
+        old = ['fn query() -> Result<()> {', '    for repo in repos() {',
+               '        store.register(repo)', '            .with_context(|| {',
+               '                describe(repo)', '            })?;', '    }', '    Ok(())', '}']
+        new = old[:2] + ['        let database = store.register(repo)'] + old[3:6] + [
+            '        database.set_usage()?;'] + old[6:]
+        if fault == 'changed-receiver':
+            new[2] = new[2].replace('store', 'other')
+        if fault == 'changed-diagnostic':
+            new[4] = new[4].replace('describe', 'rephrase')
+
+        observations = []
+        for side, source in enumerate((old, new)):
+            def region(line, start, end, count=1):
+                return [line, start, line, end, count, 0, 0, 0]
+
+            parents, children = [], []
+            call = source[2].index('register') + 1
+            receiver = source[2].index('store' if fault != 'changed-receiver' or not side else 'other') + 1
+            opening = source[3].index('{') + 1
+            for copy in range(2):
+                symbol = f'_RNvNtCs{side * 2 + copy + 1}_7omg_lib7example5query'
+                rows = [region(1, 1, source[0].index('{') + 1), region(2, 5, 13),
+                        region(3, receiver, receiver + 5), region(3, call, call + 8),
+                        region(4, 14, 26), region(6, 15, 16, copy), region(len(source), 1, 2)]
+                if side and fault != 'missing-binding-region':
+                    start = source[2].index('database') + 1
+                    rows.insert(2, region(3, start, start + 8))
+                parent = dict(name=symbol, filenames=['/src/example.rs'], regions=rows, count=1)
+                parents.append(parent)
+                if side and fault == 'missing-cold-copy' and copy == 0:
+                    continue
+                children.append(dict(name='_RNC' + symbol[2:] + '0B5_', filenames=parent['filenames'],
+                    regions=[region(4, opening, opening + 1, copy), region(5, 17, 31, copy),
+                             region(6, 13, 14, copy)], count=copy))
+            owners = parents + children
+            observations.append(coverage.zero_arg_callback_fragment(
+                source, (1, len(source), parents), owners, Counter(owner['name'] for owner in owners),
+                4, 4, coverage._construct_inventory(source, [1_000_000]), [1_000_000]))
+        return observations
+
+    def test_result_binding_keeps_the_same_context_callback(self):
+        previous, current = self.result_context_observations()
+        self.assertEqual(current.witness['kind'], 'result-context-callback-fragment')
+        self.assertEqual(previous.signature, current.signature)
+        self.assertEqual(previous.states, current.states)
+        self.assertEqual(current.line_states, ((1,), (1,)))
+
+    def test_result_binding_cannot_substitute_another_callback_or_drop_a_copy(self):
+        for fault in ('changed-receiver', 'changed-diagnostic', 'missing-cold-copy', 'missing-binding-region'):
+            with self.subTest(fault=fault):
+                previous, current = self.result_context_observations(fault)
+                self.assertTrue(current is None or previous.signature != current.signature)
+
     def compare(self, before=None, after=None, mutate=None, sources=None, filename="example.rs"):
         default_before, default_after = self.fixture()
         before = default_before if before is None else before
