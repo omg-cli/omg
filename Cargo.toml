@@ -98,7 +98,7 @@ harness = false
 #   diffs (unexpected duplicates, new proc macros, new build scripts).
 # - The archlinux/alpm git family is pinned by exact version (`=`) AND full
 #   commit rev for supply-chain integrity. Updates require a deliberate rev
-#   bump applied to all four direct alpm-* entries together (same repo commit).
+#   bump applied to all five direct alpm-* entries together (same repo commit).
 # - sequoia-openpgp tracks the stable 2.x line; Cargo.lock pins the exact release.
 # ----------------------------------------------------------------------------
 [dependencies]

@@ -49,7 +49,7 @@ pub(crate) fn exception_prompt(inspections: &[ArtifactInspection]) -> Result<Opt
                 write!(prompt, "\n  .INSTALL hook sha256={hook}")?;
             }
             for file in &inspection.privileged_files {
-                let path = crate::cli::style::display_terminal_text(&file.path);
+                let path = file.path.escape_debug();
                 write!(prompt, "\n  {path} mode={:04o}", file.mode & 0o7777)?;
                 if let Some(capability) = &file.capability {
                     write!(prompt, " capability={capability}")?;
@@ -163,7 +163,7 @@ mod tests {
         let summary = exception_prompt(&[inspection])
             .expect("sanitized summary formats")
             .expect("set-ID summary");
-        assert!(summary.contains("usr/[31mbin/marker mode=4755"));
+        assert!(summary.contains(r"usr/\u{1b}[31mbin/\u{202e}marker\n mode=4755"));
         assert!(!summary.contains(['\u{1b}', '\u{202e}']));
         assert_eq!(
             summary.matches('\n').count(),

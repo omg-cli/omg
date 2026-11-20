@@ -95,7 +95,11 @@ OMG relies on several third-party crates. We regularly audit dependencies for se
 
 **Current Known Issues:**
 
-No known dependency vulnerabilities are accepted. Release gates run `cargo audit`; yanked transitive packages are tracked separately from security advisories.
+The dependency policy exempts `RUSTSEC-2023-0071` in `rsa` because OMG uses
+public-key signature verification, not the affected private-key decryption path.
+See `deny.toml` and its mirrored `.cargo/audit.toml` for the active exception and
+rationale. Release gates run dependency advisory checks; yanked transitive
+packages are tracked separately from security advisories.
 
 ### Key Trust on First Use
 
@@ -290,9 +294,9 @@ from an arbitrary signer is insufficient.
 
 AUR review binds the complete captured source manifest, including `.SRCINFO`,
 patches and install hooks. PKGBUILD and .SRCINFO symlinks are rejected.
-Contained auxiliary symlink target strings are included in the manifest without
-following them. Filenames and review diagnostics escape terminal controls and
-invisible formatting. All fresh, dependency and rollback archives
+Auxiliary symlinks must resolve inside the checkout. The manifest records their
+target strings. Filenames and review diagnostics escape terminal controls and
+invisible formatting. Cached, fresh, dependency and rollback archives
 must match the reviewed output identity and exact install-hook bytes. Package
 archives are snapshotted into sealed Linux files before approval and copied into
 private root staging for the complete privileged transaction.
@@ -312,7 +316,8 @@ with separate invocation storage for every accepted output. The host toolchain
 and checkout are shared. Matching builds do not prove code safety or independent
 provenance. This setting governs OMG AUR operations, not other package managers.
 
-Bubblewrap builds are offline by default. The host prefetcher accepts only public
+Bubblewrap builds are offline by default and isolate PID and IPC namespaces.
+Source prefetch has a fifteen-minute deadline. The host prefetcher accepts only public
 HTTPS destinations, checks every redirect and pins resolved addresses. Sources
 that require build-time networking (including unsupported VCS prefetches) require
 an explicit `[aur] allow_network = true` setting. That setting exposes local and
@@ -320,6 +325,16 @@ private services to the build; it is a trust decision. Chroot devtools cannot
 promise this offline boundary and require the same explicit setting. Native
 builds remain an explicit unsafe option and execute with `no_new_privs` so they
 cannot gain root through a cached sudo ticket.
+
+AUR outputs containing system configuration or privileged integration files,
+including systemd generators, ALPM hooks, udev rules and kernel modules, require
+attended approval of the exact inspected paths and archive digests. Matching
+rebuilds do not waive this approval. `--yes` does not approve these exceptions.
+An accepted package can still execute malicious code after installation.
+
+Arch transactions honor configured `DownloadUser` and the default local pacman
+hook directory. Repository `Usage` limits access for the relevant queries and
+transactions, and invalid usage settings fail closed.
 
 Explicit package policies are enforced again against ALPM's prepared install or
 upgrade plan, including dependencies. Native APT/DNF/Homebrew install and upgrade paths

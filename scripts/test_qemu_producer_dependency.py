@@ -24,7 +24,8 @@ class QemuProducerDependency(unittest.TestCase):
         self.assertIn('needs: [quick-gate, linux-matrix]', clippy)
         self.assertIn('!cancelled()', clippy)
         self.assertNotIn('needs.linux-matrix.result', clippy)
-        self.assertIn('      max-parallel: 5\n', clippy)
+        self.assertNotIn('strategy:', clippy)
+        self.assertIn('native-build-artifact.py clippy-verify', clippy)
         self.assertNotIn('linux-clippy', job_block(ci, 'qemu').split('    steps:', 1)[0])
         self.assertIn('linux-clippy', job_block(ci, 'ci-success').split('    steps:', 1)[0])
 
@@ -37,7 +38,7 @@ class QemuProducerDependency(unittest.TestCase):
                        FEDORA_SQLITE='success', SANDBOX_CANCELLATION='success',
                        FEATURE_INTERSECTIONS='success', MACOS='success', MACOS_NEXTEST_SOURCE='success',
                        UBUNTU='success', RUNTIME_USAGE='success', QEMU='success', QEMU_FEDORA='success',
-                       QEMU_REQUIRED='true', DOCS_AUDIT='success')
+                       QEMU_REQUIRED='true', NATIVE_READINESS='success', DOCS_AUDIT='success')
         for state in ('success', 'failure', 'cancelled', 'skipped', ''):
             with self.subTest(clippy=state), tempfile.TemporaryDirectory() as directory:
                 result = subprocess.run([BASH, '-eu', '-c', script],
@@ -57,7 +58,7 @@ class QemuProducerDependency(unittest.TestCase):
     def test_required_guest_failures_and_skips_fail_the_executed_ci_gate(self):
         ci = (ROOT / '.github/workflows/ci.yml').read_text(encoding='utf-8')
         script = step_script(job_block(ci, 'ci-success'), 'Evaluate results')
-        start = script.index('if [[ "$QEMU_REQUIRED"')
+        start = script.index('if [[ "$QEMU_REQUIRED" == "true" && ( "$QEMU"')
         end = re.search(r'\n\s*fi\b', script[start:])
         self.assertIsNotNone(end)
         guard = script[start:start + end.end()]
@@ -65,7 +66,7 @@ class QemuProducerDependency(unittest.TestCase):
         for required, outcome, fedora in itertools.product(('true', 'false'), outcomes, outcomes):
             with self.subTest(required=required, non_fedora=outcome, fedora=fedora):
                 result = subprocess.run([BASH, '-eu', '-c', guard],
-                    env=dict(os.environ, QEMU_REQUIRED=required, QEMU=outcome, QEMU_FEDORA=fedora),
+                    env=dict(os.environ, QEMU_REQUIRED=required, NATIVE_READINESS='success', QEMU=outcome, QEMU_FEDORA=fedora),
                     capture_output=True, text=True, timeout=10)
                 self.assertEqual(result.returncode == 0,
                                  required == 'false' or outcome == fedora == 'success')
@@ -92,10 +93,12 @@ class QemuProducerDependency(unittest.TestCase):
         self.assertIn('native-build-artifact.py wait --distro "$DISTRO"', ready)
         self.assertIn("needs.native-ready.result == 'success'", job_block(lane, 'guest'))
 
-    def test_preflight_runs_alongside_producers(self):
+    def test_preflight_admits_the_complete_helper_owner_alongside_native_producers(self):
         ci = (ROOT / '.github/workflows/ci.yml').read_text(encoding='utf-8')
         preflight = job_block(ci, 'qemu-preflight')
-        self.assertRegex(preflight, r'(?m)^    needs: quick-gate$')
+        self.assertIn('needs: [quick-gate, workflow-checks]', preflight)
+        self.assertIn("current-ci-helpers: 'true'", preflight)
+        self.assertIn('actions: read', preflight)
         self.assertIn('uses: ./.github/actions/qemu-preflight', preflight)
         self.assertIn('ref: ${{ github.sha }}', preflight)
         self.assertIn('persist-credentials: false', preflight)
@@ -146,6 +149,26 @@ class QemuProducerDependency(unittest.TestCase):
                 result = subprocess.run([BASH, '-c', command], capture_output=True, text=True, timeout=10)
                 self.assertEqual(result.returncode, 0 if status in ('', 'success') else 1, result.stderr)
                 self.assertEqual(result.stdout.endswith('selected'), status in ('', 'success'))
+
+    def test_shared_readiness_failure_is_enforced_at_final_ci_gate(self):
+        ci = (ROOT / '.github/workflows/ci.yml').read_text(encoding='utf-8')
+        final = job_block(ci, 'ci-success')
+        self.assertRegex(final, r'needs: \[[^\]]*\bnative-readiness\b')
+        self.assertIn('NATIVE_READINESS: ${{ needs.native-readiness.result }}', final)
+        script = step_script(final, 'Evaluate results')
+        readiness_gate = re.search(
+            r'^([ \t]*)if [^\n]*\$\{NATIVE_READINESS:-\}[^\n]*; then\n.*?^\1fi$', script, re.MULTILINE | re.DOTALL)
+        self.assertIsNotNone(readiness_gate)
+        for required in ('false', 'true'):
+            for status in ('', 'success', 'failure', 'cancelled', 'skipped', 'invalid'):
+                with self.subTest(required=required, readiness=status):
+                    outcome = subprocess.run(
+                        [BASH, '-c', readiness_gate[0] + '\nprintf selected'],
+                        env=dict(os.environ, QEMU_REQUIRED=required, NATIVE_READINESS=status),
+                        capture_output=True, text=True, timeout=10)
+                    accepted = required == 'false' or status == 'success'
+                    self.assertEqual(outcome.returncode, 0 if accepted else 1)
+                    self.assertEqual(outcome.stdout.endswith('selected'), accepted)
 
     def test_native_failure_still_schedules_guests_after_a_successful_quick_gate(self):
         ci = (ROOT / '.github/workflows/ci.yml').read_text(encoding='utf-8')

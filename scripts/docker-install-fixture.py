@@ -53,7 +53,7 @@ def main():
     absent = subprocess.run(['pacman', '-Qq', package], capture_output=True, timeout=10)
     require(absent.returncode == 1, 'Install fixture package must initially be absent')
     before = native_state()
-    cli = ['sudo', '-n', '/usr/local/bin/omg']
+    cli = ['sudo', '-n', '/usr/bin/setpriv', '--no-new-privs', '--', '/usr/local/bin/omg']
     deny_unattended(cli + ['install', package], before)
     deny_unattended(cli + ['install', '-y', package], before)
     with tempfile.TemporaryDirectory(prefix='omg-docker-install-') as directory:

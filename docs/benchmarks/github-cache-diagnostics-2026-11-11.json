@@ -1,0 +1,22 @@
+{
+  "sourceSha": "f2413f80ae56978e708cc2f5628b74ddc5fa5f7c",
+  "runId": 43054108045,
+  "attempt": 1,
+  "jobId": 130638832127,
+  "jobConclusion": "success",
+  "workflowConclusion": "failure",
+  "artifactId": 13871097463,
+  "artifactSha256": "sha256:939ce1a16e9c26ce6c27a8e0ca5484c2aa3168b403c7d7840ad767bd919d474b",
+  "artifactBytes": 854,
+  "members": [
+    "omg-r2-cache-context.txt",
+    "omg-r2-cache-stats.json"
+  ],
+  "context": "source=f2413f80ae56978e708cc2f5628b74ddc5fa5f7c\nprefix=benchmark-v1/\n",
+  "sccacheVersion": "0.18.0",
+  "cacheLocation": "s3, name: omg-ci-compiler-cache, prefix: /benchmark-v1/",
+  "cacheReadErrors": 0,
+  "cacheWriteErrors": 0,
+  "cacheTimeouts": 0,
+  "limitation": "Workflow helper setup failed APT DNS; this receipt proves the successful measurement owner and diagnostic upload only."
+}

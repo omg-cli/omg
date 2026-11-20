@@ -5845,8 +5845,11 @@ mod tests {
                 let fast = get_counts_fast().expect("fast-path counts must succeed");
                 let ffi = crate::package_managers::alpm_direct::get_counts()
                     .expect("libalpm counts must succeed");
+                let public = crate::package_managers::get_counts()
+                    .expect("public package counts must succeed");
                 assert_eq!(fast, expected, "fast path diverged on fixture");
                 assert_eq!(ffi, expected, "libalpm path diverged on fixture");
+                assert_eq!(public, expected, "public count routing diverged on fixture");
                 assert_eq!(fast, ffi, "fast path and libalpm path must agree");
             },
         );
@@ -6065,6 +6068,18 @@ mod tests {
         symlink(&target, owner.path().join("fixture.bin"))?;
         let loaded = load_cache_from_disk_in::<LocalDbCache>(owner.path(), "fixture");
         assert!(loaded.is_err(), "derived cache accepted a redirected file");
+        Ok(())
+    }
+
+    #[test]
+    fn package_cache_refuses_oversized_files_before_deserialization() -> Result<()> {
+        let owner = tempfile::tempdir()?;
+        let file = fs::File::create(owner.path().join("fixture.bin"))?;
+        file.set_len(MAX_DERIVED_CACHE_BYTES + 1)?;
+        let error = load_cache_from_disk_in::<LocalDbCache>(owner.path(), "fixture")
+            .err()
+            .context("an oversized cache must fail before decoding")?;
+        assert!(error.to_string().contains("size limit"), "{error:#}");
         Ok(())
     }
 

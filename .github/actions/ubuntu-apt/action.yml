@@ -1,0 +1,9 @@
+name: Ubuntu archive setup
+description: Configure a signed Ubuntu mirror and refresh package indexes
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        UBUNTU_APT_ACTION_PATH: ${{ github.action_path }}
+      run: bash "$UBUNTU_APT_ACTION_PATH/setup.sh"

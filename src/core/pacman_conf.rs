@@ -82,6 +82,7 @@ pub struct PacmanConfig {
     pub cache_dirs: Vec<String>,
     pub log_file: Option<String>,
     pub gpg_dir: Option<String>,
+    pub download_user: Option<String>,
     pub hook_dirs: Vec<String>,
     pub hold_pkg: Vec<String>,
     pub ignore_pkg: Vec<String>,
@@ -286,6 +287,15 @@ impl PacmanConfig {
             }
             "LogFile" => config.log_file = value.map(String::from),
             "GPGDir" => config.gpg_dir = value.map(String::from),
+            "DownloadUser" => {
+                let username = value.context("DownloadUser requires a username")?;
+                anyhow::ensure!(
+                    username.split_whitespace().count() == 1
+                        && !username.chars().any(char::is_control),
+                    "DownloadUser requires exactly one username without control characters"
+                );
+                config.download_user = Some(username.to_owned());
+            }
             "HookDir" => {
                 if let Some(value) = value {
                     config
@@ -540,6 +550,20 @@ mod tests {
                 result.is_err(),
                 "invalid Usage {usage:?} was accepted: {result:?}"
             );
+        }
+    }
+
+    #[test]
+    fn download_user_requires_one_username() {
+        for directive in [
+            "DownloadUser",
+            "DownloadUser =",
+            "DownloadUser = root nobody",
+            "DownloadUser = root\0",
+        ] {
+            let error = PacmanConfig::parse_str(&format!("[options]\n{directive}\n"))
+                .expect_err("invalid download identity");
+            assert!(error.to_string().contains("DownloadUser"), "{error:#}");
         }
     }
 

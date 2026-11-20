@@ -30,7 +30,7 @@ const MAX_PRIVILEGED_FILES: usize = 256;
 const MAX_CAPABILITY_BYTES: usize = 8 * 1024;
 const MAX_PRIVILEGE_METADATA_BYTES: usize = 64 * 1024;
 
-pub(crate) const INSPECTION_POLICY_VERSION: u32 = 6;
+pub(crate) const INSPECTION_POLICY_VERSION: u32 = 7;
 
 // Loader roots include local administrator and volatile runtime locations.
 // https://man.archlinux.org/man/systemd.generator.7
@@ -365,13 +365,16 @@ pub(crate) fn inspect_archive(path: &Path) -> Result<ArchiveAdmission> {
         );
         let kind = entry.header().entry_type();
         let member = normalize_member_path(&raw_path, kind.is_dir())?;
+        let mut privileged_integration = false;
         for (reason, prefixes) in PRIVILEGED_PATH_PREFIXES {
             if prefixes.iter().any(|prefix| member.starts_with(prefix)) {
+                privileged_integration = true;
                 paired_build_reasons.insert((*reason).to_owned());
             }
         }
         for (reason, paths) in PRIVILEGED_EXACT_PATHS {
             if paths.contains(&member.as_str()) {
+                privileged_integration = true;
                 paired_build_reasons.insert((*reason).to_owned());
             }
         }
@@ -437,7 +440,10 @@ pub(crate) fn inspect_archive(path: &Path) -> Result<ArchiveAdmission> {
         if kind.is_file() && mode & 0o111 != 0 {
             executable_files.push(member.clone());
         }
-        if (kind.is_file() || kind.is_hard_link()) && mode & 0o6000 != 0 || capability.is_some() {
+        if (!kind.is_dir() && privileged_integration)
+            || (kind.is_file() || kind.is_hard_link()) && mode & 0o6000 != 0
+            || capability.is_some()
+        {
             // Linux documents set-ID and file capabilities as privilege-bearing
             // mechanisms: https://man7.org/linux/man-pages/man7/capabilities.7.html
             anyhow::ensure!(
@@ -1366,6 +1372,7 @@ mod tests {
         for (path, reason) in [
             ("etc/demo.conf", "system-configuration"),
             ("usr/lib/systemd/system/demo.service", "systemd-unit"),
+            ("usr/lib/systemd/system-generators/demo", "systemd-unit"),
             ("usr/lib/modules/6.0/extra/demo.ko", "kernel-module"),
             ("usr/share/libalpm/hooks/demo.hook", "package-manager-hook"),
             (
@@ -1379,6 +1386,16 @@ mod tests {
             })?;
             let inspection = inspect_archive(archive.path())?.into_inspection();
             assert!(inspection.requires_paired_build());
+            assert!(
+                inspection.requires_exception(),
+                "{path} needs attended approval"
+            );
+            assert!(
+                inspection
+                    .privileged_files
+                    .iter()
+                    .any(|file| file.path == path)
+            );
             assert!(
                 inspection
                     .paired_build_reasons
