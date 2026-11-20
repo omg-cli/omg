@@ -27,18 +27,10 @@ pub(super) async fn fetch(client: &reqwest::Client, target: &str) -> Result<Vec<
 }
 
 async fn fetch_from(client: &reqwest::Client, url: &str, target: &str) -> Result<Vec<Download>> {
-    use crate::core::http::BoundedResponseExt;
-    let value = client
-        .get(url)
-        .timeout(std::time::Duration::from_secs(30))
-        .send()
+    let text = crate::core::http::fetch_metadata_text(client, url)
         .await
-        .context("Failed to fetch Python download catalog")?
-        .error_for_status()
-        .context("Python download catalog request failed")?
-        .bounded_json()
-        .await
-        .context("Invalid Python download catalog response")?;
+        .context("Failed to fetch Python download catalog")?;
+    let value = serde_json::from_str(&text).context("Invalid Python download catalog response")?;
     parse_catalog(value, target)
 }
 
@@ -345,35 +337,43 @@ mod tests {
         let target = "x86_64-unknown-linux-gnu";
         let valid = catalog(entry(target, "3.12.14")).to_string();
         let client = reqwest::Client::builder().no_proxy().build()?;
-        for (status, body, succeeds) in [
-            ("200 OK", valid.as_str(), true),
-            ("403 Forbidden", valid.as_str(), false),
-            ("404 Not Found", "404: Not Found", false),
-            ("500 Internal Server Error", valid.as_str(), false),
-            ("200 OK", "broken-json", false),
-            ("200 OK", "{}", false),
+        let healthy = ("200 OK", valid.as_str());
+        let unavailable = ("503 Service Unavailable", "");
+        for (responses, succeeds) in [
+            (vec![healthy], true),
+            (vec![unavailable, healthy], true),
+            (vec![unavailable; 3], false),
+            (vec![("403 Forbidden", valid.as_str())], false),
+            (vec![("404 Not Found", "404: Not Found")], false),
+            (vec![("200 OK", "broken-json")], false),
+            (vec![("200 OK", "{}")], false),
         ] {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
             let url = format!("http://{}/catalog.json", listener.local_addr()?);
             let server = async {
-                let (mut socket, _) = listener.accept().await?;
-                let mut request = Vec::new();
-                while !request.ends_with(b"\r\n\r\n") {
-                    ensure!(request.len() < 8192, "oversized fixture request");
-                    request.push(socket.read_u8().await?);
+                for (status, body) in &responses {
+                    let (mut socket, _) = listener.accept().await?;
+                    let mut request = Vec::new();
+                    while !request.ends_with(b"\r\n\r\n") {
+                        ensure!(request.len() < 8192, "oversized fixture request");
+                        request.push(socket.read_u8().await?);
+                    }
+                    socket.write_all(format!("HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await?;
                 }
-                socket.write_all(format!("HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await?;
                 Ok::<_, anyhow::Error>(())
             };
-            let (result, served) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-                tokio::join!(fetch_from(&client, &url, target), server)
+            let fetch = async {
+                let result = fetch_from(&client, &url, target).await;
+                assert_eq!(result.is_ok(), succeeds, "{responses:?}: {result:?}");
+                if succeeds {
+                    assert_eq!(result?.first().unwrap().version, "3.12.14");
+                }
+                Ok::<_, anyhow::Error>(())
+            };
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                tokio::try_join!(fetch, server)
             })
-            .await?;
-            served?;
-            assert_eq!(result.is_ok(), succeeds, "{status}: {result:?}");
-            if succeeds {
-                assert_eq!(result?.first().unwrap().version, "3.12.14");
-            }
+            .await??;
         }
         Ok(())
     }
