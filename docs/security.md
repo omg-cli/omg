@@ -135,12 +135,13 @@ Despite its command name, `omg audit slsa` verifies a Sigstore artifact signatur
 
 ```bash
 omg audit slsa ./package.pkg.tar.zst \
-  --certificate-identity "$EXPECTED_SIGNER_IDENTITY"
+  --certificate-identity "$EXPECTED_SIGNER_IDENTITY" \
+  --certificate-oidc-issuer "$EXPECTED_SIGNER_ISSUER"
 ```
 
-Set `EXPECTED_SIGNER_IDENTITY` to the exact trusted publisher email or OIDC URI obtained independently. The CLI requires this option and rejects an empty identity. Use an existing artifact path without parent-directory traversal.
+Set `EXPECTED_SIGNER_IDENTITY` to the trusted publisher email or OIDC identity URI and `EXPECTED_SIGNER_ISSUER` to its trusted issuer URI. Obtain both independently from the artifact. Use an existing artifact path without parent-directory traversal.
 
-The verifier hashes the artifact, queries Rekor, checks the entry's signed entry timestamp (SET) against a pinned log key, and handles supported `hashedrekord` signatures. A successful result requires a supported artifact signature and a Fulcio certificate chain. The required identity must match exactly. It does not independently verify a Merkle inclusion proof or a log checkpoint.
+The verifier hashes the artifact, queries Rekor, checks the entry's signed entry timestamp (SET) against a pinned log key, and handles supported `hashedrekord` signatures. A successful result requires a supported artifact signature, a trusted Fulcio certificate chain, and exact matches for the identity and OIDC issuer. It does not independently verify a Merkle inclusion proof or a log checkpoint.
 
 Current limits:
 

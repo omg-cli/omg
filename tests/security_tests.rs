@@ -600,8 +600,12 @@ mod sbom_compliance {
             "slsa",
             "--certificate-identity",
             "release@example.invalid",
+            "--certificate-oidc-issuer",
+            "https://issuer.example.invalid",
             "pacman",
         ]);
+        result.assert_failure();
+        result.assert_stderr_contains("File not found: pacman");
         let output = result.combined_output();
         assert!(
             !output.contains("tier") && !output.contains("/pricing"),
@@ -995,6 +999,8 @@ mod privilege_tests {
 
     #[test]
     fn test_safe_commands_run_without_root() {
+        let project = TestProject::new();
+        project.create_file(".nvmrc", "20.10.0");
         // Every command here must fully succeed as an unprivileged user and
         // report its actual result — not merely avoid demanding root.
         // Pinned surfaces: status overview, runtime listing, which lookup,
@@ -1015,7 +1021,7 @@ mod privilege_tests {
         ];
 
         for (args, needle) in commands.iter().zip(expected_needles) {
-            let result = run_omg(args);
+            let result = project.run(args);
             result.assert_success();
             assert!(
                 result.contains(needle),

@@ -1122,6 +1122,9 @@ pub enum AuditCommands {
         /// (email or OIDC URI); required for a meaningful trust decision
         #[arg(long, required = true)]
         certificate_identity: String,
+        /// Require the Fulcio certificate OIDC issuer to match this URI
+        #[arg(long, required = true)]
+        certificate_oidc_issuer: String,
     },
     /// Scan installed package licenses (Arch backend only)
     Licenses {
@@ -1352,8 +1355,22 @@ mod tests {
     }
 
     #[test]
-    fn security_cli_requires_slsa_identity_and_accepts_explicit_scan_gate() {
+    fn security_cli_requires_slsa_signer_and_accepts_explicit_scan_gate() {
         assert!(Cli::try_parse_from(["omg", "audit", "slsa", "artifact.tar.gz"]).is_err());
+        let error = Cli::try_parse_from([
+            "omg",
+            "audit",
+            "slsa",
+            "artifact.tar.gz",
+            "--certificate-identity",
+            "builder@example.com",
+        ])
+        .expect_err("a signer identity requires a trusted issuer");
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+        assert!(error.to_string().contains("--certificate-oidc-issuer"));
         assert!(
             Cli::try_parse_from([
                 "omg",
@@ -1361,7 +1378,9 @@ mod tests {
                 "slsa",
                 "artifact.tar.gz",
                 "--certificate-identity",
-                "builder@example.com"
+                "builder@example.com",
+                "--certificate-oidc-issuer",
+                "https://issuer.example.invalid",
             ])
             .is_ok()
         );

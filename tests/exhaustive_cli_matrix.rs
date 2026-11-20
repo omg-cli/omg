@@ -220,12 +220,13 @@ mod runtime_matrix {
         let runtimes = [
             "node", "python", "go", "rust", "ruby", "java", "bun", "deno",
         ];
+        let project = TestProject::new();
+        let pins = runtimes.map(|runtime| (runtime, "1.2.3"));
+        project.with_tool_versions(&pins);
         for rt in runtimes {
-            let res = run_omg(&["which", rt]);
+            let res = project.run(&["which", rt]);
             res.assert_success();
-            // Both outcomes mention the runtime: either the pinned version or
-            // the "<rt>: no version set (...)" hint (src/bin/omg.rs:1022).
-            res.assert_stdout_contains(rt);
+            assert_eq!(res.stdout.trim(), format!("{rt} 1.2.3"));
         }
     }
 

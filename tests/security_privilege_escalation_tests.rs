@@ -895,6 +895,17 @@ install_from_release
             deny.contains("yanked = \"deny\""),
             "yanked locked dependencies must fail cargo-deny"
         );
+        let policy: toml::Value = toml::from_str(deny).expect("parse cargo-deny policy");
+        let global_licenses = policy["licenses"]["allow"]
+            .as_array()
+            .expect("global license allow list");
+        assert!(
+            global_licenses
+                .iter()
+                .filter_map(toml::Value::as_str)
+                .all(|license| !license.starts_with("AGPL-")),
+            "AGPL dependencies require a crate-specific license exception"
+        );
 
         let Some(renovate_src) = read_checkout_file(".github/renovate.json") else {
             eprintln!("skipping renovate.json assertions: .github is not present in this checkout");

@@ -84,7 +84,8 @@ impl LocalCommandRunner for AuditCommands {
             AuditCommands::Slsa {
                 package,
                 certificate_identity,
-            } => check_slsa(package, certificate_identity, ctx).await,
+                certificate_oidc_issuer,
+            } => check_slsa(package, certificate_identity, certificate_oidc_issuer, ctx).await,
             AuditCommands::Licenses {
                 format,
                 export,
@@ -757,10 +758,11 @@ pub fn scan_secrets(path: Option<String>, _ctx: &CliContext) -> Result<()> {
     enforce_secret_scan_result(&result)
 }
 
-/// Verify a Sigstore artifact signature against the required signer identity.
+/// Verify a Sigstore artifact signature against the required identity and issuer.
 pub async fn check_slsa(
     package: &str,
     certificate_identity: &str,
+    certificate_oidc_issuer: &str,
     _ctx: &CliContext,
 ) -> Result<()> {
     use crate::core::security::SlsaVerifier;
@@ -781,13 +783,18 @@ pub async fn check_slsa(
 
     let verifier = SlsaVerifier::new();
     let result = verifier
-        .verify_provenance(path, None::<&std::path::Path>, Some(certificate_identity))
+        .verify_provenance(
+            path,
+            None::<&std::path::Path>,
+            certificate_identity,
+            certificate_oidc_issuer,
+        )
         .await?;
 
     require_artifact_signature_verified(result.verified, result.error.as_deref())?;
 
     println!(
-        "{} Artifact signature verified against the required signer identity",
+        "{} Artifact signature verified against the required signer identity and OIDC issuer",
         style::maybe_color("✓", |t| t.green().to_string())
     );
     println!(

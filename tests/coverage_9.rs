@@ -206,23 +206,25 @@ fn which_rejects_external_global_symlink_targets() {
     let external = project.create_dir("3.12.14");
     std::os::unix::fs::symlink(external, versions.join("current")).unwrap();
     let result = project.run_with_env(&["which", "python"], NO_MISE_ENV);
-    result.assert_success();
-    result.assert_stdout_contains("no version set");
-    assert!(!result.stdout.contains("3.12.14"));
+    result.assert_failure();
+    assert!(result.stdout.is_empty());
+    result.assert_stderr_contains("python: no version set");
 }
 
 #[test]
-fn which_prints_no_version_notice_when_unset() {
+fn which_reports_an_unset_version_on_stderr_and_fails() {
     let project = TestProject::new();
 
-    let result = project.run_with_env(&["which", "python"], NO_MISE_ENV);
-
-    // Contract (handle_which_command Ok(None) arm): exit 0 with the exact
-    // actionable notice naming the pin files it consulted.
-    result.assert_success();
-    result.assert_stdout_contains("no version set");
-    result.assert_stdout_contains("python");
-    result.assert_stdout_contains(".tool-versions");
+    for args in [
+        vec!["which", "python"],
+        vec!["--verbose", "which", "python"],
+    ] {
+        let result = project.run_with_env(&args, NO_MISE_ENV);
+        result.assert_failure();
+        assert!(result.stdout.is_empty());
+        result.assert_stderr_contains("python: no version set");
+        result.assert_stderr_contains(".tool-versions");
+    }
 }
 
 #[test]

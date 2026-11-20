@@ -73,7 +73,7 @@ audit-log	["audit","log","--limit","3"]	read	0	pass	-	hermetic	hermetic:pass	loc
 audit-verify	["audit","verify"]	read	0	pass	-	hermetic	hermetic:pass	local:audit-verify	tempdir-drop
 audit-policy	["audit","policy"]	read	0	pass	-	hermetic	hermetic:pass	local:audit-policy	tempdir-drop
 audit-slsa	["audit","slsa","${ROOT}/project/README.md"]	controlled-error	2	pass	-	hermetic	hermetic:pass	-	tempdir-drop
-audit-slsa-identity	["audit","slsa","--certificate-identity","dev@example.invalid","${ROOT}/project/README.md"]	controlled-error	1	pass	-	hermetic	hermetic:pass	-	tempdir-drop
+audit-slsa-identity	["audit","slsa","--certificate-identity","dev@example.invalid","--certificate-oidc-issuer","https://issuer.example.invalid","${ROOT}/project/README.md"]	controlled-error	1	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 audit-licenses	["audit","licenses","--format","json"]	read	arch:0,debian:1,ubuntu:1,fedora:1	pass	-	hermetic	hermetic:pass	license-audit-json	tempdir-drop
 audit-fix	["audit","fix","--dry-run"]	read	1	pass	-	hermetic	hermetic:pass	audit-fix-refusal	tempdir-drop
 audit-export	["audit","export","--output","${ROOT}/audit-evidence"]	isolated-write	1	pass	-	hermetic	hermetic:pass	local:audit-export	tempdir-drop

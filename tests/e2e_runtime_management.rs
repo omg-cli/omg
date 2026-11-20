@@ -1088,8 +1088,9 @@ fn test_hook_invalid_shell() {
 fn test_which_shows_active_runtime() {
     let project = TestProject::new();
     let empty = project.run(&["which", "node"]);
-    empty.assert_success();
-    empty.assert_stdout_contains("node: no version set");
+    empty.assert_failure();
+    assert!(empty.stdout.is_empty());
+    empty.assert_stderr_contains("node: no version set");
     for version in ["20.10.0", "18.0.0"] {
         seed_installed_runtime(&project, "node", version, "node");
         project.run(&["use", "node", version]).assert_success();
@@ -1135,12 +1136,18 @@ fn which_resolves_every_runtime_with_project_parent_global_precedence_without_mu
     let check = |runtime: &str, expected: Option<&str>| {
         for args in [vec!["which", runtime], vec!["--quiet", "which", runtime]] {
             let output = project.run(&args);
-            output.assert_success();
-            let expected = expected.map_or_else(
-                || format!("{runtime}: no version set (check .tool-versions, .nvmrc, etc.)"),
-                |version| format!("{runtime} {version}"),
-            );
-            assert_eq!(output.stdout.trim(), expected, "{args:?}");
+            if let Some(version) = expected {
+                output.assert_success();
+                assert_eq!(
+                    output.stdout.trim(),
+                    format!("{runtime} {version}"),
+                    "{args:?}"
+                );
+            } else {
+                output.assert_failure();
+                assert!(output.stdout.is_empty(), "{args:?}");
+                output.assert_stderr_contains(&format!("{runtime}: no version set"));
+            }
         }
     };
     for runtime in &names {

@@ -703,6 +703,13 @@ impl ContainerManager {
                 version.to_string()
             };
             let version = version.as_str();
+            if version == "system" && !push_package_install_supported(base_image) {
+                runtime_errors.push(format!(
+                    "{runtime}: no system package installer for base image {base_image}"
+                ));
+                push_runtime_request_failure(&mut dockerfile, runtime);
+                continue;
+            }
             let version_check = match runtime_version_check(runtime, version) {
                 Ok(check) => check,
                 Err(error) => {
@@ -957,7 +964,7 @@ pub struct GeneratedDockerfile {
     /// digest was supplied. `omg container init` resolves these and
     /// regenerates; a non-empty list after regeneration is refused.
     pub unpinned_urls: Vec<String>,
-    /// Version requests that the generated installation cannot enforce.
+    /// Runtime requests that the generated installation cannot enforce.
     /// The CLI refuses output containing these; direct callers also receive
     /// an explicit failing build step.
     pub runtime_errors: Vec<String>,
@@ -967,7 +974,7 @@ fn push_runtime_request_failure(dockerfile: &mut String, runtime: &str) {
     use std::fmt::Write as _;
     let _ = writeln!(
         dockerfile,
-        "RUN printf '%s\\n' 'OMG cannot satisfy runtime version request for {runtime}; use a numeric pin or system' >&2; exit 1\n"
+        "RUN printf '%s\\n' 'OMG cannot satisfy runtime version request for {runtime}' >&2; exit 1\n"
     );
 }
 
@@ -1838,13 +1845,20 @@ printf build > "$root/builder-started"
             );
             assert_eq!(detect_container_shell(image), shell);
         }
+        let image = "registry.example/fedora/custom:latest";
         let unknown = manager.generate_dockerfile(
-            "registry.example/fedora/custom:latest",
-            &[("python", "system")],
+            image,
+            &[("python", "system"), ("go", "system")],
             &InstallerDigests::new(),
         );
-        assert!(unknown.content.contains("Unknown base image"));
-        assert!(!unknown.content.contains("RUN "));
+        assert_eq!(
+            unknown.runtime_errors,
+            [
+                format!("python: no system package installer for base image {image}"),
+                format!("go: no system package installer for base image {image}"),
+            ]
+        );
+        assert_eq!(unknown.content.matches("exit 1").count(), 2);
     }
 
     #[test]

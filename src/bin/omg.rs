@@ -658,22 +658,20 @@ fn try_fast_completions(args: &[String]) -> Result<bool> {
 }
 
 /// Ultra-fast path for which command
-fn try_fast_which(args: &[String]) -> bool {
+fn try_fast_which(args: &[String]) -> Result<bool> {
     if has_help_flag(args) {
-        return false;
+        return Ok(false);
     }
 
     if args.len() == 3 && args[1] == "which" {
         let runtime = &args[2];
         if runtime.starts_with('-') {
-            return false;
+            return Ok(false);
         }
-
-        // On failure, defer so the standard error reporter owns the message and
-        // the process exits non-zero.
-        return handle_which_command(runtime).is_ok();
+        handle_which_command(runtime)?;
+        return Ok(true);
     }
-    false
+    Ok(false)
 }
 
 /// Parsed form of a pre-parse `omg list|ls` invocation tail: optional runtime
@@ -767,7 +765,7 @@ fn try_fast_paths(args: &[String]) -> Result<bool> {
         || try_fast_explicit_count(args)
         || try_fast_search(args)
         || try_fast_info(args)
-        || try_fast_which(args)
+        || try_fast_which(args)?
         || try_fast_list(args)?
         || try_fast_status(args)
         || try_fast_hooks(args)
@@ -1487,10 +1485,7 @@ fn handle_which_command(runtime: &str) -> Result<()> {
             );
         }
         Ok(None) => {
-            println!(
-                "{}: no version set (check .tool-versions, .nvmrc, etc.)",
-                omg_lib::cli::style::runtime(runtime)
-            );
+            anyhow::bail!("{runtime}: no version set (check .tool-versions, .nvmrc, etc.)");
         }
         Err(error) => {
             // Propagate instead of only printing so the process exits non-zero.

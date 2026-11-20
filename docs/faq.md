@@ -118,7 +118,7 @@ GitHub Gist is unlisted, not encrypted.
 Less than their names might suggest, and that is deliberate.
 
 - The SLSA-named check verifies an artifact's signature. The current verifier
-  requires `--certificate-identity` and rejects a missing or empty value.
+  requires `--certificate-identity` and `--certificate-oidc-issuer`.
   A valid signature does not establish a SLSA build level.
 - Local audit chains show that the record has not changed since it was written. They do not
   prove who wrote it or that nothing is missing.

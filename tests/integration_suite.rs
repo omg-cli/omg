@@ -659,13 +659,16 @@ mod runtime_management {
 
     #[test]
     fn test_which_command() {
+        let project = TestProject::new();
+        let pins = RUNTIMES
+            .iter()
+            .map(|&runtime| (runtime, "1.2.3"))
+            .collect::<Vec<_>>();
+        project.with_tool_versions(&pins);
         for runtime in RUNTIMES {
-            let result = run_omg(&["which", runtime]);
-            // src/bin/omg.rs handle_which_command prints the runtime name in
-            // both resolved and no-version-set outcomes; only a resolver error
-            // exits non-zero.
+            let result = project.run(&["which", runtime]);
             result.assert_success();
-            result.assert_stdout_contains(runtime);
+            assert_eq!(result.stdout.trim(), format!("{runtime} 1.2.3"));
         }
     }
 
