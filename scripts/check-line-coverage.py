@@ -14056,6 +14056,66 @@ def aur_source_tokio_fixture(name, inventory, index, declaration, work):
     return function, root, body, markers
 
 
+def retained_aur_git_cancellation_entry(name, sides, indexes, work):
+    """Check that the cancellation fixture still spawns and polls the same child."""
+    witnesses = []
+    declaration = 'cancelling_host_git_clone_terminates_descendants'
+    prefix = [
+        *'let temp = tempfile :: tempdir ( ) . expect ('.split(), '"isolated Git staging"',
+        *') ; let staging = temp . path ( ) . join ('.split(), '"mirror"',
+        *') ; std :: fs :: create_dir ( & staging ) . expect ('.split(), '"staging directory"',
+        *') ; let ready = staging . join ('.split(), '"ready"',
+        *') ; let survived = staging . join ('.split(), '"survived"',
+        *') ; let task_staging = staging . clone ( ) ;'.split(),
+    ]
+    spawn = 'let worker = tokio :: spawn ( async move {'.split()
+    command = [
+        *'let mut command = tokio :: process :: Command :: new ('.split(), '"sh"', ')', ';',
+        *'command . current_dir ( & task_staging ) . args ( ['.split(), '"-c"', ',',
+        '"printf ready > ready; (sleep 1; printf survived > survived) & wait"', ',', ']', ')', ';',
+    ]
+    for (_, inventory, counts), index in zip(sides, indexes, strict=True):
+        code = inventory[0]
+        fixture = aur_source_tokio_fixture(name, inventory, index, declaration, work)
+        if fixture is None:
+            return None
+        function, root, body, _ = fixture
+        start = function['opening'] + 1
+        _construct_charge(work, len(prefix) + len(spawn) + len(command))
+        expected = [*prefix, *spawn, *command]
+        if code.words[start:start + len(expected)] != expected:
+            return None
+        worker = start + len(prefix)
+        opening = worker + len(spawn) - 1
+        worker_line = code.region(worker, worker)[0]
+        body_slots = (code.region(worker + 1, worker + 1), code.region(worker + 3, worker + 5))
+        nested_slots = (code.region(opening, opening), code.region(opening + 2, opening + 3),
+                        code.region(opening + 5, opening + 1 + command.index('new')))
+        owners = index.inventories.get(name, ())
+        _construct_charge(work, sum(len(owner['regions']) + len(owner['name']) for owner in owners))
+        entries = [(owner, raw) for owner in owners if (raw := [r for r in owner['regions']
+                   if r[0] <= worker_line <= r[2]])]
+        count = body['count']
+        spawn_regions = [[*slot, count, 0, 0, 0] for slot in body_slots]
+        if (len(entries) != 2 or counts.get(worker_line) != count
+                or not any(owner is body and raw == spawn_regions for owner, raw in entries)):
+            return None
+        nested, raw = next(pair for pair in entries if pair[0] is not body)
+        nested_regions = [[*slot, count, 0, 0, 0] for slot in nested_slots]
+        constructor_rows = [r for r in nested['regions'] if tuple(r[:4]) in nested_slots]
+        if (not direct_rust_callback_symbol(nested['name'], root['name'], 3, depth=2)
+                or index.name_counts[nested['name']] != 1 or len(nested['filenames']) != 1
+                or index.files.get(nested['filenames'][0]) != name or nested.get('branches')
+                or nested.get('mcdc_records') or nested['count'] != count
+                or raw != nested_regions[:1] or constructor_rows != nested_regions):
+            return None
+        witnesses.append((worker_line, [root['name'], body['name'], nested['name']],
+                          [spawn_regions, nested_regions]))
+    return dict(file=name, kind='retained-aur-git-cancellation-entry',
+                pairs=[[row[0] for row in witnesses]], owners=[row[1] for row in witnesses],
+                regions=[row[2] for row in witnesses])
+
+
 def retained_aur_git_fixture_limits(name, sides, indexes, work):
     """Verify that the staging test still builds the same cap and interval."""
     witnesses = []
@@ -14599,7 +14659,8 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
     positive_receipts = []; endpoint_receipts = []; boolean_receipts = []
     replacement_receipts = []; construct_receipts = []; completion_receipts = []; obligation_receipts = []
     early_observers_by_file = {
-        _AUR_GIT_SOURCE: (retained_aur_git_limits, retained_aur_prefetch_test_wait, retained_aur_git_fixture_limits),
+        _AUR_GIT_SOURCE: (retained_aur_git_limits, retained_aur_prefetch_test_wait,
+                          retained_aur_git_fixture_limits, retained_aur_git_cancellation_entry),
         _AUR_DEPS_SOURCE: (retained_aur_dependency_packages,),
     }
     for name in bs:

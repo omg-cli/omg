@@ -2216,6 +2216,57 @@ class RetainedArtifactReasonFixtureTests(unittest.TestCase):
 
 
 class RetainedAurGitLimitTests(unittest.TestCase):
+    def test_cancellation_fixture_spawns_and_polls_the_same_command(self):
+        filename = 'src/package_managers/aur_sources.rs'
+        files = {'/artifact/' + filename: filename}
+        for fault in (None, 'different-command', 'cold-child', 'foreign-owner'):
+            with self.subTest(fault=fault):
+                sides, indexes = [], []
+                work = [coverage.SOURCE_CONSTRUCT_WORK_CAPACITY]
+                for side in range(2):
+                    shell = 'bash' if side and fault == 'different-command' else 'sh'
+                    source = [
+                        '#[cfg(test)]', 'mod public_source_tests {', '    #[tokio::test]',
+                        '    async fn cancelling_host_git_clone_terminates_descendants() {',
+                        '        let temp = tempfile::tempdir().expect("isolated Git staging");',
+                        '        let staging = temp.path().join("mirror");',
+                        '        std::fs::create_dir(&staging).expect("staging directory");',
+                        '        let ready = staging.join("ready");',
+                        '        let survived = staging.join("survived");',
+                        '        let task_staging = staging.clone();',
+                        '        let worker = tokio::spawn(async move {',
+                        f'            let mut command = tokio::process::Command::new("{shell}");',
+                        '            command.current_dir(&task_staging).args([',
+                        '                "-c",',
+                        '                "printf ready > ready; (sleep 1; printf survived > survived) & wait",',
+                        '            ]);',
+                        '        });', '    }', '}',
+                    ]
+                    base = f'NvNtNtNtCs{side + 1}1_7omg_lib16package_managers11aur_sources19public_source_testss_48cancelling_host_git_clone_terminates_descendants'
+                    opening = source[3].index('{') + 1
+                    roots = [[4, 11, 4, opening - 1, 1, 0, 0, 0], [18, 5, 18, 6, 1, 0, 0, 0]]
+                    entry = [[4, opening, 4, opening + 1, 1, 0, 0, 0],
+                             [11, 13, 11, 19, 1, 0, 0, 0], [11, 22, 11, 34, 1, 0, 0, 0]]
+                    count = 0 if side and fault == 'cold-child' else 1
+                    nested = [[11, 46, 11, 47, count, 0, 0, 0],
+                              [12, 17, 12, 28, count, 0, 0, 0],
+                              [12, 31, 12, 59, count, 0, 0, 0]]
+                    owners = [dict(name=symbol, filenames=list(files), count=hits, regions=regions)
+                              for symbol, hits, regions in (('_R' + base, 1, roots),
+                                  ('_RNC' + base + '0B9_', 1, entry),
+                                  ('_RNCNC' + base + '00Bb_', count, nested))]
+                    if side and fault == 'foreign-owner':
+                        owners.append(dict(owners[-1], name='foreign'))
+                    counts = {11: 1, 12: count}
+                    sides.append((source, coverage._construct_inventory(source, work), counts))
+                    indexes.append(coverage.index_compiled_owner_sources(owners, files, work, {filename}))
+                proof = coverage.retained_aur_git_cancellation_entry(filename, sides, indexes, work)
+                if fault is None:
+                    self.assertIsNotNone(proof)
+                    self.assertEqual(proof['pairs'], [[11, 11]])
+                else:
+                    self.assertIsNone(proof)
+
     def test_staging_fixture_keeps_its_literal_limits_in_the_compiled_future(self):
         filename = 'src/package_managers/aur_sources.rs'
         files = {'/artifact/' + filename: filename}
