@@ -487,6 +487,8 @@ esac
     #[cfg(unix)]
     #[tokio::test]
     async fn hostile_version_is_rejected_before_npm_execution() -> Result<()> {
+        use crate::core::security::ValidationError;
+
         let temp = tempfile::tempdir()?;
         let manager =
             PiManager::with_paths(temp.path().join("versions/pi"), temp.path().join("absent"));
@@ -494,12 +496,9 @@ esac
             .install("../../malicious")
             .await
             .expect_err("hostile version must be rejected at the boundary");
-        assert!(
-            matches!(
-                error.downcast_ref::<crate::core::security::ValidationError>(),
-                Some(crate::core::security::ValidationError::VersionInvalidChar { character: '/' })
-            ),
-            "{error:#}"
+        assert_eq!(
+            error.downcast_ref::<ValidationError>(),
+            Some(&ValidationError::VersionInvalidChar { character: '/' })
         );
         assert!(!manager.versions_dir.exists());
         Ok(())
@@ -544,10 +543,8 @@ esac
 
         fake_npm(temp.path(), "0.83.0", true)?;
         fs::write(temp.path().join("occupied-bin"), "occupied")?;
-        let error = manager
-            .install("0.83.0")
-            .await
-            .expect_err("staging cannot replace an occupied bin directory");
+        let collision = manager.install("0.83.0").await;
+        let error = collision.expect_err("staging cannot replace an occupied bin directory");
         assert_eq!(
             error
                 .downcast_ref::<std::io::Error>()
