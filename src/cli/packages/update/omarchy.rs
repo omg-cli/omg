@@ -5063,17 +5063,23 @@ omarchy-pkg-drop imv mpv-mpris
         let descriptor: OwnedFd = listener.into();
         let master = register_file(File::from(descriptor))?;
         let ready = owner.path().join("ready");
+        let armed = owner.path().join("armed");
         let release = owner.path().join("release");
         let complete = owner.path().join("complete");
         let shell = crate::core::privilege::root_controlled_program_path("sh")?;
         let mut child = Command::new(shell)
-            .args(["-c", "trap '' TERM; printf ready > \"$1\"; while test ! -f \"$2\"; do sleep 0.01; done; printf cleaned > \"$3\"", "fixture"])
-            .arg(&ready).arg(&release).arg(&complete)
+            .args(["-c", "trap '' TERM; while test ! -f \"$1\"; do sleep 0.01; done; printf ready > \"$2\"; while test ! -f \"$3\"; do sleep 0.01; done; printf cleaned > \"$4\"", "fixture"])
+            .arg(&armed).arg(&ready).arg(&release).arg(&complete)
             .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
             .process_group(0).kill_on_drop(true).spawn()?;
         tokio::time::timeout(Duration::from_secs(3), async {
+            let mut released_child = false;
             while !ready.is_file() {
                 tokio::task::yield_now().await;
+                if !released_child {
+                    std::fs::write(&armed, b"armed").expect("release fixture readiness gate");
+                    released_child = true;
+                }
             }
         })
         .await
