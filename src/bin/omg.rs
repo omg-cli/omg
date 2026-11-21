@@ -1484,11 +1484,7 @@ fn handle_which_command(runtime: &str) -> Result<()> {
                 omg_lib::cli::style::version(&version)
             );
         }
-        Ok(None) => {
-            return Err(anyhow::Error::msg(format!(
-                "{runtime}: no version set (check .tool-versions, .nvmrc, etc.)"
-            )));
-        }
+        Ok(None) => return Err(no_version_set_error(runtime)),
         Err(error) => {
             // Propagate instead of only printing so the process exits non-zero.
             anyhow::bail!(
@@ -1497,6 +1493,12 @@ fn handle_which_command(runtime: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn no_version_set_error(runtime: &str) -> anyhow::Error {
+    anyhow::Error::msg(format!(
+        "{runtime}: no version set (check .tool-versions, .nvmrc, etc.)"
+    ))
 }
 
 async fn handle_audit_command(
