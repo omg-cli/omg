@@ -6,7 +6,7 @@
 use anyhow::{Context, Result};
 use owo_colors::OwoColorize;
 
-fn write_private_export(path: &std::path::Path, contents: impl AsRef<[u8]>) -> Result<()> {
+fn write_private_export(path: &std::path::Path, contents: &[u8]) -> Result<()> {
     // Security exports must never inherit a previously permissive mode from
     // the file they replace - force owner-only (0o600) through the replace.
     crate::core::safe_ops::atomic_write_file_sync_private(path, contents)
@@ -417,10 +417,10 @@ pub fn view_audit_log(
                 }
                 writer.flush()?;
             }
-            write_private_export(&path, csv)?;
+            write_private_export(&path, &csv)?;
         } else {
             let json = serde_json::to_vec_pretty(&entries)?;
-            write_private_export(&path, json)?;
+            write_private_export(&path, &json)?;
         }
         println!(
             "{} Export successful",
@@ -1107,7 +1107,7 @@ pub fn scan_licenses(
         let path = std::path::PathBuf::from(&export_path);
 
         let report = serialize_license_rows(format, &filtered_packages)?;
-        write_private_export(&path, report)?;
+        write_private_export(&path, report.as_bytes())?;
 
         println!(
             "{} Exported {} packages to {}",
@@ -1518,7 +1518,7 @@ pub async fn export_compliance(
             let entries = read_audit_entries(&logger, 1000, None)?;
             let json = serde_json::to_string_pretty(&entries)?;
             let log_path = output_dir.join(format!("audit-log-{timestamp}.json"));
-            write_private_export(&log_path, json)?;
+            write_private_export(&log_path, json.as_bytes())?;
             println!(
                 "  {} Audit log: {}",
                 style::success("✓"),
@@ -1531,7 +1531,7 @@ pub async fn export_compliance(
                 let scan = security_audit_result().await?;
                 let json = serde_json::to_string_pretty(&scan)?;
                 let scan_path = output_dir.join(format!("vulnerability-scan-{timestamp}.json"));
-                write_private_export(&scan_path, json)?;
+                write_private_export(&scan_path, json.as_bytes())?;
                 println!(
                     "  {} Vulnerability scan: {}",
                     style::success("✓"),
@@ -1565,10 +1565,8 @@ pub async fn export_compliance(
                     .context("Failed to load security policy")?,
             });
             let config_path = output_dir.join(format!("config-snapshot-{timestamp}.json"));
-            write_private_export(
-                &config_path,
-                serde_json::to_string_pretty(&config_snapshot)?,
-            )?;
+            let config_json = serde_json::to_string_pretty(&config_snapshot)?;
+            write_private_export(&config_path, config_json.as_bytes())?;
             println!(
                 "  {} Configuration: {}",
                 style::success("✓"),
