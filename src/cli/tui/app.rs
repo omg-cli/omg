@@ -287,7 +287,7 @@ impl App {
     fn update_system_metrics(&mut self) {
         // A single /proc/stat read yields a since-boot average, so CPU usage
         // must be derived from consecutive cumulative samples.
-        let cpu_usage = Self::cpu_usage_delta(&mut self.prev_cpu_sample);
+        let cpu_usage = Self::cpu_usage_delta(&mut self.prev_cpu_sample, Self::sample_cpu_totals());
         let (disk_usage, disk_free) = Self::get_disk_usage_sync();
         let (network_rx, network_tx) = Self::get_network_stats();
 
@@ -324,8 +324,8 @@ impl App {
 
     /// Usage percent since the previous sample; the very first sample only
     /// establishes the baseline and reports the previous reading.
-    fn cpu_usage_delta(previous: &mut Option<(u64, u64)>) -> f32 {
-        let Some(sample) = Self::sample_cpu_totals() else {
+    fn cpu_usage_delta(previous: &mut Option<(u64, u64)>, sample: Option<(u64, u64)>) -> f32 {
+        let Some(sample) = sample else {
             return 0.0;
         };
         let usage = match *previous {
@@ -854,6 +854,21 @@ mod tests {
         assert!(!app.daemon_connected);
         assert!(app.history.is_empty());
         assert!(app.team_status.is_none());
+    }
+
+    #[test]
+    fn cpu_usage_delta_handles_advancing_and_steady_samples() {
+        let mut previous = None;
+        let baseline = App::cpu_usage_delta(&mut previous, Some((100, 60)));
+        assert!(baseline.abs() < f32::EPSILON);
+        assert_eq!(previous, Some((100, 60)));
+
+        let advancing = App::cpu_usage_delta(&mut previous, Some((140, 70)));
+        assert!((advancing - 75.0).abs() < f32::EPSILON);
+        assert_eq!(previous, Some((140, 70)));
+
+        let steady = App::cpu_usage_delta(&mut previous, Some((140, 70)));
+        assert!(steady.abs() < f32::EPSILON);
     }
 
     #[test]
