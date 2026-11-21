@@ -1076,13 +1076,24 @@ pub enum AccountCommands {
 }
 
 #[derive(clap::Args, Debug)]
+#[group(skip)]
 pub struct SlsaCertificateIdentity {
     /// Require the Fulcio certificate SAN to match this identity
     /// (email or OIDC URI); required for a meaningful trust decision
-    #[arg(long = "certificate-identity", required = true)]
+    #[arg(
+        id = "certificate_identity",
+        long = "certificate-identity",
+        required = true,
+        value_name = "CERTIFICATE_IDENTITY"
+    )]
     pub identity: String,
     /// Require the Fulcio certificate OIDC issuer to match this URI
-    #[arg(long = "certificate-oidc-issuer", required = true)]
+    #[arg(
+        id = "certificate_oidc_issuer",
+        long = "certificate-oidc-issuer",
+        required = true,
+        value_name = "CERTIFICATE_OIDC_ISSUER"
+    )]
     pub oidc_issuer: String,
 }
 
