@@ -1107,7 +1107,7 @@ pub fn scan_licenses(
         let path = std::path::PathBuf::from(&export_path);
 
         let report = serialize_license_rows(format, &filtered_packages)?;
-        write_private_export(&path, report.as_bytes())?;
+        write_private_export(&path, &report)?;
 
         println!(
             "{} Exported {} packages to {}",
