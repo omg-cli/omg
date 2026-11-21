@@ -5066,7 +5066,7 @@ omarchy-pkg-drop imv mpv-mpris
             .stderr(Stdio::null())
             .process_group(0)
             .kill_on_drop(true);
-        let mut coordinator = coordinator.spawn()?;
+        let coordinator = coordinator.spawn()?;
         tokio::time::timeout(Duration::from_secs(3), async {
             let mut released_child = false;
             while !ready.is_file() {
