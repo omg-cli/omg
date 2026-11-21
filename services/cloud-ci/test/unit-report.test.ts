@@ -21,7 +21,7 @@ for (const partialSkips of [false, true]) {
         assert.equal(Bun.version, "1.4.4");
         const require = createRequire(import.meta.url);
         const declaredPin = JSON.parse(readFileSync(new URL(${JSON.stringify(runnerPackageUrl)}), "utf8")).dependencies.xml2js;
-        assert.equal(declaredPin, "0.5.0");
+        assert.equal(declaredPin, "0.6.2");
         assert.equal(require("xml2js/package.json").version, declaredPin);
         const directory = mkdtempSync(path.join(tmpdir(), "codeloud-junit-emitter-"));
         try {
@@ -47,7 +47,9 @@ for (const partialSkips of [false, true]) {
           assert.ok(raw.includes(commitProperty));
           assert.ok(raw.indexOf(commitProperty) < raw.indexOf("<testcase "));
           const document = await parseStringPromise(raw);
-          assert.equal(Object.getPrototypeOf(document.testsuites), null);
+          assert.ok(Object.hasOwn(document, "testsuites"));
+          assert.ok(Object.hasOwn(document.testsuites, "$"));
+          assert.equal(Object.getPrototypeOf(document.testsuites), Object.prototype);
           const summary = assertUnitExecution(document);
           assert.equal(summary.tests, ${JSON.stringify(partialSkips ? "4" : "1")});
           assert.equal(summary.skipped, ${JSON.stringify(partialSkips ? "3" : "0")});
