@@ -658,20 +658,21 @@ fn try_fast_completions(args: &[String]) -> Result<bool> {
 }
 
 /// Ultra-fast path for which command
-fn try_fast_which(args: &[String]) -> Result<bool> {
+fn try_fast_which(args: &[String]) -> bool {
     if has_help_flag(args) {
-        return Ok(false);
+        return false;
     }
 
     if args.len() == 3 && args[1] == "which" {
         let runtime = &args[2];
         if runtime.starts_with('-') {
-            return Ok(false);
+            return false;
         }
-        handle_which_command(runtime)?;
-        return Ok(true);
+        // On failure, defer so the standard error reporter owns the message and
+        // the process exits non-zero.
+        return handle_which_command(runtime).is_ok();
     }
-    Ok(false)
+    false
 }
 
 /// Parsed form of a pre-parse `omg list|ls` invocation tail: optional runtime
@@ -765,7 +766,7 @@ fn try_fast_paths(args: &[String]) -> Result<bool> {
         || try_fast_explicit_count(args)
         || try_fast_search(args)
         || try_fast_info(args)
-        || try_fast_which(args)?
+        || try_fast_which(args)
         || try_fast_list(args)?
         || try_fast_status(args)
         || try_fast_hooks(args)
@@ -1804,7 +1805,6 @@ mod fast_path_tests {
         FastCounter, configure_fast_path_output, direct_root_warning_required, has_json_flag,
         info_package_from_fast_args, parse_fast_counter_cmd, parse_fast_list_tail,
         root_help_selection, try_fast_completions, try_fast_explicit_count, try_fast_hooks,
-        try_fast_which,
     };
 
     #[cfg(feature = "arch")]
@@ -2128,14 +2128,6 @@ mod fast_path_tests {
         assert!(!try_fast_hooks(&args(&[
             "omg", "hook-env", "bash", "extra",
         ])));
-    }
-
-    #[test]
-    fn which_flag_like_runtime_defers_to_clap() {
-        assert!(
-            !try_fast_which(&args(&["omg", "which", "--runtime"]))
-                .expect("which fast path should defer flag-like runtime names")
-        );
     }
 
     #[test]
