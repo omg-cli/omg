@@ -872,9 +872,9 @@ impl SlsaVerifier {
         entry: &RekorEntry,
         artifact_hash: &str,
         artifact_bytes: &[u8],
-        expected: ExpectedSigner<'_>,
         fulcio_roots: &[&str],
         fulcio_intermediate: &str,
+        expected: ExpectedSigner<'_>,
     ) -> Result<Option<String>, SlsaError> {
         use base64::Engine as _;
 
@@ -974,7 +974,7 @@ impl SlsaVerifier {
             })
     }
 
-    fn verified_rekor_result(
+    fn classify_rekor_entries(
         entries: &[RekorEntry],
         artifact_hash: &str,
         artifact_bytes: &[u8],
@@ -987,9 +987,9 @@ impl SlsaVerifier {
                 entry,
                 artifact_hash,
                 artifact_bytes,
-                expected,
                 fulcio_roots,
                 fulcio_intermediate,
+                expected,
             ) else {
                 continue;
             };
@@ -1123,7 +1123,7 @@ impl SlsaVerifier {
         // Check Rekor for transparency log entries, then attempt REAL
         // cryptographic verification of the best candidate.
         let rekor_entries = self.query_rekor(&artifact_hash).await?;
-        if let Some(result) = Self::verified_rekor_result(
+        if let Some(result) = Self::classify_rekor_entries(
             &rekor_entries,
             &artifact_hash,
             &artifact_bytes,
@@ -1226,9 +1226,9 @@ mod tests {
             entry,
             artifact_hash,
             artifact_bytes,
-            expected,
             fulcio_roots,
             "",
+            expected,
         )
     }
 
@@ -2007,9 +2007,9 @@ mod tests {
 
         let mut rejected_entry = make_entry(&cert_pem, bad_sig.to_der().as_bytes(), now);
         rejected_entry.uuid = "rejected".into();
-        let mut accepted_entry = entry.clone();
+        let mut accepted_entry = make_entry(&cert_pem, good_sig.to_der().as_bytes(), now);
         accepted_entry.uuid = "accepted".into();
-        let verified = SlsaVerifier::verified_rekor_result(
+        let verified = SlsaVerifier::classify_rekor_entries(
             &[rejected_entry, accepted_entry],
             &artifact_hash,
             &artifact_bytes,
@@ -2022,7 +2022,7 @@ mod tests {
         assert_eq!(verified.transparency_log_entry.as_deref(), Some("accepted"));
         assert_eq!(verified.builder_id.as_deref(), Some(IDENTITY));
         assert!(
-            SlsaVerifier::verified_rekor_result(
+            SlsaVerifier::classify_rekor_entries(
                 &[],
                 &artifact_hash,
                 &artifact_bytes,
