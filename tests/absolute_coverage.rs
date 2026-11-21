@@ -14,10 +14,7 @@ use std::path::{Path, PathBuf};
 use tempfile::tempdir;
 
 const fn get_ctx() -> CliContext {
-    CliContext {
-        json: false,
-        slsa_certificate_oidc_issuer: None,
-    }
+    CliContext { json: false }
 }
 
 /// RAII guard that sets an environment variable and restores its previous

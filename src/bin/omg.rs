@@ -1053,20 +1053,7 @@ async fn async_main(args: Vec<String>) -> Result<()> {
         return omg_lib::core::privilege::run_self_sudo(&args_refs).await;
     }
 
-    let slsa_certificate_oidc_issuer = match &cli.command {
-        Commands::Audit {
-            command:
-                Some(omg_lib::cli::AuditCommands::Slsa {
-                    certificate_oidc_issuer,
-                    ..
-                }),
-        } => Some(certificate_oidc_issuer.clone()),
-        _ => None,
-    };
-    let ctx = omg_lib::cli::CliContext {
-        json: cli.json,
-        slsa_certificate_oidc_issuer,
-    };
+    let ctx = omg_lib::cli::CliContext { json: cli.json };
 
     let result = dispatch_command(&cli.command, &ctx).await;
     finish_command_telemetry(cmd_start, command_name(&cli.command), result.is_ok()).await;
