@@ -974,6 +974,45 @@ impl SlsaVerifier {
             })
     }
 
+    fn verified_rekor_result(
+        entries: &[RekorEntry],
+        artifact_hash: &str,
+        artifact_bytes: &[u8],
+        expected: ExpectedSigner<'_>,
+        fulcio_roots: &[&str],
+        fulcio_intermediate: &str,
+    ) -> Option<VerificationResult> {
+        for entry in entries {
+            let Ok(Some(signer)) = Self::verify_rekor_entry(
+                entry,
+                artifact_hash,
+                artifact_bytes,
+                expected,
+                fulcio_roots,
+                fulcio_intermediate,
+            ) else {
+                continue;
+            };
+            return Some(VerificationResult {
+                verified: true,
+                // A hashedrekord plus a valid SET proves the artifact
+                // signature and signed entry data, but this path does
+                // not verify a Merkle inclusion proof or build provenance.
+                slsa_level: SlsaLevel::None,
+                transparency_log_entry: Some(entry.uuid.clone()),
+                builder_id: Some(signer),
+                build_timestamp: None,
+                error: None,
+            });
+        }
+
+        entries.first().map(|entry| {
+            let mut result = classify_slsa_evidence(SlsaEvidence::RekorIndexHit);
+            result.transparency_log_entry = Some(entry.uuid.clone());
+            result
+        })
+    }
+
     /// Verify `signature` over the SHA-256 digest hex over the artifact,
     /// using a PEM-encoded PUBLIC KEY.
     fn verify_digest_with_spki_from_pem(
@@ -1084,34 +1123,14 @@ impl SlsaVerifier {
         // Check Rekor for transparency log entries, then attempt REAL
         // cryptographic verification of the best candidate.
         let rekor_entries = self.query_rekor(&artifact_hash).await?;
-
-        for entry in &rekor_entries {
-            let Ok(Some(signer)) = Self::verify_rekor_entry(
-                entry,
-                &artifact_hash,
-                &artifact_bytes,
-                expected,
-                &[FULCIO_ROOT_PEM, FULCIO_INTERMEDIATE_PEM],
-                FULCIO_INTERMEDIATE_PEM,
-            ) else {
-                continue;
-            };
-            return Ok(VerificationResult {
-                verified: true,
-                // A hashedrekord plus a valid SET proves the artifact
-                // signature and signed entry data, but this path does
-                // not verify a Merkle inclusion proof or build provenance.
-                slsa_level: SlsaLevel::None,
-                transparency_log_entry: Some(entry.uuid.clone()),
-                builder_id: Some(signer),
-                build_timestamp: None,
-                error: None,
-            });
-        }
-
-        if let Some(entry) = rekor_entries.first() {
-            let mut result = classify_slsa_evidence(SlsaEvidence::RekorIndexHit);
-            result.transparency_log_entry = Some(entry.uuid.clone());
+        if let Some(result) = Self::verified_rekor_result(
+            &rekor_entries,
+            &artifact_hash,
+            &artifact_bytes,
+            expected,
+            &[FULCIO_ROOT_PEM, FULCIO_INTERMEDIATE_PEM],
+            FULCIO_INTERMEDIATE_PEM,
+        ) {
             return Ok(result);
         }
 
@@ -1984,6 +2003,35 @@ mod tests {
         assert!(
             signer.as_deref() == Some(IDENTITY),
             "Fulcio SAN must be reported as the signer identity"
+        );
+
+        let mut rejected_entry = make_entry(&cert_pem, bad_sig.to_der().as_bytes(), now);
+        rejected_entry.uuid = "rejected".into();
+        let mut accepted_entry = entry.clone();
+        accepted_entry.uuid = "accepted".into();
+        let verified = SlsaVerifier::verified_rekor_result(
+            &[rejected_entry, accepted_entry],
+            &artifact_hash,
+            &artifact_bytes,
+            expected(ISSUER),
+            &ca_roots,
+            "",
+        )
+        .expect("valid trusted entry after a rejected entry");
+        assert!(verified.verified);
+        assert_eq!(verified.transparency_log_entry.as_deref(), Some("accepted"));
+        assert_eq!(verified.builder_id.as_deref(), Some(IDENTITY));
+        assert!(
+            SlsaVerifier::verified_rekor_result(
+                &[],
+                &artifact_hash,
+                &artifact_bytes,
+                expected(ISSUER),
+                &ca_roots,
+                "",
+            )
+            .is_none(),
+            "an empty Rekor response has no verification result"
         );
 
         // Wrong signature over the same valid chain -> unverified.
