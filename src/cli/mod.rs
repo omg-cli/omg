@@ -124,6 +124,7 @@ pub(crate) fn local_reverse_deps(handle: &alpm::Alpm, package: &str) -> Vec<Stri
 /// Global context for CLI command execution
 pub struct CliContext {
     pub json: bool,
+    pub slsa_certificate_oidc_issuer: Option<String>,
 }
 
 /// Execute a CLI command using process-local terminal state.

@@ -56,18 +56,6 @@ impl LocalCommandRunner for AuditCommands {
         if !machine_stdout {
             ui::print_spacer();
         }
-        if let AuditCommands::Slsa {
-            package,
-            certificate_identity,
-            certificate_oidc_issuer,
-        } = self
-        {
-            check_slsa(package, certificate_identity, certificate_oidc_issuer, ctx).await?;
-            if !machine_stdout {
-                ui::print_spacer();
-            }
-            return Ok(());
-        }
         match self {
             AuditCommands::Scan { fail_on_findings } => {
                 scan_with_options(ctx, *fail_on_findings).await
@@ -93,7 +81,11 @@ impl LocalCommandRunner for AuditCommands {
             ),
             AuditCommands::Verify => verify_audit_log(ctx),
             AuditCommands::Policy => show_policy(ctx),
-            AuditCommands::Slsa { .. } => unreachable!("SLSA dispatch returned before this match"),
+            AuditCommands::Slsa {
+                package,
+                certificate_identity,
+                ..
+            } => check_slsa(package, certificate_identity, ctx).await,
             AuditCommands::Licenses {
                 format,
                 export,
@@ -767,13 +759,13 @@ pub fn scan_secrets(path: Option<String>, _ctx: &CliContext) -> Result<()> {
 }
 
 /// Verify a Sigstore artifact signature against the required identity and issuer.
-pub async fn check_slsa(
-    package: &str,
-    certificate_identity: &str,
-    certificate_oidc_issuer: &str,
-    _ctx: &CliContext,
-) -> Result<()> {
+pub async fn check_slsa(package: &str, certificate_identity: &str, ctx: &CliContext) -> Result<()> {
     use crate::core::security::SlsaVerifier;
+
+    let certificate_oidc_issuer = ctx
+        .slsa_certificate_oidc_issuer
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("An exact --certificate-oidc-issuer is required"))?;
 
     // SECURITY: Validate path
     crate::core::security::validate_relative_path(package)?;
@@ -2538,9 +2530,17 @@ mod tests {
     #[cfg(not(feature = "arch"))]
     #[tokio::test]
     async fn auto_fix_without_arch_fails_before_scanning() {
-        let error = fix_vulnerabilities(true, true, "high", &CliContext { json: false })
-            .await
-            .expect_err("unsupported backend must fail before scanning");
+        let error = fix_vulnerabilities(
+            true,
+            true,
+            "high",
+            &CliContext {
+                json: false,
+                slsa_certificate_oidc_issuer: None,
+            },
+        )
+        .await
+        .expect_err("unsupported backend must fail before scanning");
         assert!(
             error.to_string().contains("without the Arch backend"),
             "got: {error}"
