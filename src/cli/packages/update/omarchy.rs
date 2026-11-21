@@ -5117,13 +5117,14 @@ omarchy-pkg-drop imv mpv-mpris
             std::fs::write(release, b"release")
         });
         let drain_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-        let error = tokio::time::timeout_at(
+        let drain_result = tokio::time::timeout_at(
             drain_deadline,
             drain_interrupted_coordinator(&mut coordinator, master),
-        )
-        .await
-        .context("terminal read failure must still reap the owned child")?
-        .expect_err("listening socket cannot serve as terminal input");
+        );
+        let drain_result = drain_result.await;
+        let error = drain_result
+            .context("terminal read failure must still reap the owned child")?
+            .expect_err("listening socket cannot serve as terminal input");
         finish.await??;
         assert!(format!("{error:#}").contains("Cannot drain interrupted Omarchy terminal"));
         assert_eq!(
