@@ -1710,19 +1710,22 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn slsa_dispatch_rejects_missing_package_before_verification() {
+    async fn slsa_dispatch_rejects_missing_issuer_before_rekor_query() {
         let command = AuditCommands::Slsa {
-            package: "missing-coverage-artifact.tar.gz".to_owned(),
+            package: "Cargo.toml".to_owned(),
             certificate_identity: "builder@example.invalid".to_owned(),
-            certificate_oidc_issuer: "https://issuer.example.invalid".to_owned(),
+            certificate_oidc_issuer: String::new(),
         };
 
         let error = command
             .execute(&CliContext { json: false })
             .await
-            .expect_err("missing packages must fail before invoking signature verification");
+            .expect_err("an empty issuer must fail before querying Rekor");
 
-        assert!(error.to_string().contains("File not found"), "{error}");
+        assert!(
+            error.to_string().contains("--certificate-oidc-issuer"),
+            "{error}"
+        );
     }
 
     #[cfg(unix)]
