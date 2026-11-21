@@ -5067,16 +5067,19 @@ omarchy-pkg-drop imv mpv-mpris
             .process_group(0)
             .kill_on_drop(true);
         let coordinator = coordinator.spawn()?;
-        tokio::time::timeout(Duration::from_secs(3), async {
-            let mut released_child = false;
-            while !ready.is_file() {
-                tokio::task::yield_now().await;
-                if !released_child {
-                    std::fs::write(armed, b"armed").expect("release fixture readiness gate");
-                    released_child = true;
+        tokio::time::timeout_at(
+            tokio::time::Instant::now() + Duration::from_secs(3),
+            async {
+                let mut released_child = false;
+                while !ready.is_file() {
+                    tokio::task::yield_now().await;
+                    if !released_child {
+                        std::fs::write(armed, b"armed").expect("release fixture readiness gate");
+                        released_child = true;
+                    }
                 }
-            }
-        })
+            },
+        )
         .await
         .context("owned coordinator must register its signal handling")?;
         Ok(coordinator)
