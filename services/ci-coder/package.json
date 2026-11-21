@@ -9,7 +9,7 @@
   },
   "dependencies": {
     "@ai-sdk/provider": "4.0.31",
-    "@opencode/plugin": "2.1.1",
+    "@opencode/plugin": "2.2.5",
     "@opencode/schema": "2.1.1",
     "@opencode/sdk": "2.1.1",
     "agents": "0.29.0",
