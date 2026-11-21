@@ -872,9 +872,9 @@ impl SlsaVerifier {
         entry: &RekorEntry,
         artifact_hash: &str,
         artifact_bytes: &[u8],
+        expected: ExpectedSigner<'_>,
         fulcio_roots: &[&str],
         fulcio_intermediate: &str,
-        expected: ExpectedSigner<'_>,
     ) -> Result<Option<String>, SlsaError> {
         use base64::Engine as _;
 
@@ -1090,9 +1090,9 @@ impl SlsaVerifier {
                 entry,
                 &artifact_hash,
                 &artifact_bytes,
+                expected,
                 &[FULCIO_ROOT_PEM, FULCIO_INTERMEDIATE_PEM],
                 FULCIO_INTERMEDIATE_PEM,
-                expected,
             ) else {
                 continue;
             };
@@ -1576,9 +1576,9 @@ mod tests {
                 &entry,
                 &artifact_hash,
                 artifact_bytes.as_slice(),
+                EXPECTED_TEST_SIGNER,
                 &[],
                 "",
-                EXPECTED_TEST_SIGNER,
             )
             .unwrap();
             assert!(
@@ -1608,9 +1608,9 @@ mod tests {
             &entry,
             &"b".repeat(64),
             &[0x62u8; 32],
+            EXPECTED_TEST_SIGNER,
             &[],
             "",
-            EXPECTED_TEST_SIGNER,
         )
         .unwrap();
         assert!(signer.is_none(), "recorded-hash mismatch must not verify");
@@ -1640,9 +1640,9 @@ mod tests {
             &entry,
             &artifact_hash,
             artifact_bytes.as_slice(),
+            EXPECTED_TEST_SIGNER,
             &[],
             "",
-            EXPECTED_TEST_SIGNER,
         )
         .unwrap();
         assert!(signer.is_none());
@@ -1689,9 +1689,9 @@ mod tests {
             &entry,
             &artifact_hash,
             artifact_bytes.as_slice(),
+            EXPECTED_TEST_SIGNER,
             &[],
             "",
-            EXPECTED_TEST_SIGNER,
         )
         .unwrap();
         assert!(
@@ -1948,9 +1948,9 @@ mod tests {
                 &entry,
                 &artifact_hash,
                 &artifact_bytes,
+                mismatched,
                 &ca_roots,
                 "",
-                mismatched,
             )
             .unwrap();
             assert!(
@@ -1962,9 +1962,9 @@ mod tests {
             &entry,
             &artifact_hash,
             &artifact_bytes,
+            expected(ISSUER),
             &ca_roots,
             "",
-            expected(ISSUER),
         )
         .unwrap();
         assert_eq!(
@@ -1979,9 +1979,9 @@ mod tests {
             &entry,
             &artifact_hash,
             artifact_bytes.as_slice(),
+            expected(ISSUER),
             &ca_roots,
             "",
-            expected(ISSUER),
         )
         .unwrap();
         assert!(
@@ -1995,9 +1995,9 @@ mod tests {
             &entry,
             &artifact_hash,
             artifact_bytes.as_slice(),
+            expected(ISSUER),
             &ca_roots,
             "",
-            expected(ISSUER),
         )
         .unwrap();
         assert!(
