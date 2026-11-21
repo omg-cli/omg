@@ -1863,6 +1863,7 @@ mod tests {
 
         const IDENTITY: &str = "https://accounts.example.com/users/alice";
         const ISSUER: &str = "https://issuer.example.invalid";
+        const EMPTY_FULCIO_INTERMEDIATE: &str = "";
 
         // Test CA standing in for the Sigstore root.
         let ca_key = KeyPair::generate().unwrap();
@@ -2027,7 +2028,7 @@ mod tests {
                 &artifact_bytes,
                 expected(ISSUER),
                 &ca_roots,
-                "",
+                EMPTY_FULCIO_INTERMEDIATE,
             )
             .is_none(),
             "an empty Rekor response has no verification result"
