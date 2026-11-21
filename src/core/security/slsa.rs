@@ -963,15 +963,14 @@ impl SlsaVerifier {
         // out-of-band, which this API does not accept. Never report verified
         // here — an attacker controlling distribution can produce one for any
         // artifact bytes they ship.
-        Self::verify_digest_with_spki_from_pem(pem, &signature, artifact_hash, artifact_bytes)
-            .map(|(integrity_ok, _signer)| {
-                if integrity_ok {
-                    tracing::info!(
-                        "Rekor entry is a plain public-key self-attestation;                          treated as unverified (no signer identity)"
-                    );
-                }
-                None
-            })
+        let (integrity_ok, _signer) =
+            Self::verify_digest_with_spki_from_pem(pem, &signature, artifact_hash, artifact_bytes)?;
+        if integrity_ok {
+            tracing::info!(
+                "Rekor entry is a plain public-key self-attestation;                          treated as unverified (no signer identity)"
+            );
+        }
+        Ok(None)
     }
 
     fn classify_rekor_entries(
