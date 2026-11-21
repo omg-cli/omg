@@ -112,8 +112,9 @@ const messages = (input) => Array.isArray(input.messages) ? input.messages : [];
 const lastUser = (input) => { const all = messages(input); for (let i = all.length - 1; i >= 0; i--) { const m = all[i]; if (typeof m === "object" && m !== null && m.role === "user") return textOf(m.content); } return ""; };
 const toolResults = (input) => messages(input).filter((m) => typeof m === "object" && m !== null && m.role === "tool").map((m) => textOf(m.content));
 const aiCalls = [];
+const admissionCalls = [];
 const ai = { aiGatewayLogId: null, async run(model, input, options) {
-  aiCalls.push({ model, gateway: options?.gateway ?? null });
+  aiCalls.push({ model, bodyModel: input.model, reasoningEffort: input.reasoning_effort, gateway: options?.gateway ?? null, admission: admissionCalls.shift() });
   if (input.stream !== true || !Array.isArray(input.tools)) {
     if (input.stream === true) return sse("title");
     return Response.json({ choices: [{ index: 0, finish_reason: "stop", message: { role: "assistant", content: "title" } }], usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 } });
@@ -132,7 +133,7 @@ const ai = { aiGatewayLogId: null, async run(model, input, options) {
   return sse("proposal admitted");
 } };
 export class Coder extends BaseCoder {
-  constructor(ctx, env) { super(ctx, { ...env, AI: ai, MODEL_PACER: { getByName() { return { async admit() { return { granted: true }; } }; } } }); }
+  constructor(ctx, env) { super(ctx, { ...env, AI: ai, MODEL_PACER: { getByName(name) { return { async admit(model) { admissionCalls.push({ name, model }); return { granted: true }; } }; } } }); }
   async debugState() { return (await this.ctx.storage.get("coding-result")) ?? null; }
   async debugPending() { return await this.harness.pending(); }
   async debugAI() { return aiCalls; }
@@ -222,6 +223,10 @@ test("an admitted existing-test audit reaches the real verify_patch through the 
   expect(result.admitted, JSON.stringify(result)).toBe(true);
   expect(result.aiCalls.length).toBeGreaterThan(0);
   expect(result.aiCalls.every(call => call.model === "@cf/deepseek-ai/deepseek-v4.1-flash-1017" && call.gateway === null)).toBe(true);
+  expect(result.aiCalls.every(call => call.bodyModel === call.model && call.reasoningEffort === "low")).toBe(true);
+  for (const { model, admission } of result.aiCalls) {
+    expect(admission).toEqual({ name: `workers-ai:${model}`, model });
+  }
   expect(result.afterFirst, JSON.stringify(result)).toBe(0);
   expect(result.state.job, JSON.stringify(result)).not.toBeNull();
   expect(result.afterHandoff, JSON.stringify(result)).toBe(1);

@@ -25,6 +25,7 @@
   },
   "patchedDependencies": {
     "gitlab-ai-provider@6.23.1": "patches/gitlab-ai-provider@6.23.1.patch",
+    "agents@0.29.0": "patches/agents@0.29.0.patch",
   },
   "overrides": {
     "@effect/platform-node@4.0.6": {
