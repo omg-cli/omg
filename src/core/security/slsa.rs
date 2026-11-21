@@ -1943,11 +1943,9 @@ mod tests {
         };
         let now = u64::try_from(jiff::Timestamp::now().as_second()).unwrap();
 
-        assert_eq!(
-            verify_fulcio_chain(leaf.der(), now, &ca_roots, "").as_deref(),
-            Some(IDENTITY),
-            "generated certificate chain must bind identity"
-        );
+        if verify_fulcio_chain(leaf.der(), now, &ca_roots, "").as_deref() != Some(IDENTITY) {
+            panic!("generated certificate chain must bind identity");
+        }
         assert!(
             SlsaVerifier::verify_digest_with_bytes(
                 &leaf_key.public_key_der(),
