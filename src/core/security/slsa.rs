@@ -1981,9 +1981,8 @@ mod tests {
         let signer = verifier
             .verify(&entry, &artifact_hash, &artifact_bytes, expected(ISSUER))
             .unwrap();
-        assert_eq!(
-            signer.as_deref(),
-            Some(IDENTITY),
+        assert!(
+            signer.as_deref() == Some(IDENTITY),
             "Fulcio SAN must be reported as the signer identity"
         );
 
