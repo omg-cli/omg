@@ -5069,7 +5069,7 @@ omarchy-pkg-drop imv mpv-mpris
         let shell = crate::core::privilege::root_controlled_program_path("sh")?;
         let mut coordinator = Command::new(shell)
             .args(["-c", "trap '' TERM; while test ! -f \"$1\"; do sleep 0.01; done; printf ready > \"$2\"; while test ! -f \"$3\"; do sleep 0.01; done; printf cleaned > \"$4\"", "fixture"])
-            .arg(&armed).arg(&ready).arg(&release).arg(&complete)
+            .args([&armed, &ready, &release, &complete])
             .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
             .process_group(0).kill_on_drop(true).spawn()?;
         tokio::time::timeout(Duration::from_secs(3), async {
