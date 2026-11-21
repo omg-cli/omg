@@ -1355,7 +1355,7 @@ mod tests {
     }
 
     #[test]
-    fn security_cli_requires_slsa_signer_and_accepts_explicit_scan_gate() {
+    fn security_cli_requires_slsa_identity_and_accepts_explicit_scan_gate() {
         assert!(Cli::try_parse_from(["omg", "audit", "slsa", "artifact.tar.gz"]).is_err());
         let error = Cli::try_parse_from([
             "omg",
