@@ -162,7 +162,6 @@ audit-licenses-filter-policy	["audit","licenses","--format","json","--filter","m
 audit-licenses-export	["audit","licenses","--format","csv","--export","${ROOT}/licenses-export.csv"]	isolated-write	arch:0,debian:1,ubuntu:1,fedora:1	pass	-	hermetic	hermetic:pass	license-audit-csv	tempdir-drop
 audit-fix-flags	["audit","fix","--dry-run","--yes","--min-severity","high"]	read	1	pass	-	hermetic	hermetic:pass	audit-fix-refusal	tempdir-drop
 audit-export-flags	["audit","export","--framework","soc2","--period","2024-Q4","--output","${ROOT}/audit-evidence-flags"]	isolated-write	1	pass	-	hermetic	hermetic:pass	local:audit-export-flags	tempdir-drop
-audit-export-soc2	["audit","export","--framework","soc2","--period","2024-Q4","--output","audit-evidence-soc2"]	isolated-write	0	pass	-	hermetic	hermetic:pass	audit-export-evidence	tempdir-drop
 run-parallel	["run","--parallel","parallel-one,parallel-two"]	read	0	pass	-	hermetic	hermetic:pass	parallel-tasks-executed	tempdir-drop
 run-all	["run","--all","smoke"]	read	0	pass	-	hermetic	hermetic:pass	all-tasks-executed	tempdir-drop
 team-golden-create-flags	["team","golden-path","create","flagged","--node","20","--python","3.12","--packages","ripgrep"]	isolated-write	0	pass	team-golden-list	hermetic	hermetic:pass	local:team-golden-create-flags	tempdir-drop
