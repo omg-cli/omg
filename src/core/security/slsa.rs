@@ -2048,6 +2048,64 @@ mod tests {
         )])
     }
 
+    #[tokio::test]
+    async fn verify_provenance_keeps_a_rekor_index_hit_unverified() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("fixture listener");
+        let address = listener.local_addr().expect("fixture address");
+        let index_body = "[\"captured\"]".to_string();
+        let entry_body = serde_json::to_string(&captured_rekor_response()).unwrap();
+        let server = tokio::spawn(async move {
+            for body in [index_body, entry_body] {
+                let (mut stream, _) = listener.accept().await.expect("fixture connection");
+                let mut request = [0; 2048];
+                let bytes_read = stream.read(&mut request).await.expect("read request");
+                assert!(bytes_read > 0, "empty request");
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("fixture response");
+            }
+        });
+
+        let verifier = SlsaVerifier {
+            client: reqwest::Client::builder()
+                .no_proxy()
+                .build()
+                .expect("fixture client"),
+            rekor_url: format!("http://{address}"),
+        };
+        let mut artifact = NamedTempFile::new().unwrap();
+        use std::io::Write;
+        write!(
+            artifact,
+            "artifact not represented by the captured Rekor entry"
+        )
+        .unwrap();
+        artifact.flush().unwrap();
+
+        let result = verifier
+            .verify_provenance(
+                artifact.path(),
+                None::<&Path>,
+                "signer@example.invalid",
+                "https://issuer.example.invalid",
+            )
+            .await
+            .expect("a Rekor index hit is descriptive evidence");
+        assert!(!result.verified, "an index hit does not verify an artifact");
+        assert_eq!(result.slsa_level, SlsaLevel::None);
+        assert_eq!(result.transparency_log_entry.as_deref(), Some("captured"));
+        server.await.expect("fixture server");
+    }
+
     #[test]
     fn captured_rekor_set_verifies_with_production_pin_and_rejects_tampering() {
         let response = captured_rekor_response();
