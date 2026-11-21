@@ -46,7 +46,9 @@ def main():
         if case == "split-accept":
             label = b"fixture transaction progress"
             before, prompt, after = transcript.partition(b"(default: cancel): ")
-            waiting, answer, _ = after.partition(b"accept " + b"a" * 64)
+            # macOS may echo VEOF and backspaces between the split writes.
+            # The second write echoes the final 40 digest bytes on both platforms.
+            waiting, answer, _ = after.partition(b"a" * 40)
             assert prompt and answer and label in before, (case, transcript)
             assert label not in waiting, ("progress redrew over the security prompt", transcript)
     print(json.dumps({"passed": len(cases)}))
