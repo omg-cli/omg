@@ -727,6 +727,7 @@ fn behavior_inventory_keeps_hook_and_workspace_assertions() {
             "audit-export-flags",
             Assertion::parse("local:audit-export-flags", 1),
         ),
+        ("audit-export-soc2", Assertion::AuditExportEvidence),
         (
             "enterprise-audit-export",
             Assertion::parse("local:enterprise-audit-export", 1),
@@ -1107,6 +1108,7 @@ enum Assertion {
     AllTasksExecuted,
     ManPagesGenerated,
     AuditExportAbsoluteRefusal,
+    AuditExportEvidence,
     EnterpriseAuditExportEvidence,
     TeamComplianceNoReport,
 }
@@ -1241,6 +1243,7 @@ impl Assertion {
             "all-tasks-executed" => Self::AllTasksExecuted,
             "man-pages-generated" => Self::ManPagesGenerated,
             "audit-export-absolute-refusal" => Self::AuditExportAbsoluteRefusal,
+            "audit-export-evidence" => Self::AuditExportEvidence,
             "enterprise-audit-export-evidence" => Self::EnterpriseAuditExportEvidence,
             "team-compliance-no-report" => Self::TeamComplianceNoReport,
             _ => match Self::parse_artifact_path(raw) {
@@ -3208,6 +3211,32 @@ fn behavior_inventory_runs_in_hermetic_state() {
                         || !no_artifacts
                     {
                         issues.push("absolute-path audit export did not refuse before writing".to_string());
+                    }
+                }
+                Assertion::AuditExportEvidence => {
+                    use std::os::unix::fs::PermissionsExt as _;
+
+                    let directory = project.path().join("audit-evidence-soc2");
+                    let files = std::fs::read_dir(&directory)
+                        .ok()
+                        .and_then(|entries| entries.collect::<Result<Vec<_>, _>>().ok());
+                    let audit_log = files.as_ref().and_then(|entries| {
+                        entries.iter().find(|entry| {
+                            entry.file_name().to_string_lossy().starts_with("audit-log-")
+                        })
+                    });
+                    let private_json = audit_log.is_some_and(|entry| {
+                        entry.file_type().is_ok_and(|kind| kind.is_file())
+                            && entry.metadata().is_ok_and(|metadata| {
+                                metadata.permissions().mode() & 0o777 == 0o600
+                            })
+                            && std::fs::read(entry.path())
+                                .ok()
+                                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                                .is_some_and(|value| value.is_array())
+                    });
+                    if !private_json {
+                        issues.push("SOC 2 export did not write a private audit log".to_string());
                     }
                 }
                 Assertion::EnterpriseAuditExportEvidence => {
