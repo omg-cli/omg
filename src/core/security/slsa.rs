@@ -2757,7 +2757,7 @@ mod required_signer_tests {
     async fn empty_identity_and_issuer_fail_before_file_or_network_access() {
         let verifier = super::SlsaVerifier::default();
 
-        for identity in ["", "   "] {
+        for identity in ["", "   ", "\t"] {
             let error = verifier
                 .verify_provenance(
                     "/nonexistent/artifact",
