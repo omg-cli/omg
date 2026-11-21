@@ -1187,12 +1187,28 @@ mod tests {
         artifact_hash: &str,
         artifact_bytes: &[u8],
     ) -> Result<Option<String>, SlsaError> {
-        SlsaVerifier::verify_rekor_entry(
+        verify_test_rekor_entry_with_roots(
             entry,
             artifact_hash,
             artifact_bytes,
             EXPECTED_TEST_SIGNER,
             &[],
+        )
+    }
+
+    fn verify_test_rekor_entry_with_roots(
+        entry: &RekorEntry,
+        artifact_hash: &str,
+        artifact_bytes: &[u8],
+        expected: ExpectedSigner<'_>,
+        fulcio_roots: &[&str],
+    ) -> Result<Option<String>, SlsaError> {
+        SlsaVerifier::verify_rekor_entry(
+            entry,
+            artifact_hash,
+            artifact_bytes,
+            expected,
+            fulcio_roots,
             "",
         )
     }
@@ -1930,13 +1946,12 @@ mod tests {
                 issuer: ISSUER,
             },
         ] {
-            let signer = SlsaVerifier::verify_rekor_entry(
+            let signer = verify_test_rekor_entry_with_roots(
                 &entry,
                 &artifact_hash,
                 &artifact_bytes,
                 mismatched,
                 &ca_roots,
-                "",
             )
             .unwrap();
             assert!(
@@ -1944,13 +1959,12 @@ mod tests {
                 "both the identity and the issuer must match"
             );
         }
-        let signer = SlsaVerifier::verify_rekor_entry(
+        let signer = verify_test_rekor_entry_with_roots(
             &entry,
             &artifact_hash,
             &artifact_bytes,
             expected(ISSUER),
             &ca_roots,
-            "",
         )
         .unwrap();
         assert_eq!(
@@ -1961,13 +1975,12 @@ mod tests {
 
         // Wrong signature over the same valid chain -> unverified.
         let entry = make_entry(&cert_pem, bad_sig.to_der().as_bytes(), now);
-        let signer = SlsaVerifier::verify_rekor_entry(
+        let signer = verify_test_rekor_entry_with_roots(
             &entry,
             &artifact_hash,
             artifact_bytes.as_slice(),
             expected(ISSUER),
             &ca_roots,
-            "",
         )
         .unwrap();
         assert!(
@@ -1977,13 +1990,12 @@ mod tests {
 
         // Entry recorded before the certificate existed -> unverified.
         let entry = make_entry(&cert_pem, good_sig.to_der().as_bytes(), 0);
-        let signer = SlsaVerifier::verify_rekor_entry(
+        let signer = verify_test_rekor_entry_with_roots(
             &entry,
             &artifact_hash,
             artifact_bytes.as_slice(),
             expected(ISSUER),
             &ca_roots,
-            "",
         )
         .unwrap();
         assert!(
