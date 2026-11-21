@@ -5116,8 +5116,9 @@ omarchy-pkg-drop imv mpv-mpris
             assert_eq!(reset.kind(), std::io::ErrorKind::ConnectionReset);
             std::fs::write(release, b"release")
         });
-        let error = tokio::time::timeout(
-            Duration::from_secs(3),
+        let drain_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let error = tokio::time::timeout_at(
+            drain_deadline,
             drain_interrupted_coordinator(&mut coordinator, master),
         )
         .await
