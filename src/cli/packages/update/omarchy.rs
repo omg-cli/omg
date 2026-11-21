@@ -5046,7 +5046,7 @@ omarchy-pkg-drop imv mpv-mpris
         std::fs::write(root.join("complete"), b"cleaned").expect("output cleanup completed");
     }
 
-    fn terminal_read_failure_coordinator(
+    async fn terminal_read_failure_coordinator(
         shell: impl AsRef<std::ffi::OsStr>,
         ready: &std::path::Path,
         armed: &std::path::Path,
