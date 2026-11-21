@@ -1182,6 +1182,21 @@ mod tests {
         issuer: "https://issuer.example.invalid",
     };
 
+    fn verify_test_rekor_entry(
+        entry: &RekorEntry,
+        artifact_hash: &str,
+        artifact_bytes: &[u8],
+    ) -> Result<Option<String>, SlsaError> {
+        SlsaVerifier::verify_rekor_entry(
+            entry,
+            artifact_hash,
+            artifact_bytes,
+            EXPECTED_TEST_SIGNER,
+            &[],
+            "",
+        )
+    }
+
     #[tokio::test]
     async fn rekor_index_applies_body_limit_before_json_and_accepts_small_results() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1572,15 +1587,8 @@ mod tests {
                 integrated_time: u64::try_from(jiff::Timestamp::now().as_second()).unwrap(),
                 body: make_body(&pem, sig),
             };
-            let signer = SlsaVerifier::verify_rekor_entry(
-                &entry,
-                &artifact_hash,
-                artifact_bytes.as_slice(),
-                EXPECTED_TEST_SIGNER,
-                &[],
-                "",
-            )
-            .unwrap();
+            let signer =
+                verify_test_rekor_entry(&entry, &artifact_hash, artifact_bytes.as_slice()).unwrap();
             assert!(
                 signer.is_none(),
                 "plain-key entries are self-attestations and never verify"
@@ -1604,15 +1612,7 @@ mod tests {
             integrated_time: u64::try_from(jiff::Timestamp::now().as_second()).unwrap(),
             body: make_body(&pem, &good_sig.to_bytes()),
         };
-        let signer = SlsaVerifier::verify_rekor_entry(
-            &entry,
-            &"b".repeat(64),
-            &[0x62u8; 32],
-            EXPECTED_TEST_SIGNER,
-            &[],
-            "",
-        )
-        .unwrap();
+        let signer = verify_test_rekor_entry(&entry, &"b".repeat(64), &[0x62u8; 32]).unwrap();
         assert!(signer.is_none(), "recorded-hash mismatch must not verify");
 
         // --- P-256 roundtrip ---
@@ -1636,15 +1636,8 @@ mod tests {
             body: make_body(&p256_pem, &ec_der),
         };
         // Entry-level: plain-key is never "verified" (self-attestation).
-        let signer = SlsaVerifier::verify_rekor_entry(
-            &entry,
-            &artifact_hash,
-            artifact_bytes.as_slice(),
-            EXPECTED_TEST_SIGNER,
-            &[],
-            "",
-        )
-        .unwrap();
+        let signer =
+            verify_test_rekor_entry(&entry, &artifact_hash, artifact_bytes.as_slice()).unwrap();
         assert!(signer.is_none());
         let spki_der = {
             use p256::pkcs8::DecodePublicKey as _;
@@ -1685,15 +1678,8 @@ mod tests {
             integrated_time: u64::try_from(jiff::Timestamp::now().as_second()).unwrap(),
             body: intoto_body,
         };
-        let signer = SlsaVerifier::verify_rekor_entry(
-            &entry,
-            &artifact_hash,
-            artifact_bytes.as_slice(),
-            EXPECTED_TEST_SIGNER,
-            &[],
-            "",
-        )
-        .unwrap();
+        let signer =
+            verify_test_rekor_entry(&entry, &artifact_hash, artifact_bytes.as_slice()).unwrap();
         assert!(
             signer.is_none(),
             "unsupported kinds must not claim verification"
