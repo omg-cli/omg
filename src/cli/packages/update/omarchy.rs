@@ -5067,7 +5067,7 @@ omarchy-pkg-drop imv mpv-mpris
         let release = owner.path().join("release");
         let complete = owner.path().join("complete");
         let shell = crate::core::privilege::root_controlled_program_path("sh")?;
-        let mut child = Command::new(shell)
+        let mut coordinator = Command::new(shell)
             .args(["-c", "trap '' TERM; while test ! -f \"$1\"; do sleep 0.01; done; printf ready > \"$2\"; while test ! -f \"$3\"; do sleep 0.01; done; printf cleaned > \"$4\"", "fixture"])
             .arg(&armed).arg(&ready).arg(&release).arg(&complete)
             .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
@@ -5094,7 +5094,7 @@ omarchy-pkg-drop imv mpv-mpris
         });
         let error = tokio::time::timeout(
             Duration::from_secs(3),
-            drain_interrupted_coordinator(&mut child, master),
+            drain_interrupted_coordinator(&mut coordinator, master),
         )
         .await
         .context("terminal read failure must still reap the owned child")?
@@ -5109,7 +5109,7 @@ omarchy-pkg-drop imv mpv-mpris
         );
         assert_eq!(std::fs::read(complete)?, b"cleaned");
         assert!(
-            child.id().is_none(),
+            coordinator.id().is_none(),
             "the owned coordinator has been reaped"
         );
         Ok(())
