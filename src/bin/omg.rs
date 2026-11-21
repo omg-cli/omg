@@ -1485,7 +1485,9 @@ fn handle_which_command(runtime: &str) -> Result<()> {
             );
         }
         Ok(None) => {
-            anyhow::bail!("{runtime}: no version set (check .tool-versions, .nvmrc, etc.)");
+            return Err(anyhow::Error::msg(format!(
+                "{runtime}: no version set (check .tool-versions, .nvmrc, etc.)"
+            )));
         }
         Err(error) => {
             // Propagate instead of only printing so the process exits non-zero.
