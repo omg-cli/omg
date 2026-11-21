@@ -5046,6 +5046,28 @@ omarchy-pkg-drop imv mpv-mpris
         std::fs::write(root.join("complete"), b"cleaned").expect("output cleanup completed");
     }
 
+    fn terminal_read_failure_coordinator(
+        shell: impl AsRef<std::ffi::OsStr>,
+        ready: &std::path::Path,
+        release: &std::path::Path,
+        complete: &std::path::Path,
+    ) -> Command {
+        let mut coordinator = Command::new(shell);
+        coordinator.args([
+            "-c",
+            "trap '' TERM; while test ! -f \"$1.armed\"; do sleep 0.01; done; printf ready > \"$1\"; while test ! -f \"$2\"; do sleep 0.01; done; printf cleaned > \"$3\"",
+            "fixture",
+        ]);
+        coordinator.args([ready.as_os_str(), release.as_os_str(), complete.as_os_str()]);
+        coordinator
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .kill_on_drop(true);
+        coordinator
+    }
+
     #[tokio::test]
     async fn terminal_read_failure_reaps_owned_coordinator_before_returning() -> Result<()> {
         use std::os::fd::OwnedFd;
@@ -5067,11 +5089,8 @@ omarchy-pkg-drop imv mpv-mpris
         let release = owner.path().join("release");
         let complete = owner.path().join("complete");
         let shell = crate::core::privilege::root_controlled_program_path("sh")?;
-        let mut coordinator = Command::new(shell)
-            .args(["-c", "trap '' TERM; while test ! -f \"$1.armed\"; do sleep 0.01; done; printf ready > \"$1\"; while test ! -f \"$2\"; do sleep 0.01; done; printf cleaned > \"$3\"", "fixture"])
-            .arg(&ready).arg(&release).arg(&complete)
-            .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
-            .process_group(0).kill_on_drop(true).spawn()?;
+        let mut coordinator =
+            terminal_read_failure_coordinator(shell, &ready, &release, &complete).spawn()?;
         tokio::time::timeout(Duration::from_secs(3), async {
             let mut released_child = false;
             while !ready.is_file() {
