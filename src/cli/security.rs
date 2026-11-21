@@ -6,7 +6,7 @@
 use anyhow::{Context, Result};
 use owo_colors::OwoColorize;
 
-fn write_private_export(path: &std::path::Path, contents: impl AsRef<[u8]>) -> Result<()> {
+fn write_private_export(path: &std::path::Path, contents: &[u8]) -> Result<()> {
     // Security exports must never inherit a previously permissive mode from
     // the file they replace - force owner-only (0o600) through the replace.
     crate::core::safe_ops::atomic_write_file_sync_private(path, contents)
@@ -41,7 +41,9 @@ fn read_audit_entries(
     }
 }
 
-use crate::cli::{AuditCommands, CliContext, LocalCommandRunner, style, ui};
+use crate::cli::{
+    AuditCommands, CliContext, LocalCommandRunner, SlsaCertificateIdentity, style, ui,
+};
 #[cfg(unix)]
 use crate::core::client::DaemonClient;
 use crate::core::security::{AuditLogger, AuditSeverity, SbomGenerator, SecurityPolicy};
@@ -416,10 +418,10 @@ pub fn view_audit_log(
                 }
                 writer.flush()?;
             }
-            write_private_export(&path, csv)?;
+            write_private_export(&path, &csv)?;
         } else {
             let json = serde_json::to_vec_pretty(&entries)?;
-            write_private_export(&path, json)?;
+            write_private_export(&path, &json)?;
         }
         println!(
             "{} Export successful",
@@ -757,13 +759,16 @@ pub fn scan_secrets(path: Option<String>, _ctx: &CliContext) -> Result<()> {
     enforce_secret_scan_result(&result)
 }
 
-/// Verify a Sigstore artifact signature against the required signer identity.
+/// Verify a Sigstore artifact signature against the required identity and issuer.
 pub async fn check_slsa(
     package: &str,
-    certificate_identity: &str,
+    certificate_identity: &SlsaCertificateIdentity,
     _ctx: &CliContext,
 ) -> Result<()> {
     use crate::core::security::SlsaVerifier;
+
+    let certificate_oidc_issuer = certificate_identity.oidc_issuer.as_str();
+    let certificate_identity = certificate_identity.identity.as_str();
 
     // SECURITY: Validate path
     crate::core::security::validate_relative_path(package)?;
@@ -781,13 +786,18 @@ pub async fn check_slsa(
 
     let verifier = SlsaVerifier::new();
     let result = verifier
-        .verify_provenance(path, None::<&std::path::Path>, Some(certificate_identity))
+        .verify_provenance(
+            path,
+            None::<&std::path::Path>,
+            certificate_identity,
+            certificate_oidc_issuer,
+        )
         .await?;
 
     require_artifact_signature_verified(result.verified, result.error.as_deref())?;
 
     println!(
-        "{} Artifact signature verified against the required signer identity",
+        "{} Artifact signature verified against the required signer identity and OIDC issuer",
         style::maybe_color("✓", |t| t.green().to_string())
     );
     println!(
@@ -1100,7 +1110,7 @@ pub fn scan_licenses(
         let path = std::path::PathBuf::from(&export_path);
 
         let report = serialize_license_rows(format, &filtered_packages)?;
-        write_private_export(&path, report)?;
+        write_private_export(&path, &report)?;
 
         println!(
             "{} Exported {} packages to {}",
@@ -1511,7 +1521,7 @@ pub async fn export_compliance(
             let entries = read_audit_entries(&logger, 1000, None)?;
             let json = serde_json::to_string_pretty(&entries)?;
             let log_path = output_dir.join(format!("audit-log-{timestamp}.json"));
-            write_private_export(&log_path, json)?;
+            write_private_export(&log_path, json.as_bytes())?;
             println!(
                 "  {} Audit log: {}",
                 style::success("✓"),
@@ -1524,7 +1534,7 @@ pub async fn export_compliance(
                 let scan = security_audit_result().await?;
                 let json = serde_json::to_string_pretty(&scan)?;
                 let scan_path = output_dir.join(format!("vulnerability-scan-{timestamp}.json"));
-                write_private_export(&scan_path, json)?;
+                write_private_export(&scan_path, json.as_bytes())?;
                 println!(
                     "  {} Vulnerability scan: {}",
                     style::success("✓"),
@@ -1558,10 +1568,8 @@ pub async fn export_compliance(
                     .context("Failed to load security policy")?,
             });
             let config_path = output_dir.join(format!("config-snapshot-{timestamp}.json"));
-            write_private_export(
-                &config_path,
-                serde_json::to_string_pretty(&config_snapshot)?,
-            )?;
+            let config_json = serde_json::to_string_pretty(&config_snapshot)?;
+            write_private_export(&config_path, config_json.as_bytes())?;
             println!(
                 "  {} Configuration: {}",
                 style::success("✓"),

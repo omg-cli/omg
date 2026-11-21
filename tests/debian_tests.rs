@@ -2177,14 +2177,20 @@ mod runtime_management {
 
     #[test]
     fn test_which_node() {
-        let result = run_omg(&["which", "node"]);
+        let project = TestProject::new();
+        project.with_tool_versions(&[("node", "20.10.0")]);
+        let result = project.run(&["which", "node"]);
         result.assert_success();
+        assert_eq!(result.stdout.trim(), "node 20.10.0");
     }
 
     #[test]
     fn test_which_python() {
-        let result = run_omg(&["which", "python"]);
+        let project = TestProject::new();
+        project.with_tool_versions(&[("python", "3.11.0")]);
+        let result = project.run(&["which", "python"]);
         result.assert_success();
+        assert_eq!(result.stdout.trim(), "python 3.11.0");
     }
 
     #[test]

@@ -42,6 +42,8 @@ pub enum RekorError {
 pub enum SlsaError {
     #[error("An exact --certificate-identity is required to establish signer trust")]
     IdentityRequired,
+    #[error("An exact --certificate-oidc-issuer is required to establish signer trust")]
+    IssuerRequired,
     #[error(transparent)]
     Rekor(#[from] RekorError),
     #[error("Failed to query Rekor")]
@@ -768,6 +770,39 @@ fn fulcio_signer_identity(leaf: &x509_parser::certificate::X509Certificate<'_>) 
     None
 }
 
+#[derive(Clone, Copy)]
+struct ExpectedSigner<'a> {
+    identity: &'a str,
+    issuer: &'a str,
+}
+
+fn fulcio_oidc_issuer<'a>(leaf: &x509_parser::certificate::X509Certificate<'a>) -> Option<&'a str> {
+    use x509_parser::{asn1_rs::oid, der_parser::der::parse_der_utf8string};
+
+    // The verified chain has already required unique extensions.
+    let mut legacy = None;
+    let mut current = None;
+    for extension in leaf.extensions() {
+        if extension.oid == oid!(1.3.6.1.4.1.57264.1.8) {
+            let (rest, value) = parse_der_utf8string(extension.value).ok()?;
+            if !rest.is_empty() {
+                return None;
+            }
+            current = Some(value.as_str().ok()?);
+        } else if extension.oid == oid!(1.3.6.1.4.1.57264.1.1) {
+            legacy = Some(std::str::from_utf8(extension.value).ok()?);
+        }
+    }
+    if let (Some(current), Some(legacy)) = (current, legacy)
+        && current != legacy
+    {
+        return None;
+    }
+    current
+        .or(legacy)
+        .filter(|issuer| !issuer.trim().is_empty())
+}
+
 impl SlsaVerifier {
     #[must_use]
     pub fn new() -> Self {
@@ -830,22 +865,17 @@ impl SlsaVerifier {
         Ok(parse_rekor_entry(uuid, entry_map)?)
     }
 
-    /// Attempt REAL cryptographic verification of a Rekor `hashedrekord`
-    /// entry against an artifact digest.
-    ///
-    /// Steps: decode the base64 entry body, require kind `hashedrekord`,
-    /// require its recorded SHA-256 to match the artifact digest, then verify
-    /// the embedded signature over that digest with the embedded public key
-    /// (RSA PKCS#1 v1.5 with SHA-256, or P-256 ECDSA with SHA-256 — the two
-    /// key types Sigstore issues). Other entry kinds report honestly as
-    /// unverified rather than pretending.
+    /// Return the required signer when a Rekor `hashedrekord` matches the
+    /// artifact digest, chains to a trusted Fulcio root, matches the expected
+    /// identity and issuer, and carries a valid artifact signature.
     fn verify_rekor_entry(
         entry: &RekorEntry,
         artifact_hash: &str,
         artifact_bytes: &[u8],
         fulcio_roots: &[&str],
         fulcio_intermediate: &str,
-    ) -> Result<(bool, Option<String>), SlsaError> {
+        expected: ExpectedSigner<'_>,
+    ) -> Result<Option<String>, SlsaError> {
         use base64::Engine as _;
 
         let body_json = base64::engine::general_purpose::STANDARD
@@ -856,7 +886,7 @@ impl SlsaVerifier {
 
         if body.get("kind").and_then(serde_json::Value::as_str) != Some("hashedrekord") {
             // intoto/other kinds are not verified by this engine yet.
-            return Ok((false, None));
+            return Ok(None);
         }
 
         let spec = body
@@ -870,7 +900,7 @@ impl SlsaVerifier {
             })?;
         // The log must be attesting THIS artifact, byte-for-byte.
         if !recorded_hash.eq_ignore_ascii_case(artifact_hash) {
-            return Ok((false, None));
+            return Ok(None);
         }
 
         let signature_b64 = spec
@@ -907,19 +937,23 @@ impl SlsaVerifier {
                 fulcio_roots,
                 fulcio_intermediate,
             ) else {
-                return Ok((false, None));
+                return Ok(None);
             };
-            // The artifact signature must verify with the CERTIFICATE's key.
-            let spki = {
-                use x509_parser::prelude::*;
-                let (_, cert) =
-                    X509Certificate::from_der(&der).map_err(|_| SlsaError::SignatureMalformed)?;
-                cert.public_key().raw.to_vec()
-            };
-            return Ok((
-                Self::verify_digest_with_bytes(&spki, artifact_hash, artifact_bytes, &signature),
-                Some(signer),
-            ));
+            use x509_parser::prelude::*;
+            let (_, certificate) =
+                X509Certificate::from_der(&der).map_err(|_| SlsaError::SignatureMalformed)?;
+            if signer != expected.identity
+                || fulcio_oidc_issuer(&certificate) != Some(expected.issuer)
+            {
+                return Ok(None);
+            }
+            return Ok(Self::verify_digest_with_bytes(
+                certificate.public_key().raw,
+                artifact_hash,
+                artifact_bytes,
+                &signature,
+            )
+            .then_some(signer));
         }
 
         // Plain public-key path. Rekor accepts entries from anyone, so a
@@ -929,15 +963,53 @@ impl SlsaVerifier {
         // out-of-band, which this API does not accept. Never report verified
         // here — an attacker controlling distribution can produce one for any
         // artifact bytes they ship.
-        Self::verify_digest_with_spki_from_pem(pem, &signature, artifact_hash, artifact_bytes)
-            .map(|(integrity_ok, _signer)| {
-                if integrity_ok {
-                    tracing::info!(
-                        "Rekor entry is a plain public-key self-attestation;                          treated as unverified (no signer identity)"
-                    );
-                }
-                (false, None)
-            })
+        let (integrity_ok, _signer) =
+            Self::verify_digest_with_spki_from_pem(pem, &signature, artifact_hash, artifact_bytes)?;
+        if integrity_ok {
+            tracing::info!(
+                "Rekor entry is a plain public-key self-attestation;                          treated as unverified (no signer identity)"
+            );
+        }
+        Ok(None)
+    }
+
+    fn classify_rekor_entries(
+        entries: &[RekorEntry],
+        artifact_hash: &str,
+        artifact_bytes: &[u8],
+        expected: ExpectedSigner<'_>,
+        fulcio_roots: &[&str],
+        fulcio_intermediate: &str,
+    ) -> Option<VerificationResult> {
+        for entry in entries {
+            let Ok(Some(signer)) = Self::verify_rekor_entry(
+                entry,
+                artifact_hash,
+                artifact_bytes,
+                fulcio_roots,
+                fulcio_intermediate,
+                expected,
+            ) else {
+                continue;
+            };
+            return Some(VerificationResult {
+                verified: true,
+                // A hashedrekord plus a valid SET proves the artifact
+                // signature and signed entry data, but this path does
+                // not verify a Merkle inclusion proof or build provenance.
+                slsa_level: SlsaLevel::None,
+                transparency_log_entry: Some(entry.uuid.clone()),
+                builder_id: Some(signer),
+                build_timestamp: None,
+                error: None,
+            });
+        }
+
+        entries.first().map(|entry| {
+            let mut result = classify_slsa_evidence(SlsaEvidence::RekorIndexHit);
+            result.transparency_log_entry = Some(entry.uuid.clone());
+            result
+        })
     }
 
     /// Verify `signature` over the SHA-256 digest hex over the artifact,
@@ -1011,23 +1083,29 @@ impl SlsaVerifier {
         false
     }
 
-    /// Verify SLSA provenance for a package
-    /// Gather provenance evidence for an artifact, then cryptographically
-    /// verify it when possible.
+    /// Check an artifact signature against an independently trusted signer.
     ///
     /// Queries the Rekor transparency log and verifies each `hashedrekord`
     /// entry's embedded signature over the artifact digest (RSA or P-256).
-    /// A local provenance file is parsed for context but unsigned local JSON
-    /// must not treat an `Ok` result as a verified attestation.
+    /// Local provenance files contribute descriptive evidence. Callers use
+    /// `VerificationResult::verified` to require a trusted signature.
     pub async fn verify_provenance(
         &self,
         blob_path: impl AsRef<Path>,
         provenance_path: Option<impl AsRef<Path>>,
-        required_identity: Option<&str>,
+        required_identity: &str,
+        required_issuer: &str,
     ) -> Result<VerificationResult, SlsaError> {
-        if required_identity.is_none_or(|identity| identity.trim().is_empty()) {
+        if required_identity.trim().is_empty() {
             return Err(SlsaError::IdentityRequired);
         }
+        if required_issuer.trim().is_empty() {
+            return Err(SlsaError::IssuerRequired);
+        }
+        let expected = ExpectedSigner {
+            identity: required_identity,
+            issuer: required_issuer,
+        };
         // Calculate artifact hash, keeping the bytes around: P-256 ECDSA
         // verification hashes the message itself, so the artifact content
         // must be available at verification time.
@@ -1044,47 +1122,14 @@ impl SlsaVerifier {
         // Check Rekor for transparency log entries, then attempt REAL
         // cryptographic verification of the best candidate.
         let rekor_entries = self.query_rekor(&artifact_hash).await?;
-
-        for entry in &rekor_entries {
-            let Ok((verified, signer)) = Self::verify_rekor_entry(
-                entry,
-                &artifact_hash,
-                &artifact_bytes,
-                &[FULCIO_ROOT_PEM, FULCIO_INTERMEDIATE_PEM],
-                FULCIO_INTERMEDIATE_PEM,
-            ) else {
-                continue;
-            };
-            // Trust POLICY (audit sec2 F-05): a signature from any Sigstore
-            // identity is cryptographically valid but only meaningful when it
-            // matches the caller's expected signer. When a required identity
-            // is supplied, a mismatch demotes the result to unverified.
-            if verified && required_identity.is_some() && signer.as_deref() != required_identity {
-                continue;
-            }
-            if verified {
-                // Signature over this exact artifact digest verified with
-                // the key embedded in the transparency-log entry. When the
-                // key came from a Fulcio certificate chaining to the embedded
-                // Sigstore roots, `signer` is the OIDC identity bound by the
-                // CA; plain-key entries verify integrity only.
-                return Ok(VerificationResult {
-                    verified: true,
-                    // A hashedrekord plus a valid SET proves the artifact
-                    // signature and signed entry data, but this path does
-                    // not verify a Merkle inclusion proof or build provenance.
-                    slsa_level: SlsaLevel::None,
-                    transparency_log_entry: Some(entry.uuid.clone()),
-                    builder_id: signer,
-                    build_timestamp: None,
-                    error: None,
-                });
-            }
-        }
-
-        if let Some(entry) = rekor_entries.first() {
-            let mut result = classify_slsa_evidence(SlsaEvidence::RekorIndexHit);
-            result.transparency_log_entry = Some(entry.uuid.clone());
+        if let Some(result) = Self::classify_rekor_entries(
+            &rekor_entries,
+            &artifact_hash,
+            &artifact_bytes,
+            expected,
+            &[FULCIO_ROOT_PEM, FULCIO_INTERMEDIATE_PEM],
+            FULCIO_INTERMEDIATE_PEM,
+        ) {
             return Ok(result);
         }
 
@@ -1147,9 +1192,83 @@ impl SlsaVerifier {
 mod tests {
 
     use super::*;
-
     use std::collections::HashMap;
     use tempfile::NamedTempFile;
+
+    const EXPECTED_TEST_SIGNER: ExpectedSigner<'static> = ExpectedSigner {
+        identity: "signer@example.invalid",
+        issuer: "https://issuer.example.invalid",
+    };
+
+    fn verify_test_rekor_entry(
+        entry: &RekorEntry,
+        artifact_hash: &str,
+        artifact_bytes: &[u8],
+    ) -> Result<Option<String>, SlsaError> {
+        verify_test_rekor_entry_with_roots(
+            entry,
+            artifact_hash,
+            artifact_bytes,
+            EXPECTED_TEST_SIGNER,
+            &[],
+        )
+    }
+
+    fn verify_test_rekor_entry_with_roots(
+        entry: &RekorEntry,
+        artifact_hash: &str,
+        artifact_bytes: &[u8],
+        expected: ExpectedSigner<'_>,
+        fulcio_roots: &[&str],
+    ) -> Result<Option<String>, SlsaError> {
+        SlsaVerifier::verify_rekor_entry(
+            entry,
+            artifact_hash,
+            artifact_bytes,
+            fulcio_roots,
+            "",
+            expected,
+        )
+    }
+
+    struct TestRekorVerifier<'a> {
+        fulcio_roots: &'a [&'a str],
+    }
+
+    impl TestRekorVerifier<'_> {
+        fn verify(
+            &self,
+            entry: &RekorEntry,
+            artifact_hash: &str,
+            artifact_bytes: &[u8],
+            expected: ExpectedSigner<'_>,
+        ) -> Result<Option<String>, SlsaError> {
+            verify_test_rekor_entry_with_roots(
+                entry,
+                artifact_hash,
+                artifact_bytes,
+                expected,
+                self.fulcio_roots,
+            )
+        }
+
+        fn classify_entries(
+            &self,
+            entries: &[RekorEntry],
+            artifact_hash: &str,
+            artifact_bytes: &[u8],
+            expected: ExpectedSigner<'_>,
+        ) -> Option<VerificationResult> {
+            SlsaVerifier::classify_rekor_entries(
+                entries,
+                artifact_hash,
+                artifact_bytes,
+                expected,
+                self.fulcio_roots,
+                "",
+            )
+        }
+    }
 
     #[tokio::test]
     async fn rekor_index_applies_body_limit_before_json_and_accepts_small_results() {
@@ -1541,16 +1660,10 @@ mod tests {
                 integrated_time: u64::try_from(jiff::Timestamp::now().as_second()).unwrap(),
                 body: make_body(&pem, sig),
             };
-            let (verified, _) = SlsaVerifier::verify_rekor_entry(
-                &entry,
-                &artifact_hash,
-                artifact_bytes.as_slice(),
-                &[],
-                "",
-            )
-            .unwrap();
+            let signer =
+                verify_test_rekor_entry(&entry, &artifact_hash, artifact_bytes.as_slice()).unwrap();
             assert!(
-                !verified,
+                signer.is_none(),
                 "plain-key entries are self-attestations and never verify"
             );
             assert_eq!(
@@ -1572,10 +1685,8 @@ mod tests {
             integrated_time: u64::try_from(jiff::Timestamp::now().as_second()).unwrap(),
             body: make_body(&pem, &good_sig.to_bytes()),
         };
-        let (verified, _) =
-            SlsaVerifier::verify_rekor_entry(&entry, &"b".repeat(64), &[0x62u8; 32], &[], "")
-                .unwrap();
-        assert!(!verified, "recorded-hash mismatch must not verify");
+        let signer = verify_test_rekor_entry(&entry, &"b".repeat(64), &[0x62u8; 32]).unwrap();
+        assert!(signer.is_none(), "recorded-hash mismatch must not verify");
 
         // --- P-256 roundtrip ---
         let p256_signing = p256::ecdsa::SigningKey::from_slice(&[7u8; 32]).unwrap();
@@ -1598,15 +1709,8 @@ mod tests {
             body: make_body(&p256_pem, &ec_der),
         };
         // Entry-level: plain-key is never "verified" (self-attestation).
-        let (entry_verified, signer) = SlsaVerifier::verify_rekor_entry(
-            &entry,
-            &artifact_hash,
-            artifact_bytes.as_slice(),
-            &[],
-            "",
-        )
-        .unwrap();
-        assert!(!entry_verified);
+        let signer =
+            verify_test_rekor_entry(&entry, &artifact_hash, artifact_bytes.as_slice()).unwrap();
         assert!(signer.is_none());
         let spki_der = {
             use p256::pkcs8::DecodePublicKey as _;
@@ -1647,16 +1751,12 @@ mod tests {
             integrated_time: u64::try_from(jiff::Timestamp::now().as_second()).unwrap(),
             body: intoto_body,
         };
-        let (verified, signer) = SlsaVerifier::verify_rekor_entry(
-            &entry,
-            &artifact_hash,
-            artifact_bytes.as_slice(),
-            &[],
-            "",
-        )
-        .unwrap();
-        assert!(!verified, "unsupported kinds must not claim verification");
-        assert!(signer.is_none());
+        let signer =
+            verify_test_rekor_entry(&entry, &artifact_hash, artifact_bytes.as_slice()).unwrap();
+        assert!(
+            signer.is_none(),
+            "unsupported kinds must not claim verification"
+        );
     }
     #[test]
     fn fulcio_chain_rejects_expired_intermediate_at_rekor_time() {
@@ -1730,9 +1830,56 @@ mod tests {
     }
 
     #[test]
+    fn fulcio_issuer_supports_both_encodings_and_refuses_conflicting_metadata() {
+        use rcgen::{CertificateParams, CustomExtension, KeyPair};
+        use x509_parser::prelude::{FromDer, X509Certificate};
+
+        const ISSUER: &str = "https://issuer.example.invalid";
+        let mut der = vec![0x0c, u8::try_from(ISSUER.len()).unwrap()];
+        der.extend_from_slice(ISSUER.as_bytes());
+        let mut trailing = der.clone();
+        trailing.push(0);
+
+        let cases = [
+            (None, None, None),
+            (Some(b"".as_slice()), None, None),
+            (Some(ISSUER.as_bytes()), None, Some(ISSUER)),
+            (None, Some(der.as_slice()), Some(ISSUER)),
+            (Some(ISSUER.as_bytes()), Some(der.as_slice()), Some(ISSUER)),
+            (
+                Some(b"https://other.example.invalid".as_slice()),
+                Some(der.as_slice()),
+                None,
+            ),
+            (Some(ISSUER.as_bytes()), Some(b"\x16\x01x".as_slice()), None),
+            (Some(ISSUER.as_bytes()), Some(trailing.as_slice()), None),
+        ];
+        let key = KeyPair::generate().unwrap();
+        for (legacy, current, expected) in cases {
+            let mut params = CertificateParams::new(Vec::new()).unwrap();
+            for (suffix, value) in [(1, legacy), (8, current)] {
+                if let Some(value) = value {
+                    params
+                        .custom_extensions
+                        .push(CustomExtension::from_oid_content(
+                            &[1, 3, 6, 1, 4, 1, 57264, 1, suffix],
+                            value.to_vec(),
+                        ));
+                }
+            }
+            let certificate = params.self_signed(&key).unwrap();
+            let (_, certificate) = X509Certificate::from_der(certificate.der()).unwrap();
+            assert_eq!(fulcio_oidc_issuer(&certificate), expected);
+        }
+    }
+
+    #[test]
     fn fulcio_certificate_chain_binds_signer_identity() {
         use base64::Engine as _;
         use rcgen::{CertificateParams, DnType, ExtendedKeyUsagePurpose, KeyPair};
+
+        const IDENTITY: &str = "https://accounts.example.com/users/alice";
+        const ISSUER: &str = "https://issuer.example.invalid";
 
         // Test CA standing in for the Sigstore root.
         let ca_key = KeyPair::generate().unwrap();
@@ -1760,20 +1907,23 @@ mod tests {
         // CertificateParams::new default would encode it as a DNS SAN, which
         // real Fulcio identities never are).
         let leaf_key = KeyPair::generate().unwrap();
-        let mut leaf_params =
-            CertificateParams::new(vec!["https://accounts.example.com/users/alice".to_string()])
-                .unwrap();
-        leaf_params.subject_alt_names = vec![rcgen::SanType::URI(
-            "https://accounts.example.com/users/alice"
-                .try_into()
-                .expect("ia5 uri"),
-        )];
+        let mut leaf_params = CertificateParams::new(vec![IDENTITY.to_owned()]).unwrap();
+        leaf_params.subject_alt_names =
+            vec![rcgen::SanType::URI(IDENTITY.try_into().expect("ia5 uri"))];
         leaf_params
             .distinguished_name
             .push(DnType::CommonName, "alice");
         // Fulcio profile: non-CA leaf with codeSigning EKU.
         leaf_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::CodeSigning];
         leaf_params.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
+        let mut issuer_der = vec![0x0c, u8::try_from(ISSUER.len()).unwrap()];
+        issuer_der.extend_from_slice(ISSUER.as_bytes());
+        leaf_params
+            .custom_extensions
+            .push(rcgen::CustomExtension::from_oid_content(
+                &[1, 3, 6, 1, 4, 1, 57264, 1, 8],
+                issuer_der,
+            ));
         leaf_params.serial_number = Some(rcgen::SerialNumber::from_slice(
             &[0x10, 0xd0, 0xf1].repeat(6),
         ));
@@ -1823,11 +1973,13 @@ mod tests {
         // The test CA stands in for the Sigstore Fulcio roots.
         let ca_pem = ca.pem();
         let ca_roots: Vec<&str> = vec![ca_pem.as_str()];
+        let verifier = TestRekorVerifier {
+            fulcio_roots: &ca_roots,
+        };
         let now = u64::try_from(jiff::Timestamp::now().as_second()).unwrap();
 
-        assert_eq!(
-            verify_fulcio_chain(leaf.der(), now, &ca_roots, "").as_deref(),
-            Some("https://accounts.example.com/users/alice"),
+        assert!(
+            verify_fulcio_chain(leaf.der(), now, &ca_roots, "").as_deref() == Some(IDENTITY),
             "generated certificate chain must bind identity"
         );
         assert!(
@@ -1842,31 +1994,66 @@ mod tests {
 
         // Valid chain + correct signature -> verified AND identity bound.
         let entry = make_entry(&cert_pem, good_sig.to_der().as_bytes(), now);
-        let (verified, signer) = SlsaVerifier::verify_rekor_entry(
-            &entry,
-            &artifact_hash,
-            &artifact_bytes,
-            &ca_roots,
-            "",
-        )
-        .unwrap();
-        assert!(verified, "valid chain + signature must verify");
-        assert_eq!(
-            signer.as_deref(),
-            Some("https://accounts.example.com/users/alice"),
+        let expected = |issuer| ExpectedSigner {
+            identity: IDENTITY,
+            issuer,
+        };
+        for mismatched in [
+            expected("https://other-issuer.example.invalid"),
+            ExpectedSigner {
+                identity: "other@example.invalid",
+                issuer: ISSUER,
+            },
+        ] {
+            let signer = verifier
+                .verify(&entry, &artifact_hash, &artifact_bytes, mismatched)
+                .unwrap();
+            assert!(
+                signer.is_none(),
+                "both the identity and the issuer must match"
+            );
+        }
+        let signer = verifier
+            .verify(&entry, &artifact_hash, &artifact_bytes, expected(ISSUER))
+            .unwrap();
+        assert!(
+            signer.as_deref() == Some(IDENTITY),
             "Fulcio SAN must be reported as the signer identity"
+        );
+
+        let rejected_entry = RekorEntry {
+            uuid: "rejected".into(),
+            ..make_entry(&cert_pem, bad_sig.to_der().as_bytes(), now)
+        };
+        let accepted_entry = RekorEntry {
+            uuid: "accepted".into(),
+            ..entry
+        };
+        let entries = [rejected_entry, accepted_entry];
+        let verified = verifier
+            .classify_entries(&entries, &artifact_hash, &artifact_bytes, expected(ISSUER))
+            .expect("valid trusted entry after a rejected entry");
+        assert!(verified.verified);
+        assert_eq!(verified.transparency_log_entry.as_deref(), Some("accepted"));
+        assert_eq!(verified.builder_id.as_deref(), Some(IDENTITY));
+        assert!(
+            verifier
+                .classify_entries(&[], &artifact_hash, &artifact_bytes, expected(ISSUER))
+                .is_none(),
+            "an empty Rekor response has no verification result"
         );
 
         // Wrong signature over the same valid chain -> unverified.
         let entry = make_entry(&cert_pem, bad_sig.to_der().as_bytes(), now);
-        let (verified, _) = SlsaVerifier::verify_rekor_entry(
-            &entry,
-            &artifact_hash,
-            artifact_bytes.as_slice(),
-            &ca_roots,
-            "",
-        )
-        .unwrap();
+        let signer = verifier
+            .verify(
+                &entry,
+                &artifact_hash,
+                artifact_bytes.as_slice(),
+                expected(ISSUER),
+            )
+            .unwrap();
+        let verified = signer.is_some();
         assert!(
             !verified,
             "wrong signature must not verify even on a valid chain"
@@ -1874,14 +2061,15 @@ mod tests {
 
         // Entry recorded before the certificate existed -> unverified.
         let entry = make_entry(&cert_pem, good_sig.to_der().as_bytes(), 0);
-        let (verified, signer) = SlsaVerifier::verify_rekor_entry(
-            &entry,
-            &artifact_hash,
-            artifact_bytes.as_slice(),
-            &ca_roots,
-            "",
-        )
-        .unwrap();
+        let signer = verifier
+            .verify(
+                &entry,
+                &artifact_hash,
+                artifact_bytes.as_slice(),
+                expected(ISSUER),
+            )
+            .unwrap();
+        let verified = signer.is_some();
         assert!(
             !verified && signer.is_none(),
             "certificate validity window must gate verification"
@@ -1915,6 +2103,64 @@ mod tests {
                 "verification": {"signedEntryTimestamp": entry["inclusionPromise"]["signedEntryTimestamp"]}
             }),
         )])
+    }
+
+    #[tokio::test]
+    async fn verify_provenance_keeps_a_rekor_index_hit_unverified() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("fixture listener");
+        let address = listener.local_addr().expect("fixture address");
+        let index_body = "[\"captured\"]".to_string();
+        let entry_body = serde_json::to_string(&captured_rekor_response()).unwrap();
+        let server = tokio::spawn(async move {
+            for body in [index_body, entry_body] {
+                let (mut stream, _) = listener.accept().await.expect("fixture connection");
+                let mut request = [0; 2048];
+                let bytes_read = stream.read(&mut request).await.expect("read request");
+                assert!(bytes_read > 0, "empty request");
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("fixture response");
+            }
+        });
+
+        let verifier = SlsaVerifier {
+            client: reqwest::Client::builder()
+                .no_proxy()
+                .build()
+                .expect("fixture client"),
+            rekor_url: format!("http://{address}"),
+        };
+        let mut artifact = NamedTempFile::new().unwrap();
+        use std::io::Write;
+        write!(
+            artifact,
+            "artifact not represented by the captured Rekor entry"
+        )
+        .unwrap();
+        artifact.flush().unwrap();
+
+        let result = verifier
+            .verify_provenance(
+                artifact.path(),
+                None::<&Path>,
+                "signer@example.invalid",
+                "https://issuer.example.invalid",
+            )
+            .await
+            .expect("a Rekor index hit is descriptive evidence");
+        assert!(!result.verified, "an index hit does not verify an artifact");
+        assert_eq!(result.slsa_level, SlsaLevel::None);
+        assert_eq!(result.transparency_log_entry.as_deref(), Some("captured"));
+        server.await.expect("fixture server");
     }
 
     #[test]
@@ -2624,12 +2870,33 @@ mod tests {
 mod required_signer_tests {
     #[tokio::test]
     async fn no_identity_fails_before_file_or_network_access() {
-        for identity in [None, Some(""), Some("   ")] {
-            let error = super::SlsaVerifier::default()
-                .verify_provenance("/nonexistent/artifact", None::<&str>, identity)
+        for identity in ["", "   ", "\t"] {
+            let result = super::SlsaVerifier::default()
+                .verify_provenance(
+                    "/nonexistent/artifact",
+                    None::<&str>,
+                    identity,
+                    "https://issuer.example.invalid",
+                )
+                .await;
+            assert!(matches!(result, Err(super::SlsaError::IdentityRequired)));
+        }
+    }
+
+    #[tokio::test]
+    async fn no_issuer_fails_before_file_or_network_access() {
+        let verifier = super::SlsaVerifier::default();
+        for issuer in ["", "   "] {
+            let error = verifier
+                .verify_provenance(
+                    "/nonexistent/artifact",
+                    None::<&str>,
+                    "signer@example.invalid",
+                    issuer,
+                )
                 .await
                 .unwrap_err();
-            assert!(matches!(error, super::SlsaError::IdentityRequired));
+            assert!(matches!(error, super::SlsaError::IssuerRequired));
         }
     }
 }

@@ -1075,6 +1075,28 @@ pub enum AccountCommands {
     Unlink,
 }
 
+#[derive(clap::Args, Debug)]
+#[group(skip)]
+pub struct SlsaCertificateIdentity {
+    /// Require the Fulcio certificate SAN to match this identity
+    /// (email or OIDC URI); required for a meaningful trust decision
+    #[arg(
+        id = "certificate_identity",
+        long = "certificate-identity",
+        required = true,
+        value_name = "CERTIFICATE_IDENTITY"
+    )]
+    pub identity: String,
+    /// Require the Fulcio certificate OIDC issuer to match this URI
+    #[arg(
+        id = "certificate_oidc_issuer",
+        long = "certificate-oidc-issuer",
+        required = true,
+        value_name = "CERTIFICATE_OIDC_ISSUER"
+    )]
+    pub oidc_issuer: String,
+}
+
 #[derive(Subcommand, Debug)]
 pub enum AuditCommands {
     /// Scan installed packages; optionally fail when findings are reported
@@ -1118,10 +1140,8 @@ pub enum AuditCommands {
     Slsa {
         /// Package file to verify
         package: String,
-        /// Require the Fulcio certificate SAN to match this identity
-        /// (email or OIDC URI); required for a meaningful trust decision
-        #[arg(long, required = true)]
-        certificate_identity: String,
+        #[command(flatten)]
+        certificate_identity: SlsaCertificateIdentity,
     },
     /// Scan installed package licenses (Arch backend only)
     Licenses {
@@ -1354,6 +1374,20 @@ mod tests {
     #[test]
     fn security_cli_requires_slsa_identity_and_accepts_explicit_scan_gate() {
         assert!(Cli::try_parse_from(["omg", "audit", "slsa", "artifact.tar.gz"]).is_err());
+        let error = Cli::try_parse_from([
+            "omg",
+            "audit",
+            "slsa",
+            "artifact.tar.gz",
+            "--certificate-identity",
+            "builder@example.com",
+        ])
+        .expect_err("a signer identity requires a trusted issuer");
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+        assert!(error.to_string().contains("--certificate-oidc-issuer"));
         assert!(
             Cli::try_parse_from([
                 "omg",
@@ -1361,7 +1395,9 @@ mod tests {
                 "slsa",
                 "artifact.tar.gz",
                 "--certificate-identity",
-                "builder@example.com"
+                "builder@example.com",
+                "--certificate-oidc-issuer",
+                "https://issuer.example.invalid",
             ])
             .is_ok()
         );

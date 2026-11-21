@@ -26,6 +26,22 @@ use clap::{CommandFactory, Parser};
 use common::*;
 use omg_lib::cli::Cli;
 
+#[test]
+fn slsa_cli_rejects_missing_issuer_before_rekor_query() {
+    let result = run_omg(&[
+        "audit",
+        "slsa",
+        "Cargo.toml",
+        "--certificate-identity",
+        "builder@example.invalid",
+        "--certificate-oidc-issuer",
+        "",
+    ]);
+
+    result.assert_failure();
+    result.assert_stderr_contains("--certificate-oidc-issuer");
+}
+
 // Contamination is child-local. Both repositories are disposable.
 #[test]
 fn foreign_git_environment_cannot_redirect_fixture() {
@@ -2355,6 +2371,57 @@ fn legacy_security_configuration_refuses_cli_reads_and_writes_without_rewrites()
             }
         }
     }
+}
+
+#[test]
+#[serial]
+#[cfg(feature = "arch")]
+fn soc2_compliance_export_writes_private_audit_evidence() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let project = TestProject::for_distro("arch");
+    let result = project.run(&[
+        "audit",
+        "export",
+        "--framework",
+        "soc2",
+        "--period",
+        "2024-Q4",
+        "--output",
+        "audit-evidence-soc2",
+    ]);
+    result.assert_success();
+
+    let directory = project.path().join("audit-evidence-soc2");
+    let files = std::fs::read_dir(&directory)
+        .expect("SOC 2 evidence directory")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("SOC 2 evidence files");
+    let audit_log = files
+        .iter()
+        .find(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("audit-log-")
+        })
+        .expect("SOC 2 audit log evidence");
+    assert!(audit_log.file_type().expect("audit log type").is_file());
+    assert_eq!(
+        audit_log
+            .metadata()
+            .expect("audit log metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600,
+        "audit evidence must be private"
+    );
+    let contents: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(audit_log.path()).expect("read SOC 2 audit evidence"),
+    )
+    .expect("valid SOC 2 audit log JSON");
+    assert!(contents.is_array());
 }
 
 #[test]

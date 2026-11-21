@@ -62,8 +62,8 @@ pub use args::{
     AuditCommands, CiCommands, Cli, Commands, ComplianceFramework, ConfigCommands,
     ContainerCommands, EnterpriseCommands, EnterprisePolicyCommands, EnterpriseReportType,
     EnvCommands, FleetCommands, GoldenPathCommands, HooksCommands, MigrateCommands,
-    PrivacyCommands, ShellKind, SnapshotCommands, TeamCommands, TeamRoleCommands, ToolCommands,
-    TransactionTypeFilter, WorkspaceCommands,
+    PrivacyCommands, ShellKind, SlsaCertificateIdentity, SnapshotCommands, TeamCommands,
+    TeamRoleCommands, ToolCommands, TransactionTypeFilter, WorkspaceCommands,
 };
 
 /// Parse an API timestamp string into Unix seconds.

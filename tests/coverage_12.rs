@@ -766,13 +766,13 @@ fn dockerfile_unknown_runtime_falls_back_per_base_image_family() {
 
 #[test]
 fn dockerfile_truly_unknown_base_image_emits_manual_install_warning() {
-    let df = dockerfile_for("distroless:latest", &[("htop", "system")]);
+    let df = dockerfile_for("distroless:latest", &[("htop", "latest")]);
     assert!(
         df.contains("# WARNING: Unknown base image 'distroless:latest'"),
         "unrecognized base must warn explicitly, got:\n{df}"
     );
     assert!(df.contains(
-        "# Please manually install htop system using your distribution's package manager"
+        "# Please manually install htop latest using your distribution's package manager"
     ));
     assert!(df.contains(
         "# Supported base images: ubuntu, debian, arch, alpine, fedora, rhel, centos, opensuse"
@@ -781,6 +781,7 @@ fn dockerfile_truly_unknown_base_image_emits_manual_install_warning() {
         !df.contains("install -y htop"),
         "no package-manager line may be fabricated for an unknown base"
     );
+    assert_runtime_request_refused("distroless:latest", "htop", "system");
     assert_runtime_request_refused("distroless:latest", "htop", "1.0");
 }
 

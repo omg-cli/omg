@@ -16,6 +16,8 @@ fn slsa_check_names_a_missing_file() {
         "slsa",
         "--certificate-identity",
         "release@example.invalid",
+        "--certificate-oidc-issuer",
+        "https://issuer.example.invalid",
         "ghost.bin",
     ]);
     result.assert_failure();
@@ -42,6 +44,8 @@ fn slsa_check_rejects_unreadable_artifact_before_network() {
         "slsa",
         "--certificate-identity",
         "release@example.invalid",
+        "--certificate-oidc-issuer",
+        "https://issuer.example.invalid",
         "artifact.bin",
     ]);
     result.assert_failure();
@@ -84,6 +88,8 @@ fn forged_self_asserted_account_does_not_paywall_slsa() {
         "slsa",
         "--certificate-identity",
         "release@example.invalid",
+        "--certificate-oidc-issuer",
+        "https://issuer.example.invalid",
         "artifact.bin",
     ]);
     result.assert_failure();
@@ -103,22 +109,20 @@ fn forged_self_asserted_account_does_not_paywall_slsa() {
     );
 }
 
-/// Contract: `--certificate-identity` is part of the CLI contract.
 #[test]
-fn certificate_identity_flag_is_accepted() {
+fn certificate_signer_flags_reach_artifact_validation() {
     let project = TestProject::new();
     let result = project.run(&[
         "audit",
         "slsa",
         "artifact.bin",
         "--certificate-identity",
-        "release@example.com",
+        "release@example.invalid",
+        "--certificate-oidc-issuer",
+        "https://issuer.example.invalid",
     ]);
-    let out = result.combined_output();
-    assert!(
-        !out.contains("unexpected argument") && !out.contains("Unrecognized command"),
-        "--certificate-identity must be a real CLI flag, got clap rejection:\n{out}"
-    );
+    result.assert_failure();
+    result.assert_stderr_contains("File not found: artifact.bin");
 }
 
 /// Contract: an empty-inventory `audit fix` needs neither daemon nor paid tier.

@@ -94,7 +94,7 @@ command unless the parser disables a version flag for that command.
 | `omg privacy` | `status`, `opt-out`, and `opt-in`; `export` accepts `--output`/`-o`. |
 | `omg env capture` / `check` | No additional options. `share` accepts `--description`/`-d` and `--public`; `sync <url-or-id>` accepts the Gist URL or ID. |
 | `omg audit scan` / `sbom` | `scan --fail-on-findings` fails when findings exist. `sbom` accepts `--output`/`-o` and `--inventory-only`; the latter skips advisory matching and marks it as not performed. `secrets` accepts `--path`/`-p`. `log` accepts `--limit`/`-l`, `--severity`/`-s`, and `--export`/`-e`. |
-| `omg audit slsa <package>` | `--certificate-identity` is required and must match the Fulcio certificate SAN. The command verifies a supported artifact signature, not SLSA build provenance. |
+| `omg audit slsa <package>` | Verify a supported artifact signature against both the trusted Fulcio certificate identity and OIDC issuer. |
 | `omg audit licenses` | Arch only. `--format`/`-f` (`table`, `json`, `csv`), `--export`/`-e`, `--filter`, and `--check-policy`; the policy check covers the full inventory and fails on violations. |
 | `omg audit fix` | `--dry-run`, `--yes`/`-y`, and `--min-severity` (`low`, `medium`, `high`, `critical`). |
 | `omg audit export` | `--framework`/`-f` (`soc2`, `iso27001`, `fedramp`, `hipaa`, `pci-dss`), `--period`/`-p`, and `--output`/`-o`. |
@@ -714,6 +714,7 @@ omg list python --available
 ### omg which
 
 Show which version of a runtime would be used.
+If no version is selected, the command writes a diagnostic to stderr and exits with status `1`.
 
 ```bash
 omg which <runtime>
@@ -927,7 +928,7 @@ omg audit [SUBCOMMAND]
 | `log` | View audit log entries |
 | `verify` | Check local hash-chain consistency, not authenticity or completeness |
 | `policy` | Show security policy status |
-| `slsa <pkg>` | Check a supported Sigstore artifact signature against a required `--certificate-identity`; no SLSA build level is established |
+| `slsa <pkg>` | Check a supported Sigstore artifact signature with `--certificate-identity` and `--certificate-oidc-issuer`. |
 | `licenses` | Report installed Arch package licenses; `--check-policy` fails on configured allowlist violations |
 | `fix` | Upgrade vulnerable Arch packages when updates are available; review the dry run |
 | `export` | Export SOC 2 evidence on a supported backend; other accepted framework labels are unimplemented |
@@ -978,8 +979,10 @@ omg audit verify
 # Show policy status
 omg audit policy
 
-# Check an artifact against an independently trusted signer identity
-omg audit slsa ./package.pkg.tar.zst --certificate-identity "$EXPECTED_SIGNER_IDENTITY"
+# Check an artifact against the trusted signer identity and issuer
+omg audit slsa ./package.pkg.tar.zst \
+  --certificate-identity "$EXPECTED_SIGNER_IDENTITY" \
+  --certificate-oidc-issuer "$EXPECTED_SIGNER_ISSUER"
 ```
 
 ---

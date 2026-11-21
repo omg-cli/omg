@@ -34,6 +34,7 @@ pub(crate) fn confirm_security_review(
         prompt.len() <= 64 * 1024,
         "Security acknowledgement display exceeds limit"
     );
+    let _quiesce = crate::cli::modern_ui::quiesce_terminal();
     let deadline = std::time::Instant::now() + std::time::Duration::from_mins(1);
     read_security_review(&tty, &prompt, digest, deadline, check_cancelled)
 }
@@ -1423,6 +1424,15 @@ mod tests {
             ]
             .contains(&case.as_str())
         );
+        let progress = std::env::var_os("OMG_TERMINAL_REVIEW_PROGRESS").map(|_| {
+            crate::cli::modern_ui::configure_output(0, false);
+            let bar =
+                crate::cli::modern_ui::register_spinner(indicatif::ProgressBar::new_spinner());
+            bar.set_message("fixture transaction progress");
+            bar.enable_steady_tick(std::time::Duration::from_millis(25));
+            bar.tick();
+            bar
+        });
         let result = super::confirm_security_review(
             "fixture-runtime 1.2.3 has CVE-2021-23337\nhttps://www.cve.org/CVERecord?id=CVE-2021-23337",
             &"a".repeat(64),
@@ -1432,6 +1442,9 @@ mod tests {
                 Ok(())
             },
         );
+        if let Some(bar) = progress {
+            bar.finish_and_clear();
+        }
         assert_eq!(result.is_ok(), case == "accept", "{result:?}");
         if case == "no-tty" {
             let error = result.unwrap_err().to_string();

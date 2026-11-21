@@ -854,6 +854,7 @@ enum NativeMigration {
     TrayMenuDependency,
     OmnibookAudio,
     MediaViewer,
+    SkipQualcommHardware,
 }
 
 #[derive(Debug)]
@@ -889,6 +890,18 @@ fn read_migration(path: &Path) -> Result<String> {
 fn migration_digest(contents: &str) -> [u8; 32] {
     use sha2::{Digest, Sha256};
     Sha256::digest(contents.as_bytes()).into()
+}
+
+fn qualcomm_migration_for_machine(
+    machine: &std::ffi::OsStr,
+    path: &Path,
+) -> Result<NativeMigration> {
+    anyhow::ensure!(
+        machine == "x86_64",
+        "Omarchy hardware migration {} requires a native ARM equivalent",
+        path.display()
+    );
+    Ok(NativeMigration::SkipQualcommHardware)
 }
 
 fn pending_migrations(migrations: &Path, state: &Path) -> Result<Vec<PendingMigration>> {
@@ -927,6 +940,22 @@ fn pending_migrations(migrations: &Path, state: &Path) -> Result<Vec<PendingMigr
                 Some("1794774234.sh"),
                 "2e4a9686547c5615eceb9c23cb3b079df491d000078da10b7d995ea1caf9a954",
             ) => Some(NativeMigration::MediaViewer),
+            (
+                Some("1794909082.sh"),
+                "61102765f4dc278d004a38ecdb91f25f6dca1751ba2e7e34ccbaac5e23a2f084",
+            )
+            | (
+                Some("1795274792.sh"),
+                "30bd8bec776d5797f1b08b76ffa3ef17b0d497152828b09a846cd1894594b711",
+            ) => {
+                let platform = nix::sys::utsname::uname()
+                    .context("Cannot read the Omarchy machine architecture")?;
+                Some(qualcomm_migration_for_machine(platform.machine(), &path)?)
+            }
+            (Some("1794909082.sh" | "1795274792.sh"), _) => anyhow::bail!(
+                "Omarchy hardware migration {} differs from the reviewed script",
+                path.display()
+            ),
             _ => None,
         };
         let known_external_aur = [
@@ -1085,6 +1114,10 @@ impl Commands {
                 NativeOmarchyOperation::InstallOmnibookAudio
             }
             NativeMigration::MediaViewer => return self.replace_media_viewer(home).await,
+            NativeMigration::SkipQualcommHardware => {
+                println!("  Qualcomm hardware migration does not apply on x86_64");
+                return Ok(());
+            }
         };
         self.run_native_package(operation).await?;
         if native == NativeMigration::OmnibookAudio {
@@ -3582,6 +3615,140 @@ omarchy-pkg-drop imv mpv-mpris
         Ok(())
     }
 
+    #[cfg(target_arch = "x86_64")]
+    #[tokio::test]
+    async fn published_qualcomm_migrations_are_inapplicable_only_on_x86_64() -> Result<()> {
+        let owner = private_directory();
+        let migrations = owner.path().join("migrations");
+        let markers = owner.path().join("markers");
+        std::fs::create_dir(&migrations)?;
+        let mut commands = Commands::new(
+            false,
+            OmarchyRuntime {
+                root: owner.path().to_path_buf(),
+                migration_state: markers.clone(),
+            },
+        );
+        commands.native_fixture = Some(NativeMigrationFixture {
+            operations: Vec::new(),
+            failure: None,
+            desktop_database_program: "false",
+        });
+        for (name, script) in [
+            (
+                "1794909082.sh",
+                r#"echo "Show the Samsung Galaxy Book4 Edge 14's disk unlock prompt and add its keyboard and Bluetooth support"
+
+# See install/hardware/samsung/galaxy-book4-edge-14.sh. The initramfs hook and
+# the kernel command line are in the boot image, so they take a rebuild. The
+# marker records the rebuild as owed before the setup runs, so a retry rebuilds
+# even when the files are already there.
+if ! omarchy-hw-aarch64-qualcomm || ! omarchy-hw-match-device-tree samsung,galaxy-book4-edge-14; then
+  exit 0
+fi
+
+drop_in=/etc/limine-entry-tool.d/samsung-galaxy-book4-edge-14.conf
+hook=/etc/initcpio/install/samsung-galaxy-book4-edge-14
+rebuild_pending=/var/lib/omarchy/migrations/1794909082-rebuild-pending
+if [[ -e $rebuild_pending ]] || [[ ! -f $hook ]] ||
+  ! grep -q 'usbcore.autosuspend=-1' "$drop_in" 2>/dev/null ||
+  omarchy-pkg-missing samsung-galaxy-book4-edge-14-support; then
+  sudo install -Dm644 /dev/null "$rebuild_pending" || exit 1
+  sudo env PATH="$PATH" OMARCHY_PATH="$OMARCHY_PATH" bash -euo pipefail -c '
+    source "$OMARCHY_PATH/install/hardware/samsung/galaxy-book4-edge-14.sh"
+  '
+fi
+
+if [[ -e $rebuild_pending ]]; then
+  rebuild_log=$(mktemp)
+  trap 'rm -f "$rebuild_log"' EXIT
+  sudo limine-mkinitcpio 2>&1 | tee "$rebuild_log"
+
+  # limine-mkinitcpio reports a kernel it could not rebuild and still exits 0.
+  if grep -q 'mkinitcpio failed for kernel' "$rebuild_log"; then
+    echo "A boot image was not rebuilt. Fix the error above, then run omarchy-migrate again before rebooting." >&2
+    exit 1
+  fi
+
+  # Ask for the reboot before clearing the marker, so a run cut short in
+  # between still asks on the next one.
+  omarchy-state set reboot-required
+  sudo rm -f "$rebuild_pending"
+fi
+"#,
+            ),
+            (
+                "1795274792.sh",
+                r#"echo "Show the disk unlock prompt on Snapdragon X laptops"
+
+# See install/hardware/qualcomm/hamoa-display.sh. The prompt needs the display
+# chain in the boot image, so it takes a rebuild. The Surface Laptop 7 13.8"
+# needs its keyboard there as well, which microsoft/surface-laptop-7.sh adds
+# and no earlier migration ran for it. A machine-wide marker, written only
+# after a rebuild, records that this one is done, and a retry after a failed
+# rebuild runs the setup and the rebuild again.
+if ! omarchy-hw-aarch64-qualcomm || ! omarchy-hw-match-device-tree qcom,x1e80100 qcom,x1p42100; then
+  exit 0
+fi
+
+done_marker=/var/lib/omarchy/migrations/1795274792-done
+if [[ -e $done_marker ]]; then
+  exit 0
+fi
+
+sudo env PATH="$PATH" OMARCHY_PATH="$OMARCHY_PATH" bash -euo pipefail -c '
+  source "$OMARCHY_PATH/install/hardware/qualcomm/hamoa-display.sh"
+  if omarchy-hw-match-device-tree microsoft,romulus13; then
+    source "$OMARCHY_PATH/install/hardware/microsoft/surface-laptop-7.sh"
+  fi
+' || exit 1
+
+rebuild_log=$(mktemp)
+trap 'rm -f "$rebuild_log"' EXIT
+sudo limine-mkinitcpio 2>&1 | tee "$rebuild_log"
+
+# limine-mkinitcpio reports a kernel it could not rebuild and still exits 0.
+if grep -q 'mkinitcpio failed for kernel' "$rebuild_log"; then
+  echo "A boot image was not rebuilt. Fix the error above, then run omarchy-migrate again before rebooting." >&2
+  exit 1
+fi
+
+sudo install -Dm644 /dev/null "$done_marker"
+omarchy-state set reboot-required
+"#,
+            ),
+        ] {
+            let path = migrations.join(name);
+            std::fs::write(&path, script)?;
+            let plan = pending_migrations(&migrations, &markers)?;
+            assert_eq!(plan.len(), 1);
+            let migration = plan[0].native.expect("published hardware migration");
+            assert_eq!(migration, NativeMigration::SkipQualcommHardware);
+            assert!(!markers.exists(), "preflight must not claim completion");
+            commands.run_native_migration(migration, None).await?;
+            assert!(
+                commands.active.is_none()
+                    && commands
+                        .native_fixture
+                        .as_ref()
+                        .unwrap()
+                        .operations
+                        .is_empty(),
+                "x86_64 requires no hardware or package action"
+            );
+
+            let arm_error = qualcomm_migration_for_machine("aarch64".as_ref(), &path)
+                .expect_err("the hardware update needs a native ARM implementation");
+            assert!(arm_error.to_string().contains("native ARM equivalent"));
+            std::fs::write(&path, format!("{script}# modified\n"))?;
+            let changed_error = pending_migrations(&migrations, &markers)
+                .expect_err("the published filename cannot authorize changed bytes");
+            assert!(changed_error.to_string().contains("reviewed script"));
+            std::fs::remove_file(path)?;
+        }
+        Ok(())
+    }
+
     #[tokio::test]
     async fn invalid_migration_state_directory_prevents_every_action() -> Result<()> {
         struct Recorder {
@@ -5046,6 +5213,45 @@ omarchy-pkg-drop imv mpv-mpris
         std::fs::write(root.join("complete"), b"cleaned").expect("output cleanup completed");
     }
 
+    async fn terminal_read_failure_coordinator(
+        shell: impl AsRef<std::ffi::OsStr>,
+        ready: &std::path::Path,
+        armed: &std::path::Path,
+        release: &std::path::Path,
+        complete: &std::path::Path,
+    ) -> Result<tokio::process::Child> {
+        let mut coordinator = Command::new(shell);
+        coordinator.args([
+            "-c",
+            "trap '' TERM; while test ! -f \"$1.armed\"; do sleep 0.01; done; printf ready > \"$1\"; while test ! -f \"$2\"; do sleep 0.01; done; printf cleaned > \"$3\"",
+            "fixture",
+        ]);
+        coordinator.args([ready.as_os_str(), release.as_os_str(), complete.as_os_str()]);
+        coordinator
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .kill_on_drop(true);
+        let coordinator = coordinator.spawn()?;
+        tokio::time::timeout_at(
+            tokio::time::Instant::now() + Duration::from_secs(3),
+            async {
+                let mut released_child = false;
+                while !ready.is_file() {
+                    tokio::task::yield_now().await;
+                    if !released_child {
+                        std::fs::write(armed, b"armed").expect("release fixture readiness gate");
+                        released_child = true;
+                    }
+                }
+            },
+        )
+        .await
+        .context("owned coordinator must register its signal handling")?;
+        Ok(coordinator)
+    }
+
     #[tokio::test]
     async fn terminal_read_failure_reaps_owned_coordinator_before_returning() -> Result<()> {
         use std::os::fd::OwnedFd;
@@ -5063,21 +5269,12 @@ omarchy-pkg-drop imv mpv-mpris
         let descriptor: OwnedFd = listener.into();
         let master = register_file(File::from(descriptor))?;
         let ready = owner.path().join("ready");
+        let armed = ready.with_extension("armed");
         let release = owner.path().join("release");
         let complete = owner.path().join("complete");
         let shell = crate::core::privilege::root_controlled_program_path("sh")?;
-        let mut child = Command::new(shell)
-            .args(["-c", "trap '' TERM; printf ready > \"$1\"; while test ! -f \"$2\"; do sleep 0.01; done; printf cleaned > \"$3\"", "fixture"])
-            .arg(&ready).arg(&release).arg(&complete)
-            .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
-            .process_group(0).kill_on_drop(true).spawn()?;
-        tokio::time::timeout(Duration::from_secs(3), async {
-            while !ready.is_file() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .context("owned coordinator must register its signal handling")?;
+        let mut coordinator =
+            terminal_read_failure_coordinator(shell, &ready, &armed, &release, &complete).await?;
         let finish = tokio::spawn(async move {
             let reset = peer
                 .read(&mut [0_u8; 1])
@@ -5086,13 +5283,15 @@ omarchy-pkg-drop imv mpv-mpris
             assert_eq!(reset.kind(), std::io::ErrorKind::ConnectionReset);
             std::fs::write(release, b"release")
         });
-        let error = tokio::time::timeout(
-            Duration::from_secs(3),
-            drain_interrupted_coordinator(&mut child, master),
-        )
-        .await
-        .context("terminal read failure must still reap the owned child")?
-        .expect_err("listening socket cannot serve as terminal input");
+        let drain_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let drain_result = tokio::time::timeout_at(
+            drain_deadline,
+            drain_interrupted_coordinator(&mut coordinator, master),
+        );
+        let drain_result = drain_result.await;
+        let error = drain_result
+            .context("terminal read failure must still reap the owned child")?
+            .expect_err("listening socket cannot serve as terminal input");
         finish.await??;
         assert!(format!("{error:#}").contains("Cannot drain interrupted Omarchy terminal"));
         assert_eq!(
@@ -5102,8 +5301,9 @@ omarchy-pkg-drop imv mpv-mpris
             Some(nix::libc::EINVAL)
         );
         assert_eq!(std::fs::read(complete)?, b"cleaned");
-        assert!(
-            child.id().is_none(),
+        assert_eq!(
+            coordinator.id(),
+            None,
             "the owned coordinator has been reaped"
         );
         Ok(())

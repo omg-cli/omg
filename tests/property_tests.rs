@@ -281,10 +281,8 @@ proptest! {
         let result1 = run_omg(&["which", runtime]);
         // Should not crash on any variant
         assert_process_completed(&result1);
-        // Every accepted alias must resolve through canonical_runtime_name
-        // (src/cli/runtimes.rs) and print an answer naming the requested
-        // runtime: either its active version or the explicit "no version set"
-        // notice. A silent success would mean the lookup was skipped.
+        // A selected version is written to stdout, and unset aliases report
+        // a readable error on stderr without printing a substitute version.
         if result1.success {
             prop_assert!(
                 result1.stdout.contains(runtime) || result1.stderr.contains(runtime),
@@ -293,8 +291,8 @@ proptest! {
             );
         } else {
             prop_assert!(
-                !result1.stderr.is_empty(),
-                "`which {runtime}` failure must explain why on stderr"
+                result1.stdout.is_empty() && result1.stderr.contains(runtime),
+                "`which {runtime}` failure must explain why on stderr and leave stdout empty"
             );
         }
     }
