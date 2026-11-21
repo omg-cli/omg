@@ -37,7 +37,8 @@
     "qs": "6.16.2"
   },
   "patchedDependencies": {
-    "gitlab-ai-provider@6.23.1": "patches/gitlab-ai-provider@6.23.1.patch"
+    "gitlab-ai-provider@6.23.1": "patches/gitlab-ai-provider@6.23.1.patch",
+    "agents@0.29.0": "patches/agents@0.29.0.patch"
   },
   "packageManager": "bun@1.4.4"
 }
