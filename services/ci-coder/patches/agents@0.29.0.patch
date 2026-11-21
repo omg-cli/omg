@@ -1,0 +1,57 @@
+diff --git a/dist/models/opencode/index.js b/dist/models/opencode/index.js
+index 0e5a07131cd7e0482eb11d64ffb832b31677b86e..ba391753ebbf64984316381d1533f9bce4213813 100644
+--- a/dist/models/opencode/index.js
++++ b/dist/models/opencode/index.js
+@@ -200,18 +200,7 @@ function generatedFile(part) {
+ */
+ /** The OpenCode provider id `createAI`'s plugin registers. */
+ const CLOUDFLARE_PROVIDER_ID = "cloudflare";
+-/**
+-* The AI SDK package OpenCode is told the provider uses. OpenCode builds an
+-* AI SDK model in two hook steps: `sdk` (load the package) and `language`
+-* (make the model). Its `sdk` step can only load packages it bundles; any
+-* other is handed to an npm installer that cannot run in workerd, and an
+-* external plugin's `sdk` hook runs after that installer. So the provider
+-* names `@ai-sdk/vercel`, which OpenCode bundles and loads in-process, and
+-* this plugin's `language` hook replaces the model it would make. The
+-* Vercel client is built but never called: its base URL does not resolve.
+-*/
+-const CARRIER_PACKAGE = "aisdk:@ai-sdk/vercel";
+-const UNREACHABLE_BASE_URL = "https://workers-ai.binding.invalid/v1";
++const BINDING_PACKAGE = "aisdk:workers-ai-binding";
+ const DEFAULT_LIMIT = {
+ 	context: 128e3,
+ 	output: 8192
+@@ -232,7 +221,7 @@ function createAI(settings) {
+ 	const info = (id, options) => {
+ 		return {
+ 			...Model.Info.default(providerID, Model.ID.make(id)),
+-			package: CARRIER_PACKAGE,
++			package: BINDING_PACKAGE,
+ 			limit: options?.limit ?? DEFAULT_LIMIT
+ 		};
+ 	};
+@@ -245,18 +234,15 @@ function createAI(settings) {
+ 						id: providerID,
+ 						name: "Cloudflare",
+ 						activation: "enabled",
+-						package: CARRIER_PACKAGE,
+-						settings: {
+-							baseURL: UNREACHABLE_BASE_URL,
+-							apiKey: "binding"
+-						}
++						package: BINDING_PACKAGE
+ 					},
+ 					models: [...models].map(([id, options]) => info(id, options))
+ 				});
+ 			});
+-			const hook = await ctx.aisdk.hook("language", (event) => {
+-				const id = event.model.modelID ?? event.model.id;
+-				event.language = asLanguageModelV3(aiSdk.languageModel(id, models.get(id)));
++			const hook = await ctx.aisdk.hook("sdk", (event) => {
++				event.sdk = {
++					languageModel: (id) => asLanguageModelV3(aiSdk.languageModel(id, models.get(id)))
++				};
+ 			}, { providerID });
+ 			const reload = () => ctx.provider.reload();
+ 			reloads.add(reload);
