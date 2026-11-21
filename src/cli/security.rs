@@ -56,6 +56,18 @@ impl LocalCommandRunner for AuditCommands {
         if !machine_stdout {
             ui::print_spacer();
         }
+        if let AuditCommands::Slsa {
+            package,
+            certificate_identity,
+            certificate_oidc_issuer,
+        } = self
+        {
+            check_slsa(package, certificate_identity, certificate_oidc_issuer, ctx).await?;
+            if !machine_stdout {
+                ui::print_spacer();
+            }
+            return Ok(());
+        }
         match self {
             AuditCommands::Scan { fail_on_findings } => {
                 scan_with_options(ctx, *fail_on_findings).await
@@ -81,11 +93,7 @@ impl LocalCommandRunner for AuditCommands {
             ),
             AuditCommands::Verify => verify_audit_log(ctx),
             AuditCommands::Policy => show_policy(ctx),
-            AuditCommands::Slsa {
-                package,
-                certificate_identity,
-                certificate_oidc_issuer,
-            } => check_slsa(package, certificate_identity, certificate_oidc_issuer, ctx).await,
+            AuditCommands::Slsa { .. } => unreachable!("SLSA dispatch returned before this match"),
             AuditCommands::Licenses {
                 format,
                 export,
