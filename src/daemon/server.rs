@@ -917,7 +917,9 @@ mod tests {
         }
     }
 
-    async fn daemon_with_paused_scan() -> Result<(
+    async fn daemon_with_paused_scan(
+        previous: Option<(usize, usize)>,
+    ) -> Result<(
         tempfile::TempDir,
         Arc<DaemonState>,
         Arc<PausedAdvisorySource>,
@@ -941,9 +943,11 @@ mod tests {
             backend,
             source.clone(),
         )?;
-        let previous =
-            crate::daemon::status_policy::status_snapshot(1, 1, 0, 0, vec![], Some((3, 1))).0;
-        state.cache.update_status(Arc::new(previous));
+        if let Some(counts) = previous {
+            let status =
+                crate::daemon::status_policy::status_snapshot(1, 1, 0, 0, vec![], Some(counts)).0;
+            state.cache.update_status(Arc::new(status));
+        }
         state.background_security_scans = true;
         let state = Arc::new(state);
         let socket = directory.path().join("held.sock");
@@ -961,7 +965,8 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn daemon_watchdog_detects_removed_socket_during_initial_scan() -> Result<()> {
-        let (_directory, _state, _source, socket, mut server) = daemon_with_paused_scan().await?;
+        let (_directory, _state, _source, socket, mut server) =
+            daemon_with_paused_scan(Some((3, 1))).await?;
         tokio::time::pause();
         std::fs::remove_file(&socket)?;
         tokio::time::advance(SOCKET_HEALTH_CHECK_INTERVAL + Duration::from_secs(1)).await;
@@ -977,7 +982,8 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn daemon_publication_background_scan_cannot_resurrect_a_stale_snapshot() -> Result<()> {
-        let (_directory, state, source, _socket, server) = daemon_with_paused_scan().await?;
+        let (_directory, state, source, _socket, server) =
+            daemon_with_paused_scan(Some((3, 1))).await?;
         state.replace_index(
             super::super::index::PackageIndex::empty(),
             #[cfg(feature = "arch")]
@@ -1009,7 +1015,8 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn daemon_scan_error_marks_previous_vulnerabilities_stale() -> Result<()> {
-        let (_directory, state, source, _socket, server) = daemon_with_paused_scan().await?;
+        let (_directory, state, source, _socket, server) =
+            daemon_with_paused_scan(Some((3, 1))).await?;
         source
             .fail_scan
             .store(true, std::sync::atomic::Ordering::Release);
@@ -1032,6 +1039,38 @@ mod tests {
         assert_eq!(status.security_vulnerabilities, 3);
         assert_eq!(status.scanned_vulnerability_summary(), None);
         assert_eq!(status.security_unknown_packages, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn daemon_initial_scan_error_does_not_publish_a_vulnerability_count() -> Result<()> {
+        let (directory, state, source, _socket, server) = daemon_with_paused_scan(None).await?;
+        source
+            .fail_scan
+            .store(true, std::sync::atomic::Ordering::Release);
+        source.resume.notify_one();
+        let complete = tokio::time::timeout(Duration::from_secs(5), async {
+            while state.cache.get("git").is_none() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        server.abort();
+        let exit = server.await;
+        complete.context("initial maintenance did not finish after the controlled scan error")?;
+        assert!(
+            matches!(&exit, Err(error) if error.is_cancelled()),
+            "daemon exited before fixture cleanup: {exit:?}"
+        );
+        assert!(directory.path().join("omg.status").is_file());
+        assert!(state.cache.get_status().is_none());
+        assert!(
+            state
+                .persistent
+                .get_status(Duration::from_mins(5))?
+                .is_none()
+        );
         Ok(())
     }
 
