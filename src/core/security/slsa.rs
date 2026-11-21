@@ -1996,8 +1996,9 @@ mod tests {
                 expected(ISSUER),
             )
             .unwrap();
+        let verified = signer.is_some();
         assert!(
-            signer.is_none(),
+            !verified,
             "wrong signature must not verify even on a valid chain"
         );
 
@@ -2011,8 +2012,9 @@ mod tests {
                 expected(ISSUER),
             )
             .unwrap();
+        let verified = signer.is_some();
         assert!(
-            signer.is_none(),
+            !verified && signer.is_none(),
             "certificate validity window must gate verification"
         );
     }
