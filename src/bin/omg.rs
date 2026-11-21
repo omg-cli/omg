@@ -1804,6 +1804,7 @@ mod fast_path_tests {
         FastCounter, configure_fast_path_output, direct_root_warning_required, has_json_flag,
         info_package_from_fast_args, parse_fast_counter_cmd, parse_fast_list_tail,
         root_help_selection, try_fast_completions, try_fast_explicit_count, try_fast_hooks,
+        try_fast_which,
     };
 
     #[cfg(feature = "arch")]
@@ -2127,6 +2128,14 @@ mod fast_path_tests {
         assert!(!try_fast_hooks(&args(&[
             "omg", "hook-env", "bash", "extra",
         ])));
+    }
+
+    #[test]
+    fn which_flag_like_runtime_defers_to_clap() {
+        assert!(
+            !try_fast_which(&args(&["omg", "which", "--runtime"]))
+                .expect("which fast path should defer flag-like runtime names")
+        );
     }
 
     #[test]
