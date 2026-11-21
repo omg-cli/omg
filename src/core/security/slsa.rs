@@ -1213,6 +1213,28 @@ mod tests {
         )
     }
 
+    struct TestRekorVerifier<'a> {
+        fulcio_roots: &'a [&'a str],
+    }
+
+    impl TestRekorVerifier<'_> {
+        fn verify(
+            &self,
+            entry: &RekorEntry,
+            artifact_hash: &str,
+            artifact_bytes: &[u8],
+            expected: ExpectedSigner<'_>,
+        ) -> Result<Option<String>, SlsaError> {
+            verify_test_rekor_entry_with_roots(
+                entry,
+                artifact_hash,
+                artifact_bytes,
+                expected,
+                self.fulcio_roots,
+            )
+        }
+    }
+
     #[tokio::test]
     async fn rekor_index_applies_body_limit_before_json_and_accepts_small_results() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1916,6 +1938,9 @@ mod tests {
         // The test CA stands in for the Sigstore Fulcio roots.
         let ca_pem = ca.pem();
         let ca_roots: Vec<&str> = vec![ca_pem.as_str()];
+        let verifier = TestRekorVerifier {
+            fulcio_roots: &ca_roots,
+        };
         let now = u64::try_from(jiff::Timestamp::now().as_second()).unwrap();
 
         assert_eq!(
@@ -1946,27 +1971,17 @@ mod tests {
                 issuer: ISSUER,
             },
         ] {
-            let signer = verify_test_rekor_entry_with_roots(
-                &entry,
-                &artifact_hash,
-                &artifact_bytes,
-                mismatched,
-                &ca_roots,
-            )
-            .unwrap();
+            let signer = verifier
+                .verify(&entry, &artifact_hash, &artifact_bytes, mismatched)
+                .unwrap();
             assert!(
                 signer.is_none(),
                 "both the identity and the issuer must match"
             );
         }
-        let signer = verify_test_rekor_entry_with_roots(
-            &entry,
-            &artifact_hash,
-            &artifact_bytes,
-            expected(ISSUER),
-            &ca_roots,
-        )
-        .unwrap();
+        let signer = verifier
+            .verify(&entry, &artifact_hash, &artifact_bytes, expected(ISSUER))
+            .unwrap();
         assert_eq!(
             signer.as_deref(),
             Some(IDENTITY),
@@ -1975,14 +1990,14 @@ mod tests {
 
         // Wrong signature over the same valid chain -> unverified.
         let entry = make_entry(&cert_pem, bad_sig.to_der().as_bytes(), now);
-        let signer = verify_test_rekor_entry_with_roots(
-            &entry,
-            &artifact_hash,
-            artifact_bytes.as_slice(),
-            expected(ISSUER),
-            &ca_roots,
-        )
-        .unwrap();
+        let signer = verifier
+            .verify(
+                &entry,
+                &artifact_hash,
+                artifact_bytes.as_slice(),
+                expected(ISSUER),
+            )
+            .unwrap();
         assert!(
             signer.is_none(),
             "wrong signature must not verify even on a valid chain"
@@ -1990,14 +2005,14 @@ mod tests {
 
         // Entry recorded before the certificate existed -> unverified.
         let entry = make_entry(&cert_pem, good_sig.to_der().as_bytes(), 0);
-        let signer = verify_test_rekor_entry_with_roots(
-            &entry,
-            &artifact_hash,
-            artifact_bytes.as_slice(),
-            expected(ISSUER),
-            &ca_roots,
-        )
-        .unwrap();
+        let signer = verifier
+            .verify(
+                &entry,
+                &artifact_hash,
+                artifact_bytes.as_slice(),
+                expected(ISSUER),
+            )
+            .unwrap();
         assert!(
             signer.is_none(),
             "certificate validity window must gate verification"
