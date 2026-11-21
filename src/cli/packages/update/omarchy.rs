@@ -5049,9 +5049,10 @@ omarchy-pkg-drop imv mpv-mpris
     fn terminal_read_failure_coordinator(
         shell: impl AsRef<std::ffi::OsStr>,
         ready: &std::path::Path,
+        armed: &std::path::Path,
         release: &std::path::Path,
         complete: &std::path::Path,
-    ) -> Command {
+    ) -> Result<tokio::process::Child> {
         let mut coordinator = Command::new(shell);
         coordinator.args([
             "-c",
@@ -5065,7 +5066,20 @@ omarchy-pkg-drop imv mpv-mpris
             .stderr(Stdio::null())
             .process_group(0)
             .kill_on_drop(true);
-        coordinator
+        let mut coordinator = coordinator.spawn()?;
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let mut released_child = false;
+            while !ready.is_file() {
+                tokio::task::yield_now().await;
+                if !released_child {
+                    std::fs::write(armed, b"armed").expect("release fixture readiness gate");
+                    released_child = true;
+                }
+            }
+        })
+        .await
+        .context("owned coordinator must register its signal handling")?;
+        Ok(coordinator)
     }
 
     #[tokio::test]
@@ -5090,19 +5104,7 @@ omarchy-pkg-drop imv mpv-mpris
         let complete = owner.path().join("complete");
         let shell = crate::core::privilege::root_controlled_program_path("sh")?;
         let mut coordinator =
-            terminal_read_failure_coordinator(shell, &ready, &release, &complete).spawn()?;
-        tokio::time::timeout(Duration::from_secs(3), async {
-            let mut released_child = false;
-            while !ready.is_file() {
-                tokio::task::yield_now().await;
-                if !released_child {
-                    std::fs::write(&armed, b"armed").expect("release fixture readiness gate");
-                    released_child = true;
-                }
-            }
-        })
-        .await
-        .context("owned coordinator must register its signal handling")?;
+            terminal_read_failure_coordinator(shell, &ready, &armed, &release, &complete).await?;
         let finish = tokio::spawn(async move {
             let reset = peer
                 .read(&mut [0_u8; 1])
