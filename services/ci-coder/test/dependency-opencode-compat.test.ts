@@ -30,16 +30,30 @@ function metadataVersion(entry: string): string {
   }
 }
 
-test("OpenCode keeps its compatible runtime with genuine patched dependencies", () => {
-  assert.equal(metadataVersion(coreEntry), "2.1.1");
+test("OpenCode keeps its dependency family aligned and resolves patched versions", () => {
+  const sdkEntry = import.meta.resolve("@opencode/sdk/workerd");
+  for (const entry of [
+    sdkEntry,
+    coreEntry,
+    Bun.resolveSync("@opencode/core/tool/runtime", dirname(fileURLToPath(sdkEntry))),
+    import.meta.resolve("@opencode/plugin"),
+    import.meta.resolve("@opencode/schema/tool"),
+    import.meta.resolve("@opencode/ai"),
+  ]) {
+    assert.equal(metadataVersion(entry), "2.2.5");
+    assert.equal(metadataVersion(createRequire(entry).resolve("effect")), "4.0.6");
+  }
   assert.equal(metadataVersion(coreRequire.resolve("zod/v4")), "4.6.7");
   assert.equal(metadataVersion(coreRequire.resolve("gitlab-ai-provider")), "6.23.1");
   for (const name of ["@modelcontextprotocol/client", "@modelcontextprotocol/core"]) {
     assert.equal(metadataVersion(coreRequire.resolve(name)), "2.3.1");
   }
-  for (const entry of [coreEntry, ...["@ai-sdk/cohere", "@ai-sdk/perplexity", "@ai-sdk/vercel", "@ai-sdk/openai-compatible"].map(name => coreRequire.resolve(name))]) {
-    assert.equal(metadataVersion(createRequire(entry).resolve("@ai-sdk/provider-utils")), "4.0.33");
+  assert.equal(metadataVersion(coreRequire.resolve("@ai-sdk/provider-utils")), "4.0.62");
+  for (const name of ["@ai-sdk/cohere", "@ai-sdk/perplexity", "@ai-sdk/vercel", "@ai-sdk/openai-compatible"]) {
+    assert.throws(() => coreRequire.resolve(name), { code: "MODULE_NOT_FOUND" });
   }
+  const platformRequire = createRequire(coreRequire.resolve("@effect/platform-node"));
+  assert.equal(metadataVersion(platformRequire.resolve("undici/package.json")), "8.12.4");
 });
 
 test("OpenCode converts patched Zod schemas and rejects invalid tool arguments before execution", async () => {
