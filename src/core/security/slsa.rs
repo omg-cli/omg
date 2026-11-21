@@ -2756,16 +2756,15 @@ mod required_signer_tests {
     #[tokio::test]
     async fn no_identity_fails_before_file_or_network_access() {
         for identity in ["", "   ", "\t"] {
-            let error = super::SlsaVerifier::default()
+            let result = super::SlsaVerifier::default()
                 .verify_provenance(
                     "/nonexistent/artifact",
                     None::<&str>,
                     identity,
                     "https://issuer.example.invalid",
                 )
-                .await
-                .unwrap_err();
-            assert!(matches!(error, super::SlsaError::IdentityRequired));
+                .await;
+            assert!(matches!(result, Err(super::SlsaError::IdentityRequired)));
         }
     }
 
