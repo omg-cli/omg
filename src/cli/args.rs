@@ -1075,6 +1075,17 @@ pub enum AccountCommands {
     Unlink,
 }
 
+#[derive(clap::Args, Debug)]
+pub struct SlsaCertificateIdentity {
+    /// Require the Fulcio certificate SAN to match this identity
+    /// (email or OIDC URI); required for a meaningful trust decision
+    #[arg(long = "certificate-identity", required = true)]
+    pub identity: String,
+    /// Require the Fulcio certificate OIDC issuer to match this URI
+    #[arg(long = "certificate-oidc-issuer", required = true)]
+    pub oidc_issuer: String,
+}
+
 #[derive(Subcommand, Debug)]
 pub enum AuditCommands {
     /// Scan installed packages; optionally fail when findings are reported
@@ -1118,13 +1129,8 @@ pub enum AuditCommands {
     Slsa {
         /// Package file to verify
         package: String,
-        /// Require the Fulcio certificate SAN to match this identity
-        /// (email or OIDC URI); required for a meaningful trust decision
-        #[arg(long, required = true)]
-        certificate_identity: String,
-        /// Require the Fulcio certificate OIDC issuer to match this URI
-        #[arg(long, required = true)]
-        certificate_oidc_issuer: String,
+        #[command(flatten)]
+        certificate_identity: SlsaCertificateIdentity,
     },
     /// Scan installed package licenses (Arch backend only)
     Licenses {

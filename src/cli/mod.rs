@@ -62,8 +62,8 @@ pub use args::{
     AuditCommands, CiCommands, Cli, Commands, ComplianceFramework, ConfigCommands,
     ContainerCommands, EnterpriseCommands, EnterprisePolicyCommands, EnterpriseReportType,
     EnvCommands, FleetCommands, GoldenPathCommands, HooksCommands, MigrateCommands,
-    PrivacyCommands, ShellKind, SnapshotCommands, TeamCommands, TeamRoleCommands, ToolCommands,
-    TransactionTypeFilter, WorkspaceCommands,
+    PrivacyCommands, ShellKind, SlsaCertificateIdentity, SnapshotCommands, TeamCommands,
+    TeamRoleCommands, ToolCommands, TransactionTypeFilter, WorkspaceCommands,
 };
 
 /// Parse an API timestamp string into Unix seconds.
@@ -124,7 +124,6 @@ pub(crate) fn local_reverse_deps(handle: &alpm::Alpm, package: &str) -> Vec<Stri
 /// Global context for CLI command execution
 pub struct CliContext {
     pub json: bool,
-    pub slsa_certificate_oidc_issuer: Option<String>,
 }
 
 /// Execute a CLI command using process-local terminal state.

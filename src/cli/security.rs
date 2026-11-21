@@ -41,7 +41,9 @@ fn read_audit_entries(
     }
 }
 
-use crate::cli::{AuditCommands, CliContext, LocalCommandRunner, style, ui};
+use crate::cli::{
+    AuditCommands, CliContext, LocalCommandRunner, SlsaCertificateIdentity, style, ui,
+};
 #[cfg(unix)]
 use crate::core::client::DaemonClient;
 use crate::core::security::{AuditLogger, AuditSeverity, SbomGenerator, SecurityPolicy};
@@ -84,7 +86,6 @@ impl LocalCommandRunner for AuditCommands {
             AuditCommands::Slsa {
                 package,
                 certificate_identity,
-                ..
             } => check_slsa(package, certificate_identity, ctx).await,
             AuditCommands::Licenses {
                 format,
@@ -759,13 +760,15 @@ pub fn scan_secrets(path: Option<String>, _ctx: &CliContext) -> Result<()> {
 }
 
 /// Verify a Sigstore artifact signature against the required identity and issuer.
-pub async fn check_slsa(package: &str, certificate_identity: &str, ctx: &CliContext) -> Result<()> {
+pub async fn check_slsa(
+    package: &str,
+    certificate_identity: &SlsaCertificateIdentity,
+    _ctx: &CliContext,
+) -> Result<()> {
     use crate::core::security::SlsaVerifier;
 
-    let certificate_oidc_issuer = ctx
-        .slsa_certificate_oidc_issuer
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("An exact --certificate-oidc-issuer is required"))?;
+    let certificate_oidc_issuer = certificate_identity.oidc_issuer.as_str();
+    let certificate_identity = certificate_identity.identity.as_str();
 
     // SECURITY: Validate path
     crate::core::security::validate_relative_path(package)?;
@@ -2530,17 +2533,9 @@ mod tests {
     #[cfg(not(feature = "arch"))]
     #[tokio::test]
     async fn auto_fix_without_arch_fails_before_scanning() {
-        let error = fix_vulnerabilities(
-            true,
-            true,
-            "high",
-            &CliContext {
-                json: false,
-                slsa_certificate_oidc_issuer: None,
-            },
-        )
-        .await
-        .expect_err("unsupported backend must fail before scanning");
+        let error = fix_vulnerabilities(true, true, "high", &CliContext { json: false })
+            .await
+            .expect_err("unsupported backend must fail before scanning");
         assert!(
             error.to_string().contains("without the Arch backend"),
             "got: {error}"
