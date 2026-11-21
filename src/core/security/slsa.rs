@@ -1251,6 +1251,23 @@ mod tests {
                 self.fulcio_roots,
             )
         }
+
+        fn classify_entries(
+            &self,
+            entries: &[RekorEntry],
+            artifact_hash: &str,
+            artifact_bytes: &[u8],
+            expected: ExpectedSigner<'_>,
+        ) -> Option<VerificationResult> {
+            SlsaVerifier::classify_rekor_entries(
+                entries,
+                artifact_hash,
+                artifact_bytes,
+                expected,
+                self.fulcio_roots,
+                "",
+            )
+        }
     }
 
     #[tokio::test]
@@ -1863,7 +1880,6 @@ mod tests {
 
         const IDENTITY: &str = "https://accounts.example.com/users/alice";
         const ISSUER: &str = "https://issuer.example.invalid";
-        const EMPTY_FULCIO_INTERMEDIATE: &str = "";
 
         // Test CA standing in for the Sigstore root.
         let ca_key = KeyPair::generate().unwrap();
@@ -2005,32 +2021,25 @@ mod tests {
             "Fulcio SAN must be reported as the signer identity"
         );
 
-        let mut rejected_entry = make_entry(&cert_pem, bad_sig.to_der().as_bytes(), now);
-        rejected_entry.uuid = "rejected".into();
-        let mut accepted_entry = make_entry(&cert_pem, good_sig.to_der().as_bytes(), now);
-        accepted_entry.uuid = "accepted".into();
-        let verified = SlsaVerifier::classify_rekor_entries(
-            &[rejected_entry, accepted_entry],
-            &artifact_hash,
-            &artifact_bytes,
-            expected(ISSUER),
-            &ca_roots,
-            "",
-        )
-        .expect("valid trusted entry after a rejected entry");
+        let rejected_entry = RekorEntry {
+            uuid: "rejected".into(),
+            ..make_entry(&cert_pem, bad_sig.to_der().as_bytes(), now)
+        };
+        let accepted_entry = RekorEntry {
+            uuid: "accepted".into(),
+            ..entry
+        };
+        let entries = [rejected_entry, accepted_entry];
+        let verified = verifier
+            .classify_entries(&entries, &artifact_hash, &artifact_bytes, expected(ISSUER))
+            .expect("valid trusted entry after a rejected entry");
         assert!(verified.verified);
         assert_eq!(verified.transparency_log_entry.as_deref(), Some("accepted"));
         assert_eq!(verified.builder_id.as_deref(), Some(IDENTITY));
         assert!(
-            SlsaVerifier::classify_rekor_entries(
-                &[],
-                &artifact_hash,
-                &artifact_bytes,
-                expected(ISSUER),
-                &ca_roots,
-                EMPTY_FULCIO_INTERMEDIATE,
-            )
-            .is_none(),
+            verifier
+                .classify_entries(&[], &artifact_hash, &artifact_bytes, expected(ISSUER))
+                .is_none(),
             "an empty Rekor response has no verification result"
         );
 
