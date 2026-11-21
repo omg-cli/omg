@@ -210,6 +210,53 @@ grep -q '"result":"HARNESS_ERROR"' "$(results_file "$scratch/missing-evidence")"
 
 make_stage "$scratch/valid"
 export FAKE_CONTAINER_STATE="$scratch/container-state"
+if [[ -r /proc/self/status && -x /usr/bin/setpriv ]]; then
+  arch_probe="$scratch/arch-mutation-probe"
+  arch_bin=omg-v9.9.9-x86_64-linux-arch/omg
+  mkdir -p "$arch_probe/${arch_bin%/omg}"
+  cp "$repo_root/scripts/qemu-runtime-advisory-oracle.py" "$arch_probe/"
+  cat > "$arch_probe/$arch_bin" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+case "$*" in
+  --version) echo 'omg 9.9.9' ;;
+  'install --yes tree')
+    grep -Eq '^NoNewPrivs:[[:space:]]+1$' /proc/self/status
+    printf -v digest '%064d' 0
+    printf 'SECURITY WARNING: coverage is incomplete.\nPackage: ["tree","1"]\nCoverage: unknown\nhttps://example.invalid/advisory\nType accept %s within 60 seconds to continue (default: cancel): ' "$digest"
+    [[ -t 0 ]]
+    read -r answer
+    [[ "$answer" == "accept $digest" ]]
+    touch "$FAKE_ARCH_TREE"
+    ;;
+  'remove --yes tree')
+    grep -Eq '^NoNewPrivs:[[:space:]]+1$' /proc/self/status
+    rm "$FAKE_ARCH_TREE"
+    ;;
+  *) exit 1 ;;
+esac
+EOF
+  printf '#!/usr/bin/env bash\necho "omgd 9.9.9"\n' > "$arch_probe/${arch_bin%/omg}/omgd"
+  chmod 700 "$arch_probe/$arch_bin" "$arch_probe/${arch_bin%/omg}/omgd"
+  for kind in install-tree remove-tree; do
+    evidence="$scratch/arch-$kind"
+    assert_rc 0 "$runner" --release v9.9.9 --distro arch --case "release-package-$kind" \
+      --container-engine fake-engine --staged-dir "$scratch/valid" --evidence-dir "$evidence"
+    probe="$(dirname "$(results_file "$evidence")")/arch-release-package-$kind/probe.sh"
+    FAKE_ARCH_TREE="$arch_probe/tree" OMG_SMOKE_PROBE_KIND="$kind" \
+      OMG_PROBE_BIN="$arch_bin" OMG_PROBE_ROOT="$arch_probe" OMG_PROBE_VERSION_NUM=9.9.9 \
+      OMG_PROBE_INDEX_CMD=true OMG_PROBE_INSTALLED_ASSERT='test -f "$FAKE_ARCH_TREE"' \
+      OMG_PROBE_REMOVED_ASSERT='test ! -e "$FAKE_ARCH_TREE"' OMG_PROBE_CONSENT_TIMEOUT=5 \
+      assert_rc 0 bash "$probe"
+    grep -q '"accepted_exit_code": 0' "$scratch/command.out" || fail 'Arch mutation lost PTY acceptance'
+    if [[ "$kind" == install-tree ]]; then
+      test -f "$arch_probe/tree" || fail 'Arch install did not change package state'
+      rm "$arch_probe/tree"
+    else
+      test ! -e "$arch_probe/tree" || fail 'Arch removal left the package installed'
+    fi
+  done
+fi
 mkdir -p "$scratch/copy-failure-bin"
 real_cp="$(command -v cp)"
 cat > "$scratch/copy-failure-bin/cp" <<'EOF'

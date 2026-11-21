@@ -345,6 +345,7 @@ set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 bin="${OMG_PROBE_ROOT:-/probe}/${OMG_PROBE_BIN}"
 daemon_bin="${bin%/omg}/omgd"
+mutation_bin=("$bin")
 if [[ -n "${OMG_PROBE_PHASE_FILE:-}" ]]; then printf 'prerequisite\n' > "$OMG_PROBE_PHASE_FILE"; fi
 bash -c "${OMG_PROBE_INDEX_CMD}" || exit 120
 if [[ "$OMG_SMOKE_PROBE_KIND" == install-tree || "$OMG_SMOKE_PROBE_KIND" == remove-tree ]]; then
@@ -352,6 +353,10 @@ if [[ "$OMG_SMOKE_PROBE_KIND" == install-tree || "$OMG_SMOKE_PROBE_KIND" == remo
   [[ -f "$consent_helper" && ! -L "$consent_helper" ]] || exit 120
   command -v python3 >/dev/null || exit 120
   python3 -c 'import pty, select, signal' || exit 120
+  if [[ "$OMG_PROBE_BIN" == *-x86_64-linux-arch/omg ]]; then
+    /usr/bin/setpriv --no-new-privs -- true || exit 120
+    mutation_bin=(/usr/bin/setpriv --no-new-privs -- "$bin")
+  fi
 fi
 if [[ -n "${OMG_PROBE_PHASE_FILE:-}" ]]; then printf 'product\n' > "$OMG_PROBE_PHASE_FILE"; fi
 version_line="$(printf '%s\n' "$("$bin" --version)" | head -n 1 | tr -d '[:space:]')"
@@ -373,7 +378,7 @@ case "$OMG_SMOKE_PROBE_KIND" in
     ' <<< "$search_output"
     ;;
   install-tree)
-    python3 "$consent_helper" --native --accept-only --timeout "${OMG_PROBE_CONSENT_TIMEOUT:-300}" -- "$bin" install --yes tree || exit 1
+    python3 "$consent_helper" --native --accept-only --timeout "${OMG_PROBE_CONSENT_TIMEOUT:-300}" -- "${mutation_bin[@]}" install --yes tree || exit 1
     bash -c "${OMG_PROBE_INSTALLED_ASSERT}"
     ;;
   remove-tree)
@@ -382,9 +387,9 @@ case "$OMG_SMOKE_PROBE_KIND" in
     # expected exit instead of masking it as HARNESS_ERROR (see #277,
     # where "Package not found: tree" from install setup hid a real
     # repository-lookup defect behind exit 120).
-    python3 "$consent_helper" --native --accept-only --timeout "${OMG_PROBE_CONSENT_TIMEOUT:-300}" -- "$bin" install --yes tree || exit 1
+    python3 "$consent_helper" --native --accept-only --timeout "${OMG_PROBE_CONSENT_TIMEOUT:-300}" -- "${mutation_bin[@]}" install --yes tree || exit 1
     bash -c "${OMG_PROBE_INSTALLED_ASSERT}" || exit 120
-    "$bin" remove --yes tree || exit 1
+    "${mutation_bin[@]}" remove --yes tree || exit 1
     bash -c "${OMG_PROBE_REMOVED_ASSERT}"
     ;;
   *)
