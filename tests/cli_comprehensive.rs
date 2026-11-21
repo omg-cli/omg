@@ -26,6 +26,22 @@ use clap::{CommandFactory, Parser};
 use common::*;
 use omg_lib::cli::Cli;
 
+#[test]
+fn slsa_cli_rejects_missing_issuer_before_rekor_query() {
+    let result = run_omg(&[
+        "audit",
+        "slsa",
+        "Cargo.toml",
+        "--certificate-identity",
+        "builder@example.invalid",
+        "--certificate-oidc-issuer",
+        "",
+    ]);
+
+    result.assert_failure();
+    result.assert_stderr_contains("--certificate-oidc-issuer");
+}
+
 // Contamination is child-local. Both repositories are disposable.
 #[test]
 fn foreign_git_environment_cannot_redirect_fixture() {

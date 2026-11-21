@@ -1709,25 +1709,6 @@ pub fn check_eol(_ctx: &CliContext) -> Result<()> {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn slsa_dispatch_rejects_missing_issuer_before_rekor_query() {
-        let command = AuditCommands::Slsa {
-            package: "Cargo.toml".to_owned(),
-            certificate_identity: "builder@example.invalid".to_owned(),
-            certificate_oidc_issuer: String::new(),
-        };
-
-        let error = command
-            .execute(&CliContext { json: false })
-            .await
-            .expect_err("an empty issuer must fail before querying Rekor");
-
-        assert!(
-            error.to_string().contains("--certificate-oidc-issuer"),
-            "{error}"
-        );
-    }
-
     #[cfg(unix)]
     #[tokio::test]
     async fn audit_report_preserves_unknown_scope_and_sanitizes_findings_in_both_color_modes()
