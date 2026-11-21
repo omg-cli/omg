@@ -5134,8 +5134,9 @@ omarchy-pkg-drop imv mpv-mpris
             Some(nix::libc::EINVAL)
         );
         assert_eq!(std::fs::read(complete)?, b"cleaned");
-        assert!(
-            coordinator.id().is_none(),
+        assert_eq!(
+            coordinator.id(),
+            None,
             "the owned coordinator has been reaped"
         );
         Ok(())
