@@ -247,6 +247,52 @@ fn team_initialization_warns_without_installing_shared_worktree_hooks() -> anyho
     Ok(())
 }
 
+#[cfg(unix)]
+#[test]
+fn team_initialization_recovers_from_status_and_hook_obstructions() -> anyhow::Result<()> {
+    for block_status in [true, false] {
+        let project = common::TestProject::new();
+        let root = project.path();
+        let git = common::fixture_git_command(root)
+            .args(["init", "--quiet", "--template="])
+            .output()?;
+        assert!(git.status.success(), "{git:?}");
+
+        let hooks = root.join(".git/hooks");
+        let config = root.join(".omg/team.toml");
+        let status = root.join(".omg/team-status.json");
+        if block_status {
+            std::fs::create_dir_all(&status)?;
+        } else {
+            std::fs::write(&hooks, b"existing hooks obstruction")?;
+        }
+
+        let args = ["team", "init", "fixture-team"];
+        let failed = project.run(&args);
+        assert_eq!(failed.exit_code, 1, "{}", failed.combined_output());
+        assert!(!config.exists());
+        assert!(!hooks.join("post-merge").exists());
+        assert!(!hooks.join("post-checkout").exists());
+        if block_status {
+            assert!(status.is_dir());
+            assert!(!hooks.exists());
+            std::fs::remove_dir(&status)?;
+        } else {
+            assert!(!root.join(".omg").exists());
+            assert_eq!(std::fs::read(&hooks)?, b"existing hooks obstruction");
+            std::fs::remove_file(&hooks)?;
+        }
+
+        let retry = project.run(&args);
+        assert!(retry.success, "{}", retry.combined_output());
+        assert!(config.is_file() && status.is_file());
+        assert!(hooks.join("post-merge").is_file());
+        assert!(hooks.join("post-checkout").is_file());
+        project.close_checked();
+    }
+    Ok(())
+}
+
 #[cfg(feature = "license")]
 fn account_expiry_output_fixture(expiry: &str) -> anyhow::Result<String> {
     let project = common::TestProject::new();

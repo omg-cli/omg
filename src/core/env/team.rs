@@ -8,6 +8,7 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::io::{ErrorKind, Write as _};
 use std::path::{Path, PathBuf};
 
 use super::fingerprint::EnvironmentState;
@@ -133,6 +134,107 @@ pub struct TeamWorkspace {
     config: Option<TeamConfig>,
 }
 
+/// Tracks only paths created by this init attempt. Open handles retain their
+/// identity until commit so rollback can distinguish replacements.
+#[derive(Default)]
+struct TeamInitFiles {
+    files: Vec<(PathBuf, same_file::Handle)>,
+    directories: Vec<(PathBuf, same_file::Handle)>,
+}
+
+impl TeamInitFiles {
+    fn ensure_dir(&mut self, path: &Path) -> Result<()> {
+        match std::fs::create_dir(path) {
+            Ok(()) => {
+                let owner = same_file::Handle::from_path(path)?;
+                self.directories.push((path.to_path_buf(), owner));
+                crate::core::safe_ops::sync_parent_directory_sync(path)
+            }
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+                anyhow::ensure!(
+                    path.symlink_metadata()?.is_dir(),
+                    "{} must be a real directory",
+                    path.display()
+                );
+                Ok(())
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn publish(&mut self, path: &Path, content: &[u8], hook: bool) -> Result<()> {
+        if hook && path.symlink_metadata().is_ok() {
+            return Ok(());
+        }
+        let parent = path.parent().context("Team init path has no parent")?;
+        let mut builder = tempfile::Builder::new();
+        #[cfg(unix)]
+        if hook {
+            use std::os::unix::fs::PermissionsExt as _;
+            builder.permissions(std::fs::Permissions::from_mode(0o755));
+        }
+        let mut file = builder.tempfile_in(parent)?;
+        file.write_all(content)?;
+        file.as_file().sync_all()?;
+        let owner = same_file::Handle::from_file(file.as_file().try_clone()?)?;
+        match file.persist_noclobber(path) {
+            Ok(_) => self.files.push((path.to_path_buf(), owner)),
+            Err(error) if error.error.kind() == ErrorKind::AlreadyExists => {
+                if hook {
+                    return Ok(());
+                }
+                anyhow::bail!(
+                    "{} already exists; move it aside to initialize a new team",
+                    path.display()
+                );
+            }
+            Err(error) => {
+                return Err(error.error)
+                    .with_context(|| format!("Failed to publish {}", path.display()));
+            }
+        }
+        crate::core::safe_ops::sync_parent_directory_sync(path)
+    }
+
+    fn commit(mut self) {
+        self.files.clear();
+        self.directories.clear();
+    }
+
+    fn remove_owned(path: &Path, owner: same_file::Handle, directory: bool) -> Result<()> {
+        match path.symlink_metadata() {
+            Ok(metadata) if metadata.file_type().is_symlink() => return Ok(()),
+            Ok(_) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        }
+        if same_file::Handle::from_path(path)? == owner {
+            if directory {
+                std::fs::remove_dir(path)?;
+            } else {
+                std::fs::remove_file(path)?;
+            }
+            crate::core::safe_ops::sync_parent_directory_sync(path)?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for TeamInitFiles {
+    fn drop(&mut self) {
+        for (path, owner) in self.files.drain(..).rev() {
+            if let Err(error) = Self::remove_owned(&path, owner, false) {
+                tracing::warn!(path = %path.display(), %error, "Could not roll back team init file");
+            }
+        }
+        for (path, owner) in self.directories.drain(..).rev() {
+            if let Err(error) = Self::remove_owned(&path, owner, true) {
+                tracing::warn!(path = %path.display(), %error, "Could not roll back team init directory");
+            }
+        }
+    }
+}
+
 impl TeamWorkspace {
     /// Create a new team workspace manager.
     ///
@@ -239,7 +341,7 @@ impl TeamWorkspace {
                 existing.team_id
             );
         }
-        self.ensure_config_dir()?;
+        Self::validate_config_dir(&self.root)?;
 
         let config = TeamConfig {
             team_id: team_id.to_string(),
@@ -267,12 +369,17 @@ impl TeamWorkspace {
 
         let status_json = serde_json::to_vec_pretty(&status)?;
         let content = toml::to_string_pretty(&config)?;
-        self.install_git_hooks()?;
+        let mut files = TeamInitFiles::default();
+        files
+            .ensure_dir(&self.config_dir())
+            .context("Failed to create team config directory")?;
+        files.publish(&self.status_path(), &status_json, false)?;
+        self.install_git_hooks(&mut files)?;
 
         // Publish the config last. Its presence is the initialization marker,
-        // so a failed hook install or status write cannot leave one behind.
-        crate::core::safe_ops::atomic_write_file_sync(self.status_path(), status_json)?;
-        crate::core::safe_ops::atomic_write_file_sync(self.config_path(), content)?;
+        // so other operations do not see the workspace until init commits.
+        files.publish(&self.config_path(), content.as_bytes(), false)?;
+        files.commit();
 
         self.config = Some(config);
         Ok(())
@@ -443,13 +550,11 @@ impl TeamWorkspace {
     }
 
     /// Install git hooks for auto-sync
-    fn install_git_hooks(&self) -> Result<()> {
+    fn install_git_hooks(&self, files: &mut TeamInitFiles) -> Result<()> {
         let git_dir = self.root.join(".git");
-        match std::fs::metadata(&git_dir) {
-            Ok(metadata) if metadata.is_file() => {
-                tracing::warn!(
-                    "Skipping team Git hooks: .git is a file, not a local hooks directory"
-                );
+        match git_dir.symlink_metadata() {
+            Ok(metadata) if !metadata.is_dir() => {
+                tracing::warn!("Skipping team Git hooks: .git is not a local directory");
                 return Ok(());
             }
             Ok(_) => {}
@@ -468,13 +573,14 @@ impl TeamWorkspace {
         let omg = crate::hooks::posix_single_quoted(&omg);
 
         let hooks_dir = git_dir.join("hooks");
-        std::fs::create_dir_all(&hooks_dir)
+        files
+            .ensure_dir(&hooks_dir)
             .with_context(|| format!("Failed to create hooks dir {}", hooks_dir.display()))?;
 
         // Never overwrite an existing hook: it may belong to another tool.
-        Self::write_hook_if_absent(
+        files.publish(
             &hooks_dir.join("post-merge"),
-            &format!(
+            format!(
                 r#"#!/bin/sh
 # OMG Team Sync Hook
 # Auto-check for environment drift after git pull
@@ -484,12 +590,13 @@ if [ -f "omg.lock" ]; then
     {omg} env check 2>/dev/null || echo "⚠️  OMG: Environment drift detected! Run 'omg env check' for details."
 fi
 "#,
-            ),
+            ).as_bytes(),
+            true,
         )?;
 
-        Self::write_hook_if_absent(
+        files.publish(
             &hooks_dir.join("post-checkout"),
-            &format!(
+            format!(
                 r#"#!/bin/sh
 # OMG Team Sync Hook
 # Auto-check for environment drift after git checkout
@@ -498,33 +605,11 @@ if [ -f "omg.lock" ]; then
     {omg} env check 2>/dev/null || true
 fi
 "#,
-            ),
+            )
+            .as_bytes(),
+            true,
         )?;
 
-        Ok(())
-    }
-
-    /// Write a hook script and mark it executable, unless any entry already exists.
-    fn write_hook_if_absent(path: &Path, content: &str) -> Result<()> {
-        #[cfg(unix)]
-        {
-            crate::core::safe_ops::write_executable(path, content.as_bytes(), false)?;
-        }
-        #[cfg(not(unix))]
-        {
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(path)
-            {
-                Ok(mut file) => {
-                    use std::io::Write as _;
-                    file.write_all(content.as_bytes())?;
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(error) => return Err(error.into()),
-            }
-        }
         Ok(())
     }
 
@@ -628,6 +713,7 @@ mod tests {
         );
         let gitfile = root.join(".git");
         let original_gitfile = std::fs::read(&gitfile)?;
+        let private_git_dir = String::from_utf8(git(&root, &["rev-parse", "--absolute-git-dir"]))?;
 
         TeamWorkspace::new(&root)?.init("worktree-team", "Worktree Team")?;
 
@@ -643,6 +729,7 @@ mod tests {
             b"existing shared hook"
         );
         assert!(!shared_hooks.join("post-checkout").exists());
+        assert!(!Path::new(private_git_dir.trim_end()).join("hooks").exists());
 
         let config = std::fs::read(reopened.config_path())?;
         let status = std::fs::read(reopened.status_path())?;
@@ -687,6 +774,101 @@ mod tests {
             use std::os::unix::fs::PermissionsExt as _;
             assert_ne!(installed.metadata()?.permissions().mode() & 0o111, 0);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn init_can_retry_after_status_or_config_publication_fails() -> Result<()> {
+        for block_status in [true, false] {
+            let repository = git_workspace();
+            let root = repository.path();
+            let hooks = root.join(".git/hooks");
+            std::fs::create_dir_all(&hooks)?;
+            let existing_hook = hooks.join("post-merge");
+            std::fs::write(&existing_hook, b"original hook")?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                std::fs::set_permissions(&existing_hook, std::fs::Permissions::from_mode(0o711))?;
+            }
+
+            let mut workspace = TeamWorkspace::new(root)?;
+            std::fs::create_dir(workspace.config_dir())?;
+            let unrelated = workspace.config_dir().join("unrelated");
+            std::fs::write(&unrelated, b"existing workspace data")?;
+            let (blocked, unpublished) = if block_status {
+                (workspace.status_path(), workspace.config_path())
+            } else {
+                (workspace.config_path(), workspace.status_path())
+            };
+            std::fs::create_dir(&blocked)?;
+            std::fs::write(blocked.join("keep"), b"existing obstruction data")?;
+
+            let error = workspace.init("retry-team", "Retry Team").unwrap_err();
+            assert!(format!("{error:#}").contains(blocked.to_str().unwrap()));
+            assert!(!workspace.is_team_workspace());
+            assert!(!hooks.join("post-checkout").exists());
+            assert_eq!(std::fs::read(&existing_hook)?, b"original hook");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                assert_eq!(
+                    existing_hook.metadata()?.permissions().mode() & 0o777,
+                    0o711
+                );
+            }
+            assert_eq!(std::fs::read(&unrelated)?, b"existing workspace data");
+            assert_eq!(
+                std::fs::read(blocked.join("keep"))?,
+                b"existing obstruction data"
+            );
+            assert!(!unpublished.exists());
+
+            std::fs::remove_file(blocked.join("keep"))?;
+            std::fs::remove_dir(&blocked)?;
+            workspace.init("retry-team", "Retry Team")?;
+            assert_eq!(
+                TeamWorkspace::new(root)?.load_status()?.config.team_id,
+                "retry-team"
+            );
+            assert!(hooks.join("post-checkout").is_file());
+            assert_eq!(std::fs::read(&existing_hook)?, b"original hook");
+            assert_eq!(std::fs::read(&unrelated)?, b"existing workspace data");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn init_refuses_to_overwrite_status_without_a_team_config() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut workspace = TeamWorkspace::new(directory.path())?;
+        std::fs::create_dir(workspace.config_dir())?;
+        std::fs::write(workspace.status_path(), b"pre-existing status")?;
+
+        let error = workspace.init("other-team", "Other Team").unwrap_err();
+        assert!(error.to_string().contains("already exists"));
+        assert_eq!(
+            std::fs::read(workspace.status_path())?,
+            b"pre-existing status"
+        );
+        assert!(!workspace.config_path().exists());
+        Ok(())
+    }
+
+    #[test]
+    fn init_rollback_leaves_replacement_at_a_previously_published_path() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("post-merge");
+        let moved = directory.path().join("moved");
+        let mut files = TeamInitFiles::default();
+        files.publish(&path, b"published hook", true)?;
+        std::fs::rename(&path, &moved)?;
+        std::fs::write(&path, b"replacement")?;
+
+        drop(files);
+
+        assert_eq!(std::fs::read(path)?, b"replacement");
+        assert_eq!(std::fs::read(moved)?, b"published hook");
         Ok(())
     }
 
