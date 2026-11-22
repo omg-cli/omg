@@ -3565,7 +3565,6 @@ dependencies = [
  "rustc-hash",
  "rustix",
  "ruzstd",
- "same-file",
  "scopeguard",
  "semver",
  "sentry",

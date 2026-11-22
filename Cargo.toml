@@ -242,8 +242,7 @@ which = "8.0"
 # Semver handling
 semver = "1.0.27"
 
-# Temporary files and file identity
-same-file = "1.0.6"
+# Tempfile handling
 tempfile = "3.25.0"
 
 # URL encoding (for DNF/COPR API)
