@@ -306,14 +306,21 @@ impl TeamWorkspace {
             config_path.display()
         );
         self.config = Some(config);
-        if let Err(error) = crate::core::safe_ops::sync_parent_directory_sync(&config_path) {
-            tracing::warn!(%error, "Team initialized, but syncing the config directory failed");
-        } else if let Some(hooks_dir) = hooks_dir
-            && let Err(error) = self.install_git_hooks(&hooks_dir)
-        {
-            tracing::warn!(%error, "Team initialized, but could not install all Git hooks");
-        }
+        self.finish_init(&config_path, hooks_dir.as_deref());
         Ok(())
+    }
+
+    fn finish_init(&self, config_path: &Path, hooks_dir: Option<&Path>) {
+        let result =
+            crate::core::safe_ops::sync_parent_directory_sync(config_path).and_then(|()| {
+                match hooks_dir {
+                    Some(hooks_dir) => self.install_git_hooks(hooks_dir),
+                    None => Ok(()),
+                }
+            });
+        if let Err(error) = result {
+            tracing::warn!(%error, "Team initialized, but post-commit setup failed");
+        }
     }
 
     fn publish_init_file(path: &Path, content: &[u8]) -> Result<bool> {
@@ -494,33 +501,31 @@ impl TeamWorkspace {
         self.root.join(".git").exists()
     }
 
+    fn git_path_metadata(path: &Path) -> Result<Option<std::fs::Metadata>> {
+        match path.symlink_metadata() {
+            Ok(metadata) => Ok(Some(metadata)),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+            Err(error) => {
+                Err(error).with_context(|| format!("Failed to inspect {}", path.display()))
+            }
+        }
+    }
+
     fn preflight_git_hooks(&self) -> Result<Option<PathBuf>> {
         let git_dir = self.root.join(".git");
-        match git_dir.symlink_metadata() {
-            Ok(metadata) if !metadata.is_dir() => {
-                tracing::warn!("Skipping team Git hooks: .git is not a local directory");
-                return Ok(None);
-            }
-            Ok(_) => {}
-            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("Failed to inspect {}", git_dir.display()));
-            }
+        let Some(metadata) = Self::git_path_metadata(&git_dir)? else {
+            return Ok(None);
+        };
+        if !metadata.is_dir() {
+            tracing::warn!("Skipping team Git hooks: .git is not a local directory");
+            return Ok(None);
         }
         let hooks_dir = git_dir.join("hooks");
-        match hooks_dir.symlink_metadata() {
-            Ok(metadata) if metadata.is_dir() => {}
-            Ok(_) => anyhow::bail!(
-                "Failed to create hooks dir {}: not a real directory",
-                hooks_dir.display()
-            ),
-            Err(error) if error.kind() == ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("Failed to inspect {}", hooks_dir.display()));
-            }
-        }
+        anyhow::ensure!(
+            Self::git_path_metadata(&hooks_dir)?.is_none_or(|metadata| metadata.is_dir()),
+            "Failed to create hooks dir {}: not a real directory",
+            hooks_dir.display()
+        );
         Ok(Some(hooks_dir))
     }
 
@@ -704,7 +709,9 @@ mod tests {
         let original_gitfile = std::fs::read(&gitfile)?;
         let private_git_dir = String::from_utf8(git(&root, &["rev-parse", "--absolute-git-dir"]))?;
 
-        TeamWorkspace::new(&root)?.init("worktree-team", "Worktree Team")?;
+        let mut workspace = TeamWorkspace::new(&root)?;
+        assert!(workspace.is_git_repo());
+        workspace.init("worktree-team", "Worktree Team")?;
 
         let mut reopened = TeamWorkspace::new(&root)?;
         let status = reopened.load_status()?;
@@ -871,6 +878,66 @@ mod tests {
 
         workspace.init("original-team", "Original")?;
         assert_eq!(std::fs::read(workspace.status_path())?, staged);
+        Ok(())
+    }
+
+    #[test]
+    fn init_preflight_does_not_treat_git_stat_errors_as_absence() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join("root");
+        let mut workspace = TeamWorkspace::new(&root)?;
+        assert!(!workspace.is_git_repo());
+        std::fs::write(&root, b"not a directory")?;
+
+        let error = workspace.init("team", "Team").unwrap_err();
+        assert!(error.to_string().contains("Failed to inspect"));
+        assert_eq!(std::fs::read(root)?, b"not a directory");
+        assert!(!workspace.is_team_workspace());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn init_publication_errors_other_than_collision_are_reported() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("x".repeat(1024));
+        let error = TeamWorkspace::publish_init_file(&path, b"state").unwrap_err();
+        assert!(error.to_string().contains("Failed to publish"));
+        assert_eq!(std::fs::read_dir(directory.path())?.count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn init_post_commit_hook_failure_leaves_committed_state_and_the_obstruction() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut workspace = TeamWorkspace::new(directory.path())?;
+        workspace.init("team", "Team")?;
+        let config = std::fs::read(workspace.config_path())?;
+        let status = std::fs::read(workspace.status_path())?;
+        let git = directory.path().join(".git");
+        std::fs::create_dir(&git)?;
+        let hooks_dir = workspace.preflight_git_hooks()?.unwrap();
+        std::fs::write(&hooks_dir, b"existing obstruction")?;
+
+        workspace.finish_init(&workspace.config_path(), Some(&hooks_dir));
+
+        assert_eq!(std::fs::read(hooks_dir)?, b"existing obstruction");
+        assert_eq!(std::fs::read(workspace.config_path())?, config);
+        assert_eq!(std::fs::read(workspace.status_path())?, status);
+        assert!(TeamWorkspace::new(directory.path())?.is_team_workspace());
+        Ok(())
+    }
+
+    #[test]
+    fn init_creates_missing_hooks_directory_after_committing() -> Result<()> {
+        let repository = tempfile::tempdir()?;
+        git(repository.path(), &["init", "--quiet", "--template="]);
+        let hooks = repository.path().join(".git/hooks");
+        assert!(!hooks.exists());
+        TeamWorkspace::new(repository.path())?.init("team", "Team")?;
+        assert!(TeamWorkspace::new(repository.path())?.is_team_workspace());
+        assert!(hooks.join("post-merge").is_file());
+        assert!(hooks.join("post-checkout").is_file());
         Ok(())
     }
 
