@@ -339,6 +339,12 @@ impl HomebrewPackageManager {
         self.prefix.join("bin").join("brew")
     }
 
+    pub(super) async fn inventory_counts(&self) -> Result<(usize, usize, usize)> {
+        let packages = self.read_installed_packages().await?;
+        let explicit = packages.iter().filter(|p| p.installed_on_request).count();
+        Ok((packages.len(), explicit, 0))
+    }
+
     /// Match Homebrew's Cellar selection: `brew --cellar` reports
     /// `$HOMEBREW_PREFIX/Cellar` on every architecture, so the prefix Cellar
     /// is the inventory location. On Intel the Homebrew git checkout lives at
@@ -1270,14 +1276,7 @@ impl PackageManager for HomebrewPackageManager {
         _fast: bool,
     ) -> Pin<Box<dyn Future<Output = Result<(usize, usize, usize, usize)>> + Send + '_>> {
         Box::pin(async move {
-            let packages = self.read_installed_packages().await?;
-            let total = packages.len();
-            let explicit = packages.iter().filter(|p| p.installed_on_request).count();
-
-            // Homebrew doesn't have an orphans concept like pacman; report
-            // zero rather than guessing.
-            let orphans = 0;
-
+            let (total, explicit, orphans) = self.inventory_counts().await?;
             let updates = self
                 .list_updates()
                 .await
@@ -1805,6 +1804,7 @@ mod tests {
                 .build()?,
         };
 
+        assert_eq!(manager.inventory_counts().await?, (0, 0, 0));
         let error = manager
             .get_status(false)
             .await
