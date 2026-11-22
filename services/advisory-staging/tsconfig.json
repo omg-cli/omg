@@ -1,0 +1,13 @@
+{
+    "extends": "../advisories/tsconfig.json",
+    "compilerOptions": {
+        "types": ["bun"],
+        "typeRoots": ["../advisories/node_modules/@types"]
+    },
+    "include": [
+        "*.ts",
+        "test/**/*.ts",
+        "../advisories/node_modules/@cloudflare/workers-types/index.d.ts",
+        "../advisories/worker-configuration.d.ts"
+    ]
+}

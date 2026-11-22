@@ -1,32 +1,7 @@
 import { expect, test } from "bun:test";
-import { operatorPost, recoverCheckpoint, readCheckpoint, requireCheckpointTransport, stageOperatorFetcher, verifyIngestReply, proofProgress, type OperatorFetcher } from "../scripts/operator";
-import { CANONICAL_ORIGIN, STAGE_ORIGIN } from "../src/stage-identity";
+import { operatorPost, recoverCheckpoint, readCheckpoint, verifyIngestReply, proofProgress, type OperatorFetcher } from "../scripts/operator";
 
 const binding = { digest:"a".repeat(64), endpoint:"https://advisories.example", instance_id:"1".repeat(32), session_id:"afb732ac-68e4-4549-98ec-e89224449b75" };
-
-test("stage credentials cannot leave the fixed protected origin or follow a redirect", async () => {
-    let calls = 0;
-    const init = { method: "POST", redirect: "error" } satisfies RequestInit;
-    const fetcher = stageOperatorFetcher("fixture-id", "fixture-secret", async (input, options) => {
-        calls++;
-        expect(String(input)).toBe(STAGE_ORIGIN + "/internal/ingest");
-        expect(options?.redirect).toBe("error");
-        expect(new Headers(options?.headers).get("cf-access-client-secret")).toBe("fixture-secret");
-        return Response.redirect(CANONICAL_ORIGIN + "/internal/ingest");
-    });
-    for (const url of [
-        CANONICAL_ORIGIN + "/internal/ingest", "https://other.example/internal/ingest",
-        STAGE_ORIGIN + "/internal/ingest?target=other", STAGE_ORIGIN + "/v1/status",
-    ]) await expect(fetcher(new URL(url), init)).rejects.toThrow("destination refused");
-    await expect(fetcher(new URL(STAGE_ORIGIN + "/internal/ingest"), { ...init, redirect: "follow" })).rejects.toThrow("destination refused");
-    expect(calls).toBe(0);
-    await expect(fetcher(new URL(STAGE_ORIGIN + "/internal/ingest"), init)).rejects.toThrow("redirect refused");
-    expect(calls).toBe(1);
-    const checkpoint = recoverCheckpoint({ ...binding, endpoint: CANONICAL_ORIGIN });
-    expect(() => requireCheckpointTransport(checkpoint, true)).toThrow("transport");
-    expect(() => requireCheckpointTransport({ ...checkpoint, transport_endpoint: STAGE_ORIGIN }, false)).toThrow("transport");
-    expect(() => requireCheckpointTransport({ ...checkpoint, transport_endpoint: STAGE_ORIGIN }, true)).not.toThrow();
-});
 test("lost state recovery replays from zero with exact supplied session and archive bindings", () => {
     const recovered = recoverCheckpoint(binding);
     expect(recovered).toEqual({ digest:binding.digest, next_entry:0, accepted:0, exhausted:false, finished_at:null, baseline:binding });

@@ -1,33 +1,8 @@
 import { boundedBody, date, object } from "../src/domain";
-import { STAGE_ORIGIN, STAGE_POST_PATHS } from "../src/stage-identity";
 import type { ArchiveState } from "./archive";
 export type BaselineBinding = { digest:string; endpoint:string; instance_id:string; session_id:string };
 export type Checkpoint = ArchiveState & { baseline:BaselineBinding };
 export type OperatorFetcher = (input:Parameters<typeof fetch>[0],init?:Parameters<typeof fetch>[1])=>ReturnType<typeof fetch>;
-
-export function stageOperatorFetcher(clientId: string | undefined, clientSecret: string | undefined, fetcher: OperatorFetcher = fetch): OperatorFetcher {
-    if (!clientId || !clientSecret) throw new Error("stage Access credentials required");
-    return async (input, init) => {
-        if (!(input instanceof URL) || input.origin !== STAGE_ORIGIN || input.username || input.password ||
-            input.search || input.hash || !STAGE_POST_PATHS.has(input.pathname) ||
-            init?.method !== "POST" || init.redirect !== "error") throw new Error("stage credential destination refused");
-        const headers = new Headers(init.headers);
-        headers.set("CF-Access-Client-Id", clientId);
-        headers.set("CF-Access-Client-Secret", clientSecret);
-        const reply = await fetcher(input, { ...init, headers });
-        if (reply.redirected || (reply.status >= 300 && reply.status < 400) || (reply.url && reply.url !== input.href)) {
-            await reply.body?.cancel();
-            throw new Error("stage redirect refused");
-        }
-        return reply;
-    };
-}
-
-export function requireCheckpointTransport(saved: Record<string, unknown>, stage: boolean) {
-    if (stage ? saved.transport_endpoint !== STAGE_ORIGIN : "transport_endpoint" in saved) {
-        throw new Error("checkpoint transport does not match operator mode");
-    }
-}
 export function baselineBinding(value:unknown, digest:string, endpoint:string):BaselineBinding {
     const input=object(value);
     if(input.digest!==digest || input.endpoint!==endpoint || !/^[a-f0-9]{64}$/.test(digest)

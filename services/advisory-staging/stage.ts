@@ -1,8 +1,8 @@
-import { refresh, type Fetcher } from "./ingestion";
-import { r2Raw } from "./raw-pack";
-import { handle } from "./service";
+import { refresh, type Fetcher } from "../advisories/src/ingestion";
+import { r2Raw } from "../advisories/src/raw-pack";
+import { handle } from "../advisories/src/service";
 import { BASELINE_PATHS, CANONICAL_ORIGIN, STAGE_MODE, STAGE_ORIGIN, STAGE_POST_PATHS } from "./stage-identity";
-import { d1Sql, Store } from "./storage";
+import { d1Sql, Store } from "../advisories/src/storage";
 
 type StagePolicy = {
     STAGE_MODE?: string;

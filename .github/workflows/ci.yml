@@ -197,6 +197,9 @@ jobs:
           bun run --cwd services/advisories test
           bun run --cwd services/advisories check
           bun run --cwd services/advisories dry-run
+          bun --cwd services/advisories tsc --project ../advisory-staging/tsconfig.json
+          bun test services/advisory-staging/test
+          bun --cwd services/advisories wrangler deploy --dry-run --config ../advisory-staging/wrangler.example.json
 
       - name: Verify installer destination safety
         if: matrix.shard == 0
