@@ -3640,7 +3640,10 @@ mod tests {
             "Repository keyword".to_owned(),
         );
         assert_eq!(search("widget.lib"), [available.clone(), installed.clone()]);
-        assert_eq!(search("widget.lib.x86_64"), [installed.clone()]);
+        assert_eq!(
+            search("widget.lib.x86_64").as_slice(),
+            std::slice::from_ref(&installed)
+        );
         assert_eq!(search("repository keyword"), [available.clone(), installed]);
         assert_eq!(search("widget.lib.i686"), [available]);
         assert_eq!(
