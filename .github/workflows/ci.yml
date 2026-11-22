@@ -22,10 +22,14 @@ on:
         description: "Use an isolated R2 cache; rerun the same run for a warm comparison"
         type: boolean
         default: false
+      release-candidate:
+        description: "Authorize one release from main: vVERSION@FULL_COMMIT_SHA (leave blank for CI only)"
+        type: string
+        default: ""
 
 concurrency:
-  # An isolated experiment must never replace a pending main push.
-  group: ${{ inputs.isolated-cache == true && format('ci-isolated-cache-{0}', github.run_id) || format('ci-{0}', github.head_ref || github.ref) }}
+  # Experiments and release dispatches must not replace a pending main push.
+  group: ${{ inputs['release-candidate'] != '' && format('release-ci-{0}', github.ref) || inputs.isolated-cache == true && format('ci-isolated-cache-{0}', github.run_id) || format('ci-{0}', github.head_ref || github.ref) }}
   # PRs cancel superseded runs; active main pushes keep running.
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
@@ -2276,13 +2280,13 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "All required checks passed!" >> $GITHUB_STEP_SUMMARY
 
-  # This definition grants write permissions only to the push-to-main job.
+  # This definition grants write permissions only to the explicit main release job.
   # A collaborator who can modify workflows can also change this condition;
   # repository rules, not this editable condition, govern that authority.
   release-tag:
     name: "Tag Release"
     needs: [quick-gate, portable, linux-matrix, sandbox-cancellation, feature-intersections, macos, ubuntu, ci-success]
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && github.run_attempt == '1' && inputs['release-candidate'] != ''
     runs-on: ubuntu-24.04
     timeout-minutes: 100
     permissions:
@@ -2297,6 +2301,7 @@ jobs:
       - name: Tag Cargo.toml version when all platform builds succeeded
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_CANDIDATE: ${{ inputs['release-candidate'] }}
           LINUX_MATRIX: ${{ needs.linux-matrix.result }}
           SANDBOX_CANCELLATION: ${{ needs.sandbox-cancellation.result }}
           FEATURE_INTERSECTIONS: ${{ needs.feature-intersections.result }}
@@ -2316,24 +2321,43 @@ jobs:
           test -n "$VERSION"
           TAG="v${VERSION}"
 
+          if [[ "$GITHUB_EVENT_NAME" != workflow_dispatch || "$GITHUB_REF" != refs/heads/main \
+             || "$GITHUB_RUN_ATTEMPT" != 1 \
+             || "$RELEASE_CANDIDATE" != "$TAG@$GITHUB_SHA" ]]; then
+            echo "::error::Release authorization requires a fresh main dispatch and must match its Cargo.toml version and full commit SHA"
+            exit 1
+          fi
+
           if git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null; then
             echo "Tag $TAG already exists; bump Cargo.toml to cut a new alpha"
             exit 0
           fi
 
+          scripts/require-workflow-success.sh ci.yml "$GITHUB_SHA" CI
           scripts/require-workflow-success.sh benchmark.yml "$GITHUB_SHA" Benchmark
           # Version tags are immutable. Validate the other workflows BEFORE
           # creating a tag, so a failed candidate cannot consume a version.
-          # CI's own platform jobs are required through this job's needs.
           scripts/require-workflow-success.sh audit.yml "$GITHUB_SHA" "Security Audit"
           scripts/require-workflow-success.sh secrets.yml "$GITHUB_SHA" "Secret Scanning"
           scripts/require-workflow-success.sh codeql.yml "$GITHUB_SHA" CodeQL
           scripts/require-workflow-success.sh coverage.yml "$GITHUB_SHA" Coverage
           scripts/require-workflow-success.sh docker-e2e.yml "$GITHUB_SHA" "Docker E2E"
-          # CI Success already requires this run's staged QEMU verification.
+
+          require_current_main() {
+            local live_main
+            if ! live_main=$(git ls-remote --exit-code --refs origin refs/heads/main); then
+              echo "::error::Cannot read live refs/heads/main; refusing release"
+              return 1
+            fi
+            if [[ "$live_main" != "$GITHUB_SHA"$'\trefs/heads/main' ]]; then
+              echo "::error::Live refs/heads/main does not match the authorized release commit"
+              return 1
+            fi
+          }
 
           # Archive membership comes from the publisher proof, never local counts.
           python3 scripts/advisory-baseline.py status
+          require_current_main
           git tag "$TAG" "$GITHUB_SHA"
           git push origin "refs/tags/${TAG}"
           if ! git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null; then
@@ -2345,5 +2369,6 @@ jobs:
 
           # GITHUB_TOKEN tag pushes do not start other workflows. Dispatch
           # Release explicitly so GitHub Latest is not left on a 7-month-old tag.
+          require_current_main
           gh workflow run release.yml --ref "$TAG" -f dry_run=false
           echo "Dispatched Release for $TAG"

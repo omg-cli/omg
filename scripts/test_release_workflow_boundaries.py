@@ -65,14 +65,124 @@ class ReleaseWorkflowBoundaryTests(unittest.TestCase):
         self.assertIn('--repo "$source_signer"', script)
         self.assertIn('--signer-workflow "$source_signer/.github/workflows/release.yml"', script)
 
-    def test_immutable_tag_waits_for_other_workflows_without_waiting_on_itself(self):
-        block = job_block((WORKFLOWS / 'ci.yml').read_text(), 'release-tag')
+    def test_immutable_tag_requires_explicit_dispatch_and_push_evidence(self):
+        ci = (WORKFLOWS / 'ci.yml').read_text()
+        block = job_block(ci, 'release-tag')
         tag = block.index('git tag "$TAG" "$GITHUB_SHA"')
-        for workflow in ('benchmark.yml', 'audit.yml', 'secrets.yml', 'codeql.yml',
+        self.assertIn("if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' "
+                      "&& github.run_attempt == '1' && inputs['release-candidate'] != ''", block)
+        self.assertIn("RELEASE_CANDIDATE: ${{ inputs['release-candidate'] }}", block)
+        self.assertRegex(ci, r'(?m)^      release-candidate:\n        description: [^\n]+\n'
+                             r'        type: string\n        default: ""$')
+        self.assertIn("--event push", (ROOT / 'scripts/require-workflow-success.sh').read_text())
+        for workflow in ('ci.yml', 'benchmark.yml', 'audit.yml', 'secrets.yml', 'codeql.yml',
                          'coverage.yml', 'docker-e2e.yml'):
             self.assertLess(block.index(f'scripts/require-workflow-success.sh {workflow}'), tag)
-        self.assertNotIn('scripts/require-workflow-success.sh ci.yml', block)
         self.assertIn('ci-success]', block)
+
+    def test_release_concurrency_cannot_collide_with_pr_branch_name(self):
+        ci = (WORKFLOWS / 'ci.yml').read_text()
+        group = re.search(r'(?m)^  group: (.*)$', ci)[1]
+        release_format = re.search(r"format\('([^']+)', github.ref\)", group)[1]
+        pr_format = re.search(r"format\('([^']+)', github.head_ref \|\| github.ref\)", group)[1]
+        self.assertTrue(release_format.startswith('release-ci-'))
+        self.assertTrue(pr_format.startswith('ci-'))
+        release_group = release_format.format('refs/heads/main')
+        for branch in ('main', 'ci-authorized-release-refs/heads/main', 'authorized-release-refs/heads/main',
+                       release_group, release_group.upper(), 'refs/heads/main'):
+            with self.subTest(branch=branch):
+                self.assertNotEqual(release_group.casefold(), pr_format.format(branch).casefold())
+
+    def test_release_dispatch_cannot_tag_without_exact_authorization_and_push_ci(self):
+        ci = (WORKFLOWS / 'ci.yml').read_text()
+        script = step_script(job_block(ci, 'release-tag'),
+                             'Tag Cargo.toml version when all platform builds succeeded')
+        sha = 'a' * 40
+        approved = f'v0.1.225@{sha}'
+        main = 'refs/heads/main'
+        all_lookups = ['ci.yml', 'benchmark.yml', 'audit.yml', 'secrets.yml', 'codeql.yml',
+                       'coverage.yml', 'docker-e2e.yml']
+        for label, overrides, expected_lookups, tagged, dispatched in (
+            ('push', {'GITHUB_EVENT_NAME': 'push'}, [], False, False),
+            ('pull request', {'GITHUB_EVENT_NAME': 'pull_request', 'GITHUB_REF': 'refs/pull/1/merge'},
+             [], False, False),
+            ('off-main', {'GITHUB_REF': 'refs/heads/other'}, [], False, False),
+            ('no authorization', {'RELEASE_CANDIDATE': ''}, [], False, False),
+            ('wrong version', {'RELEASE_CANDIDATE': f'v0.1.224@{sha}'}, [], False, False),
+            ('wrong SHA', {'RELEASE_CANDIDATE': 'v0.1.225@' + 'b' * 40}, [], False, False),
+            ('short SHA', {'RELEASE_CANDIDATE': f'v0.1.225@{sha[:7]}'}, [], False, False),
+            ('metacharacters', {'RELEASE_CANDIDATE': '$(touch injected)'}, [], False, False),
+            ('replay', {'GITHUB_RUN_ATTEMPT': '2'}, [], False, False),
+            ('missing attempt', {'GITHUB_RUN_ATTEMPT': ''}, [], False, False),
+            ('failed push CI', {'PUSH_CI': 'failure'}, ['ci.yml'], False, False),
+            ('drift before tag', {'BEFORE_TAG': 'drifted'}, all_lookups, False, False),
+            ('unreadable before tag', {'BEFORE_TAG': 'unreadable'}, all_lookups, False, False),
+            ('drift after tag', {'AFTER_TAG': 'drifted'}, all_lookups, True, False),
+            ('unreadable after tag', {'AFTER_TAG': 'unreadable'}, all_lookups, True, False),
+            ('exact fresh authorization', {}, all_lookups, True, True),
+        ):
+            with self.subTest(label=label), \
+                    tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                (root / 'Cargo.toml').write_text('version = "0.1.225"\n', encoding='utf-8')
+                fixtures = {
+                    'git': 'case "$1" in\n'
+                           '  ls-remote)\n'
+                           '    if [ "$*" = "ls-remote --exit-code --refs origin refs/heads/main" ]; then\n'
+                           '      state=$BEFORE_TAG\n'
+                           '      if [ -f pushed ]; then state=$AFTER_TAG; fi\n'
+                           '      printf "%s\\n" "$state" >> main-reads\n'
+                           '      test -f archive-checked || exit 98\n'
+                           '      case "$state" in\n'
+                           '        unreadable) exit 128;;\n'
+                           '        drifted) printf "%040d\\trefs/heads/main\\n" 0;;\n'
+                           '        current) printf "%s\\trefs/heads/main\\n" "$GITHUB_SHA";;\n'
+                           '        *) exit 99;;\n'
+                           '      esac\n'
+                           '    else test -f tagged; fi;;\n'
+                           '  tag) printf "%s\\n" "$*" > tagged;;\n'
+                           '  push) printf "%s\\n" "$*" > pushed;;\n'
+                           '  *) exit 99;;\n'
+                           'esac\n',
+                    'gh': 'printf "%s\\n" "$*" > dispatched\n',
+                    'python3': 'test "$*" = "scripts/advisory-baseline.py status" && touch archive-checked\n',
+                    'scripts/require-workflow-success.sh': 'printf "%s %s\\n" "$1" "$2" >> lookups\n'
+                                                           'test "$1" != ci.yml || test "$PUSH_CI" = success\n',
+                }
+                (root / 'scripts').mkdir()
+                for name, body in fixtures.items():
+                    fixture = root / name
+                    fixture.write_text('#!/bin/sh\n' + body, encoding='utf-8', newline='\n')
+                    fixture.chmod(0o700)
+                env = dict(os.environ, PATH=str(root) + os.pathsep + os.environ['PATH'],
+                           GITHUB_EVENT_NAME='workflow_dispatch', GITHUB_REF=main, GITHUB_SHA=sha,
+                           GITHUB_RUN_ATTEMPT='1', GITHUB_STEP_SUMMARY=str(root / 'summary'),
+                           RELEASE_CANDIDATE=approved, BEFORE_TAG='current', AFTER_TAG='current',
+                           PUSH_CI='success', LINUX_MATRIX='success', SANDBOX_CANCELLATION='success',
+                           FEATURE_INTERSECTIONS='success', MACOS='success', UBUNTU='success')
+                env.update(overrides)
+                result = subprocess.run([BASH, '-e', '-o', 'pipefail', '-c', script], cwd=root,
+                                        env=env, capture_output=True, text=True, timeout=10)
+                lookups = root / 'lookups'
+                self.assertEqual(lookups.read_text().splitlines() if lookups.exists() else [],
+                                 [f'{name} {sha}' for name in expected_lookups])
+                self.assertEqual(result.returncode == 0, dispatched, result.stdout + result.stderr)
+                self.assertEqual((root / 'archive-checked').exists(), expected_lookups == all_lookups)
+                reads = root / 'main-reads'
+                expected_reads = [env['BEFORE_TAG']] if expected_lookups == all_lookups else []
+                if tagged:
+                    expected_reads.append(env['AFTER_TAG'])
+                self.assertEqual(reads.read_text().splitlines() if reads.exists() else [], expected_reads)
+                self.assertEqual((root / 'tagged').exists(), tagged)
+                self.assertEqual((root / 'pushed').exists(), tagged)
+                self.assertEqual((root / 'dispatched').exists(), dispatched)
+                self.assertFalse((root / 'injected').exists())
+                if tagged:
+                    self.assertEqual((root / 'tagged').read_text().strip(), f'tag v0.1.225 {sha}')
+                    self.assertEqual((root / 'pushed').read_text().strip(), 'push origin refs/tags/v0.1.225')
+                if dispatched:
+                    self.assertEqual((root / 'dispatched').read_text().strip(),
+                                     'workflow run release.yml --ref v0.1.225 -f dry_run=false')
 
     def test_dispatch_executes_exact_gates_without_evaluating_input(self):
         release = (WORKFLOWS / 'release.yml').read_text(encoding='utf-8')
