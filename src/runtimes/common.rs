@@ -4211,6 +4211,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn legacy_runtime_requires_a_utf8_runtime_directory_name() -> Result<()> {
         use std::os::unix::ffi::OsStrExt as _;
