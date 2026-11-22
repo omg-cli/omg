@@ -1410,14 +1410,14 @@ fn status_entry_identity(
     fallback_name: Option<&str>,
 ) -> Option<DpkgPackageIdentity> {
     let name = status_entry_field(paragraph, "Package").or(fallback_name)?;
-    let architecture = status_entry_field(paragraph, "Architecture")
-        .filter(|architecture| *architecture != "all")
-        .unwrap_or(super::debian_arch())
-        .to_owned();
+    let architecture = match status_entry_field(paragraph, "Architecture") {
+        Some(architecture) if architecture != "all" => architecture,
+        _ => super::debian_arch(),
+    };
 
     Some(DpkgPackageIdentity {
         name: name.to_owned(),
-        architecture,
+        architecture: architecture.to_owned(),
     })
 }
 
