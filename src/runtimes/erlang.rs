@@ -668,16 +668,12 @@ mod tests {
     ) -> Result<PathBuf> {
         let destination = fixture.versions.join(version);
         let staging = begin_staged_install(&fixture.versions)?;
-        fs::write(
-            staging.path().join("interrupted-payload"),
-            b"retained OTP bytes",
-        )?;
-        fs::File::create_new(
-            staging
-                .path()
-                .join(super::super::common::INSTALL_PENDING_MARKER),
-        )?
-        .sync_all()?;
+        let payload = staging.path().join("interrupted-payload");
+        fs::write(payload, b"retained OTP bytes")?;
+        let pending = staging
+            .path()
+            .join(super::super::common::INSTALL_PENDING_MARKER);
+        fs::File::create_new(pending)?.sync_all()?;
         super::super::security::fixture_prepare("erlang", version, staging.path(), &destination)?;
         complete_staged_install(&staging, &destination, version)?;
         Ok(destination)
@@ -723,10 +719,11 @@ mod tests {
         fs::rename(&path, &backup)?;
 
         let launcher = b"#!/bin/sh\nexit 0\n";
-        fixture.write(&tar_gz_entries(
-            "otp",
-            &[("Install", launcher), ("bin/erl", launcher)],
-        )?);
+        let entries = [
+            ("Install", launcher.as_slice()),
+            ("bin/erl", launcher.as_slice()),
+        ];
+        fixture.write(&tar_gz_entries("otp", &entries)?);
         manager
             .publish_download(
                 &fixture.archive,

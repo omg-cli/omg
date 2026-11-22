@@ -2102,6 +2102,18 @@ path = "hostile"
     }
 
     #[test]
+    fn dotnet_exact_path_requires_a_completed_version() {
+        let dir = tempdir().unwrap();
+        let versions = dir.path().join("dotnet");
+        let version = versions.join("9.0.100");
+        fs::create_dir_all(&version).unwrap();
+        assert!(dotnet_version_bin_path(&versions, "9.0.100").is_none());
+
+        mark_test_runtime_complete(&version).unwrap();
+        assert_eq!(dotnet_version_bin_path(&versions, "9.0.100"), Some(version));
+    }
+
+    #[test]
     fn resolve_installed_version_req_missing_dir_is_none() {
         let dir = tempdir().unwrap();
         assert!(

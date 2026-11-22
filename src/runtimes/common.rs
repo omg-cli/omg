@@ -1603,11 +1603,14 @@ pub(crate) fn is_valid_version_dir(version_dir: &Path) -> bool {
         return false;
     }
     match fs::symlink_metadata(version_dir.join(INSTALL_MARKER)) {
-        Ok(metadata) => return metadata.is_file(),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(_) => return false,
+        Ok(metadata) => metadata.is_file(),
+        Err(error) => {
+            error.kind() == io::ErrorKind::NotFound && has_legacy_runtime_launcher(version_dir)
+        }
     }
+}
 
+fn has_legacy_runtime_launcher(version_dir: &Path) -> bool {
     let Some(runtime) = version_dir
         .parent()
         .and_then(Path::file_name)
@@ -1629,16 +1632,21 @@ pub(crate) fn is_valid_version_dir(version_dir: &Path) -> bool {
             Path::new("bin").join(tool.binary)
         }
     };
-    let Ok(root) = version_dir.canonicalize() else {
-        return false;
-    };
-    let Ok(binary) = root.join(launcher).canonicalize() else {
-        return false;
-    };
-    binary.starts_with(&root)
-        && fs::metadata(binary).is_ok_and(|metadata| {
-            use std::os::unix::fs::PermissionsExt as _;
-            metadata.is_file() && metadata.len() > 0 && metadata.permissions().mode() & 0o111 != 0
+    version_dir
+        .canonicalize()
+        .and_then(|root| {
+            root.join(launcher)
+                .canonicalize()
+                .map(|binary| (root, binary))
+        })
+        .is_ok_and(|(root, binary)| {
+            binary.starts_with(&root)
+                && fs::metadata(binary).is_ok_and(|metadata| {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    metadata.is_file()
+                        && metadata.len() > 0
+                        && metadata.permissions().mode() & 0o111 != 0
+                })
         })
 }
 
@@ -4200,6 +4208,34 @@ mod tests {
             symlink(&outside, &launcher)?;
             assert!(!is_valid_version_dir(&version), "{runtime}");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_runtime_requires_a_utf8_runtime_directory_name() -> Result<()> {
+        use std::os::unix::ffi::OsStrExt as _;
+        let temp = TempDir::new()?;
+        let version = temp
+            .path()
+            .join(std::ffi::OsStr::from_bytes(b"\xff"))
+            .join("1.0.0");
+        fs::create_dir_all(&version)?;
+        assert!(!is_valid_version_dir(&version));
+        Ok(())
+    }
+
+    #[test]
+    fn unavailable_install_destination_reports_the_inspection_error() -> Result<()> {
+        let temp = TempDir::new()?;
+        let parent = temp.path().join("existing-file");
+        fs::write(&parent, b"unchanged")?;
+        let error = require_unoccupied_install_destination(&parent.join("1.0.0")).unwrap_err();
+        assert!(error.to_string().contains("left untouched"));
+        assert_eq!(
+            error.downcast_ref::<io::Error>().unwrap().kind(),
+            io::ErrorKind::NotADirectory
+        );
+        assert_eq!(fs::read(parent)?, b"unchanged");
         Ok(())
     }
 
