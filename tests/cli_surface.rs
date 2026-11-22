@@ -197,6 +197,56 @@ fn team_initialization_preserves_existing_git_hooks() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
+#[test]
+fn team_initialization_warns_without_installing_shared_worktree_hooks() -> anyhow::Result<()> {
+    let repository = tempfile::tempdir()?;
+    let project = common::TestProject::new();
+    let git = |args: &[&str]| -> anyhow::Result<()> {
+        let output = std::process::Command::new("git")
+            .current_dir(repository.path())
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .args(args)
+            .output()?;
+        anyhow::ensure!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(())
+    };
+    git(&["init", "--quiet", "--template="])?;
+    git(&["config", "user.name", "OMG regression"])?;
+    git(&["config", "user.email", "test@example.invalid"])?;
+    git(&[
+        "commit",
+        "--quiet",
+        "--allow-empty",
+        "-m",
+        "Initial fixture",
+    ])?;
+    git(&[
+        "worktree",
+        "add",
+        "--detach",
+        project.path().to_str().unwrap(),
+    ])?;
+
+    let result = project.run_with_env(&["team", "init", "fixture-team"], &[("RUST_LOG", "warn")]);
+    assert!(result.success, "{}", result.combined_output());
+    assert!(result.stdout.contains("Team workspace initialized!"));
+    assert!(result.stderr.contains("Skipping team Git hooks"));
+    assert!(project.path().join(".omg/team.toml").is_file());
+    assert!(project.path().join(".omg/team-status.json").is_file());
+    assert!(!repository.path().join(".git/hooks").exists());
+    project.close_checked();
+    repository.close()?;
+    Ok(())
+}
+
 #[cfg(feature = "license")]
 fn account_expiry_output_fixture(expiry: &str) -> anyhow::Result<String> {
     let project = common::TestProject::new();
