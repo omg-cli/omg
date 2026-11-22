@@ -543,7 +543,12 @@ fn doctor_eol_fixture(version: Option<&str>) -> anyhow::Result<common::CommandRe
     let project = common::TestProject::new();
     if let Some(version) = version {
         let versions = project.data_dir.path().join("versions/node");
-        std::fs::create_dir_all(versions.join(version).join("bin"))?;
+        let version_dir = versions.join(version);
+        std::fs::create_dir_all(version_dir.join("bin"))?;
+        std::fs::write(
+            version_dir.join(".omg-install-complete"),
+            format!("{version}\n"),
+        )?;
         std::os::unix::fs::symlink(version, versions.join("current"))?;
     }
     let result = project.run(&["doctor", "--eol"]);
