@@ -412,21 +412,11 @@ impl SwiftManager {
         let _install_lease = super::common::try_lock_runtime_install(&self.versions_dir, &version)?;
         let version_dir = self.versions_dir.join(&version);
 
-        if is_valid_version_dir(&version_dir) {
+        if is_valid_version_dir(&version_dir) && version_dir.join(SWIFT_BINARY).is_file() {
             print_already_installed("Swift", &version);
             return self.use_version(&version);
         }
-        match fs::symlink_metadata(&version_dir) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| super::common::blocked_install_destination(&version_dir));
-            }
-            Ok(_) => anyhow::bail!(
-                "{}",
-                super::common::blocked_install_destination(&version_dir)
-            ),
-        }
+        super::common::require_unoccupied_install_destination(&version_dir)?;
 
         println!(
             "{} Installing Swift {}...\n",

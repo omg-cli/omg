@@ -365,44 +365,6 @@ fn recorded_admission(tree: &Path, destination: &Path) -> Result<RuntimeAdmissio
     })
 }
 
-pub(super) fn verify_interrupted_erlang_install(destination: &Path, version: &str) -> Result<()> {
-    use std::os::unix::fs::MetadataExt as _;
-
-    let metadata = fs::symlink_metadata(destination)?;
-    ensure!(
-        metadata.is_dir()
-            && metadata.uid() == nix::unistd::geteuid().as_raw()
-            && metadata.mode() & 0o022 == 0,
-        "Interrupted runtime is not an owned, real directory"
-    );
-    let complete = format!("{version}\n");
-    ensure!(
-        matches!(
-            fs::symlink_metadata(destination.join(super::common::TEST_RUNTIME_MARKER)),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound
-        ) && read_regular(&destination.join(super::common::INSTALL_PENDING_MARKER), 0)?.as_deref()
-            == Some(&[][..])
-            && read_regular(
-                &destination.join(super::common::INSTALL_MARKER),
-                complete.len()
-            )?
-            .as_deref()
-                == Some(complete.as_bytes()),
-        "Interrupted Erlang publication markers do not match"
-    );
-    let admission = recorded_admission(destination, destination)?;
-    let identity = read_identity(&admission.record.destination)?
-        .context("Interrupted Erlang publication has no publisher identity")?;
-    ensure!(
-        admission.record.query.runtime == "erlang"
-            && identity.runtime == "erlang"
-            && identity.requested == version
-            && identity.version == version,
-        "Interrupted Erlang publication identity does not match"
-    );
-    admission.verify_content(destination)
-}
-
 /// Automatic hooks may validate current evidence, but cannot fetch or prompt.
 pub(crate) fn require_selected_path(runtime: &str, binary_dir: &Path) -> Result<RuntimeAdmission> {
     admit_selected_path(runtime, binary_dir, ReviewMode::CachedOnly)

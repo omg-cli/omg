@@ -1254,7 +1254,7 @@ fn extract_task(archive_path: &Path) -> ProgressTask {
     })
 }
 
-pub(super) const INSTALL_MARKER: &str = ".omg-install-complete";
+const INSTALL_MARKER: &str = ".omg-install-complete";
 
 /// Best-effort file removal for leftover archives and stale current links.
 /// Failure only wastes cache space or leaves a dangling symlink; the next
@@ -1361,15 +1361,19 @@ pub(crate) fn complete_staged_install_with_lease(
             version_dir,
             rustix::fs::RenameFlags::NOREPLACE,
         )
-        .with_context(|| {
-            if fs::symlink_metadata(version_dir).is_ok() && !is_valid_version_dir(version_dir) {
+        .map_err(|error| {
+            let message = if error == rustix::io::Errno::EXIST
+                && fs::symlink_metadata(version_dir).is_ok()
+                && !is_valid_version_dir(version_dir)
+            {
                 blocked_install_destination(version_dir)
             } else {
                 format!(
                     "Failed to publish runtime installation at {}",
                     version_dir.display()
                 )
-            }
+            };
+            anyhow::Error::new(error).context(message)
         })
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -1643,6 +1647,14 @@ pub(super) fn blocked_install_destination(version_dir: &Path) -> String {
         "Runtime path {} was left untouched. Inspect it and, if you own it, move it aside before retrying the install",
         version_dir.display()
     )
+}
+
+pub(super) fn require_unoccupied_install_destination(version_dir: &Path) -> Result<()> {
+    match fs::symlink_metadata(version_dir) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| blocked_install_destination(version_dir)),
+        Ok(_) => anyhow::bail!("{}", blocked_install_destination(version_dir)),
+    }
 }
 
 #[cfg(test)]

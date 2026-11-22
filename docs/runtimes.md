@@ -78,6 +78,8 @@ omg use node 22.10.0 --uninstall
 
 Switch away from an active version before removing it. The command removes that version's installation, not a project pin file.
 
+If a retry reports an occupied runtime path, OMG leaves that path alone. Stop any install for that runtime and inspect the exact path in the error. If you own the contents and confirm they are from an incomplete install, move only that path to a backup location outside the runtime versions directory, then rerun `omg use` with the same version. Leave sibling versions and the `current` link in place.
+
 ## Select versions by directory
 
 Install the [shell hook](./shell-integration.md) to update the terminal's command search path when you change directories. The hook chooses installed versions. It does not run `omg use` or download a missing version.
