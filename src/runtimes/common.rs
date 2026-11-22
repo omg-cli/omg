@@ -5213,6 +5213,20 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn runtime_path_rejects_a_missing_bin_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let version = temp.path().join("20.11.1");
+        fs::create_dir(&version).unwrap();
+        mark_test_runtime_complete(&version).unwrap();
+
+        assert!(!is_trusted_runtime_dir_chain(
+            &version.join("bin"),
+            temp.path()
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn runtime_path_rejects_group_writable_directories() {
         use std::os::unix::fs::PermissionsExt;
 

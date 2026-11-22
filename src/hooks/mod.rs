@@ -2088,6 +2088,20 @@ path = "hostile"
     }
 
     #[test]
+    fn semver_range_skips_completed_versions_without_a_semver_name() {
+        let dir = tempdir().unwrap();
+        let legacy = dir.path().join("20.11");
+        fs::create_dir(&legacy).unwrap();
+        mark_test_runtime_complete(&legacy).unwrap();
+
+        assert!(
+            resolve_installed_version_req(dir.path(), "^20")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
     fn resolve_installed_version_req_missing_dir_is_none() {
         let dir = tempdir().unwrap();
         assert!(
