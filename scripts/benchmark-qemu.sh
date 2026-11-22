@@ -1385,25 +1385,29 @@ if [[ -n "$inventory_tiers" ]]; then
     # https://strace.io/files/6.6/ . Keep the traced-child cleanup guarantee.
     # Build as bench, install only this fixture tool into a root-owned prefix.
     (
+      strace_fixture_failed() {
+        printf 'Bookworm strace fixture failed: phase=%s exit=%s\n' "$1" "$2" >> "$HOME/evidence/inventory-setup.txt"
+        exit 120
+      }
       set -o pipefail
-      build=$(mktemp -d "$HOME/omg-qemu-strace.XXXXXX") || exit 120
-      cd "$build" || exit 120
+      build=$(mktemp -d "$HOME/omg-qemu-strace.XXXXXX") || strace_fixture_failed workspace "$?"
+      cd "$build" || strace_fixture_failed workspace "$?"
       curl --fail --location --proto '=https' --proto-redir '=https' --tlsv1.2 --max-time 60 \
-        https://strace.io/files/6.6/strace-6.6.tar.xz -o strace-6.6.tar.xz || exit 120
+        https://strace.io/files/6.6/strace-6.6.tar.xz -o strace-6.6.tar.xz || strace_fixture_failed download "$?"
       printf '%s  %s\n' \
         421b4186c06b705163e64dc85f271ebdcf67660af8667283147d5e859fc8a96c \
-        strace-6.6.tar.xz | sha256sum --check - || exit 120
-      tar -xf strace-6.6.tar.xz || exit 120
-      cd strace-6.6 || exit 120
+        strace-6.6.tar.xz | sha256sum --check - || strace_fixture_failed checksum "$?"
+      tar -xf strace-6.6.tar.xz || strace_fixture_failed unpack "$?"
+      cd strace-6.6 || strace_fixture_failed unpack "$?"
       timeout --kill-after=5s 120s ./configure --prefix=/opt/omg-qemu-strace \
-        --enable-mpers=no --without-libunwind --without-libdw || exit 120
-      timeout --kill-after=5s 180s make -j2 || exit 120
-      sudo -n install -d -m 755 /opt/omg-qemu-strace/bin || exit 120
-      sudo -n install -m 755 src/strace /opt/omg-qemu-strace/bin/strace || exit 120
-      /opt/omg-qemu-strace/bin/strace --version || exit 120
+        --enable-mpers=no --without-libunwind --without-libdw || strace_fixture_failed configure "$?"
+      timeout --kill-after=5s 180s make -j2 || strace_fixture_failed build "$?"
+      sudo -n install -d -m 755 /opt/omg-qemu-strace/bin || strace_fixture_failed install "$?"
+      sudo -n install -m 755 src/strace /opt/omg-qemu-strace/bin/strace || strace_fixture_failed install "$?"
+      /opt/omg-qemu-strace/bin/strace --version || strace_fixture_failed version "$?"
       /opt/omg-qemu-strace/bin/strace --kill-on-exit -f -qq -e trace=execve \
-        -o "$build/preflight.trace" /usr/bin/true || exit 120
-      grep -Fq 'execve("/usr/bin/true"' "$build/preflight.trace" || exit 120
+        -o "$build/preflight.trace" /usr/bin/true || strace_fixture_failed preflight "$?"
+      grep -Fq 'execve("/usr/bin/true"' "$build/preflight.trace" || strace_fixture_failed preflight "$?"
     ) > evidence/strace-build.txt 2>&1 || exit 120
   fi
   # The hermetic `new` row exercises the missing-toolchain refusal. A guest
