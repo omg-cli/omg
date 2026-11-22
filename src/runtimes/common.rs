@@ -1361,19 +1361,21 @@ pub(crate) fn complete_staged_install_with_lease(
             version_dir,
             rustix::fs::RenameFlags::NOREPLACE,
         )
+        .with_context(|| {
+            format!(
+                "Failed to publish runtime installation at {}",
+                version_dir.display()
+            )
+        })
         .map_err(|error| {
-            let message = if error == rustix::io::Errno::EXIST
+            if error.downcast_ref::<rustix::io::Errno>() == Some(&rustix::io::Errno::EXIST)
                 && fs::symlink_metadata(version_dir).is_ok()
                 && !is_valid_version_dir(version_dir)
             {
-                blocked_install_destination(version_dir)
+                error.context(blocked_install_destination(version_dir))
             } else {
-                format!(
-                    "Failed to publish runtime installation at {}",
-                    version_dir.display()
-                )
-            };
-            anyhow::Error::new(error).context(message)
+                error
+            }
         })
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -4908,6 +4910,33 @@ mod tests {
         assert!(version_dir.is_dir());
         assert!(fs::read_dir(&version_dir)?.next().is_none());
         assert!(staging.path().join(INSTALL_MARKER).is_file());
+        Ok(())
+    }
+
+    #[test]
+    fn staged_install_collision_preserves_a_completed_version_and_its_diagnostic() -> Result<()> {
+        let temp = TempDir::new()?;
+        let version = temp.path().join("1.0.0");
+        fs::create_dir(&version)?;
+        mark_test_runtime_complete(&version)?;
+        fs::write(version.join("payload"), b"prior runtime bytes")?;
+        let staging = begin_staged_install(temp.path())?;
+        prepare_runtime_fixture(staging.path(), &version, "1.0.0")?;
+
+        let error = complete_staged_install(&staging, &version, "1.0.0").unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "Failed to publish runtime installation at {}",
+                version.display()
+            )
+        );
+        assert_eq!(
+            error.downcast_ref::<rustix::io::Errno>(),
+            Some(&rustix::io::Errno::EXIST)
+        );
+        assert_eq!(fs::read(version.join("payload"))?, b"prior runtime bytes");
+        assert!(is_valid_version_dir(&version));
         Ok(())
     }
 
