@@ -329,7 +329,8 @@ class AdvisoryReleaseBoundaryTests(unittest.TestCase):
                 path.chmod(0o700)
             environment = dict(os.environ, PATH=str(root / "bin") + os.pathsep + os.environ["PATH"],
                                GITHUB_SHA="a" * 40, GITHUB_REF="refs/heads/main",
-                               GITHUB_EVENT_NAME="workflow_dispatch", RELEASE_CANDIDATE="v0.1.225@" + "a" * 40,
+                               GITHUB_EVENT_NAME="workflow_dispatch", GITHUB_RUN_ATTEMPT="1",
+                               RELEASE_CANDIDATE="v0.1.225@" + "a" * 40,
                                GITHUB_STEP_SUMMARY=str(root / "summary"),
                                LINUX_MATRIX="success", SANDBOX_CANCELLATION="success",
                                FEATURE_INTERSECTIONS="success", MACOS="success", UBUNTU="success")

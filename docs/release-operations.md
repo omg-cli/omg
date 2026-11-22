@@ -23,12 +23,19 @@ write access can run the **CI** workflow on `main` and fill in
 prefixed with `v`, and the full SHA of that exact commit). Leave the input
 blank for a nonpublishing CI dispatch.
 
-The tag job refuses a mismatched candidate and still requires successful push
-checks for that exact SHA, including staged guest verification, and rechecks
-publisher archive proof before creating the immutable tag. On success it
-dispatches **Release** on that tag. The authorization is scoped to the dispatch,
-not a persistent setting. Do not retry a tag-capable run without renewed
-release approval, including old push runs created before this interlock.
+The tag job runs only on the dispatch's first attempt. It refuses a mismatched
+candidate and still requires successful push checks for that exact SHA,
+including staged guest verification, and publisher archive proof. It checks
+the live `main` ref immediately before creating the tag and again before
+dispatching **Release** on that tag. If `main` moves after the tag is pushed,
+the tag stays immutable and Release is not dispatched.
+
+Keep `main` frozen from dispatch until **Tag Release** finishes: each live-ref
+check and the following write are separate operations, so a check cannot lock
+`main`. Keep pre-interlock push runs out of the retry queue. For a failed
+release dispatch, obtain fresh approval and start a new dispatch rather than
+rerunning it. If it already pushed a tag, stop; do not move the tag or retry
+publication without a separate recovery decision.
 
 ## Pipeline overview
 

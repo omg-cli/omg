@@ -29,7 +29,7 @@ on:
 
 concurrency:
   # Experiments and release dispatches must not replace a pending main push.
-  group: ${{ inputs['release-candidate'] != '' && format('ci-authorized-release-{0}', github.ref) || inputs.isolated-cache == true && format('ci-isolated-cache-{0}', github.run_id) || format('ci-{0}', github.head_ref || github.ref) }}
+  group: ${{ inputs['release-candidate'] != '' && format('release-ci-{0}', github.ref) || inputs.isolated-cache == true && format('ci-isolated-cache-{0}', github.run_id) || format('ci-{0}', github.head_ref || github.ref) }}
   # PRs cancel superseded runs; active main pushes keep running.
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
@@ -2286,7 +2286,7 @@ jobs:
   release-tag:
     name: "Tag Release"
     needs: [quick-gate, portable, linux-matrix, sandbox-cancellation, feature-intersections, macos, ubuntu, ci-success]
-    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs['release-candidate'] != ''
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && github.run_attempt == '1' && inputs['release-candidate'] != ''
     runs-on: ubuntu-24.04
     timeout-minutes: 100
     permissions:
@@ -2322,8 +2322,9 @@ jobs:
           TAG="v${VERSION}"
 
           if [[ "$GITHUB_EVENT_NAME" != workflow_dispatch || "$GITHUB_REF" != refs/heads/main \
+             || "$GITHUB_RUN_ATTEMPT" != 1 \
              || "$RELEASE_CANDIDATE" != "$TAG@$GITHUB_SHA" ]]; then
-            echo "::error::Release authorization must match the main dispatch's Cargo.toml version and full commit SHA"
+            echo "::error::Release authorization requires a fresh main dispatch and must match its Cargo.toml version and full commit SHA"
             exit 1
           fi
 
@@ -2342,8 +2343,21 @@ jobs:
           scripts/require-workflow-success.sh coverage.yml "$GITHUB_SHA" Coverage
           scripts/require-workflow-success.sh docker-e2e.yml "$GITHUB_SHA" "Docker E2E"
 
+          require_current_main() {
+            local live_main
+            if ! live_main=$(git ls-remote --exit-code --refs origin refs/heads/main); then
+              echo "::error::Cannot read live refs/heads/main; refusing release"
+              return 1
+            fi
+            if [[ "$live_main" != "$GITHUB_SHA"$'\trefs/heads/main' ]]; then
+              echo "::error::Live refs/heads/main does not match the authorized release commit"
+              return 1
+            fi
+          }
+
           # Archive membership comes from the publisher proof, never local counts.
           python3 scripts/advisory-baseline.py status
+          require_current_main
           git tag "$TAG" "$GITHUB_SHA"
           git push origin "refs/tags/${TAG}"
           if ! git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null; then
@@ -2355,5 +2369,6 @@ jobs:
 
           # GITHUB_TOKEN tag pushes do not start other workflows. Dispatch
           # Release explicitly so GitHub Latest is not left on a 7-month-old tag.
+          require_current_main
           gh workflow run release.yml --ref "$TAG" -f dry_run=false
           echo "Dispatched Release for $TAG"
