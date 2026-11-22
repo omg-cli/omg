@@ -91,6 +91,102 @@ class OptimizationContracts(unittest.TestCase):
         self.assertIn(gate, install_step)
         self.assertIn('sudo apt-get install -y --no-install-recommends python3-venv', install_step)
 
+    @unittest.skipUnless(os.name != 'nt' and shutil.which('jq'), 'Hosted Inspector proof uses Bash and jq')
+    def test_inspector_contracts_require_the_event_checkout_before_running(self):
+        workflow = job_block((WORKFLOWS / 'ci.yml').read_text(), 'workflow-checks')
+        install = workflow.index('      - name: Install pinned Worker package manager\n')
+        step = workflow.split('      - name: Verify Inspector dependency contracts\n', 1)[1].split('\n      - ', 1)[0]
+        condition = "if: matrix.shard == 0 && (github.event_name == 'push' || needs.quick-gate.outputs.checks-required == 'true')"
+        self.assertLess(install, workflow.index('      - name: Verify Inspector dependency contracts\n'))
+        self.assertIn(condition, workflow[install:].split('\n      - ', 1)[0])
+        self.assertIn(condition, step)
+        self.assertNotIn('        env:', step)
+        self.assertIn('    permissions:\n      contents: read\n', workflow)
+        script = step_script('ci.yml', 'Verify Inspector dependency contracts')
+        clean_env = {key: value for key, value in os.environ.items() if not key.startswith('GIT_')}
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = root / 'checkout'
+            repo.mkdir()
+
+            def git(*args):
+                return subprocess.check_output(['git', *args], cwd=repo, env=clean_env, text=True, timeout=10).strip()
+
+            git('init', '-q')
+            git('config', 'user.name', 'Inspector workflow fixture')
+            git('config', 'user.email', 'ci-fixture@example.invalid')
+            git('commit', '-qm', 'base', '--allow-empty')
+            base = git('rev-parse', 'HEAD')
+            (repo / 'README.md').write_text('unrelated')
+            git('add', '.')
+            git('commit', '-qm', 'unrelated')
+            unrelated = git('rev-parse', 'HEAD')
+            unrelated_tree = git('rev-parse', 'HEAD^{tree}')
+            inspector = repo / 'services/ci-inspector/package.json'
+            inspector.parent.mkdir(parents=True)
+            inspector.write_text('{}')
+            git('add', '.')
+            git('commit', '-qm', 'Inspector lock owner')
+            head = git('rev-parse', 'HEAD')
+            tree = git('rev-parse', 'HEAD^{tree}')
+            merge = git('commit-tree', tree, '-p', base, '-p', head, '-m', 'GitHub merge')
+            wrong_tree = git('commit-tree', unrelated_tree, '-p', base, '-p', head, '-m', 'Wrong tree')
+            unrelated_merge = git('commit-tree', unrelated_tree, '-p', base, '-p', unrelated, '-m', 'Unrelated merge')
+            event = root / 'event.json'
+            log = root / 'bun.log'
+            recorder = root / 'bun'
+            recorder.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> "$BUN_LOG"\n'
+                                'if [ "$1" = --revision ]; then echo 1.4.4+38afee6c8; fi\n')
+            recorder.chmod(0o755)
+
+            def run(kind, checkout, payload, sha=None, dirty=False):
+                git('checkout', '--detach', '-q', checkout)
+                if dirty:
+                    inspector.write_text('uncommitted')
+                event.write_text(json.dumps(payload))
+                log.write_text('')
+                result = subprocess.run([BASH, '-euo', 'pipefail', '-c', script], cwd=repo, capture_output=True,
+                    text=True, timeout=10, env=dict(clean_env, PATH=str(root) + os.pathsep + clean_env.get('PATH', ''),
+                        GITHUB_EVENT_NAME=kind, GITHUB_EVENT_PATH=str(event), GITHUB_SHA=sha or checkout,
+                        GITHUB_REF='refs/heads/main', BUN_LOG=str(log)))
+                if dirty:
+                    git('restore', '--', str(inspector.relative_to(repo)))
+                return result, log.read_text().splitlines()
+
+            def pr_event(pr_head=head, pr_base=base):
+                return {'pull_request': {'head': {'sha': pr_head}, 'base': {'ref': 'main', 'sha': pr_base}}}
+
+            expected = ['--revision', 'install --cwd services/cloud-ci --frozen-lockfile --ignore-scripts',
+                'install --cwd services/ci-inspector --frozen-lockfile --ignore-scripts',
+                'run --cwd services/ci-inspector check', 'run --cwd services/ci-inspector test']
+            for kind, checkout, payload, receipt in (
+                ('pull_request', merge, pr_event(), f'base={base} head={head} tested={merge} tree={tree}'),
+                ('push', head, {'after': head}, f'base={head} head={head} tested={head} tree={tree}'),
+                ('merge_group', merge, {'merge_group': {'base_ref': 'refs/heads/main', 'base_sha': base, 'head_sha': merge}},
+                 f'base={base} head={merge} tested={merge} tree={tree}'),
+            ):
+                with self.subTest(kind=kind):
+                    result, calls = run(kind, checkout, payload)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn(receipt, result.stdout)
+                    self.assertEqual(calls, expected)
+            result, calls = run('pull_request', unrelated_merge, pr_event(unrelated))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(calls, [])
+            for case, checkout, payload, sha, dirty in (
+                ('wrong event commit', merge, pr_event(), head, False),
+                ('wrong event base', merge, pr_event(head, unrelated), None, False),
+                ('wrong event head', merge, pr_event(unrelated), None, False),
+                ('wrong tested tree', wrong_tree, pr_event(), None, False),
+                ('dirty checkout', merge, pr_event(), None, True),
+                ('missing base ref', merge, {'pull_request': {}}, None, False),
+            ):
+                with self.subTest(case=case):
+                    result, calls = run('pull_request', checkout, payload, sha=sha, dirty=dirty)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertEqual(calls, [])
+
     @unittest.skipIf(os.name == "nt", "The hosted service workflow uses POSIX executable scripts")
     def test_advisory_service_is_verified_without_remote_deployment(self):
         workflow = job_block((WORKFLOWS / 'ci.yml').read_text(), 'workflow-checks')

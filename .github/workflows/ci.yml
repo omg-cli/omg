@@ -147,6 +147,57 @@ jobs:
           echo "10702245766b225e70bbf6235fd6b47214fd94b4760d00ffaed8ab0df57ac235  $RUNNER_TEMP/bun/bun-linux-x64/bun" | sha256sum -c -
           echo "$RUNNER_TEMP/bun/bun-linux-x64" >> "$GITHUB_PATH"
 
+      - name: Verify Inspector dependency contracts
+        if: matrix.shard == 0 && (github.event_name == 'push' || needs.quick-gate.outputs.checks-required == 'true')
+        shell: bash
+        run: |
+          tested="$(git rev-parse --verify HEAD)"
+          test "$tested" = "$GITHUB_SHA"
+          tree="$(git rev-parse "${tested}^{tree}")"
+          base=
+          head="$tested"
+          case "$GITHUB_EVENT_NAME" in
+            pull_request)
+              base_ref="$(jq -er '.pull_request.base.ref' "$GITHUB_EVENT_PATH")"
+              test "$base_ref" = main || exit 0
+              base="$(jq -er '.pull_request.base.sha' "$GITHUB_EVENT_PATH")"
+              head="$(jq -er '.pull_request.head.sha' "$GITHUB_EVENT_PATH")"
+              [[ "$base" =~ ^[0-9a-f]{40}$ && "$head" =~ ^[0-9a-f]{40}$ ]]
+              test "$(git show -s --format=%P "$tested")" = "$base $head"
+              changed="$(git diff --name-only --no-renames "$base...$head" -- services/ci-inspector services/cloud-ci .github/workflows/ci.yml)"
+              test -n "$changed" || exit 0
+              if ! git merge-base --is-ancestor "$base" "$head" || test "$tree" != "$(git rev-parse "${head}^{tree}")"; then
+                echo "::error::Inspector proof requires the PR head tree on the current main base"
+                exit 1
+              fi
+              ;;
+            merge_group)
+              base_ref="$(jq -er '.merge_group.base_ref' "$GITHUB_EVENT_PATH")"
+              test "$base_ref" = refs/heads/main || exit 0
+              base="$(jq -er '.merge_group.base_sha' "$GITHUB_EVENT_PATH")"
+              [[ "$base" =~ ^[0-9a-f]{40}$ ]]
+              test "$tested" = "$(jq -er '.merge_group.head_sha' "$GITHUB_EVENT_PATH")"
+              git merge-base --is-ancestor "$base" "$tested"
+              ;;
+            push|workflow_dispatch)
+              test "$GITHUB_REF" = refs/heads/main || exit 0
+              base="$tested"
+              if test "$GITHUB_EVENT_NAME" = push; then
+                test "$tested" = "$(jq -er '.after' "$GITHUB_EVENT_PATH")"
+              fi
+              ;;
+            *)
+              exit 1
+              ;;
+          esac
+          printf 'Inspector source: base=%s head=%s tested=%s tree=%s\n' "$base" "$head" "$tested" "$tree"
+          test -z "$(git status --porcelain=v1 --untracked-files=all -- services/ci-inspector services/cloud-ci)"
+          test "$(bun --revision)" = 1.4.4+38afee6c8
+          bun install --cwd services/cloud-ci --frozen-lockfile --ignore-scripts
+          bun install --cwd services/ci-inspector --frozen-lockfile --ignore-scripts
+          bun run --cwd services/ci-inspector check
+          bun run --cwd services/ci-inspector test
+
       - name: Install frozen Worker dependencies
         if: matrix.shard == 0 && (github.event_name == 'push' || needs.quick-gate.outputs.checks-required == 'true')
         run: bun install --cwd services/ci --frozen-lockfile --ignore-scripts
