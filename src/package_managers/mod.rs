@@ -421,7 +421,12 @@ pub fn get_counts() -> anyhow::Result<(usize, usize, usize)> {
         return Ok((total, explicit, orphans));
     }
 
-    if matches!(backend, Backend::Fedora | Backend::MacOS) {
+    #[cfg(target_os = "macos")]
+    if backend == Backend::MacOS {
+        return block_on_live(homebrew::HomebrewPackageManager::new().inventory_counts());
+    }
+
+    if backend == Backend::Fedora {
         let manager = get_package_manager()?;
         let (total, explicit, orphans, _) = block_on_live(manager.get_status(false))?;
         return Ok((total, explicit, orphans));

@@ -447,6 +447,15 @@ fn try_print_counter(counter: FastCounter, json: bool) -> Result<bool> {
         return Ok(true);
     }
 
+    #[cfg(target_os = "macos")]
+    if selected_backend == omg_lib::package_managers::Backend::MacOS
+        && matches!(counter, FastCounter::Total | FastCounter::Orphan)
+    {
+        let (total, _, orphans) = omg_lib::package_managers::get_counts()?;
+        print_fast_counter(counter, total.try_into()?, 0, orphans.try_into()?, 0, json);
+        return Ok(true);
+    }
+
     #[cfg(unix)]
     if let Ok((total, explicit, orphans, updates)) = fast_status_from_daemon() {
         print_fast_counter(counter, total, explicit, orphans, updates, json);
@@ -476,7 +485,7 @@ fn try_print_counter(counter: FastCounter, json: bool) -> Result<bool> {
         return Ok(true);
     }
 
-    #[cfg(not(feature = "arch"))]
+    #[cfg(not(any(feature = "arch", target_os = "macos")))]
     let _ = selected_backend;
 
     // A cache/daemon miss must reach the selected backend through the normal

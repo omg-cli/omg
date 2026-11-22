@@ -3655,14 +3655,21 @@ pub(super) mod tests {
             "fedora",
             directory.path(),
         ));
-        let state =
-            DaemonState::new_isolated(directory.path(), PackageIndex::empty(), manager).unwrap();
+        let state = Arc::new(
+            DaemonState::new_isolated(directory.path(), PackageIndex::empty(), manager).unwrap(),
+        );
         std::fs::write(
             directory.path().join("mock_state_dnf.json"),
             b"invalid json",
         )
         .unwrap();
         assert!(state.status_counts().await.is_err());
+        assert!(matches!(
+            handle_request(Arc::clone(&state), Request::Status { id: 83 }).await,
+            Response::Error { id: 83, code: error_codes::INTERNAL_ERROR, message, .. }
+                if message.contains("Failed to get system status:")
+        ));
+        assert!(state.cache.get_status().is_none());
     }
 
     #[tokio::test]

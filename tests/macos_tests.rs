@@ -11,6 +11,117 @@ mod homebrew_integration {
     use super::*;
 
     #[tokio::test]
+    async fn offline_inventory_counters_work_without_a_status_snapshot() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        let total = HomebrewPackageManager::new().list_installed().await?.len();
+        assert!(total > 0, "the native gate installs Homebrew formulas");
+        let root = tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir_in("/tmp")?;
+        let socket = root.path().join("omg.sock");
+        omg_lib::core::paths::validate_socket_parent(&socket)?;
+        let proxy = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
+        let proxy_url = format!("http://{}", proxy.local_addr()?);
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&attempts);
+        let reject_proxy = tokio::spawn(async move {
+            while let Ok((connection, _)) = proxy.accept().await {
+                observed.fetch_add(1, Ordering::Relaxed);
+                drop(connection);
+            }
+        });
+        let run = async |args: &[&str]| -> Result<std::process::Output> {
+            let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_omg"));
+            command
+                .args(args)
+                .env("HOME", root.path())
+                .env("XDG_CACHE_HOME", root.path().join("cache"))
+                .env("HOMEBREW_CACHE", root.path().join("brew-cache"))
+                .env("OMG_CONFIG_DIR", root.path().join("config"))
+                .env("OMG_DATA_DIR", root.path().join("data"))
+                .env("OMG_SOCKET_PATH", &socket)
+                .env("OMG_DISABLE_DAEMON", "1")
+                .env("OMG_DISABLE_TELEMETRY", "1")
+                .env("OMG_NO_UPDATE_CHECK", "1")
+                .env("HTTPS_PROXY", &proxy_url)
+                .env("https_proxy", &proxy_url)
+                .env_remove("NO_PROXY")
+                .env_remove("no_proxy")
+                .env_remove("OMG_TEST_MODE")
+                .kill_on_drop(true);
+            Ok(
+                tokio::time::timeout(std::time::Duration::from_secs(20), command.output())
+                    .await??,
+            )
+        };
+
+        for (command, expected) in [("tc", total), ("oc", 0)] {
+            let output = run(&[command]).await?;
+            assert!(output.status.success(), "{command}: {:?}", output);
+            assert_eq!(
+                String::from_utf8(output.stdout)?.trim(),
+                expected.to_string()
+            );
+            let output = run(&[command, "--json"]).await?;
+            assert!(output.status.success(), "{command} --json: {:?}", output);
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&output.stdout)?,
+                serde_json::json!({"count": expected})
+            );
+        }
+        assert_eq!(attempts.load(Ordering::Relaxed), 0);
+
+        for args in [
+            &["status"][..],
+            &["status", "--fast"][..],
+            &["status", "--json"][..],
+            &["uc"][..],
+            &["uc", "--json"][..],
+        ] {
+            let before = attempts.load(Ordering::Relaxed);
+            let output = run(args).await?;
+            let stderr = String::from_utf8(output.stderr)?;
+            assert_eq!(output.status.code(), Some(1), "{args:?}: {stderr}");
+            assert!(
+                stderr.contains("Homebrew update count unavailable"),
+                "{args:?}: {stderr}"
+            );
+            let stdout = String::from_utf8(output.stdout)?;
+            assert!(
+                !stdout.contains("Updates") && !stdout.contains("updates_available"),
+                "{args:?}: {stdout}"
+            );
+            if args.contains(&"--json") || args[0] == "uc" {
+                assert!(stdout.is_empty(), "{args:?}: {stdout}");
+            }
+            assert!(
+                attempts.load(Ordering::Relaxed) > before,
+                "{args:?} did not query the catalog"
+            );
+        }
+
+        omg_lib::core::fast_status::FastStatus::new(total + 1, 0, 0, 9)
+            .write_to_file(&root.path().join("omg.status"))?;
+        let before = attempts.load(Ordering::Relaxed);
+        for (command, expected) in [("tc", total + 1), ("uc", 9)] {
+            let output = run(&[command, "--json"]).await?;
+            assert!(output.status.success(), "{command} --json: {output:?}");
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&output.stdout)?,
+                serde_json::json!({"count": expected})
+            );
+        }
+        assert_eq!(attempts.load(Ordering::Relaxed), before);
+        reject_proxy.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_homebrew_package_manager_creation() {
         let pm = HomebrewPackageManager::new();
         assert_eq!(pm.name(), "brew");
