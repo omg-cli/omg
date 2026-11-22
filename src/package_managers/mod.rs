@@ -421,7 +421,7 @@ pub fn get_counts() -> anyhow::Result<(usize, usize, usize)> {
         return Ok((total, explicit, orphans));
     }
 
-    #[cfg(any(feature = "macos", target_os = "macos"))]
+    #[cfg(target_os = "macos")]
     if backend == Backend::MacOS {
         return block_on_live(homebrew::HomebrewPackageManager::new().inventory_counts());
     }

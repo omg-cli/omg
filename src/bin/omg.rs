@@ -447,6 +447,7 @@ fn try_print_counter(counter: FastCounter, json: bool) -> Result<bool> {
         return Ok(true);
     }
 
+    #[cfg(target_os = "macos")]
     if selected_backend == omg_lib::package_managers::Backend::MacOS
         && matches!(counter, FastCounter::Total | FastCounter::Orphan)
     {
@@ -483,6 +484,9 @@ fn try_print_counter(counter: FastCounter, json: bool) -> Result<bool> {
         );
         return Ok(true);
     }
+
+    #[cfg(not(any(feature = "arch", target_os = "macos")))]
+    let _ = selected_backend;
 
     // A cache/daemon miss must reach the selected backend through the normal
     // async dispatcher, including Debian and Fedora. Do not invent zero counts.
