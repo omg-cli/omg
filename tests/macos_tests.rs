@@ -12,6 +12,7 @@ mod homebrew_integration {
 
     #[tokio::test]
     async fn offline_inventory_counters_work_without_a_status_snapshot() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
         use std::sync::{
             Arc,
             atomic::{AtomicUsize, Ordering},
@@ -19,7 +20,11 @@ mod homebrew_integration {
 
         let total = HomebrewPackageManager::new().list_installed().await?.len();
         assert!(total > 0, "the native gate installs Homebrew formulas");
-        let root = tempfile::tempdir()?;
+        let root = tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir_in("/tmp")?;
+        let socket = root.path().join("omg.sock");
+        omg_lib::core::paths::validate_socket_parent(&socket)?;
         let proxy = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
         let proxy_url = format!("http://{}", proxy.local_addr()?);
         let attempts = Arc::new(AtomicUsize::new(0));
@@ -39,7 +44,7 @@ mod homebrew_integration {
                 .env("HOMEBREW_CACHE", root.path().join("brew-cache"))
                 .env("OMG_CONFIG_DIR", root.path().join("config"))
                 .env("OMG_DATA_DIR", root.path().join("data"))
-                .env("OMG_SOCKET_PATH", root.path().join("omg.sock"))
+                .env("OMG_SOCKET_PATH", &socket)
                 .env("OMG_DISABLE_DAEMON", "1")
                 .env("OMG_DISABLE_TELEMETRY", "1")
                 .env("OMG_NO_UPDATE_CHECK", "1")
