@@ -29,6 +29,9 @@ use crate::package_managers::types::{UpdateInfo, parse_version_or_zero};
 use rusqlite::{Connection, OpenFlags};
 use zerocopy::{FromBytes, Immutable, KnownLayout, big_endian::U32};
 
+#[cfg(all(test, unix))]
+pub(crate) use tests::search_parity_data;
+
 /// RPM tag constants for parsing header entries
 #[cfg(feature = "fedora")]
 mod rpm_tags {
@@ -1179,44 +1182,36 @@ impl DnfPackageManager {
         Self::parse_available_packages(&bytes)
     }
 
-    fn search_results(
+    fn search_candidates(
         installed: Vec<InstalledPackage>,
-        mut available: Vec<Package>,
-        query_lower: &str,
+        available: Vec<Package>,
     ) -> Vec<Package> {
-        let matches = |identity: &str, summary: &str| {
-            identity.to_lowercase().contains(query_lower)
-                || summary.to_lowercase().contains(query_lower)
-        };
-        available.retain(|pkg| matches(&pkg.name, &pkg.description));
-        let matching_available: HashSet<_> =
-            available.iter().map(|pkg| pkg.name.as_str()).collect();
-        let mut results: Vec<_> = installed
+        let mut candidates: Vec<_> = installed
             .into_iter()
-            .filter_map(|pkg| {
-                let identity = pkg.identity();
-                if !matches(&identity, &pkg.summary)
-                    && !matching_available.contains(identity.as_str())
-                {
-                    return None;
-                }
-                Some(Package {
-                    name: identity,
-                    version: parse_version_or_zero(&format!("{}-{}", pkg.version, pkg.release)),
-                    description: pkg.summary,
-                    source: PackageSource::Official,
-                    installed: true,
-                })
+            .map(|pkg| Package {
+                name: pkg.identity(),
+                version: parse_version_or_zero(&format!("{}-{}", pkg.version, pkg.release)),
+                description: pkg.summary,
+                source: PackageSource::Official,
+                installed: true,
             })
             .collect();
-        results.extend(available);
-        results.sort_by(|a, b| {
-            a.name
-                .cmp(&b.name)
-                .then_with(|| b.installed.cmp(&a.installed))
-        });
-        results.dedup_by(|a, b| a.name == b.name);
-        results
+        candidates.extend(available);
+        candidates
+    }
+
+    fn search_results(mut candidates: Vec<Package>, query_lower: &str) -> Vec<Package> {
+        let mut matching_identities: HashSet<_> = candidates
+            .iter()
+            .filter(|pkg| {
+                pkg.name.to_lowercase().contains(query_lower)
+                    || pkg.description.to_lowercase().contains(query_lower)
+            })
+            .map(|pkg| pkg.name.clone())
+            .collect();
+        candidates.retain(|pkg| matching_identities.remove(&pkg.name));
+        candidates.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+        candidates
     }
 
     pub(crate) async fn installed_package_sizes(
@@ -2419,9 +2414,16 @@ impl PackageManager for DnfPackageManager {
     ) -> Pin<Box<dyn Future<Output = Result<Vec<Package>>> + Send + '_>> {
         let query_lower = query.to_lowercase();
         Box::pin(async move {
+            let candidates = self.package_index().await?;
+            Ok(Self::search_results(candidates, &query_lower))
+        })
+    }
+
+    fn package_index(&self) -> Pin<Box<dyn Future<Output = Result<Vec<Package>>> + Send + '_>> {
+        Box::pin(async move {
             let installed = self.load_installed_packages().await?;
             let available = Self::available_packages(None).await?;
-            Ok(Self::search_results(installed, available, &query_lower))
+            Ok(Self::search_candidates(installed, available))
         })
     }
 
@@ -3592,6 +3594,27 @@ mod tests {
         );
     }
 
+    fn search_catalog_fixture() -> Vec<Package> {
+        let installed =
+            [("widget.lib", "x86_64"), ("widget.local", "noarch")].map(|(name, architecture)| {
+                InstalledPackage {
+                    name: name.to_owned(),
+                    architecture: architecture.to_owned(),
+                    version: "1".to_owned(),
+                    release: "1".to_owned(),
+                    summary: "Installed summary".to_owned(),
+                    reason: InstallReason::Dependency,
+                }
+            });
+        let available = DnfPackageManager::parse_available_packages(
+            b"widget.lib.x86_64\t2-1\tRepository keyword\n\
+              widget.lib.x86_64\t3-1\tAnother repository build\n\
+              widget.lib.i686\t2-1\tRepository keyword\n",
+        )
+        .expect("valid repository rows");
+        DnfPackageManager::search_candidates(Vec::from(installed), available)
+    }
+
     #[test]
     fn search_matches_qualified_identities_and_prefers_installed_rows() {
         assert_eq!(
@@ -3599,23 +3622,7 @@ mod tests {
             "%{name}.%{arch}\t%{evr}\t%{summary}\\n"
         );
         let search = |query| {
-            let installed = [("widget.lib", "x86_64"), ("widget.local", "noarch")].map(
-                |(name, architecture)| InstalledPackage {
-                    name: name.to_owned(),
-                    architecture: architecture.to_owned(),
-                    version: "1".to_owned(),
-                    release: "1".to_owned(),
-                    summary: "Installed summary".to_owned(),
-                    reason: InstallReason::Dependency,
-                },
-            );
-            let available = DnfPackageManager::parse_available_packages(
-                b"widget.lib.x86_64\t2-1\tRepository keyword\n\
-                  widget.lib.x86_64\t3-1\tAnother repository build\n\
-                  widget.lib.i686\t2-1\tRepository keyword\n",
-            )
-            .expect("valid repository rows");
-            DnfPackageManager::search_results(installed.to_vec(), available, query)
+            DnfPackageManager::search_results(search_catalog_fixture(), query)
                 .into_iter()
                 .map(|pkg| {
                     (
@@ -3655,6 +3662,13 @@ mod tests {
                 "Installed summary".to_owned(),
             )]
         );
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn search_parity_data(query: &str) -> (Vec<Package>, Vec<Package>) {
+        let catalog = search_catalog_fixture();
+        let direct = DnfPackageManager::search_results(catalog.clone(), query);
+        (catalog, direct)
     }
 
     #[test]

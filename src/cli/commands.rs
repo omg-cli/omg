@@ -144,7 +144,7 @@ async fn complete_package_names(
 pub(crate) async fn available_package_names() -> Result<Vec<String>> {
     let backend = crate::package_managers::resolve_backend()?;
     // Official lookup failures fail closed; AUR names remain optional enrichment.
-    let names = if matches!(
+    let mut names: Vec<_> = if matches!(
         backend,
         crate::package_managers::Backend::Fedora
             | crate::package_managers::Backend::MacOS
@@ -159,6 +159,10 @@ pub(crate) async fn available_package_names() -> Result<Vec<String>> {
     } else {
         tokio::task::spawn_blocking(official_package_names).await??
     };
+    if backend == crate::package_managers::Backend::Fedora {
+        names.sort_unstable();
+        names.dedup();
+    }
 
     // Mock Arch completion can consume its isolated cache but never refresh it.
     #[cfg(feature = "arch")]

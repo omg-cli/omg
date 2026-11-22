@@ -150,6 +150,7 @@ pub struct PackageIndex {
     name_to_idx: AHashMap<String, usize>,
     bloom: PackageBloomFilter,
     trigrams: TrigramIndex,
+    rpm_summary_aliases: AHashMap<usize, Vec<u32>>,
 }
 
 struct CompactPackageInfo {
@@ -213,6 +214,7 @@ impl PackageIndex {
             name_to_idx: AHashMap::with_capacity(capacity),
             bloom: PackageBloomFilter::new(capacity),
             trigrams: TrigramIndex::new(capacity),
+            rpm_summary_aliases: AHashMap::new(),
         }
     }
 
@@ -278,10 +280,28 @@ impl PackageIndex {
         index
     }
 
-    fn from_packages(packages: Vec<crate::core::Package>, name_kind: SearchNameKind) -> Self {
+    pub(super) fn from_packages(
+        packages: Vec<crate::core::Package>,
+        name_kind: SearchNameKind,
+    ) -> Self {
         let mut index = Self::with_capacity(packages.len());
         index.name_kind = name_kind;
         for package in packages {
+            let official = package.source == crate::core::PackageSource::Official;
+            if name_kind == SearchNameKind::RpmIdentity
+                && official
+                && let Some(&idx) = index.name_to_idx.get(&package.name)
+                && index.items[idx].rpm_eligible
+            {
+                if package.description != index.pool.get(index.items[idx].description_offset) {
+                    let offset = index.pool.intern(&package.description.to_lowercase());
+                    let aliases = index.rpm_summary_aliases.entry(idx).or_default();
+                    if !aliases.contains(&offset) {
+                        aliases.push(offset);
+                    }
+                }
+                continue;
+            }
             let idx = index.items.len();
             index.push(
                 &package.name,
@@ -295,7 +315,7 @@ impl PackageIndex {
                 &[],
             );
             // Keep original source provenance for ranking without changing wire output.
-            index.items[idx].rpm_eligible = package.source == crate::core::PackageSource::Official;
+            index.items[idx].rpm_eligible = official;
         }
         index
     }
@@ -529,6 +549,11 @@ impl PackageIndex {
                     .get(item.description_offset)
                     .to_lowercase()
                     .contains(&query_lower)
+                && !self.rpm_summary_aliases.get(&idx).is_some_and(|aliases| {
+                    aliases
+                        .iter()
+                        .any(|&offset| self.pool.get(offset).contains(&query_lower))
+                })
             {
                 continue;
             }
