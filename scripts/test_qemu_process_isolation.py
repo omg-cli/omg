@@ -32,7 +32,11 @@ class QemuProcessIsolationTests(unittest.TestCase):
                         capture_output=True, text=True, timeout=5)
                     self.assertEqual(result.returncode, 0, result.stderr)
                     arguments = (root / 'arguments').read_text().splitlines()
-                    self.assertNotIn('-vga', arguments)
+                    if machine == 'virt':
+                        self.assertNotIn('-vga', arguments)
+                    else:
+                        self.assertEqual(arguments.count('-vga'), 1)
+                        self.assertEqual(arguments[arguments.index('-vga') + 1], 'none')
                     self.assertEqual(arguments[arguments.index('-display') + 1], 'none')
                     self.assertEqual(arguments.count('apic-common.vapic=false'), 0 if machine == 'virt' else 1)
                     if machine != 'virt':
@@ -45,41 +49,47 @@ class QemuProcessIsolationTests(unittest.TestCase):
                         self.assertIn(retained, arguments)
                     self.assertEqual('if=pflash,format=raw,file=vars.fd' in arguments, firmware == 'uefi')
 
-    def test_machine_selection_disables_unused_x86_sata_without_changing_arm(self):
+    def test_machine_and_firmware_selection_for_supported_guests(self):
         source = (ROOT / 'scripts/benchmark-qemu.sh').read_text(encoding='utf-8')
         function = 'pins_for() {' + source.split('pins_for() {', 1)[1].split('\n# Lifecycle case ids', 1)[0]
-        for distro, arch in [('arch', 'x86_64'), ('debian', 'x86_64'),
-                             ('debian-trixie', 'x86_64'), ('ubuntu', 'x86_64'),
-                             ('fedora', 'x86_64'), ('debian', 'aarch64'),
-                             ('ubuntu', 'aarch64'), ('fedora', 'aarch64')]:
+        for distro, arch, firmware in [('arch', 'x86_64', 'uefi'), ('debian', 'x86_64', 'bios'),
+                                       ('debian-trixie', 'x86_64', 'uefi'), ('ubuntu', 'x86_64', 'bios'),
+                                       ('fedora', 'x86_64', 'bios'), ('debian', 'aarch64', 'uefi'),
+                                       ('ubuntu', 'aarch64', 'uefi'), ('fedora', 'aarch64', 'uefi')]:
             with self.subTest(distro=distro, arch=arch):
                 command = ('set -euo pipefail\ncontroller_image_x86_64=x86\n'
                            'controller_image_aarch64=arm\n' + function
-                           + '\npins_for "$1" "$2"\nprintf "%s\\n" "$qemu_machine"\n')
+                           + '\npins_for "$1" "$2"\nprintf "%s\\n" "$qemu_machine" "$firmware"\n')
                 result = subprocess.run([BASH, '-c', command, 'machine-selection', distro, arch],
                                         capture_output=True, text=True, timeout=5)
                 self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual(result.stdout.strip(), 'q35,sata=off' if arch == 'x86_64' else 'virt')
+                machine = 'q35,sata=off' if arch == 'x86_64' else 'virt'
+                self.assertEqual(result.stdout.splitlines(), [machine, firmware])
 
     @unittest.skipIf(os.name == 'nt', 'launch fixture requires POSIX executable scripts')
-    def test_headless_launch_preserves_default_vga_serial_and_network(self):
+    def test_headless_launch_preserves_serial_and_network_with_tcg(self):
         source = (ROOT / 'scripts/benchmark-qemu.sh').read_text(encoding='utf-8')
-        launch = 'nohup "$5"' + source.split('nohup "$5"', 1)[1].split('# Launch from the controller', 1)[0]
+        launch = 'legacy_apic=()' + source.split('legacy_apic=()', 1)[1].split('# Launch from the controller', 1)[0]
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             executable = root / 'qemu-fixture'
             executable.write_text('#!/usr/bin/env python3\nimport json, sys\nprint(json.dumps(sys.argv[1:]))\n')
             executable.chmod(0o755)
-            for machine in ('q35', 'virt'):
+            for machine in ('q35,sata=off', 'virt'):
                 with self.subTest(machine=machine):
-                    command = ('set -- bios vars code firmware "$1" "$2" tcg max; '
-                               'accel=tcg; firmware=(); vm_serial=serial.log; vm_disk=disk.qcow2; '
+                    command = ('set -euo pipefail; set -- bios vars code firmware "$1" "$2" tcg max; '
+                               'firmware=(); vm_serial=serial.log; vm_disk=disk.qcow2; '
                                + launch + '\nwait $!\n')
                     result = subprocess.run([BASH, '-c', command, '_', str(executable), machine],
                                             cwd=root, capture_output=True, text=True, timeout=10)
                     self.assertEqual(result.returncode, 0, result.stderr)
                     arguments = json.loads((root / 'qemu-startup.log').read_text())
-                    self.assertNotIn('-vga', arguments)
+                    if machine == 'virt':
+                        self.assertNotIn('-vga', arguments)
+                    else:
+                        self.assertEqual(arguments.count('-vga'), 1)
+                        self.assertEqual(arguments[arguments.index('-vga') + 1], 'none')
+                    self.assertEqual(arguments[arguments.index('-accel') + 1], 'tcg,thread=multi')
                     self.assertEqual(arguments[arguments.index('-display') + 1], 'none')
                     self.assertEqual(arguments[arguments.index('-serial') + 1], 'file:serial.log')
                     self.assertIn('virtio-net-pci,netdev=n,mac=52:54:00:12:34:56,romfile=', arguments)

@@ -189,6 +189,7 @@ pins_for() {
       image_url=https://cloud.debian.org/images/cloud/trixie/20261103-2651/debian-13-genericcloud-amd64-20261103-2651.qcow2
       image_hash=d25999de0770d4cde1be72c299ba3ad94eac7ea8fd4d18f8cc86c69df69337e2e8a91d64465a9bfd8f2a78c566fcbcb0842eacc91c09efdef72d719d9f13b535
       hash_tool=sha512sum
+      firmware=uefi
       ssh_service=ssh ;;
     debian-aarch64)
       image_url=https://cloud.debian.org/images/cloud/bookworm/20261026-2643/debian-12-generic-arm64-20261026-2643.qcow2
@@ -641,7 +642,10 @@ if [[ "$1" == uefi ]]; then
   firmware=(-drive if=pflash,format=raw,readonly=on,file="$3" -drive if=pflash,format=raw,file="$vm_vars")
 fi
 legacy_apic=()
-case "$6" in q35|q35,*) legacy_apic=(-global apic-common.vapic=false) ;; esac
+vga=()
+case "$6" in
+  q35|q35,*) legacy_apic=(-global apic-common.vapic=false); vga=(-vga none) ;;
+esac
 accel=$7
 [[ "$accel" != tcg ]] || accel=tcg,thread=multi
 native_monitor=()
@@ -652,7 +656,7 @@ nohup "$5" -machine "$6" -accel "$accel" -cpu "$8" -smp 2 -m 1536 \
   -run-with user=65534:65534 \
   -sandbox on,obsolete=deny,spawn=deny,resourcecontrol=deny \
   -monitor none "${legacy_apic[@]}" "${native_monitor[@]}" \
-  "${firmware[@]}" -display none -serial "file:$vm_serial" \
+  "${firmware[@]}" -display none "${vga[@]}" -serial "file:$vm_serial" \
   -drive "file=$vm_disk,if=virtio,format=qcow2" -drive file=seed.img,if=virtio,format=raw \
   -netdev user,id=n,net=10.0.2.0/24,host=10.0.2.2,dns=10.0.2.3,dhcpstart=10.0.2.15,ipv6=off,hostfwd=tcp:127.0.0.1:2222-10.0.2.15:22 -device virtio-net-pci,netdev=n,mac=52:54:00:12:34:56,romfile= \
   -pidfile qemu.pid > qemu-startup.log 2>&1 < /dev/null &
@@ -1381,25 +1385,29 @@ if [[ -n "$inventory_tiers" ]]; then
     # https://strace.io/files/6.6/ . Keep the traced-child cleanup guarantee.
     # Build as bench, install only this fixture tool into a root-owned prefix.
     (
+      strace_fixture_failed() {
+        printf 'Bookworm strace fixture failed: phase=%s exit=%s\n' "$1" "$2" >> "$HOME/evidence/inventory-setup.txt"
+        exit 120
+      }
       set -o pipefail
-      build=$(mktemp -d "$HOME/omg-qemu-strace.XXXXXX") || exit 120
-      cd "$build" || exit 120
+      build=$(mktemp -d "$HOME/omg-qemu-strace.XXXXXX") || strace_fixture_failed workspace "$?"
+      cd "$build" || strace_fixture_failed workspace "$?"
       curl --fail --location --proto '=https' --proto-redir '=https' --tlsv1.2 --max-time 60 \
-        https://strace.io/files/6.6/strace-6.6.tar.xz -o strace-6.6.tar.xz || exit 120
+        https://strace.io/files/6.6/strace-6.6.tar.xz -o strace-6.6.tar.xz || strace_fixture_failed download "$?"
       printf '%s  %s\n' \
         421b4186c06b705163e64dc85f271ebdcf67660af8667283147d5e859fc8a96c \
-        strace-6.6.tar.xz | sha256sum --check - || exit 120
-      tar -xf strace-6.6.tar.xz || exit 120
-      cd strace-6.6 || exit 120
+        strace-6.6.tar.xz | sha256sum --check - || strace_fixture_failed checksum "$?"
+      tar -xf strace-6.6.tar.xz || strace_fixture_failed unpack "$?"
+      cd strace-6.6 || strace_fixture_failed unpack "$?"
       timeout --kill-after=5s 120s ./configure --prefix=/opt/omg-qemu-strace \
-        --enable-mpers=no --without-libunwind --without-libdw || exit 120
-      timeout --kill-after=5s 180s make -j2 || exit 120
-      sudo -n install -d -m 755 /opt/omg-qemu-strace/bin || exit 120
-      sudo -n install -m 755 src/strace /opt/omg-qemu-strace/bin/strace || exit 120
-      /opt/omg-qemu-strace/bin/strace --version || exit 120
+        --enable-mpers=no --without-libunwind --without-libdw || strace_fixture_failed configure "$?"
+      timeout --kill-after=5s 180s make -j2 || strace_fixture_failed build "$?"
+      sudo -n install -d -m 755 /opt/omg-qemu-strace/bin || strace_fixture_failed install "$?"
+      sudo -n install -m 755 src/strace /opt/omg-qemu-strace/bin/strace || strace_fixture_failed install "$?"
+      /opt/omg-qemu-strace/bin/strace --version || strace_fixture_failed version "$?"
       /opt/omg-qemu-strace/bin/strace --kill-on-exit -f -qq -e trace=execve \
-        -o "$build/preflight.trace" /usr/bin/true || exit 120
-      grep -Fq 'execve("/usr/bin/true"' "$build/preflight.trace" || exit 120
+        -o "$build/preflight.trace" /usr/bin/true || strace_fixture_failed preflight "$?"
+      grep -Fq 'execve("/usr/bin/true"' "$build/preflight.trace" || strace_fixture_failed preflight "$?"
     ) > evidence/strace-build.txt 2>&1 || exit 120
   fi
   # The hermetic `new` row exercises the missing-toolchain refusal. A guest
