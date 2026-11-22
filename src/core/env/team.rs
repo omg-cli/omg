@@ -306,15 +306,15 @@ impl TeamWorkspace {
             config_path.display()
         );
         self.config = Some(config);
-        self.finish_init(&config_path, hooks_dir.as_deref());
+        Self::finish_init(&config_path, hooks_dir.as_deref());
         Ok(())
     }
 
-    fn finish_init(&self, config_path: &Path, hooks_dir: Option<&Path>) {
+    fn finish_init(config_path: &Path, hooks_dir: Option<&Path>) {
         let result =
             crate::core::safe_ops::sync_parent_directory_sync(config_path).and_then(|()| {
                 match hooks_dir {
-                    Some(hooks_dir) => self.install_git_hooks(hooks_dir),
+                    Some(hooks_dir) => Self::install_git_hooks(hooks_dir),
                     None => Ok(()),
                 }
             });
@@ -530,7 +530,7 @@ impl TeamWorkspace {
     }
 
     /// Install git hooks for auto-sync
-    fn install_git_hooks(&self, hooks_dir: &Path) -> Result<()> {
+    fn install_git_hooks(hooks_dir: &Path) -> Result<()> {
         // Pin the hook to this executable's absolute path. A bare `omg`
         // from PATH would let an earlier entry shadow the binary on every
         // pull or checkout.
@@ -919,7 +919,7 @@ mod tests {
         let hooks_dir = workspace.preflight_git_hooks()?.unwrap();
         std::fs::write(&hooks_dir, b"existing obstruction")?;
 
-        workspace.finish_init(&workspace.config_path(), Some(&hooks_dir));
+        TeamWorkspace::finish_init(&workspace.config_path(), Some(&hooks_dir));
 
         assert_eq!(std::fs::read(hooks_dir)?, b"existing obstruction");
         assert_eq!(std::fs::read(workspace.config_path())?, config);
