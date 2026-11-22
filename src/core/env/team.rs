@@ -265,18 +265,16 @@ impl TeamWorkspace {
             updated_at: jiff::Timestamp::now().as_second(),
         };
 
-        // Publish the config last. Its presence is the initialization marker,
-        // so a failed status write cannot leave a half-initialized workspace.
         let status_json = serde_json::to_vec_pretty(&status)?;
-        crate::core::safe_ops::atomic_write_file_sync(self.status_path(), status_json)?;
         let content = toml::to_string_pretty(&config)?;
+        self.install_git_hooks()?;
+
+        // Publish the config last. Its presence is the initialization marker,
+        // so a failed hook install or status write cannot leave one behind.
+        crate::core::safe_ops::atomic_write_file_sync(self.status_path(), status_json)?;
         crate::core::safe_ops::atomic_write_file_sync(self.config_path(), content)?;
 
         self.config = Some(config);
-
-        // Install git hooks if in a git repo
-        self.install_git_hooks()?;
-
         Ok(())
     }
 
@@ -446,8 +444,20 @@ impl TeamWorkspace {
 
     /// Install git hooks for auto-sync
     fn install_git_hooks(&self) -> Result<()> {
-        if !self.is_git_repo() {
-            return Ok(());
+        let git_dir = self.root.join(".git");
+        match std::fs::metadata(&git_dir) {
+            Ok(metadata) if metadata.is_file() => {
+                tracing::warn!(
+                    "Skipping team Git hooks: .git is a file, not a local hooks directory"
+                );
+                return Ok(());
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("Failed to inspect {}", git_dir.display()));
+            }
         }
 
         // Pin the hook to this executable's absolute path. A bare `omg`
@@ -457,7 +467,7 @@ impl TeamWorkspace {
             .map_or_else(|_| "omg".to_string(), |exe| exe.display().to_string());
         let omg = crate::hooks::posix_single_quoted(&omg);
 
-        let hooks_dir = self.root.join(".git/hooks");
+        let hooks_dir = git_dir.join("hooks");
         std::fs::create_dir_all(&hooks_dir)
             .with_context(|| format!("Failed to create hooks dir {}", hooks_dir.display()))?;
 
@@ -601,6 +611,83 @@ mod tests {
         git(root, &["add", "--", "seed"]);
         git(root, &["commit", "--quiet", "-m", "Initial fixture"]);
         directory
+    }
+
+    #[test]
+    fn init_in_linked_worktree_preserves_shared_hooks_and_team_state() -> Result<()> {
+        let repository = git_workspace();
+        let checkout = tempfile::tempdir()?;
+        let root = checkout.path().join("linked worktree");
+        git(repository.path(), &["config", "--unset", "core.hooksPath"]);
+        let shared_hooks = repository.path().join(".git/hooks");
+        std::fs::create_dir_all(&shared_hooks)?;
+        std::fs::write(shared_hooks.join("post-merge"), b"existing shared hook")?;
+        git(
+            repository.path(),
+            &["worktree", "add", "--detach", root.to_str().unwrap()],
+        );
+        let gitfile = root.join(".git");
+        let original_gitfile = std::fs::read(&gitfile)?;
+
+        TeamWorkspace::new(&root)?.init("worktree-team", "Worktree Team")?;
+
+        let mut reopened = TeamWorkspace::new(&root)?;
+        let status = reopened.load_status()?;
+        assert_eq!(status.config.team_id, "worktree-team");
+        assert_eq!(status.members.len(), 1);
+        assert_eq!(status.members[0].id, status.config.member_id);
+        assert!(!repository.path().join(".omg").exists());
+        assert_eq!(std::fs::read(&gitfile)?, original_gitfile);
+        assert_eq!(
+            std::fs::read(shared_hooks.join("post-merge"))?,
+            b"existing shared hook"
+        );
+        assert!(!shared_hooks.join("post-checkout").exists());
+
+        let config = std::fs::read(reopened.config_path())?;
+        let status = std::fs::read(reopened.status_path())?;
+        let error = reopened.init("other-team", "Other Team").unwrap_err();
+        assert!(error.to_string().contains("already initialized"));
+        assert_eq!(std::fs::read(reopened.config_path())?, config);
+        assert_eq!(std::fs::read(reopened.status_path())?, status);
+        Ok(())
+    }
+
+    #[test]
+    fn init_can_retry_after_hook_directory_failure() -> Result<()> {
+        let repository = git_workspace();
+        let root = repository.path();
+        let hooks = root.join(".git/hooks");
+        let saved_hooks = root.join(".git/saved-hooks");
+        std::fs::create_dir_all(&hooks)?;
+        std::fs::write(hooks.join("post-merge"), b"existing hook")?;
+        std::fs::rename(&hooks, &saved_hooks)?;
+        std::fs::write(&hooks, b"not a directory")?;
+
+        let mut workspace = TeamWorkspace::new(root)?;
+        let error = workspace.init("retry-team", "Retry Team").unwrap_err();
+        assert!(error.to_string().contains("Failed to create hooks dir"));
+        assert!(!workspace.is_team_workspace());
+        assert!(!workspace.config_path().exists());
+        assert!(!workspace.status_path().exists());
+        assert!(!TeamWorkspace::new(root)?.is_team_workspace());
+        assert_eq!(std::fs::read(&hooks)?, b"not a directory");
+
+        std::fs::remove_file(&hooks)?;
+        std::fs::rename(&saved_hooks, &hooks)?;
+        workspace.init("retry-team", "Retry Team")?;
+
+        let status = TeamWorkspace::new(root)?.load_status()?;
+        assert_eq!(status.config.team_id, "retry-team");
+        assert_eq!(std::fs::read(hooks.join("post-merge"))?, b"existing hook");
+        let installed = hooks.join("post-checkout");
+        assert!(std::fs::read_to_string(&installed)?.contains("OMG Team Sync Hook"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_ne!(installed.metadata()?.permissions().mode() & 0o111, 0);
+        }
+        Ok(())
     }
 
     #[test]
