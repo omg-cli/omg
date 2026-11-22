@@ -198,6 +198,16 @@ jobs:
           bun run --cwd services/advisories check
           bun run --cwd services/advisories dry-run
 
+      - name: Verify isolated advisory staging
+        if: matrix.shard == 0 && (github.event_name == 'push' || needs.quick-gate.outputs.checks-required == 'true')
+        env:
+          WRANGLER_SEND_METRICS: "false"
+          CLOUDFLARE_LOAD_DEV_VARS_FROM_DOT_ENV: "false"
+        run: |
+          bun --cwd services/advisories tsc --project ../advisory-staging/tsconfig.json
+          bun test services/advisory-staging/test
+          bun --cwd services/advisories wrangler deploy --dry-run --config ../advisory-staging/wrangler.example.json
+
       - name: Verify installer destination safety
         if: matrix.shard == 0
         run: bash tests/installer_security.sh

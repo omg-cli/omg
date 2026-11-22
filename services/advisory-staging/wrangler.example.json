@@ -1,0 +1,18 @@
+{
+    "$schema": "../advisories/node_modules/wrangler/config-schema.json",
+    "account_id": "f1e95b3e1b502cf366dfc81a863695fa",
+    "name": "omg-advisories-stage-20261121-1d6c61c4",
+    "main": "stage.ts",
+    "compatibility_date": "2026-11-13",
+    "workers_dev": false,
+    "preview_urls": false,
+    "d1_databases": [{
+        "binding": "DB",
+        "database_name": "omg-advisories-stage-20261121-1d6c61c4",
+        "database_id": "00000000-0000-0000-0000-000000000000",
+        "migrations_dir": "../advisories/migrations"
+    }],
+    "r2_buckets": [{ "binding": "RAW", "bucket_name": "omg-advisories-stage-20261121-1d6c61c4-raw" }],
+    "vars": { "STAGE_MODE": "disabled", "STAGE_ENABLE_CRON": "false" },
+    "limits": { "cpu_ms": 30000 }
+}
