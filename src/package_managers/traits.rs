@@ -81,6 +81,8 @@ pub trait PackageManager: Send + Sync {
     ///
     /// Backends whose normal empty-query search is complete can use this
     /// default. Backends that cap interactive search results must override it.
+    /// Fedora supplies installed rows before repository rows for the same
+    /// identity so the index can keep the installed display and search both.
     fn package_index(&self) -> Pin<Box<dyn Future<Output = Result<Vec<Package>>> + Send + '_>> {
         self.search("")
     }
