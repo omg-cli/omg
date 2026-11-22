@@ -1683,9 +1683,14 @@ path = "hostile"
 
         let data = tempdir().unwrap();
         for version in ["3.12.4", "3.13.1"] {
-            let root = data.path().join("versions/python").join(version);
-            fs::create_dir_all(root.join("bin")).unwrap();
-            mark_test_runtime_complete(&root).unwrap();
+            fs::create_dir_all(
+                data.path()
+                    .join("versions/python")
+                    .join(version)
+                    .join("bin"),
+            )
+            .unwrap();
+            mark_test_runtime_complete(&data.path().join("versions/python").join(version)).unwrap();
         }
         temp_env::with_var("OMG_DATA_DIR", Some(data.path()), || {
             let additions = build_path_additions(&versions).unwrap();
@@ -1773,9 +1778,9 @@ path = "hostile"
         }
         let data = tempdir().unwrap();
         for version in ["1.40.1", "1.40.9", "1.41.0"] {
-            let root = data.path().join("versions/deno").join(version);
-            fs::create_dir_all(root.join("bin")).unwrap();
-            mark_test_runtime_complete(&root).unwrap();
+            fs::create_dir_all(data.path().join("versions/deno").join(version).join("bin"))
+                .unwrap();
+            mark_test_runtime_complete(&data.path().join("versions/deno").join(version)).unwrap();
         }
         temp_env::with_var("OMG_DATA_DIR", Some(data.path()), || {
             let versions = HashMap::from([("deno".to_string(), "1.40".to_string())]);
@@ -2063,16 +2068,23 @@ path = "hostile"
         let expected = dir.path().join("versions/node/20.11.1/bin");
         fs::create_dir_all(&expected).unwrap();
         mark_test_runtime_complete(expected.parent().unwrap()).unwrap();
-        fs::create_dir_all(dir.path().join("versions/node/20/bin")).unwrap();
 
         assert_eq!(
             resolve_node_bin_path(dir.path(), "^20").unwrap(),
-            Some(expected.clone())
-        );
-        assert_eq!(
-            resolve_node_bin_path(dir.path(), "20").unwrap(),
             Some(expected)
         );
+    }
+
+    #[test]
+    fn node_partial_request_skips_an_interrupted_exact_directory() {
+        let dir = tempdir().unwrap();
+        let installed = dir.path().join("versions/node/20.11.1");
+        fs::create_dir_all(installed.join("bin")).unwrap();
+        mark_test_runtime_complete(&installed).unwrap();
+        fs::create_dir_all(dir.path().join("versions/node/20/bin")).unwrap();
+
+        let resolved = resolve_node_bin_path(dir.path(), "20").unwrap();
+        assert_eq!(resolved.unwrap(), installed.join("bin"));
     }
 
     #[test]
