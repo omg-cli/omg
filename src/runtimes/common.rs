@@ -1254,7 +1254,7 @@ fn extract_task(archive_path: &Path) -> ProgressTask {
     })
 }
 
-const INSTALL_MARKER: &str = ".omg-install-complete";
+pub(super) const INSTALL_MARKER: &str = ".omg-install-complete";
 
 /// Best-effort file removal for leftover archives and stale current links.
 /// Failure only wastes cache space or leaves a dangling symlink; the next
@@ -1362,10 +1362,14 @@ pub(crate) fn complete_staged_install_with_lease(
             rustix::fs::RenameFlags::NOREPLACE,
         )
         .with_context(|| {
-            format!(
-                "Failed to publish runtime installation at {}",
-                version_dir.display()
-            )
+            if fs::symlink_metadata(version_dir).is_ok() && !is_valid_version_dir(version_dir) {
+                blocked_install_destination(version_dir)
+            } else {
+                format!(
+                    "Failed to publish runtime installation at {}",
+                    version_dir.display()
+                )
+            }
         })
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -1634,6 +1638,13 @@ pub(crate) fn is_valid_version_dir(version_dir: &Path) -> bool {
         })
 }
 
+pub(super) fn blocked_install_destination(version_dir: &Path) -> String {
+    format!(
+        "Runtime path {} was left untouched. Inspect it and, if you own it, move it aside before retrying the install",
+        version_dir.display()
+    )
+}
+
 #[cfg(test)]
 pub(crate) fn mark_test_runtime_complete(version_dir: &Path) -> Result<()> {
     let version = version_dir
@@ -1821,6 +1832,12 @@ pub(crate) fn uninstall_version_with_lease(
     // escape the versions tree through a linked version path.
     let version_dir = versions_dir.join(version);
     if !is_valid_version_dir(&version_dir) {
+        if fs::symlink_metadata(&version_dir).is_ok() {
+            anyhow::bail!(
+                "Version {version} is not installed; nothing to remove. {}",
+                blocked_install_destination(&version_dir)
+            );
+        }
         anyhow::bail!("Version {version} is not installed; nothing to remove");
     }
     if fs::read_link(versions_dir.join("current"))
@@ -4128,7 +4145,8 @@ mod tests {
         let error = set_current_version(&versions, "3.12.0").unwrap_err();
         assert!(error.to_string().contains("is not installed"));
         fs::remove_file(versions.join("current"))?;
-        assert!(uninstall_version(&versions, "3.12.0").is_err());
+        let error = uninstall_version(&versions, "3.12.0").unwrap_err();
+        assert!(error.to_string().contains("if you own it, move it aside"));
         assert!(version.join("bin").is_dir());
         Ok(())
     }
@@ -4833,6 +4851,7 @@ mod tests {
         prepare_runtime_fixture(staging.path(), &version_dir, "1.0.0")?;
         let error = complete_staged_install(&staging, &version_dir, "1.0.0")
             .expect_err("must refuse to publish over an existing version");
+        assert!(error.to_string().contains("if you own it, move it aside"));
         assert_eq!(
             error.downcast_ref::<rustix::io::Errno>(),
             Some(&rustix::io::Errno::EXIST)

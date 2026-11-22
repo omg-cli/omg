@@ -375,25 +375,12 @@ impl ErlangManager {
         let version = self.resolve_alias(version).await?;
         let version = self.resolve_requested_version(&version).await?;
         crate::core::security::validate_runtime_version(&version)?;
-        // This nonblocking filesystem lease owns final-path initialization and
-        // crash recovery. It never blocks an executor thread while awaiting I/O.
-        let _install_lease = super::common::try_lock_runtime_install(&self.versions_dir, &version)?;
+        let _install_lease = self.lock_install_destination(&version)?;
         let version_dir = self.versions_dir.join(&version);
 
-        // The fast path additionally requires `bin/erl`: a directory that
-        // survived extraction but never completed `./Install` is broken and
-        // must reinstall rather than activate.
-        if is_valid_version_dir(&version_dir) && version_dir.join("bin/erl").is_file() {
+        if is_valid_version_dir(&version_dir) {
             print_already_installed("Erlang/OTP", &version);
             return self.use_version(&version);
-        }
-        if version_dir.exists() {
-            fs::remove_dir_all(&version_dir).with_context(|| {
-                format!(
-                    "Failed to clear incomplete Erlang/OTP install at {}",
-                    version_dir.display()
-                )
-            })?;
         }
 
         println!(
@@ -430,6 +417,66 @@ impl ErlangManager {
         Ok(())
     }
 
+    fn lock_install_destination(&self, version: &str) -> Result<super::common::RuntimeLease> {
+        let install_lease = super::common::try_lock_runtime_install(&self.versions_dir, version)?;
+        let destination = self.versions_dir.join(version);
+        let _mutation_lease =
+            super::common::try_lock_runtime_file(&self.versions_dir, ".mutation.lock")?;
+        match fs::symlink_metadata(&destination) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(install_lease),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| super::common::blocked_install_destination(&destination));
+            }
+            Ok(_) if is_valid_version_dir(&destination) => return Ok(install_lease),
+            Ok(_) => {}
+        }
+        match fs::read_link(self.versions_dir.join("current")) {
+            Ok(target) if target.ends_with(version) => {
+                anyhow::bail!(
+                    "Runtime path {} is still selected; select another installed Erlang version before retrying",
+                    destination.display()
+                );
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).context(
+                    "Cannot verify the current Erlang selection; inspect it before retrying",
+                );
+            }
+        }
+        super::security::verify_interrupted_erlang_install(&destination, version)
+            .with_context(|| super::common::blocked_install_destination(&destination))?;
+
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            let retained = tempfile::Builder::new()
+                .prefix(".interrupted-")
+                .tempdir_in(&self.versions_dir)?
+                .keep();
+            let quarantine = retained.join(version);
+            if let Err(error) = rustix::fs::renameat_with(
+                rustix::fs::CWD,
+                &destination,
+                rustix::fs::CWD,
+                &quarantine,
+                rustix::fs::RenameFlags::NOREPLACE,
+            ) {
+                let _ = fs::remove_dir(&retained);
+                return Err(error)
+                    .with_context(|| super::common::blocked_install_destination(&destination));
+            }
+            println!(
+                "Preserved the interrupted Erlang install at {}",
+                quarantine.display()
+            );
+            Ok(install_lease)
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        anyhow::bail!("Atomic Erlang recovery is unsupported on this platform")
+    }
+
     async fn publish_download(&self, download_path: &Path, url: &str, version: &str) -> Result<()> {
         let version_dir = self.versions_dir.join(version);
         let publisher =
@@ -439,8 +486,7 @@ impl ErlangManager {
         if std::env::consts::OS == "linux" {
             require_staged_install_script(&staging.path().join("Install"))?;
         }
-        fs::File::create_new(staging.path().join(super::common::INSTALL_PENDING_MARKER))?
-            .sync_all()?;
+        write_pending_install_marker(staging.path())?;
         let admission =
             self.security
                 .prepare_staged("erlang", version, staging.path(), &version_dir)?;
@@ -567,6 +613,17 @@ fn cleanup_broken_install(version_dir: &Path) {
     }
 }
 
+fn write_pending_install_marker(version_dir: &Path) -> Result<()> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(version_dir.join(super::common::INSTALL_PENDING_MARKER))?
+        .sync_all()?;
+    Ok(())
+}
+
 /// Ensure the installed `erl` is executable (tarballs may drop modes).
 #[cfg(unix)]
 fn make_staged_executable(path: &Path) -> Result<()> {
@@ -628,6 +685,8 @@ mod tests {
             versions_dir: fixture.versions.clone(),
             client: download_client(),
         };
+        seed_interrupted_install(&manager, &fixture, version, url.as_str()).unwrap();
+        assert_eq!(manager.list_installed().unwrap(), ["1.0.0"]);
         manager
             .install(version)
             .await
@@ -645,6 +704,7 @@ mod tests {
             fs::read(fixture.versions.join("1.0.0/bin/erl")).unwrap(),
             b"previous reviewed runtime"
         );
+        assert_interrupted_tree_preserved(&fixture, version);
         super::super::security::admit_installed(
             "erlang",
             &installed,
@@ -656,6 +716,125 @@ mod tests {
     }
 
     use super::*;
+
+    fn seed_interrupted_install(
+        manager: &ErlangManager,
+        fixture: &super::super::test_archive::PublicationFixture,
+        version: &str,
+        url: &str,
+    ) -> Result<()> {
+        let destination = fixture.versions.join(version);
+        let staging = begin_staged_install(&fixture.versions)?;
+        fs::write(
+            staging.path().join("interrupted-payload"),
+            b"retained OTP bytes",
+        )?;
+        write_pending_install_marker(staging.path())?;
+        fixture.write(b"controlled previous archive");
+        let publisher = super::super::security::record_download(
+            "erlang",
+            version,
+            &destination,
+            &fixture.archive,
+            url,
+        )?;
+        manager
+            .security
+            .prepare_staged("erlang", version, staging.path(), &destination)?;
+        complete_staged_install(&staging, &destination, version)?;
+        publisher.commit();
+        Ok(())
+    }
+
+    fn assert_interrupted_tree_preserved(
+        fixture: &super::super::test_archive::PublicationFixture,
+        version: &str,
+    ) {
+        let quarantines: Vec<_> = fs::read_dir(&fixture.versions)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(".interrupted-")
+            })
+            .collect();
+        assert_eq!(quarantines.len(), 1);
+        assert_eq!(
+            fs::read(quarantines[0].join(version).join("interrupted-payload")).unwrap(),
+            b"retained OTP bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn interrupted_erlang_install_can_retry_without_moving_ambiguous_paths() -> Result<()> {
+        use super::super::test_archive::{PublicationFixture, tar_gz_entries};
+
+        let fixture = PublicationFixture::new("erlang", "bin/erl");
+        let manager = ErlangManager {
+            security: super::super::security::RuntimeSecurity::fixture(),
+            versions_dir: fixture.versions.clone(),
+            client: download_client(),
+        };
+        let version = "27.0.0";
+        let url = "https://builds.hex.pm/builds/otp/amd64/ubuntu-24.04/OTP-27.0.0.tar.gz";
+        let path = fixture.versions.join(version);
+        fs::create_dir(&path)?;
+        fs::write(path.join("unowned"), b"untouched")?;
+        let error = manager.install(version).await.unwrap_err();
+        assert!(error.to_string().contains("if you own it, move it aside"));
+        assert_eq!(fs::read(path.join("unowned"))?, b"untouched");
+        let moved = fixture.versions.join(".owner-moved");
+        fs::rename(&path, &moved)?;
+        std::os::unix::fs::symlink(&moved, &path)?;
+        let error = manager.install(version).await.unwrap_err();
+        assert!(error.to_string().contains("left untouched"));
+        assert_eq!(fs::read_link(&path)?, moved);
+        fs::remove_file(&path)?;
+
+        seed_interrupted_install(&manager, &fixture, version, url)?;
+        let payload = path.join("interrupted-payload");
+        fs::write(&payload, b"changed after receipt")?;
+        assert!(
+            manager
+                .lock_install_destination(version)
+                .unwrap_err()
+                .to_string()
+                .contains("left untouched")
+        );
+        assert_eq!(fs::read(&payload)?, b"changed after receipt");
+        fs::write(&payload, b"retained OTP bytes")?;
+
+        let in_use = super::super::common::try_lock_runtime_use(&fixture.versions)?;
+        assert!(manager.lock_install_destination(version).is_err());
+        assert_eq!(fs::read(&payload)?, b"retained OTP bytes");
+        drop(in_use);
+        let lease = manager.lock_install_destination(version)?;
+        assert!(
+            super::super::common::try_lock_runtime_install(&fixture.versions, version).is_err()
+        );
+        assert!(fs::symlink_metadata(&path).is_err());
+        fixture.assert_previous();
+        assert_interrupted_tree_preserved(&fixture, version);
+
+        let launcher = b"#!/bin/sh\nexit 0\n";
+        fixture.write(&tar_gz_entries(
+            "otp",
+            &[("Install", launcher), ("bin/erl", launcher)],
+        )?);
+        manager
+            .publish_download(&fixture.archive, url, version)
+            .await?;
+        fixture.assert_previous();
+        assert_eq!(manager.list_installed()?, [version, "1.0.0"]);
+        manager.use_version(version)?;
+        assert_eq!(manager.current_version().as_deref(), Some(version));
+        assert_eq!(fs::read(moved.join("unowned"))?, b"untouched");
+        assert_interrupted_tree_preserved(&fixture, version);
+        drop(lease);
+        Ok(())
+    }
 
     const BUILDS_TXT: &str = "OTP-24.3.4 0863bd30aabd035c83158c78046c5ffda16127e1 2024-04-26T03:41:09Z\n\
          OTP-27.0 2915bea4768308995489fecfed2357dcb1574e6b 2026-09-07T00:50:41Z e077943ada95e593911db5ef9cbacdd60158bca25855bfce1f03fceb052738c6\n\
