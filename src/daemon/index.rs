@@ -281,27 +281,33 @@ impl PackageIndex {
     }
 
     pub(super) fn from_packages(
-        packages: Vec<crate::core::Package>,
+        mut packages: Vec<crate::core::Package>,
         name_kind: SearchNameKind,
     ) -> Self {
         let mut index = Self::with_capacity(packages.len());
         index.name_kind = name_kind;
-        for package in packages {
-            let official = package.source == crate::core::PackageSource::Official;
-            if name_kind == SearchNameKind::RpmIdentity
-                && official
-                && let Some(&idx) = index.name_to_idx.get(&package.name)
-                && index.items[idx].rpm_eligible
-            {
-                if package.description != index.pool.get(index.items[idx].description_offset) {
-                    let offset = index.pool.intern(&package.description.to_lowercase());
+        if name_kind == SearchNameKind::RpmIdentity {
+            packages.sort_by(|a, b| a.name.cmp(&b.name));
+            let mut idx = 0;
+            packages.dedup_by(|next, first| {
+                if next.name != first.name
+                    || next.source != crate::core::PackageSource::Official
+                    || first.source != crate::core::PackageSource::Official
+                {
+                    idx += 1;
+                    return false;
+                }
+                if next.description != first.description {
+                    let offset = index.pool.intern(&next.description.to_lowercase());
                     let aliases = index.rpm_summary_aliases.entry(idx).or_default();
                     if !aliases.contains(&offset) {
                         aliases.push(offset);
                     }
                 }
-                continue;
-            }
+                true
+            });
+        }
+        for package in packages {
             let idx = index.items.len();
             index.push(
                 &package.name,
@@ -315,7 +321,7 @@ impl PackageIndex {
                 &[],
             );
             // Keep original source provenance for ranking without changing wire output.
-            index.items[idx].rpm_eligible = official;
+            index.items[idx].rpm_eligible = package.source == crate::core::PackageSource::Official;
         }
         index
     }
@@ -936,21 +942,55 @@ mod tests {
 
     #[test]
     fn fedora_search_index_keeps_alternate_summaries_private_to_each_rpm_identity() {
-        use crate::core::{Package, PackageSource};
+        use crate::core::Package;
+        use crate::core::PackageSource::{Aur, Official};
         use crate::package_managers::parse_version_or_zero;
 
         let candidates = [
-            ("widget.lib.x86_64", "1", "Installed summary", true),
-            ("widget.lib.x86_64", "2", "Installed summary", false),
-            ("widget.lib.x86_64", "3", "An ÉCLAIR keyword", false),
-            ("widget.lib.x86_64", "4", "An éclair keyword", false),
-            ("widget.lib.i686", "3", "Different architecture", false),
+            (
+                "widget.lib.x86_64",
+                "1",
+                "Installed summary",
+                Official,
+                true,
+            ),
+            (
+                "widget.lib.x86_64",
+                "2",
+                "Installed summary",
+                Official,
+                false,
+            ),
+            (
+                "widget.lib.x86_64",
+                "3",
+                "An ÉCLAIR keyword",
+                Official,
+                false,
+            ),
+            (
+                "widget.lib.x86_64",
+                "4",
+                "An éclair keyword",
+                Official,
+                false,
+            ),
+            (
+                "widget.lib.i686",
+                "3",
+                "Different architecture",
+                Official,
+                false,
+            ),
+            ("mixed.noarch", "1", "Generic record", Aur, false),
+            ("mixed.noarch", "2", "Official record", Official, false),
+            ("mixed.noarch", "3", "Other generic record", Aur, false),
         ]
-        .map(|(name, version, description, installed)| Package {
+        .map(|(name, version, description, source, installed)| Package {
             name: name.to_owned(),
             version: parse_version_or_zero(version),
             description: description.to_owned(),
-            source: PackageSource::Official,
+            source,
             installed,
         });
         let index = PackageIndex::from_packages(Vec::from(candidates), SearchNameKind::RpmIdentity);
@@ -965,6 +1005,7 @@ mod tests {
             "widget.lib.i686"
         );
         assert!(index.search("summary an éclair", 20).is_empty());
+        assert_eq!(index.search("mixed.noarch", 20).len(), 3);
     }
 
     #[test]
