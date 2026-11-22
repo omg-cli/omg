@@ -328,7 +328,9 @@ class AdvisoryReleaseBoundaryTests(unittest.TestCase):
                 path.write_text(text, encoding="utf-8", newline="\n")
                 path.chmod(0o700)
             environment = dict(os.environ, PATH=str(root / "bin") + os.pathsep + os.environ["PATH"],
-                               GITHUB_SHA="controlled-source-commit", GITHUB_STEP_SUMMARY=str(root / "summary"),
+                               GITHUB_SHA="a" * 40, GITHUB_REF="refs/heads/main",
+                               GITHUB_EVENT_NAME="workflow_dispatch", RELEASE_CANDIDATE="v0.1.225@" + "a" * 40,
+                               GITHUB_STEP_SUMMARY=str(root / "summary"),
                                LINUX_MATRIX="success", SANDBOX_CANCELLATION="success",
                                FEATURE_INTERSECTIONS="success", MACOS="success", UBUNTU="success")
             result = subprocess.run([BASH, "-e", "-o", "pipefail", "-c", script], cwd=root,

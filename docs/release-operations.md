@@ -12,6 +12,24 @@ description: Build, verify, publish, resync, and roll back OMG releases
 
 How releases are built, published, verified, and rolled back.
 
+## Authorize a new release
+
+Main pushes run CI but do not tag or publish. When a release is approved,
+confirm the candidate is the current `main` commit and that its push-triggered
+CI, Benchmark, Security Audit, Secret Scanning, CodeQL, Coverage, Docker E2E,
+and publisher archive proof have passed. Then a maintainer with repository
+write access can run the **CI** workflow on `main` and fill in
+`release-candidate` with `vVERSION@FULL_COMMIT_SHA` (the Cargo.toml version,
+prefixed with `v`, and the full SHA of that exact commit). Leave the input
+blank for a nonpublishing CI dispatch.
+
+The tag job refuses a mismatched candidate and still requires successful push
+checks for that exact SHA, including staged guest verification, and rechecks
+publisher archive proof before creating the immutable tag. On success it
+dispatches **Release** on that tag. The authorization is scoped to the dispatch,
+not a persistent setting. Do not retry a tag-capable run without renewed
+release approval, including old push runs created before this interlock.
+
 ## Pipeline overview
 
 ```mermaid

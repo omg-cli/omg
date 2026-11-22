@@ -65,14 +65,83 @@ class ReleaseWorkflowBoundaryTests(unittest.TestCase):
         self.assertIn('--repo "$source_signer"', script)
         self.assertIn('--signer-workflow "$source_signer/.github/workflows/release.yml"', script)
 
-    def test_immutable_tag_waits_for_other_workflows_without_waiting_on_itself(self):
-        block = job_block((WORKFLOWS / 'ci.yml').read_text(), 'release-tag')
+    def test_immutable_tag_requires_explicit_dispatch_and_push_evidence(self):
+        ci = (WORKFLOWS / 'ci.yml').read_text()
+        block = job_block(ci, 'release-tag')
         tag = block.index('git tag "$TAG" "$GITHUB_SHA"')
-        for workflow in ('benchmark.yml', 'audit.yml', 'secrets.yml', 'codeql.yml',
+        self.assertIn("if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' "
+                      "&& inputs['release-candidate'] != ''", block)
+        self.assertIn("RELEASE_CANDIDATE: ${{ inputs['release-candidate'] }}", block)
+        self.assertRegex(ci, r'(?m)^      release-candidate:\n        description: [^\n]+\n'
+                             r'        type: string\n        default: ""$')
+        self.assertIn("--event push", (ROOT / 'scripts/require-workflow-success.sh').read_text())
+        for workflow in ('ci.yml', 'benchmark.yml', 'audit.yml', 'secrets.yml', 'codeql.yml',
                          'coverage.yml', 'docker-e2e.yml'):
             self.assertLess(block.index(f'scripts/require-workflow-success.sh {workflow}'), tag)
-        self.assertNotIn('scripts/require-workflow-success.sh ci.yml', block)
         self.assertIn('ci-success]', block)
+
+    def test_release_dispatch_cannot_tag_without_exact_authorization_and_push_ci(self):
+        ci = (WORKFLOWS / 'ci.yml').read_text()
+        script = step_script(job_block(ci, 'release-tag'),
+                             'Tag Cargo.toml version when all platform builds succeeded')
+        sha = 'a' * 40
+        approved = f'v0.1.225@{sha}'
+        main = 'refs/heads/main'
+        for event, ref, candidate, push_ci, expected_lookups in (
+            ('push', main, approved, 'success', []),
+            ('pull_request', 'refs/pull/1/merge', approved, 'success', []),
+            ('workflow_dispatch', 'refs/heads/other', approved, 'success', []),
+            ('workflow_dispatch', main, '', 'success', []),
+            ('workflow_dispatch', main, f'v0.1.224@{sha}', 'success', []),
+            ('workflow_dispatch', main, 'v0.1.225@' + 'b' * 40, 'success', []),
+            ('workflow_dispatch', main, f'v0.1.225@{sha[:7]}', 'success', []),
+            ('workflow_dispatch', main, '$(touch injected)', 'success', []),
+            ('workflow_dispatch', main, approved, 'failure', ['ci.yml']),
+            ('workflow_dispatch', main, approved, 'success',
+             ['ci.yml', 'benchmark.yml', 'audit.yml', 'secrets.yml', 'codeql.yml',
+              'coverage.yml', 'docker-e2e.yml']),
+        ):
+            with self.subTest(event=event, ref=ref, candidate=candidate, push_ci=push_ci), \
+                    tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                (root / 'Cargo.toml').write_text('version = "0.1.225"\n', encoding='utf-8')
+                fixtures = {
+                    'git': 'case "$1" in\n'
+                           '  ls-remote) test -f tagged;;\n'
+                           '  tag) printf "%s\\n" "$*" > tagged;;\n'
+                           '  push) printf "%s\\n" "$*" > pushed;;\n'
+                           '  *) exit 99;;\n'
+                           'esac\n',
+                    'gh': 'printf "%s\\n" "$*" > dispatched\n',
+                    'python3': 'test "$*" = "scripts/advisory-baseline.py status" && touch archive-checked\n',
+                    'scripts/require-workflow-success.sh': 'printf "%s %s\\n" "$1" "$2" >> lookups\n'
+                                                           'test "$1" != ci.yml || test "$PUSH_CI" = success\n',
+                }
+                (root / 'scripts').mkdir()
+                for name, body in fixtures.items():
+                    fixture = root / name
+                    fixture.write_text('#!/bin/sh\n' + body, encoding='utf-8', newline='\n')
+                    fixture.chmod(0o700)
+                env = dict(os.environ, PATH=str(root) + os.pathsep + os.environ['PATH'],
+                           GITHUB_EVENT_NAME=event, GITHUB_REF=ref, GITHUB_SHA=sha,
+                           GITHUB_STEP_SUMMARY=str(root / 'summary'), RELEASE_CANDIDATE=candidate,
+                           PUSH_CI=push_ci, LINUX_MATRIX='success', SANDBOX_CANCELLATION='success',
+                           FEATURE_INTERSECTIONS='success', MACOS='success', UBUNTU='success')
+                result = subprocess.run([BASH, '-e', '-o', 'pipefail', '-c', script], cwd=root,
+                                        env=env, capture_output=True, text=True, timeout=10)
+                lookups = root / 'lookups'
+                self.assertEqual(lookups.read_text().splitlines() if lookups.exists() else [],
+                                 [f'{name} {sha}' for name in expected_lookups])
+                allowed = len(expected_lookups) == 7
+                self.assertEqual(result.returncode == 0, allowed, result.stdout + result.stderr)
+                for path in ('archive-checked', 'tagged', 'pushed', 'dispatched'):
+                    self.assertEqual((root / path).exists(), allowed, path)
+                self.assertFalse((root / 'injected').exists())
+                if allowed:
+                    self.assertEqual((root / 'tagged').read_text().strip(), f'tag v0.1.225 {sha}')
+                    self.assertEqual((root / 'pushed').read_text().strip(), 'push origin refs/tags/v0.1.225')
+                    self.assertEqual((root / 'dispatched').read_text().strip(),
+                                     'workflow run release.yml --ref v0.1.225 -f dry_run=false')
 
     def test_dispatch_executes_exact_gates_without_evaluating_input(self):
         release = (WORKFLOWS / 'release.yml').read_text(encoding='utf-8')
