@@ -144,7 +144,7 @@ async fn complete_package_names(
 pub(crate) async fn available_package_names() -> Result<Vec<String>> {
     let backend = crate::package_managers::resolve_backend()?;
     // Official lookup failures fail closed; AUR names remain optional enrichment.
-    let mut names: Vec<_> = if matches!(
+    let names = if matches!(
         backend,
         crate::package_managers::Backend::Fedora
             | crate::package_managers::Backend::MacOS
@@ -159,10 +159,7 @@ pub(crate) async fn available_package_names() -> Result<Vec<String>> {
     } else {
         tokio::task::spawn_blocking(official_package_names).await??
     };
-    if backend == crate::package_managers::Backend::Fedora {
-        names.sort_unstable();
-        names.dedup();
-    }
+    let names = catalog_completion_names(backend, names);
 
     // Mock Arch completion can consume its isolated cache but never refresh it.
     #[cfg(feature = "arch")]
@@ -192,6 +189,17 @@ pub(crate) async fn available_package_names() -> Result<Vec<String>> {
     let _ = backend;
 
     Ok(names)
+}
+
+fn catalog_completion_names(
+    backend: crate::package_managers::Backend,
+    mut names: Vec<String>,
+) -> Vec<String> {
+    if backend == crate::package_managers::Backend::Fedora {
+        names.sort_unstable();
+        names.dedup();
+    }
+    names
 }
 
 /// Complete installed package names for remove command
@@ -1690,6 +1698,18 @@ fn print_dashboard_sync_hint(telemetry_enabled: bool, dashboard_configured: bool
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fedora_completion_only_deduplicates_exact_rpm_identities() {
+        use crate::package_managers::Backend;
+
+        let candidates =
+            ["widget.lib.x86_64", "widget.lib.i686", "widget.lib.x86_64"].map(str::to_owned);
+        assert_eq!(
+            catalog_completion_names(Backend::Fedora, Vec::from(candidates)),
+            ["widget.lib.i686", "widget.lib.x86_64"]
+        );
+    }
 
     #[cfg(unix)]
     fn presentation_fixture_output(case: &str) -> String {

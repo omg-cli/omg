@@ -935,6 +935,39 @@ mod tests {
     }
 
     #[test]
+    fn fedora_search_index_keeps_alternate_summaries_private_to_each_rpm_identity() {
+        use crate::core::{Package, PackageSource};
+        use crate::package_managers::parse_version_or_zero;
+
+        let candidates = [
+            ("widget.lib.x86_64", "1", "Installed summary", true),
+            ("widget.lib.x86_64", "2", "Installed summary", false),
+            ("widget.lib.x86_64", "3", "An ÉCLAIR keyword", false),
+            ("widget.lib.x86_64", "4", "An éclair keyword", false),
+            ("widget.lib.i686", "3", "Different architecture", false),
+        ]
+        .map(|(name, version, description, installed)| Package {
+            name: name.to_owned(),
+            version: parse_version_or_zero(version),
+            description: description.to_owned(),
+            source: PackageSource::Official,
+            installed,
+        });
+        let index = PackageIndex::from_packages(Vec::from(candidates), SearchNameKind::RpmIdentity);
+
+        let hit = index.search("éclair keyword", 20);
+        assert_eq!(hit.len(), 1);
+        assert_eq!(hit[0].name, "widget.lib.x86_64");
+        assert_eq!(hit[0].version, "1");
+        assert_eq!(hit[0].description, "Installed summary");
+        assert_eq!(
+            index.search("different architecture", 20)[0].name,
+            "widget.lib.i686"
+        );
+        assert!(index.search("summary an éclair", 20).is_empty());
+    }
+
+    #[test]
     fn fedora_search_index_ranks_rpm_basename_before_limit() {
         let index = rpm_fixture_index(&[
             ("tree2.i686", "1", "prefix"),
