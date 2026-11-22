@@ -906,7 +906,7 @@ impl Transaction {
         })?;
         self.backups.insert(status_path.to_path_buf(), backup_path);
 
-        let updated = merge_status_entries(&current, entries);
+        let updated = merge_status_entries(&current, entries)?;
         crate::core::safe_ops::atomic_write_file_sync(status_path, updated.as_bytes())
             .context("Failed to persist updated dpkg status")?;
 
@@ -1324,18 +1324,17 @@ fn remove_packages_sequentially(
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct DpkgPackageIdentity {
     name: String,
-    architecture: Option<String>,
+    architecture: String,
 }
 
 /// Merge new dpkg status paragraphs into `current`.
 ///
 /// Existing paragraphs whose `(Package, Architecture)` identity appears in
 /// `entries` are replaced by the matching new entry; all other paragraphs are
-/// preserved verbatim. `Architecture: all` uses the package name alone, as
-/// dpkg does for architecture-independent packages. New entries are appended
-/// in the given order. The result keeps dpkg's one-blank-line paragraph
-/// separation and a trailing newline.
-fn merge_status_entries(current: &str, entries: &[(String, String)]) -> String {
+/// preserved. `Architecture: all` and legacy archless records share the
+/// native replacement slot. An update must not leave an architecture-independent
+/// package alongside another instance. New entries are appended in order.
+fn merge_status_entries(current: &str, entries: &[(String, String)]) -> Result<String> {
     let mut pending_by_identity = HashMap::new();
     let mut pending = vec![true; entries.len()];
     for (index, (name, entry)) in entries.iter().enumerate() {
@@ -1371,26 +1370,46 @@ fn merge_status_entries(current: &str, entries: &[(String, String)]) -> String {
         }
     }
 
-    out
+    let updated_names: std::collections::HashSet<_> = entries
+        .iter()
+        .map(|(name, entry)| status_entry_field(entry, "Package").unwrap_or(name))
+        .collect();
+    let mut seen = HashMap::new();
+    for paragraph in out.split("\n\n") {
+        if let Some(name) = status_entry_field(paragraph, "Package")
+            && updated_names.contains(name)
+        {
+            let independent = status_entry_field(paragraph, "Architecture") == Some("all");
+            if let Some(previous_independent) = seen.insert(name, independent) {
+                anyhow::ensure!(
+                    !independent && !previous_independent,
+                    "Cannot combine architecture-independent and other instances of {name}"
+                );
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn status_entry_field<'a>(paragraph: &'a str, key: &str) -> Option<&'a str> {
+    paragraph
+        .lines()
+        .filter(|line| !line.starts_with([' ', '\t']))
+        .filter_map(|line| line.split_once(':'))
+        .find(|(name, _)| name.eq_ignore_ascii_case(key))
+        .map(|(_, value)| value.trim())
+        .filter(|value| !value.is_empty())
 }
 
 fn status_entry_identity(
     paragraph: &str,
     fallback_name: Option<&str>,
 ) -> Option<DpkgPackageIdentity> {
-    let field = |key: &str| {
-        paragraph
-            .lines()
-            .filter(|line| !line.starts_with([' ', '\t']))
-            .filter_map(|line| line.split_once(':'))
-            .find(|(name, _)| name.eq_ignore_ascii_case(key))
-            .map(|(_, value)| value.trim())
-            .filter(|value| !value.is_empty())
-    };
-    let name = field("Package").or(fallback_name)?;
-    let architecture = field("Architecture")
+    let name = status_entry_field(paragraph, "Package").or(fallback_name)?;
+    let architecture = status_entry_field(paragraph, "Architecture")
         .filter(|architecture| *architecture != "all")
-        .map(str::to_owned);
+        .unwrap_or(super::debian_arch())
+        .to_owned();
 
     Some(DpkgPackageIdentity {
         name: name.to_owned(),
@@ -3739,7 +3758,7 @@ mod tests {
             "Package: vim\nStatus: install ok installed\nVersion: 9.9\n".to_string(),
         )];
 
-        let merged = merge_status_entries(current, &entries);
+        let merged = merge_status_entries(current, &entries).expect("valid dpkg status merge");
 
         assert!(merged.contains("Version: 9.9"), "{merged}");
         assert!(
@@ -3760,7 +3779,7 @@ mod tests {
             "Package: curl\nStatus: install ok installed\nVersion: 8.0\n".to_string(),
         )];
 
-        let merged = merge_status_entries(current, &entries);
+        let merged = merge_status_entries(current, &entries).expect("valid dpkg status merge");
 
         assert!(merged.contains("Package: curl"), "{merged}");
         assert!(merged.contains("Package: git"), "{merged}");
@@ -3774,7 +3793,7 @@ mod tests {
             "Package: curl\nStatus: install ok installed\nVersion: 8.0\n".to_string(),
         )];
 
-        let merged = merge_status_entries("", &entries);
+        let merged = merge_status_entries("", &entries).expect("valid dpkg status merge");
         assert_eq!(
             merged,
             "Package: curl\nStatus: install ok installed\nVersion: 8.0\n\n"
@@ -3794,7 +3813,7 @@ mod tests {
             ),
         ];
 
-        let merged = merge_status_entries("", &entries);
+        let merged = merge_status_entries("", &entries).expect("valid dpkg status merge");
 
         assert_eq!(merged.matches("Package: libexample\n").count(), 2);
         assert!(merged.contains("Architecture: amd64\n"), "{merged}");
@@ -3810,7 +3829,7 @@ mod tests {
                 .to_string(),
         )];
 
-        let merged = merge_status_entries(current, &entries);
+        let merged = merge_status_entries(current, &entries).expect("valid dpkg status merge");
 
         assert!(
             merged.contains("Version: 1.0\nArchitecture: amd64\n"),
@@ -3832,7 +3851,7 @@ mod tests {
                 .to_string(),
         )];
 
-        let merged = merge_status_entries(current, &entries);
+        let merged = merge_status_entries(current, &entries).expect("valid dpkg status merge");
 
         assert!(
             merged.contains("Version: 1.0\nArchitecture: amd64\n"),
@@ -3859,7 +3878,7 @@ mod tests {
                 .to_string(),
         )];
 
-        let merged = merge_status_entries(current, &entries);
+        let merged = merge_status_entries(current, &entries).expect("valid dpkg status merge");
 
         assert!(
             merged.contains("Version: 2.0\nArchitecture: all\n"),
@@ -3879,12 +3898,58 @@ mod tests {
             )
         });
 
-        let merged = merge_status_entries(current, &entries);
+        let merged = merge_status_entries(current, &entries).expect("valid dpkg status merge");
 
         assert_eq!(merged.matches("Package: libexample\n").count(), 2);
         assert!(merged.contains("Version: 3.0\nArchitecture: amd64\n"));
         assert!(merged.contains("Version: 1.0\nArchitecture: i386\n"));
         assert!(!merged.contains("Version: 2.0"));
+    }
+
+    #[test]
+    fn merge_status_entries_replaces_native_and_all_in_both_directions() {
+        let native = super::super::debian_arch();
+        for (old, new) in [("all", native), (native, "all")] {
+            let current = format!(
+                "Package: shared-data\nStatus: install ok installed\nVersion: 1.0\nArchitecture: {old}\n"
+            );
+            let entry = format!(
+                "Package: shared-data\nStatus: install ok installed\nVersion: 2.0\nArchitecture: {new}\n"
+            );
+            let merged =
+                merge_status_entries(&current, &[("shared-data".to_owned(), entry.clone())])
+                    .expect("single-instance architecture transition");
+            assert_eq!(merged, format!("{entry}\n"));
+        }
+    }
+
+    #[test]
+    fn merge_status_entries_reinstalls_over_native_legacy_archless_record() {
+        let native = super::super::debian_arch();
+        let current = "Package: shared-data\nStatus: deinstall ok config-files\nVersion: 1.0\n";
+        let entry = format!(
+            "Package: shared-data\nStatus: install ok installed\nVersion: 2.0\nArchitecture: {native}\n"
+        );
+        let merged = merge_status_entries(current, &[("shared-data".to_owned(), entry.clone())])
+            .expect("native reinstall replaces the legacy record");
+        assert_eq!(merged, format!("{entry}\n"));
+    }
+
+    #[test]
+    fn merge_status_entries_rejects_all_with_a_foreign_sibling() {
+        let foreign = if super::super::debian_arch() == "i386" {
+            "amd64"
+        } else {
+            "i386"
+        };
+        let current = format!(
+            "Package: shared-data\nStatus: install ok installed\nVersion: 1.0\nArchitecture: {foreign}\nMulti-Arch: same\n"
+        );
+        let entry =
+            "Package: shared-data\nStatus: install ok installed\nVersion: 2.0\nArchitecture: all\n";
+        let error = merge_status_entries(&current, &[("shared-data".to_owned(), entry.to_owned())])
+            .expect_err("adding all must not retain or delete the foreign sibling silently");
+        assert!(error.to_string().contains("other instances of shared-data"));
     }
 
     // ─── wave-3 fixes ───
