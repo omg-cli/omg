@@ -2958,7 +2958,7 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   fi
   if [[ "$assertions" == doctor-eol-state || "$assertions" == audit-eol-state ]]; then
     remote+="; [[ \$(id -u) != 0 ]] || { printf 'assertion failed: EOL fixture requires an unprivileged guest user\n' >&2; exit 2; }; export OMG_CONFIG_DIR=\"\$rowdir/eol-config\" OMG_DATA_DIR=\"\$rowdir/runtime-data\" OMG_CACHE_DIR=\"\$rowdir/eol-cache\" OMG_DISABLE_DAEMON=1 OMG_TEST_MODE=0"
-    remote+="; mkdir -p \"\$OMG_DATA_DIR/versions/node/16.20.2\" \"\$OMG_DATA_DIR/versions/python/3.12.14\"; ln -s 16.20.2 \"\$OMG_DATA_DIR/versions/node/current\"; ln -s 3.12.14 \"\$OMG_DATA_DIR/versions/python/current\""
+    remote+="; mkdir -p \"\$OMG_DATA_DIR/versions/node/16.20.2\" \"\$OMG_DATA_DIR/versions/python/3.12.14\"; ln -s 16.20.2 \"\$OMG_DATA_DIR/versions/node/current\"; ln -s 3.12.14 \"\$OMG_DATA_DIR/versions/python/current\"; printf '16.20.2\\n' > \"\$OMG_DATA_DIR/versions/node/16.20.2/.omg-install-complete\"; printf '3.12.14\\n' > \"\$OMG_DATA_DIR/versions/python/3.12.14/.omg-install-complete\""
     if [[ "$assertions" == doctor-eol-state ]]; then remote+="; $(declare -f check_doctor_issue_delta)"; fi
   fi
   if [[ "$assertions" == doctor-network-state ]]; then
@@ -3191,7 +3191,7 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
     runtime_version=$(jq -r '.[2]' <<< "$args_json")
     remote+="; [[ \$(id -u) != 0 ]] || { printf 'assertion failed: runtime uninstall fixture requires an unprivileged guest user\\n' >&2; exit 2; }; export OMG_DATA_DIR=\"\$rowdir/runtime-data\" OMG_CACHE_DIR=\"\$rowdir/runtime-cache\" OMG_CONFIG_DIR=\"\$rowdir/runtime-config\" OMG_TEST_MODE=0 OMG_DISABLE_DAEMON=1"
     remote+="; versions=\"\$OMG_DATA_DIR/versions/$runtime_name\"; mkdir -p \"\$versions/$runtime_version\" \"\$versions/9.9.9\" \"\$OMG_DATA_DIR/versions/other-guard/1.0.0\" \"\$rowdir/external-runtime\""
-    remote+="; printf remove-me > \"\$versions/$runtime_version/sentinel\"; printf keep-sibling > \"\$versions/9.9.9/sentinel\"; printf keep-other > \"\$OMG_DATA_DIR/versions/other-guard/1.0.0/sentinel\"; printf keep-external > \"\$rowdir/external-runtime/sentinel\""
+    remote+="; printf remove-me > \"\$versions/$runtime_version/sentinel\"; printf keep-sibling > \"\$versions/9.9.9/sentinel\"; printf keep-other > \"\$OMG_DATA_DIR/versions/other-guard/1.0.0/sentinel\"; printf keep-external > \"\$rowdir/external-runtime/sentinel\"; printf '%s\\n' '$runtime_version' > \"\$versions/$runtime_version/.omg-install-complete\"; printf '9.9.9\\n' > \"\$versions/9.9.9/.omg-install-complete\""
     remote+="; ln -s \"\$rowdir/external-runtime\" \"\$versions/$runtime_version/external-link\"; ln -s \"\$versions/9.9.9\" \"\$versions/current\"; $(declare -f check_runtime_uninstall)"
   fi
   if [[ "$assertions" == runtime-list-state || "$assertions" == runtime-switch-state ]]; then
@@ -3203,7 +3203,7 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
     esac
     remote+="; [[ \$(id -u) != 0 ]] || { printf 'assertion failed: runtime state fixture requires an unprivileged guest user\\n' >&2; exit 2; }; export OMG_DATA_DIR=\"\$rowdir/runtime-data\" OMG_CACHE_DIR=\"\$rowdir/runtime-cache\" OMG_CONFIG_DIR=\"\$rowdir/runtime-config\" OMG_TEST_MODE=0 OMG_DISABLE_DAEMON=1"
     remote+="; versions=\"\$OMG_DATA_DIR/versions/$runtime_name\"; mkdir -p \"\$versions/$runtime_version/bin\" \"\$versions/$runtime_active\" \"\$versions/8.8.8\" \"\$rowdir/external-runtime\"; chmod 700 \"\$OMG_DATA_DIR\""
-    remote+="; printf keep-selected > \"\$versions/$runtime_version/sentinel\"; printf keep-active > \"\$versions/$runtime_active/sentinel\"; printf keep-pending > \"\$versions/8.8.8/.omg-installing\"; printf keep-external > \"\$rowdir/external-runtime/sentinel\""
+    remote+="; printf keep-selected > \"\$versions/$runtime_version/sentinel\"; printf keep-active > \"\$versions/$runtime_active/sentinel\"; printf keep-pending > \"\$versions/8.8.8/.omg-installing\"; printf keep-external > \"\$rowdir/external-runtime/sentinel\"; printf '%s\\n' '$runtime_active' > \"\$versions/$runtime_active/.omg-install-complete\""
     remote+="; printf '#!/bin/sh\\nprintf runtime-fixture\\n' > \"\$versions/$runtime_version/bin/$runtime_launcher\"; chmod 755 \"\$versions/$runtime_version/bin/$runtime_launcher\"; ln -s \"\$rowdir/external-runtime\" \"\$versions/7.7.7\"; ln -s \"\$versions/$runtime_active\" \"\$versions/current\"; $(declare -f check_runtime_state); $(declare -f check_runtime_usage)"
     if [[ "$runtime_name" == node ]]; then
       # Node activation verifies the installed executable's exact version.

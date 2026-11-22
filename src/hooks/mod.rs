@@ -644,7 +644,11 @@ fn resolve_dotnet_bin_path(data_dir: &Path, version: &str) -> Result<Option<Path
 
 fn node_version_bin_path(versions_dir: &Path, version: &str) -> Option<PathBuf> {
     crate::core::security::validate_runtime_version(version).ok()?;
-    let path = versions_dir.join(version).join("bin");
+    let version_dir = versions_dir.join(version);
+    if !crate::runtimes::common::is_valid_version_dir(&version_dir) {
+        return None;
+    }
+    let path = version_dir.join("bin");
     crate::runtimes::common::is_trusted_runtime_bin_dir(&path).then_some(path)
 }
 
@@ -715,13 +719,17 @@ fn fish_single_quoted(value: &str) -> String {
 fn bun_version_bin_path(versions_dir: &Path, version: &str) -> Option<PathBuf> {
     crate::core::security::validate_runtime_version(version).ok()?;
     let path = versions_dir.join(version);
-    crate::runtimes::common::is_trusted_runtime_bin_dir(&path).then_some(path)
+    (crate::runtimes::common::is_valid_version_dir(&path)
+        && crate::runtimes::common::is_trusted_runtime_bin_dir(&path))
+    .then_some(path)
 }
 
 fn dotnet_version_bin_path(versions_dir: &Path, version: &str) -> Option<PathBuf> {
     crate::core::security::validate_runtime_version(version).ok()?;
     let path = versions_dir.join(version);
-    crate::runtimes::common::is_trusted_runtime_bin_dir(&path).then_some(path)
+    (crate::runtimes::common::is_valid_version_dir(&path)
+        && crate::runtimes::common::is_trusted_runtime_bin_dir(&path))
+    .then_some(path)
 }
 
 /// Parse a .NET `global.json` SDK pin (`{ "sdk": { "version": "9.0.100" } }`).
@@ -1205,6 +1213,7 @@ end
 #[expect(clippy::unwrap_used)] // Idiomatic in tests: panics on failure with clear error context
 mod tests {
     use super::*;
+    use crate::runtimes::common::mark_test_runtime_complete;
     use std::collections::HashMap;
     use std::fs;
     use tempfile::tempdir;
@@ -1389,6 +1398,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let erlang = dir.path().join("versions/erlang/28.0/bin");
         std::fs::create_dir_all(&erlang).unwrap();
+        mark_test_runtime_complete(erlang.parent().unwrap()).unwrap();
         assert_eq!(
             validated_runtime_bin_dir(dir.path(), "erlang", "28.0"),
             Some(erlang.clone())
@@ -1404,6 +1414,7 @@ mod tests {
         assert!(validated_runtime_bin_dir(dir.path(), "erlang", "28.0").is_none());
         let swift = dir.path().join("versions/swift/6.1.2/usr/bin");
         std::fs::create_dir_all(&swift).unwrap();
+        mark_test_runtime_complete(swift.ancestors().nth(2).unwrap()).unwrap();
         assert_eq!(
             validated_runtime_bin_dir(dir.path(), "swift", "6.1.2"),
             Some(swift)
@@ -1577,6 +1588,7 @@ path = "hostile"
         }
         let data = tempdir().unwrap();
         fs::create_dir_all(data.path().join("versions/python/3.12.0/bin")).unwrap();
+        mark_test_runtime_complete(&data.path().join("versions/python/3.12.0")).unwrap();
         temp_env::with_var("OMG_DATA_DIR", Some(data.path()), || {
             let versions = HashMap::from([("python".to_string(), "3.12.0".to_string())]);
             let additions = build_path_additions(&versions).unwrap();
@@ -1601,6 +1613,7 @@ path = "hostile"
         let data = tempdir().unwrap();
         let bin = data.path().join("versions/python/3.12.0/bin");
         fs::create_dir_all(&bin).unwrap();
+        mark_test_runtime_complete(bin.parent().unwrap()).unwrap();
         temp_env::with_var("OMG_DATA_DIR", Some(data.path()), || {
             assert!(crate::runtimes::common::is_trusted_runtime_bin_dir(&bin));
             let versions = HashMap::from([("python".to_string(), "3.12.0".to_string())]);
@@ -1677,6 +1690,7 @@ path = "hostile"
                     .join("bin"),
             )
             .unwrap();
+            mark_test_runtime_complete(&data.path().join("versions/python").join(version)).unwrap();
         }
         temp_env::with_var("OMG_DATA_DIR", Some(data.path()), || {
             let additions = build_path_additions(&versions).unwrap();
@@ -1766,6 +1780,7 @@ path = "hostile"
         for version in ["1.40.1", "1.40.9", "1.41.0"] {
             fs::create_dir_all(data.path().join("versions/deno").join(version).join("bin"))
                 .unwrap();
+            mark_test_runtime_complete(&data.path().join("versions/deno").join(version)).unwrap();
         }
         temp_env::with_var("OMG_DATA_DIR", Some(data.path()), || {
             let versions = HashMap::from([("deno".to_string(), "1.40".to_string())]);
@@ -1814,6 +1829,7 @@ path = "hostile"
         }
         let data = tempdir().unwrap();
         fs::create_dir_all(data.path().join("versions/java/21/bin")).unwrap();
+        mark_test_runtime_complete(&data.path().join("versions/java/21")).unwrap();
         temp_env::with_var("OMG_DATA_DIR", Some(data.path()), || {
             let versions = HashMap::from([("java".to_string(), "21.0".to_string())]);
             let additions = build_path_additions(&versions).unwrap();
@@ -1834,6 +1850,7 @@ path = "hostile"
     fn non_feature_java_request_fails_soft_in_hook_path_building() {
         let data = tempdir().unwrap();
         fs::create_dir_all(data.path().join("versions/java/21/bin")).unwrap();
+        mark_test_runtime_complete(&data.path().join("versions/java/21")).unwrap();
         temp_env::with_var("OMG_DATA_DIR", Some(data.path()), || {
             for request in ["21.0.5", "latest", "21-ea"] {
                 let versions = HashMap::from([("java".to_string(), request.to_string())]);
@@ -1874,6 +1891,8 @@ path = "hostile"
                     .join(relative_bin)
             };
             fs::create_dir_all(&selected).unwrap();
+            mark_test_runtime_complete(&data.path().join("versions").join(runtime).join(version))
+                .unwrap();
             fs::write(selected.join(primary), b"#!/bin/sh").unwrap();
             fs::write(selected.join(companion), b"#!/bin/sh").unwrap();
 
@@ -1899,6 +1918,8 @@ path = "hostile"
         let exact = data.path().join("versions/python/3.12.0/bin");
         fs::create_dir_all(&exact).unwrap();
         fs::create_dir_all(data.path().join("versions/python/3.12.9/bin")).unwrap();
+        mark_test_runtime_complete(exact.parent().unwrap()).unwrap();
+        mark_test_runtime_complete(&data.path().join("versions/python/3.12.9")).unwrap();
         temp_env::with_var("OMG_DATA_DIR", Some(data.path()), || {
             let versions = HashMap::from([("python".to_string(), "3.12.0".to_string())]);
             assert_eq!(
@@ -2046,11 +2067,50 @@ path = "hostile"
         let dir = tempdir().unwrap();
         let expected = dir.path().join("versions/node/20.11.1/bin");
         fs::create_dir_all(&expected).unwrap();
+        mark_test_runtime_complete(expected.parent().unwrap()).unwrap();
 
         assert_eq!(
             resolve_node_bin_path(dir.path(), "^20").unwrap(),
             Some(expected)
         );
+    }
+
+    #[test]
+    fn node_partial_request_skips_an_interrupted_exact_directory() {
+        let dir = tempdir().unwrap();
+        let installed = dir.path().join("versions/node/20.11.1");
+        fs::create_dir_all(installed.join("bin")).unwrap();
+        mark_test_runtime_complete(&installed).unwrap();
+        fs::create_dir_all(dir.path().join("versions/node/20/bin")).unwrap();
+
+        let resolved = resolve_node_bin_path(dir.path(), "20").unwrap();
+        assert_eq!(resolved.unwrap(), installed.join("bin"));
+    }
+
+    #[test]
+    fn semver_range_skips_completed_versions_without_a_semver_name() {
+        let dir = tempdir().unwrap();
+        let legacy = dir.path().join("20.11");
+        fs::create_dir(&legacy).unwrap();
+        mark_test_runtime_complete(&legacy).unwrap();
+
+        assert!(
+            resolve_installed_version_req(dir.path(), "^20")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn dotnet_exact_path_requires_a_completed_version() {
+        let dir = tempdir().unwrap();
+        let versions = dir.path().join("dotnet");
+        let version = versions.join("9.0.100");
+        fs::create_dir_all(&version).unwrap();
+        assert!(dotnet_version_bin_path(&versions, "9.0.100").is_none());
+
+        mark_test_runtime_complete(&version).unwrap();
+        assert_eq!(dotnet_version_bin_path(&versions, "9.0.100"), Some(version));
     }
 
     #[test]

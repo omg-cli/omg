@@ -45,7 +45,9 @@ def verify_scaffold(binary, owner, mode):
                OMG_DATA_DIR=str(owner / 'data'),
                OMG_DISABLE_DAEMON='1', OMG_DISABLE_TELEMETRY='1')
     rust = owner / 'data/versions/rust'
-    (rust / '1.95.0').mkdir(parents=True)
+    version_dir = rust / '1.95.0'
+    version_dir.mkdir(parents=True)
+    (version_dir / '.omg-install-complete').write_text('1.95.0\n')
     (rust / 'current').symlink_to('1.95.0', target_is_directory=True)
     for name in ('LD_LIBRARY_PATH', 'LLVM_PROFILE_FILE'):
         if name in os.environ:

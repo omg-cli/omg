@@ -375,26 +375,15 @@ impl ErlangManager {
         let version = self.resolve_alias(version).await?;
         let version = self.resolve_requested_version(&version).await?;
         crate::core::security::validate_runtime_version(&version)?;
-        // This nonblocking filesystem lease owns final-path initialization and
-        // crash recovery. It never blocks an executor thread while awaiting I/O.
+        // This nonblocking filesystem lease owns final-path initialization.
         let _install_lease = super::common::try_lock_runtime_install(&self.versions_dir, &version)?;
         let version_dir = self.versions_dir.join(&version);
 
-        // The fast path additionally requires `bin/erl`: a directory that
-        // survived extraction but never completed `./Install` is broken and
-        // must reinstall rather than activate.
         if is_valid_version_dir(&version_dir) && version_dir.join("bin/erl").is_file() {
             print_already_installed("Erlang/OTP", &version);
             return self.use_version(&version);
         }
-        if version_dir.exists() {
-            fs::remove_dir_all(&version_dir).with_context(|| {
-                format!(
-                    "Failed to clear incomplete Erlang/OTP install at {}",
-                    version_dir.display()
-                )
-            })?;
-        }
+        super::common::require_unoccupied_install_destination(&version_dir)?;
 
         println!(
             "{} Installing Erlang/OTP {}...\n",
@@ -628,6 +617,18 @@ mod tests {
             versions_dir: fixture.versions.clone(),
             client: download_client(),
         };
+        let interrupted = seed_interrupted_install(&fixture, version).unwrap();
+        assert_eq!(manager.list_installed().unwrap(), ["1.0.0"]);
+        let error = manager.install(version).await.unwrap_err();
+        assert!(error.to_string().contains("if you own it, move it aside"));
+        assert_eq!(
+            fs::read(interrupted.join("interrupted-payload")).unwrap(),
+            b"retained OTP bytes"
+        );
+        fixture.assert_previous();
+        let backup = fixture.archive.with_extension("interrupted");
+        fs::rename(&interrupted, &backup).unwrap();
+
         manager
             .install(version)
             .await
@@ -645,6 +646,10 @@ mod tests {
             fs::read(fixture.versions.join("1.0.0/bin/erl")).unwrap(),
             b"previous reviewed runtime"
         );
+        assert_eq!(
+            fs::read(backup.join("interrupted-payload")).unwrap(),
+            b"retained OTP bytes"
+        );
         super::super::security::admit_installed(
             "erlang",
             &installed,
@@ -656,6 +661,86 @@ mod tests {
     }
 
     use super::*;
+
+    fn seed_interrupted_install(
+        fixture: &super::super::test_archive::PublicationFixture,
+        version: &str,
+    ) -> Result<PathBuf> {
+        let destination = fixture.versions.join(version);
+        let staging = begin_staged_install(&fixture.versions)?;
+        let payload = staging.path().join("interrupted-payload");
+        fs::write(payload, b"retained OTP bytes")?;
+        let pending = staging
+            .path()
+            .join(super::super::common::INSTALL_PENDING_MARKER);
+        fs::File::create_new(pending)?.sync_all()?;
+        super::super::security::fixture_prepare("erlang", version, staging.path(), &destination)?;
+        complete_staged_install(&staging, &destination, version)?;
+        Ok(destination)
+    }
+
+    #[tokio::test]
+    async fn erlang_retry_preserves_occupied_paths_until_the_owner_moves_them_aside() -> Result<()>
+    {
+        use super::super::test_archive::{PublicationFixture, tar_gz_entries};
+
+        let fixture = PublicationFixture::new("erlang", "bin/erl");
+        let manager = ErlangManager {
+            security: super::super::security::RuntimeSecurity::fixture(),
+            versions_dir: fixture.versions.clone(),
+            client: download_client(),
+        };
+        let version = "27.0.0";
+        let path = fixture.versions.join(version);
+        let unknown = fixture.archive.with_extension("unknown");
+        fs::create_dir(&path)?;
+        fs::write(path.join("unowned"), b"untouched")?;
+        let error = manager.install(version).await.unwrap_err();
+        assert!(error.to_string().contains("if you own it, move it aside"));
+        assert_eq!(fs::read(path.join("unowned"))?, b"untouched");
+        fs::rename(&path, &unknown)?;
+
+        std::os::unix::fs::symlink(&unknown, &path)?;
+        let error = manager.install(version).await.unwrap_err();
+        assert!(error.to_string().contains("left untouched"));
+        assert_eq!(fs::read_link(&path)?, unknown);
+        fs::rename(&path, fixture.archive.with_extension("linked"))?;
+
+        seed_interrupted_install(&fixture, version)?;
+        assert_eq!(manager.list_installed()?, ["1.0.0"]);
+        let error = manager.install(version).await.unwrap_err();
+        assert!(error.to_string().contains("left untouched"));
+        assert_eq!(
+            fs::read(path.join("interrupted-payload"))?,
+            b"retained OTP bytes"
+        );
+        fixture.assert_previous();
+        let backup = fixture.archive.with_extension("interrupted");
+        fs::rename(&path, &backup)?;
+
+        let launcher = b"#!/bin/sh\nexit 0\n";
+        let entries = [
+            ("Install", launcher.as_slice()),
+            ("bin/erl", launcher.as_slice()),
+        ];
+        fixture.write(&tar_gz_entries("otp", &entries)?);
+        manager
+            .publish_download(
+                &fixture.archive,
+                "https://builds.hex.pm/builds/otp/amd64/ubuntu-24.04/OTP-27.0.0.tar.gz",
+                version,
+            )
+            .await?;
+        fixture.assert_previous();
+        manager.use_version(version)?;
+        assert_eq!(manager.current_version().as_deref(), Some(version));
+        assert_eq!(
+            fs::read(backup.join("interrupted-payload"))?,
+            b"retained OTP bytes"
+        );
+        assert_eq!(fs::read(unknown.join("unowned"))?, b"untouched");
+        Ok(())
+    }
 
     const BUILDS_TXT: &str = "OTP-24.3.4 0863bd30aabd035c83158c78046c5ffda16127e1 2024-04-26T03:41:09Z\n\
          OTP-27.0 2915bea4768308995489fecfed2357dcb1574e6b 2026-09-07T00:50:41Z e077943ada95e593911db5ef9cbacdd60158bca25855bfce1f03fceb052738c6\n\

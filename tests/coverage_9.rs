@@ -180,6 +180,7 @@ fn which_reports_global_selection_but_prefers_project_pins() {
     let project = TestProject::new();
     let versions = project.data_dir.path().join("versions/python");
     std::fs::create_dir_all(versions.join("3.12.14")).unwrap();
+    std::fs::write(versions.join("3.12.14/.omg-install-complete"), b"3.12.14\n").unwrap();
     std::os::unix::fs::symlink("3.12.14", versions.join("current")).unwrap();
     for args in [
         vec!["which", "python"],
@@ -203,6 +204,7 @@ fn which_rejects_external_global_symlink_targets() {
     let project = TestProject::new();
     let versions = project.data_dir.path().join("versions/python");
     std::fs::create_dir_all(versions.join("3.12.14")).unwrap();
+    std::fs::write(versions.join("3.12.14/.omg-install-complete"), b"3.12.14\n").unwrap();
     let external = project.create_dir("3.12.14");
     std::os::unix::fs::symlink(external, versions.join("current")).unwrap();
     let result = project.run_with_env(&["which", "python"], NO_MISE_ENV);
@@ -297,6 +299,7 @@ fn list_json_native_runtime_emits_exact_structured_entry() {
     // `current` symlink, so both fields have real values to pin.
     let bun_dir = project.data_dir.path().join("versions/bun/9.9.9");
     std::fs::create_dir_all(&bun_dir).unwrap();
+    std::fs::write(bun_dir.join(".omg-install-complete"), b"9.9.9\n").unwrap();
     #[cfg(unix)]
     std::os::unix::fs::symlink(
         &bun_dir,

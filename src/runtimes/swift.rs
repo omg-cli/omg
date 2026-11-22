@@ -412,21 +412,11 @@ impl SwiftManager {
         let _install_lease = super::common::try_lock_runtime_install(&self.versions_dir, &version)?;
         let version_dir = self.versions_dir.join(&version);
 
-        // The fast path additionally requires `usr/bin/swift`: a directory
-        // that survived extraction but never verified or published cleanly
-        // must reinstall rather than activate.
         if is_valid_version_dir(&version_dir) && version_dir.join(SWIFT_BINARY).is_file() {
             print_already_installed("Swift", &version);
             return self.use_version(&version);
         }
-        if version_dir.exists() {
-            fs::remove_dir_all(&version_dir).with_context(|| {
-                format!(
-                    "Failed to clear incomplete Swift install at {}",
-                    version_dir.display()
-                )
-            })?;
-        }
+        super::common::require_unoccupied_install_destination(&version_dir)?;
 
         println!(
             "{} Installing Swift {}...\n",
