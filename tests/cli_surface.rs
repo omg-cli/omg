@@ -293,6 +293,62 @@ fn team_initialization_recovers_from_status_and_hook_obstructions() -> anyhow::R
     Ok(())
 }
 
+#[cfg(all(unix, feature = "arch"))]
+#[test]
+fn team_auto_push_commits_only_the_lockfile_in_a_git_workspace() -> anyhow::Result<()> {
+    let project = common::TestProject::new();
+    let root = project.path();
+    let git = |args: &[&str]| -> anyhow::Result<Vec<u8>> {
+        let output = common::fixture_git_command(root).args(args).output()?;
+        anyhow::ensure!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(output.stdout)
+    };
+    git(&["init", "--quiet", "--template="])?;
+    git(&["config", "user.name", "OMG regression"])?;
+    git(&["config", "user.email", "test@example.invalid"])?;
+    git(&["config", "commit.gpgsign", "false"])?;
+    git(&["config", "core.hooksPath", ".git/hooks"])?;
+    git(&[
+        "commit",
+        "--quiet",
+        "--allow-empty",
+        "-m",
+        "Initial fixture",
+    ])?;
+
+    let init = project.run(&["team", "init", "fixture-team"]);
+    assert!(init.success, "{}", init.combined_output());
+    let path = root.join(".omg/team.toml");
+    let mut config: omg_lib::core::env::team::TeamConfig =
+        toml::from_str(&std::fs::read_to_string(&path)?)?;
+    config.auto_push = true;
+    std::fs::write(path, toml::to_string(&config)?)?;
+    std::fs::write(root.join("unrelated"), b"keep staged")?;
+    git(&["add", "--", "unrelated"])?;
+    let staged = git(&["ls-files", "--stage", "--", "unrelated"])?;
+
+    let result = project.run_with_env(
+        &["team", "push"],
+        &[
+            ("GIT_CONFIG_NOSYSTEM", "1"),
+            ("GIT_CONFIG_GLOBAL", "/dev/null"),
+        ],
+    );
+    assert!(result.success, "{}", result.combined_output());
+    assert_eq!(
+        git(&["show", "--format=", "--name-only", "HEAD"])?,
+        b"omg.lock\n"
+    );
+    assert_eq!(git(&["ls-files", "--stage", "--", "unrelated"])?, staged);
+    assert_eq!(std::fs::read(root.join("unrelated"))?, b"keep staged");
+    project.close_checked();
+    Ok(())
+}
+
 #[cfg(feature = "license")]
 fn account_expiry_output_fixture(expiry: &str) -> anyhow::Result<String> {
     let project = common::TestProject::new();
