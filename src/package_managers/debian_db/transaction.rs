@@ -802,8 +802,8 @@ impl Transaction {
     /// Configure all unpacked packages
     ///
     /// dpkg status updates are merged and written atomically: existing
-    /// paragraphs for the same package are *replaced* (an upgrade must not
-    /// leave two entries), and a pre-transaction copy of the status file is
+    /// paragraphs for the same package and architecture are *replaced*, and a
+    /// pre-transaction copy of the status file is
     /// recorded for rollback before the first write.
     fn configure_packages(&mut self) -> Result<()> {
         let temp_dir = self.transaction_temp_dir()?;
@@ -882,7 +882,7 @@ impl Transaction {
     /// Merge `entries` into `/var/lib/dpkg/status` atomically.
     ///
     /// Takes a rollback backup first (registered in `self.backups`), replaces
-    /// any existing paragraph for the same package, and persists via
+    /// any existing paragraph for the same package and architecture, and persists via
     /// temp-file + rename so a crash cannot truncate the database.
     fn record_dpkg_status_entries(
         &mut self,
@@ -1320,30 +1320,43 @@ fn remove_packages_sequentially(
 
     Ok(())
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct DpkgPackageIdentity {
+    name: String,
+    architecture: Option<String>,
+}
+
 /// Merge new dpkg status paragraphs into `current`.
 ///
-/// Existing paragraphs whose `Package:` name appears in `entries` are
-/// replaced by the new entry; all other paragraphs are preserved verbatim.
-/// New entries are appended in the given order. The result keeps dpkg's
-/// one-blank-line paragraph separation and a trailing newline.
+/// Existing paragraphs whose `(Package, Architecture)` identity appears in
+/// `entries` are replaced by the matching new entry; all other paragraphs are
+/// preserved verbatim. `Architecture: all` uses the package name alone, as
+/// dpkg does for architecture-independent packages. New entries are appended
+/// in the given order. The result keeps dpkg's one-blank-line paragraph
+/// separation and a trailing newline.
 fn merge_status_entries(current: &str, entries: &[(String, String)]) -> String {
-    let mut pending: std::collections::HashMap<&str, &str> = entries
-        .iter()
-        .map(|(name, entry)| (name.as_str(), entry.as_str()))
-        .collect();
+    let mut pending_by_identity = HashMap::new();
+    let mut pending = vec![true; entries.len()];
+    for (index, (name, entry)) in entries.iter().enumerate() {
+        if let Some(identity) = status_entry_identity(entry, Some(name))
+            && let Some(previous) = pending_by_identity.insert(identity, index)
+        {
+            // Keep the last update for each distinct dpkg identity.
+            pending[previous] = false;
+        }
+    }
 
     let mut out = String::with_capacity(current.len() + 512);
     for paragraph in current.split("\n\n") {
         if paragraph.trim().is_empty() {
             continue;
         }
-        let name = paragraph
-            .lines()
-            .find_map(|line| line.strip_prefix("Package: "))
-            .map(str::trim);
-        let replaced = name.and_then(|name| pending.remove(name));
-        if let Some(entry) = replaced {
-            out.push_str(entry);
+        let identity = status_entry_identity(paragraph, None);
+        let replacement = identity.and_then(|identity| pending_by_identity.remove(&identity));
+        if let Some(index) = replacement {
+            pending[index] = false;
+            out.push_str(&entries[index].1);
         } else {
             out.push_str(paragraph);
             out.push('\n');
@@ -1351,14 +1364,38 @@ fn merge_status_entries(current: &str, entries: &[(String, String)]) -> String {
         out.push('\n');
     }
 
-    for (name, entry) in entries {
-        if pending.remove(name.as_str()).is_some() {
+    for (index, (_, entry)) in entries.iter().enumerate() {
+        if pending[index] {
             out.push_str(entry);
             out.push('\n');
         }
     }
 
     out
+}
+
+fn status_entry_identity(
+    paragraph: &str,
+    fallback_name: Option<&str>,
+) -> Option<DpkgPackageIdentity> {
+    let field = |key: &str| {
+        paragraph
+            .lines()
+            .filter(|line| !line.starts_with([' ', '\t']))
+            .filter_map(|line| line.split_once(':'))
+            .find(|(name, _)| name.eq_ignore_ascii_case(key))
+            .map(|(_, value)| value.trim())
+            .filter(|value| !value.is_empty())
+    };
+    let name = field("Package").or(fallback_name)?;
+    let architecture = field("Architecture")
+        .filter(|architecture| *architecture != "all")
+        .map(str::to_owned);
+
+    Some(DpkgPackageIdentity {
+        name: name.to_owned(),
+        architecture,
+    })
 }
 
 fn remove_file_if_present(path: &Path) -> Result<()> {
@@ -3742,6 +3779,112 @@ mod tests {
             merged,
             "Package: curl\nStatus: install ok installed\nVersion: 8.0\n\n"
         );
+    }
+
+    #[test]
+    fn merge_status_entries_preserves_both_architectures_for_one_package() {
+        let entries = vec![
+            (
+                "libexample".to_string(),
+                "Package: libexample\nStatus: install ok installed\nVersion: 1.0\nArchitecture: amd64\n".to_string(),
+            ),
+            (
+                "libexample".to_string(),
+                "Package: libexample\nStatus: install ok installed\nVersion: 1.0\nArchitecture: i386\n".to_string(),
+            ),
+        ];
+
+        let merged = merge_status_entries("", &entries);
+
+        assert_eq!(merged.matches("Package: libexample\n").count(), 2);
+        assert!(merged.contains("Architecture: amd64\n"), "{merged}");
+        assert!(merged.contains("Architecture: i386\n"), "{merged}");
+    }
+
+    #[test]
+    fn merge_status_entries_keeps_an_existing_different_architecture() {
+        let current = "Package: libexample\nStatus: install ok installed\nVersion: 1.0\nArchitecture: amd64\n\n";
+        let entries = vec![(
+            "libexample".to_string(),
+            "Package: libexample\nStatus: install ok installed\nVersion: 2.0\nArchitecture: i386\n"
+                .to_string(),
+        )];
+
+        let merged = merge_status_entries(current, &entries);
+
+        assert!(
+            merged.contains("Version: 1.0\nArchitecture: amd64\n"),
+            "{merged}"
+        );
+        assert!(
+            merged.contains("Version: 2.0\nArchitecture: i386\n"),
+            "{merged}"
+        );
+        assert_eq!(merged.matches("Package: libexample\n").count(), 2);
+    }
+
+    #[test]
+    fn merge_status_entries_upgrades_one_architecture_and_preserves_the_other() {
+        let current = "Package: libexample\nStatus: install ok installed\nVersion: 1.0\nArchitecture: amd64\n\nPackage: libexample\nStatus: install ok installed\nVersion: 1.0\nArchitecture: i386\n";
+        let entries = vec![(
+            "libexample".to_string(),
+            "Package: libexample\nStatus: install ok installed\nVersion: 2.0\nArchitecture: i386\n"
+                .to_string(),
+        )];
+
+        let merged = merge_status_entries(current, &entries);
+
+        assert!(
+            merged.contains("Version: 1.0\nArchitecture: amd64\n"),
+            "{merged}"
+        );
+        assert!(
+            merged.contains("Version: 2.0\nArchitecture: i386\n"),
+            "{merged}"
+        );
+        assert!(
+            !merged.contains("Version: 1.0\nArchitecture: i386\n"),
+            "{merged}"
+        );
+        assert_eq!(merged.matches("Package: libexample\n").count(), 2);
+    }
+
+    #[test]
+    fn merge_status_entries_replaces_an_architecture_all_package_by_name() {
+        let current =
+            "Package: shared-data\nStatus: install ok installed\nVersion: 1.0\nArchitecture: all\n";
+        let entries = vec![(
+            "shared-data".to_string(),
+            "Package: shared-data\nStatus: install ok installed\nVersion: 2.0\nArchitecture: all\n"
+                .to_string(),
+        )];
+
+        let merged = merge_status_entries(current, &entries);
+
+        assert!(
+            merged.contains("Version: 2.0\nArchitecture: all\n"),
+            "{merged}"
+        );
+        assert!(!merged.contains("Version: 1.0\n"), "{merged}");
+        assert_eq!(merged.matches("Package: shared-data\n").count(), 1);
+    }
+
+    #[test]
+    fn merge_status_entries_keeps_only_the_latest_update_for_an_identity() {
+        let current = "Package: libexample\nVersion: 1.0\nARCHITECTURE:\tamd64\n\nPackage: libexample\nVersion: 1.0\nArchitecture: i386\n";
+        let entries = ["2.0", "3.0"].map(|version| {
+            (
+                "libexample".to_string(),
+                format!("Package: libexample\nVersion: {version}\nArchitecture: amd64\n"),
+            )
+        });
+
+        let merged = merge_status_entries(current, &entries);
+
+        assert_eq!(merged.matches("Package: libexample\n").count(), 2);
+        assert!(merged.contains("Version: 3.0\nArchitecture: amd64\n"));
+        assert!(merged.contains("Version: 1.0\nArchitecture: i386\n"));
+        assert!(!merged.contains("Version: 2.0"));
     }
 
     // ─── wave-3 fixes ───
