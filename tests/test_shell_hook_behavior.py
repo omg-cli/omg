@@ -301,6 +301,7 @@ omg-explicit-count
             environment = fixture_cli_environment(root)
             runtime = root / "data/versions/python/3.12.0/bin"
             runtime.mkdir(parents=True)
+            (runtime.parent / ".omg-install-complete").write_text("3.12.0\n")
             project = root / "project"
             project.mkdir()
             (project / ".python-version").write_text("3.12.0")

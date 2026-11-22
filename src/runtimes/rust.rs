@@ -2234,6 +2234,7 @@ mod tests {
         let version_dir = versions.path().join("stable-x86_64-unknown-linux-gnu");
         fs::create_dir_all(version_dir.join("bin"))?;
         fs::write(version_dir.join("bin/rustc"), b"old")?;
+        crate::runtimes::common::mark_test_runtime_complete(&version_dir)?;
         RustManager::write_metadata(
             &version_dir,
             &RustToolchainMetadata {

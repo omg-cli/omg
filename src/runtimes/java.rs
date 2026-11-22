@@ -702,6 +702,7 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let version_dir = directory.path().join("21");
         fs::create_dir(&version_dir)?;
+        crate::runtimes::common::mark_test_runtime_complete(&version_dir)?;
         let manager = JavaManager {
             security: crate::runtimes::security::RuntimeSecurity::fixture(),
             versions_dir: directory.path().to_path_buf(),

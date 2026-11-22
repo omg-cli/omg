@@ -2800,6 +2800,11 @@ fn behavior_inventory_runs_in_hermetic_state() {
                 let runtime_dir = eol_data_dir.join("versions").join(runtime);
                 std::fs::create_dir_all(runtime_dir.join(version))
                     .expect("create private EOL runtime version");
+                std::fs::write(
+                    runtime_dir.join(version).join(".omg-install-complete"),
+                    format!("{version}\n"),
+                )
+                .expect("mark the EOL runtime complete");
                 std::os::unix::fs::symlink(version, runtime_dir.join("current"))
                     .expect("point private EOL runtime at version");
             }

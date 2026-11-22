@@ -3655,14 +3655,21 @@ pub(super) mod tests {
             "fedora",
             directory.path(),
         ));
-        let state =
-            DaemonState::new_isolated(directory.path(), PackageIndex::empty(), manager).unwrap();
+        let state = Arc::new(
+            DaemonState::new_isolated(directory.path(), PackageIndex::empty(), manager).unwrap(),
+        );
         std::fs::write(
             directory.path().join("mock_state_dnf.json"),
             b"invalid json",
         )
         .unwrap();
         assert!(state.status_counts().await.is_err());
+        assert!(matches!(
+            handle_request(Arc::clone(&state), Request::Status { id: 83 }).await,
+            Response::Error { id: 83, code: error_codes::INTERNAL_ERROR, message, .. }
+                if message.contains("Failed to get system status:")
+        ));
+        assert!(state.cache.get_status().is_none());
     }
 
     #[tokio::test]
@@ -3907,6 +3914,73 @@ pub(super) mod tests {
         assert_eq!(refreshed.cache_misses - before.cache_misses, 2);
         assert_eq!(refreshed.cache_hits - before.cache_hits, 3);
         println!("SEARCH_PARITY_CACHE misses=2 hits=3 refresh=1");
+    }
+
+    #[cfg(feature = "fedora")]
+    #[tokio::test]
+    async fn repository_summary_search_has_direct_cold_and_warm_daemon_parity() -> anyhow::Result<()>
+    {
+        use crate::package_managers::{SearchNameKind, dnf::search_parity_data};
+
+        let directory = tempfile::tempdir()?;
+        let (catalog, _) = search_parity_data("");
+        let index = PackageIndex::from_packages(catalog, SearchNameKind::RpmIdentity);
+        let state = Arc::new(DaemonState::new_isolated(
+            directory.path(),
+            index,
+            Arc::new(crate::package_managers::mock::MockPackageManager::new_in(
+                "fedora",
+                directory.path(),
+            )),
+        )?);
+        for query in ["another repository build", "repository keyword"] {
+            let (_, direct) = search_parity_data(query);
+            assert_eq!(
+                direct
+                    .iter()
+                    .map(|row| (row.name.as_str(), row.installed))
+                    .collect::<Vec<_>>(),
+                if query == "another repository build" {
+                    vec![("widget.lib.x86_64", true)]
+                } else {
+                    vec![("widget.lib.i686", false), ("widget.lib.x86_64", true)]
+                }
+            );
+            assert!(state.cache.get(query).is_none());
+            let mut cold = None;
+            for id in [1, 2] {
+                let response = handle_request(
+                    Arc::clone(&state),
+                    Request::Search {
+                        id,
+                        query: query.to_owned(),
+                        limit: None,
+                    },
+                )
+                .await;
+                let Response::Success {
+                    result: ResponseResult::Search(result),
+                    ..
+                } = response
+                else {
+                    anyhow::bail!("unexpected search response: {response:?}");
+                };
+                assert_eq!(result.total, direct.len());
+                assert_eq!(result.packages.len(), direct.len());
+                for (wire, direct) in result.packages.iter().zip(&direct) {
+                    assert_eq!(wire.name, direct.name);
+                    assert_eq!(wire.version, direct.version.to_string());
+                    assert_eq!(wire.description, direct.description);
+                    assert_eq!(wire.source, WirePackageSource::Official);
+                }
+                let cached = state.cache.get(query).expect("search populates the cache");
+                if let Some(cold) = &cold {
+                    assert!(Arc::ptr_eq(cold, &cached));
+                }
+                cold = Some(cached);
+            }
+        }
+        Ok(())
     }
 
     #[tokio::test]

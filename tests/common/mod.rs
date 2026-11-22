@@ -683,6 +683,7 @@ pub fn seed_runtime_advisory_fixture_at(
         .join(runtime)
         .join(requested)
         .canonicalize()?;
+    fs::write(root.join(".omg-install-complete"), format!("{requested}\n"))?;
     let mut pending = vec![root.clone()];
     let mut rows: BTreeMap<PathBuf, (&str, u32, String, u64)> = BTreeMap::new();
     let mut total = 0_u64;

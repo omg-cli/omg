@@ -207,9 +207,10 @@ fn every_runtime_uninstall_preserves_active_siblings_and_external_state() {
         let versions = project.data_dir.path().join("versions").join(&runtime);
         let selected = versions.join(version);
         let retained = versions.join(sibling);
-        for path in [&selected, &retained] {
+        for (path, version) in [(&selected, version), (&retained, sibling)] {
             std::fs::create_dir_all(path).unwrap();
             std::fs::write(path.join("sentinel"), b"runtime fixture bytes").unwrap();
+            std::fs::write(path.join(".omg-install-complete"), format!("{version}\n")).unwrap();
         }
         let external = project.create_dir("external-runtime");
         std::fs::write(external.join("sentinel"), b"external bytes").unwrap();
@@ -507,7 +508,13 @@ fn list_reports_exact_installed_versions_for_every_runtime_and_excludes_incomple
         ] {
             std::fs::create_dir_all(versions.join(version)).unwrap();
             std::fs::write(versions.join(version).join("sentinel"), b"fixture bytes").unwrap();
+            std::fs::write(
+                versions.join(version).join(".omg-install-complete"),
+                format!("{version}\n"),
+            )
+            .unwrap();
         }
+        std::fs::create_dir_all(versions.join("11.0.0/bin")).unwrap();
         std::fs::write(versions.join("9.0.0/.omg-installing"), b"pending").unwrap();
         std::fs::write(versions.join("8.0.0/.omg-test-mock"), b"synthetic").unwrap();
         std::fs::write(versions.join("7.0.0"), b"not a directory").unwrap();
@@ -575,6 +582,7 @@ fn list_reports_exact_installed_versions_for_every_runtime_and_excludes_incomple
     );
     for runtime in &names {
         let versions = project.data_dir.path().join("versions").join(runtime);
+        assert!(versions.join("11.0.0/bin").is_dir());
         assert_eq!(
             std::fs::read_link(versions.join("current")).unwrap(),
             versions.join("1.9.0")
@@ -1154,6 +1162,7 @@ fn which_resolves_every_runtime_with_project_parent_global_precedence_without_mu
         check(runtime, None);
         let versions = project.data_dir.path().join("versions").join(runtime);
         std::fs::create_dir_all(versions.join("1.2.3")).unwrap();
+        std::fs::write(versions.join("1.2.3/.omg-install-complete"), b"1.2.3\n").unwrap();
         std::fs::write(versions.join("1.2.3/sentinel"), b"selected fixture bytes").unwrap();
         std::os::unix::fs::symlink(versions.join("1.2.3"), versions.join("current")).unwrap();
         check(runtime, Some("1.2.3"));

@@ -339,6 +339,12 @@ impl HomebrewPackageManager {
         self.prefix.join("bin").join("brew")
     }
 
+    pub(super) async fn inventory_counts(&self) -> Result<(usize, usize, usize)> {
+        let packages = self.read_installed_packages().await?;
+        let explicit = packages.iter().filter(|p| p.installed_on_request).count();
+        Ok((packages.len(), explicit, 0))
+    }
+
     /// Match Homebrew's Cellar selection: `brew --cellar` reports
     /// `$HOMEBREW_PREFIX/Cellar` on every architecture, so the prefix Cellar
     /// is the inventory location. On Intel the Homebrew git checkout lives at
@@ -1270,24 +1276,12 @@ impl PackageManager for HomebrewPackageManager {
         _fast: bool,
     ) -> Pin<Box<dyn Future<Output = Result<(usize, usize, usize, usize)>> + Send + '_>> {
         Box::pin(async move {
-            let packages = self.read_installed_packages().await?;
-            let total = packages.len();
-            let explicit = packages.iter().filter(|p| p.installed_on_request).count();
-
-            // Homebrew doesn't have an orphans concept like pacman; report
-            // zero rather than guessing.
-            let orphans = 0;
-
-            // Real update count from the formula cache — previously hardcoded
-            // to 0, which made `omg status` on macOS never report outdated
-            // packages.
-            let updates = match self.list_updates().await {
-                Ok(updates) => updates.len(),
-                Err(error) => {
-                    tracing::debug!("homebrew update count unavailable: {error:#}");
-                    0
-                }
-            };
+            let (total, explicit, orphans) = self.inventory_counts().await?;
+            let updates = self
+                .list_updates()
+                .await
+                .context("Homebrew update count unavailable")?
+                .len();
 
             Ok((total, explicit, orphans, updates))
         })
@@ -1766,6 +1760,61 @@ mod tests {
         assert_eq!(packages[0].name, "example");
         assert_eq!(packages[0].version, "1.10");
         assert!(packages[0].installed_on_request);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn status_distinguishes_unavailable_updates_from_zero() -> Result<()> {
+        const CHILD: &str = "OMG_BREW_STATUS_TEST_CHILD";
+        let root = tempfile::tempdir()?;
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe()?)
+                .args([
+                    "--exact",
+                    "package_managers::homebrew::tests::status_distinguishes_unavailable_updates_from_zero",
+                ])
+                .env(CHILD, "1")
+                .env("HOME", root.path())
+                .env("XDG_CACHE_HOME", root.path())
+                .env("HOMEBREW_CACHE", root.path())
+                .output()?;
+            assert!(
+                output.status.success(),
+                "isolated status test failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return Ok(());
+        }
+
+        struct Offline;
+        impl reqwest::dns::Resolve for Offline {
+            fn resolve(&self, _name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+                Box::pin(async { Err(std::io::Error::other("fixture DNS unavailable").into()) })
+            }
+        }
+
+        let manager = HomebrewPackageManager {
+            prefix: root.path().to_path_buf(),
+            cellar: root.path().join(CELLAR_DIR),
+            cache: Arc::new(RwLock::new(None)),
+            client: reqwest::Client::builder()
+                .no_proxy()
+                .dns_resolver(Arc::new(Offline))
+                .build()?,
+        };
+
+        assert_eq!(manager.inventory_counts().await?, (0, 0, 0));
+        let error = manager
+            .get_status(false)
+            .await
+            .expect_err("an unavailable update query must not report a successful count");
+        assert_eq!(error.to_string(), "Homebrew update count unavailable");
+        assert!(format!("{error:#}").contains("fixture DNS unavailable"));
+
+        *crate::core::sync::write_cache(&manager.cache) =
+            Some(HomebrewPackageManager::build_cache(Vec::new(), Vec::new()));
+        assert_eq!(manager.get_status(false).await?, (0, 0, 0, 0));
         Ok(())
     }
 

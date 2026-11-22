@@ -1025,7 +1025,8 @@ fn canonical_destination(path: &Path) -> Result<PathBuf> {
     if let Ok(metadata) = fs::symlink_metadata(&result) {
         ensure!(
             metadata.is_dir() && !metadata.is_symlink(),
-            "Runtime advisory destination is not a real directory"
+            "Runtime advisory destination is not a real directory. {}",
+            super::common::blocked_install_destination(&result)
         );
     }
     Ok(result)
@@ -1538,10 +1539,9 @@ pub(crate) fn fixture_install_identity(runtime: &str, version_dir: &Path) -> Res
         artifact_sha256: tree_digest(version_dir)?,
         components: BTreeMap::new(),
     };
-    write_state(
-        &state_path(&destination, "identity")?,
-        &serde_json::to_vec(&identity)?,
-    )
+    let path = state_path(&destination, "identity")?;
+    write_state(&path, &serde_json::to_vec(&identity)?)?;
+    super::common::mark_test_runtime_complete(version_dir)
 }
 
 #[cfg(test)]
@@ -1551,6 +1551,7 @@ pub(crate) fn fixture_bind_candidate(
     tree: &Path,
     destination: &Path,
 ) -> Result<()> {
+    let published = tree == destination;
     let destination = canonical_destination(destination)?;
     let version = fixture_exact_version(runtime, requested)?;
     let identity = InstallIdentity {
@@ -1564,10 +1565,12 @@ pub(crate) fn fixture_bind_candidate(
         artifact_sha256: tree_digest(tree)?,
         components: BTreeMap::new(),
     };
-    write_state(
-        &state_path(&destination, "identity")?,
-        &serde_json::to_vec(&identity)?,
-    )
+    let path = state_path(&destination, "identity")?;
+    write_state(&path, &serde_json::to_vec(&identity)?)?;
+    if published {
+        super::common::mark_test_runtime_complete(tree)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1585,6 +1588,22 @@ pub(crate) fn fixture_prepare(
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn occupied_advisory_destination_names_the_untouched_file() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let destination = temp.path().join("24.0.0");
+        fs::write(&destination, b"occupied")?;
+        let error = canonical_destination(&destination).unwrap_err();
+        assert!(error.to_string().contains("if you own it, move it aside"));
+        assert!(
+            error
+                .to_string()
+                .contains(&destination.display().to_string())
+        );
+        assert_eq!(fs::read(destination)?, b"occupied");
+        Ok(())
+    }
 
     #[test]
     #[ignore = "requires the fixed public advisory provider; selected explicitly by genuine Node coverage"]

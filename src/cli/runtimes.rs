@@ -713,12 +713,14 @@ mod tests {
         for (runtime, version) in [("node", "22.0.0"), ("ripgrep", "14.1.0")] {
             let versions = data.join("versions").join(runtime);
             std::fs::create_dir_all(versions.join(version))?;
+            crate::runtimes::common::mark_test_runtime_complete(&versions.join(version))?;
             std::os::unix::fs::symlink(version, versions.join("current"))?;
         }
         let go = data.join("versions/go");
         let outside = root.path().join("outside/1.24.0");
         std::fs::create_dir_all(&outside)?;
         std::fs::create_dir_all(go.join("1.24.0"))?;
+        crate::runtimes::common::mark_test_runtime_complete(&go.join("1.24.0"))?;
         std::os::unix::fs::symlink(&outside, go.join("current"))?;
 
         let versions = super::active_versions_at(&project, &data)?;

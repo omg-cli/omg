@@ -29,6 +29,9 @@ use crate::package_managers::types::{UpdateInfo, parse_version_or_zero};
 use rusqlite::{Connection, OpenFlags};
 use zerocopy::{FromBytes, Immutable, KnownLayout, big_endian::U32};
 
+#[cfg(all(test, unix))]
+pub(crate) use tests::search_parity_data;
+
 /// RPM tag constants for parsing header entries
 #[cfg(feature = "fedora")]
 mod rpm_tags {
@@ -1177,6 +1180,38 @@ impl DnfPackageManager {
     async fn available_packages(package: Option<&str>) -> Result<Vec<Package>> {
         let bytes = Self::repository_output(RepositoryQuery::Available(package)).await?;
         Self::parse_available_packages(&bytes)
+    }
+
+    fn search_candidates(
+        installed: Vec<InstalledPackage>,
+        available: Vec<Package>,
+    ) -> Vec<Package> {
+        let mut candidates: Vec<_> = installed
+            .into_iter()
+            .map(|pkg| Package {
+                name: pkg.identity(),
+                version: parse_version_or_zero(&format!("{}-{}", pkg.version, pkg.release)),
+                description: pkg.summary,
+                source: PackageSource::Official,
+                installed: true,
+            })
+            .collect();
+        candidates.extend(available);
+        candidates
+    }
+
+    fn search_results(mut candidates: Vec<Package>, query_lower: &str) -> Vec<Package> {
+        let mut matching_identities: HashSet<_> = candidates
+            .iter()
+            .filter(|pkg| {
+                pkg.name.to_lowercase().contains(query_lower)
+                    || pkg.description.to_lowercase().contains(query_lower)
+            })
+            .map(|pkg| pkg.name.clone())
+            .collect();
+        candidates.retain(|pkg| matching_identities.remove(&pkg.name));
+        candidates.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+        candidates
     }
 
     pub(crate) async fn installed_package_sizes(
@@ -2379,43 +2414,16 @@ impl PackageManager for DnfPackageManager {
     ) -> Pin<Box<dyn Future<Output = Result<Vec<Package>>> + Send + '_>> {
         let query_lower = query.to_lowercase();
         Box::pin(async move {
-            // Search installed packages first
+            let candidates = self.package_index().await?;
+            Ok(Self::search_results(candidates, &query_lower))
+        })
+    }
+
+    fn package_index(&self) -> Pin<Box<dyn Future<Output = Result<Vec<Package>>> + Send + '_>> {
+        Box::pin(async move {
             let installed = self.load_installed_packages().await?;
-            let mut results: Vec<Package> = installed
-                .iter()
-                .filter(|pkg| {
-                    pkg.name.to_lowercase().contains(&query_lower)
-                        || pkg.summary.to_lowercase().contains(&query_lower)
-                })
-                .map(|pkg| Package {
-                    name: pkg.identity(),
-                    version: parse_version_or_zero(&format!("{}-{}", pkg.version, pkg.release)),
-                    description: pkg.summary.clone(),
-                    source: PackageSource::Official,
-                    installed: true,
-                })
-                .collect();
-
-            results.extend(
-                Self::available_packages(None)
-                    .await?
-                    .into_iter()
-                    .filter(|package| {
-                        package.name.to_lowercase().contains(&query_lower)
-                            || package.description.to_lowercase().contains(&query_lower)
-                    }),
-            );
-
-            // Deduplicate by name; sort installed rows first within a name
-            // so dedup keeps the entry carrying `installed: true`.
-            results.sort_by(|a, b| {
-                a.name
-                    .cmp(&b.name)
-                    .then_with(|| b.installed.cmp(&a.installed))
-            });
-            results.dedup_by(|a, b| a.name == b.name);
-
-            Ok(results)
+            let available = Self::available_packages(None).await?;
+            Ok(Self::search_candidates(installed, available))
         })
     }
 
@@ -3584,6 +3592,83 @@ mod tests {
                 false,
             )
         );
+    }
+
+    fn search_catalog_fixture() -> Vec<Package> {
+        let installed =
+            [("widget.lib", "x86_64"), ("widget.local", "noarch")].map(|(name, architecture)| {
+                InstalledPackage {
+                    name: name.to_owned(),
+                    architecture: architecture.to_owned(),
+                    version: "1".to_owned(),
+                    release: "1".to_owned(),
+                    summary: "Installed summary".to_owned(),
+                    reason: InstallReason::Dependency,
+                }
+            });
+        let available = DnfPackageManager::parse_available_packages(
+            b"widget.lib.x86_64\t2-1\tRepository keyword\n\
+              widget.lib.x86_64\t3-1\tAnother repository build\n\
+              widget.lib.i686\t2-1\tRepository keyword\n",
+        )
+        .expect("valid repository rows");
+        DnfPackageManager::search_candidates(Vec::from(installed), available)
+    }
+
+    #[test]
+    fn search_matches_qualified_identities_and_prefers_installed_rows() {
+        assert_eq!(
+            DnfPackageManager::repository_query_format(&RepositoryQuery::Available(None)),
+            "%{name}.%{arch}\t%{evr}\t%{summary}\\n"
+        );
+        let search = |query| {
+            DnfPackageManager::search_results(search_catalog_fixture(), query)
+                .into_iter()
+                .map(|pkg| {
+                    (
+                        pkg.name,
+                        pkg.installed,
+                        pkg.version.to_string(),
+                        pkg.description,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let installed = (
+            "widget.lib.x86_64".to_owned(),
+            true,
+            "1-1".to_owned(),
+            "Installed summary".to_owned(),
+        );
+        let available = (
+            "widget.lib.i686".to_owned(),
+            false,
+            "2-1".to_owned(),
+            "Repository keyword".to_owned(),
+        );
+        assert_eq!(search("widget.lib"), [available.clone(), installed.clone()]);
+        assert_eq!(
+            search("widget.lib.x86_64").as_slice(),
+            std::slice::from_ref(&installed)
+        );
+        assert_eq!(search("repository keyword"), [available.clone(), installed]);
+        assert_eq!(search("widget.lib.i686"), [available]);
+        assert_eq!(
+            search("widget.local.noarch"),
+            [(
+                "widget.local.noarch".to_owned(),
+                true,
+                "1-1".to_owned(),
+                "Installed summary".to_owned(),
+            )]
+        );
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn search_parity_data(query: &str) -> (Vec<Package>, Vec<Package>) {
+        let catalog = search_catalog_fixture();
+        let direct = DnfPackageManager::search_results(catalog.clone(), query);
+        (catalog, direct)
     }
 
     #[test]

@@ -153,7 +153,9 @@ def main() -> None:
         (alias_dir / "omg").symlink_to(binary)
         for runtime, version in (("node", "16.20.2"), ("python", "3.12.14")):
             versions = data / "versions" / runtime
-            (versions / version).mkdir(parents=True)
+            version_dir = versions / version
+            version_dir.mkdir(parents=True)
+            (version_dir / ".omg-install-complete").write_text(f"{version}\n")
             (versions / "current").symlink_to(version)
 
         with socketserver.ThreadingTCPServer(("127.0.0.1", 0), RejectingProxy) as proxy:

@@ -229,6 +229,7 @@ impl PythonManager {
         }
 
         if crate::core::paths::test_mode() {
+            begin_python_mock_install(&self.versions_dir, &version_dir)?;
             fs::create_dir_all(version_dir.join("bin"))?;
             fs::write(version_dir.join("bin/python3.12"), "mock")?;
             #[cfg(unix)]
@@ -237,10 +238,6 @@ impl PythonManager {
             fs::copy(
                 version_dir.join("bin/python3.12"),
                 version_dir.join("bin/python3"),
-            )?;
-            fs::write(
-                version_dir.join(super::common::TEST_RUNTIME_MARKER),
-                "debug-only synthetic runtime\n",
             )?;
             println!(
                 "{} OMG_TEST_MODE active — synthetic Python runtime was not activated",
@@ -434,6 +431,15 @@ impl PythonManager {
 // Generate common runtime manager methods (list_installed, current_version)
 crate::runtimes::common::impl_runtime_common!(PythonManager);
 
+fn begin_python_mock_install(versions_dir: &Path, version_dir: &Path) -> Result<()> {
+    fs::create_dir_all(versions_dir)?;
+    fs::create_dir(version_dir)
+        .with_context(|| super::common::blocked_install_destination(version_dir))?;
+    let marker = version_dir.join(super::common::TEST_RUNTIME_MARKER);
+    fs::write(marker, "debug-only synthetic runtime\n")?;
+    Ok(())
+}
+
 fn python_target() -> Result<String> {
     let arch = match std::env::consts::ARCH {
         "x86_64" | "aarch64" => std::env::consts::ARCH,
@@ -519,6 +525,58 @@ mod tests {
     }
 
     use super::*;
+
+    #[cfg(all(unix, debug_assertions))]
+    #[test]
+    fn debug_python_mock_preserves_an_occupied_path_and_marks_before_payload() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+        const NAME: &str = "runtimes::python::tests::debug_python_mock_preserves_an_occupied_path_and_marks_before_payload";
+        if crate::core::testing::run_isolated_test(NAME) {
+            return Ok(());
+        }
+        let temp = tempfile::tempdir()?;
+        let versions = temp.path().join("python");
+        let occupied = versions.join("3.12.0");
+        fs::create_dir_all(occupied.join("bin"))?;
+        let executable = occupied.join("bin/python3.12");
+        fs::write(&executable, b"owner bytes")?;
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755))?;
+        let manager = PythonManager {
+            security: super::super::security::RuntimeSecurity::fixture(),
+            versions_dir: versions.clone(),
+            client: download_client(),
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let failed = temp_env::with_var("OMG_TEST_MODE", Some("1"), || {
+            runtime.block_on(manager.install("3.12.0"))
+        });
+        assert!(failed.unwrap_err().to_string().contains("left untouched"));
+        assert_eq!(fs::read(&executable)?, b"owner bytes");
+        assert_eq!(
+            fs::metadata(executable)?.permissions().mode() & 0o777,
+            0o755
+        );
+        assert_eq!(fs::read_dir(occupied.join("bin"))?.count(), 1);
+        assert!(
+            !occupied
+                .join(super::super::common::TEST_RUNTIME_MARKER)
+                .exists()
+        );
+
+        let interrupted = versions.join("3.12.1");
+        begin_python_mock_install(&versions, &interrupted)?;
+        assert!(
+            interrupted
+                .join(super::super::common::TEST_RUNTIME_MARKER)
+                .is_file()
+        );
+        assert!(!interrupted.join("bin").exists());
+        assert!(manager.list_installed()?.is_empty());
+        assert!(!versions.join("current").exists());
+        Ok(())
+    }
 
     #[tokio::test]
     async fn catalog_resolution_reuses_entries_and_refuses_missing_partial_versions() -> Result<()>
