@@ -322,6 +322,33 @@ class DescriptorTests(unittest.TestCase):
         report = json.loads((self.destination / "export-report.json").read_text())
         return status, report
 
+    def test_bookworm_strace_failure_exports_phase_without_raw_output(self):
+        prefix = "run-test/guest/evidence/"
+        setup = self.fixture(prefix + "inventory-setup.txt", b"APT setup finished\n")
+        launcher = Path(__file__).with_name("benchmark-qemu.sh").read_text()
+        start = launcher.index("    (\n", launcher.index("# Bookworm ships strace 6.1."))
+        end_line = "    ) > evidence/strace-build.txt 2>&1 || exit 120"
+        end = launcher.index(end_line, start) + len(end_line)
+        run = subprocess.run(
+            ["bash", "-euc", 'curl() { printf "%s\\n" "$FIXTURE_PRIVATE"; '
+             'printf "%s\\n" "$FIXTURE_PRIVATE" >&2; return 6; };\n' + launcher[start:end]],
+            cwd=setup.parent.parent,
+            env={**os.environ, "HOME": str(setup.parent.parent), "FIXTURE_PRIVATE": "fixture-private-proxy-value"},
+            capture_output=True, timeout=5)
+        self.assertEqual(run.returncode, 120)
+        self.assertEqual(run.stdout + run.stderr, b"")
+        raw = setup.with_name("strace-build.txt")
+        self.assertEqual(raw.read_bytes(), b"fixture-private-proxy-value\n" * 2)
+        neighbor = self.fixture(prefix + "inventory-setup.txt.bak", b"fixture-private-neighbor\n")
+
+        status, report = self.run_export()
+        self.assertEqual(status, 0, report)
+        self.assertEqual(report["copied"], [prefix + "inventory-setup.txt"])
+        self.assertEqual((self.destination / prefix / setup.name).read_bytes(),
+                         b"APT setup finished\nBookworm strace fixture failed: phase=download exit=6\n")
+        for path in (raw, neighbor):
+            self.assertFalse((self.destination / path.relative_to(self.source)).exists())
+
     def test_mutation_refusal_diagnostics_copy_exactly_without_private_neighbors(self):
         prefix = "run-test/mutation-refusal/"
         names = ("executor.log", "cases.tsv", "inventory/results.json",
