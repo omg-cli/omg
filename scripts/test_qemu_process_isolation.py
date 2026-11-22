@@ -49,21 +49,22 @@ class QemuProcessIsolationTests(unittest.TestCase):
                         self.assertIn(retained, arguments)
                     self.assertEqual('if=pflash,format=raw,file=vars.fd' in arguments, firmware == 'uefi')
 
-    def test_machine_selection_disables_unused_x86_sata_without_changing_arm(self):
+    def test_machine_and_firmware_selection_for_supported_guests(self):
         source = (ROOT / 'scripts/benchmark-qemu.sh').read_text(encoding='utf-8')
         function = 'pins_for() {' + source.split('pins_for() {', 1)[1].split('\n# Lifecycle case ids', 1)[0]
-        for distro, arch in [('arch', 'x86_64'), ('debian', 'x86_64'),
-                             ('debian-trixie', 'x86_64'), ('ubuntu', 'x86_64'),
-                             ('fedora', 'x86_64'), ('debian', 'aarch64'),
-                             ('ubuntu', 'aarch64'), ('fedora', 'aarch64')]:
+        for distro, arch, firmware in [('arch', 'x86_64', 'uefi'), ('debian', 'x86_64', 'bios'),
+                                       ('debian-trixie', 'x86_64', 'uefi'), ('ubuntu', 'x86_64', 'bios'),
+                                       ('fedora', 'x86_64', 'bios'), ('debian', 'aarch64', 'uefi'),
+                                       ('ubuntu', 'aarch64', 'uefi'), ('fedora', 'aarch64', 'uefi')]:
             with self.subTest(distro=distro, arch=arch):
                 command = ('set -euo pipefail\ncontroller_image_x86_64=x86\n'
                            'controller_image_aarch64=arm\n' + function
-                           + '\npins_for "$1" "$2"\nprintf "%s\\n" "$qemu_machine"\n')
+                           + '\npins_for "$1" "$2"\nprintf "%s\\n" "$qemu_machine" "$firmware"\n')
                 result = subprocess.run([BASH, '-c', command, 'machine-selection', distro, arch],
                                         capture_output=True, text=True, timeout=5)
                 self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual(result.stdout.strip(), 'q35,sata=off' if arch == 'x86_64' else 'virt')
+                machine = 'q35,sata=off' if arch == 'x86_64' else 'virt'
+                self.assertEqual(result.stdout.splitlines(), [machine, firmware])
 
     @unittest.skipIf(os.name == 'nt', 'launch fixture requires POSIX executable scripts')
     def test_headless_launch_preserves_serial_and_network_with_tcg(self):

@@ -189,6 +189,7 @@ pins_for() {
       image_url=https://cloud.debian.org/images/cloud/trixie/20261103-2651/debian-13-genericcloud-amd64-20261103-2651.qcow2
       image_hash=d25999de0770d4cde1be72c299ba3ad94eac7ea8fd4d18f8cc86c69df69337e2e8a91d64465a9bfd8f2a78c566fcbcb0842eacc91c09efdef72d719d9f13b535
       hash_tool=sha512sum
+      firmware=uefi
       ssh_service=ssh ;;
     debian-aarch64)
       image_url=https://cloud.debian.org/images/cloud/bookworm/20261026-2643/debian-12-generic-arm64-20261026-2643.qcow2
