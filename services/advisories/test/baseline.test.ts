@@ -6,6 +6,9 @@ import { handle } from "../src/service";
 import { Store, type Sql, type Command } from "../src/storage";
 import type { Fetcher } from "../src/ingestion";
 import { baselineImportCommands, gitBlobSha1 } from "../src/baseline";
+import { object } from "../src/domain";
+import { handleStage } from "../src/stage";
+import { CANONICAL_ORIGIN, STAGE_MODE, STAGE_ORIGIN } from "../src/stage-identity";
 
 const now = "2026-11-13T02:00:00.000Z";
 const ingestToken = "controlled-ingest-token-at-least-32-characters";
@@ -121,6 +124,83 @@ async function finish(fixture: ReturnType<typeof setup>, baseline: object) {
     fixture.db.query("UPDATE source_checkpoint SET complete=1,error=NULL,checked_at=?,cursor=? WHERE source='cve'").run(now, JSON.stringify({event:now,offset:0}));
     return handle(request("/internal/baseline", { ...baseline, baseline_at: "2026-11-13T00:00:00.000Z", finished_at: now, accepted: 1, exhausted: true }, ingestToken), fixture.store, ingestToken, now);
 }
+
+test("private staging proves the canonical session through promotion and reverse binding", async () => {
+    const incumbent = setup(), stage = setup();
+    try {
+        const prior = await binding(incumbent.store);
+        const previousDatabase = incumbent.db.serialize();
+        const id = stage.db.query<{id:string}, []>("SELECT id FROM database_instance").get()?.id;
+        if (!id) throw new Error("missing fixture stage instance");
+        const aud = "a".repeat(64);
+        const access = { access: { aud, getIdentity: async () => undefined } };
+        const policy = { STAGE_MODE, STAGE_ACCESS_AUD: aud, STAGE_DATABASE_INSTANCE_ID: id,
+            STAGE_INGEST_TOKEN: ingestToken, STAGE_RUNTIME_REFRESH_SECRET: refreshToken };
+        const publisher = await publisherFetcher();
+        const start = { digest: archiveDigest, baseline_at: "2026-11-13T00:00:00.000Z" };
+        const stagePost = (path: string, payload: unknown, token = ingestToken, origin = STAGE_ORIGIN) =>
+            new Request(origin + path, { method: "POST", body: JSON.stringify(payload),
+                headers: { authorization: `Bearer ${token}`, "content-type": "application/json",
+                    "x-forwarded-host": "attacker.example", "cf-access-jwt-assertion": "fixture-untrusted-header" } });
+        const route = (req: Request, store = stage.store) =>
+            handleStage(req, access, policy, () => store, now, publisher.fetcher);
+        const req = () => stagePost("/internal/baseline/start", start);
+        const forbiddenStore = () => { throw new Error("unexpected storage access"); };
+        expect((await handleStage(req(), {}, policy, forbiddenStore, now)).status).toBe(403);
+        expect((await handleStage(req(), access, { ...policy, STAGE_ACCESS_AUD: "b".repeat(64) }, forbiddenStore, now)).status).toBe(403);
+        expect((await handleStage(req(), access, { ...policy, STAGE_MODE: "disabled" }, forbiddenStore, now)).status).toBe(503);
+        expect((await route(stagePost("/internal/baseline/start", start, ingestToken, CANONICAL_ORIGIN))).status).toBe(403);
+        expect((await route(req(), incumbent.store)).status).toBe(503);
+        expect((await route(req())).status).toBe(503);
+        expect(stage.db.query("SELECT COUNT(*) AS count FROM baseline_receipt").get()).toEqual({count:0});
+        expect(stage.objects.size).toBe(0);
+        stage.objects.set(`stage-isolation/${id}`, "");
+        expect((await route(stagePost("/internal/baseline/start", start, "wrong-token"))).status).toBe(401);
+        expect(stage.db.query("SELECT COUNT(*) AS count FROM baseline_receipt").get()).toEqual({count:0});
+
+        const started = await route(req());
+        expect(started.status).toBe(200);
+        expect(started.headers.get("cache-control")).toBe("no-store");
+        const canonical = object(await started.json());
+        expect(canonical).toMatchObject({ endpoint: CANONICAL_ORIGIN, instance_id: id });
+        const payload = { source: "cve", records: [raw], baseline: canonical };
+        expect((await route(stagePost("/internal/ingest", { ...payload, baseline: prior }))).status).toBe(400);
+        expect(stage.objects.size).toBe(1);
+        expect((await route(stagePost("/internal/ingest", payload))).status).toBe(200);
+        const originalObjects = stage.objects.size;
+        expect(await (await route(stagePost("/internal/baseline/start", { ...start, ...canonical }))).json()).toMatchObject(canonical);
+        expect((await route(stagePost("/internal/ingest", payload))).status).toBe(200);
+        expect(stage.objects.size).toBe(originalObjects);
+        expect(stage.db.query("SELECT accepted FROM baseline_receipt").get()).toEqual({accepted:1});
+
+        const proof = { ...canonical, release_tag: "cve_2026-11-13_0000Z",
+            asset: "2026-11-13_all_CVEs_at_midnight.zip.zip", github_token: githubToken };
+        expect((await route(stagePost("/internal/baseline/verify", proof))).status).toBe(401);
+        expect(await (await route(stagePost("/internal/baseline/verify", proof, refreshToken))).json()).toMatchObject({
+            phase: "awaiting_import", expected_count: 1, pending_trees: 0,
+        });
+        stage.db.query("UPDATE source_checkpoint SET complete=1,checked_at=?,cursor=? WHERE source='cve'").run(now, JSON.stringify({event:now,offset:0}));
+        expect((await route(stagePost("/internal/baseline", { ...canonical, ...start, finished_at: now, accepted: 1, exhausted: true }))).status).toBe(200);
+        expect(await (await route(stagePost("/internal/baseline/verify", proof, refreshToken))).json()).toMatchObject({
+            phase: "verified", verified_count: 1, pending_trees: 0,
+        });
+
+        const status = (store: Store) => handle(new Request(CANONICAL_ORIGIN + "/v1/status"), store, undefined, now);
+        const verifyAtCanonical = (store: Store) => handle(stagePost("/internal/baseline/verify", proof, refreshToken, CANONICAL_ORIGIN),
+            store, ingestToken, now, publisher.fetcher, refreshToken);
+        const upstreamCalls = publisher.calls.length;
+        expect(await (await verifyAtCanonical(stage.store)).json()).toMatchObject({ phase: "verified", verified_count: 1 });
+        expect(await (await status(stage.store)).json()).toMatchObject({ bootstrap_complete: true });
+        expect((await verifyAtCanonical(incumbent.store)).status).toBe(400);
+        expect(await (await status(incumbent.store)).json()).toMatchObject({ baseline: { imported: 0, archive_verified: false }, bootstrap_complete: false });
+        expect(incumbent.db.serialize()).toEqual(previousDatabase);
+        expect(incumbent.objects.size).toBe(0);
+        expect(publisher.calls.length).toBe(upstreamCalls);
+    } finally {
+        incumbent.db.close();
+        stage.db.close();
+    }
+});
 
 test("publisher certification binds original imports while retaining newer delta payloads", async () => {
     const fixture = setup();

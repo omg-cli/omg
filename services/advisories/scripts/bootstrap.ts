@@ -4,12 +4,14 @@ import { basename } from "node:path";
 import { parseArgs } from "node:util";
 import { scanArchive, fileHash, type ArchiveState } from "./archive";
 import { boundedBody, object, string, date } from "../src/domain";
-import { baselineBinding, operatorPost, readCheckpoint, recoverCheckpoint, verifyIngestReply, type BaselineBinding } from "./operator";
+import { CANONICAL_ORIGIN, STAGE_ORIGIN } from "../src/stage-identity";
+import { baselineBinding, operatorPost, readCheckpoint, recoverCheckpoint, requireCheckpointTransport, stageOperatorFetcher, verifyIngestReply, type BaselineBinding } from "./operator";
 const { values } = parseArgs({
     options: {
         archive: { type: "string" },
         state: { type: "string" },
         endpoint: { type: "string" },
+        stage: { type: "boolean", default: false },
         "release-tag": { type: "string" },
         asset: { type: "string" },
         "token-file": { type: "string" },
@@ -25,7 +27,7 @@ const { values } = parseArgs({
 });
 if (values.help) {
     process.stdout.write(
-        "bun run bootstrap --archive PATH --state PATH --release-tag TAG --asset NAME [--endpoint HTTPS_URL] [--token-file MODE_600_FILE] [--max-records 1000] [--delay-ms 0] [--resume-instance ID --resume-session UUID] [--dry-run] [--finalize]\nINGEST_TOKEN environment variable is supported. No Cloudflare account credential is needed. Dry run never writes HTTP. Recovery requires a missing state file and replays the exact bound archive/session from zero. Batches remain serial and bounded by service limits.\n",
+        "bun run bootstrap --archive PATH --state PATH --release-tag TAG --asset NAME [--endpoint HTTPS_URL | --stage] [--token-file MODE_600_FILE] [--max-records 1000] [--delay-ms 0] [--resume-instance ID --resume-session UUID] [--dry-run] [--finalize]\nINGEST_TOKEN works in ordinary mode; --stage uses separate stage-only environment credentials. Dry run never writes HTTP. Recovery requires a missing state file and replays the exact bound archive/session from zero. Batches remain serial and bounded by service limits.\n",
     );
     process.exit(0);
 }
@@ -37,6 +39,13 @@ async function run() {
         !values.asset
     )
         throw new Error("archive, state, release-tag and asset required");
+    const stage = values.stage === true;
+    if (stage && (values.endpoint || values["token-file"] || values["dry-run"]))
+        throw new Error("stage transport has a fixed endpoint and uses only stage credentials");
+    const endpoint = stage ? new URL(STAGE_ORIGIN) : values.endpoint ? new URL(values.endpoint) : null;
+    if (!stage && endpoint?.origin === STAGE_ORIGIN)
+        throw new Error("the stage endpoint requires explicit stage mode");
+    const bindingOrigin = stage ? CANONICAL_ORIGIN : endpoint?.origin;
     const max = Number(values["max-records"]);
     const delay = Number(values["delay-ms"]);
     if (
@@ -85,14 +94,13 @@ async function run() {
     )
         throw new Error("official asset bytes mismatch");
     const baseline = date(`${full[1]}T00:00:00Z`);
-    let token = process.env.INGEST_TOKEN;
+    let token = stage ? process.env.STAGE_INGEST_TOKEN : process.env.INGEST_TOKEN;
     if (values["token-file"]) {
         const info = await stat(values["token-file"]);
         if ((info.mode & 0o077) !== 0)
             throw new Error("token file must be private");
         token = (await readFile(values["token-file"], "utf8")).trim();
     }
-    const endpoint = values.endpoint ? new URL(values.endpoint) : null;
     if (
         !values["dry-run"] &&
         (!endpoint ||
@@ -106,11 +114,12 @@ async function run() {
             token.length < 32)
     )
         throw new Error("HTTPS endpoint and strong ingest token required");
+    const fetcher = stage ? stageOperatorFetcher(process.env.STAGE_ACCESS_CLIENT_ID, process.env.STAGE_ACCESS_CLIENT_SECRET) : undefined;
     async function post(path: string, body: string) {
         if (values["dry-run"]) return {};
         if (!endpoint || !token)
             throw new Error("missing writer configuration");
-        return operatorPost({endpoint,token,path,body});
+        return operatorPost({endpoint,token,path,body,fetcher});
     }
     let binding: BaselineBinding | null = null;
     let state: ArchiveState = {
@@ -125,8 +134,9 @@ async function run() {
         const info=await lstat(values.state);
         if(!info.isFile() || info.isSymbolicLink() || info.size>16*1024) throw new Error("resume state must be a bounded regular file");
         const saved = object(JSON.parse(await readFile(values.state, "utf8")));
+        requireCheckpointTransport(saved,stage);
         const savedBinding=object(saved.baseline);
-        binding=baselineBinding(savedBinding,digest,endpoint?.origin??string(savedBinding.endpoint));
+        binding=baselineBinding(savedBinding,digest,bindingOrigin??string(savedBinding.endpoint));
         state=readCheckpoint(saved,binding);
         resumed=true;
     } catch (error) {
@@ -141,7 +151,7 @@ async function run() {
     }
     if(values["resume-instance"] || values["resume-session"]) {
         if(resumed || !endpoint || !values["resume-instance"] || !values["resume-session"]) throw new Error("recovery requires both instance/session, endpoint and a missing state file");
-        binding=baselineBinding({digest,endpoint:endpoint.origin,instance_id:values["resume-instance"],session_id:values["resume-session"]},digest,endpoint.origin);
+        binding=baselineBinding({digest,endpoint:bindingOrigin,instance_id:values["resume-instance"],session_id:values["resume-session"]},digest,bindingOrigin??"");
         state=recoverCheckpoint(binding);
     }
     const startAccepted=state.accepted;
@@ -154,7 +164,7 @@ async function run() {
         const temporary=`${path}.tmp-${randomUUID()}`;
         try {
             const file=await open(temporary,"wx",0o600);
-            try { await file.writeFile(JSON.stringify({...next,baseline:binding})+"\n"); await file.sync(); }
+            try { await file.writeFile(JSON.stringify({...next,baseline:binding,...(stage?{transport_endpoint:STAGE_ORIGIN}:{})})+"\n"); await file.sync(); }
             finally { await file.close(); }
             await rename(temporary,path);
         } finally { await rm(temporary,{force:true}); }
@@ -170,7 +180,7 @@ async function run() {
             baseline_at: baseline,
             ...binding,
         }));
-        const actual=baselineBinding(started,digest,endpoint?.origin??"");
+        const actual=baselineBinding(started,digest,bindingOrigin??"");
         if(binding && (actual.instance_id!==binding.instance_id || actual.session_id!==binding.session_id)) throw new Error("baseline response changed the requested session binding");
         binding=actual;
         await save(state);
