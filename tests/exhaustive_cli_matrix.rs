@@ -347,6 +347,7 @@ mod runtime_matrix {
         let data = project.path().join("runtime-state");
         let node = data.join("versions/node");
         std::fs::create_dir_all(node.join("26.13.1")).unwrap();
+        std::fs::write(node.join("26.13.1/.omg-install-complete"), b"26.13.1\n").unwrap();
         symlink("26.13.1", node.join("current")).unwrap();
         let env = [
             ("PATH", path.as_str()),
@@ -425,6 +426,7 @@ mod runtime_matrix {
         );
         std::fs::remove_file(node.join("current")).unwrap();
         std::fs::create_dir(node.join("1~2")).unwrap();
+        std::fs::write(node.join("1~2/.omg-install-complete"), b"1~2\n").unwrap();
         symlink("1~2", node.join("current")).unwrap();
         let invalid_lock = project.run_with_env(&["new", "node", "unsafe-lock"], &env);
         invalid_lock.assert_failure();

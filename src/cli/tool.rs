@@ -173,7 +173,7 @@ fn tool_binary_hashes(install_dir: &Path) -> Result<BTreeMap<String, String>> {
     let is_venv = install_dir.join("pyvenv.cfg").is_file();
     let mut hashes = BTreeMap::new();
     for directory in tool_binary_dirs(install_dir) {
-        if !crate::runtimes::common::is_valid_version_dir(&directory) {
+        if !crate::runtimes::common::is_runtime_payload_dir(&directory) {
             continue;
         }
         for entry in fs::read_dir(directory)? {
@@ -232,7 +232,7 @@ fn validate_tool_binary_containment(install_dir: &Path) -> Result<()> {
     })?;
     let is_venv = install_dir.join("pyvenv.cfg").is_file();
     for directory in tool_binary_dirs(install_dir) {
-        if !crate::runtimes::common::is_valid_version_dir(&directory) {
+        if !crate::runtimes::common::is_runtime_payload_dir(&directory) {
             continue;
         }
         for entry in fs::read_dir(&directory)? {
@@ -1233,7 +1233,7 @@ fn link_binaries(install_dir: &Path, bin_dir: &Path, skip_venv_base_tools: bool)
     let mut linked = 0;
 
     for dir in search_dirs {
-        if !crate::runtimes::common::is_valid_version_dir(&dir) {
+        if !crate::runtimes::common::is_runtime_payload_dir(&dir) {
             continue;
         }
 
@@ -1316,7 +1316,7 @@ fn link_binaries(install_dir: &Path, bin_dir: &Path, skip_venv_base_tools: bool)
 
 pub fn list() -> Result<()> {
     let (_, bin_dir) = get_dirs();
-    if !crate::runtimes::common::is_valid_version_dir(&bin_dir) {
+    if !crate::runtimes::common::is_runtime_payload_dir(&bin_dir) {
         println!("{}", style::dim("No tools installed via omg tool."));
         return Ok(());
     }
@@ -1369,7 +1369,7 @@ pub async fn remove(name: &str) -> Result<()> {
     let mut found = false;
     let mut removed_installs = Vec::new();
     for (manager, install_path) in candidates {
-        if crate::runtimes::common::is_valid_version_dir(&install_path) {
+        if crate::runtimes::common::is_runtime_payload_dir(&install_path) {
             println!(
                 "{} Removing {} from {}...",
                 style::header("OMG"),

@@ -1541,7 +1541,8 @@ pub(crate) fn fixture_install_identity(runtime: &str, version_dir: &Path) -> Res
     write_state(
         &state_path(&destination, "identity")?,
         &serde_json::to_vec(&identity)?,
-    )
+    )?;
+    super::common::mark_test_runtime_complete(version_dir)
 }
 
 #[cfg(test)]
@@ -1551,6 +1552,7 @@ pub(crate) fn fixture_bind_candidate(
     tree: &Path,
     destination: &Path,
 ) -> Result<()> {
+    let published = tree == destination;
     let destination = canonical_destination(destination)?;
     let version = fixture_exact_version(runtime, requested)?;
     let identity = InstallIdentity {
@@ -1567,7 +1569,11 @@ pub(crate) fn fixture_bind_candidate(
     write_state(
         &state_path(&destination, "identity")?,
         &serde_json::to_vec(&identity)?,
-    )
+    )?;
+    if published {
+        super::common::mark_test_runtime_complete(tree)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

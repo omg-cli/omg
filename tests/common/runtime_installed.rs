@@ -3,7 +3,9 @@ use crate::common::TestProject;
 pub fn seed_installed(project: &TestProject, runtime: &str, versions: &[&str]) {
     let directory = project.data_dir.path().join("versions").join(runtime);
     for version in versions {
-        std::fs::create_dir_all(directory.join(version)).unwrap();
+        let path = directory.join(version);
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join(".omg-install-complete"), format!("{version}\n")).unwrap();
     }
 }
 

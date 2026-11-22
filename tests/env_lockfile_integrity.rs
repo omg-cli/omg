@@ -397,6 +397,7 @@ fn capture_records_every_registered_runtime_and_check_detects_its_drift() {
     {
         let versions = project.data_dir.path().join("versions").join(runtime);
         std::fs::create_dir_all(versions.join("1.2.3")).unwrap();
+        std::fs::write(versions.join("1.2.3/.omg-install-complete"), b"1.2.3\n").unwrap();
         std::os::unix::fs::symlink(versions.join("1.2.3"), versions.join("current")).unwrap();
     }
     project.mock_install("git", "2.0.0").unwrap();
@@ -453,6 +454,7 @@ fn capture_records_every_registered_runtime_and_check_detects_its_drift() {
     for runtime in &names {
         let versions = project.data_dir.path().join("versions").join(runtime);
         std::fs::create_dir(versions.join("2.3.4")).unwrap();
+        std::fs::write(versions.join("2.3.4/.omg-install-complete"), b"2.3.4\n").unwrap();
         std::fs::remove_file(versions.join("current")).unwrap();
         std::os::unix::fs::symlink(versions.join("2.3.4"), versions.join("current")).unwrap();
         let drift = project.run(&["env", "check"]);

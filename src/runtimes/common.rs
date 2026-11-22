@@ -1580,15 +1580,68 @@ fn lock_runtime_file(
     }.context("Another runtime mutation or active use conflicts with this operation; retry when it finishes")
 }
 
-/// Return whether a runtime version path is a real production directory.
-///
-/// Debug-only synthetic runtimes are marked and never considered installed or
-/// eligible for activation after the test-mode process exits.
+#[must_use]
+pub(crate) fn is_runtime_payload_dir(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir())
+        && [TEST_RUNTIME_MARKER, INSTALL_PENDING_MARKER].into_iter().all(|marker| {
+            matches!(fs::symlink_metadata(path.join(marker)), Err(error) if error.kind() == io::ErrorKind::NotFound)
+        })
+}
+
+/// Recognize published runtimes and pre-marker layouts with their expected launcher.
 #[must_use]
 pub(crate) fn is_valid_version_dir(version_dir: &Path) -> bool {
-    fs::symlink_metadata(version_dir).is_ok_and(|metadata| metadata.is_dir())
-        && !version_dir.join(TEST_RUNTIME_MARKER).exists()
-        && matches!(fs::symlink_metadata(version_dir.join(INSTALL_PENDING_MARKER)), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+    if !is_runtime_payload_dir(version_dir) {
+        return false;
+    }
+    match fs::symlink_metadata(version_dir.join(INSTALL_MARKER)) {
+        Ok(metadata) => return metadata.is_file(),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(_) => return false,
+    }
+
+    let Some(runtime) = version_dir
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+    else {
+        return false;
+    };
+    let launcher = match runtime {
+        "bun" | "dotnet" => PathBuf::from(runtime),
+        "swift" => PathBuf::from("usr/bin/swift"),
+        "python" => PathBuf::from("bin/python3"),
+        "erlang" => PathBuf::from("bin/erl"),
+        "rust" => PathBuf::from("bin/rustc"),
+        name if super::NATIVE_RUNTIMES.contains(&name) => Path::new("bin").join(name),
+        name => {
+            let Some(tool) = super::tool_registry::find_tool(name) else {
+                return false;
+            };
+            Path::new("bin").join(tool.binary)
+        }
+    };
+    let Ok(root) = version_dir.canonicalize() else {
+        return false;
+    };
+    let Ok(binary) = root.join(launcher).canonicalize() else {
+        return false;
+    };
+    binary.starts_with(&root)
+        && fs::metadata(binary).is_ok_and(|metadata| {
+            use std::os::unix::fs::PermissionsExt as _;
+            metadata.is_file() && metadata.len() > 0 && metadata.permissions().mode() & 0o111 != 0
+        })
+}
+
+#[cfg(test)]
+pub(crate) fn mark_test_runtime_complete(version_dir: &Path) -> Result<()> {
+    let version = version_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("Missing test runtime version")?;
+    fs::write(version_dir.join(INSTALL_MARKER), format!("{version}\n"))?;
+    Ok(())
 }
 
 /// Return whether a runtime binary directory is safe to prepend to `PATH`.
@@ -2245,6 +2298,7 @@ where
     ] {
         for version in versions_to_create {
             fs::create_dir_all(versions.join(version))?;
+            mark_test_runtime_complete(&versions.join(version))?;
         }
         std::os::unix::fs::symlink(current, versions.join("current"))?;
     }
@@ -3605,6 +3659,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         for version in ["1.0", "1.0.0"] {
             fs::create_dir(temp.path().join(version)).unwrap();
+            mark_test_runtime_complete(&temp.path().join(version)).unwrap();
         }
         assert_eq!(
             list_installed_versions(temp.path()).unwrap(),
@@ -3717,6 +3772,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         for version in ["1.2.3alpha3", "1.2.3-alpha10", "1.2.3-alpha2"] {
             fs::create_dir(temp.path().join(version)).unwrap();
+            mark_test_runtime_complete(&temp.path().join(version)).unwrap();
         }
         assert_eq!(
             list_installed_versions(temp.path()).unwrap(),
@@ -4045,6 +4101,7 @@ mod tests {
         let version = temp.path().join("1.0.0");
         fs::create_dir_all(version.join("bin"))?;
         fs::write(version.join("bin/tool"), b"fixture")?;
+        mark_test_runtime_complete(&version)?;
         fs::write(version.join(INSTALL_PENDING_MARKER), b"")?;
         assert!(!is_valid_version_dir(&version));
         assert!(list_installed_versions(temp.path())?.is_empty());
@@ -4054,6 +4111,64 @@ mod tests {
         fs::remove_file(version.join(INSTALL_PENDING_MARKER))?;
         assert!(is_valid_version_dir(&version));
         assert_eq!(list_installed_versions(temp.path())?, vec!["1.0.0"]);
+        Ok(())
+    }
+
+    #[test]
+    fn interrupted_final_directory_is_not_an_install() -> Result<()> {
+        let temp = TempDir::new()?;
+        let versions = temp.path().join("python");
+        let version = versions.join("3.12.0");
+        fs::create_dir_all(version.join("bin"))?;
+        std::os::unix::fs::symlink("3.12.0", versions.join("current"))?;
+
+        assert!(list_installed_versions(&versions)?.is_empty());
+        assert_eq!(get_current_version(&versions), None);
+        let error = set_current_version(&versions, "3.12.0").unwrap_err();
+        assert!(error.to_string().contains("is not installed"));
+        fs::remove_file(versions.join("current"))?;
+        assert!(uninstall_version(&versions, "3.12.0").is_err());
+        assert!(version.join("bin").is_dir());
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_runtime_requires_a_contained_executable_and_no_invalid_marker() -> Result<()> {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        let temp = TempDir::new()?;
+        for (runtime, relative) in [
+            ("python", "bin/python3"),
+            ("bun", "bun"),
+            ("dotnet", "dotnet"),
+            ("swift", "usr/bin/swift"),
+            ("ripgrep", "bin/rg"),
+        ] {
+            let versions = temp.path().join(runtime);
+            let version = versions.join("1.0.0");
+            let launcher = version.join(relative);
+            fs::create_dir_all(launcher.parent().unwrap())?;
+            let executable = version.join("launcher");
+            fs::write(&executable, b"#!/bin/sh\n")?;
+            symlink(&executable, &launcher)?;
+            assert!(!is_valid_version_dir(&version), "{runtime}");
+            fs::set_permissions(&executable, fs::Permissions::from_mode(0o755))?;
+            assert_eq!(list_installed_versions(&versions)?, ["1.0.0"], "{runtime}");
+
+            let marker = version.join(INSTALL_MARKER);
+            symlink(&executable, &marker)?;
+            assert!(!is_valid_version_dir(&version), "{runtime}");
+            fs::remove_file(&marker)?;
+            fs::create_dir(&marker)?;
+            assert!(!is_valid_version_dir(&version), "{runtime}");
+            fs::remove_dir(&marker)?;
+            fs::remove_file(&launcher)?;
+            let outside = temp.path().join("outside").join(runtime);
+            fs::create_dir_all(outside.parent().unwrap())?;
+            fs::rename(&executable, &outside)?;
+            symlink(&outside, &launcher)?;
+            assert!(!is_valid_version_dir(&version), "{runtime}");
+        }
         Ok(())
     }
 
@@ -4734,6 +4849,7 @@ mod tests {
         let version_dir = versions_dir.join("1.0.0");
         fs::create_dir_all(&version_dir)?;
         fs::write(version_dir.join("bin"), "old")?;
+        mark_test_runtime_complete(&version_dir)?;
 
         let staging = begin_staged_install(&versions_dir)?;
         fs::write(staging.path().join("bin"), "new")?;
@@ -4763,6 +4879,7 @@ mod tests {
         let version_dir = temp.path().join("1.0.0");
         fs::create_dir(&version_dir)?;
         fs::write(version_dir.join("bin"), "old")?;
+        mark_test_runtime_complete(&version_dir)?;
         let staging = begin_staged_install(&version_dir)?;
         fs::write(staging.path().join("bin"), "new")?;
         prepare_runtime_fixture(staging.path(), &version_dir, "1.0.0")?;
@@ -4913,6 +5030,9 @@ mod tests {
         fs::create_dir(temp.path().join("2.0.0")).unwrap();
         fs::create_dir(temp.path().join("10.0.0")).unwrap();
         fs::create_dir(temp.path().join("current")).unwrap(); // Should be excluded
+        for name in ["1.0.0", "2.0.0", "10.0.0", "current"] {
+            mark_test_runtime_complete(&temp.path().join(name)).unwrap();
+        }
 
         let versions = list_installed_versions(temp.path()).unwrap();
         assert_eq!(versions, ["10.0.0", "2.0.0", "1.0.0"]);
@@ -4923,6 +5043,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let synthetic = temp.path().join("3.12.0");
         fs::create_dir(&synthetic).unwrap();
+        mark_test_runtime_complete(&synthetic).unwrap();
         fs::write(synthetic.join(TEST_RUNTIME_MARKER), "synthetic\n").unwrap();
 
         assert!(list_installed_versions(temp.path()).unwrap().is_empty());
@@ -4935,6 +5056,7 @@ mod tests {
     fn version_listing_and_activation_reject_symlinked_version_dirs() {
         let temp = TempDir::new().unwrap();
         fs::create_dir(temp.path().join("real")).unwrap();
+        mark_test_runtime_complete(&temp.path().join("real")).unwrap();
         std::os::unix::fs::symlink("real", temp.path().join("1.0.0")).unwrap();
         fs::write(temp.path().join("2.0.0"), b"not a directory").unwrap();
 
@@ -4957,6 +5079,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         fs::create_dir(temp.path().join("1.0.0")).unwrap();
         let current = temp.path().join("current");
+        mark_test_runtime_complete(&temp.path().join("1.0.0")).unwrap();
 
         std::os::unix::fs::symlink("missing", &current).unwrap();
         assert!(get_current_version(temp.path()).is_none());
@@ -5047,6 +5170,7 @@ mod tests {
         fs::create_dir_all(previous.join("bin"))?;
         fs::create_dir_all(candidate.join("bin"))?;
         fs::write(candidate.join("bin/node"), b"unreviewed executable bytes")?;
+        mark_test_runtime_complete(&candidate)?;
         std::os::unix::fs::symlink(&previous, versions.join("current"))?;
         let error = set_current_version(&versions, "24.22.3")
             .expect_err("an installation without advisory authority must not become active");

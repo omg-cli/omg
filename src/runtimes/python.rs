@@ -229,6 +229,11 @@ impl PythonManager {
         }
 
         if crate::core::paths::test_mode() {
+            fs::create_dir_all(&version_dir)?;
+            fs::write(
+                version_dir.join(super::common::TEST_RUNTIME_MARKER),
+                "debug-only synthetic runtime\n",
+            )?;
             fs::create_dir_all(version_dir.join("bin"))?;
             fs::write(version_dir.join("bin/python3.12"), "mock")?;
             #[cfg(unix)]
@@ -237,10 +242,6 @@ impl PythonManager {
             fs::copy(
                 version_dir.join("bin/python3.12"),
                 version_dir.join("bin/python3"),
-            )?;
-            fs::write(
-                version_dir.join(super::common::TEST_RUNTIME_MARKER),
-                "debug-only synthetic runtime\n",
             )?;
             println!(
                 "{} OMG_TEST_MODE active — synthetic Python runtime was not activated",
