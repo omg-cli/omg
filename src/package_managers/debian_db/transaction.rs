@@ -1332,8 +1332,9 @@ struct DpkgPackageIdentity {
 /// Existing paragraphs whose `(Package, Architecture)` identity appears in
 /// `entries` are replaced by the matching new entry; all other paragraphs are
 /// preserved. `Architecture: all` and legacy archless records share the
-/// native replacement slot. An update must not leave an architecture-independent
-/// package alongside another instance. New entries are appended in order.
+/// native replacement slot. An update must not leave a non-tombstone
+/// architecture-independent package alongside another non-tombstone instance.
+/// This is a narrow guard, not general dpkg validation. New entries append in order.
 fn merge_status_entries(current: &str, entries: &[(String, String)]) -> Result<String> {
     let mut pending_by_identity = HashMap::new();
     let mut pending = vec![true; entries.len()];
@@ -1378,6 +1379,9 @@ fn merge_status_entries(current: &str, entries: &[(String, String)]) -> Result<S
     for paragraph in out.split("\n\n") {
         if let Some(name) = status_entry_field(paragraph, "Package")
             && updated_names.contains(name)
+            && status_entry_field(paragraph, "Status")
+                .and_then(|status| status.split_whitespace().nth(2))
+                != Some("not-installed")
         {
             let independent = status_entry_field(paragraph, "Architecture") == Some("all");
             if let Some(previous_independent) = seen.insert(name, independent) {
@@ -3950,6 +3954,25 @@ mod tests {
         let error = merge_status_entries(&current, &[("shared-data".to_owned(), entry.to_owned())])
             .expect_err("adding all must not retain or delete the foreign sibling silently");
         assert!(error.to_string().contains("other instances of shared-data"));
+    }
+
+    #[test]
+    fn merge_status_entries_keeps_an_all_tombstone_with_a_foreign_upgrade() {
+        let foreign = if super::super::debian_arch() == "i386" {
+            "amd64"
+        } else {
+            "i386"
+        };
+        let tombstone = "Package: shared-data\nStatus: purge ok not-installed\nArchitecture: all\n";
+        let current = format!(
+            "{tombstone}\nPackage: shared-data\nStatus: install ok installed\nVersion: 1.0\nArchitecture: {foreign}\nMulti-Arch: same\n"
+        );
+        let entry = format!(
+            "Package: shared-data\nStatus: install ok installed\nVersion: 2.0\nArchitecture: {foreign}\nMulti-Arch: same\n"
+        );
+        let merged = merge_status_entries(&current, &[("shared-data".to_owned(), entry.clone())])
+            .expect("dpkg accepts a retained tombstone alongside the foreign package");
+        assert_eq!(merged, format!("{tombstone}\n{entry}\n"));
     }
 
     // ─── wave-3 fixes ───
