@@ -3434,6 +3434,7 @@ mod tests {
             let dir = versions.join(version);
             fs::create_dir_all(dir.join("bin"))?;
             fs::write(dir.join("bin").join("node"), b"fake")?;
+            mark_test_runtime_complete(&dir)?;
         }
         symlink(versions.join("20.10.0"), versions.join("current"))?;
 

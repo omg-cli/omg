@@ -1845,6 +1845,7 @@ path = "hostile"
     fn non_feature_java_request_fails_soft_in_hook_path_building() {
         let data = tempdir().unwrap();
         fs::create_dir_all(data.path().join("versions/java/21/bin")).unwrap();
+        mark_test_runtime_complete(&data.path().join("versions/java/21")).unwrap();
         temp_env::with_var("OMG_DATA_DIR", Some(data.path()), || {
             for request in ["21.0.5", "latest", "21-ea"] {
                 let versions = HashMap::from([("java".to_string(), request.to_string())]);
