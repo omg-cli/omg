@@ -1179,6 +1179,46 @@ impl DnfPackageManager {
         Self::parse_available_packages(&bytes)
     }
 
+    fn search_results(
+        installed: Vec<InstalledPackage>,
+        mut available: Vec<Package>,
+        query_lower: &str,
+    ) -> Vec<Package> {
+        let matches = |identity: &str, summary: &str| {
+            identity.to_lowercase().contains(query_lower)
+                || summary.to_lowercase().contains(query_lower)
+        };
+        available.retain(|pkg| matches(&pkg.name, &pkg.description));
+        let matching_available: HashSet<_> =
+            available.iter().map(|pkg| pkg.name.as_str()).collect();
+        let mut results: Vec<_> = installed
+            .into_iter()
+            .filter_map(|pkg| {
+                let identity = pkg.identity();
+                if !matches(&identity, &pkg.summary)
+                    && !matching_available.contains(identity.as_str())
+                {
+                    return None;
+                }
+                Some(Package {
+                    name: identity,
+                    version: parse_version_or_zero(&format!("{}-{}", pkg.version, pkg.release)),
+                    description: pkg.summary,
+                    source: PackageSource::Official,
+                    installed: true,
+                })
+            })
+            .collect();
+        results.extend(available);
+        results.sort_by(|a, b| {
+            a.name
+                .cmp(&b.name)
+                .then_with(|| b.installed.cmp(&a.installed))
+        });
+        results.dedup_by(|a, b| a.name == b.name);
+        results
+    }
+
     pub(crate) async fn installed_package_sizes(
         query: InstalledSizeQuery<'_>,
     ) -> Result<Vec<(String, i64)>> {
@@ -2379,43 +2419,9 @@ impl PackageManager for DnfPackageManager {
     ) -> Pin<Box<dyn Future<Output = Result<Vec<Package>>> + Send + '_>> {
         let query_lower = query.to_lowercase();
         Box::pin(async move {
-            // Search installed packages first
             let installed = self.load_installed_packages().await?;
-            let mut results: Vec<Package> = installed
-                .iter()
-                .filter(|pkg| {
-                    pkg.name.to_lowercase().contains(&query_lower)
-                        || pkg.summary.to_lowercase().contains(&query_lower)
-                })
-                .map(|pkg| Package {
-                    name: pkg.identity(),
-                    version: parse_version_or_zero(&format!("{}-{}", pkg.version, pkg.release)),
-                    description: pkg.summary.clone(),
-                    source: PackageSource::Official,
-                    installed: true,
-                })
-                .collect();
-
-            results.extend(
-                Self::available_packages(None)
-                    .await?
-                    .into_iter()
-                    .filter(|package| {
-                        package.name.to_lowercase().contains(&query_lower)
-                            || package.description.to_lowercase().contains(&query_lower)
-                    }),
-            );
-
-            // Deduplicate by name; sort installed rows first within a name
-            // so dedup keeps the entry carrying `installed: true`.
-            results.sort_by(|a, b| {
-                a.name
-                    .cmp(&b.name)
-                    .then_with(|| b.installed.cmp(&a.installed))
-            });
-            results.dedup_by(|a, b| a.name == b.name);
-
-            Ok(results)
+            let available = Self::available_packages(None).await?;
+            Ok(Self::search_results(installed, available, &query_lower))
         })
     }
 
@@ -3583,6 +3589,68 @@ mod tests {
                 PackageSource::Official,
                 false,
             )
+        );
+    }
+
+    #[test]
+    fn search_matches_qualified_identities_and_prefers_installed_rows() {
+        assert_eq!(
+            DnfPackageManager::repository_query_format(&RepositoryQuery::Available(None)),
+            "%{name}.%{arch}\t%{evr}\t%{summary}\\n"
+        );
+        let search = |query| {
+            let installed = [("widget.lib", "x86_64"), ("widget.local", "noarch")].map(
+                |(name, architecture)| InstalledPackage {
+                    name: name.to_owned(),
+                    architecture: architecture.to_owned(),
+                    version: "1".to_owned(),
+                    release: "1".to_owned(),
+                    summary: "Installed summary".to_owned(),
+                    reason: InstallReason::Dependency,
+                },
+            );
+            let available = DnfPackageManager::parse_available_packages(
+                b"widget.lib.x86_64\t2-1\tRepository keyword\n\
+                  widget.lib.x86_64\t3-1\tAnother repository build\n\
+                  widget.lib.i686\t2-1\tRepository keyword\n",
+            )
+            .expect("valid repository rows");
+            DnfPackageManager::search_results(installed.to_vec(), available, query)
+                .into_iter()
+                .map(|pkg| {
+                    (
+                        pkg.name,
+                        pkg.installed,
+                        pkg.version.to_string(),
+                        pkg.description,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let installed = (
+            "widget.lib.x86_64".to_owned(),
+            true,
+            "1-1".to_owned(),
+            "Installed summary".to_owned(),
+        );
+        let available = (
+            "widget.lib.i686".to_owned(),
+            false,
+            "2-1".to_owned(),
+            "Repository keyword".to_owned(),
+        );
+        assert_eq!(search("widget.lib"), [available.clone(), installed.clone()]);
+        assert_eq!(search("widget.lib.x86_64"), [installed.clone()]);
+        assert_eq!(search("repository keyword"), [available.clone(), installed]);
+        assert_eq!(search("widget.lib.i686"), [available]);
+        assert_eq!(
+            search("widget.local.noarch"),
+            [(
+                "widget.local.noarch".to_owned(),
+                true,
+                "1-1".to_owned(),
+                "Installed summary".to_owned(),
+            )]
         );
     }
 
