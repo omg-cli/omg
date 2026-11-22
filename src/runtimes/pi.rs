@@ -354,7 +354,8 @@ case "$phase" in
 install) cp "$root/lock.fixture.json" "$prefix/package-lock.json" ;;
 ci)
   if [ -f "$root/hold" ]; then
-    printf '%s' "$prefix" > "$root/started"
+    printf '%s' "$prefix" > "$root/started.tmp"
+    mv "$root/started.tmp" "$root/started"
     attempts=0
     while [ ! -f "$root/release" ]; do
       [ "$attempts" -lt 500 ] || exit 124
