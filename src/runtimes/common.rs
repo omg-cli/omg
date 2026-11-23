@@ -2711,7 +2711,17 @@ mod tests {
         )
         .await?;
         server.await??;
-        assert_eq!(fs::read(&temporary)?, payload);
+        let root = File::open(directory.path())?;
+        let name = temporary.file_name().context("Download lacks a filename")?;
+        let handle = rustix::fs::openat(
+            &root,
+            name,
+            rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NOFOLLOW,
+            rustix::fs::Mode::empty(),
+        )?;
+        let mut written = Vec::new();
+        File::from(handle).read_to_end(&mut written)?;
+        assert_eq!(written, payload);
         assert_eq!(digest, hex::encode(Sha256::digest(&payload)));
         Ok(())
     }
