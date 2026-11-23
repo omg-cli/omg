@@ -3640,7 +3640,7 @@ mod tests {
         .expect("owned fixture must succeed");
     }
 
-    fn native_package_migration_fixtures() -> [(&'static str, &'static str); 6] {
+    fn native_package_migration_fixtures() -> [(&'static str, &'static str); 3] {
         [
             (
                 "1794518371.sh",
@@ -3697,54 +3697,6 @@ fi
 # video wallpapers through it. A mimeapps.list line naming imv.desktop stops
 # resolving, and Omarchy's default, Omaview, opens those files instead.
 omarchy-pkg-drop imv mpv-mpris
-"#,
-            ),
-            (
-                "1795284903.sh",
-                r#"echo "Install the FaceTime HD camera driver on Intel Macs that have one"
-
-# Fresh installs get this from install/hardware/apple/fix-facetimehd.sh. Existing
-# Macs only pick it up on omarchy update via this migration.
-if omarchy-hw-facetimehd; then
-  source "$OMARCHY_PATH/install/hardware/apple/fix-facetimehd.sh"
-
-  # The module only loads at boot, so the camera stays missing until then.
-  (( ${#packages[@]} == 0 )) || omarchy-state set reboot-required
-
-  # The leaf only enables the fetch for the next boot; on a running system it can start now.
-  if pacman -Q facetimehd-firmware-fetcher &>/dev/null; then
-    sudo systemctl start --no-block facetimehd-firmware-fetcher.service
-  fi
-fi
-"#,
-            ),
-            (
-                "1795318856.sh",
-                r#"echo "Install Pi as a package instead of a mise tool"
-
-# The settings package drops Pi's mise declaration. Until it has, stay pending:
-# the declaration would only install Pi through mise again.
-if omarchy-mise-default-tools list | grep -qx pi; then
-  echo "Waiting for the omarchy-settings package that drops Pi from the default mise tools" >&2
-  exit 75
-fi
-
-omarchy-pkg-add pi-coding-agent
-
-# mise's shims come before /usr/bin on PATH, and the shim left by the dropped
-# declaration fails rather than falling through to the package. A Pi the user
-# declared in a mise config of their own is theirs and stays.
-if ! mise ls pi --json | jq -e 'any(.[]; .source)' >/dev/null; then
-  mise uninstall --all pi
-  mise reshim
-fi
-"#,
-            ),
-            (
-                "1795354955.sh",
-                r#"echo "Install kmscon, which setup after a factory reset is drawn in"
-
-omarchy-pkg-add kmscon
 "#,
             ),
         ]
@@ -4026,22 +3978,14 @@ omarchy-pkg-add kmscon
         assert!(markers.join("1794518371.sh").is_file());
         assert!(!markers.join("1794675791.sh").exists());
         assert!(!markers.join("1794774234.sh").exists());
-        assert!(!markers.join("1795284903.sh").exists());
-        assert!(!markers.join("1795318856.sh").exists());
-        assert!(!markers.join("1795354955.sh").exists());
         assert!(!markers.join("9999999999.sh").exists());
         recorder.calls.clear();
         recorder.fail = false;
         run_migration_plan(&plan, &markers, &mut recorder).await?;
-        let expected_retry = [
-            "1794675791.sh",
-            "1794774234.sh",
-            "1795284903.sh",
-            "1795318856.sh",
-            "1795354955.sh",
-            "9999999999.sh",
-        ];
-        assert_eq!(recorder.calls, expected_retry);
+        assert_eq!(
+            recorder.calls,
+            ["1794675791.sh", "1794774234.sh", "9999999999.sh"]
+        );
         assert!(pending_migrations(&migrations, &markers)?.is_empty());
         recorder.calls.clear();
         run_migration_plan(&plan, &markers, &mut recorder).await?;
@@ -7325,6 +7269,57 @@ omarchy-state set reboot-required
         )
         .expect("write 1795337583.sh");
         std::fs::write(
+            migrations.join("1795284903.sh"),
+            r#"echo "Install the FaceTime HD camera driver on Intel Macs that have one"
+
+# Fresh installs get this from install/hardware/apple/fix-facetimehd.sh. Existing
+# Macs only pick it up on omarchy update via this migration.
+if omarchy-hw-facetimehd; then
+  source "$OMARCHY_PATH/install/hardware/apple/fix-facetimehd.sh"
+
+  # The module only loads at boot, so the camera stays missing until then.
+  (( ${#packages[@]} == 0 )) || omarchy-state set reboot-required
+
+  # The leaf only enables the fetch for the next boot; on a running system it can start now.
+  if pacman -Q facetimehd-firmware-fetcher &>/dev/null; then
+    sudo systemctl start --no-block facetimehd-firmware-fetcher.service
+  fi
+fi
+"#,
+        )
+        .expect("write 1795284903.sh");
+        std::fs::write(
+            migrations.join("1795318856.sh"),
+            r#"echo "Install Pi as a package instead of a mise tool"
+
+# The settings package drops Pi's mise declaration. Until it has, stay pending:
+# the declaration would only install Pi through mise again.
+if omarchy-mise-default-tools list | grep -qx pi; then
+  echo "Waiting for the omarchy-settings package that drops Pi from the default mise tools" >&2
+  exit 75
+fi
+
+omarchy-pkg-add pi-coding-agent
+
+# mise's shims come before /usr/bin on PATH, and the shim left by the dropped
+# declaration fails rather than falling through to the package. A Pi the user
+# declared in a mise config of their own is theirs and stays.
+if ! mise ls pi --json | jq -e 'any(.[]; .source)' >/dev/null; then
+  mise uninstall --all pi
+  mise reshim
+fi
+"#,
+        )
+        .expect("write 1795318856.sh");
+        std::fs::write(
+            migrations.join("1795354955.sh"),
+            r#"echo "Install kmscon, which setup after a factory reset is drawn in"
+
+omarchy-pkg-add kmscon
+"#,
+        )
+        .expect("write 1795354955.sh");
+        std::fs::write(
             migrations.join("1795354646.sh"),
             concat!(
                 "echo \"Install Podman and crun, which run local models, on machines installed before they were base packages\"\n\n",
@@ -7335,15 +7330,18 @@ omarchy-state set reboot-required
 
         let pending =
             pending_migrations(&migrations, &markers).expect("resolve published migrations");
-        assert_eq!(pending.len(), 3);
+        assert_eq!(pending.len(), 6);
         assert_eq!(
             pending[0].native,
             Some(NativeMigration::SkipQualcommHardware)
         );
+        assert_eq!(pending[1].native, Some(NativeMigration::FacetimeHdCamera));
+        assert_eq!(pending[2].native, Some(NativeMigration::PiCodingAgent));
         assert_eq!(
-            pending[1].native,
+            pending[3].native,
             Some(NativeMigration::SkipQualcommHardware)
         );
-        assert_eq!(pending[2].native, Some(NativeMigration::PodmanAndCrun));
+        assert_eq!(pending[4].native, Some(NativeMigration::PodmanAndCrun));
+        assert_eq!(pending[5].native, Some(NativeMigration::Kmscon));
     }
 }
