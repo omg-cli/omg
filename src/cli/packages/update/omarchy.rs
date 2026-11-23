@@ -18,6 +18,7 @@ use crate::package_managers::arch::NativeOmarchyOperation;
 const LOG_PATH: &str = "/tmp/omarchy-update.log";
 const LOCK_FD: &str = "OMG_OMARCHY_LOCK_FD";
 const LOG_FD: &str = "OMG_OMARCHY_LOG_FD";
+const ATTENDED_ENV: &str = "OMG_OMARCHY_ATTENDED";
 const AUTHORIZATION_INTERVAL: Duration = Duration::from_mins(1);
 const TERMINATION_GRACE: Duration = Duration::from_secs(10);
 const DEVELOPMENT_UPDATE_DEADLINE: Duration = Duration::from_mins(2);
@@ -264,12 +265,20 @@ fn native_preflight_free_space() -> Result<()> {
     check_free_space_bytes(available, false)
 }
 
-fn native_confirm_update() -> Result<Outcome> {
+fn coordinator_attended_from(value: Option<&std::ffi::OsStr>, fallback: bool) -> bool {
+    match value.and_then(|value| value.to_str()) {
+        Some("1") => true,
+        Some("0") => false,
+        _ => fallback,
+    }
+}
+
+fn native_confirm_update(attended: bool) -> Result<Outcome> {
     println!("Ready to update?");
     println!("  • You cannot stop the update once you start!");
     println!("  • Make sure you're connected to power or have a full battery");
     println!("  What's new: https://github.com/omacom/omarchy/releases/latest\n");
-    if !console::user_attended() {
+    if !attended {
         println!(
             "Update cancelled (non-interactive terminal; pass -y to proceed without confirmation)."
         );
@@ -487,6 +496,7 @@ impl OmarchyRuntime {
 
 struct Commands {
     yes: bool,
+    attended: bool,
     runtime: OmarchyRuntime,
     authorization: Option<tokio::task::JoinHandle<()>>,
     inhibitor_attempted: bool,
@@ -530,6 +540,7 @@ impl Commands {
     const fn new(yes: bool, runtime: OmarchyRuntime) -> Self {
         Self {
             yes,
+            attended: false,
             runtime,
             authorization: None,
             inhibitor_attempted: false,
@@ -538,6 +549,11 @@ impl Commands {
             #[cfg(test)]
             native_fixture: None,
         }
+    }
+
+    const fn with_attended(mut self, attended: bool) -> Self {
+        self.attended = attended;
+        self
     }
 
     async fn run_program(&mut self, program: &Path, args: &[&str]) -> Result<ExitStatus> {
@@ -588,7 +604,8 @@ impl Commands {
             .env("OMARCHY_PATH", omarchy_root)
             .env("OMARCHY_MIGRATION_STATE", &self.runtime.migration_state)
             .env_remove(LOCK_FD)
-            .env_remove(LOG_FD);
+            .env_remove(LOG_FD)
+            .env_remove(ATTENDED_ENV);
         if self.yes {
             command.env("OMARCHY_UPDATE_UNATTENDED", "1");
         }
@@ -632,7 +649,10 @@ impl Commands {
     async fn run_command(&mut self, mut command: Command, label: &str) -> Result<ExitStatus> {
         anyhow::ensure!(self.active.is_none(), "An Omarchy stage is already running");
         command.kill_on_drop(true).process_group(0);
-        command.env_remove(LOCK_FD).env_remove(LOG_FD);
+        command
+            .env_remove(LOCK_FD)
+            .env_remove(LOG_FD)
+            .env_remove(ATTENDED_ENV);
         self.start(&mut command)
             .await
             .with_context(|| format!("Failed to start Omarchy stage {label}"))?;
@@ -809,14 +829,14 @@ impl StageExecutor for Commands {
                 native_preflight_free_space()?;
                 return Ok(Outcome::Success);
             }
-            Stage::Confirm => return native_confirm_update(),
+            Stage::Confirm => return native_confirm_update(self.attended),
             Stage::NativePackage(operation) => {
                 self.run_native_package(operation).await?;
                 return Ok(Outcome::Success);
             }
             Stage::RebootPrompt => {
                 if let Some(reason) = native_reboot_reason()? {
-                    if self.yes || !console::user_attended() {
+                    if self.yes || !self.attended {
                         println!("{reason} Run omarchy-system reboot when ready.");
                     } else {
                         let _quiesce = crate::cli::modern_ui::quiesce_terminal();
@@ -1976,6 +1996,7 @@ async fn execute_logged(
     use std::io::Write;
     let mut interruptions = Interruptions::new()?;
     let (mut input, terminal) = terminal_input()?;
+    let outer_attended = terminal.is_some() && console::user_attended();
     let (master, slave) = open_transport_pty(terminal.as_ref().map(|terminal| &terminal.saved))?;
     let flags = nix::fcntl::OFlag::from_bits_truncate(fcntl(&master, FcntlArg::F_GETFL)?);
     fcntl(
@@ -2009,6 +2030,7 @@ async fn execute_logged(
         .stderr(Stdio::from(slave))
         .env(LOCK_FD, lock_fd.to_string())
         .env(LOG_FD, log_fd.to_string())
+        .env(ATTENDED_ENV, if outer_attended { "1" } else { "0" })
         .env("OMARCHY_PATH", &runtime.root)
         .env("OMARCHY_MIGRATION_STATE", &runtime.migration_state)
         .kill_on_drop(true);
@@ -2173,7 +2195,11 @@ pub(super) async fn maybe_coordinate(intent: UpdateIntent) -> Result<bool> {
                     && log.metadata()?.len() > 0,
                 "Omarchy update transport has no active PTY transcript"
             );
-            let mut executor = Commands::new(yes, runtime);
+            let attended = coordinator_attended_from(
+                std::env::var_os(ATTENDED_ENV).as_deref(),
+                console::user_attended(),
+            );
+            let mut executor = Commands::new(yes, runtime).with_attended(attended);
             let result = tokio::select! {
                 result = workflow(&mut executor, yes) => result,
                 signal = interrupt() => {
@@ -6851,5 +6877,22 @@ omarchy-state set reboot-required
                 "caller checkout program must never execute"
             );
         }
+    }
+
+    #[test]
+    fn coordinator_attended_from_respects_outer_attendance_env() {
+        use std::ffi::OsStr;
+
+        assert!(coordinator_attended_from(Some(OsStr::new("1")), false));
+        assert!(!coordinator_attended_from(Some(OsStr::new("0")), true));
+        assert!(coordinator_attended_from(None, true));
+        assert!(!coordinator_attended_from(None, false));
+        assert!(coordinator_attended_from(Some(OsStr::new("other")), true));
+        assert!(!coordinator_attended_from(Some(OsStr::new("other")), false));
+    }
+
+    #[test]
+    fn native_confirm_update_declines_when_unattended() {
+        assert_eq!(native_confirm_update(false).unwrap(), Outcome::Declined);
     }
 }
