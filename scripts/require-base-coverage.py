@@ -259,6 +259,7 @@ def main():
                "base_artifact": base_artifact["id"], "head_artifact": head_artifact["id"]}
     (root / "identity.json").write_text(json.dumps(receipt, indent=2) + "\n", encoding="utf-8")
     result = subprocess.run([sys.executable, str(Path(__file__).with_name("check-line-coverage.py")),
+                             "--diff-coverage",
                              "--base", str(base_report), "--head", str(head_report),
                              "--base-regions", str(base_regions), "--head-regions", str(head_regions),
                              "--source-repo", str(Path.cwd()), "--base-sha", base_sha, "--head-sha", head_sha],

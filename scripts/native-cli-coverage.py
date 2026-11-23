@@ -1183,7 +1183,7 @@ CASES = tuple((f'test-{index:02}', role, name)
                   ((role, name) for role, harness in HARNESSES.items() for name in harness.tests), 1))
 
 OMARCHY_PREFIX = (
-    'omarchy-update-requires-free-space', 'omarchy-snapshot\tcreate',
+    'omarchy-snapshot\tcreate',
     'omarchy-update-stay-awake\tstart', 'omarchy-update-dev')
 OMARCHY_SUFFIX = (
     'omarchy-migrate\t--pending', 'omarchy-restart-shell', 'omarchy-migrate',
@@ -1256,7 +1256,7 @@ OMARCHY_CASES = {
         scene='platform-oversize', native_phase='cache-pruned'),
     'omarchy-vendor-failure': OmarchyCase(1, OMARCHY_PREFIX + ('omarchy-update-stay-awake\tstop',), native_phase='cache-pruned'),
     'omarchy-unknown-signing-key': OmarchyCase(1, OMARCHY_PREFIX + ('omarchy-update-stay-awake\tstop',), native_phase='keyrings-refreshed'),
-    'omarchy-declined': OmarchyCase(0, ('omarchy-update-requires-free-space', 'omarchy-update-confirm')),
+    'omarchy-declined': OmarchyCase(0, ()),
     'omarchy-optional-failures': OmarchyCase(0, tuple(
         item for item in OMARCHY_PREFIX + OMARCHY_SUFFIX
         if item.split('\t')[0] not in ('omarchy-snapshot', 'omarchy-restart-shell', 'omarchy-update-mise')),
@@ -1274,19 +1274,15 @@ OMARCHY_CASES = {
         if item != 'omarchy-snapshot\tcreate'), absent_helper='omarchy-snapshot', native_phase='complete'),
     'omarchy-snapshot-unsupported': OmarchyCase(0, OMARCHY_PREFIX + OMARCHY_SUFFIX,
         scene='snapshot-unsupported', native_phase='complete'),
-    'omarchy-required-helper-missing': OmarchyCase(1, OMARCHY_PREFIX[:3] +
+    'omarchy-required-helper-missing': OmarchyCase(1, OMARCHY_PREFIX[:2] +
         ('omarchy-update-stay-awake\tstop',), absent_helper='omarchy-update-dev', native_phase='cache-pruned'),
-    'omarchy-reboot-decline': OmarchyCase(0, OMARCHY_PREFIX[:1] +
-        ('omarchy-update-confirm',) + OMARCHY_PREFIX[1:] + OMARCHY_SUFFIX,
+    'omarchy-reboot-decline': OmarchyCase(0, OMARCHY_PREFIX + OMARCHY_SUFFIX,
         native_phase='complete', reboot_answer='n'),
-    'omarchy-reboot-accept': OmarchyCase(0, OMARCHY_PREFIX[:1] +
-        ('omarchy-update-confirm',) + OMARCHY_PREFIX[1:] + OMARCHY_SUFFIX + ('omarchy-system\treboot',),
+    'omarchy-reboot-accept': OmarchyCase(0, OMARCHY_PREFIX + OMARCHY_SUFFIX + ('omarchy-system\treboot',),
         native_phase='complete', reboot_answer='y'),
-    'omarchy-reboot-failure': OmarchyCase(1, OMARCHY_PREFIX[:1] +
-        ('omarchy-update-confirm',) + OMARCHY_PREFIX[1:] + OMARCHY_SUFFIX + ('omarchy-system\treboot',),
+    'omarchy-reboot-failure': OmarchyCase(1, OMARCHY_PREFIX + OMARCHY_SUFFIX + ('omarchy-system\treboot',),
         scene='reboot-failure', native_phase='complete', reboot_answer='y'),
-    'omarchy-reboot-helper-missing': OmarchyCase(1, OMARCHY_PREFIX[:1] +
-        ('omarchy-update-confirm',) + OMARCHY_PREFIX[1:] + OMARCHY_SUFFIX,
+    'omarchy-reboot-helper-missing': OmarchyCase(1, OMARCHY_PREFIX + OMARCHY_SUFFIX,
         absent_helper='omarchy-system', native_phase='complete', reboot_answer='y'),
     'omarchy-authorization-refresh': OmarchyCase(0, OMARCHY_PREFIX + OMARCHY_SUFFIX,
         scene='authorization-hold', native_phase='complete', authorization='refresh'),
@@ -1301,15 +1297,11 @@ OMARCHY_CASES = {
         scene='cancellation-hold', native_phase='cache-pruned', control='output-closed'),
     'omarchy-terminal-closed': OmarchyCase(1, OMARCHY_PREFIX + ('omarchy-update-stay-awake\tstop',),
         scene='cancellation-hold', native_phase='cache-pruned', control='terminal-closed'),
-    'omarchy-preflight-failure': OmarchyCase(1, OMARCHY_PREFIX[:1],
-        scene='preflight-failure', failure_command='omarchy-update-requires-free-space'),
-    'omarchy-confirmation-failure': OmarchyCase(1, OMARCHY_PREFIX[:1] + ('omarchy-update-confirm',),
-        scene='confirmation-failure', failure_command='omarchy-update-confirm', failure_status=2),
     'omarchy-development-failure': OmarchyCase(1, OMARCHY_PREFIX + ('omarchy-update-stay-awake\tstop',),
         scene='development-failure', native_phase='cache-pruned', failure_command='omarchy-update-dev'),
-    'omarchy-dev-config-unreadable': OmarchyCase(1, OMARCHY_PREFIX[:3] + ('omarchy-update-stay-awake\tstop',),
+    'omarchy-dev-config-unreadable': OmarchyCase(1, OMARCHY_PREFIX[:2] + ('omarchy-update-stay-awake\tstop',),
         scene='unreadable-config', native_phase='cache-pruned'),
-    'omarchy-inhibitor-start-failure': OmarchyCase(1, OMARCHY_PREFIX[:3] + ('omarchy-update-stay-awake\tstop',),
+    'omarchy-inhibitor-start-failure': OmarchyCase(1, OMARCHY_PREFIX[:2] + ('omarchy-update-stay-awake\tstop',),
         scene='inhibitor-start-failure', native_phase='cache-pruned', failure_command='omarchy-update-stay-awake'),
     'omarchy-inhibitor-stop-failure': OmarchyCase(1, OMARCHY_PREFIX + OMARCHY_SUFFIX + ('omarchy-update-stay-awake\tstop',),
         scene='inhibitor-stop-failure', native_phase='complete', failure_command='omarchy-update-stay-awake'),
@@ -1426,8 +1418,6 @@ fi
 { printf '%s' "$name"; if test "$#" -gt 0; then printf '\t%s' "$@"; fi; printf '\n'; } >> "$OMARCHY_HELPER_TRACE"
 case "$name:${OMARCHY_FIXTURE_SCENE:-none}:${1:-}" in
   omarchy-hw-aarch64-qualcomm:migration-hardware-unmatched:*) exit 1 ;;
-  omarchy-update-requires-free-space:preflight-failure:*) exit 7 ;;
-  omarchy-update-confirm:confirmation-failure:*) exit 2 ;;
   omarchy-update-dev:development-failure:*) exit 7 ;;
   omarchy-update-stay-awake:inhibitor-start-failure:start) exit 7 ;;
   omarchy-update-stay-awake:inhibitor-stop-failure:stop) exit 7 ;;
@@ -1459,9 +1449,8 @@ case "$name:${OMARCHY_FIXTURE_SCENE:-none}" in
     ;;
 esac
 case "$name" in
-  omarchy-update-pkg-prune|omarchy-update-keyring|omarchy-update-system-pkgs|omarchy-update-orphan-pkgs|pacman|pacman-key|paccache|yay|aura|paru)
+  omarchy-update-requires-free-space|omarchy-update-confirm|omarchy-update-pkg-prune|omarchy-update-keyring|omarchy-update-system-pkgs|omarchy-update-orphan-pkgs|pacman|pacman-key|paccache|yay|aura|paru)
     printf 'external package helper must never run in the native fixture\n' >&2; exit 99 ;;
-  omarchy-update-confirm) test "$OMARCHY_FIXTURE_CASE" != omarchy-declined ;;
   omarchy-snapshot|omarchy-update-mise) test "$OMARCHY_FIXTURE_CASE" != omarchy-optional-failures ;;
   *) exit 0 ;;
 esac
@@ -1563,7 +1552,7 @@ set -euo pipefail
 printf 'foreign helper executed: %s\n' "$0" >> "$OMARCHY_HELPER_TRACE.unexpected"
 OMG_FOREIGN_OMARCHY_STAGE_PREFIX
 install -d -m 755 "$fixture/foreign" "$fixture/foreign/bin" "$fixture/saved"
-for name in omarchy-snapshot omarchy-restart-shell omarchy-update-mise omarchy-update-confirm; do
+for name in omarchy-snapshot omarchy-restart-shell omarchy-update-mise; do
   cat "$fixture/foreign-stage-prefix" > "$fixture/foreign/bin/$name"
   tail -n +2 "$fixture/stage" >> "$fixture/foreign/bin/$name"
   chmod 755 "$fixture/foreign/bin/$name"
@@ -1579,6 +1568,7 @@ child, terminal = pty.fork()
 if child == 0:
     os.execv('/omg-extra-bin/cli', ['/omg-extra-bin/cli', 'update'])
 status = None
+confirmed = False
 responded = False
 output = bytearray()
 review_answers = runpy.run_path('/attend-unknown-fixture.py')['review_answers']
@@ -1605,6 +1595,9 @@ try:
                 for review_answer in answers:
                     os.write(terminal, review_answer)
                     unknown_reviews.append(review_answer[7:-1].decode('ascii'))
+                if not confirmed and b'Start system update?' in output:
+                    os.write(terminal, b'y\n')
+                    confirmed = True
                 if not responded and b'Reboot now?' in output:
                     fcntl.ioctl(terminal, termios.TIOCSWINSZ, struct.pack('HHHH', 32, 100, 0, 0))
                     os.kill(child, signal.SIGWINCH)
@@ -1810,13 +1803,13 @@ OMG_NATIVE_MIGRATION_1794774234
   args=(--yes)
   extra=()
   case "$stage" in
-    omarchy-declined|omarchy-confirmation-failure) args=() ;;
+    omarchy-declined) args=() ;;
     omarchy-unsupported-mode) args=(--fast) ;;
     omarchy-unsupported-turbo-mode) args=(--turbo) ;;
     omarchy-invalid-transport) extra=(OMG_OMARCHY_LOCK_FD=999999) ;;
   esac
   if test "$stage" = omarchy-optional-failures; then
-    for name in omarchy-snapshot omarchy-restart-shell omarchy-update-mise omarchy-update-confirm; do
+    for name in omarchy-snapshot omarchy-restart-shell omarchy-update-mise; do
       test -f "/usr/bin/$name" && test ! -L "/usr/bin/$name"
       if mountpoint -q "/usr/bin/$name"; then
         printf 'Refusing mounted optional fixture helper: %s\n' "$name" >&2
@@ -1958,6 +1951,7 @@ OMARCHY_CASE_SETUP
     OMG_PACMAN_CONF="$case_dir/pacman.conf" OMG_PACMAN_DB_DIR="$signed_owner/db" \
     "${omarchy_environment[@]}" OMARCHY_MIGRATION_STATE="$case_dir/migrations" \
     OMARCHY_FIXTURE_CASE="$stage" OMARCHY_FIXTURE_SCENE="$scene" OMARCHY_HELPER_TRACE="$case_dir/helpers.tsv" \
+    OMARCHY_UPDATE_FORCE=1 \
     LLVM_PROFILE_FILE="/profiles/omg-extra-$stage-%p-%m.profraw" "${extra[@]}" \
     "${launch[@]}" < /dev/null > "/evidence/cli/$stage.log" 2>&1 || result=$?
   case "$scene" in
@@ -2051,7 +2045,7 @@ OMG_AUTHORIZATION_RECEIPT
       > "/evidence/cli/$stage-migrations.txt"
   fi
   if test "$stage" = omarchy-optional-failures; then
-    for name in omarchy-snapshot omarchy-restart-shell omarchy-update-mise omarchy-update-confirm; do
+    for name in omarchy-snapshot omarchy-restart-shell omarchy-update-mise; do
       test -L "/usr/bin/$name"
       test "$(readlink -e "/usr/bin/$name")" = "$fixture/foreign/bin/$name"
       rm -- "/usr/bin/$name"

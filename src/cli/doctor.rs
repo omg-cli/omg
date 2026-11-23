@@ -1072,6 +1072,18 @@ enum EndpointProbe {
 }
 
 impl EndpointProbe {
+    const fn is_transient(&self) -> bool {
+        match self {
+            Self::DeadlineExceeded(_)
+            | Self::RequestTimeout
+            | Self::HttpStatus(500..=599 | 408 | 429) => true,
+            Self::Healthy
+            | Self::HttpStatus(_)
+            | Self::ConnectFailure(_)
+            | Self::RequestFailure(_) => false,
+        }
+    }
+
     fn diagnostic(&self) -> String {
         match self {
             Self::Healthy => "healthy".to_owned(),
@@ -1132,6 +1144,30 @@ async fn check_internet(
 }
 
 async fn probe_connectivity(
+    client: &reqwest::Client,
+    endpoints: [(&'static str, &str); 2],
+    deadline: Duration,
+) -> std::result::Result<&'static str, [(&'static str, EndpointProbe); 2]> {
+    probe_connectivity_with_retry(client, endpoints, deadline, Duration::from_millis(250)).await
+}
+
+async fn probe_connectivity_with_retry(
+    client: &reqwest::Client,
+    endpoints: [(&'static str, &str); 2],
+    deadline: Duration,
+    backoff: Duration,
+) -> std::result::Result<&'static str, [(&'static str, EndpointProbe); 2]> {
+    match probe_connectivity_once(client, endpoints, deadline).await {
+        Ok(name) => Ok(name),
+        Err(failures) if failures.iter().any(|(_, probe)| probe.is_transient()) => {
+            tokio::time::sleep(backoff).await;
+            probe_connectivity_once(client, endpoints, deadline).await
+        }
+        Err(failures) => Err(failures),
+    }
+}
+
+async fn probe_connectivity_once(
     client: &reqwest::Client,
     [(first_name, first_url), (second_name, second_url)]: [(&'static str, &str); 2],
     deadline: Duration,
@@ -2059,7 +2095,7 @@ mod tests {
         let (first_url, first_server) = serve_probe_response(ERROR, Duration::ZERO).await;
         let (second_url, second_server) = serve_probe_response(ERROR, Duration::ZERO).await;
         assert_eq!(
-            probe_connectivity(
+            probe_connectivity_once(
                 &client,
                 [("primary", &first_url), ("alternate", &second_url)],
                 Duration::from_secs(1)
@@ -2092,7 +2128,7 @@ mod tests {
             let (alternate_url, alternate_server) =
                 serve_probe_response(ALTERNATE, alternate_delay).await;
             assert_eq!(
-                probe_connectivity(
+                probe_connectivity_once(
                     &client,
                     [("primary", &primary_url), ("alternate", &alternate_url)],
                     Duration::from_secs(1)
@@ -2106,6 +2142,134 @@ mod tests {
             finish_probe_server(primary_server).await;
             finish_probe_server(alternate_server).await;
         }
+    }
+
+    #[tokio::test]
+    async fn basic_connectivity_retries_once_after_transient_outage() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("local probe client");
+        let primary_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind primary");
+        let primary_url = format!("http://{}", primary_listener.local_addr().unwrap());
+        let primary_server = tokio::spawn(async move {
+            for response in [
+                &b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"[..],
+                &b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"[..],
+            ] {
+                let (mut stream, _) = primary_listener.accept().await.unwrap();
+                let mut buf = [0u8; 512];
+                let _ = stream.read(&mut buf).await;
+                stream.write_all(response).await.unwrap();
+                let _ = stream.shutdown().await;
+            }
+        });
+        let alternate_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind alternate");
+        let alternate_url = format!("http://{}", alternate_listener.local_addr().unwrap());
+        let alternate_server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut stream, _) = alternate_listener.accept().await.unwrap();
+                let mut buf = [0u8; 512];
+                let _ = stream.read(&mut buf).await;
+                stream
+                    .write_all(
+                        b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .await
+                    .unwrap();
+                let _ = stream.shutdown().await;
+            }
+        });
+        assert_eq!(
+            probe_connectivity_with_retry(
+                &client,
+                [("primary", &primary_url), ("alternate", &alternate_url)],
+                Duration::from_secs(1),
+                Duration::from_millis(10),
+            )
+            .await,
+            Ok("primary")
+        );
+        primary_server.await.unwrap();
+        alternate_server.abort();
+    }
+
+    #[test]
+    fn endpoint_probe_classifies_transient_and_terminal_failures() {
+        assert!(EndpointProbe::DeadlineExceeded(Duration::from_secs(1)).is_transient());
+        assert!(EndpointProbe::RequestTimeout.is_transient());
+        assert!(EndpointProbe::HttpStatus(503).is_transient());
+        assert!(EndpointProbe::HttpStatus(408).is_transient());
+        assert!(EndpointProbe::HttpStatus(429).is_transient());
+        assert!(!EndpointProbe::Healthy.is_transient());
+        assert!(!EndpointProbe::HttpStatus(404).is_transient());
+        assert!(!EndpointProbe::ConnectFailure("refused".to_owned()).is_transient());
+        assert!(!EndpointProbe::RequestFailure("reset".to_owned()).is_transient());
+    }
+
+    #[tokio::test]
+    async fn basic_connectivity_handles_immediate_success_and_non_transient_failure() {
+        const OK: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        const NOT_FOUND: &[u8] =
+            b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("local probe client");
+
+        let (ok_primary_url, ok_primary_server) = serve_probe_response(OK, Duration::ZERO).await;
+        let (ok_alt_url, ok_alt_server) = serve_probe_response(OK, Duration::from_secs(1)).await;
+        assert_eq!(
+            probe_connectivity_with_retry(
+                &client,
+                [("primary", &ok_primary_url), ("alternate", &ok_alt_url)],
+                Duration::from_secs(1),
+                Duration::from_millis(10),
+            )
+            .await,
+            Ok("primary")
+        );
+        finish_probe_server(ok_primary_server).await;
+        ok_alt_server.abort();
+
+        let (nf_primary_url, nf_primary_server) =
+            serve_probe_response(NOT_FOUND, Duration::ZERO).await;
+        let (nf_alt_url, nf_alt_server) = serve_probe_response(NOT_FOUND, Duration::ZERO).await;
+        assert_eq!(
+            probe_connectivity_with_retry(
+                &client,
+                [("primary", &nf_primary_url), ("alternate", &nf_alt_url)],
+                Duration::from_secs(1),
+                Duration::from_millis(10),
+            )
+            .await,
+            Err([
+                ("primary", EndpointProbe::HttpStatus(404)),
+                ("alternate", EndpointProbe::HttpStatus(404)),
+            ])
+        );
+        finish_probe_server(nf_primary_server).await;
+        finish_probe_server(nf_alt_server).await;
+
+        let (ep1_url, ep1_server) = serve_probe_response(OK, Duration::ZERO).await;
+        let (ep2_url, ep2_server) = serve_probe_response(OK, Duration::from_secs(1)).await;
+        assert_eq!(
+            probe_connectivity(
+                &client,
+                [("primary", &ep1_url), ("alternate", &ep2_url)],
+                Duration::from_secs(1),
+            )
+            .await,
+            Ok("primary")
+        );
+        finish_probe_server(ep1_server).await;
+        ep2_server.abort();
     }
 
     #[tokio::test]

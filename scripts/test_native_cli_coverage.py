@@ -988,8 +988,6 @@ with socket.socket(socket.AF_UNIX) as server:
             for name, scene, arguments, expected in [
                     ('omarchy-snapshot', 'snapshot-unsupported', [], 127),
                     ('omarchy-system', 'reboot-failure', [], 7),
-                    ('omarchy-update-requires-free-space', 'preflight-failure', [], 7),
-                    ('omarchy-update-confirm', 'confirmation-failure', [], 2),
                     ('omarchy-update-dev', 'development-failure', [], 7),
                     ('omarchy-update-stay-awake', 'inhibitor-start-failure', ['start'], 7),
                     ('omarchy-update-stay-awake', 'inhibitor-stop-failure', ['stop'], 7)]:

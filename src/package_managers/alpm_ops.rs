@@ -598,7 +598,11 @@ pub(crate) fn execute_omarchy_transaction(
         NativeOmarchyOperation::RefreshKeyrings
         | NativeOmarchyOperation::InstallTrayMenuDependency
         | NativeOmarchyOperation::InstallOmnibookAudio
-        | NativeOmarchyOperation::InstallMediaViewer => TransactionKind::Install,
+        | NativeOmarchyOperation::InstallMediaViewer
+        | NativeOmarchyOperation::InstallFacetimeHd
+        | NativeOmarchyOperation::InstallPiCodingAgent
+        | NativeOmarchyOperation::InstallKmscon
+        | NativeOmarchyOperation::InstallPodmanAndCrun => TransactionKind::Install,
         NativeOmarchyOperation::UpgradeRepositories => TransactionKind::SystemUpgrade,
         NativeOmarchyOperation::RemoveOrphans
         | NativeOmarchyOperation::RemoveLegacyMediaViewers => {

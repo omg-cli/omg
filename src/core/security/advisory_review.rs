@@ -1,8 +1,10 @@
 //! Acknowledgement of disclosed advisory risk never changes its classification.
 
 use super::scan::{AdvisoryProvenance, FindingApplicability};
-use super::vulnerability::PackageAssessment;
+use super::vulnerability::{PackageAssessment, UnknownCoverage};
+use crate::package_managers::types::SecurityOrigin;
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
 pub(crate) struct AdvisoryRiskReview {
@@ -47,6 +49,8 @@ impl AdvisoryRiskReview {
             || String::from("\nSECURITY WARNING: advisory coverage for the selected transaction is unknown.\nNo clean security result was established. Accepting this gap does not mark these versions safe.\n"),
             |review| review.details.clone(),
         );
+        let mut displayed_sources = BTreeSet::new();
+        let mut standard_arch_untracked = false;
         for assessment in unknown {
             let package = &assessment.package;
             let identity = (
@@ -78,10 +82,27 @@ impl AdvisoryRiskReview {
             ))?);
             let _ = writeln!(
                 details,
-                "Package: {}\nCoverage: unknown ({:?})\nSource: {}",
+                "Package: {}\nCoverage: unknown ({:?})",
                 serde_json::to_string(&identity)?,
                 assessment.coverage.unknown_reason(),
-                serde_json::to_string(&assessment.coverage.provenance())?
+            );
+            let source_line = serde_json::to_string(&assessment.coverage.provenance())?;
+            if displayed_sources.insert(source_line.clone()) {
+                let _ = writeln!(details, "Source: {source_line}");
+            }
+            if let SecurityOrigin::OtherRepository { repository } = &package.origin
+                && matches!(repository.as_str(), "core" | "extra" | "multilib")
+                && assessment.coverage.unknown_reason() == Some(UnknownCoverage::SourceNotCovered)
+            {
+                standard_arch_untracked = true;
+            }
+        }
+        if standard_arch_untracked {
+            details.push_str(
+                "Hint: standard Arch repositories (core, extra, multilib) are not declared for advisory tracking.\n\
+                 To enable Arch Security Tracker coverage for them, add to ~/.config/omg/policy.toml:\n\
+                   advisory_requirement = \"optional\"\n\
+                   arch_advisory_repositories = [\"core\", \"extra\", \"multilib\"]\n",
             );
         }
         records.sort();
@@ -949,6 +970,67 @@ mod tests {
             .url
             .push_str("-changed");
         assert!(!accepted.matches(&AdvisoryRiskReview::new(&changed, "native-mixed")?.unwrap()));
+        Ok(())
+    }
+
+    #[test]
+    fn unknown_review_deduplicates_identical_provenance_sources() -> anyhow::Result<()> {
+        use super::super::vulnerability::PackageCoverage;
+        let provenance = AdvisoryProvenance::ArchSnapshot {
+            payload_sha256: "a".repeat(64),
+            fetched_at: "2026-11-23T00:05:24Z".parse()?,
+            checked_at: "2026-11-23T00:05:24Z".parse()?,
+        };
+        let mut first = package("pkg-one");
+        first.coverage = PackageCoverage::Unknown {
+            reason: UnknownCoverage::SourceNotCovered,
+            provenance: Some(provenance.clone()),
+        };
+        let mut second = package("pkg-two");
+        second.coverage = PackageCoverage::Unknown {
+            reason: UnknownCoverage::SourceNotCovered,
+            provenance: Some(provenance),
+        };
+        let review = AdvisoryRiskReview::new_with_unknown(&[first, second], "upgrade")?
+            .context("unknown coverage review")?;
+        assert_eq!(review.details().matches("Source: ").count(), 1);
+        assert_eq!(review.details().matches("Package: ").count(), 2);
+        assert_eq!(review.details().matches("Coverage: unknown").count(), 2);
+        assert!(review.details().contains("pkg-one"));
+        assert!(review.details().contains("pkg-two"));
+        Ok(())
+    }
+
+    #[test]
+    fn unknown_review_hints_policy_only_for_untracked_standard_arch_repos() -> anyhow::Result<()> {
+        use super::super::vulnerability::PackageCoverage;
+        let make = |repo: &str| -> PackageAssessment {
+            let mut assessment = package("pkg");
+            assessment.package.origin = SecurityOrigin::OtherRepository {
+                repository: repo.into(),
+            };
+            assessment.coverage = PackageCoverage::Unknown {
+                reason: UnknownCoverage::SourceNotCovered,
+                provenance: None,
+            };
+            assessment
+        };
+        for repo in ["core", "extra", "multilib"] {
+            let review = AdvisoryRiskReview::new_with_unknown(&[make(repo)], "upgrade")?
+                .context("untracked standard repo review")?;
+            let details = review.details();
+            assert!(
+                details.contains("arch_advisory_repositories"),
+                "expected policy hint for {repo}: {details}"
+            );
+        }
+        let omarchy = AdvisoryRiskReview::new_with_unknown(&[make("omarchy")], "upgrade")?
+            .context("untracked omarchy repo review")?;
+        let omarchy_details = omarchy.details();
+        assert!(
+            !omarchy_details.contains("arch_advisory_repositories"),
+            "did not expect standard Arch policy hint for omarchy: {omarchy_details}"
+        );
         Ok(())
     }
 }

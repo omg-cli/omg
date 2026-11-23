@@ -158,12 +158,21 @@ pub(crate) async fn fetch_public_download_fresh(
     let request =
         || fetch_public_download_with_options(raw, user_agent, total_timeout, None, false, true);
     match request().await {
-        // A transient timeout could invalidate a review already accepted by the user.
+        // A transient transport error or retryable HTTP status could invalidate
+        // an advisory review already accepted by the user.
         Err(error)
-            if error
-                .downcast_ref::<reqwest::Error>()
-                .is_some_and(reqwest::Error::is_timeout) =>
+            if error.chain().any(|source| {
+                source
+                    .downcast_ref::<reqwest::Error>()
+                    .is_some_and(is_retryable_error)
+            }) =>
         {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            request().await
+        }
+        Ok(response) if is_retryable_status(response.status()) => {
+            drop(response);
+            tokio::time::sleep(Duration::from_millis(100)).await;
             request().await
         }
         result => result,
@@ -379,10 +388,30 @@ pub fn is_retryable_status(status: reqwest::StatusCode) -> bool {
         || status == reqwest::StatusCode::TOO_MANY_REQUESTS
 }
 
+fn is_refused_http2_stream_message(message: &str) -> bool {
+    message.contains("refused stream before processing any application logic")
+        || message.contains("REFUSED_STREAM")
+}
+
+fn error_chain_has_refused_http2_stream(error: &(dyn std::error::Error + 'static)) -> bool {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(current) = source {
+        if is_refused_http2_stream_message(&current.to_string()) {
+            return true;
+        }
+        source = current.source();
+    }
+    false
+}
+
+fn is_refused_http2_stream(error: &reqwest::Error) -> bool {
+    error.is_request() && error_chain_has_refused_http2_stream(error)
+}
+
 /// Whether a request transport failure is safe to retry.
 #[must_use]
 pub fn is_retryable_error(error: &reqwest::Error) -> bool {
-    error.is_timeout() || error.is_connect() || error.is_body()
+    error.is_timeout() || error.is_connect() || error.is_body() || is_refused_http2_stream(error)
 }
 
 /// Render a remote URL without credentials, query parameters, or fragments.
@@ -611,6 +640,43 @@ mod tests {
         assert!(is_retryable_status(reqwest::StatusCode::REQUEST_TIMEOUT));
         assert!(is_retryable_status(reqwest::StatusCode::TOO_MANY_REQUESTS));
         assert!(!is_retryable_status(reqwest::StatusCode::NOT_FOUND));
+        assert!(is_refused_http2_stream_message(
+            "client error (SendRequest): http2 error: stream error received: refused stream before processing any application logic"
+        ));
+        assert!(is_refused_http2_stream_message(
+            "http2 error: REFUSED_STREAM"
+        ));
+        assert!(!is_refused_http2_stream_message("connection reset by peer"));
+
+        #[derive(Debug)]
+        struct TestError {
+            message: &'static str,
+            inner: Option<Box<dyn std::error::Error + 'static>>,
+        }
+        impl std::fmt::Display for TestError {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str(self.message)
+            }
+        }
+        impl std::error::Error for TestError {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                self.inner.as_deref()
+            }
+        }
+
+        let refused = TestError {
+            message: "client error (SendRequest)",
+            inner: Some(Box::new(TestError {
+                message: "http2 error: REFUSED_STREAM",
+                inner: None,
+            })),
+        };
+        assert!(error_chain_has_refused_http2_stream(&refused));
+        let reset = TestError {
+            message: "connection reset by peer",
+            inner: None,
+        };
+        assert!(!error_chain_has_refused_http2_stream(&reset));
     }
 
     #[test]
@@ -729,11 +795,11 @@ pub(crate) trait BoundedResponseExt {
     async fn bounded_text(self) -> anyhow::Result<String>;
 }
 
-/// Retry a metadata GET at most three times under one thirty-second budget.
+/// Retry a metadata GET at most three times under one forty-five-second budget.
 /// Each attempt includes the bounded body read; permanent errors retain their
 /// cause. Reuse the caller's client so trust and redirect policy stay intact.
 pub(crate) async fn fetch_metadata_text(client: &Client, url: &str) -> anyhow::Result<String> {
-    fetch_metadata_text_with_budget(client, url, Duration::from_secs(30)).await
+    fetch_metadata_text_with_budget(client, url, Duration::from_secs(45)).await
 }
 
 const DEFAULT_METADATA_BODY_LIMIT: usize = 16 * 1024 * 1024;
@@ -965,6 +1031,56 @@ mod metadata_limit_tests {
             assert_eq!(exhausted.finish().await?.len(), 2);
             Ok(())
         })
+    }
+
+    #[test]
+    fn fresh_public_download_retries_transient_503_once() -> anyhow::Result<()> {
+        const NAME: &str =
+            "core::http::metadata_limit_tests::fresh_public_download_retries_transient_503_once";
+        if crate::core::testing::run_isolated_test(NAME) {
+            return Ok(());
+        }
+        // SAFETY: this is a fresh single-test child with no concurrent environment users.
+        #[expect(unsafe_code, reason = "isolated single-test child process")]
+        unsafe {
+            std::env::set_var("OMG_TEST_MODE", "1");
+        }
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(async {
+                let success =
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec();
+                let unavailable =
+                    b"HTTP/1.1 503 Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        .to_vec();
+                let recovered_503 =
+                    RetryFixture::new(vec![unavailable.clone(), success], false).await?;
+                let fresh = fetch_public_download_fresh(
+                    &recovered_503.url,
+                    "omg-runtime-security-fixture",
+                    Some(Duration::from_secs(5)),
+                )
+                .await?;
+                assert_eq!(fresh.text().await?, "ok");
+                assert_eq!(
+                    recovered_503.finish().await?.len(),
+                    2,
+                    "fresh advisory reads recover from one transient 503"
+                );
+
+                let persistent_503 =
+                    RetryFixture::new(vec![unavailable.clone(), unavailable], false).await?;
+                let response = fetch_public_download_fresh(
+                    &persistent_503.url,
+                    "omg-runtime-security-fixture",
+                    Some(Duration::from_secs(5)),
+                )
+                .await?;
+                assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+                assert_eq!(persistent_503.finish().await?.len(), 2);
+                Ok(())
+            })
     }
 
     #[tokio::test]

@@ -387,6 +387,30 @@ class OutputContracts(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, r'exit=4.*runtime catalog request timed out'):
             oracle['run_denial'](command, 'node', '24.21.0', time.monotonic() + 5)
 
+    def test_runtime_consent_mirrors_nonzero_pty_error_to_stderr(self):
+        digest = '9' * 64
+        script = (
+            "import sys\n"
+            "print('SECURITY WARNING: advisory coverage for the selected transaction is unknown.')\n"
+            "print('Package: [\"python\",\"3.12.14\"]')\n"
+            "print('Coverage: unknown (EvidenceUnavailable)')\n"
+            "print('https://omg-advisories.latham.workers.dev/v1/runtimes/python')\n"
+            f"sys.stdout.write('Type accept {digest} within 60 seconds to continue (default: cancel): ')\n"
+            "sys.stdout.flush()\n"
+            "sys.stdin.readline()\n"
+            "sys.stderr.write('Error: Runtime advisory evidence kept changing during review; try again\\n')\n"
+            "sys.exit(1)\n"
+        )
+        result = subprocess.run(
+            [sys.executable, str(ROOT / 'scripts/qemu-runtime-advisory-oracle.py'),
+             '--runtime', 'python', '--version', '3.12.14', '--accept-only', '--timeout', '10',
+             '--', sys.executable, '-c', script],
+            capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('Runtime advisory evidence kept changing during review; try again', result.stderr)
+        self.assertIn('OMG_QEMU_RUNTIME_CONSENT=', result.stdout)
+
     def test_update_output_accepts_terminal_gradient_without_losing_required_evidence(self):
         for mode, header, phase in [('fast', 'Fast System Update', 'Synced in 0.09s'),
                                      ('turbo', 'TURBO System Update', 'cached, no sync')]:

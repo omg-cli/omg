@@ -19278,6 +19278,76 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
             "deleted_mapped": deleted_mapped, "deleted_mapped_hit": deleted_hit, **paint_receipt}
 
 
+def _diff_changed_lines(repo, base_sha, head_sha):
+    for commit in (base_sha, head_sha):
+        if not re.fullmatch(r"[0-9a-f]{40}", commit or "") or commit == "0" * 40:
+            raise ValueError("Exact source commit required")
+    diff = subprocess.run(
+        ["git", "-c", "core.quotepath=false", "-C", str(repo), "diff",
+         "--no-renames", "-U0", base_sha, head_sha, "--", "*.rs"],
+        check=True, capture_output=True, text=True, timeout=60,
+    ).stdout
+    changed = {}
+    current = None
+    hunk_re = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
+    for line in diff.splitlines():
+        if line.startswith("+++ "):
+            target = line[4:]
+            current = target[2:] if target.startswith("b/") else None
+            continue
+        if current is None:
+            continue
+        match = hunk_re.match(line)
+        if not match:
+            continue
+        start = int(match.group(1))
+        count = 1 if match.group(2) is None else int(match.group(2))
+        if count > 0:
+            changed.setdefault(current, set()).update(range(start, start + count))
+    return changed
+
+
+def require_diff_coverage(base, head, repo, base_sha, head_sha):
+    require_no_regression(base, head)
+    changed = _diff_changed_lines(repo, base_sha, head_sha)
+    listing = subprocess.run(
+        ["git", "-C", str(repo), "ls-tree", "-r", "--name-only", "-z", head_sha],
+        check=True, capture_output=True, timeout=30,
+    )
+    if not listing.stdout.endswith(b"\0"):
+        raise ValueError("Incomplete source path listing")
+    head_paths = {raw.decode("utf-8") for raw in listing.stdout.split(b"\0")[:-1]
+                  if raw.decode("utf-8").endswith(".rs")}
+    head_by_rel = {}
+    for filename, section in (head.sections or {}).items():
+        rel = canonical_source(filename, head_paths)
+        if rel in head_by_rel:
+            raise ValueError(f"Duplicate canonical coverage source: {rel}")
+        head_by_rel[rel] = section["counts"]
+    checked_files = 0
+    checked_lines = 0
+    uncovered = []
+    for path in sorted(changed):
+        counts = head_by_rel.get(path)
+        if counts is None:
+            continue
+        checked_files += 1
+        for line in sorted(changed[path]):
+            if line in counts:
+                checked_lines += 1
+                if counts[line] == 0:
+                    uncovered.append(f"{path}:{line}")
+    if uncovered:
+        sample = ", ".join(uncovered[:25])
+        suffix = f" (+{len(uncovered) - 25} more)" if len(uncovered) > 25 else ""
+        raise ValueError(f"New uncovered instrumented lines ({len(uncovered)}): {sample}{suffix}")
+    return {
+        "mode": "diff-coverage",
+        "checked_files": checked_files,
+        "checked_changed_instrumented_lines": checked_lines,
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base", required=True, type=Path)
@@ -19287,6 +19357,7 @@ def main():
     parser.add_argument("--source-repo", type=Path)
     parser.add_argument("--base-sha")
     parser.add_argument("--head-sha")
+    parser.add_argument("--diff-coverage", action="store_true")
     parser.add_argument('--diagnostic-output', type=Path)
     parser.add_argument('--diagnostic-file', action='append', default=[])
     args = parser.parse_args()
@@ -19294,6 +19365,13 @@ def main():
     head = read_coverage(args.head, "head")
     print(json.dumps({"base": {k: v for k, v in vars(base).items() if k != "sections"},
                       "head": {k: v for k, v in vars(head).items() if k != "sections"}}, sort_keys=True))
+    if args.diff_coverage:
+        if not all((args.source_repo, args.base_sha, args.head_sha)):
+            raise ValueError("Diff coverage requires --source-repo, --base-sha, and --head-sha")
+        receipt = require_diff_coverage(base, head, args.source_repo, args.base_sha, args.head_sha)
+        print(json.dumps(receipt, sort_keys=True))
+        print("PASS: complete line coverage meets the exact base report")
+        return
     evidence = (args.base_regions, args.head_regions, args.source_repo, args.base_sha, args.head_sha)
     if bool(args.diagnostic_output) != bool(args.diagnostic_file):
         parser.error('Diagnostic output and source file selections are required together')

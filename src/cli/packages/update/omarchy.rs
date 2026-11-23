@@ -18,6 +18,7 @@ use crate::package_managers::arch::NativeOmarchyOperation;
 const LOG_PATH: &str = "/tmp/omarchy-update.log";
 const LOCK_FD: &str = "OMG_OMARCHY_LOCK_FD";
 const LOG_FD: &str = "OMG_OMARCHY_LOG_FD";
+const ATTENDED_ENV: &str = "OMG_OMARCHY_ATTENDED";
 const AUTHORIZATION_INTERVAL: Duration = Duration::from_mins(1);
 const TERMINATION_GRACE: Duration = Duration::from_secs(10);
 const DEVELOPMENT_UPDATE_DEADLINE: Duration = Duration::from_mins(2);
@@ -25,6 +26,7 @@ const MAX_MIGRATIONS: usize = 4096;
 const MAX_MIGRATION_BYTES: u64 = 1024 * 1024;
 const OMARCHY_DEV_CONFIG: &str = "/etc/omarchy.conf";
 const MAX_DEV_CONFIG_BYTES: u64 = 4096;
+const MIN_UPDATE_FREE_BYTES: u128 = 10 * 1024 * 1024 * 1024;
 const INCOMPLETE_UPDATE_SCOPE: &str = "Omarchy requires its complete update lifecycle; --fast, --turbo and mutating --no-sync cannot preserve that scope. Use omg update, or --check/--dry-run/--aur-only for a scoped operation.";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -214,8 +216,6 @@ async fn workflow(executor: &mut impl StageExecutor, yes: bool) -> Result<()> {
 
 fn stage_command(stage: Stage) -> Option<(&'static str, &'static [&'static str])> {
     Some(match stage {
-        Stage::Preflight => ("omarchy-update-requires-free-space", &[]),
-        Stage::Confirm => ("omarchy-update-confirm", &[]),
         Stage::Authorize => ("sudo", &["true"]),
         Stage::Snapshot => ("omarchy-snapshot", &["create"]),
         Stage::InhibitSleep => ("omarchy-update-stay-awake", &["start"]),
@@ -230,12 +230,82 @@ fn stage_command(stage: Stage) -> Option<(&'static str, &'static [&'static str])
         Stage::Mise => ("omarchy-update-mise", &[]),
         Stage::VerifyBoot => ("omarchy-update-boot", &[]),
         Stage::ReleaseInhibitor => ("omarchy-update-stay-awake", &["stop"]),
+        #[expect(
+            clippy::match_same_arms,
+            reason = "keep native preflight/confirm distinct from package stages"
+        )]
+        Stage::Preflight | Stage::Confirm => return None,
         Stage::NativePackage(_)
         | Stage::MigrationPreflight
         | Stage::NativeAur
         | Stage::ReleaseAuthorization
         | Stage::RebootPrompt => return None,
     })
+}
+
+fn check_free_space_bytes(available_bytes: u128, force: bool) -> Result<()> {
+    if force || available_bytes >= MIN_UPDATE_FREE_BYTES {
+        return Ok(());
+    }
+    let available_gib = available_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+    anyhow::bail!(
+        "At least 10 GiB of free space is required on / before updating ({available_gib:.2} GiB available). Free up space or set OMARCHY_UPDATE_FORCE=1 to bypass this check."
+    );
+}
+
+const fn statvfs_unit_size(fragment_size: u64, block_size: u64) -> u64 {
+    if fragment_size > 0 {
+        fragment_size
+    } else {
+        block_size
+    }
+}
+
+fn native_preflight_free_space() -> Result<()> {
+    if std::env::var("OMARCHY_UPDATE_FORCE").as_deref() == Ok("1") {
+        return Ok(());
+    }
+    let stat =
+        nix::sys::statvfs::statvfs("/").context("Failed to check available disk space on /")?;
+    let unit = statvfs_unit_size(stat.fragment_size(), stat.block_size());
+    let available = u128::from(stat.blocks_available()) * u128::from(unit);
+    check_free_space_bytes(available, false)
+}
+
+fn coordinator_attended_from(value: Option<&std::ffi::OsStr>, fallback: bool) -> bool {
+    match value.and_then(|value| value.to_str()) {
+        Some("1") => true,
+        Some("0") => false,
+        _ => fallback,
+    }
+}
+
+fn confirm_outcome(accepted: bool) -> Outcome {
+    if accepted {
+        Outcome::Success
+    } else {
+        println!("Update cancelled.");
+        Outcome::Declined
+    }
+}
+
+fn native_confirm_update(attended: bool) -> Result<Outcome> {
+    println!("Ready to update?");
+    println!("  • You cannot stop the update once you start!");
+    println!("  • Make sure you're connected to power or have a full battery");
+    println!("  What's new: https://github.com/omacom/omarchy/releases/latest\n");
+    if !attended {
+        println!(
+            "Update cancelled (non-interactive terminal; pass -y to proceed without confirmation)."
+        );
+        return Ok(Outcome::Declined);
+    }
+    let _quiesce = crate::cli::modern_ui::quiesce_terminal();
+    let accepted = dialoguer::Confirm::with_theme(&crate::cli::ui::prompt_theme())
+        .with_prompt("Start system update?")
+        .default(true)
+        .interact()?;
+    Ok(confirm_outcome(accepted))
 }
 
 #[derive(Clone, Debug)]
@@ -352,7 +422,6 @@ impl OmarchyRuntime {
 
     fn validate_available_helpers(&self) -> Result<()> {
         for stage in [
-            Stage::Preflight,
             Stage::InhibitSleep,
             Stage::DevelopmentCheckout,
             Stage::MigrationsPending,
@@ -438,6 +507,7 @@ impl OmarchyRuntime {
 
 struct Commands {
     yes: bool,
+    attended: bool,
     runtime: OmarchyRuntime,
     authorization: Option<tokio::task::JoinHandle<()>>,
     inhibitor_attempted: bool,
@@ -445,6 +515,8 @@ struct Commands {
     foreground: Option<nix::unistd::Pid>,
     #[cfg(test)]
     native_fixture: Option<NativeMigrationFixture>,
+    #[cfg(test)]
+    migration_overrides: Option<MigrationTestOverrides>,
 }
 
 #[cfg(test)]
@@ -452,6 +524,15 @@ struct NativeMigrationFixture {
     operations: Vec<NativeOmarchyOperation>,
     failure: Option<NativeOmarchyOperation>,
     desktop_database_program: &'static str,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct MigrationTestOverrides {
+    helper_overrides: std::collections::BTreeMap<&'static str, PathBuf>,
+    absent_optional_helpers: std::collections::BTreeSet<&'static str>,
+    installed_packages: Option<std::collections::BTreeSet<&'static str>>,
+    sudo_program: Option<PathBuf>,
 }
 
 fn foreground_group() -> Result<Option<nix::unistd::Pid>> {
@@ -481,11 +562,14 @@ impl Commands {
     const fn new(yes: bool, runtime: OmarchyRuntime) -> Self {
         Self {
             yes,
+            attended: false,
             runtime,
             authorization: None,
             inhibitor_attempted: false,
             active: None,
             foreground: None,
+            #[cfg(test)]
+            migration_overrides: None,
             #[cfg(test)]
             native_fixture: None,
         }
@@ -494,6 +578,11 @@ impl Commands {
     async fn run_program(&mut self, program: &Path, args: &[&str]) -> Result<ExitStatus> {
         self.run_program_at(program, args, self.runtime.root.clone())
             .await
+    }
+
+    const fn with_attended(mut self, attended: bool) -> Self {
+        self.attended = attended;
+        self
     }
 
     async fn run_development_checkout(
@@ -518,13 +607,12 @@ impl Commands {
         result
     }
 
-    async fn run_program_at(
-        &mut self,
+    fn build_program_command(
+        &self,
         program: &Path,
         args: &[&str],
-        omarchy_root: PathBuf,
-    ) -> Result<ExitStatus> {
-        anyhow::ensure!(self.active.is_none(), "An Omarchy stage is already running");
+        omarchy_root: &Path,
+    ) -> Result<Command> {
         let path = std::env::join_paths(
             std::iter::once(self.runtime.root.join("bin"))
                 .chain(std::env::split_paths(crate::core::privilege::SYSTEM_PATH)),
@@ -534,24 +622,133 @@ impl Commands {
         command
             .args(args)
             .kill_on_drop(true)
-            .process_group(0)
             .env("PATH", path)
             .env_remove("BASH_ENV")
             .env_remove("ENV")
             .env("OMARCHY_PATH", omarchy_root)
-            .env("OMARCHY_MIGRATION_STATE", &self.runtime.migration_state);
-        command.env_remove(LOCK_FD).env_remove(LOG_FD);
+            .env("OMARCHY_MIGRATION_STATE", &self.runtime.migration_state)
+            .env_remove(LOCK_FD)
+            .env_remove(LOG_FD)
+            .env_remove(ATTENDED_ENV);
         if self.yes {
             command.env("OMARCHY_UPDATE_UNATTENDED", "1");
         }
+        Ok(command)
+    }
+
+    async fn run_program_at(
+        &mut self,
+        program: &Path,
+        args: &[&str],
+        omarchy_root: PathBuf,
+    ) -> Result<ExitStatus> {
+        anyhow::ensure!(self.active.is_none(), "An Omarchy stage is already running");
+        let mut command = self.build_program_command(program, args, &omarchy_root)?;
+        command.process_group(0);
         self.run_command(command, &program.display().to_string())
             .await
+    }
+
+    async fn capture_program_stdout(
+        &self,
+        program: &Path,
+        args: &[&str],
+    ) -> Result<std::process::Output> {
+        let mut command = self.build_program_command(program, args, &self.runtime.root)?;
+        command
+            .output()
+            .await
+            .with_context(|| format!("Failed to run {}", program.display()))
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(
+            clippy::unused_self,
+            reason = "uses self.migration_overrides in unit tests"
+        )
+    )]
+    fn sudo_command(&self) -> Result<Command> {
+        #[cfg(test)]
+        if let Some(program) = self
+            .migration_overrides
+            .as_ref()
+            .and_then(|overrides| overrides.sudo_program.as_ref())
+        {
+            return Ok(Command::new(program));
+        }
+        crate::core::privilege::sudo_command()
+    }
+
+    fn resolve_migration_helper(&self, name: &str) -> Result<PathBuf> {
+        #[cfg(test)]
+        if let Some(path) = self
+            .migration_overrides
+            .as_ref()
+            .and_then(|overrides| overrides.helper_overrides.get(name))
+        {
+            return Ok(path.clone());
+        }
+        let helper = crate::core::privilege::root_controlled_program_path(name)?;
+        self.runtime.check_helper_layout(name, &helper)?;
+        Ok(helper)
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(
+            clippy::unused_self,
+            reason = "uses self.migration_overrides in unit tests"
+        )
+    )]
+    fn resolve_optional_helper(&self, name: &str) -> Option<PathBuf> {
+        #[cfg(test)]
+        if let Some(overrides) = self.migration_overrides.as_ref() {
+            if overrides.absent_optional_helpers.contains(name) {
+                return None;
+            }
+            if let Some(path) = overrides.helper_overrides.get(name) {
+                return Some(path.clone());
+            }
+        }
+        crate::core::privilege::root_controlled_program_path(name).ok()
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(
+            clippy::unused_self,
+            reason = "uses self.migration_overrides in unit tests"
+        )
+    )]
+    fn is_package_installed(&self, name: &str) -> Result<bool> {
+        #[cfg(test)]
+        if let Some(packages) = self
+            .migration_overrides
+            .as_ref()
+            .and_then(|overrides| overrides.installed_packages.as_ref())
+        {
+            return Ok(packages.contains(name));
+        }
+        crate::package_managers::is_installed_fast(name)
+    }
+
+    async fn run_sudo(&mut self, args: &[&str], error_context: &str) -> Result<()> {
+        let mut command = self.sudo_command()?;
+        command.args(args);
+        let label = format!("sudo {}", args.join(" "));
+        let status = self.run_command(command, &label).await?;
+        anyhow::ensure!(status.success(), "{error_context}: {status}");
+        Ok(())
     }
 
     async fn run_command(&mut self, mut command: Command, label: &str) -> Result<ExitStatus> {
         anyhow::ensure!(self.active.is_none(), "An Omarchy stage is already running");
         command.kill_on_drop(true).process_group(0);
-        command.env_remove(LOCK_FD).env_remove(LOG_FD);
+        command
+            .env_remove(LOCK_FD)
+            .env_remove(LOG_FD)
+            .env_remove(ATTENDED_ENV);
         self.start(&mut command)
             .await
             .with_context(|| format!("Failed to start Omarchy stage {label}"))?;
@@ -724,13 +921,18 @@ impl Commands {
 impl StageExecutor for Commands {
     async fn execute(&mut self, stage: Stage) -> Result<Outcome> {
         match stage {
+            Stage::Preflight => {
+                native_preflight_free_space()?;
+                return Ok(Outcome::Success);
+            }
+            Stage::Confirm => return native_confirm_update(self.attended),
             Stage::NativePackage(operation) => {
                 self.run_native_package(operation).await?;
                 return Ok(Outcome::Success);
             }
             Stage::RebootPrompt => {
                 if let Some(reason) = native_reboot_reason()? {
-                    if self.yes || !console::user_attended() {
+                    if self.yes || !self.attended {
                         println!("{reason} Run omarchy-system reboot when ready.");
                     } else {
                         let _quiesce = crate::cli::modern_ui::quiesce_terminal();
@@ -839,14 +1041,18 @@ impl StageExecutor for Commands {
             }
             return Ok(Outcome::Success);
         }
-        if matches!(stage, Stage::Confirm | Stage::MigrationsPending) && status.code() == Some(1) {
-            return Ok(Outcome::Declined);
-        }
-        if stage == Stage::Snapshot && status.code() == Some(127) {
-            return Ok(Outcome::Unavailable);
-        }
-        anyhow::bail!("Omarchy stage {program} did not complete: {status}")
+        stage_exit_outcome(stage, status, program)
     }
+}
+
+fn stage_exit_outcome(stage: Stage, status: ExitStatus, program: &str) -> Result<Outcome> {
+    if stage == Stage::MigrationsPending && status.code() == Some(1) {
+        return Ok(Outcome::Declined);
+    }
+    if stage == Stage::Snapshot && status.code() == Some(127) {
+        return Ok(Outcome::Unavailable);
+    }
+    anyhow::bail!("Omarchy stage {program} did not complete: {status}")
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -855,6 +1061,10 @@ enum NativeMigration {
     OmnibookAudio,
     MediaViewer,
     SkipQualcommHardware,
+    FacetimeHdCamera,
+    PiCodingAgent,
+    Kmscon,
+    PodmanAndCrun,
 }
 
 #[derive(Debug)]
@@ -941,21 +1151,47 @@ fn pending_migrations(migrations: &Path, state: &Path) -> Result<Vec<PendingMigr
                 "2e4a9686547c5615eceb9c23cb3b079df491d000078da10b7d995ea1caf9a954",
             ) => Some(NativeMigration::MediaViewer),
             (
+                Some("1795284903.sh"),
+                "28a0c1d32f634efe9c005c42fe4353b8ead88914867abccc7dbb310d4a7c937b",
+            ) => Some(NativeMigration::FacetimeHdCamera),
+            (
+                Some("1795318856.sh"),
+                "559ed11ca9d1dcb21b3a2f4cfcc2907cd8ee68e056b60e549f6fed532f152b70",
+            ) => Some(NativeMigration::PiCodingAgent),
+            (
+                Some("1795354955.sh"),
+                "c5328f65a8d4afa9157339f4821f0121e911e741f7d9cee581586a6d241e6bfd",
+            ) => Some(NativeMigration::Kmscon),
+            (
+                Some("1795354646.sh"),
+                "a40d46ed75d0701a64c72fba2a6dd0a46d8608ef0966b59723cc553e1dc921fe",
+            ) => Some(NativeMigration::PodmanAndCrun),
+            (
+                Some("1794864665.sh"),
+                "21a57acd1251ef82766a31004f6b260493917ae0d1890e430f698b01f3ad6373",
+            )
+            | (
                 Some("1794909082.sh"),
                 "61102765f4dc278d004a38ecdb91f25f6dca1751ba2e7e34ccbaac5e23a2f084",
             )
             | (
                 Some("1795274792.sh"),
                 "30bd8bec776d5797f1b08b76ffa3ef17b0d497152828b09a846cd1894594b711",
+            )
+            | (
+                Some("1795337583.sh"),
+                "bc0609dfe8064c3ea023ccf834b414e45e9195449f00ee68c53bf043f4d46255",
             ) => {
                 let platform = nix::sys::utsname::uname()
                     .context("Cannot read the Omarchy machine architecture")?;
                 Some(qualcomm_migration_for_machine(platform.machine(), &path)?)
             }
-            (Some("1794909082.sh" | "1795274792.sh"), _) => anyhow::bail!(
-                "Omarchy hardware migration {} differs from the reviewed script",
-                path.display()
-            ),
+            (Some("1794864665.sh" | "1794909082.sh" | "1795274792.sh" | "1795337583.sh"), _) => {
+                anyhow::bail!(
+                    "Omarchy hardware migration {} differs from the reviewed script",
+                    path.display()
+                )
+            }
             _ => None,
         };
         let known_external_aur = [
@@ -1114,6 +1350,10 @@ impl Commands {
                 NativeOmarchyOperation::InstallOmnibookAudio
             }
             NativeMigration::MediaViewer => return self.replace_media_viewer(home).await,
+            NativeMigration::FacetimeHdCamera => return self.install_facetimehd_camera().await,
+            NativeMigration::PiCodingAgent => return self.install_pi_coding_agent().await,
+            NativeMigration::Kmscon => NativeOmarchyOperation::InstallKmscon,
+            NativeMigration::PodmanAndCrun => NativeOmarchyOperation::InstallPodmanAndCrun,
             NativeMigration::SkipQualcommHardware => {
                 println!("  Qualcomm hardware migration does not apply on x86_64");
                 return Ok(());
@@ -1121,15 +1361,10 @@ impl Commands {
         };
         self.run_native_package(operation).await?;
         if native == NativeMigration::OmnibookAudio {
-            let helper = crate::core::privilege::root_controlled_program_path("omarchy-state")?;
-            self.runtime.check_helper_layout("omarchy-state", &helper)?;
-            let status = self
-                .run_program(&helper, &["set", "reboot-required"])
-                .await?;
-            anyhow::ensure!(
-                status.success(),
-                "Cannot mark the Omarchy audio migration as requiring a reboot"
-            );
+            self.mark_reboot_required(
+                "Cannot mark the Omarchy audio migration as requiring a reboot",
+            )
+            .await?;
         }
         Ok(())
     }
@@ -1165,6 +1400,128 @@ impl Commands {
         }
         self.run_native_package(NativeOmarchyOperation::RemoveLegacyMediaViewers)
             .await
+    }
+
+    async fn mark_reboot_required(&mut self, error_context: &str) -> Result<()> {
+        let helper = self.resolve_migration_helper("omarchy-state")?;
+        let status = self
+            .run_program(&helper, &["set", "reboot-required"])
+            .await?;
+        anyhow::ensure!(status.success(), "{error_context}");
+        Ok(())
+    }
+
+    async fn install_facetimehd_camera(&mut self) -> Result<()> {
+        let detector = self.resolve_migration_helper("omarchy-hw-facetimehd")?;
+        let status = self.run_program(&detector, &[]).await?;
+        if status.code() == Some(1) {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            status.success(),
+            "Omarchy hardware detection omarchy-hw-facetimehd failed: {status}"
+        );
+        let missing_driver = !self.is_package_installed("facetimehd-dkms")?
+            && !self.is_package_installed("bcwc-pcie")?
+            && !self.is_package_installed("bcwc-pcie-dkms")?;
+        let missing_firmware = !self.is_package_installed("facetimehd-firmware")?
+            && !self.is_package_installed("bcwc-pcie-firmware")?
+            && !self.is_package_installed("facetimehd-firmware-fetcher")?;
+        if missing_driver || missing_firmware {
+            self.run_native_package(NativeOmarchyOperation::InstallFacetimeHd)
+                .await?;
+            self.mark_reboot_required(
+                "Cannot mark the FaceTime HD migration as requiring a reboot",
+            )
+            .await?;
+        }
+        if self.is_package_installed("facetimehd-firmware-fetcher")? {
+            self.run_sudo(
+                &["systemctl", "enable", "facetimehd-firmware-fetcher.service"],
+                "Failed to enable facetimehd-firmware-fetcher.service",
+            )
+            .await?;
+            self.run_sudo(
+                &[
+                    "systemctl",
+                    "start",
+                    "--no-block",
+                    "facetimehd-firmware-fetcher.service",
+                ],
+                "Failed to start facetimehd-firmware-fetcher.service",
+            )
+            .await?;
+        }
+        let source = self
+            .runtime
+            .root
+            .join("default/systemd/system/omarchy-facetimehd-hibernate.conf");
+        let source = source
+            .to_str()
+            .context("FaceTime HD systemd drop-in path is not UTF-8")?;
+        for unit in [
+            "systemd-hibernate",
+            "systemd-hybrid-sleep",
+            "systemd-suspend-then-hibernate",
+        ] {
+            let destination =
+                format!("/etc/systemd/system/{unit}.service.d/omarchy-facetimehd.conf");
+            self.run_sudo(
+                &["install", "-Dm644", source, &destination],
+                "Failed to install FaceTime HD hibernation drop-in",
+            )
+            .await?;
+        }
+        self.run_sudo(
+            &["systemctl", "daemon-reload"],
+            "Failed to reload systemd units",
+        )
+        .await
+    }
+
+    async fn install_pi_coding_agent(&mut self) -> Result<()> {
+        let helper = self.resolve_migration_helper("omarchy-mise-default-tools")?;
+        let output = self.capture_program_stdout(&helper, &["list"]).await?;
+        anyhow::ensure!(
+            output.status.success(),
+            "Failed to check Omarchy default mise tools: {}",
+            output.status
+        );
+        let stdout = std::str::from_utf8(&output.stdout)
+            .context("omarchy-mise-default-tools output is not valid UTF-8")?;
+        anyhow::ensure!(
+            !stdout.lines().any(|line| line == "pi"),
+            "Waiting for the omarchy-settings package that drops Pi from the default mise tools"
+        );
+        self.run_native_package(NativeOmarchyOperation::InstallPiCodingAgent)
+            .await?;
+        if let Some(mise) = self.resolve_optional_helper("mise") {
+            let mise_output = self
+                .capture_program_stdout(&mise, &["ls", "pi", "--json"])
+                .await?;
+            if mise_output.status.success() {
+                let items: serde_json::Value = serde_json::from_slice(&mise_output.stdout)
+                    .context("Invalid JSON from `mise ls pi --json`")?;
+                let user_declared = items.as_array().is_some_and(|entries| {
+                    entries.iter().any(|entry| {
+                        entry.get("source").is_some_and(|source| {
+                            !source.is_null() && *source != serde_json::Value::Bool(false)
+                        })
+                    })
+                });
+                if !user_declared {
+                    if items.as_array().is_some_and(|entries| !entries.is_empty()) {
+                        let status = self
+                            .run_program(&mise, &["uninstall", "--all", "pi"])
+                            .await?;
+                        anyhow::ensure!(status.success(), "Failed to uninstall mise pi: {status}");
+                    }
+                    let status = self.run_program(&mise, &["reshim"]).await?;
+                    anyhow::ensure!(status.success(), "Failed to run mise reshim: {status}");
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1748,6 +2105,7 @@ async fn execute_logged(
     use std::io::Write;
     let mut interruptions = Interruptions::new()?;
     let (mut input, terminal) = terminal_input()?;
+    let outer_attended = terminal.is_some() && console::user_attended();
     let (master, slave) = open_transport_pty(terminal.as_ref().map(|terminal| &terminal.saved))?;
     let flags = nix::fcntl::OFlag::from_bits_truncate(fcntl(&master, FcntlArg::F_GETFL)?);
     fcntl(
@@ -1781,6 +2139,7 @@ async fn execute_logged(
         .stderr(Stdio::from(slave))
         .env(LOCK_FD, lock_fd.to_string())
         .env(LOG_FD, log_fd.to_string())
+        .env(ATTENDED_ENV, if outer_attended { "1" } else { "0" })
         .env("OMARCHY_PATH", &runtime.root)
         .env("OMARCHY_MIGRATION_STATE", &runtime.migration_state)
         .kill_on_drop(true);
@@ -1945,7 +2304,11 @@ pub(super) async fn maybe_coordinate(intent: UpdateIntent) -> Result<bool> {
                     && log.metadata()?.len() > 0,
                 "Omarchy update transport has no active PTY transcript"
             );
-            let mut executor = Commands::new(yes, runtime);
+            let attended = coordinator_attended_from(
+                std::env::var_os(ATTENDED_ENV).as_deref(),
+                console::user_attended(),
+            );
+            let mut executor = Commands::new(yes, runtime).with_attended(attended);
             let result = tokio::select! {
                 result = workflow(&mut executor, yes) => result,
                 signal = interrupt() => {
@@ -2866,6 +3229,8 @@ mod tests {
             }
         }
         for stage in [
+            Stage::Preflight,
+            Stage::Confirm,
             Stage::NativePackage(NativeOmarchyOperation::PruneCache),
             Stage::NativePackage(NativeOmarchyOperation::RefreshKeyrings),
             Stage::NativePackage(NativeOmarchyOperation::UpgradeRepositories),
@@ -2874,10 +3239,26 @@ mod tests {
         ] {
             assert!(
                 stage_command(stage).is_none(),
-                "{stage:?} must execute native ALPM, never a package helper"
+                "{stage:?} must execute natively, never via an external helper"
             );
         }
         assert!(stage_command(Stage::NativeAur).is_none());
+    }
+
+    #[test]
+    fn native_preflight_checks_ten_gib_threshold_and_force_override() {
+        let low = check_free_space_bytes(MIN_UPDATE_FREE_BYTES - 1, false)
+            .expect_err("below 10 GiB must fail preflight");
+        assert!(low.to_string().contains("10 GiB"), "{low:#}");
+        assert!(
+            low.to_string().contains("OMARCHY_UPDATE_FORCE=1"),
+            "{low:#}"
+        );
+        check_free_space_bytes(MIN_UPDATE_FREE_BYTES, false)
+            .expect("exact 10 GiB threshold must succeed");
+        check_free_space_bytes(MIN_UPDATE_FREE_BYTES + 1024, false)
+            .expect("above 10 GiB threshold must succeed");
+        check_free_space_bytes(0, true).expect("OMARCHY_UPDATE_FORCE=1 bypasses free space check");
     }
 
     #[tokio::test]
@@ -6547,5 +6928,420 @@ omarchy-state set reboot-required
                 "caller checkout program must never execute"
             );
         }
+    }
+
+    #[test]
+    fn coordinator_attended_from_respects_outer_attendance_env() {
+        use std::ffi::OsStr;
+
+        assert!(coordinator_attended_from(Some(OsStr::new("1")), false));
+        assert!(!coordinator_attended_from(Some(OsStr::new("0")), true));
+        assert!(coordinator_attended_from(None, true));
+        assert!(!coordinator_attended_from(None, false));
+        assert!(coordinator_attended_from(Some(OsStr::new("other")), true));
+        assert!(!coordinator_attended_from(Some(OsStr::new("other")), false));
+    }
+
+    #[test]
+    fn native_confirm_update_declines_when_unattended() {
+        assert_eq!(native_confirm_update(false).unwrap(), Outcome::Declined);
+    }
+
+    #[test]
+    fn native_preflight_free_space_covers_statvfs_and_force_paths() {
+        assert_eq!(statvfs_unit_size(4096, 512), 4096);
+        assert_eq!(statvfs_unit_size(0, 4096), 4096);
+        let _ = temp_env::with_var(
+            "OMARCHY_UPDATE_FORCE",
+            None::<&str>,
+            native_preflight_free_space,
+        );
+        temp_env::with_var("OMARCHY_UPDATE_FORCE", Some("1"), || {
+            assert!(native_preflight_free_space().is_ok());
+        });
+    }
+
+    #[test]
+    fn confirm_outcome_maps_user_choice() {
+        assert_eq!(confirm_outcome(true), Outcome::Success);
+        assert_eq!(confirm_outcome(false), Outcome::Declined);
+    }
+
+    #[test]
+    fn stage_exit_outcome_maps_declined_unavailable_and_errors() {
+        use std::os::unix::process::ExitStatusExt;
+
+        assert_eq!(
+            stage_exit_outcome(
+                Stage::MigrationsPending,
+                ExitStatus::from_raw(1 << 8),
+                "omarchy-migrate",
+            )
+            .unwrap(),
+            Outcome::Declined
+        );
+        assert_eq!(
+            stage_exit_outcome(
+                Stage::Snapshot,
+                ExitStatus::from_raw(127 << 8),
+                "omarchy-snapshot",
+            )
+            .unwrap(),
+            Outcome::Unavailable
+        );
+        assert!(
+            stage_exit_outcome(
+                Stage::DevelopmentCheckout,
+                ExitStatus::from_raw(2 << 8),
+                "omarchy-update-dev",
+            )
+            .is_err()
+        );
+    }
+
+    fn write_test_executable(path: &Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::write(path, body).expect("write test executable");
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod test executable");
+    }
+
+    #[tokio::test]
+    async fn native_facetimehd_migration_covers_unmatched_and_full_install_flow() {
+        let owner = private_directory();
+        let runtime = OmarchyRuntime {
+            root: owner.path().to_path_buf(),
+            migration_state: owner.path().join("markers"),
+        };
+
+        let bare = Commands::new(false, runtime.clone());
+        let _ = bare.sudo_command();
+        let _ = bare.resolve_migration_helper("sh");
+        let _ = bare.resolve_optional_helper("sh");
+        let _ = bare.is_package_installed("nonexistent-omg-pkg");
+
+        let empty_fixture = || NativeMigrationFixture {
+            operations: Vec::new(),
+            failure: None,
+            desktop_database_program: "false",
+        };
+
+        let hw_miss = owner.path().join("hw-miss");
+        write_test_executable(&hw_miss, "#!/bin/sh\nexit 1\n");
+        let mut unmatched = Commands::new(false, runtime.clone());
+        unmatched.native_fixture = Some(empty_fixture());
+        unmatched.migration_overrides = Some(MigrationTestOverrides {
+            helper_overrides: std::collections::BTreeMap::from([(
+                "omarchy-hw-facetimehd",
+                hw_miss,
+            )]),
+            ..Default::default()
+        });
+        unmatched
+            .run_native_migration(NativeMigration::FacetimeHdCamera, None)
+            .await
+            .expect("non-facetimehd hardware exits early cleanly");
+        assert!(
+            unmatched
+                .native_fixture
+                .as_ref()
+                .unwrap()
+                .operations
+                .is_empty()
+        );
+
+        let hw_hit = owner.path().join("hw-hit");
+        write_test_executable(&hw_hit, "#!/bin/sh\nexit 0\n");
+        let state_ok = owner.path().join("omarchy-state");
+        write_test_executable(&state_ok, "#!/bin/sh\nexit 0\n");
+        let sudo_ok = owner.path().join("sudo-ok");
+        write_test_executable(&sudo_ok, "#!/bin/sh\nexit 0\n");
+        let mut matched = Commands::new(false, runtime.clone());
+        matched.native_fixture = Some(empty_fixture());
+        matched.migration_overrides = Some(MigrationTestOverrides {
+            helper_overrides: std::collections::BTreeMap::from([
+                ("omarchy-hw-facetimehd", hw_hit.clone()),
+                ("omarchy-state", state_ok),
+            ]),
+            installed_packages: Some(std::collections::BTreeSet::from([
+                "facetimehd-firmware-fetcher",
+            ])),
+            sudo_program: Some(sudo_ok.clone()),
+            ..Default::default()
+        });
+        matched
+            .run_native_migration(NativeMigration::FacetimeHdCamera, None)
+            .await
+            .expect("matched facetimehd hardware installs driver and units");
+        assert_eq!(
+            matched.native_fixture.as_ref().unwrap().operations,
+            vec![NativeOmarchyOperation::InstallFacetimeHd]
+        );
+
+        let mut preinstalled = Commands::new(false, runtime);
+        preinstalled.native_fixture = Some(empty_fixture());
+        preinstalled.migration_overrides = Some(MigrationTestOverrides {
+            helper_overrides: std::collections::BTreeMap::from([("omarchy-hw-facetimehd", hw_hit)]),
+            installed_packages: Some(std::collections::BTreeSet::from([
+                "bcwc-pcie",
+                "facetimehd-firmware",
+            ])),
+            sudo_program: Some(sudo_ok),
+            ..Default::default()
+        });
+        preinstalled
+            .run_native_migration(NativeMigration::FacetimeHdCamera, None)
+            .await
+            .expect("preinstalled facetimehd hardware skips package install and fetcher service");
+        assert!(
+            preinstalled
+                .native_fixture
+                .as_ref()
+                .unwrap()
+                .operations
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn native_pi_coding_agent_and_kmscon_migrations_cover_mise_cleanup_and_install() {
+        let owner = private_directory();
+        let runtime = OmarchyRuntime {
+            root: owner.path().to_path_buf(),
+            migration_state: owner.path().join("markers"),
+        };
+        let empty_fixture = || NativeMigrationFixture {
+            operations: Vec::new(),
+            failure: None,
+            desktop_database_program: "false",
+        };
+
+        let mut kmscon = Commands::new(false, runtime.clone());
+        kmscon.native_fixture = Some(empty_fixture());
+        kmscon.migration_overrides = Some(MigrationTestOverrides::default());
+        let _ = kmscon.resolve_optional_helper("sh");
+        kmscon
+            .run_native_migration(NativeMigration::Kmscon, None)
+            .await
+            .expect("kmscon migration runs native package install");
+        kmscon
+            .run_native_migration(NativeMigration::PodmanAndCrun, None)
+            .await
+            .expect("podman and crun migration runs native package install");
+        assert_eq!(
+            kmscon.native_fixture.as_ref().unwrap().operations,
+            vec![
+                NativeOmarchyOperation::InstallKmscon,
+                NativeOmarchyOperation::InstallPodmanAndCrun,
+            ]
+        );
+
+        let default_tools = owner.path().join("omarchy-mise-default-tools");
+        write_test_executable(&default_tools, "#!/bin/sh\nprintf 'node\\n'\n");
+        let mise_cleanup = owner.path().join("mise-cleanup");
+        write_test_executable(
+            &mise_cleanup,
+            "#!/bin/sh\nif [ \"$1\" = ls ]; then printf '[{\"version\":\"1.0\",\"source\":null}]'; fi\nexit 0\n",
+        );
+        let mut pi_cleanup = Commands::new(false, runtime.clone());
+        pi_cleanup.native_fixture = Some(empty_fixture());
+        pi_cleanup.migration_overrides = Some(MigrationTestOverrides {
+            helper_overrides: std::collections::BTreeMap::from([
+                ("omarchy-mise-default-tools", default_tools.clone()),
+                ("mise", mise_cleanup),
+            ]),
+            ..Default::default()
+        });
+        pi_cleanup
+            .run_native_migration(NativeMigration::PiCodingAgent, None)
+            .await
+            .expect("pi migration removes non-user-declared mise tool");
+        assert_eq!(
+            pi_cleanup.native_fixture.as_ref().unwrap().operations,
+            vec![NativeOmarchyOperation::InstallPiCodingAgent]
+        );
+
+        let mise_declared = owner.path().join("mise-declared");
+        write_test_executable(
+            &mise_declared,
+            "#!/bin/sh\nprintf '[{\"version\":\"1.0\",\"source\":{\"type\":\"mise.toml\"}}]'\n",
+        );
+        let mut pi_declared = Commands::new(false, runtime.clone());
+        pi_declared.native_fixture = Some(empty_fixture());
+        pi_declared.migration_overrides = Some(MigrationTestOverrides {
+            helper_overrides: std::collections::BTreeMap::from([
+                ("omarchy-mise-default-tools", default_tools.clone()),
+                ("mise", mise_declared),
+            ]),
+            ..Default::default()
+        });
+        pi_declared
+            .run_native_migration(NativeMigration::PiCodingAgent, None)
+            .await
+            .expect("pi migration keeps user-declared mise tool");
+
+        let mise_empty = owner.path().join("mise-empty");
+        write_test_executable(
+            &mise_empty,
+            "#!/bin/sh\nif [ \"$1\" = ls ]; then printf '[]'; fi\nexit 0\n",
+        );
+        let mut pi_empty = Commands::new(false, runtime.clone());
+        pi_empty.native_fixture = Some(empty_fixture());
+        pi_empty.migration_overrides = Some(MigrationTestOverrides {
+            helper_overrides: std::collections::BTreeMap::from([
+                ("omarchy-mise-default-tools", default_tools.clone()),
+                ("mise", mise_empty),
+            ]),
+            ..Default::default()
+        });
+        pi_empty
+            .run_native_migration(NativeMigration::PiCodingAgent, None)
+            .await
+            .expect("pi migration skips uninstall when mise list is empty");
+
+        let mise_fail = owner.path().join("mise-fail");
+        write_test_executable(&mise_fail, "#!/bin/sh\nexit 1\n");
+        let mut pi_mise_fail = Commands::new(false, runtime.clone());
+        pi_mise_fail.native_fixture = Some(empty_fixture());
+        pi_mise_fail.migration_overrides = Some(MigrationTestOverrides {
+            helper_overrides: std::collections::BTreeMap::from([
+                ("omarchy-mise-default-tools", default_tools.clone()),
+                ("mise", mise_fail),
+            ]),
+            ..Default::default()
+        });
+        pi_mise_fail
+            .run_native_migration(NativeMigration::PiCodingAgent, None)
+            .await
+            .expect("pi migration tolerates non-zero mise ls exit");
+
+        let mut pi_no_mise = Commands::new(false, runtime);
+        pi_no_mise.native_fixture = Some(empty_fixture());
+        pi_no_mise.migration_overrides = Some(MigrationTestOverrides {
+            helper_overrides: std::collections::BTreeMap::from([(
+                "omarchy-mise-default-tools",
+                default_tools,
+            )]),
+            absent_optional_helpers: std::collections::BTreeSet::from(["mise"]),
+            ..Default::default()
+        });
+        pi_no_mise
+            .run_native_migration(NativeMigration::PiCodingAgent, None)
+            .await
+            .expect("pi migration succeeds when mise is absent");
+    }
+
+    #[test]
+    fn published_surface_and_podman_migrations_resolve_to_native_equivalents() {
+        let owner = private_directory();
+        let migrations = owner.path().join("migrations");
+        let markers = owner.path().join("markers");
+        std::fs::create_dir(&migrations).expect("create migrations dir");
+        std::fs::write(
+            migrations.join("1794864665.sh"),
+            concat!(
+                "echo \"Install the Surface Laptop 7 15\\\"'s support package on installs made before it existed\"\n\n",
+                "# microsoft-surface-laptop-7-support reads the battery pack's cycle count from\n",
+                "# the Surface controller (surface-laptop-7-battery) and keeps the infrared\n",
+                "# camera out of camera pickers. Its timer checks for this laptop itself and\n",
+                "# starts at the next boot.\n",
+                "if ! omarchy-hw-aarch64-qualcomm || ! omarchy-hw-match-device-tree microsoft,romulus15; then\n",
+                "  exit 0\n",
+                "fi\n\n",
+                "omarchy-pkg-add microsoft-surface-laptop-7-support\n",
+            ),
+        )
+        .expect("write 1794864665.sh");
+        std::fs::write(
+            migrations.join("1795337583.sh"),
+            concat!(
+                "echo \"Install the Surface Laptop 7 13.8\\\"'s Wi-Fi and Bluetooth addresses, iptsd and camera relay\"\n\n",
+                "# See install/hardware/microsoft/surface-laptop-7.sh. Without the addresses\n",
+                "# Bluetooth has no controller, iptsd gives the touchpad its gestures and runs\n",
+                "# the touchscreen, and microsoft-surface-laptop-7-support relays the front\n",
+                "# camera to a webcam device. Packages already installed are skipped.\n",
+                "if ! omarchy-hw-aarch64-qualcomm || ! omarchy-hw-match-device-tree microsoft,romulus13; then\n",
+                "  exit 0\n",
+                "fi\n\n",
+                "omarchy-pkg-add microsoft-surface-snapdragon-addresses iptsd microsoft-surface-laptop-7-support\n",
+            ),
+        )
+        .expect("write 1795337583.sh");
+        std::fs::write(
+            migrations.join("1795284903.sh"),
+            r#"echo "Install the FaceTime HD camera driver on Intel Macs that have one"
+
+# Fresh installs get this from install/hardware/apple/fix-facetimehd.sh. Existing
+# Macs only pick it up on omarchy update via this migration.
+if omarchy-hw-facetimehd; then
+  source "$OMARCHY_PATH/install/hardware/apple/fix-facetimehd.sh"
+
+  # The module only loads at boot, so the camera stays missing until then.
+  (( ${#packages[@]} == 0 )) || omarchy-state set reboot-required
+
+  # The leaf only enables the fetch for the next boot; on a running system it can start now.
+  if pacman -Q facetimehd-firmware-fetcher &>/dev/null; then
+    sudo systemctl start --no-block facetimehd-firmware-fetcher.service
+  fi
+fi
+"#,
+        )
+        .expect("write 1795284903.sh");
+        std::fs::write(
+            migrations.join("1795318856.sh"),
+            r#"echo "Install Pi as a package instead of a mise tool"
+
+# The settings package drops Pi's mise declaration. Until it has, stay pending:
+# the declaration would only install Pi through mise again.
+if omarchy-mise-default-tools list | grep -qx pi; then
+  echo "Waiting for the omarchy-settings package that drops Pi from the default mise tools" >&2
+  exit 75
+fi
+
+omarchy-pkg-add pi-coding-agent
+
+# mise's shims come before /usr/bin on PATH, and the shim left by the dropped
+# declaration fails rather than falling through to the package. A Pi the user
+# declared in a mise config of their own is theirs and stays.
+if ! mise ls pi --json | jq -e 'any(.[]; .source)' >/dev/null; then
+  mise uninstall --all pi
+  mise reshim
+fi
+"#,
+        )
+        .expect("write 1795318856.sh");
+        std::fs::write(
+            migrations.join("1795354955.sh"),
+            r#"echo "Install kmscon, which setup after a factory reset is drawn in"
+
+omarchy-pkg-add kmscon
+"#,
+        )
+        .expect("write 1795354955.sh");
+        std::fs::write(
+            migrations.join("1795354646.sh"),
+            concat!(
+                "echo \"Install Podman and crun, which run local models, on machines installed before they were base packages\"\n\n",
+                "omarchy-pkg-add podman crun\n",
+            ),
+        )
+        .expect("write 1795354646.sh");
+
+        let pending =
+            pending_migrations(&migrations, &markers).expect("resolve published migrations");
+        assert_eq!(pending.len(), 6);
+        assert_eq!(
+            pending[0].native,
+            Some(NativeMigration::SkipQualcommHardware)
+        );
+        assert_eq!(pending[1].native, Some(NativeMigration::FacetimeHdCamera));
+        assert_eq!(pending[2].native, Some(NativeMigration::PiCodingAgent));
+        assert_eq!(
+            pending[3].native,
+            Some(NativeMigration::SkipQualcommHardware)
+        );
+        assert_eq!(pending[4].native, Some(NativeMigration::PodmanAndCrun));
+        assert_eq!(pending[5].native, Some(NativeMigration::Kmscon));
     }
 }

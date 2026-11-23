@@ -1,0 +1,242 @@
+# Multi-distro and native ARM64 OCI container E2E verification for OMG.
+#
+# Replaces slow, flaky QEMU full-system VMs on PR/push paths with fast native
+# OCI containers across Arch, Debian 12/13, Ubuntu 24.04, and Fedora on x86_64
+# plus native ARM64 containers on ubuntu-24.04-arm (no /dev/kvm required).
+
+name: Distro Container E2E
+
+on:
+  pull_request:
+    paths:
+      - "src/package_managers/**"
+      - "src/cli/doctor.rs"
+      - "src/daemon/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "scripts/distro-e2e.sh"
+      - ".github/workflows/distro-e2e.yml"
+  push:
+    branches: [main]
+  merge_group:
+    types: [checks_requested]
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: distro-e2e-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'schedule' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_CI_DEBUG: "line-tables-only"
+  RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+
+jobs:
+  container-e2e:
+    name: "Distro E2E (${{ matrix.distro }} / ${{ matrix.arch }})"
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 25
+    container:
+      image: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - distro: arch
+            arch: x86_64
+            runner: ubuntu-24.04
+            image: archlinux:latest@sha256:f3691b4dde62ba4c4b6f0ae2c1fbf28e8c0c8c4b9a35c7e06dc1f70e21aa29f6
+            features: "arch,pgp,license"
+          - distro: debian
+            arch: x86_64
+            runner: ubuntu-24.04
+            image: debian:bookworm
+            features: "debian,pgp,license"
+          - distro: debian-trixie
+            arch: x86_64
+            runner: ubuntu-24.04
+            image: debian:trixie
+            features: "debian,pgp,license"
+          - distro: ubuntu
+            arch: x86_64
+            runner: ubuntu-24.04
+            image: ubuntu:24.04
+            features: "debian,pgp,license"
+          - distro: fedora
+            arch: x86_64
+            runner: ubuntu-24.04
+            image: fedora:latest@sha256:6c75d5bf57cb0fa5aa4b92c6a83c86c791644496d9ac230de7711f5b8ec3b898
+            features: "fedora,pgp,license"
+          # Native ARM64 lanes — run directly on GitHub's ubuntu-24.04-arm runner without /dev/kvm!
+          - distro: debian
+            arch: aarch64
+            runner: ubuntu-24.04-arm
+            image: debian:bookworm
+            features: "debian,pgp,license"
+          - distro: ubuntu
+            arch: aarch64
+            runner: ubuntu-24.04-arm
+            image: ubuntu:24.04
+            features: "debian,pgp,license"
+          - distro: fedora
+            arch: aarch64
+            runner: ubuntu-24.04-arm
+            image: fedora:latest@sha256:e402cca673711fee025f9ce21c6c08b1bd25ee26b3c482119c8675fbaaedbc85
+            features: "fedora,pgp,license"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install distro build prerequisites and mold linker
+        shell: bash
+        env:
+          MATRIX_DISTRO: ${{ matrix.distro }}
+        run: |
+          set -euo pipefail
+          case "$MATRIX_DISTRO" in
+            arch)
+              pacman -Syu --noconfirm
+              pacman -S --noconfirm --needed base-devel pkgconf openssl libarchive clang cmake curl python mold
+              ;;
+            debian|debian-trixie|ubuntu)
+              apt-get update -qq
+              DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+                build-essential pkg-config libssl-dev libapt-pkg-dev libclang-dev curl ca-certificates python3 mold
+              ;;
+            fedora)
+              dnf install -y gcc gcc-c++ make pkgconf-pkg-config openssl-devel clang-devel curl ca-certificates python3 mold perl-core
+              ;;
+            *)
+              echo "Unsupported distro: $MATRIX_DISTRO" >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: "1.95.0"
+
+      - name: Install sccache for Cloudflare R2 compilation cache
+        if: >-
+          vars.OMG_R2_CACHE_ENABLED == 'true' &&
+          github.ref == 'refs/heads/main' &&
+          (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+        uses: taiki-e/install-action@e67fa11c4b9316fa714ddf0abed07a0c3143b95b # v2.87.4
+        with:
+          tool: sccache@0.18.0
+
+      - name: Configure Cloudflare R2 sccache
+        if: >-
+          vars.OMG_R2_CACHE_ENABLED == 'true' &&
+          github.ref == 'refs/heads/main' &&
+          (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+        shell: bash
+        env:
+          R2_ACCOUNT_ID: ${{ vars.OMG_R2_CACHE_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.OMG_R2_CACHE_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.OMG_R2_CACHE_SECRET_ACCESS_KEY }}
+          MATRIX_DISTRO: ${{ matrix.distro }}
+          MATRIX_ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          if [[ -n "$R2_ACCOUNT_ID" && -n "$R2_ACCESS_KEY_ID" && -n "$R2_SECRET_ACCESS_KEY" ]]; then
+            {
+              echo "RUSTC_WRAPPER=sccache"
+              echo "SCCACHE_BUCKET=omg-ci-compiler-cache"
+              echo "SCCACHE_ENDPOINT=https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+              echo "SCCACHE_REGION=auto"
+              echo "SCCACHE_S3_USE_SSL=true"
+              echo "SCCACHE_S3_KEY_PREFIX=distro-e2e-${MATRIX_DISTRO}-${MATRIX_ARCH}-v1/"
+              echo "SCCACHE_IDLE_TIMEOUT=0"
+              echo "AWS_ACCESS_KEY_ID=${R2_ACCESS_KEY_ID}"
+              echo "AWS_SECRET_ACCESS_KEY=${R2_SECRET_ACCESS_KEY}"
+            } >> "$GITHUB_ENV"
+          else
+            echo "Cloudflare R2 credentials not configured; falling back to rust-cache"
+          fi
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
+        with:
+          key: distro-e2e-${{ matrix.distro }}-${{ matrix.arch }}
+
+      - name: Build omg for ${{ matrix.distro }} (${{ matrix.arch }})
+        shell: bash
+        env:
+          MATRIX_FEATURES: ${{ matrix.features }}
+        run: cargo build --profile ci --locked --no-default-features --features "$MATRIX_FEATURES" --bin omg
+
+      - name: Run native distro E2E checks
+        shell: bash
+        env:
+          MATRIX_DISTRO: ${{ matrix.distro }}
+        run: bash scripts/distro-e2e.sh "$MATRIX_DISTRO" "./target/ci/omg"
+
+      - name: Print sccache stats
+        if: always() && env.RUSTC_WRAPPER == 'sccache'
+        shell: bash
+        run: sccache --show-stats || true
+
+  systemd-daemon-e2e:
+    name: "Native systemd + daemon E2E (Ubuntu x86_64)"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Verify systemd PID 1 environment and install mold
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -d /run/systemd/system && systemctl is-system-running --wait || systemctl status --no-pager | head -n 5
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends mold libclang-dev libapt-pkg-dev
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: "1.95.0"
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
+        with:
+          key: systemd-daemon-ubuntu-x86_64
+
+      - name: Build omg and omgd
+        run: cargo build --profile ci --locked --no-default-features --features "debian,pgp,license" --bin omg --bin omgd
+
+      - name: Verify omgd lifecycle and socket IPC on real systemd host
+        shell: bash
+        run: |
+          set -euo pipefail
+          state="$(mktemp -d)"
+          trap 'kill "${DAEMON_PID:-}" 2>/dev/null || true; rm -rf -- "$state"' EXIT
+          mkdir -m 700 "$state/run"
+          export XDG_RUNTIME_DIR="$state/run"
+          export OMG_DATA_DIR="$state/data"
+          export OMG_CONFIG_DIR="$state/config"
+          export OMG_CACHE_DIR="$state/cache"
+          export OMG_NO_TELEMETRY=1
+          ./target/ci/omgd >"$state/omgd.log" 2>&1 &
+          DAEMON_PID=$!
+          for _ in $(seq 1 30); do
+            if ./target/ci/omg daemon-status >/dev/null 2>&1; then
+              break
+            fi
+            sleep 0.5
+          done
+          ./target/ci/omg daemon-status
+          ./target/ci/omg status
+          kill -TERM "$DAEMON_PID"
+          wait "$DAEMON_PID" || true

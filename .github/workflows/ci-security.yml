@@ -1,0 +1,66 @@
+# Static security audit for GitHub Actions workflows using zizmor.
+#
+# Checks for script injection, unpinned actions/images, excessive token
+# permissions, dangerous workflow triggers, and credential persistence leaks.
+
+name: Workflow Security Audit
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/**"
+      - ".github/actions/**"
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/**"
+      - ".github/actions/**"
+  schedule:
+    - cron: "30 4 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: ci-security-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'schedule' }}
+
+permissions:
+  contents: read
+
+jobs:
+  zizmor:
+    name: Audit GitHub Actions workflows (zizmor)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Install zizmor
+        run: python3 -m pip install --no-cache-dir --break-system-packages zizmor
+
+      - name: Run zizmor workflow security audit
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == "pull_request" && -n "$PR_BASE_SHA" ]]; then
+            mapfile -t targets < <(
+              git diff --name-only --diff-filter=d "$PR_BASE_SHA"...HEAD -- .github/workflows .github/actions
+            )
+            if [[ "${#targets[@]}" -eq 0 ]]; then
+              echo "No modified workflow/action files to audit."
+              exit 0
+            fi
+            zizmor --min-severity high --no-online-audits "${targets[@]}"
+          else
+            zizmor --min-severity high --no-online-audits \
+              .github/workflows/ci.yml \
+              .github/workflows/distro-e2e.yml \
+              .github/workflows/ci-security.yml
+            echo "::notice::Full repository advisory scan (legacy workflows):"
+            zizmor --min-severity high --no-online-audits --no-exit-codes .github/workflows .github/actions || true
+          fi
