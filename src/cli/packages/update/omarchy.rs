@@ -1349,6 +1349,39 @@ impl Commands {
         Ok(())
     }
 
+    async fn replace_media_viewer(&mut self, home: Option<PathBuf>) -> Result<()> {
+        const SHIPPED_LAUNCHERS: &[&str] = &[
+            "120d30326a77e1f23d050e52293d0acf1aeb9499bf9cd47b93996d6e2be99480",
+            "a7a75999f161c6a409ff4c5da26ad9c79fc1ffdd4e633aac87f972ad72fc85d4",
+            "d105a16b60ecc1c67f6cc37e5bb7831ca8a08d0e602cb64dd4a1386703362385",
+            "9844e9d22d1b4b9801965afea1eb250103cfc6f12e6e62e542ac47abd4b8094d",
+        ];
+        self.run_native_package(NativeOmarchyOperation::InstallMediaViewer)
+            .await?;
+        let applications = home
+            .context("Cannot locate the Omarchy user's home")?
+            .join(".local/share/applications");
+        if remove_shipped_media_launchers(&applications, SHIPPED_LAUNCHERS)? {
+            let program = "update-desktop-database";
+            #[cfg(test)]
+            let program = self
+                .native_fixture
+                .as_ref()
+                .map_or(program, |fixture| fixture.desktop_database_program);
+            let updater = crate::core::privilege::root_controlled_program_path(program)?;
+            let path = applications
+                .to_str()
+                .context("Desktop application directory is not UTF-8")?;
+            let status = self.run_program(&updater, &[path]).await?;
+            anyhow::ensure!(
+                status.success(),
+                "Cannot refresh the desktop application database: {status}"
+            );
+        }
+        self.run_native_package(NativeOmarchyOperation::RemoveLegacyMediaViewers)
+            .await
+    }
+
     async fn mark_reboot_required(&mut self, error_context: &str) -> Result<()> {
         let helper = self.resolve_migration_helper("omarchy-state")?;
         let status = self
@@ -1469,39 +1502,6 @@ impl Commands {
             }
         }
         Ok(())
-    }
-
-    async fn replace_media_viewer(&mut self, home: Option<PathBuf>) -> Result<()> {
-        const SHIPPED_LAUNCHERS: &[&str] = &[
-            "120d30326a77e1f23d050e52293d0acf1aeb9499bf9cd47b93996d6e2be99480",
-            "a7a75999f161c6a409ff4c5da26ad9c79fc1ffdd4e633aac87f972ad72fc85d4",
-            "d105a16b60ecc1c67f6cc37e5bb7831ca8a08d0e602cb64dd4a1386703362385",
-            "9844e9d22d1b4b9801965afea1eb250103cfc6f12e6e62e542ac47abd4b8094d",
-        ];
-        self.run_native_package(NativeOmarchyOperation::InstallMediaViewer)
-            .await?;
-        let applications = home
-            .context("Cannot locate the Omarchy user's home")?
-            .join(".local/share/applications");
-        if remove_shipped_media_launchers(&applications, SHIPPED_LAUNCHERS)? {
-            let program = "update-desktop-database";
-            #[cfg(test)]
-            let program = self
-                .native_fixture
-                .as_ref()
-                .map_or(program, |fixture| fixture.desktop_database_program);
-            let updater = crate::core::privilege::root_controlled_program_path(program)?;
-            let path = applications
-                .to_str()
-                .context("Desktop application directory is not UTF-8")?;
-            let status = self.run_program(&updater, &[path]).await?;
-            anyhow::ensure!(
-                status.success(),
-                "Cannot refresh the desktop application database: {status}"
-            );
-        }
-        self.run_native_package(NativeOmarchyOperation::RemoveLegacyMediaViewers)
-            .await
     }
 }
 
@@ -7145,6 +7145,7 @@ omarchy-state set reboot-required
 
         let mut kmscon = Commands::new(false, runtime.clone());
         kmscon.native_fixture = Some(NativeMigrationFixture::default());
+        let _ = kmscon.resolve_optional_helper("sh");
         kmscon
             .run_native_migration(NativeMigration::Kmscon, None)
             .await
