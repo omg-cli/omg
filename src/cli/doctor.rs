@@ -1072,6 +1072,15 @@ enum EndpointProbe {
 }
 
 impl EndpointProbe {
+    fn is_transient(&self) -> bool {
+        matches!(
+            self,
+            Self::DeadlineExceeded(_)
+                | Self::RequestTimeout
+                | Self::HttpStatus(500..=599 | 408 | 429)
+        )
+    }
+
     fn diagnostic(&self) -> String {
         match self {
             Self::Healthy => "healthy".to_owned(),
@@ -1127,8 +1136,31 @@ async fn check_internet(
         return Ok(endpoints[0].0);
     }
     // The detailed mirror probe already uses five seconds. Start both sites
-    // together so the basic check has the same ceiling, even when one stalls.
-    probe_connectivity(shared_client(), endpoints, Duration::from_secs(5)).await
+    // together so the basic check has the same ceiling, even when one stalls,
+    // and retry once if a transient timeout/5xx hit both probes simultaneously.
+    probe_connectivity_with_retry(
+        shared_client(),
+        endpoints,
+        Duration::from_secs(5),
+        Duration::from_millis(250),
+    )
+    .await
+}
+
+async fn probe_connectivity_with_retry(
+    client: &reqwest::Client,
+    endpoints: [(&'static str, &str); 2],
+    deadline: Duration,
+    backoff: Duration,
+) -> std::result::Result<&'static str, [(&'static str, EndpointProbe); 2]> {
+    match probe_connectivity(client, endpoints, deadline).await {
+        Ok(name) => Ok(name),
+        Err(failures) if failures.iter().any(|(_, probe)| probe.is_transient()) => {
+            tokio::time::sleep(backoff).await;
+            probe_connectivity(client, endpoints, deadline).await
+        }
+        Err(failures) => Err(failures),
+    }
 }
 
 async fn probe_connectivity(
@@ -2106,6 +2138,62 @@ mod tests {
             finish_probe_server(primary_server).await;
             finish_probe_server(alternate_server).await;
         }
+    }
+
+    #[tokio::test]
+    async fn basic_connectivity_retries_once_after_transient_outage() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("local probe client");
+        let primary_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind primary");
+        let primary_url = format!("http://{}", primary_listener.local_addr().unwrap());
+        let primary_server = tokio::spawn(async move {
+            for response in [
+                &b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"[..],
+                &b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"[..],
+            ] {
+                let (mut stream, _) = primary_listener.accept().await.unwrap();
+                let mut buf = [0u8; 512];
+                let _ = stream.read(&mut buf).await;
+                stream.write_all(response).await.unwrap();
+                let _ = stream.shutdown().await;
+            }
+        });
+        let alternate_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind alternate");
+        let alternate_url = format!("http://{}", alternate_listener.local_addr().unwrap());
+        let alternate_server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut stream, _) = alternate_listener.accept().await.unwrap();
+                let mut buf = [0u8; 512];
+                let _ = stream.read(&mut buf).await;
+                stream
+                    .write_all(
+                        b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .await
+                    .unwrap();
+                let _ = stream.shutdown().await;
+            }
+        });
+        assert_eq!(
+            probe_connectivity_with_retry(
+                &client,
+                [("primary", &primary_url), ("alternate", &alternate_url)],
+                Duration::from_secs(1),
+                Duration::from_millis(10),
+            )
+            .await,
+            Ok("primary")
+        );
+        primary_server.await.unwrap();
+        alternate_server.abort();
     }
 
     #[tokio::test]

@@ -1,5 +1,5 @@
 [build]
-jobs = 5
+# Let Cargo default to available CPU cores instead of throttling multi-core CI runners.
 rustflags = []
 
 # CPU-Specific Optimization (5-10% improvement on native hardware)

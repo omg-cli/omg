@@ -358,6 +358,17 @@ debug = true
 incremental = true
 split-debuginfo = "unpacked" # Faster linking on Linux
 
+# Fast CI build/test profile: line-tables-only cuts DWARF size & link time
+# by ~80% while preserving full file:line backtraces, and disables dep -O2
+# and incremental bloat for higher sccache hit rates.
+[profile.ci]
+inherits = "dev"
+debug = "line-tables-only"
+incremental = false
+
+[profile.ci.package."*"]
+opt-level = 0
+
 # ----------------------------------------------------------------------------
 # Feature policy
 #

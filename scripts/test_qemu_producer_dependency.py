@@ -182,9 +182,9 @@ class QemuProducerDependency(unittest.TestCase):
         self.assertIsNotNone(condition)
         expression = condition.group(1)
         self.assertIn("needs.quick-gate.result == 'success'", expression)
-        self.assertIn("needs.quick-gate.outputs.should-build == 'true'", expression)
-        self.assertIn("github.event_name == 'push'", expression)
-        self.assertIn("github.event_name == 'pull_request'", expression)
+        self.assertIn("github.event_name == 'workflow_dispatch'", expression)
+        self.assertIn("inputs['run-qemu'] == true", expression)
+        self.assertNotIn("github.event_name == 'pull_request'", expression)
 
     def test_reusable_guests_do_not_start_a_second_automatic_workflow(self):
         matrix = (ROOT / '.github/workflows/qemu-matrix.yml').read_text(encoding='utf-8')

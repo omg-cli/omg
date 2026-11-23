@@ -169,6 +169,10 @@ def main():
     else:
         code, transcript, receipt = run_install(command, args.runtime, args.version, args.timeout, Path.cwd())
     sys.stdout.buffer.write(transcript)
+    if code != 0:
+        diagnostic = transcript[-MAX_FAILURE_DIAGNOSTIC:].strip()
+        if diagnostic:
+            sys.stderr.buffer.write(diagnostic + b'\n')
     print('\n' + ('OMG_QEMU_NATIVE_CONSENT=' if args.native else 'OMG_QEMU_RUNTIME_CONSENT=') + json.dumps(receipt, sort_keys=True))
     return code
 

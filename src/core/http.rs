@@ -158,12 +158,21 @@ pub(crate) async fn fetch_public_download_fresh(
     let request =
         || fetch_public_download_with_options(raw, user_agent, total_timeout, None, false, true);
     match request().await {
-        // A transient timeout could invalidate a review already accepted by the user.
+        // A transient transport error or retryable HTTP status could invalidate
+        // an advisory review already accepted by the user.
         Err(error)
-            if error
-                .downcast_ref::<reqwest::Error>()
-                .is_some_and(reqwest::Error::is_timeout) =>
+            if error.chain().any(|source| {
+                source
+                    .downcast_ref::<reqwest::Error>()
+                    .is_some_and(is_retryable_error)
+            }) =>
         {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            request().await
+        }
+        Ok(response) if is_retryable_status(response.status()) => {
+            drop(response);
+            tokio::time::sleep(Duration::from_millis(100)).await;
             request().await
         }
         result => result,
@@ -379,10 +388,29 @@ pub fn is_retryable_status(status: reqwest::StatusCode) -> bool {
         || status == reqwest::StatusCode::TOO_MANY_REQUESTS
 }
 
+fn is_refused_http2_stream_message(message: &str) -> bool {
+    message.contains("refused stream before processing any application logic")
+        || message.contains("REFUSED_STREAM")
+}
+
+fn is_refused_http2_stream(error: &reqwest::Error) -> bool {
+    if !error.is_request() {
+        return false;
+    }
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(current) = source {
+        if is_refused_http2_stream_message(&current.to_string()) {
+            return true;
+        }
+        source = current.source();
+    }
+    false
+}
+
 /// Whether a request transport failure is safe to retry.
 #[must_use]
 pub fn is_retryable_error(error: &reqwest::Error) -> bool {
-    error.is_timeout() || error.is_connect() || error.is_body()
+    error.is_timeout() || error.is_connect() || error.is_body() || is_refused_http2_stream(error)
 }
 
 /// Render a remote URL without credentials, query parameters, or fragments.
@@ -611,6 +639,13 @@ mod tests {
         assert!(is_retryable_status(reqwest::StatusCode::REQUEST_TIMEOUT));
         assert!(is_retryable_status(reqwest::StatusCode::TOO_MANY_REQUESTS));
         assert!(!is_retryable_status(reqwest::StatusCode::NOT_FOUND));
+        assert!(is_refused_http2_stream_message(
+            "client error (SendRequest): http2 error: stream error received: refused stream before processing any application logic"
+        ));
+        assert!(is_refused_http2_stream_message(
+            "http2 error: REFUSED_STREAM"
+        ));
+        assert!(!is_refused_http2_stream_message("connection reset by peer"));
     }
 
     #[test]
@@ -729,11 +764,11 @@ pub(crate) trait BoundedResponseExt {
     async fn bounded_text(self) -> anyhow::Result<String>;
 }
 
-/// Retry a metadata GET at most three times under one thirty-second budget.
+/// Retry a metadata GET at most three times under one forty-five-second budget.
 /// Each attempt includes the bounded body read; permanent errors retain their
 /// cause. Reuse the caller's client so trust and redirect policy stay intact.
 pub(crate) async fn fetch_metadata_text(client: &Client, url: &str) -> anyhow::Result<String> {
-    fetch_metadata_text_with_budget(client, url, Duration::from_secs(30)).await
+    fetch_metadata_text_with_budget(client, url, Duration::from_secs(45)).await
 }
 
 const DEFAULT_METADATA_BODY_LIMIT: usize = 16 * 1024 * 1024;
@@ -951,7 +986,7 @@ mod metadata_limit_tests {
                 assert_eq!(headers.lines().filter(|line| line.starts_with("cache-control:")).collect::<Vec<_>>(), if index < 2 { vec!["cache-control: no-cache"] } else { Vec::new() }, "request {index} must preserve its cache policy across redirects");
             }
             let success = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec();
-            let retry = RetryFixture::new(vec![Vec::new(), success], false).await?;
+            let retry = RetryFixture::new(vec![Vec::new(), success.clone()], false).await?;
             let timeout = Some(Duration::from_millis(250));
             let fresh = fetch_public_download_fresh(&retry.url, "omg-runtime-security-fixture", timeout).await?;
             assert_eq!(fresh.text().await?, "ok");
@@ -963,6 +998,17 @@ mod metadata_limit_tests {
                 .await.expect_err("a second timeout must remain an error");
             assert!(error.downcast_ref::<reqwest::Error>().is_some_and(reqwest::Error::is_timeout));
             assert_eq!(exhausted.finish().await?.len(), 2);
+
+            let unavailable = b"HTTP/1.1 503 Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec();
+            let recovered_503 = RetryFixture::new(vec![unavailable.clone(), success], false).await?;
+            let fresh = fetch_public_download_fresh(&recovered_503.url, "omg-runtime-security-fixture", Some(Duration::from_secs(5))).await?;
+            assert_eq!(fresh.text().await?, "ok");
+            assert_eq!(recovered_503.finish().await?.len(), 2, "fresh advisory reads recover from one transient 503");
+
+            let persistent_503 = RetryFixture::new(vec![unavailable.clone(), unavailable], false).await?;
+            let response = fetch_public_download_fresh(&persistent_503.url, "omg-runtime-security-fixture", Some(Duration::from_secs(5))).await?;
+            assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(persistent_503.finish().await?.len(), 2);
             Ok(())
         })
     }

@@ -3344,7 +3344,9 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
     # The release binary must remain healthy when optional host executables
     # are absent from its PATH. Its backend and sudo checks still resolve real
     # native system tools, so the second run cannot pass by skipping them.
-    remote+="; doctor_path=$quoted_binary_dir; for optional in curl tar git; do if env PATH=\"\$doctor_path\" /bin/bash -c 'command -v \"\$1\" >/dev/null' _ \"\$optional\"; then printf 'assertion failed: controlled doctor PATH still exposes %s\\n' \"\$optional\" >&2; execution_phase=dependency; rc=2; assertion=1; break; fi; done"
+    # Only run this follow-up when the baseline doctor run itself succeeded so
+    # an unrelated baseline failure is not misattributed to missing optional tools.
+    remote+="; if [ \"\$rc\" = 0 ] && [ \"\$assertion\" = 0 ]; then doctor_path=$quoted_binary_dir; for optional in curl tar git; do if env PATH=\"\$doctor_path\" /bin/bash -c 'command -v \"\$1\" >/dev/null' _ \"\$optional\"; then printf 'assertion failed: controlled doctor PATH still exposes %s\\n' \"\$optional\" >&2; execution_phase=dependency; rc=2; assertion=1; break; fi; done"
     if [[ "$distro" == arch ]]; then
       remote+="; if [ \"\$assertion\" = 0 ] && env PATH=\"\$doctor_path\" /bin/bash -c 'command -v makepkg >/dev/null'; then printf 'assertion failed: controlled doctor PATH still exposes makepkg\\n' >&2; execution_phase=dependency; rc=2; assertion=1; fi"
     fi
@@ -3359,6 +3361,7 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
     else
       remote+="; if [ \"\$assertion\" = 0 ]; then oracle_rc=0; check_doctor_native_backend '$distro' doctor.minimal.stdout.log /etc/os-release '' true || oracle_rc=\$?; if [ \"\$oracle_rc\" = 2 ]; then execution_phase=dependency; rc=2; elif [ \"\$oracle_rc\" != 0 ]; then assertion=1; fi; fi"
     fi
+    remote+="; fi"
   fi
   if [[ "$assertions" == info-native-package ]]; then
     remote+="; if [ \"\$rc\" = 0 ]; then oracle_rc=0; check_info_native_package '$distro' command.stdout.log || oracle_rc=\$?; if [ \"\$oracle_rc\" = 2 ]; then execution_phase=dependency; rc=2; elif [ \"\$oracle_rc\" != 0 ]; then assertion=1; fi; fi"

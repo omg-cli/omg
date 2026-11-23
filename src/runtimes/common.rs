@@ -431,15 +431,44 @@ fn is_retryable_connect_error(error: &anyhow::Error) -> bool {
     })
 }
 
+const DOWNLOAD_HEARTBEAT_PERIOD: std::time::Duration = std::time::Duration::from_secs(30);
+/// Minimum bytes expected within one heartbeat window before a larger
+/// runtime download is treated as stalled and retried on a fresh connection.
+/// 256 KiB per 30s (~8.5 KiB/s) catches degraded CDN trickles while leaving
+/// small downloads unaffected.
+const DOWNLOAD_LOW_SPEED_MIN_BYTES: u64 = 256 * 1024;
+
 /// Stream a runtime artifact body into a same-filesystem temporary file with
-/// bounded retry for transient mid-stream failures.
+/// bounded retry for transient mid-stream failures and low-speed stalls.
 ///
-/// A broken body is resumed only under a strong HTTP validator and an exact
-/// range response. The caller verifies the digest before persisting `dest`.
+/// A broken or stalled body is resumed only under a strong HTTP validator and
+/// an exact range response. The caller verifies the digest before persisting `dest`.
 async fn stream_runtime_download_to_temp<D, F, Fut>(
+    host: &str,
+    request: F,
+    dest: &Path,
+) -> Result<(tempfile::TempPath, String)>
+where
+    D: Digest + Default,
+    F: FnMut(Option<ResumeRequest>) -> Fut,
+    Fut: std::future::Future<Output = Result<reqwest::Response>>,
+{
+    stream_runtime_download_to_temp_with_low_speed::<D, F, Fut>(
+        host,
+        request,
+        dest,
+        DOWNLOAD_HEARTBEAT_PERIOD,
+        DOWNLOAD_LOW_SPEED_MIN_BYTES,
+    )
+    .await
+}
+
+async fn stream_runtime_download_to_temp_with_low_speed<D, F, Fut>(
     host: &str,
     mut request: F,
     dest: &Path,
+    heartbeat_period: std::time::Duration,
+    low_speed_min_bytes: u64,
 ) -> Result<(tempfile::TempPath, String)>
 where
     D: Digest + Default,
@@ -617,9 +646,13 @@ where
         task.set_position(downloaded);
         let mut stream = response.bytes_stream();
         let mut received_this_attempt: u64 = 0;
+        let mut last_heartbeat_bytes: u64 = 0;
+        let mut stalled = false;
         let mut failure: Option<reqwest::Error> = None;
-        let period = std::time::Duration::from_secs(30);
-        let mut heartbeat = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+        let mut heartbeat = tokio::time::interval_at(
+            tokio::time::Instant::now() + heartbeat_period,
+            heartbeat_period,
+        );
         heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         tracing::info!(
             attempt = attempt + 1,
@@ -632,7 +665,19 @@ where
             let item = tokio::select! {
                 item = stream.next() => item,
                 _ = heartbeat.tick() => {
-                    tracing::info!(attempt = attempt + 1, host, bytes_received = received_this_attempt, downloaded, elapsed_ms = started.elapsed().as_millis(), "Runtime download body progress");
+                    let window_bytes = received_this_attempt.saturating_sub(last_heartbeat_bytes);
+                    last_heartbeat_bytes = received_this_attempt;
+                    tracing::info!(attempt = attempt + 1, host, bytes_received = received_this_attempt, window_bytes, downloaded, elapsed_ms = started.elapsed().as_millis(), "Runtime download body progress");
+                    let remaining_exceeds_floor = total_size == 0
+                        || total_size.saturating_sub(downloaded) > low_speed_min_bytes;
+                    if low_speed_min_bytes > 0
+                        && attempt + 1 < MAX_DOWNLOAD_ATTEMPTS
+                        && remaining_exceeds_floor
+                        && window_bytes < low_speed_min_bytes
+                    {
+                        stalled = true;
+                        break;
+                    }
                     continue;
                 }
             };
@@ -660,6 +705,30 @@ where
             downloaded = next_size;
             received_this_attempt += u64::try_from(chunk.len())?;
             task.set_position(downloaded);
+        }
+
+        if stalled {
+            drop(stream);
+            resume = representation.as_ref().and_then(|(total, validator)| {
+                (downloaded > 0 && downloaded < *total).then(|| ResumeRequest {
+                    offset: downloaded,
+                    total: *total,
+                    validator: validator.clone(),
+                })
+            });
+            tracing::warn!(
+                attempt = attempt + 1,
+                host,
+                bytes_received = received_this_attempt,
+                retained_bytes = resume.as_ref().map_or(0, |range| range.offset),
+                "Runtime download stalled below minimum throughput; retrying bounded download"
+            );
+            tokio::time::sleep(crate::core::http::retry_backoff(
+                std::time::Duration::from_millis(100),
+                u32::try_from(attempt).unwrap_or(u32::MAX),
+            ))
+            .await;
+            continue;
         }
 
         if let Some(error) = failure {
@@ -2557,6 +2626,93 @@ mod tests {
         assert!(!dest.exists());
         drop(temporary);
         assert_eq!(fs::read_dir(directory.path())?.count(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_download_recovers_from_low_speed_stall_with_validated_resume()
+    -> anyhow::Result<()> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let payload: Vec<u8> = (0..256_u32).map(|i| (i & 0xff) as u8).collect();
+        let prefix_len = 16;
+        let etag = "\"stall-fixture-v1\"";
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let url = format!("http://{}/archive", listener.local_addr()?);
+        let client = reqwest::Client::builder().no_proxy().build()?;
+        let server_payload = payload.clone();
+        let server = tokio::spawn(async move {
+            // Attempt 1: send only 16 bytes (< 64-byte floor) and then stall.
+            let (mut first, _) = listener.accept().await?;
+            let mut req1 = Vec::new();
+            while !req1.ends_with(b"\r\n\r\n") {
+                req1.push(first.read_u8().await?);
+            }
+            let head1 = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nETag: {etag}\r\nConnection: close\r\n\r\n",
+                server_payload.len()
+            );
+            first.write_all(head1.as_bytes()).await?;
+            first.write_all(&server_payload[..prefix_len]).await?;
+            // Wait for the client to abort the stalled stream.
+            let mut drain = [0u8; 16];
+            let _ = first.read(&mut drain).await;
+            drop(first);
+
+            // Attempt 2: expect validated Range resume from offset 16 and deliver the rest fast.
+            let (mut second, _) = listener.accept().await?;
+            let mut req2 = Vec::new();
+            while !req2.ends_with(b"\r\n\r\n") {
+                req2.push(second.read_u8().await?);
+            }
+            let req2_text = String::from_utf8(req2)?.to_ascii_lowercase();
+            assert!(
+                req2_text.contains(&format!("range: bytes={prefix_len}-")),
+                "stalled attempt must resume with Range header: {req2_text}"
+            );
+            assert!(
+                req2_text.contains(&format!("if-range: {etag}")),
+                "stalled attempt must bind resume to strong ETag: {req2_text}"
+            );
+            let remaining = &server_payload[prefix_len..];
+            let head2 = format!(
+                "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {}-{}/{}\r\nETag: {etag}\r\nConnection: close\r\n\r\n",
+                remaining.len(),
+                prefix_len,
+                server_payload.len() - 1,
+                server_payload.len()
+            );
+            second.write_all(head2.as_bytes()).await?;
+            second.write_all(remaining).await?;
+            second.shutdown().await?;
+            Ok::<_, anyhow::Error>(())
+        });
+
+        let directory = tempfile::tempdir()?;
+        let dest = directory.path().join("go.tar.gz");
+        let (temporary, digest) = stream_runtime_download_to_temp_with_low_speed::<Sha256, _, _>(
+            "go.dev",
+            |resume| {
+                let client = client.clone();
+                let url = url.clone();
+                async move {
+                    let mut req = client.get(&url);
+                    if let Some(range) = resume {
+                        req = req
+                            .header(reqwest::header::RANGE, format!("bytes={}-", range.offset))
+                            .header(reqwest::header::IF_RANGE, range.validator);
+                    }
+                    Ok(req.send().await?)
+                }
+            },
+            &dest,
+            std::time::Duration::from_millis(80),
+            64,
+        )
+        .await?;
+        server.await??;
+        assert_eq!(fs::read(&temporary)?, payload);
+        assert_eq!(digest, hex::encode(Sha256::digest(&payload)));
         Ok(())
     }
 
