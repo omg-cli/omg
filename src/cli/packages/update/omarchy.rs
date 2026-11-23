@@ -512,14 +512,20 @@ struct Commands {
     foreground: Option<nix::unistd::Pid>,
     #[cfg(test)]
     native_fixture: Option<NativeMigrationFixture>,
+    #[cfg(test)]
+    migration_overrides: Option<MigrationTestOverrides>,
 }
 
 #[cfg(test)]
-#[derive(Default)]
 struct NativeMigrationFixture {
     operations: Vec<NativeOmarchyOperation>,
     failure: Option<NativeOmarchyOperation>,
     desktop_database_program: &'static str,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct MigrationTestOverrides {
     helper_overrides: std::collections::BTreeMap<&'static str, PathBuf>,
     absent_optional_helpers: std::collections::BTreeSet<&'static str>,
     installed_packages: Option<std::collections::BTreeSet<&'static str>>,
@@ -561,6 +567,8 @@ impl Commands {
             foreground: None,
             #[cfg(test)]
             native_fixture: None,
+            #[cfg(test)]
+            migration_overrides: None,
         }
     }
 
@@ -652,14 +660,17 @@ impl Commands {
 
     #[cfg_attr(
         not(test),
-        expect(clippy::unused_self, reason = "uses self.native_fixture in unit tests")
+        expect(
+            clippy::unused_self,
+            reason = "uses self.migration_overrides in unit tests"
+        )
     )]
     fn sudo_command(&self) -> Result<Command> {
         #[cfg(test)]
         if let Some(program) = self
-            .native_fixture
+            .migration_overrides
             .as_ref()
-            .and_then(|fixture| fixture.sudo_program.as_ref())
+            .and_then(|overrides| overrides.sudo_program.as_ref())
         {
             return Ok(Command::new(program));
         }
@@ -669,9 +680,9 @@ impl Commands {
     fn resolve_migration_helper(&self, name: &str) -> Result<PathBuf> {
         #[cfg(test)]
         if let Some(path) = self
-            .native_fixture
+            .migration_overrides
             .as_ref()
-            .and_then(|fixture| fixture.helper_overrides.get(name))
+            .and_then(|overrides| overrides.helper_overrides.get(name))
         {
             return Ok(path.clone());
         }
@@ -682,15 +693,18 @@ impl Commands {
 
     #[cfg_attr(
         not(test),
-        expect(clippy::unused_self, reason = "uses self.native_fixture in unit tests")
+        expect(
+            clippy::unused_self,
+            reason = "uses self.migration_overrides in unit tests"
+        )
     )]
     fn resolve_optional_helper(&self, name: &str) -> Option<PathBuf> {
         #[cfg(test)]
-        if let Some(fixture) = self.native_fixture.as_ref() {
-            if fixture.absent_optional_helpers.contains(name) {
+        if let Some(overrides) = self.migration_overrides.as_ref() {
+            if overrides.absent_optional_helpers.contains(name) {
                 return None;
             }
-            if let Some(path) = fixture.helper_overrides.get(name) {
+            if let Some(path) = overrides.helper_overrides.get(name) {
                 return Some(path.clone());
             }
         }
@@ -699,14 +713,17 @@ impl Commands {
 
     #[cfg_attr(
         not(test),
-        expect(clippy::unused_self, reason = "uses self.native_fixture in unit tests")
+        expect(
+            clippy::unused_self,
+            reason = "uses self.migration_overrides in unit tests"
+        )
     )]
     fn is_package_installed(&self, name: &str) -> Result<bool> {
         #[cfg(test)]
         if let Some(packages) = self
-            .native_fixture
+            .migration_overrides
             .as_ref()
-            .and_then(|fixture| fixture.installed_packages.as_ref())
+            .and_then(|overrides| overrides.installed_packages.as_ref())
         {
             return Ok(packages.contains(name));
         }
@@ -3914,7 +3931,6 @@ omarchy-pkg-add kmscon
                 operations: Vec::new(),
                 failure,
                 desktop_database_program: updater,
-                ..Default::default()
             });
             let result = commands
                 .run_native_migration(NativeMigration::MediaViewer, Some(home.clone()))
@@ -4053,7 +4069,6 @@ omarchy-pkg-add kmscon
             operations: Vec::new(),
             failure: None,
             desktop_database_program: "false",
-            ..Default::default()
         });
         for (name, script) in [
             (
@@ -7061,10 +7076,17 @@ omarchy-state set reboot-required
         let _ = bare.resolve_optional_helper("sh");
         let _ = bare.is_package_installed("nonexistent-omg-pkg");
 
+        let empty_fixture = || NativeMigrationFixture {
+            operations: Vec::new(),
+            failure: None,
+            desktop_database_program: "false",
+        };
+
         let hw_miss = owner.path().join("hw-miss");
         write_test_executable(&hw_miss, "#!/bin/sh\nexit 1\n");
         let mut unmatched = Commands::new(false, runtime.clone());
-        unmatched.native_fixture = Some(NativeMigrationFixture {
+        unmatched.native_fixture = Some(empty_fixture());
+        unmatched.migration_overrides = Some(MigrationTestOverrides {
             helper_overrides: std::collections::BTreeMap::from([(
                 "omarchy-hw-facetimehd",
                 hw_miss,
@@ -7091,7 +7113,8 @@ omarchy-state set reboot-required
         let sudo_ok = owner.path().join("sudo-ok");
         write_test_executable(&sudo_ok, "#!/bin/sh\nexit 0\n");
         let mut matched = Commands::new(false, runtime.clone());
-        matched.native_fixture = Some(NativeMigrationFixture {
+        matched.native_fixture = Some(empty_fixture());
+        matched.migration_overrides = Some(MigrationTestOverrides {
             helper_overrides: std::collections::BTreeMap::from([
                 ("omarchy-hw-facetimehd", hw_hit.clone()),
                 ("omarchy-state", state_ok),
@@ -7112,7 +7135,8 @@ omarchy-state set reboot-required
         );
 
         let mut preinstalled = Commands::new(false, runtime);
-        preinstalled.native_fixture = Some(NativeMigrationFixture {
+        preinstalled.native_fixture = Some(empty_fixture());
+        preinstalled.migration_overrides = Some(MigrationTestOverrides {
             helper_overrides: std::collections::BTreeMap::from([("omarchy-hw-facetimehd", hw_hit)]),
             installed_packages: Some(std::collections::BTreeSet::from([
                 "bcwc-pcie",
@@ -7142,9 +7166,15 @@ omarchy-state set reboot-required
             root: owner.path().to_path_buf(),
             migration_state: owner.path().join("markers"),
         };
+        let empty_fixture = || NativeMigrationFixture {
+            operations: Vec::new(),
+            failure: None,
+            desktop_database_program: "false",
+        };
 
         let mut kmscon = Commands::new(false, runtime.clone());
-        kmscon.native_fixture = Some(NativeMigrationFixture::default());
+        kmscon.native_fixture = Some(empty_fixture());
+        kmscon.migration_overrides = Some(MigrationTestOverrides::default());
         let _ = kmscon.resolve_optional_helper("sh");
         kmscon
             .run_native_migration(NativeMigration::Kmscon, None)
@@ -7170,7 +7200,8 @@ omarchy-state set reboot-required
             "#!/bin/sh\nif [ \"$1\" = ls ]; then printf '[{\"version\":\"1.0\",\"source\":null}]'; fi\nexit 0\n",
         );
         let mut pi_cleanup = Commands::new(false, runtime.clone());
-        pi_cleanup.native_fixture = Some(NativeMigrationFixture {
+        pi_cleanup.native_fixture = Some(empty_fixture());
+        pi_cleanup.migration_overrides = Some(MigrationTestOverrides {
             helper_overrides: std::collections::BTreeMap::from([
                 ("omarchy-mise-default-tools", default_tools.clone()),
                 ("mise", mise_cleanup),
@@ -7192,7 +7223,8 @@ omarchy-state set reboot-required
             "#!/bin/sh\nprintf '[{\"version\":\"1.0\",\"source\":{\"type\":\"mise.toml\"}}]'\n",
         );
         let mut pi_declared = Commands::new(false, runtime.clone());
-        pi_declared.native_fixture = Some(NativeMigrationFixture {
+        pi_declared.native_fixture = Some(empty_fixture());
+        pi_declared.migration_overrides = Some(MigrationTestOverrides {
             helper_overrides: std::collections::BTreeMap::from([
                 ("omarchy-mise-default-tools", default_tools.clone()),
                 ("mise", mise_declared),
@@ -7210,7 +7242,8 @@ omarchy-state set reboot-required
             "#!/bin/sh\nif [ \"$1\" = ls ]; then printf '[]'; fi\nexit 0\n",
         );
         let mut pi_empty = Commands::new(false, runtime.clone());
-        pi_empty.native_fixture = Some(NativeMigrationFixture {
+        pi_empty.native_fixture = Some(empty_fixture());
+        pi_empty.migration_overrides = Some(MigrationTestOverrides {
             helper_overrides: std::collections::BTreeMap::from([
                 ("omarchy-mise-default-tools", default_tools.clone()),
                 ("mise", mise_empty),
@@ -7225,7 +7258,8 @@ omarchy-state set reboot-required
         let mise_fail = owner.path().join("mise-fail");
         write_test_executable(&mise_fail, "#!/bin/sh\nexit 1\n");
         let mut pi_mise_fail = Commands::new(false, runtime.clone());
-        pi_mise_fail.native_fixture = Some(NativeMigrationFixture {
+        pi_mise_fail.native_fixture = Some(empty_fixture());
+        pi_mise_fail.migration_overrides = Some(MigrationTestOverrides {
             helper_overrides: std::collections::BTreeMap::from([
                 ("omarchy-mise-default-tools", default_tools.clone()),
                 ("mise", mise_fail),
@@ -7238,7 +7272,8 @@ omarchy-state set reboot-required
             .expect("pi migration tolerates non-zero mise ls exit");
 
         let mut pi_no_mise = Commands::new(false, runtime);
-        pi_no_mise.native_fixture = Some(NativeMigrationFixture {
+        pi_no_mise.native_fixture = Some(empty_fixture());
+        pi_no_mise.migration_overrides = Some(MigrationTestOverrides {
             helper_overrides: std::collections::BTreeMap::from([(
                 "omarchy-mise-default-tools",
                 default_tools,
