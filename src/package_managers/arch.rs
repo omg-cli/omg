@@ -20,6 +20,9 @@ pub enum NativeOmarchyOperation {
     InstallOmnibookAudio,
     InstallMediaViewer,
     RemoveLegacyMediaViewers,
+    InstallFacetimeHd,
+    InstallPiCodingAgent,
+    InstallKmscon,
 }
 
 impl NativeOmarchyOperation {
@@ -34,6 +37,9 @@ impl NativeOmarchyOperation {
             "migration-omnibook-audio" => Some(Self::InstallOmnibookAudio),
             "migration-omaview-install" => Some(Self::InstallMediaViewer),
             "migration-omaview-cleanup" => Some(Self::RemoveLegacyMediaViewers),
+            "migration-facetimehd" => Some(Self::InstallFacetimeHd),
+            "migration-pi-coding-agent" => Some(Self::InstallPiCodingAgent),
+            "migration-kmscon" => Some(Self::InstallKmscon),
             _ => None,
         }
     }
@@ -49,6 +55,9 @@ impl NativeOmarchyOperation {
             Self::InstallOmnibookAudio => "migration-omnibook-audio",
             Self::InstallMediaViewer => "migration-omaview-install",
             Self::RemoveLegacyMediaViewers => "migration-omaview-cleanup",
+            Self::InstallFacetimeHd => "migration-facetimehd",
+            Self::InstallPiCodingAgent => "migration-pi-coding-agent",
+            Self::InstallKmscon => "migration-kmscon",
         }
     }
 }
@@ -174,6 +183,24 @@ pub fn execute_native_omarchy_operation(
             }
             names
         }
+        NativeOmarchyOperation::InstallFacetimeHd => {
+            let mut names = Vec::new();
+            if !super::is_installed_fast("facetimehd-dkms")?
+                && !super::is_installed_fast("bcwc-pcie")?
+                && !super::is_installed_fast("bcwc-pcie-dkms")?
+            {
+                names.push("facetimehd-dkms".to_owned());
+            }
+            if !super::is_installed_fast("facetimehd-firmware")?
+                && !super::is_installed_fast("bcwc-pcie-firmware")?
+                && !super::is_installed_fast("facetimehd-firmware-fetcher")?
+            {
+                names.push("facetimehd-firmware-fetcher".to_owned());
+            }
+            names
+        }
+        NativeOmarchyOperation::InstallPiCodingAgent => missing_package_target("pi-coding-agent")?,
+        NativeOmarchyOperation::InstallKmscon => missing_package_target("kmscon")?,
     };
     if operation == NativeOmarchyOperation::RefreshKeyrings {
         tokio::runtime::Builder::new_current_thread()

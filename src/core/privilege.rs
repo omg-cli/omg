@@ -271,11 +271,14 @@ fn read_security_review(
         nix::unistd::tcgetpgrp(tty)? == nix::unistd::getpgrp(),
         "Security terminal foreground changed during acknowledgement"
     );
-    anyhow::ensure!(
-        answer == format!("accept {digest}\n").as_bytes()
-            || answer == format!("accept {digest}\r\n").as_bytes(),
-        "Security acknowledgement declined"
-    );
+    if answer != format!("accept {digest}\n").as_bytes()
+        && answer != format!("accept {digest}\r\n").as_bytes()
+    {
+        if answer.trim_ascii().is_empty() {
+            anyhow::bail!("Security acknowledgement declined");
+        }
+        anyhow::bail!("Security acknowledgement declined (expected: accept {digest})");
+    }
     check_cancelled()?;
     Ok(())
 }
