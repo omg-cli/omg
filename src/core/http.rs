@@ -1017,7 +1017,7 @@ mod metadata_limit_tests {
                 assert_eq!(headers.lines().filter(|line| line.starts_with("cache-control:")).collect::<Vec<_>>(), if index < 2 { vec!["cache-control: no-cache"] } else { Vec::new() }, "request {index} must preserve its cache policy across redirects");
             }
             let success = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec();
-            let retry = RetryFixture::new(vec![Vec::new(), success.clone()], false).await?;
+            let retry = RetryFixture::new(vec![Vec::new(), success], false).await?;
             let timeout = Some(Duration::from_millis(250));
             let fresh = fetch_public_download_fresh(&retry.url, "omg-runtime-security-fixture", timeout).await?;
             assert_eq!(fresh.text().await?, "ok");
@@ -1029,19 +1029,58 @@ mod metadata_limit_tests {
                 .await.expect_err("a second timeout must remain an error");
             assert!(error.downcast_ref::<reqwest::Error>().is_some_and(reqwest::Error::is_timeout));
             assert_eq!(exhausted.finish().await?.len(), 2);
-
-            let unavailable = b"HTTP/1.1 503 Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec();
-            let recovered_503 = RetryFixture::new(vec![unavailable.clone(), success], false).await?;
-            let fresh = fetch_public_download_fresh(&recovered_503.url, "omg-runtime-security-fixture", Some(Duration::from_secs(5))).await?;
-            assert_eq!(fresh.text().await?, "ok");
-            assert_eq!(recovered_503.finish().await?.len(), 2, "fresh advisory reads recover from one transient 503");
-
-            let persistent_503 = RetryFixture::new(vec![unavailable.clone(), unavailable], false).await?;
-            let response = fetch_public_download_fresh(&persistent_503.url, "omg-runtime-security-fixture", Some(Duration::from_secs(5))).await?;
-            assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
-            assert_eq!(persistent_503.finish().await?.len(), 2);
             Ok(())
         })
+    }
+
+    #[test]
+    fn fresh_public_download_retries_transient_503_once() -> anyhow::Result<()> {
+        const NAME: &str =
+            "core::http::metadata_limit_tests::fresh_public_download_retries_transient_503_once";
+        if crate::core::testing::run_isolated_test(NAME) {
+            return Ok(());
+        }
+        // SAFETY: this is a fresh single-test child with no concurrent environment users.
+        #[expect(unsafe_code, reason = "isolated single-test child process")]
+        unsafe {
+            std::env::set_var("OMG_TEST_MODE", "1");
+        }
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(async {
+                let success =
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec();
+                let unavailable =
+                    b"HTTP/1.1 503 Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        .to_vec();
+                let recovered_503 =
+                    RetryFixture::new(vec![unavailable.clone(), success], false).await?;
+                let fresh = fetch_public_download_fresh(
+                    &recovered_503.url,
+                    "omg-runtime-security-fixture",
+                    Some(Duration::from_secs(5)),
+                )
+                .await?;
+                assert_eq!(fresh.text().await?, "ok");
+                assert_eq!(
+                    recovered_503.finish().await?.len(),
+                    2,
+                    "fresh advisory reads recover from one transient 503"
+                );
+
+                let persistent_503 =
+                    RetryFixture::new(vec![unavailable.clone(), unavailable], false).await?;
+                let response = fetch_public_download_fresh(
+                    &persistent_503.url,
+                    "omg-runtime-security-fixture",
+                    Some(Duration::from_secs(5)),
+                )
+                .await?;
+                assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+                assert_eq!(persistent_503.finish().await?.len(), 2);
+                Ok(())
+            })
     }
 
     #[tokio::test]

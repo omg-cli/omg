@@ -53,12 +53,6 @@ impl AdvisoryRiskReview {
         let mut standard_arch_untracked = false;
         for assessment in unknown {
             let package = &assessment.package;
-            if let SecurityOrigin::OtherRepository { repository } = &package.origin
-                && matches!(repository.as_str(), "core" | "extra" | "multilib")
-                && assessment.coverage.unknown_reason() == Some(UnknownCoverage::SourceNotCovered)
-            {
-                standard_arch_untracked = true;
-            }
             let identity = (
                 &package.name,
                 &package.version,
@@ -95,6 +89,12 @@ impl AdvisoryRiskReview {
             let source_line = serde_json::to_string(&assessment.coverage.provenance())?;
             if displayed_sources.insert(source_line.clone()) {
                 let _ = writeln!(details, "Source: {source_line}");
+            }
+            if let SecurityOrigin::OtherRepository { repository } = &package.origin
+                && matches!(repository.as_str(), "core" | "extra" | "multilib")
+                && assessment.coverage.unknown_reason() == Some(UnknownCoverage::SourceNotCovered)
+            {
+                standard_arch_untracked = true;
             }
         }
         if standard_arch_untracked {
