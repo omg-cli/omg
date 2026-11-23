@@ -1139,21 +1139,16 @@ async fn check_internet(
         return Ok(endpoints[0].0);
     }
     // The detailed mirror probe already uses five seconds. Start both sites
-    // together so the basic check has the same ceiling, even when one stalls,
-    // and retry once if a transient timeout/5xx hit both probes simultaneously.
-    probe_internet_endpoints(endpoints).await
+    // together so the basic check has the same ceiling, even when one stalls.
+    probe_connectivity(shared_client(), endpoints, Duration::from_secs(5)).await
 }
 
-async fn probe_internet_endpoints(
+async fn probe_connectivity(
+    client: &reqwest::Client,
     endpoints: [(&'static str, &str); 2],
+    deadline: Duration,
 ) -> std::result::Result<&'static str, [(&'static str, EndpointProbe); 2]> {
-    probe_connectivity_with_retry(
-        shared_client(),
-        endpoints,
-        Duration::from_secs(5),
-        Duration::from_millis(250),
-    )
-    .await
+    probe_connectivity_with_retry(client, endpoints, deadline, Duration::from_millis(250)).await
 }
 
 async fn probe_connectivity_with_retry(
@@ -1162,17 +1157,17 @@ async fn probe_connectivity_with_retry(
     deadline: Duration,
     backoff: Duration,
 ) -> std::result::Result<&'static str, [(&'static str, EndpointProbe); 2]> {
-    match probe_connectivity(client, endpoints, deadline).await {
+    match probe_connectivity_once(client, endpoints, deadline).await {
         Ok(name) => Ok(name),
         Err(failures) if failures.iter().any(|(_, probe)| probe.is_transient()) => {
             tokio::time::sleep(backoff).await;
-            probe_connectivity(client, endpoints, deadline).await
+            probe_connectivity_once(client, endpoints, deadline).await
         }
         Err(failures) => Err(failures),
     }
 }
 
-async fn probe_connectivity(
+async fn probe_connectivity_once(
     client: &reqwest::Client,
     [(first_name, first_url), (second_name, second_url)]: [(&'static str, &str); 2],
     deadline: Duration,
@@ -2100,7 +2095,7 @@ mod tests {
         let (first_url, first_server) = serve_probe_response(ERROR, Duration::ZERO).await;
         let (second_url, second_server) = serve_probe_response(ERROR, Duration::ZERO).await;
         assert_eq!(
-            probe_connectivity(
+            probe_connectivity_once(
                 &client,
                 [("primary", &first_url), ("alternate", &second_url)],
                 Duration::from_secs(1)
@@ -2133,7 +2128,7 @@ mod tests {
             let (alternate_url, alternate_server) =
                 serve_probe_response(ALTERNATE, alternate_delay).await;
             assert_eq!(
-                probe_connectivity(
+                probe_connectivity_once(
                     &client,
                     [("primary", &primary_url), ("alternate", &alternate_url)],
                     Duration::from_secs(1)
@@ -2265,7 +2260,12 @@ mod tests {
         let (ep1_url, ep1_server) = serve_probe_response(OK, Duration::ZERO).await;
         let (ep2_url, ep2_server) = serve_probe_response(OK, Duration::from_secs(1)).await;
         assert_eq!(
-            probe_internet_endpoints([("primary", &ep1_url), ("alternate", &ep2_url)]).await,
+            probe_connectivity(
+                &client,
+                [("primary", &ep1_url), ("alternate", &ep2_url)],
+                Duration::from_secs(1),
+            )
+            .await,
             Ok("primary")
         );
         finish_probe_server(ep1_server).await;

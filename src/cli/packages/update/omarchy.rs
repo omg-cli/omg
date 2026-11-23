@@ -521,6 +521,7 @@ struct NativeMigrationFixture {
     failure: Option<NativeOmarchyOperation>,
     desktop_database_program: &'static str,
     helper_overrides: std::collections::BTreeMap<&'static str, PathBuf>,
+    absent_optional_helpers: std::collections::BTreeSet<&'static str>,
     installed_packages: Option<std::collections::BTreeSet<&'static str>>,
     sudo_program: Option<PathBuf>,
 }
@@ -685,12 +686,13 @@ impl Commands {
     )]
     fn resolve_optional_helper(&self, name: &str) -> Option<PathBuf> {
         #[cfg(test)]
-        if let Some(path) = self
-            .native_fixture
-            .as_ref()
-            .and_then(|fixture| fixture.helper_overrides.get(name))
-        {
-            return Some(path.clone());
+        if let Some(fixture) = self.native_fixture.as_ref() {
+            if fixture.absent_optional_helpers.contains(name) {
+                return None;
+            }
+            if let Some(path) = fixture.helper_overrides.get(name) {
+                return Some(path.clone());
+            }
         }
         crate::core::privilege::root_controlled_program_path(name).ok()
     }
@@ -7088,16 +7090,16 @@ omarchy-state set reboot-required
         write_test_executable(&state_ok, "#!/bin/sh\nexit 0\n");
         let sudo_ok = owner.path().join("sudo-ok");
         write_test_executable(&sudo_ok, "#!/bin/sh\nexit 0\n");
-        let mut matched = Commands::new(false, runtime);
+        let mut matched = Commands::new(false, runtime.clone());
         matched.native_fixture = Some(NativeMigrationFixture {
             helper_overrides: std::collections::BTreeMap::from([
-                ("omarchy-hw-facetimehd", hw_hit),
+                ("omarchy-hw-facetimehd", hw_hit.clone()),
                 ("omarchy-state", state_ok),
             ]),
             installed_packages: Some(std::collections::BTreeSet::from([
                 "facetimehd-firmware-fetcher",
             ])),
-            sudo_program: Some(sudo_ok),
+            sudo_program: Some(sudo_ok.clone()),
             ..Default::default()
         });
         matched
@@ -7107,6 +7109,29 @@ omarchy-state set reboot-required
         assert_eq!(
             matched.native_fixture.as_ref().unwrap().operations,
             vec![NativeOmarchyOperation::InstallFacetimeHd]
+        );
+
+        let mut preinstalled = Commands::new(false, runtime);
+        preinstalled.native_fixture = Some(NativeMigrationFixture {
+            helper_overrides: std::collections::BTreeMap::from([("omarchy-hw-facetimehd", hw_hit)]),
+            installed_packages: Some(std::collections::BTreeSet::from([
+                "bcwc-pcie",
+                "facetimehd-firmware",
+            ])),
+            sudo_program: Some(sudo_ok),
+            ..Default::default()
+        });
+        preinstalled
+            .run_native_migration(NativeMigration::FacetimeHdCamera, None)
+            .await
+            .expect("preinstalled facetimehd hardware skips package install and fetcher service");
+        assert!(
+            preinstalled
+                .native_fixture
+                .as_ref()
+                .unwrap()
+                .operations
+                .is_empty()
         );
     }
 
@@ -7165,10 +7190,10 @@ omarchy-state set reboot-required
             &mise_declared,
             "#!/bin/sh\nprintf '[{\"version\":\"1.0\",\"source\":{\"type\":\"mise.toml\"}}]'\n",
         );
-        let mut pi_declared = Commands::new(false, runtime);
+        let mut pi_declared = Commands::new(false, runtime.clone());
         pi_declared.native_fixture = Some(NativeMigrationFixture {
             helper_overrides: std::collections::BTreeMap::from([
-                ("omarchy-mise-default-tools", default_tools),
+                ("omarchy-mise-default-tools", default_tools.clone()),
                 ("mise", mise_declared),
             ]),
             ..Default::default()
@@ -7177,6 +7202,53 @@ omarchy-state set reboot-required
             .run_native_migration(NativeMigration::PiCodingAgent, None)
             .await
             .expect("pi migration keeps user-declared mise tool");
+
+        let mise_empty = owner.path().join("mise-empty");
+        write_test_executable(
+            &mise_empty,
+            "#!/bin/sh\nif [ \"$1\" = ls ]; then printf '[]'; fi\nexit 0\n",
+        );
+        let mut pi_empty = Commands::new(false, runtime.clone());
+        pi_empty.native_fixture = Some(NativeMigrationFixture {
+            helper_overrides: std::collections::BTreeMap::from([
+                ("omarchy-mise-default-tools", default_tools.clone()),
+                ("mise", mise_empty),
+            ]),
+            ..Default::default()
+        });
+        pi_empty
+            .run_native_migration(NativeMigration::PiCodingAgent, None)
+            .await
+            .expect("pi migration skips uninstall when mise list is empty");
+
+        let mise_fail = owner.path().join("mise-fail");
+        write_test_executable(&mise_fail, "#!/bin/sh\nexit 1\n");
+        let mut pi_mise_fail = Commands::new(false, runtime.clone());
+        pi_mise_fail.native_fixture = Some(NativeMigrationFixture {
+            helper_overrides: std::collections::BTreeMap::from([
+                ("omarchy-mise-default-tools", default_tools.clone()),
+                ("mise", mise_fail),
+            ]),
+            ..Default::default()
+        });
+        pi_mise_fail
+            .run_native_migration(NativeMigration::PiCodingAgent, None)
+            .await
+            .expect("pi migration tolerates non-zero mise ls exit");
+
+        let mut pi_no_mise = Commands::new(false, runtime);
+        pi_no_mise.native_fixture = Some(NativeMigrationFixture {
+            helper_overrides: std::collections::BTreeMap::from([(
+                "omarchy-mise-default-tools",
+                default_tools,
+            )]),
+            absent_optional_helpers: std::collections::BTreeSet::from(["mise"]),
+            ..Default::default()
+        });
+        pi_no_mise
+            .run_native_migration(NativeMigration::PiCodingAgent, None)
+            .await
+            .expect("pi migration succeeds when mise is absent");
     }
 
     #[test]
