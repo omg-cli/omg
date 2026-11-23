@@ -277,5 +277,82 @@ class DownloadMemberBehaviorTests(unittest.TestCase):
                 self.download(Path(directory) / "download", attempt=3, producer_attempt=2,
                               changed_carried_owner=True)
 
+
+class DiffCoverageTests(unittest.TestCase):
+    def _run_diff_coverage(self, base_lcov, head_lcov, base_src, head_src):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = root / "repo"
+            repo.mkdir()
+            def git(*args):
+                return subprocess.check_output(
+                    ["git", "-c", "maintenance.auto=false", "-c", "gc.auto=0", "-C", str(repo), *args],
+                    stderr=subprocess.DEVNULL,
+                ).decode().strip()
+            git("init")
+            (repo / "src").mkdir()
+            (repo / "src/lib.rs").write_text(base_src, encoding="utf-8")
+            git("add", ".")
+            git("-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "base")
+            base_sha = git("rev-parse", "HEAD")
+            (repo / "src/lib.rs").write_text(head_src, encoding="utf-8")
+            git("add", ".")
+            git("-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "head")
+            head_sha = git("rev-parse", "HEAD")
+            base_file = root / "base.info"
+            head_file = root / "head.info"
+            base_file.write_text(base_lcov, encoding="utf-8")
+            head_file.write_text(head_lcov, encoding="utf-8")
+            return subprocess.run(
+                [sys.executable, str(Path(__file__).with_name("check-line-coverage.py")),
+                 "--diff-coverage",
+                 "--base", str(base_file), "--head", str(head_file),
+                 "--source-repo", str(repo), "--base-sha", base_sha, "--head-sha", head_sha],
+                capture_output=True, text=True,
+            )
+
+    def test_diff_coverage_passes_when_changed_lines_hit_and_no_regression(self):
+        base_lcov = "SF:/repo/src/lib.rs\nDA:1,1\nDA:2,0\nLF:2\nLH:1\nend_of_record\n"
+        head_lcov = "SF:/repo/src/lib.rs\nDA:1,1\nDA:2,0\nDA:3,1\nLF:3\nLH:2\nend_of_record\n"
+        result = self._run_diff_coverage(
+            base_lcov, head_lcov,
+            "pub fn a() {}\npub fn b() {}\n",
+            "pub fn a() {}\npub fn b() {}\npub fn c() {}\n",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("PASS: complete line coverage meets the exact base report", result.stdout)
+        self.assertIn('"checked_changed_instrumented_lines": 1', result.stdout)
+
+    def test_diff_coverage_rejects_new_uncovered_changed_line(self):
+        base_lcov = "SF:/repo/src/lib.rs\nDA:1,1\nDA:2,1\nLF:2\nLH:2\nend_of_record\n"
+        head_lcov = "SF:/repo/src/lib.rs\nDA:1,1\nDA:2,1\nDA:3,0\nLF:3\nLH:2\nend_of_record\n"
+        result = self._run_diff_coverage(
+            base_lcov, head_lcov,
+            "pub fn a() {}\npub fn b() {}\n",
+            "pub fn a() {}\npub fn b() {}\npub fn c() {}\n",
+        )
+        self.assertNotEqual(result.returncode, 0)
+        # Fails on overall regression or uncovered line; test explicit uncovered line with non-regressing overall ratio
+        base_lcov2 = "SF:/repo/src/lib.rs\nDA:1,1\nDA:2,0\nDA:3,0\nLF:3\nLH:1\nend_of_record\n"
+        head_lcov2 = "SF:/repo/src/lib.rs\nDA:1,1\nDA:2,1\nDA:3,0\nDA:4,0\nLF:4\nLH:2\nend_of_record\n"
+        result2 = self._run_diff_coverage(
+            base_lcov2, head_lcov2,
+            "pub fn a() {}\npub fn b() {}\npub fn c() {}\n",
+            "pub fn a() {}\npub fn b() {}\npub fn c() {}\npub fn d() {}\n",
+        )
+        self.assertNotEqual(result2.returncode, 0)
+        self.assertIn("New uncovered instrumented lines (1): src/lib.rs:4", result2.stderr)
+
+    def test_diff_coverage_rejects_overall_regression(self):
+        base_lcov = "SF:/repo/src/lib.rs\nDA:1,1\nDA:2,1\nLF:2\nLH:2\nend_of_record\n"
+        head_lcov = "SF:/repo/src/lib.rs\nDA:1,1\nDA:2,0\nDA:3,1\nLF:3\nLH:2\nend_of_record\n"
+        result = self._run_diff_coverage(
+            base_lcov, head_lcov,
+            "pub fn a() {}\npub fn b() {}\n",
+            "pub fn a() {}\npub fn b() {}\npub fn c() {}\n",
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Line coverage decreased", result.stderr)
+
 if __name__ == "__main__":
     unittest.main()
