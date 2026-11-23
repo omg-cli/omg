@@ -1,0 +1,65 @@
+{
+  "data": [
+    {
+      "count": 18,
+      "path": "/omg-cli/omg",
+      "title": "Overview",
+      "uniques": 10
+    },
+    {
+      "count": 2,
+      "path": "/omg-cli/omg/actions/workflows/ci.yml",
+      "title": "/actions/workflows/ci.yml",
+      "uniques": 1
+    },
+    {
+      "count": 2,
+      "path": "/omg-cli/omg/pulls",
+      "title": "/pulls",
+      "uniques": 1
+    },
+    {
+      "count": 1,
+      "path": "/omg-cli/omg/actions/runs/42920226022",
+      "title": "/actions/runs/42920226022",
+      "uniques": 1
+    },
+    {
+      "count": 1,
+      "path": "/omg-cli/omg/actions/runs/42934882536",
+      "title": "/actions/runs/42934882536",
+      "uniques": 1
+    },
+    {
+      "count": 1,
+      "path": "/omg-cli/omg/blob/main/docs/faq.md",
+      "title": "/blob/main/docs/faq.md",
+      "uniques": 1
+    },
+    {
+      "count": 1,
+      "path": "/omg-cli/omg/issues",
+      "title": "/issues",
+      "uniques": 1
+    },
+    {
+      "count": 1,
+      "path": "/omg-cli/omg/issues/450",
+      "title": "/issues/450",
+      "uniques": 1
+    },
+    {
+      "count": 1,
+      "path": "/omg-cli/omg/issues/611",
+      "title": "/issues/611",
+      "uniques": 1
+    },
+    {
+      "count": 1,
+      "path": "/omg-cli/omg/pull/1057",
+      "title": "/pull/1057",
+      "uniques": 1
+    }
+  ],
+  "date": "2026-11-23"
+}
