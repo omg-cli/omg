@@ -8,7 +8,7 @@
     "build": "wrangler deploy --dry-run --outdir dist"
   },
   "dependencies": {
-    "@ai-sdk/provider": "4.0.31",
+    "@ai-sdk/provider": "4.0.35",
     "@opencode/plugin": "2.2.5",
     "@opencode/schema": "2.2.5",
     "@opencode/sdk": "2.2.5",
