@@ -50,8 +50,6 @@ env:
   CARGO_PROFILE_TEST_LTO: "off"
   CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
   CARGO_PROFILE_TEST_DEBUG: "line-tables-only"
-  CARGO_PROFILE_RELEASE_LTO: ${{ github.event_name == 'pull_request' && 'thin' || 'fat' }}
-  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: ${{ github.event_name == 'pull_request' && '16' || '1' }}
 
 jobs:
   #############################################################################

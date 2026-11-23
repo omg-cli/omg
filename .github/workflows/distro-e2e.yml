@@ -52,7 +52,7 @@ jobs:
           - distro: arch
             arch: x86_64
             runner: ubuntu-24.04
-            image: archlinux:latest
+            image: archlinux:latest@sha256:f3691b4dde62ba4c4b6f0ae2c1fbf28e8c0c8c4b9a35c7e06dc1f70e21aa29f6
             features: "arch,pgp,license"
           - distro: debian
             arch: x86_64
@@ -72,7 +72,7 @@ jobs:
           - distro: fedora
             arch: x86_64
             runner: ubuntu-24.04
-            image: fedora:latest
+            image: fedora:latest@sha256:6c75d5bf57cb0fa5aa4b92c6a83c86c791644496d9ac230de7711f5b8ec3b898
             features: "fedora,pgp,license"
           # Native ARM64 lanes — run directly on GitHub's ubuntu-24.04-arm runner without /dev/kvm!
           - distro: debian
@@ -88,7 +88,7 @@ jobs:
           - distro: fedora
             arch: aarch64
             runner: ubuntu-24.04-arm
-            image: fedora:latest
+            image: fedora:latest@sha256:e402cca673711fee025f9ce21c6c08b1bd25ee26b3c482119c8675fbaaedbc85
             features: "fedora,pgp,license"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -112,7 +112,7 @@ jobs:
                 build-essential pkg-config libssl-dev curl ca-certificates python3 mold
               ;;
             fedora)
-              dnf install -y gcc gcc-c++ make pkgconf-pkg-config openssl-devel curl ca-certificates python3 mold
+              dnf install -y gcc gcc-c++ make pkgconf-pkg-config openssl-devel curl ca-certificates python3 mold perl-core
               ;;
             *)
               echo "Unsupported distro: $MATRIX_DISTRO" >&2

@@ -27,7 +27,7 @@ OMG follows a 4-tier CI/CD model aligned with modern Rust systems and package-ma
 To overcome Rust compile times across 219k lines of source and multiple distro targets:
 1. **Dedicated `[profile.ci]` (`Cargo.toml`):** Uses `debug = "line-tables-only"` (cuts DWARF object size and link latency while preserving full file/line backtraces), `incremental = false` (maximizes `sccache` reuse), and `opt-level = 0` on dependencies for E2E checks.
 2. **Fast Linking & Uncapped Cores:** Removed the hard-coded `jobs = 5` cap in `.cargo/config.toml` and enabled `mold` (`-C link-arg=-fuse-ld=mold`) on Linux container E2E builds.
-3. **PR vs. Main LTO Split (`ci.yml`):** Pull requests override release validation builds to `CARGO_PROFILE_RELEASE_LTO=thin` and `CODEGEN_UNITS=16`, while `main`, `merge_group`, and `release.yml` retain full `fat` LTO + `codegen-units = 1`.
+3. **Debuginfo & Release Parity (`ci.yml`):** Sets `CARGO_PROFILE_DEV_DEBUG=line-tables-only` and `CARGO_PROFILE_TEST_DEBUG=line-tables-only` across CI while preserving exact `[profile.release]` (`fat` LTO + `codegen-units = 1`) required by native release admission.
 4. **Scoped Container Triggers (`distro-e2e.yml`):** PRs only rebuild the 8-target container matrix when native package backends, `doctor.rs`, daemon code, or build definitions change; `push` to `main` and `merge_group` always run the full matrix.
 5. **Cloudflare R2 Scaling Roadmap:**
    - **Shared `sccache` on R2 (`omg-ci-compiler-cache`):** Zero-egress distributed compiler caching across `ci.yml` and `distro-e2e.yml`.
