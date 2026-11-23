@@ -58,17 +58,17 @@ jobs:
             arch: x86_64
             runner: ubuntu-24.04
             image: debian:bookworm
-            features: "debian-pure,pgp,license"
+            features: "debian,pgp,license"
           - distro: debian-trixie
             arch: x86_64
             runner: ubuntu-24.04
             image: debian:trixie
-            features: "debian-pure,pgp,license"
+            features: "debian,pgp,license"
           - distro: ubuntu
             arch: x86_64
             runner: ubuntu-24.04
             image: ubuntu:24.04
-            features: "debian-pure,pgp,license"
+            features: "debian,pgp,license"
           - distro: fedora
             arch: x86_64
             runner: ubuntu-24.04
@@ -79,12 +79,12 @@ jobs:
             arch: aarch64
             runner: ubuntu-24.04-arm
             image: debian:bookworm
-            features: "debian-pure,pgp,license"
+            features: "debian,pgp,license"
           - distro: ubuntu
             arch: aarch64
             runner: ubuntu-24.04-arm
             image: ubuntu:24.04
-            features: "debian-pure,pgp,license"
+            features: "debian,pgp,license"
           - distro: fedora
             arch: aarch64
             runner: ubuntu-24.04-arm
@@ -109,7 +109,7 @@ jobs:
             debian|debian-trixie|ubuntu)
               apt-get update -qq
               DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-                build-essential pkg-config libssl-dev libclang-dev curl ca-certificates python3 mold
+                build-essential pkg-config libssl-dev libapt-pkg-dev libclang-dev curl ca-certificates python3 mold
               ;;
             fedora)
               dnf install -y gcc gcc-c++ make pkgconf-pkg-config openssl-devel clang-devel curl ca-certificates python3 mold perl-core
@@ -201,7 +201,7 @@ jobs:
           set -euo pipefail
           test -d /run/systemd/system && systemctl is-system-running --wait || systemctl status --no-pager | head -n 5
           sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends mold libclang-dev
+          sudo apt-get install -y --no-install-recommends mold libclang-dev libapt-pkg-dev
 
       - name: Set up Rust toolchain
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
@@ -214,7 +214,7 @@ jobs:
           key: systemd-daemon-ubuntu-x86_64
 
       - name: Build omg and omgd
-        run: cargo build --profile ci --locked --no-default-features --features "debian-pure,pgp,license" --bin omg --bin omgd
+        run: cargo build --profile ci --locked --no-default-features --features "debian,pgp,license" --bin omg --bin omgd
 
       - name: Verify omgd lifecycle and socket IPC on real systemd host
         shell: bash
@@ -222,6 +222,8 @@ jobs:
           set -euo pipefail
           state="$(mktemp -d)"
           trap 'kill "${DAEMON_PID:-}" 2>/dev/null || true; rm -rf -- "$state"' EXIT
+          mkdir -m 700 "$state/run"
+          export XDG_RUNTIME_DIR="$state/run"
           export OMG_DATA_DIR="$state/data"
           export OMG_CONFIG_DIR="$state/config"
           export OMG_CACHE_DIR="$state/cache"

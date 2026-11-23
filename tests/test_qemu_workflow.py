@@ -505,14 +505,18 @@ exit "$rc"
         }
         for name, expression in expressions.items():
             with self.subTest(boundary=name):
-                expression = expression.replace('!cancelled()', '0 == 0').replace('github.event_name', "'merge_group'").replace(
-                    'needs.quick-gate.outputs.should-build', "'false'").replace('inputs.staged', '0 == 1').replace(
-                    'needs.quick-gate.result', "'success'")
+                if name in ('producer', 'required'):
+                    expression = expression.replace('!cancelled()', '0 == 0').replace('github.event_name', "'workflow_dispatch'").replace(
+                        "inputs['run-qemu']", 'true').replace('needs.quick-gate.result', "'success'")
+                else:
+                    expression = expression.replace('!cancelled()', '0 == 0').replace('github.event_name', "'merge_group'").replace(
+                        'needs.quick-gate.outputs.should-build', "'false'").replace('inputs.staged', '0 == 1').replace(
+                        'needs.quick-gate.result', "'success'")
                 result = subprocess.run([self.bash, '-c', '[[ ' + expression + ' ]]'],
                                         text=True, capture_output=True, timeout=5)
                 self.assertEqual(result.returncode, 0, result.stderr)
-        producer = expressions['producer'].replace('!cancelled()', '0 == 0').replace('github.event_name', "'merge_group'").replace(
-            'needs.quick-gate.outputs.should-build', "'false'")
+        producer = expressions['producer'].replace('!cancelled()', '0 == 0').replace('github.event_name', "'workflow_dispatch'").replace(
+            "inputs['run-qemu']", 'true')
         for quick_gate, expected in (('success', 0), ('failure', 1), ('skipped', 1)):
             with self.subTest(quick_gate=quick_gate):
                 expression = producer.replace('needs.quick-gate.result', repr(quick_gate))
