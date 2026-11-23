@@ -1951,6 +1951,7 @@ OMARCHY_CASE_SETUP
     OMG_PACMAN_CONF="$case_dir/pacman.conf" OMG_PACMAN_DB_DIR="$signed_owner/db" \
     "${omarchy_environment[@]}" OMARCHY_MIGRATION_STATE="$case_dir/migrations" \
     OMARCHY_FIXTURE_CASE="$stage" OMARCHY_FIXTURE_SCENE="$scene" OMARCHY_HELPER_TRACE="$case_dir/helpers.tsv" \
+    OMARCHY_UPDATE_FORCE=1 \
     LLVM_PROFILE_FILE="/profiles/omg-extra-$stage-%p-%m.profraw" "${extra[@]}" \
     "${launch[@]}" < /dev/null > "/evidence/cli/$stage.log" 2>&1 || result=$?
   case "$scene" in
