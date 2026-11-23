@@ -716,11 +716,13 @@ where
                     validator: validator.clone(),
                 })
             });
+            let next_attempt = attempt + 1;
+            let retained_bytes = resume.as_ref().map_or(0, |range| range.offset);
             tracing::warn!(
-                attempt = attempt + 1,
+                attempt = next_attempt,
                 host,
                 bytes_received = received_this_attempt,
-                retained_bytes = resume.as_ref().map_or(0, |range| range.offset),
+                retained_bytes,
                 "Runtime download stalled below minimum throughput; retrying bounded download"
             );
             tokio::time::sleep(crate::core::http::retry_backoff(
@@ -2718,7 +2720,8 @@ mod tests {
             name,
             rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NOFOLLOW,
             rustix::fs::Mode::empty(),
-        )?;
+        )
+        .expect("open downloaded runtime temp file");
         let mut written = Vec::new();
         File::from(handle).read_to_end(&mut written)?;
         assert_eq!(written, payload);

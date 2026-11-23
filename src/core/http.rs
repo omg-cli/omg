@@ -393,10 +393,7 @@ fn is_refused_http2_stream_message(message: &str) -> bool {
         || message.contains("REFUSED_STREAM")
 }
 
-fn is_refused_http2_stream(error: &reqwest::Error) -> bool {
-    if !error.is_request() {
-        return false;
-    }
+fn error_chain_has_refused_http2_stream(error: &(dyn std::error::Error + 'static)) -> bool {
     let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
     while let Some(current) = source {
         if is_refused_http2_stream_message(&current.to_string()) {
@@ -405,6 +402,10 @@ fn is_refused_http2_stream(error: &reqwest::Error) -> bool {
         source = current.source();
     }
     false
+}
+
+fn is_refused_http2_stream(error: &reqwest::Error) -> bool {
+    error.is_request() && error_chain_has_refused_http2_stream(error)
 }
 
 /// Whether a request transport failure is safe to retry.
@@ -646,6 +647,36 @@ mod tests {
             "http2 error: REFUSED_STREAM"
         ));
         assert!(!is_refused_http2_stream_message("connection reset by peer"));
+
+        #[derive(Debug)]
+        struct TestError {
+            message: &'static str,
+            inner: Option<Box<dyn std::error::Error + 'static>>,
+        }
+        impl std::fmt::Display for TestError {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str(self.message)
+            }
+        }
+        impl std::error::Error for TestError {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                self.inner.as_deref()
+            }
+        }
+
+        let refused = TestError {
+            message: "client error (SendRequest)",
+            inner: Some(Box::new(TestError {
+                message: "http2 error: REFUSED_STREAM",
+                inner: None,
+            })),
+        };
+        assert!(error_chain_has_refused_http2_stream(&refused));
+        let reset = TestError {
+            message: "connection reset by peer",
+            inner: None,
+        };
+        assert!(!error_chain_has_refused_http2_stream(&reset));
     }
 
     #[test]

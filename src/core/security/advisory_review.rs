@@ -1018,18 +1018,18 @@ mod tests {
         for repo in ["core", "extra", "multilib"] {
             let review = AdvisoryRiskReview::new_with_unknown(&[make(repo)], "upgrade")?
                 .context("untracked standard repo review")?;
+            let details = review.details();
             assert!(
-                review.details().contains("arch_advisory_repositories"),
-                "expected policy hint for {repo}: {}",
-                review.details()
+                details.contains("arch_advisory_repositories"),
+                "expected policy hint for {repo}: {details}"
             );
         }
         let omarchy = AdvisoryRiskReview::new_with_unknown(&[make("omarchy")], "upgrade")?
             .context("untracked omarchy repo review")?;
+        let omarchy_details = omarchy.details();
         assert!(
-            !omarchy.details().contains("arch_advisory_repositories"),
-            "did not expect standard Arch policy hint for omarchy: {}",
-            omarchy.details()
+            !omarchy_details.contains("arch_advisory_repositories"),
+            "did not expect standard Arch policy hint for omarchy: {omarchy_details}"
         );
         Ok(())
     }

@@ -23,6 +23,7 @@ pub enum NativeOmarchyOperation {
     InstallFacetimeHd,
     InstallPiCodingAgent,
     InstallKmscon,
+    InstallPodmanAndCrun,
 }
 
 impl NativeOmarchyOperation {
@@ -40,6 +41,7 @@ impl NativeOmarchyOperation {
             "migration-facetimehd" => Some(Self::InstallFacetimeHd),
             "migration-pi-coding-agent" => Some(Self::InstallPiCodingAgent),
             "migration-kmscon" => Some(Self::InstallKmscon),
+            "migration-podman-crun" => Some(Self::InstallPodmanAndCrun),
             _ => None,
         }
     }
@@ -58,6 +60,7 @@ impl NativeOmarchyOperation {
             Self::InstallFacetimeHd => "migration-facetimehd",
             Self::InstallPiCodingAgent => "migration-pi-coding-agent",
             Self::InstallKmscon => "migration-kmscon",
+            Self::InstallPodmanAndCrun => "migration-podman-crun",
         }
     }
 }
@@ -165,42 +168,16 @@ pub fn execute_native_omarchy_operation(
         }
         NativeOmarchyOperation::UpgradeRepositories => Vec::new(),
         NativeOmarchyOperation::RemoveOrphans => super::list_orphans_direct()?,
-        NativeOmarchyOperation::InstallTrayMenuDependency => missing_package_target("xorg-xrandr")?,
-        NativeOmarchyOperation::InstallOmnibookAudio => {
-            missing_package_target("hp-omnibook-3-audio")?
+        NativeOmarchyOperation::InstallTrayMenuDependency
+        | NativeOmarchyOperation::InstallOmnibookAudio
+        | NativeOmarchyOperation::InstallMediaViewer
+        | NativeOmarchyOperation::RemoveLegacyMediaViewers
+        | NativeOmarchyOperation::InstallFacetimeHd
+        | NativeOmarchyOperation::InstallPiCodingAgent
+        | NativeOmarchyOperation::InstallKmscon
+        | NativeOmarchyOperation::InstallPodmanAndCrun => {
+            resolve_install_targets(operation, super::is_installed_fast)?
         }
-        NativeOmarchyOperation::InstallMediaViewer => missing_package_target("omaview")?,
-        NativeOmarchyOperation::RemoveLegacyMediaViewers => {
-            anyhow::ensure!(
-                super::is_installed_fast("omaview")?,
-                "Omaview must be installed before removing its legacy packages"
-            );
-            let mut names = Vec::new();
-            for name in ["imv", "mpv-mpris"] {
-                if super::is_installed_fast(name)? {
-                    names.push(name.to_owned());
-                }
-            }
-            names
-        }
-        NativeOmarchyOperation::InstallFacetimeHd => {
-            let mut names = Vec::new();
-            if !super::is_installed_fast("facetimehd-dkms")?
-                && !super::is_installed_fast("bcwc-pcie")?
-                && !super::is_installed_fast("bcwc-pcie-dkms")?
-            {
-                names.push("facetimehd-dkms".to_owned());
-            }
-            if !super::is_installed_fast("facetimehd-firmware")?
-                && !super::is_installed_fast("bcwc-pcie-firmware")?
-                && !super::is_installed_fast("facetimehd-firmware-fetcher")?
-            {
-                names.push("facetimehd-firmware-fetcher".to_owned());
-            }
-            names
-        }
-        NativeOmarchyOperation::InstallPiCodingAgent => missing_package_target("pi-coding-agent")?,
-        NativeOmarchyOperation::InstallKmscon => missing_package_target("kmscon")?,
     };
     if operation == NativeOmarchyOperation::RefreshKeyrings {
         tokio::runtime::Builder::new_current_thread()
@@ -268,12 +245,80 @@ pub fn execute_native_omarchy_operation(
     Ok(())
 }
 
-fn missing_package_target(name: &str) -> AnyhowResult<Vec<String>> {
-    Ok(if super::is_installed_fast(name)? {
+fn missing_package_target(
+    name: &str,
+    is_installed: &mut impl FnMut(&str) -> AnyhowResult<bool>,
+) -> AnyhowResult<Vec<String>> {
+    Ok(if is_installed(name)? {
         Vec::new()
     } else {
         vec![name.to_owned()]
     })
+}
+
+fn resolve_install_targets(
+    operation: NativeOmarchyOperation,
+    mut is_installed: impl FnMut(&str) -> AnyhowResult<bool>,
+) -> AnyhowResult<Vec<String>> {
+    match operation {
+        NativeOmarchyOperation::InstallTrayMenuDependency => {
+            missing_package_target("xorg-xrandr", &mut is_installed)
+        }
+        NativeOmarchyOperation::InstallOmnibookAudio => {
+            missing_package_target("hp-omnibook-3-audio", &mut is_installed)
+        }
+        NativeOmarchyOperation::InstallMediaViewer => {
+            missing_package_target("omaview", &mut is_installed)
+        }
+        NativeOmarchyOperation::RemoveLegacyMediaViewers => {
+            anyhow::ensure!(
+                is_installed("omaview")?,
+                "Omaview must be installed before removing its legacy packages"
+            );
+            let mut names = Vec::new();
+            for name in ["imv", "mpv-mpris"] {
+                if is_installed(name)? {
+                    names.push(name.to_owned());
+                }
+            }
+            Ok(names)
+        }
+        NativeOmarchyOperation::InstallFacetimeHd => {
+            let mut names = Vec::new();
+            if !is_installed("facetimehd-dkms")?
+                && !is_installed("bcwc-pcie")?
+                && !is_installed("bcwc-pcie-dkms")?
+            {
+                names.push("facetimehd-dkms".to_owned());
+            }
+            if !is_installed("facetimehd-firmware")?
+                && !is_installed("bcwc-pcie-firmware")?
+                && !is_installed("facetimehd-firmware-fetcher")?
+            {
+                names.push("facetimehd-firmware-fetcher".to_owned());
+            }
+            Ok(names)
+        }
+        NativeOmarchyOperation::InstallPiCodingAgent => {
+            missing_package_target("pi-coding-agent", &mut is_installed)
+        }
+        NativeOmarchyOperation::InstallKmscon => {
+            missing_package_target("kmscon", &mut is_installed)
+        }
+        NativeOmarchyOperation::InstallPodmanAndCrun => {
+            let mut names = Vec::new();
+            for name in ["podman", "crun"] {
+                if !is_installed(name)? {
+                    names.push(name.to_owned());
+                }
+            }
+            Ok(names)
+        }
+        NativeOmarchyOperation::PruneCache
+        | NativeOmarchyOperation::RefreshKeyrings
+        | NativeOmarchyOperation::UpgradeRepositories
+        | NativeOmarchyOperation::RemoveOrphans => Ok(Vec::new()),
+    }
 }
 
 /// Arch Linux package manager (ALPM) implementation
@@ -1089,5 +1134,123 @@ pub(super) mod tests {
         assert_eq!(change.old_version.as_deref(), Some("1.2.3-1"));
         assert!(change.new_version.is_none());
         assert_eq!(change.source, "pacman");
+    }
+
+    #[test]
+    fn native_omarchy_operations_map_arguments_and_install_targets() {
+        let cases = [
+            (NativeOmarchyOperation::PruneCache, "cache-prune"),
+            (NativeOmarchyOperation::RefreshKeyrings, "keyring-refresh"),
+            (
+                NativeOmarchyOperation::UpgradeRepositories,
+                "repository-upgrade",
+            ),
+            (NativeOmarchyOperation::RemoveOrphans, "orphan-remove"),
+            (
+                NativeOmarchyOperation::InstallTrayMenuDependency,
+                "migration-xrandr",
+            ),
+            (
+                NativeOmarchyOperation::InstallOmnibookAudio,
+                "migration-omnibook-audio",
+            ),
+            (
+                NativeOmarchyOperation::InstallMediaViewer,
+                "migration-omaview-install",
+            ),
+            (
+                NativeOmarchyOperation::RemoveLegacyMediaViewers,
+                "migration-omaview-cleanup",
+            ),
+            (
+                NativeOmarchyOperation::InstallFacetimeHd,
+                "migration-facetimehd",
+            ),
+            (
+                NativeOmarchyOperation::InstallPiCodingAgent,
+                "migration-pi-coding-agent",
+            ),
+            (NativeOmarchyOperation::InstallKmscon, "migration-kmscon"),
+            (
+                NativeOmarchyOperation::InstallPodmanAndCrun,
+                "migration-podman-crun",
+            ),
+        ];
+        for (operation, expected) in cases {
+            assert_eq!(operation.argument(), expected);
+            assert_eq!(
+                NativeOmarchyOperation::from_argument(expected),
+                Some(operation)
+            );
+        }
+
+        assert_eq!(
+            resolve_install_targets(NativeOmarchyOperation::InstallTrayMenuDependency, |_| {
+                Ok(false)
+            })
+            .unwrap(),
+            vec!["xorg-xrandr"]
+        );
+        assert_eq!(
+            resolve_install_targets(NativeOmarchyOperation::InstallOmnibookAudio, |_| Ok(false))
+                .unwrap(),
+            vec!["hp-omnibook-3-audio"]
+        );
+        assert_eq!(
+            resolve_install_targets(NativeOmarchyOperation::InstallMediaViewer, |_| Ok(false))
+                .unwrap(),
+            vec!["omaview"]
+        );
+        assert_eq!(
+            resolve_install_targets(NativeOmarchyOperation::RemoveLegacyMediaViewers, |name| {
+                Ok(matches!(name, "omaview" | "imv"))
+            })
+            .unwrap(),
+            vec!["imv"]
+        );
+        assert!(
+            resolve_install_targets(NativeOmarchyOperation::RemoveLegacyMediaViewers, |_| {
+                Ok(false)
+            })
+            .is_err()
+        );
+        assert_eq!(
+            resolve_install_targets(NativeOmarchyOperation::InstallFacetimeHd, |_| Ok(false))
+                .unwrap(),
+            vec!["facetimehd-dkms", "facetimehd-firmware-fetcher"]
+        );
+        assert!(
+            resolve_install_targets(NativeOmarchyOperation::InstallFacetimeHd, |name| {
+                Ok(matches!(name, "bcwc-pcie" | "facetimehd-firmware"))
+            })
+            .unwrap()
+            .is_empty()
+        );
+        assert_eq!(
+            resolve_install_targets(NativeOmarchyOperation::InstallPiCodingAgent, |_| Ok(false))
+                .unwrap(),
+            vec!["pi-coding-agent"]
+        );
+        assert_eq!(
+            resolve_install_targets(NativeOmarchyOperation::InstallKmscon, |_| Ok(false)).unwrap(),
+            vec!["kmscon"]
+        );
+        assert_eq!(
+            resolve_install_targets(NativeOmarchyOperation::InstallPodmanAndCrun, |_| Ok(false))
+                .unwrap(),
+            vec!["podman", "crun"]
+        );
+        assert_eq!(
+            resolve_install_targets(NativeOmarchyOperation::InstallPodmanAndCrun, |name| {
+                Ok(name == "podman")
+            })
+            .unwrap(),
+            vec!["crun"]
+        );
+        assert!(
+            resolve_install_targets(NativeOmarchyOperation::PruneCache, |_| Ok(true))
+                .unwrap()
+                .is_empty()
+        );
     }
 }

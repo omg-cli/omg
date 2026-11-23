@@ -601,7 +601,8 @@ pub(crate) fn execute_omarchy_transaction(
         | NativeOmarchyOperation::InstallMediaViewer
         | NativeOmarchyOperation::InstallFacetimeHd
         | NativeOmarchyOperation::InstallPiCodingAgent
-        | NativeOmarchyOperation::InstallKmscon => TransactionKind::Install,
+        | NativeOmarchyOperation::InstallKmscon
+        | NativeOmarchyOperation::InstallPodmanAndCrun => TransactionKind::Install,
         NativeOmarchyOperation::UpgradeRepositories => TransactionKind::SystemUpgrade,
         NativeOmarchyOperation::RemoveOrphans
         | NativeOmarchyOperation::RemoveLegacyMediaViewers => {
