@@ -230,9 +230,12 @@ fn stage_command(stage: Stage) -> Option<(&'static str, &'static [&'static str])
         Stage::Mise => ("omarchy-update-mise", &[]),
         Stage::VerifyBoot => ("omarchy-update-boot", &[]),
         Stage::ReleaseInhibitor => ("omarchy-update-stay-awake", &["stop"]),
-        Stage::Preflight
-        | Stage::Confirm
-        | Stage::NativePackage(_)
+        #[expect(
+            clippy::match_same_arms,
+            reason = "keep native preflight/confirm distinct from package stages"
+        )]
+        Stage::Preflight | Stage::Confirm => return None,
+        Stage::NativePackage(_)
         | Stage::MigrationPreflight
         | Stage::NativeAur
         | Stage::ReleaseAuthorization
@@ -566,20 +569,20 @@ impl Commands {
             active: None,
             foreground: None,
             #[cfg(test)]
-            native_fixture: None,
-            #[cfg(test)]
             migration_overrides: None,
+            #[cfg(test)]
+            native_fixture: None,
         }
-    }
-
-    const fn with_attended(mut self, attended: bool) -> Self {
-        self.attended = attended;
-        self
     }
 
     async fn run_program(&mut self, program: &Path, args: &[&str]) -> Result<ExitStatus> {
         self.run_program_at(program, args, self.runtime.root.clone())
             .await
+    }
+
+    const fn with_attended(mut self, attended: bool) -> Self {
+        self.attended = attended;
+        self
     }
 
     async fn run_development_checkout(
@@ -4030,17 +4033,15 @@ omarchy-pkg-add kmscon
         recorder.calls.clear();
         recorder.fail = false;
         run_migration_plan(&plan, &markers, &mut recorder).await?;
-        assert_eq!(
-            recorder.calls,
-            [
-                "1794675791.sh",
-                "1794774234.sh",
-                "1795284903.sh",
-                "1795318856.sh",
-                "1795354955.sh",
-                "9999999999.sh"
-            ]
-        );
+        let expected_retry = [
+            "1794675791.sh",
+            "1794774234.sh",
+            "1795284903.sh",
+            "1795318856.sh",
+            "1795354955.sh",
+            "9999999999.sh",
+        ];
+        assert_eq!(recorder.calls, expected_retry);
         assert!(pending_migrations(&migrations, &markers)?.is_empty());
         recorder.calls.clear();
         run_migration_plan(&plan, &markers, &mut recorder).await?;
