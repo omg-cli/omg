@@ -204,10 +204,15 @@ fn display_security_audit(
             ui::print_success("No vulnerabilities found in assessed packages.");
         }
     } else {
-        ui::print_warning(format!(
-            "Found {} vulnerabilities ({} high severity)",
+        let summary = format!(
+            "Found {} vulnerabilities ({} high/critical severity).",
             res.total_vulnerabilities, res.high_severity
-        ));
+        );
+        if res.high_severity > 0 {
+            ui::print_critical_card("Vulnerabilities Detected", &summary);
+        } else {
+            ui::print_warning_card("Vulnerabilities Detected", &summary);
+        }
         println!();
         for (pkg, vulns) in res.vulnerabilities {
             println!(
@@ -442,18 +447,19 @@ pub fn view_audit_log(
 
     for entry in entries.iter().take(effective_limit) {
         let sev_str = entry.severity.to_string();
-        let severity_color = match entry.severity {
-            AuditSeverity::Debug => style::dim(&sev_str),
-            AuditSeverity::Info => style::maybe_color(&sev_str, |t| t.blue().to_string()),
-            AuditSeverity::Warning => style::maybe_color(&sev_str, |t| t.yellow().to_string()),
-            AuditSeverity::Error => style::maybe_color(&sev_str, |t| t.red().to_string()),
-            AuditSeverity::Critical => style::maybe_color(&sev_str, |t| t.red().bold().to_string()),
+        let severity_badge = match entry.severity {
+            AuditSeverity::Debug => ui::render_badge(ui::BadgeTone::Neutral, &sev_str),
+            AuditSeverity::Info => ui::render_badge(ui::BadgeTone::Info, &sev_str),
+            AuditSeverity::Warning => ui::render_badge(ui::BadgeTone::Warning, &sev_str),
+            AuditSeverity::Error | AuditSeverity::Critical => {
+                ui::render_badge(ui::BadgeTone::Critical, &sev_str)
+            }
         };
 
         println!(
-            "  {} [{}] {} - {}",
+            "  {} {} {} - {}",
             style::dim(&style::sanitize_terminal_text(&entry.timestamp)),
-            severity_color,
+            severity_badge,
             style::maybe_color(&format!("{:?}", entry.event_type), |t| {
                 t.cyan().to_string()
             }),
@@ -689,49 +695,61 @@ pub fn scan_secrets(path: Option<String>, _ctx: &CliContext) -> Result<()> {
 
     if result.critical_count > 0 {
         println!(
-            "  {} {} CRITICAL",
-            style::maybe_color("●", |t| t.red().to_string()),
-            result.critical_count
+            "  {} {}",
+            ui::render_badge(ui::BadgeTone::Critical, "CRITICAL"),
+            ui::Style::new()
+                .foreground(ui::Color::Red)
+                .bold(true)
+                .render(result.critical_count)
         );
     }
     if result.high_count > 0 {
         println!(
-            "  {} {} HIGH",
-            style::maybe_color("●", |t| t.yellow().to_string()),
-            result.high_count
+            "  {} {}",
+            ui::render_badge(ui::BadgeTone::Warning, "HIGH"),
+            ui::Style::new()
+                .foreground(ui::Color::Yellow)
+                .bold(true)
+                .render(result.high_count)
         );
     }
     if result.medium_count > 0 {
         println!(
-            "  {} {} MEDIUM",
-            style::maybe_color("●", |t| t.blue().to_string()),
+            "  {} {}",
+            ui::render_badge(ui::BadgeTone::Info, "MEDIUM"),
             result.medium_count
         );
     }
     if result.low_count > 0 {
-        println!("  {} {} LOW", style::dim("●"), result.low_count);
+        println!(
+            "  {} {}",
+            ui::render_badge(ui::BadgeTone::Neutral, "LOW"),
+            result.low_count
+        );
     }
 
     println!();
 
     for finding in result.findings.iter().take(DISPLAY_LIMIT) {
         let sev_str = finding.severity.to_string();
-        let severity_color = match finding.severity {
+        let severity_badge = match finding.severity {
             crate::core::security::secrets::SecretSeverity::Critical => {
-                style::maybe_color(&sev_str, |t| t.red().bold().to_string())
+                ui::render_badge(ui::BadgeTone::Critical, &sev_str)
             }
             crate::core::security::secrets::SecretSeverity::High => {
-                style::maybe_color(&sev_str, |t| t.yellow().to_string())
+                ui::render_badge(ui::BadgeTone::Warning, &sev_str)
             }
             crate::core::security::secrets::SecretSeverity::Medium => {
-                style::maybe_color(&sev_str, |t| t.blue().to_string())
+                ui::render_badge(ui::BadgeTone::Info, &sev_str)
             }
-            crate::core::security::secrets::SecretSeverity::Low => style::dim(&sev_str),
+            crate::core::security::secrets::SecretSeverity::Low => {
+                ui::render_badge(ui::BadgeTone::Neutral, &sev_str)
+            }
         };
 
         println!(
-            "  [{}] {} in {}:{}",
-            severity_color,
+            "  {} {} in {}:{}",
+            severity_badge,
             style::maybe_color(&finding.secret_type.to_string(), |t| {
                 t.cyan().to_string()
             }),
@@ -750,9 +768,9 @@ pub fn scan_secrets(path: Option<String>, _ctx: &CliContext) -> Result<()> {
     }
 
     if result.has_critical() {
-        println!(
-            "\n{} Critical secrets found! Remove them before committing.",
-            style::maybe_color("⚠", |t| t.red().bold().to_string())
+        ui::print_critical_card(
+            "Critical Secrets Detected",
+            "Remove exposed secrets before committing or pushing.",
         );
     }
 
