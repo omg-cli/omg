@@ -111,13 +111,18 @@ def run_terminal(command, runtime, version, deadline, denied_exit_code=None, req
                 require(len(transcript) <= MAX_TRANSCRIPT, 'runtime terminal capture exceeded its bound')
                 prompt = PROMPT.search(transcript, consumed)
                 if prompt:
-                    checked_warning(transcript[consumed:prompt.start()], runtime, version)
+                    window = transcript[consumed:prompt.start()]
+                    checked_warning(window, runtime, version)
                     require(len(accepted) < 16, 'command exceeded its bounded review count')
                     if prompt[1] is not None:
                         accepted.append(prompt[1].decode('ascii'))
                         os.write(descriptor, b'accept ' + prompt[1] + b'\n')
                     else:
-                        accepted.append(prompt[2].decode('ascii'))
+                        plain_window = ANSI_RE.sub(b'', window)
+                        review_id = re.findall(rb'Review ID: ([0-9a-f]{8})', plain_window)
+                        accepted.append(
+                            review_id[-1].decode('ascii') if review_id else prompt[2].decode('ascii')
+                        )
                         os.write(descriptor, prompt[2] + b'\n')
                     consumed = prompt.end()
         while status is None and time.monotonic() < deadline:
