@@ -684,14 +684,14 @@ pub fn scan_secrets(path: Option<String>, _ctx: &CliContext) -> Result<()> {
         (ui::BadgeTone::Neutral, "LOW", result.low_count),
     ] {
         if count > 0 {
-            println!("{}", format_secret_summary_line(tone, label, count));
+            println!("{}", format_finding_count_line(tone, label, count));
         }
     }
 
     println!();
 
     for finding in result.findings.iter().take(DISPLAY_LIMIT) {
-        let severity_color = format_secret_severity(finding.severity);
+        let severity_color = format_finding_severity(finding.severity);
 
         println!(
             "  [{}] {} in {}:{}",
@@ -1693,7 +1693,7 @@ fn format_audit_severity_badge(severity: AuditSeverity) -> String {
     }
 }
 
-fn format_secret_summary_line(tone: ui::BadgeTone, label: &str, count: usize) -> String {
+fn format_finding_count_line(tone: ui::BadgeTone, label: &str, count: usize) -> String {
     if style::colors_enabled() {
         format!("  {} {count}", ui::render_badge(tone, label))
     } else {
@@ -1701,7 +1701,7 @@ fn format_secret_summary_line(tone: ui::BadgeTone, label: &str, count: usize) ->
     }
 }
 
-fn format_secret_severity(severity: crate::core::security::secrets::SecretSeverity) -> String {
+fn format_finding_severity(severity: crate::core::security::secrets::SecretSeverity) -> String {
     let sev_str = severity.to_string();
     match severity {
         crate::core::security::secrets::SecretSeverity::Critical => ui::Style::new()
@@ -2639,14 +2639,14 @@ mod tests {
 
         temp_env::with_var("NO_COLOR", Some("1"), || {
             assert_eq!(
-                format_secret_summary_line(ui::BadgeTone::Critical, "CRITICAL", 2),
+                format_finding_count_line(ui::BadgeTone::Critical, "CRITICAL", 2),
                 "  ● 2 CRITICAL"
             );
         });
         temp_env::with_vars(
             [("NO_COLOR", None::<&str>), ("OMG_COLORS", Some("always"))],
             || {
-                let colored = format_secret_summary_line(ui::BadgeTone::Warning, "HIGH", 3);
+                let colored = format_finding_count_line(ui::BadgeTone::Warning, "HIGH", 3);
                 assert!(colored.contains("HIGH") && colored.contains('3'));
                 for sev in [
                     SecretSeverity::Critical,
@@ -2654,7 +2654,7 @@ mod tests {
                     SecretSeverity::Medium,
                     SecretSeverity::Low,
                 ] {
-                    assert!(!format_secret_severity(sev).is_empty());
+                    assert!(!format_finding_severity(sev).is_empty());
                 }
             },
         );
