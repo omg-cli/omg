@@ -113,7 +113,7 @@ pub(crate) fn execute_cmd(cmd: crate::cli::tea::Cmd<()>) -> anyhow::Result<()> {
                 crate::cli::ui::print_header(&title, &body);
             }
             Cmd::View(View::Card(title, content)) => {
-                crate::cli::ui::print_card(&title, content);
+                crate::cli::ui::print_card(&title, &content);
             }
             Cmd::View(View::StyledText(config)) => {
                 use crate::cli::tea::TextStyle;

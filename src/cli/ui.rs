@@ -190,7 +190,13 @@ pub fn print_list_item(item: &str, metadata: Option<&str>) {
 }
 
 /// A high-contrast Lipgloss contextual header with a true-color pill badge.
+/// Degrades to `[context] title` when colors are disabled.
 pub fn print_header(context: &str, title: &str) {
+    if !crate::cli::style::colors_enabled() {
+        println!("\n[{context}] {title}");
+        return;
+    }
+
     let ctx_style = Style::new()
         .background(Color::Accent)
         .foreground(Color::Black)
@@ -724,7 +730,7 @@ pub fn prompt_theme() -> dialoguer::theme::ColorfulTheme {
 }
 
 /// Wrap a block of text in a fast Lipgloss rounded bordered card.
-pub fn print_card(title: &str, content: Vec<String>) {
+pub fn print_card(title: &str, content: &[String]) {
     let body = content.join("\n");
     print!(
         "{}",
@@ -834,8 +840,9 @@ mod tests {
             || {
                 let ascii =
                     render_security_review_card("pkg 1.0 warning", "11223344", false, "proceed");
-                assert!(ascii.contains("+---"));
-                assert!(ascii.contains("> Type"));
+                let plain_ascii = console::strip_ansi_codes(&ascii);
+                assert!(plain_ascii.contains("+---"));
+                assert!(plain_ascii.contains("> Type"));
             },
         );
     }
@@ -898,7 +905,7 @@ mod tests {
                 print_error("err");
                 print_warning_card("Warn", "Details");
                 print_critical_card("Crit", "Details");
-                print_card("Card", vec!["Row 1".to_owned()]);
+                print_card("Card", &["Row 1".to_owned()]);
                 let _theme = prompt_theme();
             },
         );

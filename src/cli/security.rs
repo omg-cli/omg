@@ -205,7 +205,7 @@ fn display_security_audit(
         }
     } else {
         let summary = format!(
-            "Found {} vulnerabilities ({} high/critical severity).",
+            "Found {} vulnerabilities ({} high severity)",
             res.total_vulnerabilities, res.high_severity
         );
         if res.high_severity > 0 {

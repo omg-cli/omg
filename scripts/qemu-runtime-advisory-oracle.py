@@ -18,7 +18,11 @@ import time
 
 MAX_TRANSCRIPT = 2 * 1024 * 1024
 MAX_FAILURE_DIAGNOSTIC = 2048
-PROMPT = re.compile(rb"(?:^|\r?\n)Type accept ([0-9a-f]{64}) within 60 seconds to continue \(default: cancel\): ")
+PROMPT = re.compile(
+    rb"(?:(?:^|\r?\n)Type accept ([0-9a-f]{64}) within 60 seconds to continue \(default: cancel\): "
+    rb"|Type '(?:\x1b\[[0-9;]*m)*([a-z-]+)(?:\x1b\[[0-9;]*m)*' within 60s to continue, or press Enter to cancel (?:\x1b\[[0-9;]*m)*\(default: cancel\): (?:\x1b\[[0-9;]*m)*)"
+)
+ANSI_RE = re.compile(rb"\x1b\[[0-9;]*m")
 
 
 def require(condition, reason):
@@ -34,23 +38,25 @@ def stop(pid):
 
 
 def checked_warning(transcript, runtime, version):
-    require(b'SECURITY WARNING:' in transcript, 'missing explicit security warning before acceptance')
+    plain = ANSI_RE.sub(b'', transcript)
+    require(b'SECURITY WARNING:' in plain, 'missing explicit security warning before acceptance')
     if runtime == 'native':
         subjects = []
-        for value in re.findall(rb'(?:^|\r?\n)Package: ([^\r\n]+)', transcript):
-            identity = json.loads(value)
+        for value in re.findall(rb'(?:^|\r?\n)(?:(?:\xe2\x94\x82|\|) )?Package: ([^\r\n]+)', plain):
+            cleaned = re.sub(rb'\s*(?:\xe2\x94\x82|\|)\s*$', b'', value).strip()
+            identity = json.loads(cleaned)
             require(isinstance(identity, list) and 2 <= len(identity) <= 8
                     and all(isinstance(part, str) and 0 < len(part) <= 4096 for part in identity[:2]),
                     'native warning has no exact package/version identity')
             subjects.append(identity[:2])
         require(subjects, 'native warning has no exact package/version identity')
     else:
-        require(f'Package: ["{runtime}","{version}"'.encode() in transcript, 'warning identity does not match the selected runtime')
-    require(re.search(rb'https://[A-Za-z0-9.-]+/[^\s"<>]*', transcript), 'warning has no public HTTPS source URL')
-    if b'disclosed advisory findings' in transcript:
-        require(re.search(rb'(?:CVE-\d{4}-\d{4,19}|GHSA-[a-z0-9-]+|GO-\d{4}-\d+|RUSTSEC-\d{4}-\d+|PSF-\d{4}-\d+|NODE-CORE-\d+|AVG-\d+|(?:RHSA|FEDORA|DSA|USN|ALAS)[-:][A-Za-z0-9:.-]+)', transcript), 'warning has no disclosed advisory identifier')
+        require(f'Package: ["{runtime}","{version}"'.encode() in plain, 'warning identity does not match the selected runtime')
+    require(re.search(rb'https://[A-Za-z0-9.-]+/[^\s"<>]*', plain), 'warning has no public HTTPS source URL')
+    if b'disclosed advisory findings' in plain:
+        require(re.search(rb'(?:CVE-\d{4}-\d{4,19}|GHSA-[a-z0-9-]+|GO-\d{4}-\d+|RUSTSEC-\d{4}-\d+|PSF-\d{4}-\d+|NODE-CORE-\d+|AVG-\d+|(?:RHSA|FEDORA|DSA|USN|ALAS)[-:][A-Za-z0-9:.-]+)', plain), 'warning has no disclosed advisory identifier')
     else:
-        require(b'coverage' in transcript and (b'Coverage gap:' in transcript or b'Coverage: unknown' in transcript), 'warning does not explain unknown coverage')
+        require(b'coverage' in plain and (b'Coverage gap:' in plain or b'Coverage: unknown' in plain), 'warning does not explain unknown coverage')
 
 
 def run_denial(command, runtime, version, deadline):
@@ -107,8 +113,12 @@ def run_terminal(command, runtime, version, deadline, denied_exit_code=None, req
                 if prompt:
                     checked_warning(transcript[consumed:prompt.start()], runtime, version)
                     require(len(accepted) < 16, 'command exceeded its bounded review count')
-                    accepted.append(prompt[1].decode('ascii'))
-                    os.write(descriptor, b'accept ' + prompt[1] + b'\n')
+                    if prompt[1] is not None:
+                        accepted.append(prompt[1].decode('ascii'))
+                        os.write(descriptor, b'accept ' + prompt[1] + b'\n')
+                    else:
+                        accepted.append(prompt[2].decode('ascii'))
+                        os.write(descriptor, prompt[2] + b'\n')
                     consumed = prompt.end()
         while status is None and time.monotonic() < deadline:
             child, completed = os.waitpid(pid, os.WNOHANG)

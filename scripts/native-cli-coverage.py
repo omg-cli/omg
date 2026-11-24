@@ -2523,7 +2523,14 @@ def validate_evidence(evidence, profiles, artifacts, commit):
         log = (evidence / f'{stage}.log').read_text()
         if case.native_phase not in ('initial', 'cache-pruned') and not case.control:
             consent = json.loads((evidence / f'{stage}-unknown.json').read_text())
-            observed = re.findall(r'Type accept ([0-9a-f]{64}) within 60 seconds to continue \(default: cancel\): ', log)
+            observed = [
+                m[1] or m[2]
+                for m in re.finditer(
+                    r"Type accept ([0-9a-f]{64}) within 60 seconds to continue \(default: cancel\): "
+                    r"|Type '(?:\x1b\[[0-9;]*m)*([a-z-]+)(?:\x1b\[[0-9;]*m)*' within 60s to continue, or press Enter to cancel (?:\x1b\[[0-9;]*m)*\(default: cancel\): ",
+                    log,
+                )
+            ]
             require(set(consent) == {'reviews', 'cli_exit_code'}
                     and consent['cli_exit_code'] == case.exit_status
                     and type(consent['reviews']) is list and 0 < len(consent['reviews']) <= 64
