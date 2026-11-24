@@ -1,0 +1,37 @@
+{
+    "$schema": "node_modules/wrangler/config-schema.json",
+    "name": "omg-advisories",
+    "main": "src/index.pg.ts",
+    "compatibility_date": "2026-11-13",
+    "compatibility_flags": ["nodejs_compat"],
+    "account_id": "f1e95b3e1b502cf366dfc81a863695fa",
+    "workers_dev": true,
+    "routes": [{ "pattern": "advisories.latham.cloud", "custom_domain": true }],
+    "d1_databases": [
+        {
+            "binding": "DB",
+            "database_name": "omg-advisories",
+            "database_id": "98202f8c-7d5f-4de9-8ddd-cea35fd95d09",
+            "migrations_dir": "migrations",
+        },
+    ],
+    "hyperdrive": [
+        {
+            "binding": "HYPERDRIVE",
+            "id": "edb12adb4d9941ffa291ca95285dfb24",
+        },
+        {
+            "binding": "HYPERDRIVE_REPLICA",
+            "id": "7ae6aa5033a94a2c9c1c77e2f25cf54f",
+        },
+    ],
+    "r2_buckets": [{ "binding": "RAW", "bucket_name": "omg-advisories-raw" }],
+    "vars": { "CVE_BATCH_SIZE": "32", "DB_BACKEND": "postgres" },
+    "limits": { "cpu_ms": 30000 },
+    "placement": { "mode": "smart" },
+    "triggers": { "crons": ["*/5 * * * *"] },
+    "observability": {
+        "enabled": true,
+        "traces": { "enabled": true, "head_sampling_rate": 0.1 },
+    },
+}

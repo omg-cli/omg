@@ -15,14 +15,20 @@ import time
 def review_answers(output, offset):
     answers = []
     start = offset
-    pattern = rb'Type accept ([0-9a-f]{64}) within 60 seconds to continue \(default: cancel\): '
+    pattern = (
+        rb"Type accept ([0-9a-f]{64}) within 60 seconds to continue \(default: cancel\): "
+        rb"|Type '(?:\x1b\[[0-9;]*m)*([a-z-]+)(?:\x1b\[[0-9;]*m)*' within 60s to continue, or press Enter to cancel (?:\x1b\[[0-9;]*m)*\(default: cancel\): (?:\x1b\[[0-9;]*m)*"
+    )
     for prompt in re.finditer(pattern, output[offset:]):
         end = offset + prompt.end()
-        details = output[start:end]
+        details = re.sub(rb'\x1b\[[0-9;]*m', b'', output[start:end])
         if (b'SECURITY WARNING: advisory coverage for the selected transaction is unknown.' not in details
                 or b'disclosed advisory findings' in details):
             raise ValueError('Fixture may acknowledge only an identified Unknown-only review')
-        answers.append(b'accept ' + prompt[1] + b'\n')
+        if prompt[1] is not None:
+            answers.append(b'accept ' + prompt[1] + b'\n')
+        else:
+            answers.append(prompt[2] + b'\n')
         start = end
     if answers:
         offset = end
@@ -64,7 +70,8 @@ def attend(command, receipt, timeout):
             raise ValueError('Unknown fixture exceeded its review count bound')
         for answer in answers:
             os.write(terminal, answer)
-            reviews.append(answer[7:-1].decode('ascii'))
+            token = answer[7:-1] if answer.startswith(b'accept ') else answer[:-1]
+            reviews.append(token.decode('ascii'))
         return True
 
     try:

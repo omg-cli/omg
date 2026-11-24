@@ -7,7 +7,7 @@ const CACHE_DIGEST = /^[a-f0-9]{64}$/;
 function publicRead(request: Request): boolean {
     return request.method === "GET" && !request.headers.has("authorization") &&
         !request.headers.has("cookie") &&
-        /^\/v1\/(?:arch\/advisories|cves\/(?:recent|CVE-\d{4}-\d{4,19})|epss\/CVE-\d{4}-\d{4,19}|runtimes\/[a-z]+)$/.test(new URL(request.url).pathname);
+        /^\/v1\/(?:arch\/advisories|bundles\/hot|packages\/check|eol(?:\/[a-z0-9-]+)?|cves\/(?:recent|CVE-\d{4}-\d{4,19})|epss\/CVE-\d{4}-\d{4,19}|runtimes\/[a-z]+)$/.test(new URL(request.url).pathname);
 }
 function conditional(request: Request, response: Response): Response {
     const etag = response.headers.get("etag");
@@ -58,6 +58,7 @@ export async function publicResponse(request: Request, response: Response, now: 
 export async function cachedRead(
     request: Request, cache: Pick<Cache, "match" | "put">,
     load: (request: Request) => Promise<Response>, now = Date.now(),
+    waitUntil?: (promise: Promise<unknown>) => void,
 ): Promise<Response> {
     if (request.url.length > MAX_CACHE_URL_LENGTH || !publicRead(request)) return load(request);
     const origin = CACHE_ORIGIN.exec(new URL(request.url).origin)?.[0];
@@ -81,8 +82,11 @@ export async function cachedRead(
     }
     const response = await load(request);
     if (!noStore && response.status === 200 && response.headers.get("Cache-Control")?.startsWith("public,")) {
-        try { await cache.put(key, response.clone()); }
-        catch (error) { console.error("advisory_cache_write_failed", error); }
+        const write = Promise.resolve(cache.put(key, response.clone())).catch((error) => {
+            console.error("advisory_cache_write_failed", error);
+        });
+        if (waitUntil) waitUntil(write);
+        else await write;
     }
     return conditional(request, response);
 }

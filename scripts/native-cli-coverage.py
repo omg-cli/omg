@@ -561,7 +561,7 @@ def fresh_admission_terminal(cli, arguments, environment, case, directory, state
                     require(state.get('install_confirmed'), 'Signing-key prompt preceded installation confirmation')
                     os.write(terminal, b'n')
                     state['signing_key_declined'] = True
-            if not answered and b'seconds to continue (default: cancel): ' in transcript:
+            if not answered and b'(default: cancel): ' in transcript:
                 found = re.search(rb'Full prepared batch SHA-256: ([a-f0-9]{64})', transcript)
                 require(found is not None, 'Native acknowledgement must publish its exact batch digest')
                 state['prompt_seen'] = True
@@ -1594,7 +1594,12 @@ try:
                 assert len(unknown_reviews) + len(answers) <= 64, 'Attended review count exceeded'
                 for review_answer in answers:
                     os.write(terminal, review_answer)
-                    unknown_reviews.append(review_answer[7:-1].decode('ascii'))
+                    token = (
+                        review_answer[7:-1]
+                        if review_answer.startswith(b'accept ')
+                        else review_answer[:-1]
+                    )
+                    unknown_reviews.append(token.decode('ascii'))
                 if not confirmed and b'Start system update?' in output:
                     os.write(terminal, b'y\n')
                     confirmed = True
@@ -2523,7 +2528,14 @@ def validate_evidence(evidence, profiles, artifacts, commit):
         log = (evidence / f'{stage}.log').read_text()
         if case.native_phase not in ('initial', 'cache-pruned') and not case.control:
             consent = json.loads((evidence / f'{stage}-unknown.json').read_text())
-            observed = re.findall(r'Type accept ([0-9a-f]{64}) within 60 seconds to continue \(default: cancel\): ', log)
+            observed = [
+                m[1] or m[2]
+                for m in re.finditer(
+                    r"Type accept ([0-9a-f]{64}) within 60 seconds to continue \(default: cancel\): "
+                    r"|Type '(?:\x1b\[[0-9;]*m)*([a-z-]+)(?:\x1b\[[0-9;]*m)*' within 60s to continue, or press Enter to cancel (?:\x1b\[[0-9;]*m)*\(default: cancel\): ",
+                    log,
+                )
+            ]
             require(set(consent) == {'reviews', 'cli_exit_code'}
                     and consent['cli_exit_code'] == case.exit_status
                     and type(consent['reviews']) is list and 0 < len(consent['reviews']) <= 64

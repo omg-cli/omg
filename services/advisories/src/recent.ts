@@ -31,7 +31,7 @@ export async function recentCves(url: URL, sql: Sql, now: string) {
     }
     const windowStart = new Date(Date.parse(asOf) - WINDOW).toISOString();
     const rows = await sql.all<RecordRow>(
-        "SELECT * FROM source_record WHERE modified_at>=? AND modified_at<=? AND (modified_at,id)<(?,?) ORDER BY modified_at DESC,id DESC LIMIT ?",
+        "SELECT id,source,source_url,schema_version,state,published_at,modified_at,fetched_at,payload_sha256,object_key,normalization_version,supported FROM source_record WHERE modified_at>=? AND modified_at<=? AND (modified_at,id)<(?,?) ORDER BY modified_at DESC,id DESC LIMIT ?",
         [windowStart, asOf, modified, id, limit + 1],
     );
     const records = rows.slice(0, limit);

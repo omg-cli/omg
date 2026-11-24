@@ -339,11 +339,124 @@ async function route(
                 await store.release("cve", owner);
             }
         }
+        if (request.method === "POST" && url.pathname === "/v1/packages/audit") {
+            const raw = await boundedBody(request.body, 256 * 1024);
+            const body = object(JSON.parse(raw));
+            const pkgs = Array.isArray(body.packages) ? body.packages : null;
+            if (!pkgs || pkgs.length === 0 || pkgs.length > 500) {
+                return Response.json({ error: "packages must be a non-empty array of up to 500 items" }, { status: 400 });
+            }
+            const pairs: { ecosystem: string; name: string }[] = [];
+            for (const item of pkgs) {
+                const entry = object(item);
+                if (typeof entry.ecosystem !== "string" || typeof entry.name !== "string" || !entry.ecosystem.trim() || !entry.name.trim()) {
+                    return Response.json({ error: "each package requires non-empty ecosystem and name" }, { status: 400 });
+                }
+                pairs.push({ ecosystem: entry.ecosystem.trim().toLowerCase(), name: entry.name.trim().toLowerCase() });
+            }
+            const placeholders = pairs.map(() => "(?,?)").join(",");
+            const flatValues = pairs.flatMap((p) => [p.ecosystem, p.name]);
+            const rows = await store.sql.all<{
+                id: string;
+                ecosystem: string;
+                package_name: string;
+                is_malware: boolean;
+                summary: string | null;
+                severity: string | null;
+                aliases: string[];
+                fixed_versions: string[];
+                modified_at: string | null;
+                epss: number | null;
+                epss_percentile: number | null;
+                in_kev: boolean;
+                in_euvd: boolean;
+            }>(
+                `SELECT a.id, a.ecosystem, a.package_name, a.is_malware, a.summary, a.severity,
+                        a.aliases, a.fixed_versions, a.modified_at,
+                        ep.epss, ep.percentile AS epss_percentile,
+                        (k.cve_id IS NOT NULL) AS in_kev,
+                        (ev.cve_id IS NOT NULL) AS in_euvd
+                 FROM osv_package_advisory a
+                 LEFT JOIN epss_scores ep ON ep.cve_id = ANY(a.aliases) OR ep.cve_id = a.id
+                 LEFT JOIN kev_annotation k ON k.cve_id = ANY(a.aliases) OR k.cve_id = a.id
+                 LEFT JOIN euvd_exploited ev ON ev.cve_id = ANY(a.aliases) OR ev.cve_id = a.id
+                 WHERE (lower(a.ecosystem), lower(a.package_name)) IN (${placeholders})
+                 ORDER BY a.is_malware DESC, (k.cve_id IS NOT NULL) DESC, COALESCE(ep.epss, 0) DESC, a.modified_at DESC
+                 LIMIT 1000`,
+                flatValues,
+            );
+            return Response.json({
+                schema_version: 1,
+                checked_at: now,
+                queried: pairs.length,
+                malware_count: rows.filter((r) => r.is_malware).length,
+                kev_count: rows.filter((r) => r.in_kev).length,
+                findings: rows,
+            });
+        }
         if (request.method !== "GET")
             return Response.json(
                 { error: "method not allowed" },
                 { status: 405 },
             );
+        if (url.pathname === "/v1/packages/check") {
+            const ecosystem = (url.searchParams.get("ecosystem") ?? "").trim().toLowerCase();
+            const name = (url.searchParams.get("name") ?? "").trim().toLowerCase();
+            if (!ecosystem || !name || ecosystem.length > 64 || name.length > 256) {
+                return Response.json({ error: "ecosystem and name query parameters are required" }, { status: 400 });
+            }
+            const rows = await store.sql.all<{
+                id: string;
+                ecosystem: string;
+                package_name: string;
+                is_malware: boolean;
+                summary: string | null;
+                severity: string | null;
+                aliases: string[];
+                fixed_versions: string[];
+                modified_at: string | null;
+                epss: number | null;
+                epss_percentile: number | null;
+                in_kev: boolean;
+                in_euvd: boolean;
+            }>(
+                `SELECT a.id, a.ecosystem, a.package_name, a.is_malware, a.summary, a.severity,
+                        a.aliases, a.fixed_versions, a.modified_at,
+                        ep.epss, ep.percentile AS epss_percentile,
+                        (k.cve_id IS NOT NULL) AS in_kev,
+                        (ev.cve_id IS NOT NULL) AS in_euvd
+                 FROM osv_package_advisory a
+                 LEFT JOIN epss_scores ep ON ep.cve_id = ANY(a.aliases) OR ep.cve_id = a.id
+                 LEFT JOIN kev_annotation k ON k.cve_id = ANY(a.aliases) OR k.cve_id = a.id
+                 LEFT JOIN euvd_exploited ev ON ev.cve_id = ANY(a.aliases) OR ev.cve_id = a.id
+                 WHERE lower(a.ecosystem) = ? AND lower(a.package_name) = ?
+                 ORDER BY a.is_malware DESC, (k.cve_id IS NOT NULL) DESC, COALESCE(ep.epss, 0) DESC, a.modified_at DESC
+                 LIMIT 200`,
+                [ecosystem, name],
+            );
+            return Response.json({
+                schema_version: 1,
+                checked_at: now,
+                ecosystem,
+                name,
+                malware: rows.some((r) => r.is_malware),
+                actively_exploited: rows.some((r) => r.in_kev || r.in_euvd),
+                advisories: rows,
+            });
+        }
+        const eolMatch = /^\/v1\/eol(?:\/([a-z0-9-]+))?$/.exec(url.pathname);
+        if (eolMatch) {
+            const product = eolMatch[1];
+            const cycles = product
+                ? await store.sql.all("SELECT product,cycle,eol,lts,latest,release_date,support,updated_at FROM runtime_eol WHERE product=? ORDER BY release_date DESC NULLS LAST, cycle DESC", [product])
+                : await store.sql.all("SELECT product,cycle,eol,lts,latest,release_date,support,updated_at FROM runtime_eol ORDER BY product ASC, release_date DESC NULLS LAST");
+            return Response.json({
+                schema_version: 1,
+                checked_at: now,
+                product: product ?? "all",
+                cycles,
+            });
+        }
         if (url.pathname === "/v1/status") {
             const checkpoints = await store.sql.all<Checkpoint>(
                 "SELECT * FROM source_checkpoint ORDER BY source",
@@ -411,9 +524,39 @@ async function route(
                 payload_json: await raw.text(),
             });
         }
+        if (url.pathname === "/v1/bundles/hot") {
+            const [recent, kevs, checkpoints] = await Promise.all([
+                store.sql.all<RecordRow & { kev_payload_json: string | null }>(
+                    "SELECT r.id,r.source,r.source_url,r.schema_version,r.state,r.published_at,r.modified_at,r.fetched_at,r.payload_sha256,r.object_key,r.normalization_version,r.supported,k.payload_json AS kev_payload_json FROM source_record r LEFT JOIN kev_annotation k ON k.cve_id=r.id ORDER BY r.modified_at DESC,r.id DESC LIMIT 50",
+                ),
+                store.sql.all<{ cve_id: string; payload_json: string }>(
+                    "SELECT cve_id,payload_json FROM kev_annotation ORDER BY cve_id DESC LIMIT 200",
+                ),
+                store.sql.all<Checkpoint>(
+                    "SELECT * FROM source_checkpoint WHERE source IN ('cve','kev')",
+                ),
+            ]);
+            const cve = checkpoints.find((row) => row.source === "cve") ?? null;
+            const kev = checkpoints.find((row) => row.source === "kev") ?? null;
+            return Response.json({
+                schema_version: 1,
+                generated_at: now,
+                cve_checked_at: cve?.checked_at ?? null,
+                kev_checked_at: kev?.checked_at ?? null,
+                recent_count: recent.length,
+                kev_count: kevs.length,
+                recent: recent.map(({ kev_payload_json, ...rec }) => ({
+                    ...rec,
+                    kev: kev_payload_json ? JSON.parse(kev_payload_json) : null,
+                })),
+                kev_latest: kevs.map((k) => ({ cve_id: k.cve_id, kev: JSON.parse(k.payload_json) })),
+            });
+        }
         if (url.pathname === "/v1/cves/recent") {
-            const page = await recentCves(url, store.sql, now);
-            const checkpoint = await store.checkpoint("cve");
+            const [page, checkpoint] = await Promise.all([
+                recentCves(url, store.sql, now),
+                store.checkpoint("cve"),
+            ]);
             return Response.json({
                 schema_version: 1, ...page,
                 checked_at: checkpoint?.checked_at ?? null,
@@ -425,28 +568,48 @@ async function route(
         const match = /^\/v1\/cves\/(CVE-\d{4}-\d{4,19})$/.exec(url.pathname);
         if (match?.[1]) {
             const id = cveId(match[1]);
-            const record = await store.sql.first<RecordRow>(
-                "SELECT * FROM source_record WHERE id=?",
-                [id],
-            );
-            if (!record)
+            const [joined, checkpoints] = await Promise.all([
+                store.sql.first<
+                    RecordRow & {
+                        kev_payload_json: string | null;
+                        payload_raw?: string | null;
+                        payload_jsonb?: unknown;
+                    }
+                >(
+                    "SELECT r.*, k.payload_json AS kev_payload_json FROM source_record r LEFT JOIN kev_annotation k ON k.cve_id=r.id WHERE r.id=?",
+                    [id],
+                ),
+                store.sql.all<Checkpoint>(
+                    "SELECT * FROM source_checkpoint WHERE source IN ('cve','kev')",
+                ),
+            ]);
+            if (!joined)
                 return Response.json(
                     { error: "CVE unavailable", complete: false },
                     { status: 404 },
                 );
-            const raw = await store.raw.get(record.object_key).catch((cause: unknown) => {
-                throw new Error("CVE storage unavailable", { cause });
-            });
-            if (!raw) throw new Error("CVE object missing");
-            const payload = await raw.text();
+            const {
+                kev_payload_json: kevPayloadJson,
+                payload_raw: inlinePayloadRaw,
+                payload_jsonb: _inlineJsonb,
+                ...record
+            } = joined;
+            const payload =
+                inlinePayloadRaw != null
+                    ? inlinePayloadRaw
+                    : await store.raw
+                          .get(record.object_key)
+                          .catch((cause: unknown) => {
+                              throw new Error("CVE storage unavailable", { cause });
+                          })
+                          .then((raw) => {
+                              if (!raw) throw new Error("CVE object missing");
+                              return raw.text();
+                          });
             if (await sha256(payload) !== record.payload_sha256)
                 throw new Error("CVE stored payload failed integrity");
-            const kev = await store.checkpoint("kev");
-            const cve = await store.checkpoint("cve");
-            const annotation = await store.sql.first<{ payload_json: string }>(
-                "SELECT payload_json FROM kev_annotation WHERE cve_id=?",
-                [id],
-            );
+            const kev = checkpoints.find((row) => row.source === "kev") ?? null;
+            const cve = checkpoints.find((row) => row.source === "cve") ?? null;
             return Response.json({
                 schema_version: 1,
                 payload_json: payload,
@@ -454,7 +617,7 @@ async function route(
                 cve_checked_at: cve?.checked_at ?? null,
                 cve_complete: !!cve?.complete && !!cve.bootstrap_complete &&
                     !cve.error && fresh(cve, now),
-                kev: annotation ? JSON.parse(annotation.payload_json) : null,
+                kev: kevPayloadJson ? JSON.parse(kevPayloadJson) : null,
                 kev_checked_at: kev?.checked_at,
                 kev_complete: kev
                     ? !!kev.complete && !kev.error && fresh(kev, now)

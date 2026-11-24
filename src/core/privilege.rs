@@ -5,7 +5,26 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// Require an exact, bounded decision from the owning foreground terminal.
+fn is_critical_security_alert(details: &str) -> bool {
+    let lower = details.to_ascii_lowercase();
+    lower.contains("kev")
+        || lower.contains("0-day")
+        || lower.contains("zero-day")
+        || lower.contains("actively exploited")
+        || lower.contains("mal-")
+        || lower.contains("malware")
+        || lower.contains("critical")
+}
+
+fn security_confirmation_phrase(details: &str) -> &'static str {
+    if is_critical_security_alert(details) {
+        "install-unsafe"
+    } else {
+        "proceed"
+    }
+}
+
+/// Require an intentional, human-friendly decision from the owning foreground terminal.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) fn confirm_security_review(
     details: &str,
@@ -14,7 +33,6 @@ pub(crate) fn confirm_security_review(
     check_cancelled: &dyn Fn() -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     use anyhow::Context as _;
-    use std::fmt::Write as _;
     use std::os::unix::fs::OpenOptionsExt;
     check_cancelled()?;
     let tty = std::fs::OpenOptions::new().read(true).write(true)
@@ -25,18 +43,17 @@ pub(crate) fn confirm_security_review(
         "Security acknowledgement must run in the terminal foreground"
     );
     verify_review_terminal(&tty, invoking_uid)?;
-    let mut prompt = details.to_owned();
-    let _ = write!(
-        prompt,
-        "\nType accept {digest} within 60 seconds to continue (default: cancel): "
-    );
+    let critical = is_critical_security_alert(details);
+    let phrase = security_confirmation_phrase(details);
+    let short_id = &digest[..digest.len().min(8)];
+    let prompt = crate::cli::ui::render_security_review_card(details, short_id, critical, phrase);
     anyhow::ensure!(
         prompt.len() <= 64 * 1024,
         "Security acknowledgement display exceeds limit"
     );
     let _quiesce = crate::cli::modern_ui::quiesce_terminal();
     let deadline = std::time::Instant::now() + std::time::Duration::from_mins(1);
-    read_security_review(&tty, &prompt, digest, deadline, check_cancelled)
+    read_security_review(&tty, &prompt, phrase, digest, deadline, check_cancelled)
 }
 
 #[cfg(target_os = "linux")]
@@ -168,6 +185,7 @@ fn review_io_count(result: std::io::Result<usize>) -> anyhow::Result<Option<usiz
 fn read_security_review(
     tty: &std::fs::File,
     prompt: &str,
+    phrase: &str,
     digest: &str,
     deadline: std::time::Instant,
     check_cancelled: &dyn Fn() -> anyhow::Result<()>,
@@ -271,13 +289,17 @@ fn read_security_review(
         nix::unistd::tcgetpgrp(tty)? == nix::unistd::getpgrp(),
         "Security terminal foreground changed during acknowledgement"
     );
-    if answer != format!("accept {digest}\n").as_bytes()
-        && answer != format!("accept {digest}\r\n").as_bytes()
-    {
+    let trimmed = std::str::from_utf8(&answer)
+        .ok()
+        .map(|s| s.trim_end_matches(['\r', '\n']));
+    let legacy_accept = format!("accept {digest}");
+    let accepted =
+        trimmed.is_some_and(|line| line.eq_ignore_ascii_case(phrase) || line == legacy_accept);
+    if !accepted {
         if answer.trim_ascii().is_empty() {
             anyhow::bail!("Security acknowledgement declined");
         }
-        anyhow::bail!("Security acknowledgement declined (expected: accept {digest})");
+        anyhow::bail!("Security acknowledgement declined (expected '{phrase}')");
     }
     check_cancelled()?;
     Ok(())
@@ -2561,5 +2583,21 @@ mod elevation_path_tests {
                 }
             ));
         }
+    }
+
+    #[test]
+    fn security_confirmation_phrase_escalates_for_critical_alerts() {
+        assert_eq!(
+            super::security_confirmation_phrase("CVE-2026-0001 KEV actively exploited"),
+            "install-unsafe"
+        );
+        assert_eq!(
+            super::security_confirmation_phrase("MAL-2026-1234 malware package"),
+            "install-unsafe"
+        );
+        assert_eq!(
+            super::security_confirmation_phrase("CVE-2026-0002 moderate advisory"),
+            "proceed"
+        );
     }
 }

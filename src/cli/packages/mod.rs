@@ -100,24 +100,31 @@ pub(crate) fn execute_cmd(cmd: crate::cli::tea::Cmd<()>) -> anyhow::Result<()> {
                 println!("{output}");
             }
             Cmd::View(View::Info(msg)) => {
-                println!("  ℹ {msg}");
+                crate::cli::ui::print_info(msg);
             }
             Cmd::View(View::Success(msg)) => {
-                println!("  ✓ {msg}");
+                crate::cli::ui::print_success(msg);
             }
             Cmd::View(View::Warning(msg)) => {
-                println!("  ⚠ {msg}");
+                crate::cli::ui::print_warning(msg);
             }
             Cmd::View(View::Error(msg)) => anyhow::bail!("{msg}"),
             Cmd::View(View::Header(title, body)) => {
-                println!("\n[{title}] {body}");
+                crate::cli::ui::print_header(&title, &body);
             }
             Cmd::View(View::Card(title, content)) => {
-                crate::cli::ui::print_card(&title, content);
+                crate::cli::ui::print_card(&title, &content);
             }
             Cmd::View(View::StyledText(config)) => {
-                // In fallback mode, just print the text without styling
-                println!("{}", config.text);
+                use crate::cli::tea::TextStyle;
+                use crate::cli::ui::{Color, Style};
+                let style = match config.style {
+                    TextStyle::Bold => Style::new().foreground(Color::White).bold(true),
+                    TextStyle::Success => Style::new().foreground(Color::Green).bold(true),
+                    TextStyle::Info => Style::new().foreground(Color::Cyan),
+                    TextStyle::Muted => Style::new().foreground(Color::Gray),
+                };
+                println!("  {}", style.render(&config.text));
             }
             Cmd::View(View::Spacer) => {
                 println!();
@@ -144,5 +151,35 @@ mod tests {
         let error = execute_cmd(Cmd::error("package operation failed"))
             .expect_err("fallback Cmd::Error must fail the command");
         assert!(error.to_string().contains("package operation failed"));
+    }
+
+    #[test]
+    fn fallback_executor_renders_lipgloss_views() {
+        use crate::cli::tea::{StyledTextConfig, TextStyle};
+
+        let batch = Cmd::batch([
+            Cmd::info("checking packages"),
+            Cmd::success("packages updated"),
+            Cmd::warning("deprecated runtime"),
+            Cmd::header("OMG", "Lipgloss Views"),
+            Cmd::card("Summary", vec!["1 package checked".to_owned()]),
+            Cmd::styled_text(StyledTextConfig {
+                text: "bold".to_owned(),
+                style: TextStyle::Bold,
+            }),
+            Cmd::styled_text(StyledTextConfig {
+                text: "ok".to_owned(),
+                style: TextStyle::Success,
+            }),
+            Cmd::styled_text(StyledTextConfig {
+                text: "info".to_owned(),
+                style: TextStyle::Info,
+            }),
+            Cmd::styled_text(StyledTextConfig {
+                text: "muted".to_owned(),
+                style: TextStyle::Muted,
+            }),
+        ]);
+        execute_cmd(batch).expect("Lipgloss view commands should render without error");
     }
 }

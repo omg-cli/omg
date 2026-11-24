@@ -91,7 +91,7 @@ def terminal_case(unit, case, environment, expected=(b"possible match", b"1-1", 
                     break
                 transcript.extend(chunk)
                 assert len(transcript) <= 128 * 1024, "terminal capture exceeded limit"
-                prompt = re.search(rb"Type accept ([0-9a-f]{64}).*default: cancel", transcript)
+                prompt = re.search(rb"Type '(?:\x1b\[[0-9;]*m)*([a-z-]+)(?:\x1b\[[0-9;]*m)*' within 60s to continue.*default: cancel", transcript)
                 if prompt and not sent:
                     assert all(fragment in transcript for fragment in expected), transcript.decode(errors="replace")
                     if before_answer:
@@ -101,11 +101,13 @@ def terminal_case(unit, case, environment, expected=(b"possible match", b"1-1", 
                     elif case == "split-accept":
                         # Canonical EOF after pending bytes delivers a partial
                         # read without closing the terminal or accepting a line.
-                        os.write(descriptor, b"accept " + prompt[1][:24] + b"\x04")
+                        phrase = prompt[1]
+                        split_at = max(1, len(phrase) // 2)
+                        os.write(descriptor, phrase[:split_at] + b"\x04")
                         time.sleep(0.15)
-                        os.write(descriptor, prompt[1][24:] + b"\n")
+                        os.write(descriptor, phrase[split_at:] + b"\n")
                     else:
-                        answer = {"generic-yes": b"yes\n", "blank": b"\n", "wrong-review": b"accept another-review\n", "eof": b"\x04", "interrupt": b"\x03"}.get(case, b"accept " + prompt[1] + b"\n")
+                        answer = {"generic-yes": b"yes\n", "blank": b"\n", "wrong-review": b"accept another-review\n", "eof": b"\x04", "interrupt": b"\x03"}.get(case, prompt[1] + b"\n")
                         os.write(descriptor, answer)
                     sent = True
         while time.monotonic() < deadline:
