@@ -1594,7 +1594,12 @@ try:
                 assert len(unknown_reviews) + len(answers) <= 64, 'Attended review count exceeded'
                 for review_answer in answers:
                     os.write(terminal, review_answer)
-                    unknown_reviews.append(review_answer[7:-1].decode('ascii'))
+                    token = (
+                        review_answer[7:-1]
+                        if review_answer.startswith(b'accept ')
+                        else review_answer[:-1]
+                    )
+                    unknown_reviews.append(token.decode('ascii'))
                 if not confirmed and b'Start system update?' in output:
                     os.write(terminal, b'y\n')
                     confirmed = True

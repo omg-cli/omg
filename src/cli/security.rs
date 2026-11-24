@@ -729,24 +729,24 @@ pub fn scan_secrets(path: Option<String>, _ctx: &CliContext) -> Result<()> {
 
     for finding in result.findings.iter().take(DISPLAY_LIMIT) {
         let sev_str = finding.severity.to_string();
-        let severity_badge = match finding.severity {
-            crate::core::security::secrets::SecretSeverity::Critical => {
-                ui::render_badge(ui::BadgeTone::Critical, &sev_str)
-            }
-            crate::core::security::secrets::SecretSeverity::High => {
-                ui::render_badge(ui::BadgeTone::Warning, &sev_str)
-            }
-            crate::core::security::secrets::SecretSeverity::Medium => {
-                ui::render_badge(ui::BadgeTone::Info, &sev_str)
-            }
-            crate::core::security::secrets::SecretSeverity::Low => {
-                ui::render_badge(ui::BadgeTone::Neutral, &sev_str)
-            }
+        let severity_color = match finding.severity {
+            crate::core::security::secrets::SecretSeverity::Critical => ui::Style::new()
+                .foreground(ui::Color::Red)
+                .bold(true)
+                .render(&sev_str),
+            crate::core::security::secrets::SecretSeverity::High => ui::Style::new()
+                .foreground(ui::Color::Yellow)
+                .bold(true)
+                .render(&sev_str),
+            crate::core::security::secrets::SecretSeverity::Medium => ui::Style::new()
+                .foreground(ui::Color::Cyan)
+                .render(&sev_str),
+            crate::core::security::secrets::SecretSeverity::Low => style::dim(&sev_str),
         };
 
         println!(
-            "  {} {} in {}:{}",
-            severity_badge,
+            "  [{}] {} in {}:{}",
+            severity_color,
             style::maybe_color(&finding.secret_type.to_string(), |t| {
                 t.cyan().to_string()
             }),

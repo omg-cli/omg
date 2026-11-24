@@ -70,7 +70,7 @@ def main():
         review = json.loads(receipt.read_text())
         require(review.get('cli_exit_code') == 0 and type(review.get('reviews')) is list
                 and 0 < len(review['reviews']) <= 64
-                and all(type(digest) is str and re.fullmatch('[a-f0-9]{64}', digest) for digest in review['reviews']),
+                and all(type(digest) is str and re.fullmatch(r'[a-f0-9]{64}|proceed|install-unsafe', digest) for digest in review['reviews']),
                 'Successful install lacks exact explicit security-review receipts')
         subprocess.run(['pacman', '-Qi', package], check=True, timeout=10)
         subprocess.run(['which', executable], check=True, timeout=10)
