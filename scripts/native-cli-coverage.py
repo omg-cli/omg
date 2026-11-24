@@ -561,7 +561,7 @@ def fresh_admission_terminal(cli, arguments, environment, case, directory, state
                     require(state.get('install_confirmed'), 'Signing-key prompt preceded installation confirmation')
                     os.write(terminal, b'n')
                     state['signing_key_declined'] = True
-            if not answered and b'seconds to continue (default: cancel): ' in transcript:
+            if not answered and b'(default: cancel): ' in transcript:
                 found = re.search(rb'Full prepared batch SHA-256: ([a-f0-9]{64})', transcript)
                 require(found is not None, 'Native acknowledgement must publish its exact batch digest')
                 state['prompt_seen'] = True
