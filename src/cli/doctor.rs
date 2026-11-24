@@ -1441,7 +1441,7 @@ pub fn enable_turbo_mode() -> Result<()> {
             exe_path
         );
         if console::user_attended()
-            && !dialoguer::Confirm::with_theme(&crate::cli::ui::prompt_theme())
+            && !dialoguer::Confirm::new()
                 .with_prompt("Run `sudo setcap -r` on the omg binary?")
                 .default(true)
                 .interact()?

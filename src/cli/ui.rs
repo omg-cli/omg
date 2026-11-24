@@ -428,13 +428,17 @@ pub fn render_badge(tone: BadgeTone, label: &str) -> String {
         .render(label)
 }
 
-fn panel_inner_width(lines: &[String], header_width: usize, footer_width: usize) -> usize {
-    let term_cols = usize::from(console::Term::stdout().size().1);
+fn clamp_panel_width(term_cols: usize, content_max: usize) -> usize {
     let max_inner = if term_cols >= 64 {
         term_cols.saturating_sub(4).clamp(60, 88)
     } else {
         72
     };
+    content_max.saturating_add(2).clamp(60, max_inner)
+}
+
+fn panel_inner_width(lines: &[String], header_width: usize, footer_width: usize) -> usize {
+    let term_cols = usize::from(console::Term::stdout().size().1);
     let content_max = lines
         .iter()
         .map(|line| console::measure_text_width(line))
@@ -442,7 +446,7 @@ fn panel_inner_width(lines: &[String], header_width: usize, footer_width: usize)
         .unwrap_or(0)
         .max(header_width)
         .max(footer_width);
-    content_max.saturating_add(2).clamp(60, max_inner)
+    clamp_panel_width(term_cols, content_max)
 }
 
 fn pad_panel_row(content: &str, inner_width: usize, left_v: &str, right_v: &str) -> String {
@@ -906,6 +910,8 @@ mod tests {
                 print_warning_card("Warn", "Details");
                 print_critical_card("Crit", "Details");
                 print_card("Card", &["Row 1".to_owned()]);
+                assert_eq!(clamp_panel_width(40, 20), 60);
+                assert_eq!(clamp_panel_width(120, 70), 72);
                 let _theme = prompt_theme();
             },
         );

@@ -281,7 +281,7 @@ pub fn reset(yes: bool) -> Result<()> {
     }
 
     if !yes {
-        let confirm = Confirm::with_theme(&crate::cli::ui::prompt_theme())
+        let confirm = Confirm::new()
             .with_prompt("Reset configuration to defaults? This cannot be undone.")
             .default(false)
             .interact()?;

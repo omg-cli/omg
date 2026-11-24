@@ -204,15 +204,7 @@ fn display_security_audit(
             ui::print_success("No vulnerabilities found in assessed packages.");
         }
     } else {
-        let summary = format!(
-            "Found {} vulnerabilities ({} high severity)",
-            res.total_vulnerabilities, res.high_severity
-        );
-        if res.high_severity > 0 {
-            ui::print_critical_card("Vulnerabilities Detected", &summary);
-        } else {
-            ui::print_warning_card("Vulnerabilities Detected", &summary);
-        }
+        print_vulnerability_summary(res.total_vulnerabilities, res.high_severity);
         println!();
         for (pkg, vulns) in res.vulnerabilities {
             println!(
@@ -446,15 +438,7 @@ pub fn view_audit_log(
     }
 
     for entry in entries.iter().take(effective_limit) {
-        let sev_str = entry.severity.to_string();
-        let severity_badge = match entry.severity {
-            AuditSeverity::Debug => ui::render_badge(ui::BadgeTone::Neutral, &sev_str),
-            AuditSeverity::Info => ui::render_badge(ui::BadgeTone::Info, &sev_str),
-            AuditSeverity::Warning => ui::render_badge(ui::BadgeTone::Warning, &sev_str),
-            AuditSeverity::Error | AuditSeverity::Critical => {
-                ui::render_badge(ui::BadgeTone::Critical, &sev_str)
-            }
-        };
+        let severity_badge = format_audit_severity_badge(entry.severity);
 
         println!(
             "  {} {} {} - {}",
@@ -693,56 +677,21 @@ pub fn scan_secrets(path: Option<String>, _ctx: &CliContext) -> Result<()> {
         })
     );
 
-    let format_summary = |tone: ui::BadgeTone, label: &str, count: usize| -> String {
-        if style::colors_enabled() {
-            format!("  {} {}", ui::render_badge(tone, label), count)
-        } else {
-            format!("  ● {count} {label}")
+    for (tone, label, count) in [
+        (ui::BadgeTone::Critical, "CRITICAL", result.critical_count),
+        (ui::BadgeTone::Warning, "HIGH", result.high_count),
+        (ui::BadgeTone::Info, "MEDIUM", result.medium_count),
+        (ui::BadgeTone::Neutral, "LOW", result.low_count),
+    ] {
+        if count > 0 {
+            println!("{}", format_secret_summary_line(tone, label, count));
         }
-    };
-    if result.critical_count > 0 {
-        println!(
-            "{}",
-            format_summary(ui::BadgeTone::Critical, "CRITICAL", result.critical_count)
-        );
-    }
-    if result.high_count > 0 {
-        println!(
-            "{}",
-            format_summary(ui::BadgeTone::Warning, "HIGH", result.high_count)
-        );
-    }
-    if result.medium_count > 0 {
-        println!(
-            "{}",
-            format_summary(ui::BadgeTone::Info, "MEDIUM", result.medium_count)
-        );
-    }
-    if result.low_count > 0 {
-        println!(
-            "{}",
-            format_summary(ui::BadgeTone::Neutral, "LOW", result.low_count)
-        );
     }
 
     println!();
 
     for finding in result.findings.iter().take(DISPLAY_LIMIT) {
-        let sev_str = finding.severity.to_string();
-        let severity_color = match finding.severity {
-            crate::core::security::secrets::SecretSeverity::Critical => ui::Style::new()
-                .foreground(ui::Color::Red)
-                .bold(true)
-                .render(&sev_str),
-            crate::core::security::secrets::SecretSeverity::High => ui::Style::new()
-                .foreground(ui::Color::Yellow)
-                .bold(true)
-                .render(&sev_str),
-            crate::core::security::secrets::SecretSeverity::Medium => ui::Style::new()
-                .foreground(ui::Color::Cyan)
-                .render(&sev_str),
-            crate::core::security::secrets::SecretSeverity::Low => style::dim(&sev_str),
-        };
+        let severity_color = format_secret_severity(finding.severity);
 
         println!(
             "  [{}] {} in {}:{}",
@@ -1723,6 +1672,53 @@ pub fn check_eol(_ctx: &CliContext) -> Result<()> {
     Ok(())
 }
 
+fn print_vulnerability_summary(total: usize, high: usize) {
+    let summary = format!("Found {total} vulnerabilities ({high} high severity)");
+    if high > 0 {
+        ui::print_critical_card("Vulnerabilities Detected", &summary);
+    } else {
+        ui::print_warning_card("Vulnerabilities Detected", &summary);
+    }
+}
+
+fn format_audit_severity_badge(severity: AuditSeverity) -> String {
+    let sev_str = severity.to_string();
+    match severity {
+        AuditSeverity::Debug => ui::render_badge(ui::BadgeTone::Neutral, &sev_str),
+        AuditSeverity::Info => ui::render_badge(ui::BadgeTone::Info, &sev_str),
+        AuditSeverity::Warning => ui::render_badge(ui::BadgeTone::Warning, &sev_str),
+        AuditSeverity::Error | AuditSeverity::Critical => {
+            ui::render_badge(ui::BadgeTone::Critical, &sev_str)
+        }
+    }
+}
+
+fn format_secret_summary_line(tone: ui::BadgeTone, label: &str, count: usize) -> String {
+    if style::colors_enabled() {
+        format!("  {} {count}", ui::render_badge(tone, label))
+    } else {
+        format!("  ● {count} {label}")
+    }
+}
+
+fn format_secret_severity(severity: crate::core::security::secrets::SecretSeverity) -> String {
+    let sev_str = severity.to_string();
+    match severity {
+        crate::core::security::secrets::SecretSeverity::Critical => ui::Style::new()
+            .foreground(ui::Color::Red)
+            .bold(true)
+            .render(&sev_str),
+        crate::core::security::secrets::SecretSeverity::High => ui::Style::new()
+            .foreground(ui::Color::Yellow)
+            .bold(true)
+            .render(&sev_str),
+        crate::core::security::secrets::SecretSeverity::Medium => ui::Style::new()
+            .foreground(ui::Color::Cyan)
+            .render(&sev_str),
+        crate::core::security::secrets::SecretSeverity::Low => style::dim(&sev_str),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2621,6 +2617,46 @@ mod tests {
         assert!(
             enforce_scan_findings(findings.len(), true).is_err(),
             "possible findings remain in --fail-on-findings totals"
+        );
+    }
+
+    #[test]
+    fn lipgloss_security_formatters_cover_all_severities_and_color_modes() {
+        use crate::core::security::secrets::SecretSeverity;
+
+        print_vulnerability_summary(2, 1);
+        print_vulnerability_summary(2, 0);
+
+        for sev in [
+            AuditSeverity::Debug,
+            AuditSeverity::Info,
+            AuditSeverity::Warning,
+            AuditSeverity::Error,
+            AuditSeverity::Critical,
+        ] {
+            assert!(!format_audit_severity_badge(sev).is_empty());
+        }
+
+        temp_env::with_var("NO_COLOR", Some("1"), || {
+            assert_eq!(
+                format_secret_summary_line(ui::BadgeTone::Critical, "CRITICAL", 2),
+                "  ● 2 CRITICAL"
+            );
+        });
+        temp_env::with_vars(
+            [("NO_COLOR", None::<&str>), ("OMG_COLORS", Some("always"))],
+            || {
+                let colored = format_secret_summary_line(ui::BadgeTone::Warning, "HIGH", 3);
+                assert!(colored.contains("HIGH") && colored.contains('3'));
+                for sev in [
+                    SecretSeverity::Critical,
+                    SecretSeverity::High,
+                    SecretSeverity::Medium,
+                    SecretSeverity::Low,
+                ] {
+                    assert!(!format_secret_severity(sev).is_empty());
+                }
+            },
         );
     }
 }
