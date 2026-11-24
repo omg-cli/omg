@@ -14,7 +14,7 @@ The runtime integration suite covers the 68-entry inventory, aliases, unreadable
 
 - Arch install and dry-run resolve exact names against the configured local install repositories in ALPM order. A missing or invalid install database surfaces an error before AUR fallback. Search-only repositories remain available to package info.
 - The terminal `omg info` AUR fallback uses RPC `type=info`. The request accepts a one-character name and checks that the response contains at most one row for that exact name.
-- The Arch work shares ALPM handle setup between direct queries and the worker, removes a redundant post-sync daemon refresh, and avoids running a parent spinner over privilege prompts. Four extracted test modules accompany these edits.
+- The Arch work shares ALPM handle setup between direct queries and the worker, removes a redundant post-sync daemon refresh, and avoids running a parent spinner over privilege prompts. Existing tests retain their original module paths for the diff coverage gate.
 - The ALPM fixture verifies that an install-only repository wins over a search-only repository and that a missing install catalog fails. A native Arch fixture exercises install and dry-run with a private daemon socket listening and verifies that the package reaches the local policy check without connecting to that socket. See the [upstream ALPM project](https://github.com/archlinux/alpm) for the Rust parser and repository contracts.
 - The Omarchy migration and AUR review fixtures use the exact shell and Python strings from `main`. This preserves the published migration digests and the AUR review test driver's indentation.
 
@@ -27,11 +27,6 @@ cargo clippy --locked --no-default-features --features arch,pgp,license \
   --lib --test e2e_runtime_management --test install_update_comprehensive -- -D warnings
 ```
 
-## Continue on Linux
+## Working branch
 
-```sh
-git fetch origin codex/arch-runtime-audit
-git switch --track origin/codex/arch-runtime-audit
-```
-
-The separate advisory service edits are in the Windows checkout. This branch carries the Rust CLI and package manager batch. Local logs and timing samples are under `.git/nov24-cli-audit/`, including `routing-staged-native-receipt.json` and `routing-staged-cli-receipt.json`. The hosted CI and coverage workflows run on pull requests and on `main`.
+The Rust CLI and package manager batch is in PR #1098. The Windows checkout holds separate advisory service edits. Local logs and timing samples are under `.git/nov24-cli-audit/`, including `routing-staged-native-receipt.json` and `routing-staged-cli-receipt.json`. [PR #1098](https://github.com/omg-cli/omg/pull/1098)

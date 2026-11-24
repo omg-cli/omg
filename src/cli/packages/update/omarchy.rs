@@ -2325,5 +2325,5027 @@ pub(super) async fn maybe_coordinate(intent: UpdateIntent) -> Result<bool> {
 }
 
 #[cfg(test)]
-#[path = "omarchy_tests.rs"]
-mod tests;
+mod tests {
+    use super::*;
+
+    // Only the private x86-64 fixture thread receives these kernel fault filters.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn deny_fixture_syscall_argument(syscall: nix::libc::c_long, argument: usize, value: u32) {
+        use nix::libc::{seccomp_data, sock_filter, sock_fprog};
+        assert!(argument < 6);
+        // Linux classic BPF: load a word, compare a constant, return an action.
+        const LOAD: u16 = 0x20;
+        const EQUAL: u16 = 0x15;
+        const RETURN: u16 = 0x06;
+        // Linux audit.h: ELF machine 62, 64-bit and little-endian ABI flags.
+        const X86_64_AUDIT_ARCH: u32 = 0xc000_003e;
+        let instruction = |code, jt, jf, k| sock_filter { code, jt, jf, k };
+        let argument_offset = std::mem::offset_of!(seccomp_data, args) + argument * 8;
+        let mut filter = [
+            instruction(
+                LOAD,
+                0,
+                0,
+                u32::try_from(std::mem::offset_of!(seccomp_data, arch)).unwrap(),
+            ),
+            instruction(EQUAL, 0, 5, X86_64_AUDIT_ARCH),
+            instruction(
+                LOAD,
+                0,
+                0,
+                u32::try_from(std::mem::offset_of!(seccomp_data, nr)).unwrap(),
+            ),
+            instruction(EQUAL, 0, 3, u32::try_from(syscall).unwrap()),
+            instruction(LOAD, 0, 0, u32::try_from(argument_offset).unwrap()),
+            instruction(EQUAL, 0, 1, value),
+            instruction(
+                RETURN,
+                0,
+                0,
+                nix::libc::SECCOMP_RET_ERRNO | u32::try_from(nix::libc::EPERM).unwrap(),
+            ),
+            instruction(RETURN, 0, 0, nix::libc::SECCOMP_RET_ALLOW),
+        ];
+        let program = sock_fprog {
+            len: u16::try_from(filter.len()).unwrap(),
+            filter: filter.as_mut_ptr(),
+        };
+        nix::sys::prctl::set_no_new_privs().unwrap();
+        // SAFETY: program and every instruction remain valid for prctl, which
+        // copies them. This runs only in a disposable child fixture thread.
+        #[expect(
+            unsafe_code,
+            reason = "install a kernel fault in the owned fixture only"
+        )]
+        let result = unsafe {
+            nix::libc::prctl(
+                nix::libc::PR_SET_SECCOMP,
+                nix::libc::SECCOMP_MODE_FILTER,
+                &raw const program,
+            )
+        };
+        assert_eq!(result, 0, "private seccomp fault installation");
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[tokio::test]
+    async fn kernel_boundary_fixture() {
+        use nix::libc;
+        use std::sync::{Arc, Barrier, atomic::AtomicBool};
+        let Some(case) = std::env::var_os("OMG_OMARCHY_KERNEL_BOUNDARY_FIXTURE") else {
+            return;
+        };
+        let case = case.to_str().expect("known kernel fixture case");
+        let _tracing = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::DEBUG)
+                .finish(),
+        );
+        let owner = private_directory();
+        match case {
+            "empty-runtime" => {
+                assert_eq!(
+                    std::env::var_os("OMARCHY_PATH"),
+                    Some(std::ffi::OsString::new())
+                );
+                let error = OmarchyRuntime::discover()
+                    .expect_err("empty runtime hint is rejected before helper discovery");
+                assert!(error.to_string().contains("OMARCHY_PATH must be non-empty"));
+            }
+            "runtime-unset" | "runtime-unset-invalid-state" => {
+                assert!(std::env::var_os("OMARCHY_PATH").is_none());
+                let discovered = OmarchyRuntime::discover();
+                if case == "runtime-unset-invalid-state" {
+                    assert!(
+                        discovered
+                            .as_ref()
+                            .expect_err("empty migration state must be rejected")
+                            .to_string()
+                            .contains("OMARCHY_MIGRATION_STATE must be non-empty")
+                    );
+                }
+                assert!(discovered.as_ref().err().is_none_or(|error| {
+                    !error.to_string().contains("OMARCHY_PATH must be non-empty")
+                }));
+            }
+            "stage-grace" => {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let shell = crate::core::privilege::root_controlled_program_path("sh").unwrap();
+                let mut child = Command::new(shell)
+                    .args([
+                        "-c",
+                        "trap '' TERM; read -r gate && test \"$gate\" = ready || exit 1; printf ready; sleep 30",
+                    ])
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .process_group(0)
+                    .kill_on_drop(true)
+                    .spawn()
+                    .unwrap();
+                let mut gate = child.stdin.take().expect("private readiness input");
+                let mut readiness = child.stdout.take().expect("private readiness output");
+                let pid = nix::unistd::Pid::from_raw(i32::try_from(child.id().unwrap()).unwrap());
+                let mut cleanup = FixtureGroup(Some(pid));
+                let mut commands = Commands::new(false, transport_runtime());
+                commands.active = Some(child);
+                tokio::time::timeout(Duration::from_secs(3), async {
+                    gate.write_all(b"ready\n").await.unwrap();
+                    let mut reply = [0; 5];
+                    readiness.read_exact(&mut reply).await.unwrap();
+                    assert_eq!(&reply, b"ready");
+                })
+                .await
+                .expect("TERM-ignore handler installed before cleanup");
+                let start = std::time::Instant::now();
+                commands.stop_active().await.unwrap();
+                assert!(start.elapsed() >= TERMINATION_GRACE);
+                assert!(commands.active.is_none());
+                assert_eq!(
+                    nix::sys::signal::kill(pid, None),
+                    Err(nix::errno::Errno::ESRCH)
+                );
+                cleanup.0 = None;
+            }
+            "lock-probe-denied" | "lock-probe-release-denied" => {
+                let probe = open_owned_file(&owner.path().join("probe")).unwrap();
+                let operation = if case == "lock-probe-denied" {
+                    libc::LOCK_EX | libc::LOCK_NB
+                } else {
+                    libc::LOCK_UN
+                };
+                deny_fixture_syscall_argument(
+                    libc::SYS_flock,
+                    1,
+                    u32::try_from(operation).unwrap(),
+                );
+                let error = inherited_lock(probe.as_raw_fd(), &owner.path().join("probe"))
+                    .expect_err("kernel lock denial must propagate through inherited handoff");
+                let expected = if case == "lock-probe-denied" {
+                    "Cannot verify the inherited Omarchy lock"
+                } else {
+                    "Cannot release the Omarchy lock probe"
+                };
+                assert!(error.to_string().contains(expected));
+                assert!(format!("{error:#}").contains("Operation not permitted"));
+            }
+            "foreground-assignment" => {
+                let before = foreground_group()
+                    .unwrap()
+                    .expect("private controlling terminal");
+                let sleep = crate::core::privilege::root_controlled_program_path("sleep").unwrap();
+                let mut command = Command::new(sleep);
+                command.arg("30").process_group(0).kill_on_drop(true);
+                let mut commands = Commands::new(false, transport_runtime());
+                deny_fixture_syscall_argument(
+                    libc::SYS_ioctl,
+                    1,
+                    u32::try_from(libc::TIOCSPGRP).unwrap(),
+                );
+                let error = commands
+                    .start(&mut command)
+                    .await
+                    .expect_err("foreground denied");
+                assert_eq!(
+                    error.downcast_ref::<nix::errno::Errno>(),
+                    Some(&nix::errno::Errno::EPERM)
+                );
+                assert!(commands.active.is_none());
+                assert!(commands.foreground.is_none());
+                assert_eq!(foreground_group().unwrap(), Some(before));
+            }
+            "foreground-detached" => {
+                let mut commands = Commands::new(false, transport_runtime());
+                commands.foreground = foreground_group().unwrap();
+                assert!(commands.foreground.is_some());
+                nix::unistd::dup2_stdin(File::open("/dev/null").unwrap()).unwrap();
+                commands
+                    .restore_foreground()
+                    .expect("detached terminal is benign");
+                assert!(commands.foreground.is_none());
+            }
+            "terminal-restore" => {
+                let (_input, restoration) = terminal_input().unwrap();
+                let restoration = restoration.expect("private terminal restoration guard");
+                deny_fixture_syscall_argument(
+                    libc::SYS_ioctl,
+                    1,
+                    u32::try_from(libc::TCSETS).unwrap(),
+                );
+                // glibc 2.42 and later use the termios2 ioctl ABI.
+                deny_fixture_syscall_argument(
+                    libc::SYS_ioctl,
+                    1,
+                    u32::try_from(libc::TCSETS2).unwrap(),
+                );
+                assert_eq!(
+                    nix::sys::termios::tcsetattr(
+                        &restoration.file,
+                        nix::sys::termios::SetArg::TCSANOW,
+                        &restoration.saved
+                    ),
+                    Err(nix::errno::Errno::EPERM)
+                );
+                drop(restoration);
+            }
+            "resize" | "transport-nonblocking" => {
+                let before = nix::sys::termios::tcgetattr(std::io::stdin()).unwrap();
+                let lock = open_owned_file(&owner.path().join("lock")).unwrap();
+                let log = open_owned_file(&owner.path().join("log")).unwrap();
+                let program = crate::core::privilege::root_controlled_program_path("true").unwrap();
+                if case == "resize" {
+                    deny_fixture_syscall_argument(
+                        libc::SYS_ioctl,
+                        1,
+                        u32::try_from(libc::TIOCSWINSZ).unwrap(),
+                    );
+                } else {
+                    deny_fixture_syscall_argument(
+                        libc::SYS_fcntl,
+                        1,
+                        u32::try_from(libc::F_SETFL).unwrap(),
+                    );
+                }
+                let error = execute_logged(&program, &[], &lock, &log, &transport_runtime())
+                    .await
+                    .expect_err("resize denied before spawn");
+                assert!(error.to_string().contains("Operation not permitted"));
+                assert_eq!(
+                    nix::sys::termios::tcgetattr(std::io::stdin()).unwrap(),
+                    before
+                );
+                assert_eq!(log.metadata().unwrap().len(), 0);
+            }
+            "descriptor-inspection" => {
+                let file = Arc::new(open_owned_file(&owner.path().join("probe")).unwrap());
+                deny_fixture_syscall_argument(
+                    libc::SYS_fcntl,
+                    1,
+                    u32::try_from(libc::F_GETFD).unwrap(),
+                );
+                let observed = observe_coordination_descriptors(
+                    &[Arc::clone(&file), Arc::clone(&file)],
+                    &Barrier::new(1),
+                    &AtomicBool::new(true),
+                    std::time::Instant::now(),
+                );
+                assert_eq!(
+                    observed.inspection_error,
+                    Some((0, nix::errno::Errno::EPERM))
+                );
+                assert_eq!(observed.inherited, [0, 0]);
+                assert_eq!(observed.samples, 1);
+                assert!(!observed.expired);
+                assert!(fcntl(file.as_ref(), FcntlArg::F_GETFL).is_ok());
+            }
+            "coordinator-interrupt" | "stage-stop" => {
+                let program =
+                    crate::core::privilege::root_controlled_program_path("sleep").unwrap();
+                let mut unrelated = Command::new(&program)
+                    .arg("30")
+                    .process_group(0)
+                    .kill_on_drop(true)
+                    .spawn()
+                    .unwrap();
+                let mut child = Command::new(program)
+                    .arg("0.2")
+                    .process_group(0)
+                    .kill_on_drop(true)
+                    .spawn()
+                    .unwrap();
+                let pid = i32::try_from(child.id().unwrap()).unwrap();
+                if case == "coordinator-interrupt" {
+                    deny_fixture_syscall_argument(
+                        libc::SYS_kill,
+                        1,
+                        u32::try_from(libc::SIGTERM).unwrap(),
+                    );
+                    let error =
+                        interrupt_coordinator(&child).expect_err("owned coordinator signal denied");
+                    assert_eq!(
+                        error.downcast_ref::<nix::errno::Errno>(),
+                        Some(&nix::errno::Errno::EPERM)
+                    );
+                    tokio::time::timeout(Duration::from_secs(3), child.wait())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                } else {
+                    deny_fixture_syscall_argument(
+                        libc::SYS_kill,
+                        0,
+                        u32::from_ne_bytes((-pid).to_ne_bytes()),
+                    );
+                    let mut commands = Commands::new(false, transport_runtime());
+                    commands.active = Some(child);
+                    tokio::time::timeout(Duration::from_secs(3), commands.stop_active())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert!(commands.active.is_none());
+                    assert_eq!(
+                        nix::sys::wait::waitpid(
+                            nix::unistd::Pid::from_raw(pid),
+                            Some(nix::sys::wait::WaitPidFlag::WNOHANG)
+                        ),
+                        Err(nix::errno::Errno::ECHILD)
+                    );
+                }
+                assert!(unrelated.try_wait().unwrap().is_none());
+                unrelated
+                    .kill()
+                    .await
+                    .expect("unrelated owned control remains manageable");
+            }
+            _ => {
+                assert!(
+                    matches!(
+                        case,
+                        "transcript-write"
+                            | "transcript-cleanup"
+                            | "resize-during-update"
+                            | "resize-forwarded"
+                    ),
+                    "unknown kernel fixture case"
+                );
+                let lock = open_owned_file(&owner.path().join("lock")).unwrap();
+                let log = open_owned_file(&owner.path().join("log")).unwrap();
+                let ready = owner.path().join("go");
+                let shell = crate::core::privilege::root_controlled_program_path("sh").unwrap();
+                let sleep = crate::core::privilege::root_controlled_program_path("sleep").unwrap();
+                let stty = crate::core::privilege::root_controlled_program_path("stty").unwrap();
+                let runtime = transport_runtime();
+                let fault = async {
+                    while log.metadata().unwrap().len() == 0 {
+                        tokio::task::yield_now().await;
+                    }
+                    if case == "resize-forwarded" {
+                        rustix::termios::tcsetwinsize(
+                            std::io::stdin(),
+                            rustix::termios::Winsize {
+                                ws_row: 37,
+                                ws_col: 111,
+                                ws_xpixel: 0,
+                                ws_ypixel: 0,
+                            },
+                        )
+                        .unwrap();
+                        nix::sys::signal::kill(
+                            nix::unistd::getpid(),
+                            nix::sys::signal::Signal::SIGWINCH,
+                        )
+                        .unwrap();
+                    } else if case == "resize-during-update" {
+                        deny_fixture_syscall_argument(
+                            libc::SYS_ioctl,
+                            1,
+                            u32::try_from(libc::TIOCSWINSZ).unwrap(),
+                        );
+                        nix::sys::signal::kill(
+                            nix::unistd::getpid(),
+                            nix::sys::signal::Signal::SIGWINCH,
+                        )
+                        .unwrap();
+                    } else {
+                        deny_fixture_syscall_argument(
+                            libc::SYS_write,
+                            0,
+                            u32::try_from(log.as_raw_fd()).unwrap(),
+                        );
+                    }
+                    if case == "transcript-cleanup" {
+                        deny_fixture_syscall_argument(
+                            libc::SYS_kill,
+                            1,
+                            u32::try_from(libc::SIGTERM).unwrap(),
+                        );
+                    }
+                    std::fs::write(&ready, b"ready").unwrap();
+                };
+                let script = if case == "resize-forwarded" {
+                    "until test -f \"$1\"; do \"$2\" 0.01; done; until test \"$(\"$3\" size)\" = '37 111'; do \"$2\" 0.01; done; printf resized"
+                } else {
+                    "until test -f \"$1\"; do sleep 0.01; done; printf payload; sleep 1"
+                };
+                let arguments = [
+                    "-c",
+                    script,
+                    "fixture",
+                    ready.to_str().unwrap(),
+                    sleep.to_str().unwrap(),
+                    stty.to_str().unwrap(),
+                ];
+                let execution = execute_logged(&shell, &arguments, &lock, &log, &runtime);
+                let ((), result) = tokio::join!(fault, execution);
+                if case == "resize-forwarded" {
+                    result.expect("successful window forwarding completes the coordinator");
+                } else {
+                    let error = result.expect_err("private transcript write denied");
+                    if case == "transcript-cleanup" {
+                        assert!(format!("{error:#}").contains("Transport cleanup failed"));
+                    } else {
+                        assert!(!format!("{error:#}").contains("Transport cleanup failed"));
+                    }
+                }
+                let transcript = std::fs::read_to_string(owner.path().join("log")).unwrap();
+                if matches!(case, "resize-during-update" | "resize-forwarded") {
+                    if case == "resize-forwarded" {
+                        assert!(transcript.contains("resized"));
+                    }
+                    assert!(transcript.starts_with("OMG Omarchy update started\n"));
+                    assert!(transcript.contains("OMG Omarchy update finished:"));
+                } else {
+                    assert_eq!(transcript, "OMG Omarchy update started\n");
+                }
+            }
+        }
+        println!("kernel boundary verified: {case}");
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[tokio::test]
+    async fn kernel_failures_preserve_owned_cleanup_and_diagnostics() {
+        let launcher = crate::core::privilege::root_controlled_program_path("setsid").unwrap();
+        for (case, diagnostic) in [
+            ("empty-runtime", None),
+            ("runtime-unset", None),
+            ("runtime-unset-invalid-state", None),
+            ("resize-forwarded", None),
+            ("stage-grace", None),
+            ("lock-probe-denied", None),
+            ("lock-probe-release-denied", None),
+            ("transport-nonblocking", None),
+            ("resize-during-update", None),
+            ("foreground-assignment", None),
+            ("foreground-detached", Some("Update terminal detached")),
+            (
+                "terminal-restore",
+                Some("Cannot restore update terminal settings"),
+            ),
+            ("resize", None),
+            ("descriptor-inspection", None),
+            ("coordinator-interrupt", None),
+            (
+                "stage-stop",
+                Some("Unable to kill owned Omarchy stage group"),
+            ),
+            (
+                "transcript-write",
+                Some("Cannot finish interrupted update transcript"),
+            ),
+            ("transcript-cleanup", None),
+        ] {
+            let (master, slave) = open_transport_pty(None).unwrap();
+            let mut command = Command::new(&launcher);
+            if case.starts_with("runtime-unset") {
+                command.env_remove("OMARCHY_PATH");
+            } else {
+                command.env("OMARCHY_PATH", "");
+            }
+            if case == "runtime-unset-invalid-state" {
+                command.env("OMARCHY_MIGRATION_STATE", "");
+            }
+            let deadline = if case == "stage-grace" {
+                TERMINATION_GRACE + Duration::from_secs(3)
+            } else {
+                Duration::from_secs(10)
+            };
+            let output = tokio::time::timeout(
+                deadline,
+                command
+                    .args(["--ctty", "--"])
+                    .arg(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "cli::packages::update::omarchy::tests::kernel_boundary_fixture",
+                        "--nocapture",
+                    ])
+                    .env("OMG_OMARCHY_KERNEL_BOUNDARY_FIXTURE", case)
+                    .stdin(Stdio::from(slave))
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .kill_on_drop(true)
+                    .output(),
+            )
+            .await
+            .expect("kernel fixture deadline")
+            .expect("owned kernel fixture runs");
+            drop(master);
+            fixture_success(&output, format_args!("kernel boundary {case}: "))
+                .expect("owned fixture must succeed");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stdout.contains(&format!("kernel boundary verified: {case}")),
+                "{stdout}"
+            );
+            if let Some(diagnostic) = diagnostic {
+                assert!(
+                    stdout.contains(diagnostic) || stderr.contains(diagnostic),
+                    "{case}: {stdout}{stderr}"
+                );
+            }
+        }
+    }
+
+    struct FixtureOutput<'a>(&'a std::process::Output);
+
+    impl std::fmt::Display for FixtureOutput<'_> {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(
+                formatter,
+                "{}; stdout: {}; stderr: {}",
+                self.0.status,
+                String::from_utf8_lossy(&self.0.stdout),
+                String::from_utf8_lossy(&self.0.stderr)
+            )
+        }
+    }
+
+    fn fixture_success(
+        output: &std::process::Output,
+        context: std::fmt::Arguments<'_>,
+    ) -> Result<()> {
+        if output.status.success() {
+            return Ok(());
+        }
+        anyhow::bail!("{context}{}", FixtureOutput(output));
+    }
+
+    #[test]
+    fn fixture_diagnostics_preserve_status_and_non_utf8_output() {
+        use std::os::unix::process::ExitStatusExt;
+        for code in [0, 7] {
+            let output = std::process::Output {
+                status: ExitStatus::from_raw(code << 8),
+                stdout: b"out\xff".to_vec(),
+                stderr: b"err\xfe".to_vec(),
+            };
+            let result = fixture_success(&output, format_args!("probe: "));
+            if code == 0 {
+                result.expect("successful fixture accepted");
+            } else {
+                assert_eq!(
+                    result.unwrap_err().to_string(),
+                    format!("probe: exit status: {code}; stdout: out\u{fffd}; stderr: err\u{fffd}")
+                );
+            }
+            assert_eq!(
+                FixtureOutput(&output).to_string(),
+                format!("exit status: {code}; stdout: out\u{fffd}; stderr: err\u{fffd}")
+            );
+        }
+    }
+
+    async fn fixture_ready<T: std::fmt::Debug>(
+        operation: impl std::future::Future<Output = T>,
+        ready: impl std::future::Future<Output = ()>,
+        context: &str,
+    ) -> Result<()> {
+        tokio::select! {
+            result = operation => anyhow::bail!("{context}: {result:?}"),
+            () = ready => Ok(()),
+        }
+    }
+
+    #[tokio::test]
+    async fn fixture_readiness_preserves_early_completion_and_success() {
+        use std::os::unix::process::ExitStatusExt;
+        fixture_ready(
+            std::future::pending::<Result<()>>(),
+            std::future::ready(()),
+            "ready",
+        )
+        .await
+        .unwrap();
+        let error = fixture_ready(
+            std::future::ready(Err::<(), _>(anyhow::anyhow!("inert failure"))),
+            std::future::pending(),
+            "early failure",
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("early failure"));
+        assert!(error.to_string().contains("inert failure"));
+        let status = ExitStatus::from_raw(7 << 8);
+        let error = fixture_ready(
+            std::future::ready(Ok::<_, anyhow::Error>(status)),
+            std::future::pending(),
+            "early exit",
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("early exit"));
+        assert!(error.to_string().contains(&format!("{status:?}")));
+    }
+
+    async fn finish_fixture_prompt(
+        child: &mut tokio::process::Child,
+        prompt: std::result::Result<Result<()>, tokio::time::error::Elapsed>,
+        observed: &[u8],
+    ) -> Result<()> {
+        if matches!(prompt, Ok(Ok(()))) {
+            return Ok(());
+        }
+        child.kill().await?;
+        anyhow::bail!(
+            "partial prompt was not visible before input: {prompt:?}; observed {:?}",
+            String::from_utf8_lossy(observed)
+        );
+    }
+
+    #[tokio::test]
+    async fn prompt_failure_reaps_the_owned_fixture_and_keeps_diagnostics() {
+        let program = crate::core::privilege::root_controlled_program_path("sleep").unwrap();
+        for expired in [false, true] {
+            let mut child = Command::new(&program)
+                .arg("30")
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            finish_fixture_prompt(&mut child, Ok(Ok(())), b"Enter value: ")
+                .await
+                .unwrap();
+            assert!(child.try_wait().unwrap().is_none());
+            let prompt = if expired {
+                tokio::time::timeout(
+                    Duration::from_millis(1),
+                    std::future::pending::<Result<()>>(),
+                )
+                .await
+            } else {
+                Ok(Err(anyhow::anyhow!(
+                    "fixture closed output before its prompt"
+                )))
+            };
+            let error = finish_fixture_prompt(&mut child, prompt, b"partial\xff")
+                .await
+                .expect_err("failed prompt must stop its owned child");
+            let diagnostic = error.to_string();
+            assert!(diagnostic.contains("partial\u{fffd}"), "{diagnostic}");
+            assert!(
+                diagnostic.contains(if expired {
+                    "Elapsed"
+                } else {
+                    "fixture closed output"
+                }),
+                "{diagnostic}"
+            );
+            assert!(child.id().is_none());
+        }
+    }
+
+    struct FixtureGroup(Option<nix::unistd::Pid>);
+
+    impl Drop for FixtureGroup {
+        fn drop(&mut self) {
+            if let Some(group) = self.0 {
+                let _ = nix::sys::signal::killpg(group, nix::sys::signal::Signal::SIGKILL);
+            }
+        }
+    }
+
+    struct PendingFixtureGroup(Option<PathBuf>);
+
+    fn pending_fixture_group(root: &Path) -> Option<nix::unistd::Pid> {
+        let pid: i32 = std::fs::read_to_string(root.join("ready"))
+            .ok()?
+            .parse()
+            .ok()?;
+        (pid > 1 && pid != nix::unistd::getpgrp().as_raw()).then(|| nix::unistd::Pid::from_raw(pid))
+    }
+
+    impl Drop for PendingFixtureGroup {
+        fn drop(&mut self) {
+            if let Some(root) = &self.0 {
+                drop(FixtureGroup(pending_fixture_group(root)));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_group_guard_rejects_invalid_ids_and_reaps_its_owned_fixture() {
+        let owner = private_directory();
+        assert_eq!(pending_fixture_group(owner.path()), None);
+        for value in [
+            String::new(),
+            "not-a-pid".to_owned(),
+            "0".to_owned(),
+            "-1".to_owned(),
+            "1".to_owned(),
+            nix::unistd::getpgrp().to_string(),
+        ] {
+            std::fs::write(owner.path().join("ready"), value).unwrap();
+            assert_eq!(pending_fixture_group(owner.path()), None);
+        }
+        let program = crate::core::privilege::root_controlled_program_path("sleep").unwrap();
+        let mut child = Command::new(program)
+            .arg("30")
+            .process_group(0)
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let pid = child.id().unwrap();
+        std::fs::write(owner.path().join("ready"), pid.to_string()).unwrap();
+        assert_eq!(
+            pending_fixture_group(owner.path()).unwrap().as_raw(),
+            i32::try_from(pid).unwrap()
+        );
+        let mut disarmed = PendingFixtureGroup(Some(owner.path().to_owned()));
+        disarmed.0 = None;
+        drop(disarmed);
+        assert!(child.try_wait().unwrap().is_none());
+        drop(PendingFixtureGroup(Some(owner.path().to_owned())));
+        let status = tokio::time::timeout(Duration::from_secs(3), child.wait())
+            .await
+            .unwrap()
+            .unwrap();
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(status.signal(), Some(nix::libc::SIGKILL));
+    }
+
+    #[derive(Debug, Default)]
+    struct DescriptorObservation {
+        samples: u64,
+        inherited: [u64; 2],
+        inspection_error: Option<(usize, nix::errno::Errno)>,
+        expired: bool,
+    }
+
+    fn observe_coordination_descriptors(
+        files: &[std::sync::Arc<File>; 2],
+        ready: &std::sync::Barrier,
+        done: &std::sync::atomic::AtomicBool,
+        deadline: std::time::Instant,
+    ) -> DescriptorObservation {
+        let mut observed = DescriptorObservation::default();
+        loop {
+            for (index, file) in files.iter().enumerate() {
+                match fcntl(file.as_ref(), FcntlArg::F_GETFD) {
+                    Ok(flags) => {
+                        if !FdFlag::from_bits_truncate(flags).contains(FdFlag::FD_CLOEXEC) {
+                            observed.inherited[index] += 1;
+                        }
+                    }
+                    Err(error) => {
+                        observed.inspection_error.get_or_insert((index, error));
+                    }
+                }
+            }
+            observed.samples += 1;
+            if observed.samples == 1 {
+                ready.wait();
+            }
+            if done.load(std::sync::atomic::Ordering::Acquire) {
+                return observed;
+            }
+            if std::time::Instant::now() >= deadline {
+                observed.expired = true;
+                return observed;
+            }
+        }
+    }
+
+    #[test]
+    fn descriptor_observer_detects_inheritable_files_and_deadline_expiry() {
+        use std::sync::{Arc, Barrier, atomic::AtomicBool};
+        let owner = private_directory();
+        let lock = Arc::new(open_owned_file(&owner.path().join("probe-lock")).unwrap());
+        let log = Arc::new(open_owned_file(&owner.path().join("probe-log")).unwrap());
+        for (flags, finished, expected) in [
+            (FdFlag::empty(), false, [1, 0]),
+            (FdFlag::FD_CLOEXEC, true, [0, 0]),
+        ] {
+            fcntl(lock.as_ref(), FcntlArg::F_SETFD(flags)).unwrap();
+            let ready = Arc::new(Barrier::new(2));
+            let observer = std::thread::spawn({
+                let files = [Arc::clone(&lock), Arc::clone(&log)];
+                let ready = Arc::clone(&ready);
+                move || {
+                    observe_coordination_descriptors(
+                        &files,
+                        &ready,
+                        &AtomicBool::new(finished),
+                        std::time::Instant::now(),
+                    )
+                }
+            });
+            ready.wait();
+            let observed = observer.join().unwrap();
+            assert_eq!(observed.samples, 1);
+            assert_eq!(observed.inherited, expected);
+            assert_eq!(observed.inspection_error, None);
+            assert_eq!(observed.expired, !finished);
+        }
+    }
+
+    fn private_directory() -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt;
+        tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .expect("private Omarchy fixture")
+    }
+
+    fn transport_runtime() -> OmarchyRuntime {
+        OmarchyRuntime {
+            root: PathBuf::from("/usr/share/omarchy"),
+            migration_state: std::path::absolute("markers")
+                .expect("private transport migration state"),
+        }
+    }
+
+    #[derive(Default)]
+    struct ObservedStages {
+        stages: Vec<Stage>,
+        failure: Option<Stage>,
+        decline: Option<Stage>,
+        missing_snapshot: bool,
+    }
+
+    impl StageExecutor for ObservedStages {
+        async fn execute(&mut self, stage: Stage) -> Result<Outcome> {
+            self.stages.push(stage);
+            if self.failure == Some(stage) {
+                anyhow::bail!("inert stage failure {stage:?}");
+            }
+            Ok(if self.decline == Some(stage) {
+                Outcome::Declined
+            } else if self.missing_snapshot && stage == Stage::Snapshot {
+                Outcome::Unavailable
+            } else {
+                Outcome::Success
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn lifecycle_preserves_omarchy_order_with_native_aur() {
+        let mut observed = ObservedStages::default();
+        workflow(&mut observed, false)
+            .await
+            .expect("complete inert lifecycle");
+        assert_eq!(
+            observed.stages,
+            [
+                Stage::Preflight,
+                Stage::MigrationPreflight,
+                Stage::Confirm,
+                Stage::Authorize,
+                Stage::NativePackage(NativeOmarchyOperation::PruneCache),
+                Stage::Snapshot,
+                Stage::InhibitSleep,
+                Stage::DevelopmentCheckout,
+                Stage::NativePackage(NativeOmarchyOperation::RefreshKeyrings),
+                Stage::NativePackage(NativeOmarchyOperation::UpgradeRepositories),
+                Stage::MigrationPreflight,
+                Stage::MigrationsPending,
+                Stage::RestartShell,
+                Stage::Migrations,
+                Stage::NativePackage(NativeOmarchyOperation::RemoveOrphans),
+                Stage::AnalyzeLog,
+                Stage::ClearIndicator,
+                Stage::RestartServices,
+                Stage::PostUpdateHooks,
+                Stage::Mise,
+                Stage::NativeAur,
+                Stage::VerifyBoot,
+                Stage::ReleaseAuthorization,
+                Stage::ReleaseInhibitor,
+                Stage::RebootPrompt,
+            ]
+        );
+        for stage in observed.stages {
+            if let Some((program, _)) = stage_command(stage) {
+                assert!(
+                    ![
+                        "yay",
+                        "aura",
+                        "paru",
+                        "omarchy-update-aur-pkgs",
+                        "omarchy-update"
+                    ]
+                    .contains(&program)
+                );
+            }
+        }
+        for stage in [
+            Stage::Preflight,
+            Stage::Confirm,
+            Stage::NativePackage(NativeOmarchyOperation::PruneCache),
+            Stage::NativePackage(NativeOmarchyOperation::RefreshKeyrings),
+            Stage::NativePackage(NativeOmarchyOperation::UpgradeRepositories),
+            Stage::NativePackage(NativeOmarchyOperation::RemoveOrphans),
+            Stage::RebootPrompt,
+        ] {
+            assert!(
+                stage_command(stage).is_none(),
+                "{stage:?} must execute natively, never via an external helper"
+            );
+        }
+        assert!(stage_command(Stage::NativeAur).is_none());
+    }
+
+    #[test]
+    fn native_preflight_checks_ten_gib_threshold_and_force_override() {
+        let low = check_free_space_bytes(MIN_UPDATE_FREE_BYTES - 1, false)
+            .expect_err("below 10 GiB must fail preflight");
+        assert!(low.to_string().contains("10 GiB"), "{low:#}");
+        assert!(
+            low.to_string().contains("OMARCHY_UPDATE_FORCE=1"),
+            "{low:#}"
+        );
+        check_free_space_bytes(MIN_UPDATE_FREE_BYTES, false)
+            .expect("exact 10 GiB threshold must succeed");
+        check_free_space_bytes(MIN_UPDATE_FREE_BYTES + 1024, false)
+            .expect("above 10 GiB threshold must succeed");
+        check_free_space_bytes(0, true).expect("OMARCHY_UPDATE_FORCE=1 bypasses free space check");
+    }
+
+    #[tokio::test]
+    async fn failures_never_report_completion_or_leave_lifecycle_cleanup_out() {
+        for failure in [
+            Stage::Authorize,
+            Stage::InhibitSleep,
+            Stage::DevelopmentCheckout,
+            Stage::NativePackage(NativeOmarchyOperation::RefreshKeyrings),
+            Stage::NativePackage(NativeOmarchyOperation::UpgradeRepositories),
+            Stage::MigrationsPending,
+            Stage::Migrations,
+            Stage::NativePackage(NativeOmarchyOperation::RemoveOrphans),
+            Stage::AnalyzeLog,
+            Stage::ClearIndicator,
+            Stage::RestartServices,
+            Stage::PostUpdateHooks,
+            Stage::NativeAur,
+            Stage::VerifyBoot,
+            Stage::ReleaseAuthorization,
+            Stage::ReleaseInhibitor,
+        ] {
+            let mut observed = ObservedStages {
+                failure: Some(failure),
+                ..ObservedStages::default()
+            };
+            let error = workflow(&mut observed, true)
+                .await
+                .expect_err("critical stage failure");
+            assert!(format!("{error:#}").contains("inert stage failure"));
+            assert!(
+                observed.stages.contains(&Stage::ReleaseAuthorization),
+                "{failure:?}"
+            );
+            if observed.stages.contains(&Stage::InhibitSleep) {
+                assert!(
+                    observed.stages.contains(&Stage::ReleaseInhibitor),
+                    "{failure:?}"
+                );
+            }
+            assert!(
+                !observed.stages.contains(&Stage::RebootPrompt),
+                "{failure:?}"
+            );
+        }
+        for failure in [Stage::Preflight, Stage::MigrationPreflight] {
+            let mut observed = ObservedStages {
+                failure: Some(failure),
+                ..ObservedStages::default()
+            };
+            workflow(&mut observed, false)
+                .await
+                .expect_err("preflight refusal");
+            assert!(!observed.stages.contains(&Stage::Authorize));
+        }
+    }
+
+    #[tokio::test]
+    async fn workflow_retains_operation_and_all_cleanup_failures() {
+        struct FailingStages {
+            events: Vec<Stage>,
+        }
+
+        impl StageExecutor for FailingStages {
+            async fn execute(&mut self, stage: Stage) -> Result<Outcome> {
+                self.events.push(stage);
+                match stage {
+                    Stage::NativePackage(NativeOmarchyOperation::UpgradeRepositories) => {
+                        anyhow::bail!("official package operation failed")
+                    }
+                    Stage::ReleaseAuthorization => {
+                        anyhow::bail!("authorization release failed")
+                    }
+                    Stage::ReleaseInhibitor => anyhow::bail!("sleep inhibitor release failed"),
+                    _ => Ok(Outcome::Success),
+                }
+            }
+        }
+
+        let mut observed = FailingStages { events: Vec::new() };
+        let error = workflow(&mut observed, true)
+            .await
+            .expect_err("operation and both releases fail");
+        for stage in [Stage::ReleaseAuthorization, Stage::ReleaseInhibitor] {
+            assert_eq!(
+                observed
+                    .events
+                    .iter()
+                    .filter(|event| **event == stage)
+                    .count(),
+                1,
+                "{stage:?} must be attempted once despite the other failures"
+            );
+        }
+        assert!(
+            !observed.events.contains(&Stage::RebootPrompt),
+            "failed operation and cleanup cannot invite reboot"
+        );
+        let diagnostic = format!("{error:#}");
+        for failure in [
+            "official package operation failed",
+            "authorization release failed",
+            "sleep inhibitor release failed",
+        ] {
+            assert!(
+                diagnostic.contains(failure),
+                "returned error lost {failure:?}: {diagnostic}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn optional_failures_do_not_skip_native_aur_or_boot_verification() {
+        for failure in [
+            Stage::NativePackage(NativeOmarchyOperation::PruneCache),
+            Stage::Snapshot,
+            Stage::RestartShell,
+            Stage::Mise,
+        ] {
+            let mut observed = ObservedStages {
+                failure: Some(failure),
+                ..ObservedStages::default()
+            };
+            workflow(&mut observed, true)
+                .await
+                .expect("optional stage permits completion");
+            assert!(observed.stages.contains(&Stage::NativeAur));
+            assert!(observed.stages.contains(&Stage::VerifyBoot));
+            assert_eq!(observed.stages.last(), Some(&Stage::RebootPrompt));
+        }
+        let mut observed = ObservedStages {
+            missing_snapshot: true,
+            decline: Some(Stage::MigrationsPending),
+            ..ObservedStages::default()
+        };
+        workflow(&mut observed, true)
+            .await
+            .expect("no snapshot and no pending migration");
+        assert!(!observed.stages.contains(&Stage::RestartShell));
+        assert!(!observed.stages.contains(&Stage::Confirm));
+    }
+
+    #[tokio::test]
+    async fn nested_omarchy_commands_use_the_selected_runtime() -> Result<()> {
+        let directory = private_directory();
+        let bin = directory.path().join("bin");
+        std::fs::create_dir(&bin)?;
+        let helper = bin.join("omarchy-fixture-nested");
+        let script = "#!/bin/bash\n[[ \"$OMARCHY_PATH/bin/omarchy-fixture-nested\" == \"$0\" ]]\n";
+        std::fs::write(&helper, script)?;
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700))?;
+        let shell = crate::core::privilege::root_controlled_program_path("bash")?;
+        let mut commands = Commands::new(
+            false,
+            OmarchyRuntime {
+                root: directory.path().to_owned(),
+                migration_state: directory.path().join("markers"),
+            },
+        );
+        let status = commands
+            .run_program(
+                &shell,
+                &["--noprofile", "--norc", "-c", "omarchy-fixture-nested"],
+            )
+            .await?;
+        assert!(
+            status.success(),
+            "nested helper was not found in the selected runtime: {status}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn dev_link_uses_the_literal_path_written_by_omarchy() -> Result<()> {
+        let config = r#"export OMARCHY_PATH="/home/dev/checkout with \$ and \"quotes\"""#;
+        assert_eq!(
+            parse_configured_omarchy_root(config)?,
+            Path::new(r#"/home/dev/checkout with $ and "quotes""#),
+        );
+        for invalid in [
+            r#"export OMARCHY_PATH="checkout""#,
+            r#"export OMARCHY_PATH="/home/$USER/checkout""#,
+            "export OMARCHY_PATH=\"/home/dev\"\ntrue\n",
+            "export OMARCHY_PATH=\"/home/dev`true`\"\n",
+        ] {
+            assert!(parse_configured_omarchy_root(invalid).is_err());
+        }
+        let invalid = "export OMARCHY_PATH=\"/home/dev\tcheckout\"";
+        assert!(
+            parse_configured_omarchy_root(invalid)
+                .expect_err("a control character must refuse the configured path")
+                .to_string()
+                .contains("Invalid character in Omarchy dev-link path")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn declined_confirmation_has_no_authorization_or_mutating_stages() {
+        let mut observed = ObservedStages {
+            decline: Some(Stage::Confirm),
+            ..ObservedStages::default()
+        };
+        workflow(&mut observed, false)
+            .await
+            .expect("declined update");
+        assert_eq!(
+            observed.stages,
+            [Stage::Preflight, Stage::MigrationPreflight, Stage::Confirm]
+        );
+    }
+
+    #[test]
+    fn standard_migration_fixture() {
+        if std::env::var_os("OMG_OMARCHY_MIGRATION_FIXTURE").is_none() {
+            return;
+        }
+        assert_eq!(
+            crate::config::Settings::load()
+                .expect("private standard settings")
+                .aur
+                .security_profile,
+            crate::config::AurSecurityProfile::Standard
+        );
+        let runtime = OmarchyRuntime {
+            root: PathBuf::from(std::env::var_os("OMARCHY_PATH").expect("private migration root")),
+            migration_state: PathBuf::from(
+                std::env::var_os("OMARCHY_MIGRATION_STATE").expect("private migration state"),
+            ),
+        };
+        let error = runtime
+            .check_pending_migrations()
+            .expect_err("Standard must refuse a known external AUR helper");
+        assert!(
+            error.to_string().contains("external package helper"),
+            "{error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn checkout_migration_fixture() {
+        let Some(root) = std::env::var_os("OMG_OMARCHY_CHECKOUT_FIXTURE") else {
+            return;
+        };
+        let root = PathBuf::from(root);
+        let runtime = OmarchyRuntime {
+            root: PathBuf::from(std::env::var_os("OMARCHY_PATH").expect("private checkout root")),
+            migration_state: PathBuf::from(
+                std::env::var_os("OMARCHY_MIGRATION_STATE").expect("private checkout state"),
+            ),
+        };
+        let commands = Commands::new(false, runtime);
+        if let Ok(variable) = std::env::var("OMG_OMARCHY_EMPTY_VARIABLE_FIXTURE") {
+            let error = commands
+                .runtime
+                .check_pending_migrations()
+                .expect_err("explicitly empty migration paths must fail preflight");
+            let diagnostic = error.to_string();
+            assert!(
+                diagnostic.contains(&variable) && diagnostic.contains("non-empty"),
+                "{error:#}"
+            );
+            assert!(
+                !root.join("executed").exists(),
+                "invalid migration paths must not execute checkout programs"
+            );
+            return;
+        }
+        commands
+            .runtime
+            .check_pending_migrations()
+            .expect("user checkout migration data must pass preflight");
+        std::fs::write(
+            root.join("migrations/0002.sh"),
+            "omarchy-pkg-aur-add brave-origin-bin\n",
+        )
+        .expect("inert external helper migration");
+        let error = commands
+            .runtime
+            .check_pending_migrations()
+            .expect_err("user checkout must still refuse external AUR migrations");
+        assert!(
+            error.to_string().contains("external package helper"),
+            "{error:#}"
+        );
+        assert!(
+            !root.join("executed").exists(),
+            "migration preflight must not execute checkout programs"
+        );
+    }
+
+    #[test]
+    fn user_checkout_migration_data_passes_preflight_without_executing_checkout_programs() {
+        use std::os::unix::fs::PermissionsExt;
+        let owner = private_directory();
+        let root = owner.path().join("omarchy");
+        let markers = owner.path().join("markers");
+        for path in [root.join("migrations"), root.join("bin"), markers.clone()] {
+            std::fs::create_dir_all(path).expect("private checkout directories");
+        }
+        std::fs::write(
+            root.join("migrations/0001.sh"),
+            "echo native configuration\n",
+        )
+        .expect("inert native migration");
+        let executable = root.join("bin/omarchy-migrate");
+        std::fs::write(
+            &executable,
+            "#!/bin/sh\nprintf executed > \"$OMARCHY_PATH/executed\"\nexit 88\n",
+        )
+        .expect("checkout executable sentinel");
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))
+            .expect("user checkout executable permissions");
+        for empty_variable in [None, Some("OMARCHY_PATH"), Some("OMARCHY_MIGRATION_STATE")] {
+            let mut command =
+                std::process::Command::new(std::env::current_exe().expect("test executable"));
+            command
+                .args([
+                    "--exact",
+                    "cli::packages::update::omarchy::tests::checkout_migration_fixture",
+                    "--nocapture",
+                ])
+                .current_dir(owner.path())
+                .env("OMG_OMARCHY_CHECKOUT_FIXTURE", &root)
+                .env("OMARCHY_PATH", &root)
+                .env("OMARCHY_MIGRATION_STATE", &markers)
+                .env_remove("OMG_OMARCHY_EMPTY_VARIABLE_FIXTURE");
+            if let Some(variable) = empty_variable {
+                command
+                    .env("OMG_OMARCHY_EMPTY_VARIABLE_FIXTURE", variable)
+                    .env(variable, "");
+            }
+            let output = command
+                .output()
+                .expect("isolated checkout migration preflight");
+            fixture_success(&output, format_args!("empty variable {empty_variable:?}: "))
+                .expect("owned fixture must succeed");
+        }
+    }
+
+    #[test]
+    fn standard_updates_refuse_pending_external_aur_helpers() {
+        let owner = private_directory();
+        let root = owner.path().join("omarchy");
+        let migrations = root.join("migrations");
+        let markers = owner.path().join("markers");
+        let config = owner.path().join("config");
+        for path in [&migrations, &markers, &config] {
+            std::fs::create_dir_all(path).expect("private migration directories");
+        }
+        std::fs::write(
+            migrations.join("0001.sh"),
+            "omarchy-pkg-aur-add brave-origin-bin\n",
+        )
+        .expect("inert known external helper payload");
+        std::fs::write(
+            config.join("config.toml"),
+            toml::to_string(&crate::config::Settings::default())
+                .expect("serialize Standard config"),
+        )
+        .expect("private Standard config");
+        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "cli::packages::update::omarchy::tests::standard_migration_fixture",
+                "--nocapture",
+            ])
+            .env("OMG_OMARCHY_MIGRATION_FIXTURE", "1")
+            .env("OMG_CONFIG_DIR", config)
+            .env("OMARCHY_PATH", root)
+            .env("OMARCHY_MIGRATION_STATE", markers)
+            .output()
+            .expect("isolated Standard migration admission test");
+        fixture_success(
+            &output,
+            format_args!("Standard migration admission failed: "),
+        )
+        .expect("owned fixture must succeed");
+    }
+
+    fn native_package_migration_fixtures() -> [(&'static str, &'static str); 3] {
+        [
+            (
+                "1794518371.sh",
+                r#"echo "Install xrandr so Wine tray menus open at the pointer"
+
+# omarchy-tray-context-menu reads Xwayland's monitor layout with xrandr to
+# place a Wine app's own tray menu where it was right-clicked.
+omarchy-pkg-add xorg-xrandr
+"#,
+            ),
+            (
+                "1794675791.sh",
+                r#"echo "Give the HP OmniBook 3 working speakers and microphones"
+
+# See install/hardware/hp/fix-hp-omnibook-3-speakers.sh. The sound card comes
+# with linux-omarchy-dtbs' OmniBook 3 tree, so it comes up from the next boot.
+# Migrations run once per user, so a later user finds the package installed
+# and leaves the machine as it is.
+if ! omarchy-hw-aarch64-qualcomm || ! omarchy-hw-match "OmniBook 3 Laptop" || omarchy-pkg-present hp-omnibook-3-audio; then
+  exit 0
+fi
+
+omarchy-pkg-add hp-omnibook-3-audio
+omarchy-state set reboot-required
+"#,
+            ),
+            (
+                "1794774234.sh",
+                r#"echo "Replace imv and mpv with Omaview"
+
+omarchy-pkg-add omaview
+
+# Omarchy's own Image Viewer (imv) and Media Player (mpv) launchers give way to
+# Omaview's Media Viewer. Only a copy still as Omarchy shipped it goes, so one
+# the user changed, or linked from their dotfiles, stays theirs.
+applications="$HOME/.local/share/applications"
+for entry in imv.desktop mpv.desktop; do
+  file="$applications/$entry"
+  [[ -f $file && ! -L $file ]] || continue
+  case $(sha256sum <"$file") in
+    120d30326a77e1f23d050e52293d0acf1aeb9499bf9cd47b93996d6e2be99480* | \
+      a7a75999f161c6a409ff4c5da26ad9c79fc1ffdd4e633aac87f972ad72fc85d4* | \
+      d105a16b60ecc1c67f6cc37e5bb7831ca8a08d0e602cb64dd4a1386703362385* | \
+      9844e9d22d1b4b9801965afea1eb250103cfc6f12e6e62e542ac47abd4b8094d*)
+      rm -f "$file"
+      ;;
+  esac
+done
+if [[ -d $applications ]]; then
+  update-desktop-database "$applications"
+fi
+
+# imv and mpv-mpris go. mpv stays, as Omarchy's wallpaper engine, owe, plays
+# video wallpapers through it. A mimeapps.list line naming imv.desktop stops
+# resolving, and Omarchy's default, Omaview, opens those files instead.
+omarchy-pkg-drop imv mpv-mpris
+"#,
+            ),
+        ]
+    }
+
+    #[test]
+    fn deployed_package_migrations_have_native_equivalents() {
+        let owner = private_directory();
+        let migrations = owner.path().join("migrations");
+        let markers = owner.path().join("markers");
+        std::fs::create_dir(&migrations).expect("migration directory");
+        for (name, contents) in native_package_migration_fixtures() {
+            std::fs::write(migrations.join(name), contents).expect("deployed migration fixture");
+        }
+        ensure_migrations_use_native_aur(&migrations, &markers)
+            .expect("all exact deployed scripts must use native package equivalents");
+        assert!(!markers.exists(), "preflight must not claim completion");
+    }
+
+    #[test]
+    fn media_viewer_migration_keeps_custom_and_linked_launchers() -> Result<()> {
+        let owner = private_directory();
+        let applications = owner.path().join("applications");
+        assert!(!remove_shipped_media_launchers(&applications, &[])?);
+        std::fs::create_dir(&applications)?;
+        let imv = applications.join("imv.desktop");
+        let mpv = applications.join("mpv.desktop");
+        let dotfile = owner.path().join("mpv.desktop");
+        let shipped = "unmodified vendor launch command\n";
+        let digest = hex::encode(migration_digest(shipped));
+        std::fs::write(&imv, shipped)?;
+        std::fs::write(&mpv, "modified launcher\n")?;
+        assert!(remove_shipped_media_launchers(&applications, &[&digest])?);
+        assert!(!imv.exists());
+        assert_eq!(std::fs::read_to_string(&mpv)?, "modified launcher\n");
+        std::fs::remove_file(&mpv)?;
+        std::fs::write(&dotfile, shipped)?;
+        std::os::unix::fs::symlink(&dotfile, &mpv)?;
+        assert!(remove_shipped_media_launchers(&applications, &[&digest])?);
+        assert_eq!(std::fs::read_link(&mpv)?, dotfile);
+        assert_eq!(std::fs::read_to_string(dotfile)?, shipped);
+        Ok(())
+    }
+
+    #[test]
+    fn media_launcher_cleanup_refuses_unreadable_locations_and_keeps_non_files() -> Result<()> {
+        let owner = private_directory();
+        let applications = owner.path().join("applications");
+        std::fs::write(&applications, "not a directory")?;
+        assert!(!remove_shipped_media_launchers(&applications, &[])?);
+        assert!(
+            remove_shipped_media_launchers(&applications.join("nested"), &[])
+                .expect_err("path beneath a file must fail")
+                .to_string()
+                .contains("Cannot inspect the desktop application directory")
+        );
+
+        std::fs::remove_file(&applications)?;
+        std::fs::create_dir(&applications)?;
+        let launcher = applications.join("imv.desktop");
+        std::fs::create_dir(&launcher)?;
+        assert!(remove_shipped_media_launchers(&applications, &[])?);
+        assert!(launcher.is_dir());
+        std::fs::remove_dir(&launcher)?;
+
+        let socket = std::os::unix::net::UnixListener::bind(&launcher)?;
+        assert!(
+            remove_shipped_media_launchers(&applications, &[])
+                .expect_err("a launcher socket must not be opened")
+                .to_string()
+                .contains("Cannot inspect imv.desktop")
+        );
+        drop(socket);
+        Ok(())
+    }
+
+    #[test]
+    fn media_launcher_cleanup_reports_a_matching_launcher_it_cannot_remove() -> Result<()> {
+        const TEST: &str = "cli::packages::update::omarchy::tests::media_launcher_cleanup_reports_a_matching_launcher_it_cannot_remove";
+        if crate::config::Settings::rerun_test_unprivileged(TEST) {
+            return Ok(());
+        }
+        use std::os::unix::fs::PermissionsExt;
+
+        let owner = private_directory();
+        let applications = owner.path().join("applications");
+        std::fs::create_dir(&applications)?;
+        let launcher = applications.join("imv.desktop");
+        let shipped = "vendor image viewer\n";
+        std::fs::write(&launcher, shipped)?;
+        let digest = hex::encode(migration_digest(shipped));
+        std::fs::set_permissions(&applications, std::fs::Permissions::from_mode(0o500))?;
+        let result = remove_shipped_media_launchers(&applications, &[&digest]);
+        std::fs::set_permissions(&applications, std::fs::Permissions::from_mode(0o700))?;
+
+        let error = result.expect_err("the read-only directory must prevent removing the launcher");
+        assert_eq!(
+            error.to_string(),
+            "Cannot remove the old Omarchy launcher imv.desktop"
+        );
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .map(std::io::Error::kind),
+            Some(std::io::ErrorKind::PermissionDenied)
+        );
+        assert_eq!(std::fs::read_to_string(launcher)?, shipped);
+        Ok(())
+    }
+
+    #[test]
+    fn native_package_stage_refuses_malformed_security_policy_before_launch() -> Result<()> {
+        const TEST: &str = "cli::packages::update::omarchy::tests::native_package_stage_refuses_malformed_security_policy_before_launch";
+        if crate::core::testing::run_isolated_test(TEST)
+            || crate::config::Settings::rerun_test_unprivileged(TEST)
+        {
+            return Ok(());
+        }
+
+        let owner = private_directory();
+        let policy = "require_pgp = 'not-a-boolean'\n";
+        std::fs::write(owner.path().join("policy.toml"), policy)
+            .expect("write invalid policy fixture");
+        let runtime = OmarchyRuntime {
+            root: owner.path().to_path_buf(),
+            migration_state: owner.path().join("markers"),
+        };
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let mut commands = Commands::new(false, runtime);
+        let result = temp_env::with_var("OMG_CONFIG_DIR", Some(owner.path()), || {
+            executor
+                .block_on(commands.run_native_package(NativeOmarchyOperation::InstallMediaViewer))
+        });
+        let error = result.expect_err("malformed policy must refuse the native package stage");
+        assert!(
+            error
+                .downcast_ref::<crate::core::security::policy::PolicyError>()
+                .is_some()
+        );
+        assert!(
+            commands.active.is_none(),
+            "no subprocess may launch before policy admission"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn native_media_migration_removes_legacy_packages_only_after_install_and_refresh()
+    -> Result<()> {
+        use NativeOmarchyOperation::{InstallMediaViewer, RemoveLegacyMediaViewers};
+
+        let owner = private_directory();
+        let home = owner.path().join("home");
+        let applications = home.join(".local/share/applications");
+        for (present, updater, failure, expected) in [
+            (
+                false,
+                "true",
+                Some(InstallMediaViewer),
+                &[InstallMediaViewer][..],
+            ),
+            (
+                false,
+                "false",
+                None,
+                &[InstallMediaViewer, RemoveLegacyMediaViewers][..],
+            ),
+            (true, "false", None, &[InstallMediaViewer][..]),
+            (
+                true,
+                "true",
+                None,
+                &[InstallMediaViewer, RemoveLegacyMediaViewers][..],
+            ),
+        ] {
+            if present {
+                std::fs::create_dir_all(&applications)?;
+            }
+            let runtime = OmarchyRuntime {
+                root: owner.path().to_path_buf(),
+                migration_state: owner.path().join("markers"),
+            };
+            let mut commands = Commands::new(false, runtime);
+            commands.native_fixture = Some(NativeMigrationFixture {
+                operations: Vec::new(),
+                failure,
+                desktop_database_program: updater,
+            });
+            let result = commands
+                .run_native_migration(NativeMigration::MediaViewer, Some(home.clone()))
+                .await;
+            assert_eq!(
+                result.is_ok(),
+                failure.is_none() && (!present || updater == "true")
+            );
+            assert_eq!(
+                commands
+                    .native_fixture
+                    .expect("native fixture is retained")
+                    .operations,
+                expected
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn native_migration_equivalents_require_the_exact_name_and_contents() {
+        let owner = private_directory();
+        let migrations = owner.path().join("migrations");
+        let markers = owner.path().join("markers");
+        std::fs::create_dir(&migrations).expect("migration directory");
+        for (name, contents) in native_package_migration_fixtures() {
+            for (filename, text) in [
+                (name, format!("{contents}\n")),
+                ("other.sh", contents.to_owned()),
+                (name, format!("{contents}omarchy-pkg-add extra-package\n")),
+            ] {
+                let path = migrations.join(filename);
+                std::fs::write(&path, text).expect("changed migration");
+                ensure_migrations_use_native_aur(&migrations, &markers)
+                    .expect_err("a changed or renamed package script has no native equivalent");
+                std::fs::remove_file(path).expect("remove changed migration");
+            }
+        }
+        assert!(!markers.exists());
+    }
+
+    #[tokio::test]
+    async fn native_migration_plan_preserves_order_and_retries_only_unfinished_actions()
+    -> Result<()> {
+        struct Recorder {
+            calls: Vec<String>,
+            fail: bool,
+        }
+        impl MigrationExecutor for Recorder {
+            async fn execute_migration(&mut self, migration: &PendingMigration) -> Result<()> {
+                self.calls.push(
+                    migration
+                        .path
+                        .file_name()
+                        .expect("migration name")
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+                anyhow::ensure!(
+                    !self.fail || migration.native != Some(NativeMigration::OmnibookAudio),
+                    "fixture installation refused"
+                );
+                Ok(())
+            }
+        }
+        let owner = private_directory();
+        let migrations = owner.path().join("migrations");
+        let markers = owner.path().join("markers");
+        std::fs::create_dir(&migrations)?;
+        for (name, contents) in native_package_migration_fixtures().into_iter().rev() {
+            std::fs::write(migrations.join(name), contents)?;
+        }
+        for name in ["9999999999.sh", "0000000000.sh"] {
+            std::fs::write(migrations.join(name), "echo configuration\n")?;
+        }
+        let plan = pending_migrations(&migrations, &markers)?;
+        let mut recorder = Recorder {
+            calls: Vec::new(),
+            fail: true,
+        };
+        let error = run_migration_plan(&plan, &markers, &mut recorder)
+            .await
+            .expect_err("failed package action stays pending");
+        assert!(error.to_string().contains("fixture installation refused"));
+        assert_eq!(
+            recorder.calls,
+            ["0000000000.sh", "1794518371.sh", "1794675791.sh"]
+        );
+        assert!(markers.join("0000000000.sh").is_file());
+        assert!(markers.join("1794518371.sh").is_file());
+        assert!(!markers.join("1794675791.sh").exists());
+        assert!(!markers.join("1794774234.sh").exists());
+        assert!(!markers.join("9999999999.sh").exists());
+        recorder.calls.clear();
+        recorder.fail = false;
+        run_migration_plan(&plan, &markers, &mut recorder).await?;
+        assert_eq!(
+            recorder.calls,
+            ["1794675791.sh", "1794774234.sh", "9999999999.sh"]
+        );
+        assert!(pending_migrations(&migrations, &markers)?.is_empty());
+        recorder.calls.clear();
+        run_migration_plan(&plan, &markers, &mut recorder).await?;
+        assert!(
+            recorder.calls.is_empty(),
+            "completed migrations are not repeated"
+        );
+        Ok(())
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[tokio::test]
+    async fn published_qualcomm_migrations_are_inapplicable_only_on_x86_64() -> Result<()> {
+        let owner = private_directory();
+        let migrations = owner.path().join("migrations");
+        let markers = owner.path().join("markers");
+        std::fs::create_dir(&migrations)?;
+        let mut commands = Commands::new(
+            false,
+            OmarchyRuntime {
+                root: owner.path().to_path_buf(),
+                migration_state: markers.clone(),
+            },
+        );
+        commands.native_fixture = Some(NativeMigrationFixture {
+            operations: Vec::new(),
+            failure: None,
+            desktop_database_program: "false",
+        });
+        for (name, script) in [
+            (
+                "1794909082.sh",
+                r#"echo "Show the Samsung Galaxy Book4 Edge 14's disk unlock prompt and add its keyboard and Bluetooth support"
+
+# See install/hardware/samsung/galaxy-book4-edge-14.sh. The initramfs hook and
+# the kernel command line are in the boot image, so they take a rebuild. The
+# marker records the rebuild as owed before the setup runs, so a retry rebuilds
+# even when the files are already there.
+if ! omarchy-hw-aarch64-qualcomm || ! omarchy-hw-match-device-tree samsung,galaxy-book4-edge-14; then
+  exit 0
+fi
+
+drop_in=/etc/limine-entry-tool.d/samsung-galaxy-book4-edge-14.conf
+hook=/etc/initcpio/install/samsung-galaxy-book4-edge-14
+rebuild_pending=/var/lib/omarchy/migrations/1794909082-rebuild-pending
+if [[ -e $rebuild_pending ]] || [[ ! -f $hook ]] ||
+  ! grep -q 'usbcore.autosuspend=-1' "$drop_in" 2>/dev/null ||
+  omarchy-pkg-missing samsung-galaxy-book4-edge-14-support; then
+  sudo install -Dm644 /dev/null "$rebuild_pending" || exit 1
+  sudo env PATH="$PATH" OMARCHY_PATH="$OMARCHY_PATH" bash -euo pipefail -c '
+    source "$OMARCHY_PATH/install/hardware/samsung/galaxy-book4-edge-14.sh"
+  '
+fi
+
+if [[ -e $rebuild_pending ]]; then
+  rebuild_log=$(mktemp)
+  trap 'rm -f "$rebuild_log"' EXIT
+  sudo limine-mkinitcpio 2>&1 | tee "$rebuild_log"
+
+  # limine-mkinitcpio reports a kernel it could not rebuild and still exits 0.
+  if grep -q 'mkinitcpio failed for kernel' "$rebuild_log"; then
+    echo "A boot image was not rebuilt. Fix the error above, then run omarchy-migrate again before rebooting." >&2
+    exit 1
+  fi
+
+  # Ask for the reboot before clearing the marker, so a run cut short in
+  # between still asks on the next one.
+  omarchy-state set reboot-required
+  sudo rm -f "$rebuild_pending"
+fi
+"#,
+            ),
+            (
+                "1795274792.sh",
+                r#"echo "Show the disk unlock prompt on Snapdragon X laptops"
+
+# See install/hardware/qualcomm/hamoa-display.sh. The prompt needs the display
+# chain in the boot image, so it takes a rebuild. The Surface Laptop 7 13.8"
+# needs its keyboard there as well, which microsoft/surface-laptop-7.sh adds
+# and no earlier migration ran for it. A machine-wide marker, written only
+# after a rebuild, records that this one is done, and a retry after a failed
+# rebuild runs the setup and the rebuild again.
+if ! omarchy-hw-aarch64-qualcomm || ! omarchy-hw-match-device-tree qcom,x1e80100 qcom,x1p42100; then
+  exit 0
+fi
+
+done_marker=/var/lib/omarchy/migrations/1795274792-done
+if [[ -e $done_marker ]]; then
+  exit 0
+fi
+
+sudo env PATH="$PATH" OMARCHY_PATH="$OMARCHY_PATH" bash -euo pipefail -c '
+  source "$OMARCHY_PATH/install/hardware/qualcomm/hamoa-display.sh"
+  if omarchy-hw-match-device-tree microsoft,romulus13; then
+    source "$OMARCHY_PATH/install/hardware/microsoft/surface-laptop-7.sh"
+  fi
+' || exit 1
+
+rebuild_log=$(mktemp)
+trap 'rm -f "$rebuild_log"' EXIT
+sudo limine-mkinitcpio 2>&1 | tee "$rebuild_log"
+
+# limine-mkinitcpio reports a kernel it could not rebuild and still exits 0.
+if grep -q 'mkinitcpio failed for kernel' "$rebuild_log"; then
+  echo "A boot image was not rebuilt. Fix the error above, then run omarchy-migrate again before rebooting." >&2
+  exit 1
+fi
+
+sudo install -Dm644 /dev/null "$done_marker"
+omarchy-state set reboot-required
+"#,
+            ),
+        ] {
+            let path = migrations.join(name);
+            std::fs::write(&path, script)?;
+            let plan = pending_migrations(&migrations, &markers)?;
+            assert_eq!(plan.len(), 1);
+            let migration = plan[0].native.expect("published hardware migration");
+            assert_eq!(migration, NativeMigration::SkipQualcommHardware);
+            assert!(!markers.exists(), "preflight must not claim completion");
+            commands.run_native_migration(migration, None).await?;
+            assert!(
+                commands.active.is_none()
+                    && commands
+                        .native_fixture
+                        .as_ref()
+                        .unwrap()
+                        .operations
+                        .is_empty(),
+                "x86_64 requires no hardware or package action"
+            );
+
+            let arm_error = qualcomm_migration_for_machine("aarch64".as_ref(), &path)
+                .expect_err("the hardware update needs a native ARM implementation");
+            assert!(arm_error.to_string().contains("native ARM equivalent"));
+            std::fs::write(&path, format!("{script}# modified\n"))?;
+            let changed_error = pending_migrations(&migrations, &markers)
+                .expect_err("the published filename cannot authorize changed bytes");
+            assert!(changed_error.to_string().contains("reviewed script"));
+            std::fs::remove_file(path)?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn invalid_migration_state_directory_prevents_every_action() -> Result<()> {
+        struct Recorder {
+            calls: usize,
+        }
+        impl MigrationExecutor for Recorder {
+            async fn execute_migration(&mut self, _migration: &PendingMigration) -> Result<()> {
+                self.calls += 1;
+                Ok(())
+            }
+        }
+        let owner = private_directory();
+        let migrations = owner.path().join("migrations");
+        let state = owner.path().join("state-file");
+        std::fs::create_dir(&migrations)?;
+        std::fs::write(migrations.join("0001.sh"), "echo configuration\n")?;
+        std::fs::write(&state, "preserve state file\n")?;
+        let plan = pending_migrations(&migrations, &state)?;
+        let mut executor = Recorder { calls: 0 };
+        run_migration_plan(&plan, &state, &mut executor)
+            .await
+            .expect_err("state must be writable before package/configuration actions");
+        assert_eq!(
+            executor.calls, 0,
+            "invalid state must not permit a partial update"
+        );
+        assert_eq!(std::fs::read_to_string(&state)?, "preserve state file\n");
+        std::fs::remove_file(&state)?;
+        run_migration_plan(&plan, &state, &mut executor).await?;
+        assert_eq!(
+            executor.calls, 1,
+            "repairing state permits exactly one action"
+        );
+        assert!(state.join("0001.sh").is_file());
+        run_migration_plan(&plan, &state, &mut executor).await?;
+        assert_eq!(executor.calls, 1, "the repaired migration remains complete");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn native_migration_commands_reject_untrusted_inventory_without_spawning() -> Result<()> {
+        let owner = private_directory();
+        let runtime = OmarchyRuntime {
+            root: owner.path().join("runtime"),
+            migration_state: owner.path().join("markers"),
+        };
+        std::fs::create_dir(&runtime.root)?;
+        std::fs::write(runtime.root.join("migrations"), "invalid directory\n")?;
+        let mut commands = Commands::new(true, runtime);
+        let error = commands
+            .execute(Stage::Migrations)
+            .await
+            .expect_err("invalid inventory");
+        assert!(format!("{error:#}").contains("Cannot inspect pending Omarchy migrations"));
+        let script = owner.path().join("0001.sh");
+        std::fs::write(&script, "echo must-not-run > observed\n")?;
+        let migration = PendingMigration {
+            path: script,
+            digest: migration_digest("echo must-not-run > observed\n"),
+            native: None,
+        };
+        let error = commands
+            .execute_migration(&migration)
+            .await
+            .expect_err("user-owned runtime");
+        assert!(format!("{error:#}").contains("root-controlled"));
+        assert!(commands.active.is_none());
+        assert!(!owner.path().join("observed").exists());
+        assert!(!owner.path().join("markers").exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn migration_source_changes_never_create_a_completion_marker() -> Result<()> {
+        struct ChangingExecutor {
+            calls: usize,
+            rewrite: bool,
+        }
+        impl MigrationExecutor for ChangingExecutor {
+            async fn execute_migration(&mut self, migration: &PendingMigration) -> Result<()> {
+                self.calls += 1;
+                if self.rewrite {
+                    std::fs::write(&migration.path, "echo changed during execution\n")?;
+                }
+                Ok(())
+            }
+        }
+        let owner = private_directory();
+        let migrations = owner.path().join("migrations");
+        let markers = owner.path().join("markers");
+        std::fs::create_dir(&migrations)?;
+        let path = migrations.join("0001.sh");
+        std::fs::write(&path, "echo initial\n")?;
+        let plan = pending_migrations(&migrations, &markers)?;
+        let mut executor = ChangingExecutor {
+            calls: 0,
+            rewrite: true,
+        };
+        std::fs::write(&path, "echo changed before execution\n")?;
+        let error = run_migration_plan(&plan, &markers, &mut executor)
+            .await
+            .expect_err("changed preflight source");
+        assert!(error.to_string().contains("changed after preflight"));
+        assert_eq!(executor.calls, 0);
+        let plan = pending_migrations(&migrations, &markers)?;
+        let error = run_migration_plan(&plan, &markers, &mut executor)
+            .await
+            .expect_err("changed running source");
+        assert!(error.to_string().contains("changed during execution"));
+        assert_eq!(executor.calls, 1);
+        assert!(
+            !markers.join("0001.sh").exists(),
+            "neither changed script is marked complete"
+        );
+        let repaired = pending_migrations(&migrations, &markers)?;
+        executor.rewrite = false;
+        run_migration_plan(&repaired, &markers, &mut executor).await?;
+        assert_eq!(
+            executor.calls, 2,
+            "freshly reviewed source may complete once"
+        );
+        assert!(markers.join("0001.sh").is_file());
+        run_migration_plan(&repaired, &markers, &mut executor).await?;
+        assert_eq!(
+            executor.calls, 2,
+            "completed repaired migration is not repeated"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn known_external_aur_migrations_are_refused_until_marked_complete() {
+        let owner = private_directory();
+        let migrations = owner.path().join("migrations");
+        let markers = owner.path().join("markers");
+        std::fs::create_dir(&migrations).expect("migration directory");
+        std::fs::create_dir(&markers).expect("marker directory");
+        std::fs::write(migrations.join("0001.sh"), "echo native configuration\n")
+            .expect("inert migration");
+        ensure_migrations_use_native_aur(&migrations, &markers).expect("ordinary vendor migration");
+        for command in [
+            "omarchy-pkg-aur-add brave-origin-bin\n",
+            "yay -Sua\n",
+            "aura -Au\n",
+            "paru -Sua\n",
+            "sudo pacman -Syu\n",
+            "pacman-key --populate\n",
+            "paccache -rk2\n",
+            "omarchy-pkg-add package\n",
+            "omarchy-pkg-drop package\n",
+            "omarchy-pkg-present package\n",
+            "omarchy-pkg-missing package\n",
+        ] {
+            std::fs::write(migrations.join("0002.sh"), command)
+                .expect("inert helper-bearing migration");
+            let error = ensure_migrations_use_native_aur(&migrations, &markers)
+                .expect_err("known external AUR helper");
+            assert!(error.to_string().contains("0002.sh"));
+        }
+        std::fs::write(markers.join("0002.sh"), b"").expect("upstream completion marker");
+        ensure_migrations_use_native_aur(&migrations, &markers)
+            .expect("completed migration is not rerun");
+        ensure_migrations_use_native_aur(&owner.path().join("absent"), &markers)
+            .expect("no migrations");
+        std::fs::write(
+            migrations.join("0003.sh"),
+            vec![b'x'; MAX_MIGRATION_BYTES as usize + 1],
+        )
+        .expect("oversized inert payload");
+        assert!(ensure_migrations_use_native_aur(&migrations, &markers).is_err());
+    }
+
+    #[test]
+    fn pending_migration_helper_names_do_not_depend_on_shell_spacing() -> Result<()> {
+        let owner = private_directory();
+        let migrations = owner.path().join("migrations");
+        let state = owner.path().join("markers");
+        std::fs::create_dir(&migrations)?;
+        let source = migrations.join("0001.sh");
+        for contents in [
+            "aura",
+            "paru",
+            "yay",
+            "aura\n",
+            "paru\n",
+            "yay\t-Syu\n",
+            "aura\t-Au\n",
+            "paru\t-Sua\n",
+            "sudo /usr/bin/yay\n",
+            "\"/usr/bin/aura\" -Au\n",
+            "'paru' -Sua\n",
+            "yay;-Sua\n",
+            "$(aura)\n",
+            "exec yay\r\n",
+        ] {
+            std::fs::write(&source, contents)?;
+            let result = pending_migrations(&migrations, &state);
+            assert!(
+                result.is_err(),
+                "external helper must be refused: {contents:?}"
+            );
+            assert_eq!(std::fs::read_to_string(&source)?, contents);
+            assert!(
+                !state.exists(),
+                "inspection must not create completion markers"
+            );
+        }
+        for contents in [
+            "echo 'railway configuration'\n",
+            "printf 'aurora'\n",
+            "echo not_yay_helper\n",
+        ] {
+            std::fs::write(&source, contents)?;
+            let pending = pending_migrations(&migrations, &state)?;
+            assert_eq!(
+                pending.len(),
+                1,
+                "unrelated words are not package helper names"
+            );
+            assert_eq!(pending[0].native, None);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn coordination_refuses_aliases_writable_files_and_replaced_names() {
+        use std::os::unix::fs::PermissionsExt;
+        let owner = private_directory();
+        let path = owner.path().join("update.lock");
+        let original = open_owned_file(&path).expect("owned lock");
+        original.try_lock().expect("first updater");
+        assert!(
+            open_owned_file(&path)
+                .expect("same lock inode")
+                .try_lock()
+                .is_err()
+        );
+        let displaced = owner.path().join("displaced");
+        std::fs::rename(&path, &displaced).expect("private replacement fault");
+        std::fs::write(&path, b"replacement").expect("replacement inode");
+        assert!(validate_file(&original, &path).is_err());
+        std::fs::remove_file(&path).expect("remove replacement");
+        std::os::unix::fs::symlink(&displaced, &path).expect("private alias");
+        assert!(open_owned_file(&path).is_err());
+        std::fs::remove_file(&path).expect("remove symlink");
+        std::fs::hard_link(&displaced, &path).expect("private hardlink");
+        assert!(open_owned_file(&path).is_err());
+        std::fs::remove_file(&path).expect("remove hardlink");
+        std::fs::rename(&displaced, &path).expect("restore original name");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666))
+            .expect("private mode fault");
+        assert!(open_owned_file(&path).is_err());
+        assert!(open_owned_file(&owner.path().join("missing/file")).is_err());
+    }
+
+    #[test]
+    fn migration_inventory_errors_cannot_admit_an_uninspected_update() {
+        let owner = private_directory();
+        let inventory = owner.path().join("inventory");
+        let markers = owner.path().join("markers");
+        std::fs::write(&inventory, b"not a directory").expect("invalid inventory fixture");
+        let error = ensure_migrations_use_native_aur(&inventory, &markers)
+            .expect_err("a non-directory inventory must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("Cannot inspect pending Omarchy migrations")
+        );
+        assert!(error.downcast_ref::<std::io::Error>().is_some());
+    }
+
+    #[test]
+    fn migration_preflight_ignores_non_scripts_but_refuses_unreadable_scripts() {
+        let owner = private_directory();
+        let inventory = owner.path().join("migrations");
+        let markers = owner.path().join("markers");
+        std::fs::create_dir(&inventory).expect("private migration inventory");
+        for name in ["README", "notes.txt", "0001.SH"] {
+            std::fs::write(inventory.join(name), b"yay -Sua\n")
+                .expect("non-script helper documentation");
+        }
+        ensure_migrations_use_native_aur(&inventory, &markers)
+            .expect("non-shell entries are not pending migrations");
+        let script = inventory.join("0002.sh");
+        std::fs::create_dir(&script).expect("directory masquerading as a script");
+        let error = ensure_migrations_use_native_aur(&inventory, &markers)
+            .expect_err("a shell migration must be a regular file");
+        assert!(error.to_string().contains("0002.sh"));
+        std::fs::remove_dir(&script).expect("retire private directory fixture");
+        std::os::unix::fs::symlink(owner.path().join("absent"), &script)
+            .expect("dangling migration link");
+        let error = ensure_migrations_use_native_aur(&inventory, &markers)
+            .expect_err("missing migration contents must fail closed");
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .expect("symlink refusal")
+                .raw_os_error(),
+            Some(nix::libc::ELOOP)
+        );
+        std::fs::remove_file(&script).expect("retire dangling link");
+        std::fs::write(&script, [0xff, 0xfe]).expect("non-UTF8 shell contents");
+        let error = ensure_migrations_use_native_aur(&inventory, &markers)
+            .expect_err("uninspectable shell contents must fail closed");
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .expect("decoding error")
+                .kind(),
+            std::io::ErrorKind::InvalidData
+        );
+    }
+
+    #[tokio::test]
+    async fn authorization_worker_failure_does_not_prevent_cleanup_or_reuse() {
+        let mut commands = Commands::new(false, transport_runtime());
+        let worker = tokio::spawn(async { panic!("isolated authorization worker failure") });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !worker.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("worker failure is observable before cleanup");
+        commands.authorization = Some(worker);
+        commands
+            .cleanup()
+            .await
+            .expect("panicked worker is released");
+        commands
+            .cleanup()
+            .await
+            .expect("cleanup remains idempotent");
+        let shell =
+            crate::core::privilege::root_controlled_program_path("sh").expect("system shell");
+        assert!(
+            commands
+                .run_program(&shell, &["-c", "exit 0"])
+                .await
+                .expect("next inert stage can run after worker failure")
+                .success()
+        );
+        assert!(commands.authorization.is_none());
+    }
+
+    #[tokio::test]
+    async fn auto_reaped_stage_wait_error_fixture() {
+        use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, sigaction};
+
+        if std::env::var_os("OMG_OMARCHY_AUTOREAP_FIXTURE").is_none() {
+            return;
+        }
+        let owner = private_directory();
+        let marker = owner.path().join("stage-pid");
+        let program =
+            crate::core::privilege::root_controlled_program_path("sh").expect("system shell");
+        let primer =
+            crate::core::privilege::root_controlled_program_path("true").expect("system true");
+        assert!(
+            Command::new(primer)
+                .status()
+                .await
+                .expect("prime and reap Tokio's process driver")
+                .success()
+        );
+
+        // SAFETY: this exact-test subprocess has reaped its sole child before
+        // changing SIGCHLD. No parent test process changes signal disposition.
+        // Keeping Tokio's registered handler lets its signal reaper wake while
+        // SA_NOCLDWAIT makes the kernel reap the next inert child automatically.
+        #[expect(
+            unsafe_code,
+            reason = "isolated child exercises real kernel auto-reaping"
+        )]
+        let previous = unsafe {
+            let previous = sigaction(
+                Signal::SIGCHLD,
+                &SigAction::new(SigHandler::SigIgn, SaFlags::empty(), SigSet::empty()),
+            )
+            .expect("save isolated fixture SIGCHLD disposition");
+            let autoreap = SigAction::new(
+                previous.handler(),
+                previous.flags() | SaFlags::SA_NOCLDWAIT,
+                previous.mask(),
+            );
+            sigaction(Signal::SIGCHLD, &autoreap).expect("enable kernel auto-reaping");
+            previous
+        };
+        let mut commands = Commands::new(false, transport_runtime());
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            commands.run_program(
+                &program,
+                &[
+                    "-c",
+                    "printf '%s\\n' \"$$\" > \"$1\"",
+                    "fixture",
+                    marker.to_str().expect("private stage marker path"),
+                ],
+            ),
+        )
+        .await;
+        // SAFETY: previous is the disposition saved in this same isolated
+        // process; the owned inert child has exited or remains owned by cleanup.
+        #[expect(unsafe_code, reason = "restore isolated fixture SIGCHLD disposition")]
+        let restored = unsafe { sigaction(Signal::SIGCHLD, &previous) };
+        let cleanup = commands.cleanup().await;
+
+        restored.expect("restore fixture signal disposition before assertions");
+        cleanup.expect("cleanup remains reusable after auto-reaping");
+        let error = result
+            .expect("auto-reaped stage reports its wait failure promptly")
+            .expect_err("the kernel already reaped the stage");
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .expect("actual OS wait failure")
+                .raw_os_error(),
+            Some(nix::libc::ECHILD),
+            "{error:#}"
+        );
+        let pid: i32 = std::fs::read_to_string(&marker)
+            .expect("real stage wrote its own PID")
+            .trim()
+            .parse()
+            .expect("owned inert stage PID");
+        assert_eq!(
+            nix::sys::wait::waitpid(
+                nix::unistd::Pid::from_raw(pid),
+                Some(nix::sys::wait::WaitPidFlag::WNOHANG)
+            ),
+            Err(nix::errno::Errno::ECHILD),
+            "kernel auto-reaping left no waitable stage"
+        );
+        // waitpid can report ECHILD before the kernel detaches an auto-reaped PID.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let mut poll = tokio::time::interval(Duration::from_millis(10));
+            let mut pid_visible = true;
+            while pid_visible {
+                poll.tick().await;
+                pid_visible = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None)
+                    != Err(nix::errno::Errno::ESRCH);
+            }
+        })
+        .await
+        .expect("the inert stage no longer exists");
+        assert!(
+            commands.active.is_none(),
+            "cleanup released child ownership"
+        );
+        let diagnostic = format!("{error:#}");
+        assert!(
+            diagnostic.contains(&format!("Failed to wait for {}", program.display())),
+            "original stage wait context must survive cleanup failure: {diagnostic}"
+        );
+        assert!(
+            diagnostic.contains("Failed to reap"),
+            "cleanup's real reaping failure must remain visible: {diagnostic}"
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_reaped_stage_preserves_wait_and_cleanup_errors() {
+        let output = tokio::time::timeout(
+            Duration::from_secs(15),
+            Command::new(std::env::current_exe().expect("test executable"))
+                .args([
+                    "--exact",
+                    "cli::packages::update::omarchy::tests::auto_reaped_stage_wait_error_fixture",
+                    "--nocapture",
+                ])
+                .env("OMG_OMARCHY_AUTOREAP_FIXTURE", "1")
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .expect("isolated auto-reaping fixture finishes within its deadline")
+        .expect("isolated auto-reaping fixture status");
+        fixture_success(&output, format_args!("auto-reaping fixture failed: "))
+            .expect("owned fixture must succeed");
+    }
+
+    #[tokio::test]
+    async fn concurrent_stage_rejection_preserves_the_owned_child() {
+        let owner = private_directory();
+        let shell =
+            crate::core::privilege::root_controlled_program_path("sh").expect("system shell");
+        let mut commands = Commands::new(false, transport_runtime());
+        let mut first = Command::new(&shell);
+        first
+            .args(["-c", "exec sleep 30"])
+            .process_group(0)
+            .kill_on_drop(true);
+        commands.start(&mut first).await.expect("owned inert stage");
+        let pid = commands
+            .active
+            .as_ref()
+            .and_then(tokio::process::Child::id)
+            .expect("owned active child");
+        let marker = owner.path().join("unexpected-second-stage");
+        let error = commands
+            .run_program(
+                &shell,
+                &[
+                    "-c",
+                    "printf unexpected > \"$1\"",
+                    "fixture",
+                    marker.to_str().expect("marker path"),
+                ],
+            )
+            .await
+            .expect_err("overlapping stage must be refused");
+        assert!(error.to_string().contains("already running"));
+        assert!(!marker.exists(), "the rejected stage must never execute");
+        assert_eq!(
+            commands.active.as_ref().and_then(tokio::process::Child::id),
+            Some(pid)
+        );
+        commands
+            .cleanup()
+            .await
+            .expect("original child still belongs to cleanup");
+        assert_eq!(
+            nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(i32::try_from(pid).expect("pid")),
+                None
+            ),
+            Err(nix::errno::Errno::ESRCH)
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_input_pipe_fixture() {
+        let Some(root) = std::env::var_os("OMG_OMARCHY_PIPE_FIXTURE") else {
+            return;
+        };
+        let root = PathBuf::from(root);
+        let lock = open_owned_file(&root.join("lock")).expect("private pipe lock");
+        lock.try_lock().expect("private pipe lease");
+        let log = open_owned_file(&root.join("log")).expect("private pipe transcript");
+        let shell =
+            crate::core::privilege::root_controlled_program_path("sh").expect("system shell");
+        if std::env::var_os("OMG_OMARCHY_MISSING_STDIN_FIXTURE").is_some() {
+            let _signals = Interruptions::new().expect("register signals before closing stdin");
+            nix::unistd::close(nix::libc::STDIN_FILENO)
+                .expect("close input only in isolated fixture");
+            tokio::time::timeout(
+                Duration::from_secs(3),
+                execute_logged(
+                    &shell,
+                    &[
+                        "-c",
+                        "if IFS= read -r answer; then exit 19; fi; printf 'EOF received\\n'",
+                    ],
+                    &lock,
+                    &log,
+                    &transport_runtime(),
+                ),
+            )
+            .await
+            .expect("closed stdin must forward EOF instead of stranding the coordinator")
+            .expect("coordinator accepts absent input as EOF");
+            let transcript =
+                std::fs::read_to_string(root.join("log")).expect("absent-input transcript");
+            assert!(transcript.contains("EOF received"));
+            assert!(transcript.contains("OMG Omarchy update finished: exit status: 0"));
+            return;
+        }
+        execute_logged(
+            &shell,
+            &["-c", "printf 'Enter value: '; IFS= read -r value; printf 'received:<%s>\\n' \"$value\"; if IFS= read -r extra; then exit 19; fi"],
+            &lock,
+            &log, &transport_runtime()).await.expect("pipe bytes and EOF reach the owned terminal");
+        let transcript = std::fs::read_to_string(root.join("log")).expect("pipe transcript");
+        assert!(
+            transcript.contains("received:<literal; $(not-a-command) \\tail>"),
+            "{transcript}"
+        );
+        assert!(
+            transcript.contains("OMG Omarchy update finished: exit status: 0"),
+            "{transcript}"
+        );
+    }
+
+    #[tokio::test]
+    async fn already_closed_input_forwards_eof_to_the_owned_coordinator() {
+        let owner = private_directory();
+        let output = tokio::time::timeout(
+            Duration::from_secs(8),
+            Command::new(std::env::current_exe().expect("test executable"))
+                .args([
+                    "--exact",
+                    "cli::packages::update::omarchy::tests::terminal_input_pipe_fixture",
+                    "--nocapture",
+                ])
+                .env("OMG_OMARCHY_PIPE_FIXTURE", owner.path())
+                .env("OMG_OMARCHY_MISSING_STDIN_FIXTURE", "1")
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .expect("absent input fixture stays bounded")
+        .expect("absent input fixture output");
+        fixture_success(&output, format_args!("closed-input fixture failed: "))
+            .expect("owned fixture must succeed");
+    }
+
+    #[tokio::test]
+    async fn partial_prompt_is_visible_before_the_terminal_requires_input() -> Result<()> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let owner = private_directory();
+        let mut child = Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "cli::packages::update::omarchy::tests::terminal_input_pipe_fixture",
+                "--nocapture",
+            ])
+            .env("OMG_OMARCHY_PIPE_FIXTURE", owner.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()?;
+        let mut output = child.stdout.take().context("fixture stdout")?;
+        let mut observed = Vec::new();
+        let prompt = tokio::time::timeout(Duration::from_secs(2), async {
+            let mut buffer = [0_u8; 256];
+            loop {
+                let count = output.read(&mut buffer).await?;
+                anyhow::ensure!(count > 0, "fixture closed output before its prompt");
+                observed.extend_from_slice(&buffer[..count]);
+                anyhow::ensure!(
+                    observed.len() <= 16 * 1024,
+                    "fixture output exceeded budget"
+                );
+                if observed.ends_with(b"Enter value: ") {
+                    return Ok::<_, anyhow::Error>(());
+                }
+            }
+        })
+        .await;
+        finish_fixture_prompt(&mut child, prompt, &observed).await?;
+        child
+            .stdin
+            .take()
+            .context("fixture stdin")?
+            .write_all(b"literal; $(not-a-command) \\tail\n")
+            .await?;
+        tokio::time::timeout(Duration::from_secs(5), output.read_to_end(&mut observed))
+            .await
+            .context("fixture output did not close after its answer")??;
+        let result = child.wait_with_output().await?;
+        anyhow::ensure!(
+            result.status.success(),
+            "fixture rejected its literal answer"
+        );
+        assert!(
+            String::from_utf8_lossy(&observed)
+                .contains("received:<literal; $(not-a-command) \\tail>")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn real_pipe_input_reaches_the_pty_without_shell_interpretation() {
+        use tokio::io::AsyncWriteExt;
+        let owner = private_directory();
+        let mut child = Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "cli::packages::update::omarchy::tests::terminal_input_pipe_fixture",
+                "--nocapture",
+            ])
+            .env("OMG_OMARCHY_PIPE_FIXTURE", owner.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("isolated pipe transport fixture");
+        let mut input = child.stdin.take().expect("owned pipe input");
+        input
+            .write_all(b"literal; $(not-a-command) \\tail\n")
+            .await
+            .expect("write real pipe bytes");
+        drop(input);
+        let output = tokio::time::timeout(Duration::from_secs(10), child.wait_with_output())
+            .await
+            .expect("pipe EOF must not strand the coordinator")
+            .expect("pipe fixture status");
+        fixture_success(&output, format_args!("pipe fixture failed: "))
+            .expect("owned fixture must succeed");
+    }
+
+    #[tokio::test]
+    async fn terminal_input_socket_fixture() {
+        if std::env::var_os("OMG_OMARCHY_SOCKET_FIXTURE").is_none() {
+            return;
+        }
+        let error = terminal_input()
+            .err()
+            .expect("socket stdin cannot be reopened as terminal input");
+        assert!(error.to_string().contains("Cannot open update input"));
+        assert!(error.downcast_ref::<std::io::Error>().is_some());
+    }
+
+    #[tokio::test]
+    async fn unsupported_socket_input_fails_before_launching_a_coordinator() {
+        use std::os::fd::OwnedFd;
+        let (input, _peer) = std::os::unix::net::UnixStream::pair().expect("private socket pair");
+        let descriptor: OwnedFd = input.into();
+        let output = tokio::time::timeout(
+            Duration::from_secs(5),
+            Command::new(std::env::current_exe().expect("test executable"))
+                .args([
+                    "--exact",
+                    "cli::packages::update::omarchy::tests::terminal_input_socket_fixture",
+                    "--nocapture",
+                ])
+                .env("OMG_OMARCHY_SOCKET_FIXTURE", "1")
+                .stdin(Stdio::from(descriptor))
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .expect("socket rejection is bounded")
+        .expect("socket fixture status");
+        fixture_success(&output, format_args!("socket fixture failed: "))
+            .expect("owned fixture must succeed");
+    }
+
+    #[test]
+    fn reboot_inspection_distinguishes_kernel_marker_and_replaced_executable() -> Result<()> {
+        let owner = private_directory();
+        let root = owner.path().join("root");
+        let processes = owner.path().join("proc");
+        let home = owner.path().join("home");
+        std::fs::create_dir_all(processes.join("sys/kernel"))?;
+        std::fs::write(processes.join("sys/kernel/osrelease"), "fixture-kernel\n")?;
+        let modules = root.join("usr/lib/modules/fixture-kernel/modules.builtin");
+        std::fs::create_dir_all(modules.parent().expect("module directory"))?;
+        std::fs::write(&modules, "fixture module inventory\n")?;
+        let paths = RebootInspection {
+            root: &root,
+            processes: &processes,
+            home: Some(&home),
+            uid: rustix::process::getuid().as_raw(),
+        };
+        let owns_running_modules = std::cell::Cell::new(false);
+        let owns_modules = |_: &str| Ok(owns_running_modules.get());
+        assert_eq!(
+            reboot_reason_at(&paths, owns_modules)?,
+            Some("The installed kernel differs from the running kernel.")
+        );
+        owns_running_modules.set(true);
+        assert_eq!(reboot_reason_at(&paths, owns_modules)?, None);
+        std::os::unix::fs::symlink(owner.path().join("exited-process"), processes.join("124"))?;
+        assert_eq!(reboot_reason_at(&paths, owns_modules)?, None);
+        let marker = home.join(".local/state/omarchy/reboot-required");
+        std::fs::create_dir_all(marker.parent().expect("marker directory"))?;
+        std::fs::write(&marker, "reboot requested\n")?;
+        assert_eq!(
+            reboot_reason_at(&paths, owns_modules)?,
+            Some("Omarchy marked this update as requiring a reboot.")
+        );
+        std::fs::remove_file(marker)?;
+        let hyprland = processes.join("123");
+        std::fs::create_dir(&hyprland)?;
+        std::fs::write(hyprland.join("comm"), "Hyprland\n")?;
+        std::os::unix::fs::symlink("/inert/Hyprland", hyprland.join("exe"))?;
+        assert_eq!(reboot_reason_at(&paths, owns_modules)?, None);
+        std::fs::remove_file(hyprland.join("exe"))?;
+        std::os::unix::fs::symlink("/inert/Hyprland (deleted)", hyprland.join("exe"))?;
+        assert_eq!(
+            reboot_reason_at(&paths, owns_modules)?,
+            Some("The running Hyprland executable was replaced during the update.")
+        );
+        let other_user = RebootInspection {
+            uid: paths.uid.checked_add(1).expect("test uid fits"),
+            ..paths
+        };
+        assert_eq!(reboot_reason_at(&other_user, owns_modules)?, None);
+        std::fs::remove_file(modules)?;
+        assert_eq!(
+            reboot_reason_at(&paths, owns_modules)?,
+            Some("The installed kernel differs from the running kernel.")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reboot_inspection_rejects_invalid_kernel_data_and_tolerates_process_churn() -> Result<()> {
+        use std::cell::Cell;
+        use std::os::unix::ffi::OsStringExt;
+        let owner = private_directory();
+        let root = owner.path().join("root");
+        let processes = owner.path().join("proc");
+        std::fs::create_dir_all(processes.join("sys/kernel"))?;
+        let release = processes.join("sys/kernel/osrelease");
+        let paths = RebootInspection {
+            root: &root,
+            processes: &processes,
+            home: None,
+            uid: rustix::process::getuid().as_raw(),
+        };
+        let queries = Cell::new(0);
+        let owns = |_: &str| {
+            queries.set(queries.get() + 1);
+            Ok(true)
+        };
+        assert!(reboot_reason_at(&paths, owns).is_err());
+        for invalid in [b"".as_slice(), b"../escape", b"/absolute", b"\xff"] {
+            std::fs::write(&release, invalid)?;
+            assert!(reboot_reason_at(&paths, owns).is_err());
+            assert_eq!(
+                queries.get(),
+                0,
+                "invalid kernel data must not query native ownership"
+            );
+        }
+        std::fs::write(&release, "fixture\n")?;
+        let modules = root.join("usr/lib/modules/fixture/modules.builtin");
+        std::fs::create_dir_all(modules.parent().expect("module directory"))?;
+        std::fs::write(modules, "inert module inventory")?;
+        std::fs::write(processes.join("not-a-process"), "ignored")?;
+        std::fs::write(
+            processes.join(std::ffi::OsString::from_vec(vec![0xff])),
+            "ignored",
+        )
+        .expect("non-UTF8 process fixture entry");
+        std::os::unix::fs::symlink(
+            owner.path().join("disappeared-process"),
+            processes.join("123"),
+        )
+        .expect("disappearing process fixture entry");
+        assert_eq!(reboot_reason_at(&paths, owns)?, None);
+        assert_eq!(queries.get(), 1);
+        let result = reboot_reason_at(&paths, |_| {
+            std::fs::remove_dir_all(&processes)?;
+            Ok(true)
+        });
+        assert_eq!(
+            result
+                .expect_err("lost process inventory must remain an error")
+                .downcast_ref::<std::io::Error>()
+                .expect("filesystem cause")
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn migration_state_defaults_to_the_session_home() -> Result<()> {
+        const CHILD: &str = "OMG_OMARCHY_DEFAULT_STATE_FIXTURE";
+        if std::env::var_os(CHILD).is_some() {
+            let home = PathBuf::from(std::env::var_os("HOME").context("fixture home")?);
+            assert_eq!(
+                OmarchyRuntime::migration_state()?,
+                home.join(".local/state/omarchy/migrations")
+            );
+            return Ok(());
+        }
+        let owner = private_directory();
+        let output = std::process::Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "cli::packages::update::omarchy::tests::migration_state_defaults_to_the_session_home",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("HOME", owner.path())
+            .env_remove("OMARCHY_MIGRATION_STATE")
+            .output()?;
+        let diagnostic = format!("default migration state: {}", FixtureOutput(&output));
+        assert!(output.status.success(), "{diagnostic}");
+        Ok(())
+    }
+
+    #[test]
+    fn transport_inheritance_action_contains_failures_and_preserves_file_identity() -> Result<()> {
+        use crate::core::testing::run_isolated_test;
+        if run_isolated_test(
+            "cli::packages::update::omarchy::tests::transport_inheritance_action_contains_failures_and_preserves_file_identity",
+        ) {
+            return Ok(());
+        }
+        let owner = private_directory();
+        let lock = open_owned_file(&owner.path().join("lock"))?;
+        let log = open_owned_file(&owner.path().join("log"))?;
+        let lock_identity = lock.metadata()?.ino();
+        let log_identity = log.metadata()?.ino();
+        let mut expose = transport_inheritance_action(lock.as_raw_fd(), log.as_raw_fd());
+        expose()?;
+        for file in [&lock, &log] {
+            assert!(
+                !FdFlag::from_bits_truncate(fcntl(file, FcntlArg::F_GETFD)?)
+                    .contains(FdFlag::FD_CLOEXEC)
+            );
+            set_descriptor_inheritance(file.as_raw_fd(), false)?;
+        }
+        assert_eq!(lock.metadata()?.ino(), lock_identity);
+        assert_eq!(log.metadata()?.ino(), log_identity);
+        for operation in [
+            DescriptorOperation::ReadFlags,
+            DescriptorOperation::WriteFlags(nix::libc::FD_CLOEXEC),
+        ] {
+            assert_eq!(
+                descriptor_control(-1, operation)
+                    .expect_err("invalid descriptor cannot be inspected or changed")
+                    .raw_os_error(),
+                Some(nix::libc::EBADF)
+            );
+        }
+        for (lock_fd, log_fd) in [(-1, log.as_raw_fd()), (lock.as_raw_fd(), -1)] {
+            let result = transport_inheritance_action(lock_fd, log_fd)();
+            set_descriptor_inheritance(lock.as_raw_fd(), false)?;
+            set_descriptor_inheritance(log.as_raw_fd(), false)?;
+            assert_eq!(
+                result
+                    .expect_err("invalid transport descriptor refuses exec")
+                    .raw_os_error(),
+                Some(nix::libc::EBADF)
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn inherited_transport_has_one_validated_pair_or_no_handoff() -> Result<()> {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        assert_eq!(inherited_transport(None, None)?, None);
+        assert_eq!(
+            inherited_transport(Some("3".into()), Some("4".into()))?,
+            Some(InheritedTransport { lock: 3, log: 4 })
+        );
+        for (lock, log) in [
+            (Some("3"), None),
+            (None, Some("4")),
+            (Some("3"), Some("03")),
+            (Some("garbage"), Some("4")),
+            (Some("3"), Some("2147483648")),
+            (Some("0"), Some("4")),
+            (Some("3"), Some("-1")),
+        ] {
+            assert!(
+                inherited_transport(lock.map(OsString::from), log.map(OsString::from)).is_err()
+            );
+        }
+        for (lock, log) in [
+            (OsString::from_vec(vec![0xff]), "4".into()),
+            ("3".into(), OsString::from_vec(vec![0xff])),
+            (
+                OsString::from_vec(vec![0xff]),
+                OsString::from_vec(vec![0xff]),
+            ),
+        ] {
+            assert!(inherited_transport(Some(lock), Some(log)).is_err());
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejected_lock_probe_releases_its_lease_while_child_retains_descriptor() {
+        use tokio::io::AsyncReadExt;
+        let owner = private_directory();
+        let path = owner.path().join("probe");
+        let probe = open_owned_file(&path).unwrap();
+        let raw = probe.as_raw_fd();
+        let inert_log = open_owned_file(&owner.path().join("inert-log")).unwrap();
+        let shell = crate::core::privilege::root_controlled_program_path("sh").unwrap();
+        let mut command = Command::new(shell);
+        command
+            .args(["-c", "printf ready; IFS= read -r line || :"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .kill_on_drop(true);
+        // SAFETY: the owned probe stays open until spawn completes. Only the
+        // async-signal-safe integer fcntl helper runs in the child after fork.
+        #[expect(
+            unsafe_code,
+            reason = "inherit one inert descriptor in the owned regression fixture"
+        )]
+        unsafe {
+            command.pre_exec(transport_inheritance_action(raw, inert_log.as_raw_fd()));
+        }
+        let mut child = command.spawn().unwrap();
+        drop(command);
+        drop(inert_log);
+        let mut ready = [0_u8; 5];
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            child.stdout.as_mut().unwrap().read_exact(&mut ready),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(&ready, b"ready");
+        assert!(!probe_existing_lock(&probe).unwrap());
+        drop(probe);
+        assert!(child.try_wait().unwrap().is_none());
+        let independent = open_owned_file(&path).unwrap();
+        let result = independent.try_lock();
+        drop(child.stdin.take());
+        assert!(
+            tokio::time::timeout(Duration::from_secs(3), child.wait())
+                .await
+                .unwrap()
+                .unwrap()
+                .success()
+        );
+        result.expect("rejected probe must release its lease before an inherited copy closes");
+        independent.unlock().unwrap();
+    }
+
+    #[test]
+    fn inherited_descriptors_are_bound_to_their_owned_inodes() {
+        let owner = private_directory();
+        let path = owner.path().join("handoff");
+        let file = open_owned_file(&path).expect("owned handoff");
+        let raw = file.as_raw_fd();
+        assert!(inherited_lock(raw, &path).is_err());
+        file.try_lock().expect("original inherited lease");
+        inherited_lock(raw, &path).expect("verified existing lock lease");
+        let duplicate = duplicate_inherited(raw, &path).expect("matching inherited inode");
+        duplicate
+            .try_lock()
+            .expect("duplicated open description owns the same lock");
+        assert!(
+            FdFlag::from_bits_truncate(
+                fcntl(&duplicate, FcntlArg::F_GETFD).expect("duplicate flags")
+            )
+            .contains(FdFlag::FD_CLOEXEC)
+        );
+        for invalid in ["garbage", "-1", "0", "1", "2", "2147483647"] {
+            assert!(
+                transport_descriptor(invalid)
+                    .and_then(|raw| duplicate_inherited(raw, &path))
+                    .is_err(),
+                "{invalid}"
+            );
+        }
+        let different = owner.path().join("different");
+        drop(open_owned_file(&different).expect("different inode"));
+        assert!(duplicate_inherited(raw, &different).is_err());
+    }
+
+    #[tokio::test]
+    async fn terminal_reader_recovers_from_stale_readiness() {
+        use std::io::Write;
+        use tokio::io::AsyncWriteExt;
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let (socket, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
+            socket.set_nonblocking(true).unwrap();
+            peer.set_nonblocking(true).unwrap();
+            peer.write_all(b"old").unwrap();
+            let reader = register_file(File::from(std::os::fd::OwnedFd::from(socket))).unwrap();
+            reader.readable().await.unwrap().retain_ready();
+            let mut old = [0_u8; 3];
+            assert_eq!(nix::unistd::read(reader.get_ref(), &mut old).unwrap(), 3);
+            assert_eq!(&old, b"old");
+            let mut peer = tokio::net::UnixStream::from_std(peer).unwrap();
+            let supply = tokio::spawn(async move { peer.write_all(b"new").await.unwrap() });
+            let mut received = [0_u8; 3];
+            assert_eq!(read_pty(&reader, &mut received).await.unwrap(), 3);
+            assert_eq!(&received, b"new");
+            supply.await.unwrap();
+        })
+        .await
+        .expect("stale readability must clear and await new input");
+    }
+
+    #[tokio::test]
+    async fn terminal_writer_recovers_from_stale_readiness() {
+        use tokio::io::AsyncReadExt;
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let (socket, peer) = std::os::unix::net::UnixStream::pair().unwrap();
+            socket.set_nonblocking(true).unwrap();
+            peer.set_nonblocking(true).unwrap();
+            let writer = register_file(File::from(std::os::fd::OwnedFd::from(socket))).unwrap();
+            writer.writable().await.unwrap().retain_ready();
+            let mut queued = 0usize;
+            let stopped = loop {
+                match nix::unistd::write(writer.get_ref(), &[b'x'; 8192]) {
+                    Ok(count) => {
+                        assert!(count > 0);
+                        queued += count;
+                        assert!(queued < 4 * 1024 * 1024, "private socket fill budget");
+                    }
+                    Err(error) => break error,
+                }
+            };
+            assert_eq!(stopped, nix::errno::Errno::EAGAIN);
+            let mut peer = tokio::net::UnixStream::from_std(peer).unwrap();
+            let drain = tokio::spawn(async move {
+                let mut received = Vec::new();
+                peer.read_to_end(&mut received).await.unwrap();
+                received
+            });
+            assert_eq!(write_pty(&writer, b"!").await.unwrap(), 1);
+            drop(writer);
+            let received = drain.await.unwrap();
+            assert_eq!(received.len(), queued + 1);
+            assert_eq!(&received[..queued], vec![b'x'; queued]);
+            assert_eq!(received.last(), Some(&b'!'));
+        })
+        .await
+        .expect("stale writability must clear and resume after peer drain");
+    }
+
+    #[tokio::test]
+    async fn reaped_coordinator_and_stage_cleanup_are_idempotent() {
+        let program = crate::core::privilege::root_controlled_program_path("true").unwrap();
+        let mut child = Command::new(program).kill_on_drop(true).spawn().unwrap();
+        assert!(child.wait().await.unwrap().success());
+        assert!(child.id().is_none());
+        interrupt_coordinator(&child).expect("reaped coordinator needs no signal");
+        let mut commands = Commands::new(false, transport_runtime());
+        commands.active = Some(child);
+        commands
+            .stop_active()
+            .await
+            .expect("reap already completed stage");
+        assert!(commands.active.is_none());
+        commands.stop_active().await.expect("repeat empty cleanup");
+    }
+
+    #[tokio::test]
+    async fn fixture_group_guard_stops_only_its_owned_group_and_can_disarm() {
+        let program = crate::core::privilege::root_controlled_program_path("sleep").unwrap();
+        let spawn = || {
+            Command::new(&program)
+                .arg("30")
+                .process_group(0)
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap()
+        };
+        let mut owned = spawn();
+        let mut unrelated = spawn();
+        let group = nix::unistd::Pid::from_raw(i32::try_from(owned.id().unwrap()).unwrap());
+        drop(FixtureGroup(Some(group)));
+        let status = tokio::time::timeout(Duration::from_secs(3), owned.wait())
+            .await
+            .expect("owned group is stopped promptly")
+            .unwrap();
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(status.signal(), Some(nix::libc::SIGKILL));
+        assert!(unrelated.try_wait().unwrap().is_none());
+
+        let mut guard = FixtureGroup(Some(nix::unistd::Pid::from_raw(
+            i32::try_from(unrelated.id().unwrap()).unwrap(),
+        )));
+        guard.0 = None;
+        drop(guard);
+        assert!(unrelated.try_wait().unwrap().is_none());
+        unrelated.kill().await.expect("reap private control child");
+    }
+
+    #[tokio::test]
+    async fn private_commands_preserve_status_and_cancelled_children_are_reaped() {
+        let mut commands = Commands::new(false, transport_runtime());
+        let program =
+            crate::core::privilege::root_controlled_program_path("sh").expect("system shell");
+        assert_eq!(
+            commands
+                .run_program(&program, &["-c", "exit 7"])
+                .await
+                .expect("inert child")
+                .code(),
+            Some(7)
+        );
+        assert!(commands.active.is_none());
+        let owner = private_directory();
+        let ready = owner.path().join("ready");
+        let script = "printf ready > \"$1\"; exec sleep 30";
+        let arguments = [
+            "-c",
+            script,
+            "omg-fixture",
+            ready.to_str().expect("fixture path"),
+        ];
+        let mut operation = Box::pin(commands.run_program(&program, &arguments));
+        let started = async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !ready.is_file() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("owned child started");
+        };
+        fixture_ready(
+            &mut operation,
+            started,
+            "owned child finished before cancellation",
+        )
+        .await
+        .expect("fixture must reach readiness");
+        drop(operation);
+        let pid = commands
+            .active
+            .as_ref()
+            .and_then(tokio::process::Child::id)
+            .expect("owned active child");
+        commands
+            .stop_active()
+            .await
+            .expect("stop and reap cancellation");
+        assert!(commands.active.is_none());
+        assert_eq!(
+            nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(i32::try_from(pid).expect("pid")),
+                None
+            ),
+            Err(nix::errno::Errno::ESRCH)
+        );
+        commands.cleanup().await.expect("idempotent cleanup");
+        assert!(
+            commands
+                .run_program(&owner.path().join("absent"), &[])
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_terminates_surviving_descendants() {
+        let owner = private_directory();
+        let ready = owner.path().join("descendant");
+        let program =
+            crate::core::privilege::root_controlled_program_path("sh").expect("system shell");
+        let mut commands = Commands::new(false, transport_runtime());
+        let arguments = [
+            "-c",
+            r#"sh -c 'trap "" TERM; printf %s "$$" > "$1"; exec sleep 30' fixture "$1" & wait"#,
+            "fixture",
+            ready.to_str().expect("private descendant path"),
+        ];
+        let mut operation = Box::pin(commands.run_program(&program, &arguments));
+        fixture_ready(
+            &mut operation,
+            async {
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while std::fs::read_to_string(&ready)
+                        .unwrap_or_default()
+                        .is_empty()
+                    {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .expect("descendant installed its TERM handler");
+            },
+            "stage ended before cancellation",
+        )
+        .await
+        .expect("fixture must reach readiness");
+        drop(operation);
+        let leader = commands
+            .active
+            .as_ref()
+            .and_then(tokio::process::Child::id)
+            .expect("owned leader");
+        let mut cleanup = FixtureGroup(Some(nix::unistd::Pid::from_raw(
+            i32::try_from(leader).expect("leader PID"),
+        )));
+        let descendant: i32 = std::fs::read_to_string(&ready)
+            .expect("descendant identity")
+            .parse()
+            .expect("descendant PID");
+        let running = tokio::sync::Notify::new();
+        let mut stopped = Box::pin(async {
+            while std::fs::read_to_string(format!("/proc/{descendant}/stat")).is_ok_and(|stat| {
+                stat.rsplit_once(')')
+                    .is_some_and(|(_, fields)| !fields.trim_start().starts_with('Z'))
+            }) {
+                running.notify_one();
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+        fixture_ready(
+            &mut stopped,
+            running.notified(),
+            "descendant stopped before cleanup could be tested",
+        )
+        .await
+        .expect("a live descendant must be observed before cancellation");
+        commands
+            .cleanup()
+            .await
+            .expect("cancel complete stage group");
+        tokio::time::timeout(Duration::from_secs(5), stopped)
+            .await
+            .expect("TERM-ignoring stage descendant must stop after cleanup");
+        cleanup.0 = None;
+    }
+
+    #[tokio::test]
+    async fn hangup_fixture() {
+        if std::env::var_os("OMG_OMARCHY_HANGUP_FIXTURE").is_none() {
+            return;
+        }
+        let mut commands = Commands::new(false, transport_runtime());
+        commands.authorization = Some(tokio::spawn(std::future::pending()));
+        let mut interrupted = Box::pin(interrupt());
+        fixture_ready(
+            &mut interrupted,
+            tokio::task::yield_now(),
+            "signal preceded fixture",
+        )
+        .await
+        .expect("fixture must reach readiness");
+        nix::sys::signal::kill(nix::unistd::getpid(), nix::sys::signal::Signal::SIGHUP)
+            .expect("private subprocess hangup signal");
+        tokio::time::timeout(Duration::from_secs(5), interrupted)
+            .await
+            .expect("hangup reaches graceful cancellation")
+            .expect("receive hangup");
+        commands.cleanup().await.expect("hangup cleanup");
+        assert!(
+            commands.authorization.is_none(),
+            "hangup stops authorization refresh"
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_disconnect_fixture() {
+        let Some(root) = std::env::var_os("OMG_OMARCHY_DISCONNECT_FIXTURE") else {
+            return;
+        };
+        let root = PathBuf::from(root);
+        let mut commands = Commands::new(false, transport_runtime());
+        commands.foreground = Some(
+            foreground_group()
+                .expect("attached fixture terminal")
+                .expect("controlling PTY"),
+        );
+        commands.authorization = Some(tokio::spawn(std::future::pending()));
+        let mut interrupted = Box::pin(interrupt());
+        fixture_ready(
+            &mut interrupted,
+            tokio::task::yield_now(),
+            "signal preceded disconnect fixture",
+        )
+        .await
+        .expect("fixture must reach readiness");
+        std::fs::write(
+            root.join("ready"),
+            nix::unistd::getpid().as_raw().to_string(),
+        )
+        .expect("private disconnect readiness");
+        tokio::time::timeout(Duration::from_secs(5), interrupted)
+            .await
+            .expect("closed PTY delivers hangup")
+            .expect("receive terminal hangup");
+        use std::io::IsTerminal;
+        assert!(
+            !std::io::stdin().is_terminal(),
+            "fixture must lose the actual terminal"
+        );
+        commands
+            .cleanup()
+            .await
+            .expect("cleanup after controlling terminal disconnect");
+        assert!(
+            commands.authorization.is_none(),
+            "disconnect stops authorization refresh"
+        );
+        std::fs::write(root.join("complete"), b"cleaned")
+            .expect("private disconnect cleanup receipt");
+    }
+
+    #[tokio::test]
+    async fn real_pty_master_disconnect_preserves_cleanup() {
+        let owner = private_directory();
+        let (master, slave) = open_transport_pty(None).expect("private PTY pair");
+        let program =
+            crate::core::privilege::root_controlled_program_path("setsid").expect("system setsid");
+        let mut child = Command::new(program)
+            .args(["--ctty", "--fork", "--wait"])
+            .arg(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "cli::packages::update::omarchy::tests::terminal_disconnect_fixture",
+                "--nocapture",
+            ])
+            .env("OMG_OMARCHY_DISCONNECT_FIXTURE", owner.path())
+            .stdin(Stdio::from(slave))
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("private controlling-terminal fixture");
+        let mut group = FixtureGroup(None);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(value) = std::fs::read_to_string(owner.path().join("ready"))
+                    && let Ok(pid) = value.parse()
+                {
+                    group.0 = Some(nix::unistd::Pid::from_raw(pid));
+                    break;
+                }
+                assert!(
+                    child.try_wait().expect("fixture status").is_none(),
+                    "disconnect fixture exited before readiness"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("private controlling terminal is ready");
+        drop(master);
+        let output = tokio::time::timeout(Duration::from_secs(5), child.wait_with_output())
+            .await
+            .expect("disconnected fixture exits")
+            .expect("fixture exit status");
+        fixture_success(&output, format_args!("disconnected fixture failed: "))
+            .expect("owned fixture must succeed");
+        assert_eq!(
+            std::fs::read(owner.path().join("complete")).expect("cleanup receipt survives hangup"),
+            b"cleaned"
+        );
+        group.0 = None;
+    }
+
+    #[tokio::test]
+    async fn transcript_error_cleanup_fixture() {
+        use std::io::Write;
+        let Some(root) = std::env::var_os("OMG_OMARCHY_TRANSCRIPT_ERROR_FIXTURE") else {
+            return;
+        };
+        let root = PathBuf::from(root);
+        let mut interrupted = Box::pin(interrupt());
+        fixture_ready(
+            &mut interrupted,
+            tokio::task::yield_now(),
+            "signal preceded output readiness",
+        )
+        .await
+        .expect("fixture must reach readiness");
+        std::fs::write(root.join("ready"), b"ready").expect("private signal readiness");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !root.join("sealed").is_file() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("private transcript sealed");
+        println!("trigger the transcript failure");
+        interrupted
+            .await
+            .expect("inner receives transcript cancellation");
+        std::io::stdout()
+            .write_all(&vec![b'x'; 1024 * 1024])
+            .expect("cleanup output drains before coordinator reaping");
+        std::fs::write(root.join("complete"), b"cleaned").expect("output cleanup completed");
+    }
+
+    async fn terminal_read_failure_coordinator(
+        shell: impl AsRef<std::ffi::OsStr>,
+        ready: &std::path::Path,
+        armed: &std::path::Path,
+        release: &std::path::Path,
+        complete: &std::path::Path,
+    ) -> Result<tokio::process::Child> {
+        let mut coordinator = Command::new(shell);
+        coordinator.args([
+            "-c",
+            "trap '' TERM; while test ! -f \"$1.armed\"; do sleep 0.01; done; printf ready > \"$1\"; while test ! -f \"$2\"; do sleep 0.01; done; printf cleaned > \"$3\"",
+            "fixture",
+        ]);
+        coordinator.args([ready.as_os_str(), release.as_os_str(), complete.as_os_str()]);
+        coordinator
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .kill_on_drop(true);
+        let coordinator = coordinator.spawn()?;
+        tokio::time::timeout_at(
+            tokio::time::Instant::now() + Duration::from_secs(3),
+            async {
+                let mut released_child = false;
+                while !ready.is_file() {
+                    tokio::task::yield_now().await;
+                    if !released_child {
+                        std::fs::write(armed, b"armed").expect("release fixture readiness gate");
+                        released_child = true;
+                    }
+                }
+            },
+        )
+        .await
+        .context("owned coordinator must register its signal handling")?;
+        Ok(coordinator)
+    }
+
+    #[tokio::test]
+    async fn terminal_read_failure_reaps_owned_coordinator_before_returning() -> Result<()> {
+        use std::os::fd::OwnedFd;
+        use std::os::unix::fs::PermissionsExt;
+        use tokio::io::AsyncReadExt;
+
+        let owner = tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir_in("/tmp")?;
+        let listener = std::os::unix::net::UnixListener::bind(owner.path().join("read-error"))?;
+        listener.set_nonblocking(true)?;
+        let peer = std::os::unix::net::UnixStream::connect(owner.path().join("read-error"))?;
+        peer.set_nonblocking(true)?;
+        let mut peer = tokio::net::UnixStream::from_std(peer)?;
+        let descriptor: OwnedFd = listener.into();
+        let master = register_file(File::from(descriptor))?;
+        let ready = owner.path().join("ready");
+        let armed = ready.with_extension("armed");
+        let release = owner.path().join("release");
+        let complete = owner.path().join("complete");
+        let shell = crate::core::privilege::root_controlled_program_path("sh")?;
+        let mut coordinator =
+            terminal_read_failure_coordinator(shell, &ready, &armed, &release, &complete).await?;
+        let finish = tokio::spawn(async move {
+            let reset = peer
+                .read(&mut [0_u8; 1])
+                .await
+                .expect_err("failed terminal closes before reaping");
+            assert_eq!(reset.kind(), std::io::ErrorKind::ConnectionReset);
+            std::fs::write(release, b"release")
+        });
+        let drain_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let drain_result = tokio::time::timeout_at(
+            drain_deadline,
+            drain_interrupted_coordinator(&mut coordinator, master),
+        );
+        let drain_result = drain_result.await;
+        let error = drain_result
+            .context("terminal read failure must still reap the owned child")?
+            .expect_err("listening socket cannot serve as terminal input");
+        finish.await??;
+        assert!(format!("{error:#}").contains("Cannot drain interrupted Omarchy terminal"));
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .and_then(std::io::Error::raw_os_error),
+            Some(nix::libc::EINVAL)
+        );
+        assert_eq!(std::fs::read(complete)?, b"cleaned");
+        assert_eq!(
+            coordinator.id(),
+            None,
+            "the owned coordinator has been reaped"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn transcript_failure_drains_cleanup_before_returning_original_error() {
+        use rustix::fs::{MemfdFlags, SealFlags, fcntl_add_seals, memfd_create};
+        fn assert_send<T: Send>(future: T) -> T {
+            future
+        }
+        let owner = private_directory();
+        let lock = open_owned_file(&owner.path().join("lock")).expect("private transport lock");
+        lock.try_lock().expect("private transport lease");
+        let log = File::from(
+            memfd_create(
+                "omg-test-transcript",
+                MemfdFlags::CLOEXEC | MemfdFlags::ALLOW_SEALING,
+            )
+            .expect("private sealable transcript"),
+        );
+        let seal = log.try_clone().expect("private transcript sealing handle");
+        let trigger = tokio::spawn({
+            let root = owner.path().to_owned();
+            async move {
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while !root.join("ready").is_file() {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .expect("inner signal handler ready");
+                fcntl_add_seals(&seal, SealFlags::WRITE).expect("inject real transcript EPERM");
+                std::fs::write(root.join("sealed"), b"sealed").expect("release private output");
+            }
+        });
+        let executable = std::env::current_exe().expect("test executable");
+        let env = crate::core::privilege::root_controlled_program_path("env").expect("system env");
+        let assignment = format!(
+            "OMG_OMARCHY_TRANSCRIPT_ERROR_FIXTURE={}",
+            owner.path().display()
+        );
+        let arguments = [
+            assignment.as_str(),
+            executable.to_str().expect("test executable path"),
+            "--exact",
+            "cli::packages::update::omarchy::tests::transcript_error_cleanup_fixture",
+            "--nocapture",
+        ];
+        let result = tokio::time::timeout(
+            Duration::from_secs(8),
+            assert_send(execute_logged(
+                &env,
+                &arguments,
+                &lock,
+                &log,
+                &transport_runtime(),
+            )),
+        )
+        .await
+        .expect("transcript failure must drain and reap inner cleanup");
+        trigger.await.expect("private transcript failure trigger");
+        let error = result.expect_err("retain the original transcript failure");
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .and_then(std::io::Error::raw_os_error),
+            Some(nix::libc::EPERM),
+            "{error:#}"
+        );
+        assert_eq!(
+            std::fs::read(owner.path().join("complete")).expect("cleanup completed before return"),
+            b"cleaned"
+        );
+    }
+
+    #[tokio::test]
+    async fn transport_inner_cleanup_fixture() {
+        let Some(root) = std::env::var_os("OMG_OMARCHY_INNER_CLEANUP_FIXTURE") else {
+            return;
+        };
+        let root = PathBuf::from(root);
+        let mut interrupted = Box::pin(interrupt());
+        fixture_ready(
+            &mut interrupted,
+            tokio::task::yield_now(),
+            "signal preceded inner readiness",
+        )
+        .await
+        .expect("fixture must reach readiness");
+        std::fs::write(
+            root.join("ready"),
+            nix::unistd::getpid().as_raw().to_string(),
+        )
+        .expect("inner signal handler ready");
+        interrupted.await.expect("inner receives cancellation");
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        std::fs::write(root.join("complete"), b"cleaned").expect("slow cleanup completed");
+    }
+
+    #[tokio::test]
+    async fn transport_outer_cleanup_fixture() {
+        let Some(root) = std::env::var_os("OMG_OMARCHY_OUTER_CLEANUP_FIXTURE") else {
+            return;
+        };
+        let root = PathBuf::from(root);
+        let lock = open_owned_file(&root.join("lock")).expect("private transport lock");
+        lock.try_lock().expect("private transport lease");
+        let log = open_owned_file(&root.join("log")).expect("private transport transcript");
+        let trigger = tokio::spawn({
+            let root = root.clone();
+            async move {
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while !root.join("ready").is_file() {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .expect("inner became ready");
+                if std::env::var_os("OMG_OMARCHY_OUTER_DISCONNECT_FIXTURE").is_none() {
+                    nix::sys::signal::kill(
+                        nix::unistd::getpid(),
+                        nix::sys::signal::Signal::SIGTERM,
+                    )
+                    .expect("interrupt isolated outer coordinator");
+                }
+            }
+        });
+        let executable = std::env::current_exe().expect("test executable");
+        let env = crate::core::privilege::root_controlled_program_path("env").expect("system env");
+        let assignment = format!("OMG_OMARCHY_INNER_CLEANUP_FIXTURE={}", root.display());
+        let result = execute_logged(
+            &env,
+            &[
+                &assignment,
+                executable.to_str().expect("test executable path"),
+                "--exact",
+                "cli::packages::update::omarchy::tests::transport_inner_cleanup_fixture",
+                "--nocapture",
+            ],
+            &lock,
+            &log,
+            &transport_runtime(),
+        )
+        .await;
+        trigger.await.expect("isolated signal trigger");
+        assert!(
+            result.is_err(),
+            "cancellation must retain a failed update result"
+        );
+        assert_eq!(
+            std::fs::read(root.join("complete")).expect("outer must await complete inner cleanup"),
+            b"cleaned"
+        );
+    }
+
+    #[tokio::test]
+    async fn outer_transport_waits_for_inner_cleanup() {
+        let owner = private_directory();
+        let output = tokio::time::timeout(
+            Duration::from_secs(15),
+            Command::new(std::env::current_exe().expect("test executable"))
+                .args([
+                    "--exact",
+                    "cli::packages::update::omarchy::tests::transport_outer_cleanup_fixture",
+                    "--nocapture",
+                ])
+                .env("OMG_OMARCHY_OUTER_CLEANUP_FIXTURE", owner.path())
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .expect("isolated outer cancellation is bounded")
+        .expect("outer fixture runs");
+        fixture_success(
+            &output,
+            format_args!("outer transport abandoned inner cleanup: "),
+        )
+        .expect("owned fixture must succeed");
+    }
+
+    #[tokio::test]
+    async fn outer_terminal_disconnect_waits_for_inner_cleanup() {
+        let owner = private_directory();
+        let mut cleanup = PendingFixtureGroup(Some(owner.path().to_owned()));
+        let (master, slave) = open_transport_pty(None).expect("private outer terminal");
+        let launcher = crate::core::privilege::root_controlled_program_path("setsid")
+            .expect("system session launcher");
+        let mut child = Command::new(launcher)
+            .args(["--ctty", "--"])
+            .arg(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "cli::packages::update::omarchy::tests::transport_outer_cleanup_fixture",
+                "--nocapture",
+            ])
+            .env("OMG_OMARCHY_OUTER_CLEANUP_FIXTURE", owner.path())
+            .env("OMG_OMARCHY_OUTER_DISCONNECT_FIXTURE", "1")
+            .stdin(Stdio::from(slave))
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("isolated outer controlling terminal");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !owner.path().join("ready").is_file() {
+                assert!(
+                    child.try_wait().expect("outer status").is_none(),
+                    "outer exited before terminal disconnect"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("inner ready before physical outer hangup");
+        drop(master);
+        let output = tokio::time::timeout(Duration::from_secs(15), child.wait_with_output())
+            .await
+            .expect("physical outer disconnect completes")
+            .expect("outer disconnect status");
+        fixture_success(
+            &output,
+            format_args!("outer terminal hangup abandoned inner cleanup: "),
+        )
+        .expect("owned fixture must succeed");
+        assert_eq!(
+            std::fs::read(owner.path().join("complete"))
+                .expect("inner cleanup complete before outer exit"),
+            b"cleaned"
+        );
+        let transcript =
+            std::fs::read_to_string(owner.path().join("log")).expect("complete native transcript");
+        assert!(
+            transcript.starts_with("OMG Omarchy update started\n"),
+            "{transcript}"
+        );
+        assert!(
+            transcript.contains("\nOMG Omarchy update finished: "),
+            "{transcript}"
+        );
+        cleanup.0 = None;
+    }
+
+    #[tokio::test]
+    async fn real_pty_hangup_reaches_cleanup() {
+        let owner = private_directory();
+        let lock = open_owned_file(&owner.path().join("lock")).expect("private PTY lock");
+        lock.try_lock().expect("private PTY lease");
+        let log = open_owned_file(&owner.path().join("log")).expect("private PTY log");
+        let executable = std::env::current_exe().expect("test executable");
+        let program =
+            crate::core::privilege::root_controlled_program_path("env").expect("system env");
+        execute_logged(
+            &program,
+            &[
+                "OMG_OMARCHY_HANGUP_FIXTURE=1",
+                executable.to_str().expect("test path"),
+                "--exact",
+                "cli::packages::update::omarchy::tests::hangup_fixture",
+                "--nocapture",
+            ],
+            &lock,
+            &log,
+            &transport_runtime(),
+        )
+        .await
+        .expect("PTY hangup fixture completes graceful cleanup");
+        let transcript = std::fs::read_to_string(owner.path().join("log")).expect("PTY transcript");
+        assert!(transcript.contains("1 passed"), "{transcript}");
+    }
+
+    #[tokio::test]
+    async fn completed_coordinator_waits_for_terminal_eof() {
+        use std::io::Write;
+        struct ReapChild(std::process::Child);
+        impl Drop for ReapChild {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let owner = private_directory();
+        let transcript = open_owned_file(&owner.path().join("transcript"))
+            .expect("private pending-tail transcript");
+        let (master, slave) = open_transport_pty(None).expect("private pending-tail PTY");
+        let sleep =
+            crate::core::privilege::root_controlled_program_path("sleep").expect("system sleeper");
+        let mut unrelated = ReapChild(
+            std::process::Command::new(sleep)
+                .arg("30")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("owned unrelated child"),
+        );
+        fcntl(&master, FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK))
+            .expect("nonblocking pending-tail master");
+        let master = register_file(master).expect("owned pending-tail master");
+        let mut slave = slave;
+        slave
+            .write_all(b"before-")
+            .expect("initial terminal output");
+        let pending_output = async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            slave.write_all(b"after").expect("pending terminal tail");
+            drop(slave);
+        };
+        let (drained, ()) = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(
+                drain_completed_coordinator(&master, &transcript),
+                pending_output
+            )
+        })
+        .await
+        .expect("terminal tail reaches EOF without hanging");
+        drained.expect("complete terminal stream");
+        assert!(
+            unrelated
+                .0
+                .try_wait()
+                .expect("unrelated child state")
+                .is_none(),
+            "terminal EOF must not depend on unrelated child termination"
+        );
+        assert_eq!(
+            std::fs::read(owner.path().join("transcript")).expect("pending-tail transcript"),
+            b"before-after",
+            "completion must include output pending before terminal EOF"
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_coordinator_preserves_all_pty_tail_bytes() {
+        let owner = private_directory();
+        let transcript =
+            open_owned_file(&owner.path().join("transcript")).expect("private transcript");
+        let program =
+            crate::core::privilege::root_controlled_program_path("printf").expect("system printf");
+        let payload = "x".repeat(257);
+        for attempt in 0..2000 {
+            let (master, slave) = open_transport_pty(None).expect("private tail PTY");
+            fcntl(&master, FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK))
+                .expect("nonblocking tail master");
+            let master = register_file(master).expect("owned tail master");
+            transcript.set_len(0).expect("reset private transcript");
+            use std::io::{Seek, SeekFrom};
+            let mut transcript = &transcript;
+            transcript
+                .seek(SeekFrom::Start(0))
+                .expect("reset transcript position");
+            let mut command = std::process::Command::new(&program);
+            command
+                .arg("%s")
+                .arg(&payload)
+                .stdin(Stdio::null())
+                .stderr(Stdio::null())
+                .stdout(Stdio::from(slave));
+            let mut child = command.spawn().expect("private tail writer");
+            drop(command);
+            assert!(child.wait().expect("tail writer reap").success());
+            drain_completed_coordinator(&master, transcript)
+                .await
+                .expect("drain exited coordinator output");
+            assert_eq!(
+                std::fs::read(owner.path().join("transcript")).expect("tail transcript"),
+                payload.as_bytes(),
+                "all child bytes must survive reap on attempt {attempt}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn parent_coordination_descriptors_stay_close_on_exec_during_launch() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Barrier};
+
+        let owner = private_directory();
+        let lock = Arc::new(open_owned_file(&owner.path().join("lock")).expect("private lease"));
+        lock.try_lock().expect("exclusive fixture lease");
+        let log = Arc::new(open_owned_file(&owner.path().join("log")).expect("private transcript"));
+        let program =
+            crate::core::privilege::root_controlled_program_path("sh").expect("system shell");
+        for file in [&lock, &log] {
+            assert!(
+                FdFlag::from_bits_truncate(
+                    fcntl(file.as_ref(), FcntlArg::F_GETFD).expect("initial coordination flags")
+                )
+                .contains(FdFlag::FD_CLOEXEC),
+                "parent coordination descriptors start close-on-exec"
+            );
+        }
+
+        let ready = Arc::new(Barrier::new(2));
+        let done = Arc::new(AtomicBool::new(false));
+        let observer = {
+            let lock = Arc::clone(&lock);
+            let log = Arc::clone(&log);
+            let ready = Arc::clone(&ready);
+            let done = Arc::clone(&done);
+            std::thread::spawn(move || {
+                observe_coordination_descriptors(
+                    &[lock, log],
+                    &ready,
+                    &done,
+                    std::time::Instant::now() + Duration::from_secs(20),
+                )
+            })
+        };
+        ready.wait();
+        let mut launches = 0;
+        let result = tokio::time::timeout(Duration::from_secs(10), async {
+            for _ in 0..32 {
+                execute_logged(
+                    &program,
+                    &[
+                        "-c",
+                        "test -t 0 && test -t 1 && test -f \"/proc/self/fd/$OMG_OMARCHY_LOCK_FD\" && test -f \"/proc/self/fd/$OMG_OMARCHY_LOG_FD\"",
+                    ],
+                    &lock,
+                    &log, &transport_runtime())
+                .await?;
+                launches += 1;
+            }
+            Ok::<_, anyhow::Error>(())
+        })
+        .await;
+        done.store(true, Ordering::Release);
+        let observation = observer.join();
+
+        let DescriptorObservation {
+            samples,
+            inherited,
+            inspection_error,
+            expired,
+        } = observation.expect("descriptor observer joins before checking launch results");
+        assert!(
+            !expired,
+            "descriptor observer exceeded its independent deadline"
+        );
+        assert_eq!(
+            inspection_error, None,
+            "owned descriptors remain inspectable"
+        );
+        assert!(
+            samples > 1,
+            "observer sampled both descriptors during launches"
+        );
+        result
+            .expect("inert transport launches finish within ten seconds")
+            .expect("child receives both genuine coordination descriptors");
+        assert_eq!(launches, 32, "every real transport launch completes");
+        assert_eq!(
+            inherited,
+            [0, 0],
+            "parent lock/log became inheritable in {inherited:?} of {samples} observations; concurrent exec could retain the update lease or transcript"
+        );
+    }
+
+    #[tokio::test]
+    async fn real_pty_transcript_preserves_literal_arguments_and_child_failure() {
+        let owner = private_directory();
+        let lock = open_owned_file(&owner.path().join("lock")).expect("private transcript lock");
+        lock.try_lock().expect("transcript ownership");
+        let log = open_owned_file(&owner.path().join("log")).expect("private transcript file");
+        let program =
+            crate::core::privilege::root_controlled_program_path("sh").expect("system shell");
+        let literal = "value; $(printf must-not-execute) 'quoted'";
+        execute_logged(
+            &program,
+            &[
+                "-c",
+                "test -t 1 && printf '%s\\n' \"$1\"",
+                "fixture",
+                literal,
+            ],
+            &lock,
+            &log,
+            &transport_runtime(),
+        )
+        .await
+        .expect("inert PTY child");
+        let text =
+            std::fs::read_to_string(owner.path().join("log")).expect("real current-run transcript");
+        assert!(text.contains(literal), "{text}");
+        assert!(
+            FdFlag::from_bits_truncate(
+                fcntl(&lock, FcntlArg::F_GETFD).expect("restored lock flags")
+            )
+            .contains(FdFlag::FD_CLOEXEC)
+        );
+        log.set_len(0).expect("new private transcript");
+        let error = execute_logged(
+            &program,
+            &["-c", "printf failed-stage; exit 7"],
+            &lock,
+            &log,
+            &transport_runtime(),
+        )
+        .await
+        .expect_err("failed PTY command");
+        assert!(error.to_string().contains("did not complete"));
+        assert!(
+            std::fs::read_to_string(owner.path().join("log"))
+                .expect("failed-stage transcript")
+                .contains("failed-stage")
+        );
+    }
+
+    #[tokio::test]
+    async fn foreground_fixture() {
+        if std::env::var_os("OMG_OMARCHY_FOREGROUND_FIXTURE").is_none() {
+            return;
+        }
+        let initial = foreground_group()
+            .expect("fixture terminal")
+            .expect("PTY foreground");
+        let program =
+            crate::core::privilege::root_controlled_program_path("sh").expect("system shell");
+        let mut commands = Commands::new(false, transport_runtime());
+        let status = commands
+            .run_program(
+                &program,
+                &[
+                    "-c",
+                    "test -t 0 && test \"$(ps -o pgid= -p $$)\" = \"$(ps -o tpgid= -p $$)\"",
+                ],
+            )
+            .await
+            .expect("foreground fixture child");
+        assert!(status.success(), "interactive stage must own the terminal");
+        assert_eq!(
+            foreground_group().expect("restored foreground"),
+            Some(initial)
+        );
+        let mut operation = Box::pin(commands.run_program(&program, &["-c", "exec sleep 30"]));
+        fixture_ready(
+            &mut operation,
+            tokio::time::sleep(Duration::from_millis(100)),
+            "foreground child finished unexpectedly",
+        )
+        .await
+        .expect("fixture must reach readiness");
+        drop(operation);
+        assert_ne!(
+            foreground_group().expect("active foreground"),
+            Some(initial)
+        );
+        commands
+            .cleanup()
+            .await
+            .expect("foreground cancellation cleanup");
+        assert_eq!(
+            foreground_group().expect("cancelled foreground"),
+            Some(initial)
+        );
+        assert!(commands.active.is_none());
+    }
+
+    #[tokio::test]
+    async fn real_pty_stages_restore_foreground_on_completion_and_cancellation() {
+        let owner = private_directory();
+        let lock = open_owned_file(&owner.path().join("lock")).expect("PTY fixture lock");
+        lock.try_lock().expect("PTY fixture lease");
+        let log = open_owned_file(&owner.path().join("log")).expect("PTY fixture transcript");
+        let executable = std::env::current_exe().expect("test executable");
+        let program =
+            crate::core::privilege::root_controlled_program_path("env").expect("system env");
+        execute_logged(
+            &program,
+            &[
+                "OMG_OMARCHY_FOREGROUND_FIXTURE=1",
+                executable.to_str().expect("test executable path"),
+                "--exact",
+                "cli::packages::update::omarchy::tests::foreground_fixture",
+                "--nocapture",
+            ],
+            &lock,
+            &log,
+            &transport_runtime(),
+        )
+        .await
+        .expect("inert foreground PTY workflow");
+        let transcript =
+            std::fs::read_to_string(owner.path().join("log")).expect("foreground transcript");
+        assert!(transcript.contains("1 passed"), "{transcript}");
+    }
+
+    #[test]
+    fn mutation_context_never_allows_the_test_harness_to_run_host_helpers() {
+        let error = ensure_mutation_context().expect_err("unit test mutation guard");
+        assert!(error.to_string().contains("test/development mode"));
+    }
+
+    #[test]
+    fn omarchy_full_updates_include_distro_coordination() {
+        for yes in [false, true] {
+            assert_eq!(
+                plan(
+                    ArchFlavor::Omarchy,
+                    UpdateIntent::Standard {
+                        yes,
+                        no_sync: false,
+                    },
+                )
+                .expect("a full Omarchy update is supported"),
+                UpdatePlan::Omarchy { yes },
+                "full updates must run Omarchy's surrounding update lifecycle"
+            );
+        }
+    }
+
+    #[test]
+    fn normal_arch_preserves_native_update_modes() {
+        for intent in [
+            UpdateIntent::Check,
+            UpdateIntent::DryRun,
+            UpdateIntent::AurOnly,
+            UpdateIntent::Standard {
+                yes: false,
+                no_sync: false,
+            },
+            UpdateIntent::Standard {
+                yes: true,
+                no_sync: true,
+            },
+        ] {
+            assert_eq!(
+                plan(ArchFlavor::Arch, intent).expect("native Arch update mode"),
+                UpdatePlan::Native,
+                "normal Arch must retain its existing behavior for {intent:?}"
+            );
+        }
+        require_native_scope(ArchFlavor::Arch)
+            .expect("fast and turbo stay native on ordinary Arch");
+    }
+
+    #[test]
+    fn omarchy_read_only_and_aur_only_requests_never_run_system_stages() {
+        for intent in [
+            UpdateIntent::Check,
+            UpdateIntent::DryRun,
+            UpdateIntent::AurOnly,
+        ] {
+            assert_eq!(
+                plan(ArchFlavor::Omarchy, intent).expect("scoped native operation"),
+                UpdatePlan::Native,
+                "{intent:?} must not invoke the mutating Omarchy coordinator"
+            );
+        }
+    }
+
+    #[test]
+    fn omarchy_refuses_cached_and_official_only_modes_before_mutation() {
+        let intent = UpdateIntent::Standard {
+            yes: false,
+            no_sync: true,
+        };
+        assert!(
+            plan(ArchFlavor::Omarchy, intent).is_err(),
+            "{intent:?} cannot silently widen into a refreshing full Omarchy update"
+        );
+        assert!(
+            require_native_scope(ArchFlavor::Omarchy).is_err(),
+            "fast and turbo cannot omit Omarchy system stages"
+        );
+    }
+
+    #[test]
+    fn cleanup_composition_preserves_values_and_primary_os_cause() {
+        assert_eq!(
+            finish_cleanup(Ok(17), Ok(())).expect("successful operation"),
+            17
+        );
+        let cleanup = finish_cleanup(Ok(17), Err(anyhow::anyhow!("lease release failed")))
+            .expect_err("cleanup failure prevents success");
+        assert!(format!("{cleanup:#}").contains("lease release failed"));
+        for cleanup in [Ok(()), Err(anyhow::anyhow!("terminal restoration failed"))] {
+            let failed_cleanup = cleanup.is_err();
+            let primary: Result<usize> =
+                Err(std::io::Error::from_raw_os_error(nix::libc::ECHILD).into());
+            let error = finish_cleanup(primary, cleanup).expect_err("primary wait failed");
+            assert_eq!(
+                error
+                    .downcast_ref::<std::io::Error>()
+                    .expect("original OS error remains the cause")
+                    .raw_os_error(),
+                Some(nix::libc::ECHILD)
+            );
+            assert_eq!(
+                format!("{error:#}").contains("terminal restoration failed"),
+                failed_cleanup
+            );
+        }
+    }
+
+    #[test]
+    fn inherited_transport_startup_fixture() {
+        let Some(mode) = std::env::var_os("OMG_OMARCHY_CONTAIN_FIXTURE") else {
+            return;
+        };
+        let mode = mode.to_str().expect("fixture mode");
+        let command = if mode == "other" { "status" } else { "update" };
+        let args = match mode {
+            "alias" => vec!["omg", "u"],
+            "global-prefix" => vec!["omg", "--verbose", "--json", "update"],
+            "clustered-prefix" => vec!["omg", "-vvq", "u"],
+            _ => vec!["omg", command],
+        }
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+        if matches!(mode, "alias" | "global-prefix" | "clustered-prefix") {
+            use clap::Parser;
+            assert!(matches!(
+                crate::cli::Cli::try_parse_from(&args)
+                    .expect("supported update invocation")
+                    .command,
+                crate::cli::Commands::Update { .. }
+            ));
+        }
+        let result = contain_inherited_transport(&args);
+        if matches!(
+            mode,
+            "valid" | "alias" | "global-prefix" | "clustered-prefix" | "absent" | "other"
+        ) {
+            result.expect("valid transport or unrelated command is admitted");
+        } else {
+            result.expect_err("malformed transport is refused before initialization");
+            return;
+        }
+        if !matches!(
+            mode,
+            "valid" | "alias" | "global-prefix" | "clustered-prefix"
+        ) {
+            return;
+        }
+        contain_inherited_transport(&args).expect("containment is idempotent");
+        let lock = std::env::var(LOCK_FD).expect("fixture lock descriptor");
+        let log = std::env::var(LOG_FD).expect("fixture log descriptor");
+        for raw in [&lock, &log] {
+            let raw = transport_descriptor(raw).expect("fixture descriptor");
+            // SAFETY: F_GETFD observes the inherited integer without adopting ownership.
+            #[expect(unsafe_code, reason = "observe isolated startup descriptor flags")]
+            let flags = unsafe { nix::libc::fcntl(raw, nix::libc::F_GETFD) };
+            assert!(
+                flags >= 0 && flags & nix::libc::FD_CLOEXEC != 0,
+                "transport is contained before any helper exec"
+            );
+        }
+        let program =
+            crate::core::privilege::root_controlled_program_path("sh").expect("system shell");
+        let status = std::process::Command::new(program)
+            .args([
+                "-c",
+                "test ! /proc/self/fd/$1 -ef \"$2\" && test ! /proc/self/fd/$3 -ef \"$4\"",
+                "fixture",
+                &lock,
+                &std::env::var("OMG_OMARCHY_CONTAIN_LOCK_PATH").expect("fixture lock path"),
+                &log,
+                &std::env::var("OMG_OMARCHY_CONTAIN_LOG_PATH").expect("fixture log path"),
+            ])
+            .status()
+            .expect("unrelated real helper runs");
+        assert!(
+            status.success(),
+            "unrelated exec cannot retain either transport inode"
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_contains_only_complete_canonical_update_transports() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        let owner = private_directory();
+        let lock_path = owner.path().join("startup-lock");
+        let log_path = owner.path().join("startup-log");
+        let lock = open_owned_file(&lock_path)
+            .expect("private startup lock")
+            .try_clone()
+            .expect("lock above stdio");
+        let log = open_owned_file(&log_path)
+            .expect("private startup log")
+            .try_clone()
+            .expect("log above stdio");
+        let lock_fd = lock.as_raw_fd();
+        let log_fd = log.as_raw_fd();
+        for mode in [
+            "alias",
+            "global-prefix",
+            "clustered-prefix",
+            "valid",
+            "absent",
+            "other",
+            "missing-lock",
+            "missing-log",
+            "malformed",
+            "negative",
+            "overflow",
+            "stdio",
+            "overlap",
+            "encoding",
+            "log-encoding",
+            "log-malformed",
+            "both-encoding",
+            "closed",
+        ] {
+            let mut command = Command::new(std::env::current_exe().expect("test executable"));
+            command
+                .args([
+                    "--exact",
+                    "cli::packages::update::omarchy::tests::inherited_transport_startup_fixture",
+                    "--nocapture",
+                ])
+                .env("OMG_OMARCHY_CONTAIN_FIXTURE", mode)
+                .env("OMG_OMARCHY_CONTAIN_LOCK_PATH", &lock_path)
+                .env("OMG_OMARCHY_CONTAIN_LOG_PATH", &log_path)
+                .env_remove(LOCK_FD)
+                .env_remove(LOG_FD)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true);
+            if mode != "absent" {
+                if mode != "missing-lock" {
+                    let value = match mode {
+                        "other" | "malformed" => OsString::from("invalid"),
+                        "negative" => OsString::from("-3"),
+                        "overflow" => OsString::from("2147483648"),
+                        "stdio" => OsString::from("0"),
+                        "encoding" | "both-encoding" => OsString::from_vec(vec![0xff]),
+                        "closed" => OsString::from(i32::MAX.to_string()),
+                        _ => OsString::from(lock_fd.to_string()),
+                    };
+                    command.env(LOCK_FD, value);
+                }
+                if mode != "missing-log" && mode != "other" {
+                    command.env(
+                        LOG_FD,
+                        match mode {
+                            "overlap" => OsString::from(format!("0{lock_fd}")),
+                            "log-encoding" | "both-encoding" => OsString::from_vec(vec![0xff]),
+                            "log-malformed" => OsString::from("invalid"),
+                            _ => OsString::from(log_fd.to_string()),
+                        },
+                    );
+                }
+            }
+            // SAFETY: the closure only changes flags in this isolated fork. The
+            // parent retains both Files until output has spawned and reaped it.
+            #[expect(
+                unsafe_code,
+                reason = "pass real descriptors to isolated startup fixture"
+            )]
+            unsafe {
+                command.pre_exec(transport_inheritance_action(lock_fd, log_fd));
+            }
+            let output = tokio::time::timeout(Duration::from_secs(10), command.output())
+                .await
+                .expect("startup fixture finishes within its deadline")
+                .expect("startup fixture output");
+            fixture_success(&output, format_args!("{mode}: ")).expect("owned fixture must succeed");
+        }
+        for file in [&lock, &log] {
+            assert!(
+                FdFlag::from_bits_truncate(
+                    fcntl(file, FcntlArg::F_GETFD).expect("parent descriptor remains open")
+                )
+                .contains(FdFlag::FD_CLOEXEC),
+                "child handoff never changes parent's descriptor flags"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn atomic_transport_pty_retains_terminal_attributes() {
+        let (_source_master, source) = open_transport_pty(None).expect("initial private terminal");
+        let mut saved = nix::sys::termios::tcgetattr(&source).expect("original terminal settings");
+        saved
+            .local_flags
+            .remove(nix::sys::termios::LocalFlags::ECHO);
+        let (master, slave) =
+            open_transport_pty(Some(&saved)).expect("configured private terminal");
+        for file in [&master, &slave] {
+            assert!(
+                FdFlag::from_bits_truncate(
+                    fcntl(file, FcntlArg::F_GETFD).expect("terminal descriptor flags")
+                )
+                .contains(FdFlag::FD_CLOEXEC),
+                "terminal starts close-on-exec"
+            );
+        }
+        assert_eq!(
+            nix::sys::termios::tcgetattr(&slave).expect("configured terminal attributes"),
+            saved,
+            "new slave receives saved terminal settings"
+        );
+    }
+
+    #[tokio::test]
+    async fn stalled_development_fetch_releases_the_stage_for_cleanup() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let runtime = OmarchyRuntime {
+            root: directory.path().to_path_buf(),
+            migration_state: directory.path().join("markers"),
+        };
+        let shell = crate::core::privilege::root_controlled_program_path("sh")?;
+        let mut commands = Commands::new(false, runtime);
+        let early = commands
+            .run_development_checkout(
+                &shell,
+                &["-c", "exit 7"],
+                directory.path().to_path_buf(),
+                Duration::from_secs(2),
+            )
+            .await?;
+        assert_eq!(early.code(), Some(7));
+        let error = commands
+            .run_development_checkout(
+                &shell,
+                &["-c", "exec /usr/bin/sleep 1"],
+                directory.path().to_path_buf(),
+                Duration::from_millis(50),
+            )
+            .await
+            .expect_err("a stalled development helper must fail the update");
+        assert!(
+            error
+                .to_string()
+                .contains("Omarchy dev checkout update timed out")
+        );
+        assert!(
+            commands
+                .run_program(&shell, &["-c", "exit 0"])
+                .await?
+                .success()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_environment_fixture() -> Result<()> {
+        let Some(mode) = std::env::var_os("OMG_OMARCHY_RUNTIME_ENV_FIXTURE") else {
+            return Ok(());
+        };
+        let directory = std::env::current_dir()?;
+        let observed = directory.join("observed-environment");
+        let shell = crate::core::privilege::root_controlled_program_path("sh")?;
+        let runtime = OmarchyRuntime {
+            root: PathBuf::from("/usr/share/omarchy"),
+            migration_state: OmarchyRuntime::migration_state()?,
+        };
+        let args = [
+            "-c",
+            "printf '%s\\n%s\\n' \"$OMARCHY_PATH\" \"$OMARCHY_MIGRATION_STATE\" > \"$1\"",
+            "runtime-fixture",
+            observed
+                .to_str()
+                .context("private runtime observation path is UTF8")?,
+        ];
+        if mode == "stage" {
+            let mut commands = Commands::new(false, runtime.clone());
+            let status =
+                tokio::time::timeout(Duration::from_secs(10), commands.run_program(&shell, &args))
+                    .await
+                    .context("inert stage environment observation timed out")??;
+            anyhow::ensure!(status.success(), "inert stage observation failed");
+        } else {
+            anyhow::ensure!(mode == "coordinator", "unknown runtime environment fixture");
+            let lock = open_owned_file(&directory.join("lock"))?;
+            lock.try_lock()?;
+            let log = open_owned_file(&directory.join("log"))?;
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                execute_logged(&shell, &args, &lock, &log, &runtime),
+            )
+            .await
+            .context("inert coordinator environment observation timed out")??;
+        }
+        assert_eq!(
+            std::fs::read_to_string(observed)?,
+            format!(
+                "/usr/share/omarchy\n{}\n",
+                directory.join("markers").display()
+            ),
+            "selected installed runtime and resolved migration state must reach the actual child instead of caller checkout/relative environment"
+        );
+        Ok(())
+    }
+
+    fn check_runtime_environment(mode: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let owner = private_directory();
+        let checkout = owner.path().join("caller-checkout");
+        std::fs::create_dir_all(checkout.join("bin")).expect("private caller checkout");
+        std::fs::create_dir(owner.path().join("markers")).expect("private migration markers");
+        let sentinel = checkout.join("bin/omarchy-migrate");
+        std::fs::write(
+            &sentinel,
+            "#!/bin/sh\nprintf executed > \"$OMARCHY_PATH/executed\"\nexit 88\n",
+        )
+        .expect("caller checkout executable sentinel");
+        std::fs::set_permissions(&sentinel, std::fs::Permissions::from_mode(0o700))
+            .expect("caller sentinel mode");
+        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "cli::packages::update::omarchy::tests::runtime_environment_fixture",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .current_dir(owner.path())
+            .env("OMG_OMARCHY_RUNTIME_ENV_FIXTURE", mode)
+            .env("OMARCHY_PATH", &checkout)
+            .env("OMARCHY_MIGRATION_STATE", "markers")
+            .stdin(Stdio::null())
+            .output()
+            .expect("isolated inert runtime observation");
+        assert!(
+            !checkout.join("executed").exists(),
+            "caller checkout executable must never run"
+        );
+        fixture_success(
+            &output,
+            format_args!("{mode} runtime environment observation failed: "),
+        )
+        .expect("owned fixture must succeed");
+    }
+
+    #[test]
+    fn stage_children_receive_selected_runtime_instead_of_caller_checkout() {
+        check_runtime_environment("stage");
+    }
+
+    #[test]
+    fn coordinator_child_receives_selected_runtime_instead_of_caller_checkout() {
+        check_runtime_environment("coordinator");
+    }
+
+    #[test]
+    fn runtime_layout_binds_packaged_and_trusted_checkout_helpers_without_mixing_roots() {
+        let packaged = OmarchyRuntime::root_for_migrate(Path::new("/usr/bin/omarchy-migrate"))
+            .expect("packaged migration layout");
+        assert_eq!(packaged, Path::new("/usr/share/omarchy"));
+        let runtime = OmarchyRuntime {
+            root: packaged,
+            migration_state: PathBuf::from("/private/markers"),
+        };
+        runtime
+            .check_helper_layout(
+                "omarchy-update-stay-awake",
+                Path::new("/usr/bin/omarchy-update-stay-awake"),
+            )
+            .expect("packaged protected helper layout");
+        assert!(
+            runtime
+                .check_helper_layout(
+                    "omarchy-update-stay-awake",
+                    Path::new("/opt/other/bin/omarchy-update-stay-awake")
+                )
+                .is_err()
+        );
+        let checkout =
+            OmarchyRuntime::root_for_migrate(Path::new("/opt/trusted-omarchy/bin/omarchy-migrate"))
+                .expect("trusted selected executable can define its own checkout layout");
+        assert_eq!(checkout, Path::new("/opt/trusted-omarchy"));
+        let runtime = OmarchyRuntime {
+            root: checkout,
+            migration_state: PathBuf::from("/private/markers"),
+        };
+        runtime
+            .check_helper_layout(
+                "omarchy-update-stay-awake",
+                Path::new("/opt/trusted-omarchy/bin/omarchy-update-stay-awake"),
+            )
+            .expect("same selected checkout layout");
+        assert!(
+            runtime
+                .check_helper_layout(
+                    "omarchy-update-stay-awake",
+                    Path::new("/usr/bin/omarchy-update-stay-awake")
+                )
+                .is_err()
+        );
+        for invalid in [
+            "omarchy-migrate",
+            "/opt/omarchy/tools/omarchy-migrate",
+            "/opt/omarchy/bin/other",
+        ] {
+            assert!(
+                OmarchyRuntime::root_for_migrate(Path::new(invalid)).is_err(),
+                "{invalid}"
+            );
+        }
+        let private = private_directory();
+        assert!(
+            OmarchyRuntime::validate_root_directory(private.path()).is_err(),
+            "a user-writable ancestor cannot become a trusted runtime root"
+        );
+    }
+
+    #[tokio::test]
+    async fn selected_migration_runtime_fixture() -> Result<()> {
+        let Some(selected) = std::env::var_os("OMG_OMARCHY_SELECTED_RUNTIME_FIXTURE") else {
+            return Ok(());
+        };
+        if let Ok(variable) = std::env::var("OMG_OMARCHY_EMPTY_VARIABLE_FIXTURE") {
+            let error = OmarchyRuntime::discover()
+                .expect_err("explicit empty runtime variables refuse before helper discovery");
+            assert!(
+                error.to_string().contains(&variable) && error.to_string().contains("non-empty"),
+                "{error:#}"
+            );
+            return Ok(());
+        }
+        let selected = PathBuf::from(selected);
+        let runtime = OmarchyRuntime {
+            root: selected.clone(),
+            migration_state: OmarchyRuntime::migration_state()?,
+        };
+        assert_eq!(
+            runtime.migration_state,
+            std::env::current_dir()?.join("markers")
+        );
+        let mut commands = Commands::new(false, runtime);
+        if std::env::var_os("OMG_OMARCHY_SELECTED_FORBIDDEN_FIXTURE").is_some() {
+            let error = commands
+                .runtime
+                .check_pending_migrations()
+                .expect_err("selected runtime external AUR migration must refuse");
+            assert!(
+                error.to_string().contains("external package helper"),
+                "{error:#}"
+            );
+            std::fs::write(
+                commands.runtime.migration_state.join("0001.sh"),
+                b"complete",
+            )
+            .expect("completed selected-runtime migration fixture");
+            commands.runtime.check_pending_migrations()?;
+        } else {
+            commands.runtime.check_pending_migrations()?;
+        }
+        let shell = crate::core::privilege::root_controlled_program_path("sh")?;
+        let output = std::env::current_dir()?.join("selected-runtime-observed");
+        let status = commands
+            .run_program(
+                &shell,
+                &[
+                    "-c",
+                    "printf '%s' \"$OMARCHY_PATH\" > \"$1\"",
+                    "runtime-fixture",
+                    output.to_str().context("private output UTF8")?,
+                ],
+            )
+            .await?;
+        assert!(status.success());
+        assert_eq!(
+            std::fs::read_to_string(output)?,
+            selected.to_str().context("selected root UTF8")?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn selected_runtime_migrations_are_scanned_instead_of_the_caller_checkout() {
+        for (selected_forbidden, empty) in [
+            (false, None),
+            (true, None),
+            (false, Some("OMARCHY_PATH")),
+            (false, Some("OMARCHY_MIGRATION_STATE")),
+        ] {
+            let owner = private_directory();
+            let selected = owner.path().join("selected-runtime");
+            let caller = owner.path().join("caller-checkout");
+            for path in [
+                selected.join("migrations"),
+                caller.join("migrations"),
+                caller.join("bin"),
+                owner.path().join("markers"),
+            ] {
+                std::fs::create_dir_all(path).expect("private split-runtime directory");
+            }
+            let (selected_text, caller_text) = if selected_forbidden {
+                (
+                    "omarchy-pkg-aur-add forbidden-fixture\n",
+                    "echo inert migration\n",
+                )
+            } else {
+                (
+                    "echo inert migration\n",
+                    "omarchy-pkg-aur-add forbidden-caller-fixture\n",
+                )
+            };
+            std::fs::write(selected.join("migrations/0001.sh"), selected_text)
+                .expect("selected runtime migration");
+            std::fs::write(caller.join("migrations/0001.sh"), caller_text)
+                .expect("caller migration");
+            std::fs::write(
+                caller.join("bin/omarchy-migrate"),
+                "#!/bin/sh\nprintf executed > \"$OMARCHY_PATH/executed\"\nexit 88\n",
+            )
+            .expect("caller executable sentinel");
+            let mut command =
+                std::process::Command::new(std::env::current_exe().expect("test executable"));
+            command
+                .args([
+                    "--exact",
+                    "cli::packages::update::omarchy::tests::selected_migration_runtime_fixture",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .current_dir(owner.path())
+                .env("OMG_OMARCHY_SELECTED_RUNTIME_FIXTURE", &selected)
+                .env("OMARCHY_PATH", &caller)
+                .env("OMARCHY_MIGRATION_STATE", "markers")
+                .env_remove("OMG_OMARCHY_SELECTED_FORBIDDEN_FIXTURE")
+                .env_remove("OMG_OMARCHY_EMPTY_VARIABLE_FIXTURE");
+            if selected_forbidden {
+                command.env("OMG_OMARCHY_SELECTED_FORBIDDEN_FIXTURE", "1");
+            }
+            if let Some(variable) = empty {
+                command
+                    .env("OMG_OMARCHY_EMPTY_VARIABLE_FIXTURE", variable)
+                    .env(variable, "");
+            }
+            let output = command
+                .output()
+                .expect("isolated split-runtime migration data check");
+            fixture_success(
+                &output,
+                format_args!("selected_forbidden={selected_forbidden}, empty={empty:?}: "),
+            )
+            .expect("owned fixture must succeed");
+            assert!(
+                !caller.join("executed").exists(),
+                "caller checkout program must never execute"
+            );
+        }
+    }
+
+    #[test]
+    fn coordinator_attended_from_respects_outer_attendance_env() {
+        use std::ffi::OsStr;
+
+        assert!(coordinator_attended_from(Some(OsStr::new("1")), false));
+        assert!(!coordinator_attended_from(Some(OsStr::new("0")), true));
+        assert!(coordinator_attended_from(None, true));
+        assert!(!coordinator_attended_from(None, false));
+        assert!(coordinator_attended_from(Some(OsStr::new("other")), true));
+        assert!(!coordinator_attended_from(Some(OsStr::new("other")), false));
+    }
+
+    #[test]
+    fn native_confirm_update_declines_when_unattended() {
+        assert_eq!(native_confirm_update(false).unwrap(), Outcome::Declined);
+    }
+
+    #[test]
+    fn native_preflight_free_space_covers_statvfs_and_force_paths() {
+        assert_eq!(statvfs_unit_size(4096, 512), 4096);
+        assert_eq!(statvfs_unit_size(0, 4096), 4096);
+        let _ = temp_env::with_var(
+            "OMARCHY_UPDATE_FORCE",
+            None::<&str>,
+            native_preflight_free_space,
+        );
+        temp_env::with_var("OMARCHY_UPDATE_FORCE", Some("1"), || {
+            assert!(native_preflight_free_space().is_ok());
+        });
+    }
+
+    #[test]
+    fn confirm_outcome_maps_user_choice() {
+        assert_eq!(confirm_outcome(true), Outcome::Success);
+        assert_eq!(confirm_outcome(false), Outcome::Declined);
+    }
+
+    #[test]
+    fn stage_exit_outcome_maps_declined_unavailable_and_errors() {
+        use std::os::unix::process::ExitStatusExt;
+
+        assert_eq!(
+            stage_exit_outcome(
+                Stage::MigrationsPending,
+                ExitStatus::from_raw(1 << 8),
+                "omarchy-migrate",
+            )
+            .unwrap(),
+            Outcome::Declined
+        );
+        assert_eq!(
+            stage_exit_outcome(
+                Stage::Snapshot,
+                ExitStatus::from_raw(127 << 8),
+                "omarchy-snapshot",
+            )
+            .unwrap(),
+            Outcome::Unavailable
+        );
+        assert!(
+            stage_exit_outcome(
+                Stage::DevelopmentCheckout,
+                ExitStatus::from_raw(2 << 8),
+                "omarchy-update-dev",
+            )
+            .is_err()
+        );
+    }
+
+    fn write_test_executable(path: &Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::write(path, body).expect("write test executable");
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod test executable");
+    }
+
+    #[tokio::test]
+    async fn native_facetimehd_migration_covers_unmatched_and_full_install_flow() {
+        let owner = private_directory();
+        let runtime = OmarchyRuntime {
+            root: owner.path().to_path_buf(),
+            migration_state: owner.path().join("markers"),
+        };
+
+        let bare = Commands::new(false, runtime.clone());
+        let _ = bare.sudo_command();
+        let _ = bare.resolve_migration_helper("sh");
+        let _ = bare.resolve_optional_helper("sh");
+        let _ = bare.is_package_installed("nonexistent-omg-pkg");
+
+        let empty_fixture = || NativeMigrationFixture {
+            operations: Vec::new(),
+            failure: None,
+            desktop_database_program: "false",
+        };
+
+        let hw_miss = owner.path().join("hw-miss");
+        write_test_executable(&hw_miss, "#!/bin/sh\nexit 1\n");
+        let mut unmatched = Commands::new(false, runtime.clone());
+        unmatched.native_fixture = Some(empty_fixture());
+        unmatched.migration_overrides = Some(MigrationTestOverrides {
+            helper_overrides: std::collections::BTreeMap::from([(
+                "omarchy-hw-facetimehd",
+                hw_miss,
+            )]),
+            ..Default::default()
+        });
+        unmatched
+            .run_native_migration(NativeMigration::FacetimeHdCamera, None)
+            .await
+            .expect("non-facetimehd hardware exits early cleanly");
+        assert!(
+            unmatched
+                .native_fixture
+                .as_ref()
+                .unwrap()
+                .operations
+                .is_empty()
+        );
+
+        let hw_hit = owner.path().join("hw-hit");
+        write_test_executable(&hw_hit, "#!/bin/sh\nexit 0\n");
+        let state_ok = owner.path().join("omarchy-state");
+        write_test_executable(&state_ok, "#!/bin/sh\nexit 0\n");
+        let sudo_ok = owner.path().join("sudo-ok");
+        write_test_executable(&sudo_ok, "#!/bin/sh\nexit 0\n");
+        let mut matched = Commands::new(false, runtime.clone());
+        matched.native_fixture = Some(empty_fixture());
+        matched.migration_overrides = Some(MigrationTestOverrides {
+            helper_overrides: std::collections::BTreeMap::from([
+                ("omarchy-hw-facetimehd", hw_hit.clone()),
+                ("omarchy-state", state_ok),
+            ]),
+            installed_packages: Some(std::collections::BTreeSet::from([
+                "facetimehd-firmware-fetcher",
+            ])),
+            sudo_program: Some(sudo_ok.clone()),
+            ..Default::default()
+        });
+        matched
+            .run_native_migration(NativeMigration::FacetimeHdCamera, None)
+            .await
+            .expect("matched facetimehd hardware installs driver and units");
+        assert_eq!(
+            matched.native_fixture.as_ref().unwrap().operations,
+            vec![NativeOmarchyOperation::InstallFacetimeHd]
+        );
+
+        let mut preinstalled = Commands::new(false, runtime);
+        preinstalled.native_fixture = Some(empty_fixture());
+        preinstalled.migration_overrides = Some(MigrationTestOverrides {
+            helper_overrides: std::collections::BTreeMap::from([("omarchy-hw-facetimehd", hw_hit)]),
+            installed_packages: Some(std::collections::BTreeSet::from([
+                "bcwc-pcie",
+                "facetimehd-firmware",
+            ])),
+            sudo_program: Some(sudo_ok),
+            ..Default::default()
+        });
+        preinstalled
+            .run_native_migration(NativeMigration::FacetimeHdCamera, None)
+            .await
+            .expect("preinstalled facetimehd hardware skips package install and fetcher service");
+        assert!(
+            preinstalled
+                .native_fixture
+                .as_ref()
+                .unwrap()
+                .operations
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn native_pi_coding_agent_and_kmscon_migrations_cover_mise_cleanup_and_install() {
+        let owner = private_directory();
+        let runtime = OmarchyRuntime {
+            root: owner.path().to_path_buf(),
+            migration_state: owner.path().join("markers"),
+        };
+        let empty_fixture = || NativeMigrationFixture {
+            operations: Vec::new(),
+            failure: None,
+            desktop_database_program: "false",
+        };
+
+        let mut kmscon = Commands::new(false, runtime.clone());
+        kmscon.native_fixture = Some(empty_fixture());
+        kmscon.migration_overrides = Some(MigrationTestOverrides::default());
+        let _ = kmscon.resolve_optional_helper("sh");
+        kmscon
+            .run_native_migration(NativeMigration::Kmscon, None)
+            .await
+            .expect("kmscon migration runs native package install");
+        kmscon
+            .run_native_migration(NativeMigration::PodmanAndCrun, None)
+            .await
+            .expect("podman and crun migration runs native package install");
+        assert_eq!(
+            kmscon.native_fixture.as_ref().unwrap().operations,
+            vec![
+                NativeOmarchyOperation::InstallKmscon,
+                NativeOmarchyOperation::InstallPodmanAndCrun,
+            ]
+        );
+
+        let default_tools = owner.path().join("omarchy-mise-default-tools");
+        write_test_executable(&default_tools, "#!/bin/sh\nprintf 'node\\n'\n");
+        let mise_cleanup = owner.path().join("mise-cleanup");
+        write_test_executable(
+            &mise_cleanup,
+            "#!/bin/sh\nif [ \"$1\" = ls ]; then printf '[{\"version\":\"1.0\",\"source\":null}]'; fi\nexit 0\n",
+        );
+        let mut pi_cleanup = Commands::new(false, runtime.clone());
+        pi_cleanup.native_fixture = Some(empty_fixture());
+        pi_cleanup.migration_overrides = Some(MigrationTestOverrides {
+            helper_overrides: std::collections::BTreeMap::from([
+                ("omarchy-mise-default-tools", default_tools.clone()),
+                ("mise", mise_cleanup),
+            ]),
+            ..Default::default()
+        });
+        pi_cleanup
+            .run_native_migration(NativeMigration::PiCodingAgent, None)
+            .await
+            .expect("pi migration removes non-user-declared mise tool");
+        assert_eq!(
+            pi_cleanup.native_fixture.as_ref().unwrap().operations,
+            vec![NativeOmarchyOperation::InstallPiCodingAgent]
+        );
+
+        let mise_declared = owner.path().join("mise-declared");
+        write_test_executable(
+            &mise_declared,
+            "#!/bin/sh\nprintf '[{\"version\":\"1.0\",\"source\":{\"type\":\"mise.toml\"}}]'\n",
+        );
+        let mut pi_declared = Commands::new(false, runtime.clone());
+        pi_declared.native_fixture = Some(empty_fixture());
+        pi_declared.migration_overrides = Some(MigrationTestOverrides {
+            helper_overrides: std::collections::BTreeMap::from([
+                ("omarchy-mise-default-tools", default_tools.clone()),
+                ("mise", mise_declared),
+            ]),
+            ..Default::default()
+        });
+        pi_declared
+            .run_native_migration(NativeMigration::PiCodingAgent, None)
+            .await
+            .expect("pi migration keeps user-declared mise tool");
+
+        let mise_empty = owner.path().join("mise-empty");
+        write_test_executable(
+            &mise_empty,
+            "#!/bin/sh\nif [ \"$1\" = ls ]; then printf '[]'; fi\nexit 0\n",
+        );
+        let mut pi_empty = Commands::new(false, runtime.clone());
+        pi_empty.native_fixture = Some(empty_fixture());
+        pi_empty.migration_overrides = Some(MigrationTestOverrides {
+            helper_overrides: std::collections::BTreeMap::from([
+                ("omarchy-mise-default-tools", default_tools.clone()),
+                ("mise", mise_empty),
+            ]),
+            ..Default::default()
+        });
+        pi_empty
+            .run_native_migration(NativeMigration::PiCodingAgent, None)
+            .await
+            .expect("pi migration skips uninstall when mise list is empty");
+
+        let mise_fail = owner.path().join("mise-fail");
+        write_test_executable(&mise_fail, "#!/bin/sh\nexit 1\n");
+        let mut pi_mise_fail = Commands::new(false, runtime.clone());
+        pi_mise_fail.native_fixture = Some(empty_fixture());
+        pi_mise_fail.migration_overrides = Some(MigrationTestOverrides {
+            helper_overrides: std::collections::BTreeMap::from([
+                ("omarchy-mise-default-tools", default_tools.clone()),
+                ("mise", mise_fail),
+            ]),
+            ..Default::default()
+        });
+        pi_mise_fail
+            .run_native_migration(NativeMigration::PiCodingAgent, None)
+            .await
+            .expect("pi migration tolerates non-zero mise ls exit");
+
+        let mut pi_no_mise = Commands::new(false, runtime);
+        pi_no_mise.native_fixture = Some(empty_fixture());
+        pi_no_mise.migration_overrides = Some(MigrationTestOverrides {
+            helper_overrides: std::collections::BTreeMap::from([(
+                "omarchy-mise-default-tools",
+                default_tools,
+            )]),
+            absent_optional_helpers: std::collections::BTreeSet::from(["mise"]),
+            ..Default::default()
+        });
+        pi_no_mise
+            .run_native_migration(NativeMigration::PiCodingAgent, None)
+            .await
+            .expect("pi migration succeeds when mise is absent");
+    }
+
+    #[test]
+    fn published_surface_and_podman_migrations_resolve_to_native_equivalents() {
+        let owner = private_directory();
+        let migrations = owner.path().join("migrations");
+        let markers = owner.path().join("markers");
+        std::fs::create_dir(&migrations).expect("create migrations dir");
+        std::fs::write(
+            migrations.join("1794864665.sh"),
+            concat!(
+                "echo \"Install the Surface Laptop 7 15\\\"'s support package on installs made before it existed\"\n\n",
+                "# microsoft-surface-laptop-7-support reads the battery pack's cycle count from\n",
+                "# the Surface controller (surface-laptop-7-battery) and keeps the infrared\n",
+                "# camera out of camera pickers. Its timer checks for this laptop itself and\n",
+                "# starts at the next boot.\n",
+                "if ! omarchy-hw-aarch64-qualcomm || ! omarchy-hw-match-device-tree microsoft,romulus15; then\n",
+                "  exit 0\n",
+                "fi\n\n",
+                "omarchy-pkg-add microsoft-surface-laptop-7-support\n",
+            ),
+        )
+        .expect("write 1794864665.sh");
+        std::fs::write(
+            migrations.join("1795337583.sh"),
+            concat!(
+                "echo \"Install the Surface Laptop 7 13.8\\\"'s Wi-Fi and Bluetooth addresses, iptsd and camera relay\"\n\n",
+                "# See install/hardware/microsoft/surface-laptop-7.sh. Without the addresses\n",
+                "# Bluetooth has no controller, iptsd gives the touchpad its gestures and runs\n",
+                "# the touchscreen, and microsoft-surface-laptop-7-support relays the front\n",
+                "# camera to a webcam device. Packages already installed are skipped.\n",
+                "if ! omarchy-hw-aarch64-qualcomm || ! omarchy-hw-match-device-tree microsoft,romulus13; then\n",
+                "  exit 0\n",
+                "fi\n\n",
+                "omarchy-pkg-add microsoft-surface-snapdragon-addresses iptsd microsoft-surface-laptop-7-support\n",
+            ),
+        )
+        .expect("write 1795337583.sh");
+        std::fs::write(
+            migrations.join("1795284903.sh"),
+            r#"echo "Install the FaceTime HD camera driver on Intel Macs that have one"
+
+# Fresh installs get this from install/hardware/apple/fix-facetimehd.sh. Existing
+# Macs only pick it up on omarchy update via this migration.
+if omarchy-hw-facetimehd; then
+  source "$OMARCHY_PATH/install/hardware/apple/fix-facetimehd.sh"
+
+  # The module only loads at boot, so the camera stays missing until then.
+  (( ${#packages[@]} == 0 )) || omarchy-state set reboot-required
+
+  # The leaf only enables the fetch for the next boot; on a running system it can start now.
+  if pacman -Q facetimehd-firmware-fetcher &>/dev/null; then
+    sudo systemctl start --no-block facetimehd-firmware-fetcher.service
+  fi
+fi
+"#,
+        )
+        .expect("write 1795284903.sh");
+        std::fs::write(
+            migrations.join("1795318856.sh"),
+            r#"echo "Install Pi as a package instead of a mise tool"
+
+# The settings package drops Pi's mise declaration. Until it has, stay pending:
+# the declaration would only install Pi through mise again.
+if omarchy-mise-default-tools list | grep -qx pi; then
+  echo "Waiting for the omarchy-settings package that drops Pi from the default mise tools" >&2
+  exit 75
+fi
+
+omarchy-pkg-add pi-coding-agent
+
+# mise's shims come before /usr/bin on PATH, and the shim left by the dropped
+# declaration fails rather than falling through to the package. A Pi the user
+# declared in a mise config of their own is theirs and stays.
+if ! mise ls pi --json | jq -e 'any(.[]; .source)' >/dev/null; then
+  mise uninstall --all pi
+  mise reshim
+fi
+"#,
+        )
+        .expect("write 1795318856.sh");
+        std::fs::write(
+            migrations.join("1795354955.sh"),
+            r#"echo "Install kmscon, which setup after a factory reset is drawn in"
+
+omarchy-pkg-add kmscon
+"#,
+        )
+        .expect("write 1795354955.sh");
+        std::fs::write(
+            migrations.join("1795354646.sh"),
+            concat!(
+                "echo \"Install Podman and crun, which run local models, on machines installed before they were base packages\"\n\n",
+                "omarchy-pkg-add podman crun\n",
+            ),
+        )
+        .expect("write 1795354646.sh");
+
+        let pending =
+            pending_migrations(&migrations, &markers).expect("resolve published migrations");
+        assert_eq!(pending.len(), 6);
+        assert_eq!(
+            pending[0].native,
+            Some(NativeMigration::SkipQualcommHardware)
+        );
+        assert_eq!(pending[1].native, Some(NativeMigration::FacetimeHdCamera));
+        assert_eq!(pending[2].native, Some(NativeMigration::PiCodingAgent));
+        assert_eq!(
+            pending[3].native,
+            Some(NativeMigration::SkipQualcommHardware)
+        );
+        assert_eq!(pending[4].native, Some(NativeMigration::PodmanAndCrun));
+        assert_eq!(pending[5].native, Some(NativeMigration::Kmscon));
+    }
+}
