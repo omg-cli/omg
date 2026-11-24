@@ -5958,6 +5958,7 @@ mod tests {
                 assert_eq!(ffi, expected, "libalpm path diverged on fixture");
                 assert_eq!(public, expected, "public count routing diverged on fixture");
                 assert_eq!(fast, ffi, "fast path and libalpm path must agree");
+                assert_eq!(get_explicit_count().unwrap(), expected.1);
             },
         );
     }

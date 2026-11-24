@@ -316,8 +316,10 @@ fn test_docker_nonexistent_package() {
     );
     assert!(success, "Native info fixture failed: {stdout}\n{stderr}");
     assert!(
-        stdout.contains("INFO_FIXTURE_PASS missing=1 untrusted_tls=1 native_state_unchanged=1"),
-        "Both real CLI lookup outcomes and unchanged native state must be proven: {stdout}"
+        stdout.contains(
+            "INFO_FIXTURE_PASS missing=1 untrusted_tls=1 short_exact=1 native_state_unchanged=1"
+        ),
+        "All real CLI lookup outcomes and unchanged native state must be proven: {stdout}"
     );
 }
 

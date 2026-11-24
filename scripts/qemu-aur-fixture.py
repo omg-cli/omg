@@ -57,12 +57,13 @@ class FixtureServer(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
     daemon_threads = True
 
-    def __init__(self, address, cert, key, log, *, query=QUERY, response=RESPONSE):
+    def __init__(self, address, cert, key, log, *, query=QUERY, response=RESPONSE, rpc_type="search"):
         self.context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         self.context.load_cert_chain(cert, key)
         self.log_path = Path(log)
         self.log_lock = threading.Lock()
-        self.query = query
+        arg = "arg[]" if rpc_type == "info" else "arg"
+        self.rpc_query = {"v": ["5"], "type": [rpc_type], arg: [query]}
         self.response = response
         super().__init__(address, FixtureHandler)
 
@@ -92,7 +93,7 @@ class FixtureHandler(socketserver.BaseRequestHandler):
                     return
                 parsed = urlsplit(parts[1])
                 query = parse_qs(parsed.query)
-                if parsed.path != "/rpc" or query != {"v": ["5"], "type": ["search"], "arg": [self.server.query]}:
+                if parsed.path != "/rpc" or query != self.server.rpc_query:
                     self.server.record("rejected-request", parts[1])
                     tls.sendall(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
                     return

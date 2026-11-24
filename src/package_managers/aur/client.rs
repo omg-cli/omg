@@ -51,7 +51,7 @@ use crate::package_managers::pacman_db;
 use crate::runtimes::common::MAX_DECOMPRESSED_BYTES;
 
 use crate::core::security::artifact::ArchiveSnapshot;
-const AUR_RPC_URL: &str = "https://aur.archlinux.org/rpc";
+pub(crate) const AUR_RPC_URL: &str = "https://aur.archlinux.org/rpc";
 // makepkg records BUILDDIR in .BUILDINFO; physical invocation storage stays private.
 const SANDBOX_BUILD_ROOT: &str = "/omg-build";
 
@@ -4756,11 +4756,10 @@ pub async fn search_detailed(query: &str) -> Result<Vec<AurPackageDetail>> {
     Ok(results)
 }
 
-pub(crate) async fn info_detailed(package: &str) -> Result<Option<AurPackageDetail>> {
-    info_detailed_at(AUR_RPC_URL, package).await
-}
-
-async fn info_detailed_at(endpoint: &str, package: &str) -> Result<Option<AurPackageDetail>> {
+pub(crate) async fn info_detailed_at(
+    endpoint: &str,
+    package: &str,
+) -> Result<Option<AurPackageDetail>> {
     crate::core::security::validate_package_name(package)?;
     let url = format!(
         "{endpoint}?v=5&type=info&arg[]={}",

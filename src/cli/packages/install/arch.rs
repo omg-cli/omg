@@ -246,31 +246,34 @@ pub async fn install_dry_run(packages: &[String]) -> Result<()> {
             continue;
         }
 
-        if let Some(info) = lookup_official_package(pkg_name).await? {
-            let download_size = info.download_size.unwrap_or(0);
-            let size_mb = download_size as f64 / 1024.0 / 1024.0;
-            total_size += download_size;
-            table.add_row(vec![
-                style::emphasis(&info.name),
-                style::accent(&info.version.to_string()),
-                format!("{size_mb:.2} MB"),
-                format!("{} Official", style::positive("✓")),
-            ]);
-            continue;
-        }
+        match lookup_official_package(pkg_name).await {
+            Ok(Some(info)) => {
+                let size_mb = info.download_size.unwrap_or(0) as f64 / 1024.0 / 1024.0;
+                total_size += info.download_size.unwrap_or(0);
 
-        if !permits_live_lookup(crate::package_managers::resolve_backend()?) {
-            anyhow::bail!("Package '{pkg_name}' was not found");
+                table.add_row(vec![
+                    style::emphasis(&info.name),
+                    style::accent(&info.version.to_string()),
+                    format!("{size_mb:.2} MB"),
+                    format!("{} Official", style::positive("✓")),
+                ]);
+            }
+            Ok(None) => {
+                if !permits_live_lookup(crate::package_managers::resolve_backend()?) {
+                    anyhow::bail!("Package '{pkg_name}' was not found");
+                }
+                let (info, _) = resolve_aur_package(pkg_name)
+                    .await
+                    .with_context(|| format!("Package '{pkg_name}' was not found"))?;
+                table.add_row(vec![
+                    style::emphasis(&info.name),
+                    style::community(&info.version.to_string()),
+                    String::new(),
+                    format!("{} AUR", style::positive("✓")),
+                ]);
+            }
+            Err(error) => return Err(error),
         }
-        let (info, _) = resolve_aur_package(pkg_name)
-            .await
-            .with_context(|| format!("Package '{pkg_name}' was not found"))?;
-        table.add_row(vec![
-            style::emphasis(&info.name),
-            style::community(&info.version.to_string()),
-            String::new(),
-            format!("{} AUR", style::positive("✓")),
-        ]);
     }
 
     println!("{table}");

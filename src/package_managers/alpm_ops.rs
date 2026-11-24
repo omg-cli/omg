@@ -3495,6 +3495,11 @@ mod tests {
                         error.downcast_ref::<crate::core::security::PolicyError>(),
                         Some(crate::core::security::PolicyError::Banned { name }) if name == &packages[0]
                     ), "{error:#}");
+                    std::fs::remove_file(fixture.database().join("sync/fixture.db"))?;
+                    let error = crate::cli::packages::install(&packages, true, true, false)
+                        .await
+                        .expect_err("a missing install database must stop the preview");
+                    assert!(format!("{error:#}").contains("Repository 'fixture' is unavailable"));
                     Ok::<(), anyhow::Error>(())
                 })?;
                 assert_eq!(

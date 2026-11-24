@@ -189,6 +189,41 @@ mod tests {
     use super::*;
 
     #[test]
+    fn one_advisory_applies_once_to_each_matching_installed_identity() -> Result<()> {
+        let package = SecurityPackage {
+            origin: SecurityOrigin::ArchRepository {
+                repository: "core".into(),
+            },
+            name: "fixture".into(),
+            version: "1-1".into(),
+            advisory_source: None,
+            architecture: Some("x86_64".into()),
+            description: String::new(),
+            licenses: Vec::new(),
+        };
+        let mut second = package.clone();
+        second.architecture = Some("aarch64".into());
+        let advisory = serde_json::from_str(
+            r#"{"name":"AVG-fixture","packages":["fixture","fixture"],"status":"Vulnerable","severity":"High","affected":"1-1","fixed":"2-1","issues":["CVE-fixture"]}"#,
+        )?;
+        let source = AdvisoryProvenance::ArchSnapshot {
+            payload_sha256: "01".repeat(32),
+            fetched_at: jiff::Timestamp::UNIX_EPOCH,
+            checked_at: jiff::Timestamp::UNIX_EPOCH,
+        };
+        let assessments = assess_packages(&[package, second], &[advisory], Some(&source))?;
+        assert_eq!(assessments.len(), 2);
+        for assessment in assessments {
+            assert_eq!(assessment.findings.len(), 1);
+            assert_eq!(
+                assessment.findings[0].applicability,
+                FindingApplicability::Applicable
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn coverage17_unknown_installed_origin_is_reported_even_without_matches() {
         let package = SecurityPackage {
             origin: SecurityOrigin::Unknown,

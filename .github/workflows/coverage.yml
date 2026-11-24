@@ -490,6 +490,8 @@ jobs:
                   return 1
                 fi
                 if [[ "$test_name" == config::settings::tests::hardened_aur_settings_refuse_incompatible_build_options ||
+                      "$test_name" == cli::packages::info::tests::native_text_info_looks_up_one_character_aur_names ||
+                      "$test_name" == package_managers::alpm_ops::tests::native_install_and_preview_resolve_locally_with_daemon_available ||
                       "$test_name" == cli::packages::update::omarchy::tests::media_launcher_cleanup_reports_a_matching_launcher_it_cannot_remove ||
                       "$test_name" == runtimes::npm::admission_tests::banned_transitive_dependency_stops_npm_before_materialization ||
                       "$test_name" == runtimes::npm::admission_tests::retained_npm_admission_refuses_policy_changes_before_publication ||
@@ -506,6 +508,8 @@ jobs:
               }
               cases=(
                 package_managers::alpm_direct::tests::native_inventory_and_search_match_pacman
+                package_managers::alpm_ops::tests::native_install_and_preview_resolve_locally_with_daemon_available
+                cli::packages::info::tests::native_text_info_looks_up_one_character_aur_names
                 package_managers::aur::client::tests::cancelling_logged_sandbox_build_terminates_descendants
                 package_managers::aur::client::tests::sandbox_launcher_isolates_host_ipc_namespace
                 cli::self_update::tests::elevated_verifier_rejects_another_users_helper

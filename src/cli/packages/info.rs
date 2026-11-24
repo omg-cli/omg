@@ -15,7 +15,7 @@ use crate::package_managers::VersionDisplay;
 use crate::package_managers::get_package_manager;
 
 #[cfg(feature = "arch")]
-use crate::package_managers::aur::info_detailed;
+use crate::package_managers::aur::{AUR_RPC_URL, info_detailed_at};
 
 const DAEMON_INFO_TIMEOUT: Duration = Duration::from_secs(3);
 #[cfg(feature = "arch")]
@@ -183,7 +183,12 @@ pub async fn info_with_json(package: &str, json: bool) -> Result<()> {
         return info_json(package).await;
     }
 
-    info_fallback(package).await
+    info_fallback(
+        package,
+        #[cfg(feature = "arch")]
+        AUR_RPC_URL,
+    )
+    .await
 }
 
 async fn info_json(package: &str) -> Result<()> {
@@ -292,7 +297,7 @@ async fn info_json(package: &str) -> Result<()> {
     anyhow::bail!("Package '{package}' not found")
 }
 
-async fn info_fallback(package: &str) -> Result<()> {
+async fn info_fallback(package: &str, #[cfg(feature = "arch")] aur_rpc: &str) -> Result<()> {
     if crate::package_managers::resolve_backend()? == crate::package_managers::Backend::Mock {
         let pm = get_package_manager()?;
         let info = manager_info(pm.as_ref(), package)
@@ -337,7 +342,8 @@ async fn info_fallback(package: &str) -> Result<()> {
     #[cfg(feature = "arch")]
     {
         let pb = style::spinner("Looking up package on the AUR...");
-        let lookup = tokio::time::timeout(AUR_INFO_TIMEOUT, info_detailed(package)).await;
+        let lookup =
+            tokio::time::timeout(AUR_INFO_TIMEOUT, info_detailed_at(aur_rpc, package)).await;
         pb.finish_and_clear();
 
         let details = lookup
@@ -441,6 +447,82 @@ mod tests {
     use super::info_with_json;
     #[cfg(unix)]
     use crate::daemon::protocol::{DetailedPackageInfo, WirePackageSource};
+
+    #[cfg(feature = "arch")]
+    #[test]
+    #[ignore = "requires a native Arch backend and a private package catalog"]
+    fn native_text_info_looks_up_one_character_aur_names() -> anyhow::Result<()> {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        const NAME: &str =
+            "cli::packages::info::tests::native_text_info_looks_up_one_character_aur_names";
+        if crate::core::testing::run_isolated_test(NAME)
+            || crate::config::Settings::rerun_test_unprivileged(NAME)
+        {
+            return Ok(());
+        }
+        assert_eq!(
+            crate::package_managers::resolve_backend()?,
+            crate::package_managers::Backend::Arch
+        );
+        let catalog = tempfile::tempdir()?;
+        let root = catalog.path().join("root");
+        let db = catalog.path().join("db");
+        let conf = catalog.path().join("pacman.conf");
+        std::fs::create_dir(&root)?;
+        std::fs::create_dir_all(db.join("local"))?;
+        std::fs::create_dir(db.join("sync"))?;
+        std::fs::write(db.join("local/ALPM_DB_VERSION"), "9\n")?;
+        std::fs::write(
+            &conf,
+            format!(
+                "[options]\nRootDir = {}\nDBPath = {}\n",
+                root.display(),
+                db.display()
+            ),
+        )?;
+        temp_env::with_vars(
+            [
+                ("OMG_PACMAN_CONF", Some(conf.as_os_str())),
+                ("OMG_CONFIG_DIR", Some(catalog.path().as_os_str())),
+                ("OMG_DISABLE_DAEMON", Some(std::ffi::OsStr::new("1"))),
+            ],
+            || {
+                tokio::runtime::Builder::new_current_thread().enable_all().build()?.block_on(async {
+                for (body, error) in [
+                    (Some(r#"{"type":"multiinfo","results":[{"Name":"x","Version":"2-1","Description":"Fixture","Maintainer":"fixture","NumVotes":1,"Popularity":0.1,"OutOfDate":null,"FirstSubmitted":1,"LastModified":2}]}"#), None),
+                    (Some(r#"{"type":"multiinfo","results":[]}"#), Some("not found")),
+                    (Some(r#"{"type":"error","error":"fixture error"}"#), Some("Failed to look up x on the AUR")),
+                    (None, Some("Timed out looking up x on the AUR")),
+                ] {
+                    let server = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+                    let endpoint = format!("http://{}/rpc", server.local_addr()?);
+                    let reply = tokio::spawn(async move {
+                        let (mut stream, _) = server.accept().await?;
+                        let mut request = String::new();
+                        BufReader::new(&mut stream).read_line(&mut request).await?;
+                        assert_eq!(request.trim_end(), "GET /rpc?v=5&type=info&arg[]=x HTTP/1.1");
+                        if let Some(body) = body {
+                            let reply = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                            stream.write_all(reply.as_bytes()).await?;
+                        } else {
+                            tokio::time::sleep(super::AUR_INFO_TIMEOUT + std::time::Duration::from_millis(100)).await;
+                        }
+                        anyhow::Ok(())
+                    });
+                    let result = super::info_fallback("x", &endpoint).await;
+                    tokio::time::timeout(std::time::Duration::from_secs(2), reply).await???;
+                    if let Some(error) = error {
+                        assert!(result.expect_err("AUR lookup should fail").to_string().contains(error));
+                    } else {
+                        result?;
+                    }
+                }
+                Ok(())
+            })
+            },
+        )
+    }
 
     #[cfg(unix)]
     #[test]

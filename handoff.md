@@ -20,13 +20,13 @@ The runtime integration suite covers the 68-entry inventory, aliases, unreadable
 
 ## Verification
 
-The batch passed 630 native Arch WSL unit and fixture tests plus 105 unprivileged Ubuntu WSL CLI tests. The native test executable was built in Ubuntu WSL and linked against Arch's system libalpm at execution. Fourteen other ignored tests still require their dedicated fixtures or benchmarks. `cargo fmt --all --check` passed. The staged Rust code passed this Clippy command with warnings treated as errors.
+The batch passed 633 native Arch WSL unit and fixture tests plus 105 unprivileged Ubuntu WSL CLI tests. The native test executable was built in Ubuntu WSL and linked against Arch's system libalpm at execution. The exact AUR HTTPS fixture verified one-character lookup, absent package handling, and rejection of an untrusted certificate without changing installed packages. Fourteen other ignored tests still require their dedicated fixtures or benchmarks. `cargo fmt --all --check` passed. The staged Rust code passed this Clippy command with warnings treated as errors.
 
 ```sh
 cargo clippy --locked --no-default-features --features arch,pgp,license \
-  --lib --test e2e_runtime_management --test install_update_comprehensive -- -D warnings
+  --lib --test e2e_runtime_management --test install_update_comprehensive --test docker_e2e -- -D warnings
 ```
 
 ## Working branch
 
-The Rust CLI and package manager batch is in PR #1098. The Windows checkout holds separate advisory service edits. Local logs and timing samples are under `.git/nov24-cli-audit/`, including `routing-staged-native-receipt.json` and `routing-staged-cli-receipt.json`. [PR #1098](https://github.com/omg-cli/omg/pull/1098)
+The Rust CLI and package manager batch is in PR #1098. The Windows checkout holds separate advisory service edits. Local logs and timing samples are under `.git/nov24-cli-audit/`, including `pr1098-native-info-receipt.json` and `pr1098-native-https.log`. [PR #1098](https://github.com/omg-cli/omg/pull/1098)
