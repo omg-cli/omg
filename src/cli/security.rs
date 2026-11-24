@@ -693,38 +693,35 @@ pub fn scan_secrets(path: Option<String>, _ctx: &CliContext) -> Result<()> {
         })
     );
 
+    let format_summary = |tone: ui::BadgeTone, label: &str, count: usize| -> String {
+        if style::colors_enabled() {
+            format!("  {} {}", ui::render_badge(tone, label), count)
+        } else {
+            format!("  ● {count} {label}")
+        }
+    };
     if result.critical_count > 0 {
         println!(
-            "  {} {}",
-            ui::render_badge(ui::BadgeTone::Critical, "CRITICAL"),
-            ui::Style::new()
-                .foreground(ui::Color::Red)
-                .bold(true)
-                .render(result.critical_count)
+            "{}",
+            format_summary(ui::BadgeTone::Critical, "CRITICAL", result.critical_count)
         );
     }
     if result.high_count > 0 {
         println!(
-            "  {} {}",
-            ui::render_badge(ui::BadgeTone::Warning, "HIGH"),
-            ui::Style::new()
-                .foreground(ui::Color::Yellow)
-                .bold(true)
-                .render(result.high_count)
+            "{}",
+            format_summary(ui::BadgeTone::Warning, "HIGH", result.high_count)
         );
     }
     if result.medium_count > 0 {
         println!(
-            "  {} {}",
-            ui::render_badge(ui::BadgeTone::Info, "MEDIUM"),
-            result.medium_count
+            "{}",
+            format_summary(ui::BadgeTone::Info, "MEDIUM", result.medium_count)
         );
     }
     if result.low_count > 0 {
         println!(
-            "  {} {}",
-            ui::render_badge(ui::BadgeTone::Neutral, "LOW"),
-            result.low_count
+            "{}",
+            format_summary(ui::BadgeTone::Neutral, "LOW", result.low_count)
         );
     }
 
