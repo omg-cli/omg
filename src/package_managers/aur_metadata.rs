@@ -361,14 +361,16 @@ fn read_metadata_archive(file: File) -> Result<Vec<AurJsonPackage>> {
     serde_json::from_reader(decoder).map_err(Into::into)
 }
 
-pub fn metadata_path() -> PathBuf {
+#[cfg(test)]
+pub(crate) fn metadata_path() -> PathBuf {
     paths::cache_dir()
         .join("aur")
         .join("_meta")
         .join("packages-meta-ext-v1.json.gz")
 }
 
-pub fn index_path() -> PathBuf {
+#[cfg(test)]
+pub(crate) fn index_path() -> PathBuf {
     paths::cache_dir()
         .join("aur")
         .join("_meta")
@@ -412,7 +414,36 @@ fn publish_generation(root: &Path, bytes: &[u8], validators: AurMetaCache) -> Re
         validators,
     };
     commit_manifest(root, &manifest).context("Failed to publish AUR metadata generation")?;
+    prune_superseded_generations(root, &manifest.generation);
     Ok(())
+}
+
+fn prune_superseded_generations(root: &Path, active_generation: &str) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else {
+            continue;
+        };
+        if !name.starts_with("gen-") || name == active_generation {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if meta.file_type().is_dir()
+            && let Err(error) = std::fs::remove_dir_all(&path)
+        {
+            tracing::debug!(
+                path = %path.display(),
+                %error,
+                "Failed to prune superseded AUR metadata generation"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -598,7 +629,7 @@ mod tests {
             manifest_before
         );
         let (_, index) = current_generation(root).unwrap().unwrap();
-        assert!(index.get("cached").unwrap().is_some());
+        assert!(index.get("cached").is_some());
     }
 
     #[tokio::test]
@@ -628,7 +659,7 @@ mod tests {
         let (published_archive, _) = generation_paths(root, &manifest).unwrap();
         assert_eq!(std::fs::read(published_archive).unwrap(), archive);
         assert_eq!(std::fs::read(legacy).unwrap(), archive);
-        assert!(index.get("legacy").unwrap().is_some());
+        assert!(index.get("legacy").is_some());
         assert!(manifest.validators.etag.is_none());
         assert!(manifest.validators.last_modified.is_none());
     }
@@ -669,10 +700,10 @@ mod tests {
         assert_eq!(manifest.validators.last_modified.as_deref(), Some(modified));
         let (published_archive, _) = generation_paths(root, &manifest).unwrap();
         assert_eq!(std::fs::read(&published_archive).unwrap(), archive);
-        assert!(index.get("new").unwrap().is_some());
-        assert!(index.get("old").unwrap().is_none());
-        assert!(snapshot.get("old").unwrap().is_some());
-        assert!(snapshot.get("new").unwrap().is_none());
+        assert!(index.get("new").is_some());
+        assert!(index.get("old").is_none());
+        assert!(snapshot.get("old").is_some());
+        assert!(snapshot.get("new").is_none());
     }
 
     #[tokio::test]
@@ -730,7 +761,6 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .get("cached")
-                .unwrap()
                 .is_some()
         );
     }
@@ -790,8 +820,8 @@ mod tests {
             assert!(!request.contains("\r\nif-none-match:"), "{damage:?}");
             assert!(!request.contains("\r\nif-modified-since:"), "{damage:?}");
             let (manifest, index) = current_generation(root).unwrap().unwrap();
-            assert!(index.get("recovered").unwrap().is_some(), "{damage:?}");
-            assert!(index.get("old").unwrap().is_none(), "{damage:?}");
+            assert!(index.get("recovered").is_some(), "{damage:?}");
+            assert!(index.get("old").is_none(), "{damage:?}");
             assert_eq!(
                 std::fs::read(generation_paths(root, &manifest).unwrap().0).unwrap(),
                 recovered,
@@ -869,7 +899,7 @@ mod tests {
         );
         let (manifest, index) = current_generation(root).unwrap().unwrap();
         assert_eq!(manifest.validators.etag.as_deref(), Some("\"cached-etag\""));
-        assert!(index.get("cached").unwrap().is_some());
+        assert!(index.get("cached").is_some());
     }
 
     #[test]
@@ -914,13 +944,7 @@ mod tests {
             read_metadata_archive(File::open(&archive).unwrap()).unwrap()[0].name,
             "package-b"
         );
-        assert!(
-            AurIndex::open(&index)
-                .unwrap()
-                .get("package-a")
-                .unwrap()
-                .is_some()
-        );
+        assert!(AurIndex::open(&index).unwrap().get("package-a").is_some());
         assert!(
             open_fresh_metadata_index_at(&location, Duration::from_mins(1))
                 .unwrap()
@@ -967,12 +991,12 @@ mod tests {
         assert_eq!(manifest.validators.etag.as_deref(), Some("etag"));
         commit_manifest(root, &manifest).unwrap();
         publish_generation(root, &catalogue("new"), AurMetaCache::default()).unwrap();
-        assert!(snapshot.get("old").unwrap().is_some());
+        assert!(snapshot.get("old").is_some());
         let current = open_fresh_metadata_index_at(&location, Duration::from_mins(1))
             .unwrap()
             .unwrap();
-        assert!(current.get("new").unwrap().is_some());
-        assert!(current.get("old").unwrap().is_none());
+        assert!(current.get("new").is_some());
+        assert!(current.get("old").is_none());
     }
 
     #[test]
@@ -1153,7 +1177,6 @@ mod tests {
         assert_eq!(
             published_index
                 .search("", 2)
-                .unwrap()
                 .iter()
                 .map(|entry| (entry.name.as_str(), entry.version.as_str()))
                 .collect::<Vec<_>>(),
@@ -1176,7 +1199,7 @@ mod tests {
                 "published metadata files must remain private"
             );
         }
-        let entry = published_index.get("aur-helper").unwrap().unwrap();
+        let entry = published_index.get("aur-helper").unwrap();
         assert!(entry.maintainer.is_none());
         assert!(entry.last_modified.is_none());
         assert!(entry.description.is_none());
@@ -1302,7 +1325,7 @@ mod tests {
                         tokio::time::timeout(Duration::from_secs(5), finished_rx).await???;
                         let (manifest, index) =
                             current_generation(&root)?.context("worker generation")?;
-                        assert!(index.get("worker-generation")?.is_some());
+                        assert!(index.get("worker-generation").is_some());
                         assert_eq!(
                             std::fs::read(generation_paths(&root, &manifest)?.0)?,
                             catalogue("worker-generation")

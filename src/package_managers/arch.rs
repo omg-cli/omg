@@ -485,15 +485,15 @@ impl PackageManager for ArchPackageManager {
                     operation.assessments().to_vec(),
                 );
                 let mut after = self.security_inventory().await?;
-                let identity = |package: &super::types::SecurityPackage| {
-                    (
-                        package.name.clone(),
-                        package.version.clone(),
-                        package.architecture.clone(),
-                    )
-                };
-                before.sort_by_key(identity);
-                after.sort_by_key(identity);
+                let cmp_identity =
+                    |a: &super::types::SecurityPackage, b: &super::types::SecurityPackage| {
+                        a.name
+                            .cmp(&b.name)
+                            .then_with(|| a.version.cmp(&b.version))
+                            .then_with(|| a.architecture.cmp(&b.architecture))
+                    };
+                before.sort_by(cmp_identity);
+                after.sort_by(cmp_identity);
                 anyhow::ensure!(
                     before == after,
                     "Installed packages changed during native security audit"
@@ -758,7 +758,9 @@ impl PackageManager for ArchPackageManager {
 }
 
 pub async fn list_orphans() -> AnyhowResult<Vec<String>> {
-    crate::package_managers::list_orphans_direct()
+    tokio::task::spawn_blocking(crate::package_managers::list_orphans_direct)
+        .await
+        .map_err(|error| anyhow::anyhow!("Orphan package lookup task failed: {error}"))?
 }
 
 fn orphan_history_change(

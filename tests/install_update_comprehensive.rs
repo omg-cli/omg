@@ -133,7 +133,15 @@ fn run_omg_with_env(args: &[&str], env_vars: &[(&str, &str)]) -> TestResult {
 }
 
 fn run_in_project(project: &common::TestProject, args: &[&str]) -> TestResult {
-    let result = project.run_with_env(args, &[("NO_COLOR", "1")]);
+    run_in_project_with_env(project, args, &[("NO_COLOR", "1")])
+}
+
+fn run_in_project_with_env(
+    project: &common::TestProject,
+    args: &[&str],
+    env: &[(&str, &str)],
+) -> TestResult {
+    let result = project.run_with_env(args, env);
     TestResult {
         success: result.success,
         stdout: result.stdout,
@@ -806,10 +814,16 @@ mod e2e_workflow_tests {
         for directory in ["var/lib/pacman/local", "var/lib/pacman/sync"] {
             std::fs::create_dir_all(project.pacman_root.path().join(directory)).unwrap();
         }
+        let pacman_conf = project.config_dir.path().join("pacman.conf");
+        std::fs::write(
+            &pacman_conf,
+            "[options]\nSigLevel = Required DatabaseOptional\n",
+        )
+        .unwrap();
         let archive = project.path().join("decoy-1.0-1-x86_64.pkg.tar.gz");
         write_preview_package(&archive);
         assert_no_installed_packages(&project);
-        let result = run_in_project(
+        let result = run_in_project_with_env(
             &project,
             &[
                 "install",
@@ -818,6 +832,10 @@ mod e2e_workflow_tests {
                 "firefox",
                 archive.to_str().unwrap(),
                 "git",
+            ],
+            &[
+                ("NO_COLOR", "1"),
+                ("OMG_PACMAN_CONF", pacman_conf.to_str().unwrap()),
             ],
         );
         assert_preview_rows(

@@ -1155,7 +1155,7 @@ mod tests {
                 )
                 .expect("read published AUR metadata")
                 .expect("fresh local metadata");
-                assert!(index.get("aur-fixture")?.is_some());
+                assert!(index.get("aur-fixture").is_some());
                 let mut before = std::fs::read_dir(cache.join("aur"))?
                     .map(|entry| entry.map(|entry| entry.file_name()))
                     .collect::<std::io::Result<Vec<_>>>()?;

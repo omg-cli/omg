@@ -4,13 +4,10 @@ use std::thread;
 use anyhow::{Context, Result};
 use tokio::sync::oneshot;
 
-use super::alpm_ops::{
-    collect_updates, configure_package_filters, configure_signature_policy, open_default_alpm,
-    register_configured_syncdbs,
-};
+use super::alpm_direct::create_alpm_handle;
+use super::alpm_ops::collect_updates;
 use super::pacman_db::AlpmCatalogEpoch;
 use super::types::UpdateInfo;
-use crate::core::paths;
 
 struct LoadedAlpm {
     handle: alpm::Alpm,
@@ -33,19 +30,9 @@ fn request_channel() -> (
     tokio::sync::mpsc::channel(ALPM_REQUEST_QUEUE_CAPACITY)
 }
 
-fn initialize_alpm_worker() -> Result<alpm::Alpm> {
-    let mut alpm = open_default_alpm().context("Failed to initialize ALPM worker")?;
-    let config = crate::core::pacman_conf::PacmanConfig::parse(paths::pacman_conf_path())
-        .context("Failed to load pacman.conf for ALPM worker")?;
-    configure_signature_policy(&mut alpm, &config)?;
-    register_configured_syncdbs(&alpm, &config)?;
-    configure_package_filters(&mut alpm, &config)?;
-    Ok(alpm)
-}
-
 fn load_alpm_worker() -> Result<LoadedAlpm> {
     let (handle, epoch) =
-        AlpmCatalogEpoch::load_stable(AlpmCatalogEpoch::observe, initialize_alpm_worker)
+        AlpmCatalogEpoch::load_stable(AlpmCatalogEpoch::observe, create_alpm_handle)
             .context("Failed to load a stable ALPM worker snapshot")?;
     Ok(LoadedAlpm { handle, epoch })
 }

@@ -568,9 +568,18 @@ fn commit_staged_files(
     }
 
     // Make the complete new set durable while rollback copies still exist.
-    // If a directory sync fails, restore every previous database before the
-    // staging directory (which owns the backups) is dropped.
+    // Deduplicate parent directories so we fsync each directory once instead of
+    // once per published file. If a directory sync fails, restore every previous
+    // database before the staging directory (which owns the backups) is dropped.
+    let mut synced_dirs = std::collections::HashSet::with_capacity(2);
     for index in 0..publications.len() {
+        let parent = publications[index]
+            .destination
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."));
+        if !synced_dirs.insert(parent.to_path_buf()) {
+            continue;
+        }
         if let Err(error) =
             crate::core::safe_ops::sync_parent_directory_sync(&publications[index].destination)
         {

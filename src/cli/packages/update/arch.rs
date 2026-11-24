@@ -307,12 +307,9 @@ async fn update_packages(
         // Do not animate here. `pm.sync()` elevates and the child owns the
         // per-repository lanes; a parent spinner hides the sudo prompt and
         // reprints itself as a second "Syncing package databases" bar.
+        // `pm.sync()` already refreshes the daemon index after writing.
         println!();
         pm.sync().await?;
-        // The daemon serves its frozen pre-sync snapshot until told
-        // otherwise; refresh it before probing so the update list
-        // below reflects the sync that just finished.
-        crate::cli::packages::common::refresh_daemon_index_after_sync().await?;
     }
 
     let mut all_updates: Vec<UpdateInfo> = Vec::with_capacity(32);
@@ -488,19 +485,13 @@ async fn update_packages(
         if official_count > 0 {
             if needs_deferred_sync {
                 // Databases were refreshed before the prompt (or skipped via
-                // `--no-sync`). The child only commits the upgrade. `fullupdate`
-                // would download every repository again.
+                // `--no-sync`). Avoid starting a parent spinner while `pm.update()`
+                // elevates so the sudo prompt stays visible.
                 println!(
                     "  {} Upgrading {official_count} official packages...",
                     style::community("→")
                 );
-                crate::package_managers::arch::run_privileged_operation(
-                    "update",
-                    &[],
-                    &[],
-                    || async { Ok(()) },
-                )
-                .await?;
+                pm.update().await?;
             } else {
                 let pb = modern_ui::modern_spinner(
                     "Upgrading",

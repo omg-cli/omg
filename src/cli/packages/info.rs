@@ -15,7 +15,7 @@ use crate::package_managers::VersionDisplay;
 use crate::package_managers::get_package_manager;
 
 #[cfg(feature = "arch")]
-use crate::package_managers::search_detailed;
+use crate::package_managers::aur::info_detailed;
 
 const DAEMON_INFO_TIMEOUT: Duration = Duration::from_secs(3);
 #[cfg(feature = "arch")]
@@ -336,22 +336,14 @@ async fn info_fallback(package: &str) -> Result<()> {
     // Try AUR directly as final fallback (Arch only)
     #[cfg(feature = "arch")]
     {
-        let pb = style::spinner("Searching AUR...");
-        let details: Vec<crate::package_managers::AurPackageDetail> =
-            match tokio::time::timeout(AUR_INFO_TIMEOUT, search_detailed(package)).await {
-                Ok(Ok(results)) => results,
-                Ok(Err(err)) => {
-                    pb.finish_and_clear();
-                    return Err(err).context(format!("Failed to look up {package} on the AUR"));
-                }
-                Err(_) => {
-                    pb.finish_and_clear();
-                    anyhow::bail!("Timed out looking up {package} on the AUR");
-                }
-            };
+        let pb = style::spinner("Looking up package on the AUR...");
+        let lookup = tokio::time::timeout(AUR_INFO_TIMEOUT, info_detailed(package)).await;
         pb.finish_and_clear();
 
-        let Some(pkg) = details.into_iter().find(|p| p.name == package) else {
+        let details = lookup
+            .with_context(|| format!("Timed out looking up {package} on the AUR"))?
+            .with_context(|| format!("Failed to look up {package} on the AUR"))?;
+        let Some(pkg) = details else {
             anyhow::bail!("Package '{package}' not found. Try: omg search {package}");
         };
 

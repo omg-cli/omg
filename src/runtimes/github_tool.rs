@@ -727,8 +727,11 @@ impl GenericToolManager {
     }
 }
 
-// Generate common manager methods (list_installed, current_version)
-super::common::impl_runtime_common!(GenericToolManager);
+impl GenericToolManager {
+    pub fn list_installed(&self) -> Result<Vec<String>> {
+        super::common::list_installed_versions(&self.versions_dir)
+    }
+}
 
 /// Ensure a staged binary is executable (ZIP archives may drop modes).
 #[cfg(unix)]

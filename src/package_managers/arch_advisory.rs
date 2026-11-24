@@ -2,7 +2,7 @@
 //! introduced-version boundary; installed packages remain candidates until
 //! the published fix is installed (the arch-audit comparison model).
 use anyhow::{Context, Result, ensure};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use super::types::{SecurityOrigin, SecurityPackage, parse_version};
 
@@ -33,11 +33,16 @@ pub(crate) fn assess_packages(
         provenance.is_none_or(|source| matches!(source, AdvisoryProvenance::ArchSnapshot { .. })),
         "Arch advisory applicability requires Arch snapshot provenance"
     );
-    for package in installed {
+    let mut parsed_versions = Vec::with_capacity(installed.len());
+    let mut assessments_by_name: HashMap<&str, Vec<usize>> =
+        HashMap::with_capacity(installed.len());
+    for (idx, package) in installed.iter().enumerate() {
         ensure!(
-            !package.name.trim().is_empty() && parse_version(&package.version).is_some(),
+            !package.name.trim().is_empty(),
             "Incomplete or invalid Arch package advisory identity"
         );
+        let parsed = parse_version(&package.version)
+            .context("Incomplete or invalid Arch package advisory identity")?;
         if let SecurityOrigin::ArchRepository { repository }
         | SecurityOrigin::OtherRepository { repository } = &package.origin
         {
@@ -46,6 +51,11 @@ pub(crate) fn assess_packages(
                 "Empty advisory repository identity"
             );
         }
+        parsed_versions.push(parsed);
+        assessments_by_name
+            .entry(package.name.as_str())
+            .or_default()
+            .push(idx);
     }
     let mut assessments = installed
         .iter()
@@ -118,52 +128,57 @@ pub(crate) fn assess_packages(
             .filter(|value| !value.is_empty())
             .map(|value| parse_version(value).context("Invalid Arch advisory fixed version"))
             .transpose()?;
-        for assessment in &mut assessments {
-            let package = &assessment.package;
-            if !advisory.packages.contains(&package.name) {
+        let mut matched_indices = HashSet::new();
+        for pkg_name in &advisory.packages {
+            let Some(indices) = assessments_by_name.get(pkg_name.as_str()) else {
                 continue;
+            };
+            for &idx in indices {
+                if !matched_indices.insert(idx) {
+                    continue;
+                }
+                if let Some(fixed) = &fixed
+                    && &parsed_versions[idx] >= fixed
+                {
+                    continue;
+                }
+                let assessment = &mut assessments[idx];
+                let package = &assessment.package;
+                let references = advisory
+                    .issues
+                    .iter()
+                    .map(|id| AdvisoryReference {
+                        id: id.clone(),
+                        kind: "Arch Linux Security Tracker".into(),
+                        url: format!("https://security.archlinux.org/{}", urlencoding::encode(id)),
+                    })
+                    .collect();
+                assessment.findings.push(Vulnerability {
+                    applicability: if assessment.coverage.is_assessed() {
+                        FindingApplicability::Applicable
+                    } else {
+                        FindingApplicability::Possible
+                    },
+                    id: advisory.name.clone(),
+                    summary: format!("{}: {}", advisory.name, advisory.kind),
+                    score: None,
+                    advisory_severity: Some(severity),
+                    native_advisory: Some(NativeAdvisory {
+                        source: "Arch Linux Security Tracker".into(),
+                        // Arch has no RPM NEVRA. Empty means not applicable.
+                        advisory_nevra: String::new(),
+                        published_severity: advisory.severity.clone(),
+                        description: format!(
+                            "Status: {}; affected snapshot: {}; fixed: {}",
+                            advisory.status,
+                            advisory.affected,
+                            advisory.fixed.as_deref().unwrap_or("not published")
+                        ),
+                        references,
+                    }),
+                    affected_installed: vec![InstalledIdentity::from(package)],
+                });
             }
-            let version =
-                parse_version(&package.version).context("Invalid installed Arch version")?;
-            if let Some(fixed) = &fixed
-                && &version >= fixed
-            {
-                continue;
-            }
-            let references = advisory
-                .issues
-                .iter()
-                .map(|id| AdvisoryReference {
-                    id: id.clone(),
-                    kind: "Arch Linux Security Tracker".into(),
-                    url: format!("https://security.archlinux.org/{}", urlencoding::encode(id)),
-                })
-                .collect();
-            assessment.findings.push(Vulnerability {
-                applicability: if assessment.coverage.is_assessed() {
-                    FindingApplicability::Applicable
-                } else {
-                    FindingApplicability::Possible
-                },
-                id: advisory.name.clone(),
-                summary: format!("{}: {}", advisory.name, advisory.kind),
-                score: None,
-                advisory_severity: Some(severity),
-                native_advisory: Some(NativeAdvisory {
-                    source: "Arch Linux Security Tracker".into(),
-                    // Arch has no RPM NEVRA. Empty means not applicable.
-                    advisory_nevra: String::new(),
-                    published_severity: advisory.severity.clone(),
-                    description: format!(
-                        "Status: {}; affected snapshot: {}; fixed: {}",
-                        advisory.status,
-                        advisory.affected,
-                        advisory.fixed.as_deref().unwrap_or("not published")
-                    ),
-                    references,
-                }),
-                affected_installed: vec![InstalledIdentity::from(package)],
-            });
         }
     }
     Ok(assessments)
