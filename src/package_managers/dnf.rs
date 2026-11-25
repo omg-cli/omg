@@ -765,6 +765,14 @@ impl DnfPackageManager {
             .collect()
     }
 
+    /// Count installed RPM entries without querying DNF repositories.
+    ///
+    /// # Errors
+    /// Returns an error when the installed RPM inventory cannot be read.
+    pub fn installed_count(&self) -> Result<usize> {
+        Ok(self.load_installed_packages_blocking()?.len())
+    }
+
     /// Load installed packages from RPM `SQLite` database
     ///
     /// Reads directly from `/var/lib/rpm/rpmdb.sqlite` and parses RPM header blobs

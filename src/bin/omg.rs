@@ -462,6 +462,15 @@ fn try_print_counter(counter: FastCounter, json: bool) -> Result<bool> {
         return Ok(true);
     }
 
+    #[cfg(feature = "fedora")]
+    if selected_backend == omg_lib::package_managers::Backend::Fedora
+        && counter == FastCounter::Total
+    {
+        let total = omg_lib::package_managers::DnfPackageManager::new().installed_count()?;
+        print_fast_counter(counter, total.try_into()?, 0, 0, 0, json);
+        return Ok(true);
+    }
+
     #[cfg(feature = "arch")]
     if selected_backend == omg_lib::package_managers::Backend::Arch
         && let Ok((total, explicit, orphans)) =
@@ -485,7 +494,7 @@ fn try_print_counter(counter: FastCounter, json: bool) -> Result<bool> {
         return Ok(true);
     }
 
-    #[cfg(not(any(feature = "arch", target_os = "macos")))]
+    #[cfg(not(any(feature = "arch", feature = "fedora", target_os = "macos")))]
     let _ = selected_backend;
 
     // A cache/daemon miss must reach the selected backend through the normal
