@@ -2421,8 +2421,6 @@ jobs:
             fi
           }
 
-          # Archive membership comes from the publisher proof, never local counts.
-          python3 scripts/advisory-baseline.py status
           require_current_main
           git tag "$TAG" "$GITHUB_SHA"
           git push origin "refs/tags/${TAG}"

@@ -784,6 +784,17 @@ def main():
         job_rows = []
         evidence_error = True
         evidence_diagnostic = evidence_diagnostic or admission_failure("job-listing", error)
+    if not evidence_error and run["conclusion"] == "success" and run["path"] == ".github/workflows/ci.yml":
+        skipped_qemu_jobs = {
+            "QEMU behavioral verification preflight",
+            "QEMU behavioral verification (non-Fedora)",
+            "QEMU behavioral verification (Fedora)",
+        }
+        qemu_jobs = [job for job in job_rows if job["name"].startswith(("QEMU ", "ARM guest runner KVM health"))]
+        if (len(qemu_jobs) == len(skipped_qemu_jobs)
+                and {job["name"] for job in qemu_jobs if job["conclusion"] == "skipped"} == skipped_qemu_jobs):
+            print("CI succeeded without selecting QEMU guest verification")
+            return 0
     published_candidate = (run["conclusion"] == "success"
                            and run["path"] == ".github/workflows/qemu-matrix.yml"
                            and run["event"] in ("schedule", "workflow_dispatch")

@@ -961,6 +961,26 @@ class ReportingBoundaryTests(unittest.TestCase):
             workflow_path='.github/workflows/ci.yml', all_distros=True)
         self.assertIsNone(historical, 'historical four-guest CI must remain admissible')
 
+    def test_successful_ci_with_all_qemu_jobs_skipped_does_not_file_guest_failure(self):
+        jobs = [
+            dict(name="CI Success", conclusion="success"),
+            dict(name="QEMU behavioral verification preflight", conclusion="skipped"),
+            dict(name="QEMU behavioral verification (non-Fedora)", conclusion="skipped"),
+            dict(name="QEMU behavioral verification (Fedora)", conclusion="skipped"),
+        ]
+        calls, catalog = self.run_report_fixture(
+            [], conclusion="success", workflow_path=".github/workflows/ci.yml",
+            no_artifacts=True, jobs=jobs)
+        self.assertEqual(calls, [])
+        self.assertIsNone(catalog)
+
+        for unexpected in (jobs[:3], [*jobs, dict(name="QEMU guest (arch)", conclusion="success")]):
+            with self.subTest(jobs=unexpected):
+                _, catalog = self.run_report_fixture(
+                    [], conclusion="success", workflow_path=".github/workflows/ci.yml",
+                    no_artifacts=True, jobs=unexpected)
+                self.assertTrue(catalog["evidence_invalid_or_unavailable"])
+
 
     def test_dual_partition_workflow_reports_are_admitted_without_duplicate_failures(self):
         row = dict(self.row(), case_id="qemu-matrix-workflow", distro="ubuntu")
