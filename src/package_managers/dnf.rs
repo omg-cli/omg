@@ -30,6 +30,7 @@ mod rpm_database;
 
 mod repository_observation;
 use repository_observation::RepositoryObservation;
+pub(crate) use repository_observation::StatusRepositories;
 use rpm_database::{HOST_SQLITE, RpmDatabase};
 use rusqlite::{Connection, OpenFlags};
 use zerocopy::{FromBytes, Immutable, KnownLayout, big_endian::U32};
@@ -855,6 +856,32 @@ impl DnfPackageManager {
         Self::status_scope_for(&location, &state)
     }
 
+    pub(crate) fn status_scopes(
+        repositories: &mut StatusRepositories,
+    ) -> Result<crate::core::fast_status::StatusScopes> {
+        use crate::core::fast_status::{StatusScope, StatusScopes};
+        use sha2::{Digest as _, Sha256};
+
+        let (location, state) = RpmDatabase::detect_with_state_dir(Path::new(HOST_SQLITE))?;
+        let installed = Self::status_scope_for(&location, &state)?;
+        let (normal, advisory) =
+            repositories.revisions(&location.root, &Self::advisory_cache_dir())?;
+        let mut hash = Sha256::new();
+        hash.update(b"OMG Fedora package status v1\0");
+        hash.update(installed.0);
+        hash.update(normal);
+        let packages = StatusScope(hash.finalize_reset().into());
+        hash.update(b"OMG Fedora complete status v1\0");
+        hash.update(packages.0);
+        hash.update(advisory);
+        let complete = StatusScope(hash.finalize().into());
+        Ok(StatusScopes {
+            installed,
+            packages,
+            complete,
+        })
+    }
+
     fn status_scope_for(
         location: &RpmDatabase,
         state: &Path,
@@ -864,7 +891,7 @@ impl DnfPackageManager {
         let identity = RpmDatabaseIdentity::read(&location.sqlite)
             .context("Cannot identify the RPM database for cached status")?;
         let mut hash = Sha256::new();
-        hash.update(b"OMG Fedora status inputs v2\0");
+        hash.update(b"OMG Fedora installed status inputs v3\0");
         for path in [location.root.as_path(), location.sqlite.as_path(), state] {
             hash.update(path.as_os_str().as_encoded_bytes());
             hash.update([0]);
@@ -1882,8 +1909,12 @@ impl DnfPackageManager {
         .context("DNF stored transaction owner failed")?
     }
 
+    fn advisory_cache_dir() -> PathBuf {
+        crate::core::paths::cache_dir().join("dnf-security")
+    }
+
     fn advisory_command() -> Result<tokio::process::Command> {
-        let cache = crate::core::paths::cache_dir().join("dnf-security");
+        let cache = Self::advisory_cache_dir();
         let cache = cache
             .to_str()
             .context("DNF advisory cache path is not UTF-8")?;

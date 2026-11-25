@@ -20,6 +20,25 @@ impl StatusScope {
     pub(crate) const UNSCOPED: Self = Self([0; 32]);
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct StatusScopes {
+    pub(crate) installed: StatusScope,
+    pub(crate) packages: StatusScope,
+    pub(crate) complete: StatusScope,
+}
+
+impl StatusScopes {
+    pub(crate) const UNSCOPED: Self = Self::installed(StatusScope::UNSCOPED);
+
+    pub(crate) const fn installed(scope: StatusScope) -> Self {
+        Self {
+            installed: scope,
+            packages: scope,
+            complete: scope,
+        }
+    }
+}
+
 /// Fast status structure - fixed size for mmap-friendly reads
 ///
 /// Uses zerocopy for safe serialization without unsafe transmute.
@@ -167,13 +186,27 @@ impl FastStatus {
         Some(status)
     }
 
-    /// Read the default status file with full validation.
+    /// Read all counters when the file can validate every input locally.
     pub fn read_default() -> Option<Self> {
+        Self::read_default_for(false)
+    }
+
+    /// Read the installed total using only the installed-state scope.
+    pub fn read_total_count() -> Option<u32> {
+        Self::read_default_for(true).map(|status| status.total_packages)
+    }
+
+    fn read_default_for(
+        #[cfg_attr(not(feature = "fedora"), allow(unused_variables))] installed_only: bool,
+    ) -> Option<Self> {
         let status = Self::read_validated(&paths::fast_status_path())?;
         #[cfg(feature = "fedora")]
         if crate::package_managers::resolve_backend().ok()?
             == crate::package_managers::Backend::Fedora
         {
+            if !installed_only {
+                return None;
+            }
             let scope = crate::package_managers::DnfPackageManager::status_scope().ok()?;
             return status.matches_scope(scope);
         }
@@ -198,7 +231,7 @@ impl FastStatus {
     /// Read explicit count directly (fastest path)
     #[must_use]
     pub fn read_explicit_count() -> Option<usize> {
-        Self::read_default().map(|status| status.explicit_packages as usize)
+        Self::read_default_for(true).map(|status| status.explicit_packages as usize)
     }
 }
 

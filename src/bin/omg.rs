@@ -435,6 +435,15 @@ fn try_print_counter(counter: FastCounter, json: bool) -> Result<bool> {
         return Ok(true);
     }
 
+    #[cfg(feature = "fedora")]
+    if selected_backend == omg_lib::package_managers::Backend::Fedora
+        && counter == FastCounter::Total
+        && let Some(total) = omg_lib::core::fast_status::FastStatus::read_total_count()
+    {
+        print_fast_counter(counter, total, 0, 0, 0, json);
+        return Ok(true);
+    }
+
     if let Some(status) = omg_lib::core::fast_status::FastStatus::read_default() {
         print_fast_counter(
             counter,

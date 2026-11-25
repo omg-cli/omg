@@ -14,7 +14,7 @@ use super::protocol::{
     DetailedPackageInfo, ExplicitResult, HealthStatus, PackageInfo, Request, RequestId, Response,
     ResponseResult, SearchResult, UpdateEntry, WirePackageSource, error_codes,
 };
-use crate::core::fast_status::StatusScope;
+use crate::core::fast_status::{StatusScope, StatusScopes};
 use crate::core::metrics::GLOBAL_METRICS;
 use crate::core::security::{AuditEventType, AuditSeverity, audit_log_nonblocking};
 use crate::package_managers::{
@@ -219,6 +219,8 @@ pub struct DaemonState {
     system_backends: Arc<RwLock<SystemBackendAccess>>,
     refresh_lock: Arc<tokio::sync::Mutex<()>>,
     catalog_observation_budget: Arc<tokio::sync::Semaphore>,
+    #[cfg(feature = "fedora")]
+    status_repositories: Arc<std::sync::Mutex<crate::package_managers::dnf::StatusRepositories>>,
     native_tasks: tokio_util::task::TaskTracker,
     refresh_debounce: RefreshDebounce,
     index_generation: AtomicU64,
@@ -513,14 +515,23 @@ impl DaemonState {
         }
     }
 
+    pub(super) async fn status_scope(&self) -> Option<StatusScope> {
+        self.status_scopes(false)
+            .await
+            .map(|scopes| scopes.installed)
+    }
+
     #[cfg_attr(
         not(feature = "fedora"),
         allow(
             clippy::unused_async,
-            reason = "Fedora resolves native database identity on a blocking worker"
+            reason = "Fedora observes native status inputs on a blocking worker"
         )
     )]
-    pub(super) async fn status_scope(&self) -> Option<StatusScope> {
+    pub(super) async fn status_scopes(
+        &self,
+        #[cfg_attr(not(feature = "fedora"), allow(unused_variables))] include_repositories: bool,
+    ) -> Option<StatusScopes> {
         #[cfg(feature = "fedora")]
         if self.uses_production_backends() && self.package_manager.name() == "dnf" {
             use crate::package_managers::DnfPackageManager;
@@ -529,25 +540,33 @@ impl DaemonState {
                 let permit = Arc::clone(&self.catalog_observation_budget)
                     .acquire_owned()
                     .await?;
+                let repositories = Arc::clone(&self.status_repositories);
                 tokio::task::spawn_blocking(move || {
                     let _permit = permit;
-                    DnfPackageManager::status_scope()
+                    if include_repositories {
+                        let mut repositories = repositories
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        DnfPackageManager::status_scopes(&mut repositories)
+                    } else {
+                        DnfPackageManager::status_scope().map(StatusScopes::installed)
+                    }
                 })
                 .await
-                .context("RPM status scope task failed")?
+                .context("DNF status observation task failed")?
             })
             .await
-            .context("RPM status scope task exceeded its deadline")
+            .context("DNF status observation exceeded its deadline")
             .and_then(std::convert::identity);
             return match result {
-                Ok(scope) => Some(scope),
+                Ok(scopes) => Some(scopes),
                 Err(error) => {
                     tracing::debug!("Skipping package status cache: {error:#}");
                     None
                 }
             };
         }
-        Some(StatusScope::UNSCOPED)
+        Some(StatusScopes::UNSCOPED)
     }
 
     pub(super) async fn status_counts(&self) -> anyhow::Result<(usize, usize, usize, usize)> {
@@ -732,6 +751,8 @@ impl DaemonState {
             system_backends: Arc::new(RwLock::new(system_backends)),
             refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
             catalog_observation_budget: Arc::new(tokio::sync::Semaphore::new(1)),
+            #[cfg(feature = "fedora")]
+            status_repositories: Arc::default(),
             native_tasks: tokio_util::task::TaskTracker::new(),
             refresh_debounce: RefreshDebounce::default(),
             index_generation: AtomicU64::new(0),
@@ -1344,7 +1365,10 @@ async fn handle_status(state: Arc<DaemonState>, id: RequestId) -> Response {
     // METRICS: Track status requests
     GLOBAL_METRICS.inc_status_requests();
 
-    let scope = state.status_scope().await;
+    let scope = state
+        .status_scopes(true)
+        .await
+        .map(|scopes| scopes.complete);
     if let Some(cached) = scope.and_then(|scope| state.cache.get_scoped_status(scope)) {
         // METRICS: Cache hit (memory)
         GLOBAL_METRICS.inc_cache_hits();
@@ -1393,8 +1417,14 @@ async fn handle_status(state: Arc<DaemonState>, id: RequestId) -> Response {
     // status paths; dependency-injected states stay behind the package-manager
     // interface and never access host package databases.
     let status_result = state.status_counts().await;
-    if scope.is_some() && state.status_scope().await != scope {
-        return internal_error(id, "RPM database changed during the status query");
+    if scope.is_some()
+        && state
+            .status_scopes(true)
+            .await
+            .map(|scopes| scopes.complete)
+            != scope
+    {
+        return internal_error(id, "Package status inputs changed during the query");
     }
 
     match status_result {

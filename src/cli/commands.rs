@@ -442,7 +442,7 @@ type StatusSnapshot = (
 /// A missing daemon or binary cache falls back to a direct query, but a failed
 /// direct query is an error rather than a fake "healthy" zero report.
 fn read_status_snapshot() -> Result<StatusSnapshot> {
-    crate::package_managers::resolve_backend()?;
+    let backend = crate::package_managers::resolve_backend()?;
     // Use the same isolated fixture as JSON and async status. Native fast
     // readers may provide their own fixed test records and must not override
     // the explicit adapter (or read a real daemon cache in root-run tests).
@@ -491,6 +491,11 @@ fn read_status_snapshot() -> Result<StatusSnapshot> {
             res.scanned_vulnerability_summary(),
             Some(res.runtime_versions),
         ));
+    }
+
+    if backend == crate::package_managers::Backend::Fedora {
+        let (total, explicit, orphans, updates) = crate::package_managers::get_system_status()?;
+        return Ok((total, explicit, orphans, updates, None, None));
     }
 
     #[cfg(any(feature = "debian", feature = "debian-pure"))]

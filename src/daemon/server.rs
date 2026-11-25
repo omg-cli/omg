@@ -247,13 +247,13 @@ async fn run_with_status_path(
                     return;
                 }
             };
-            let scope = state.status_scope().await;
+            let scopes = state.status_scopes(true).await;
             state
                 .runtime_versions
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone_from(&versions);
-            let Some(scope) = scope else {
+            let Some(scopes) = scopes else {
                 return;
             };
 
@@ -264,12 +264,16 @@ async fn run_with_status_path(
                     return;
                 }
             };
-            if state.status_scope().await != Some(scope) {
+            let Some(current) = state.status_scopes(true).await else {
+                return;
+            };
+            if current.packages != scopes.packages {
                 return;
             }
+            let mut complete = current.complete;
             let fast_status =
                 crate::core::fast_status::FastStatus::new(total, explicit, orphans, updates)
-                    .with_scope(scope);
+                    .with_scope(scopes.installed);
             match write_fast_status_async(
                 fast_status,
                 fast_status_path.to_path_buf(),
@@ -288,50 +292,62 @@ async fn run_with_status_path(
             if !state.background_security_scans || shutdown.is_cancelled() {
                 return;
             }
-            let previous_vulns = state
-                .cache
-                .get_scoped_status(scope)
-                .and_then(|status| status.scanned_vulnerability_summary());
-            let scan = tokio::select! {
-                biased;
-                () = shutdown.cancelled() => {
-                    tracing::debug!("Cancelled background security refresh during shutdown");
+            for _ in 0..2 {
+                let previous_vulns = state
+                    .cache
+                    .get_scoped_status(complete)
+                    .and_then(|status| status.scanned_vulnerability_summary());
+                let scan = tokio::select! {
+                    biased;
+                    () = shutdown.cancelled() => {
+                        tracing::debug!("Cancelled background security refresh during shutdown");
+                        return;
+                    }
+                    result = state.scan_security() => result.and_then(super::status_policy::reported_vulnerability_counts),
+                };
+                if let Err(error) = &scan {
+                    tracing::warn!("Vulnerability scan failed during status refresh: {error}");
+                }
+                let Some(current) = state.status_scopes(true).await else {
+                    return;
+                };
+                if current.packages != scopes.packages {
                     return;
                 }
-                result = state.scan_security() => result.and_then(super::status_policy::reported_vulnerability_counts),
-            };
-            if let Err(error) = &scan {
-                tracing::warn!("Vulnerability scan failed during status refresh: {error}");
-            }
-            let Some(vuln_count) =
-                super::status_policy::vulnerability_count_from_scan(&scan, previous_vulns)
-            else {
-                tracing::warn!("No prior vulnerability count; not publishing a zero-vuln status");
-                return;
-            };
-            let mut res = super::status_policy::status_snapshot(
-                total,
-                explicit,
-                orphans,
-                updates,
-                versions,
-                Some(vuln_count),
-            )
-            .0;
-            if scan.is_err() {
-                res.invalidate_security_scope();
-            }
-            if state.status_scope().await != Some(scope) {
-                return;
-            }
-            let res_arc = Arc::new(res);
-            // The in-memory cache is authoritative, so persistence is best-effort.
-            state.with_current_index(&index, || {
-                if let Err(error) = state.persistent.set_scoped_status(scope, &res_arc) {
-                    tracing::warn!("Failed to persist status cache: {error}");
+                if current.complete != complete {
+                    // The advisory query may fetch a new manifest itself. Repeat
+                    // once and publish only for an observation spanning the scan.
+                    complete = current.complete;
+                    continue;
                 }
-                state.cache.update_scoped_status(scope, res_arc);
-            });
+                let Some(vuln_count) =
+                    super::status_policy::vulnerability_count_from_scan(&scan, previous_vulns)
+                else {
+                    tracing::warn!("No prior vulnerability count; not publishing a zero-vuln status");
+                    return;
+                };
+                let mut res = super::status_policy::status_snapshot(
+                    total,
+                    explicit,
+                    orphans,
+                    updates,
+                    versions,
+                    Some(vuln_count),
+                )
+                .0;
+                if scan.is_err() {
+                    res.invalidate_security_scope();
+                }
+                let res_arc = Arc::new(res);
+                // The in-memory cache is authoritative, so persistence is best-effort.
+                state.with_current_index(&index, || {
+                    if let Err(error) = state.persistent.set_scoped_status(complete, &res_arc) {
+                        tracing::warn!("Failed to persist status cache: {error}");
+                    }
+                    state.cache.update_scoped_status(complete, res_arc);
+                });
+                return;
+            }
         }
 
         async fn maintain(

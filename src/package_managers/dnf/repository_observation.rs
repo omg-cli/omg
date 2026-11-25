@@ -1,7 +1,7 @@
 //! DNF's repository configuration and cached manifests used by the daemon index.
 
 use std::fs;
-use std::io;
+use std::io::{self, Read as _};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -27,10 +27,27 @@ pub(super) struct RepositoryObservation {
 
 impl RepositoryObservation {
     pub(super) fn capture(root: &Path) -> Result<Self> {
+        let paths = ResolvedRepositoryPaths::capture(root)?.paths;
+        let fingerprint = paths.fingerprint()?;
+        Ok(Self { paths, fingerprint })
+    }
+
+    pub(super) fn is_current(&self) -> Result<bool> {
+        Ok(self.paths.fingerprint()? == self.fingerprint)
+    }
+}
+
+struct ResolvedRepositoryPaths {
+    root: PathBuf,
+    controls: RepositoryPaths,
+    control_revision: [u8; 32],
+    paths: RepositoryPaths,
+}
+
+impl ResolvedRepositoryPaths {
+    fn capture(root: &Path) -> Result<Self> {
         let controls = RepositoryPaths::controls(root)?;
-        let before = controls.fingerprint()?;
-        // Ask DNF for effective custom paths only when building the index.
-        // Warm queries compare filesystem revisions without invoking DNF.
+        let control_revision = controls.fingerprint()?;
         let settings = read_path_settings()?;
         anyhow::ensure!(
             parse_absolute_setting(&settings, "installroot")? == root,
@@ -38,16 +55,51 @@ impl RepositoryObservation {
         );
         let mut paths = controls.clone();
         paths.add_effective_paths(root, &settings)?;
-        let fingerprint = paths.fingerprint()?;
         anyhow::ensure!(
-            controls.fingerprint()? == before,
+            controls.fingerprint()? == control_revision,
             "DNF configuration changed while resolving repository paths"
         );
-        Ok(Self { paths, fingerprint })
+        Ok(Self {
+            root: root.to_path_buf(),
+            controls,
+            control_revision,
+            paths,
+        })
     }
 
-    pub(super) fn is_current(&self) -> Result<bool> {
-        Ok(self.paths.fingerprint()? == self.fingerprint)
+    fn current_for(&self, root: &Path) -> Result<bool> {
+        Ok(self.root == root && self.controls.fingerprint()? == self.control_revision)
+    }
+}
+
+/// Effective paths are resolved on configuration changes, not for every status request.
+#[derive(Default)]
+pub(crate) struct StatusRepositories {
+    paths: Option<ResolvedRepositoryPaths>,
+}
+
+impl StatusRepositories {
+    pub(super) fn revisions(
+        &mut self,
+        root: &Path,
+        advisory_cache: &Path,
+    ) -> Result<([u8; 32], [u8; 32])> {
+        if let Some(paths) = &self.paths
+            && paths.current_for(root)?
+        {
+            return Ok((
+                paths.paths.fingerprint()?,
+                advisory_revision(advisory_cache)?,
+            ));
+        }
+
+        let paths = ResolvedRepositoryPaths::capture(root)?;
+        let revisions = (
+            paths.paths.fingerprint()?,
+            advisory_revision(advisory_cache)?,
+        );
+        self.paths = Some(paths);
+        Ok(revisions)
     }
 }
 
@@ -140,14 +192,7 @@ impl RepositoryPaths {
         caches.sort_unstable();
         caches.dedup();
         for directory in caches {
-            for entry in directory_entries(directory)?.into_iter().flatten() {
-                let entry = entry?;
-                let kind = entry.file_type()?;
-                if kind.is_dir() || kind.is_symlink() {
-                    let path = entry.path();
-                    files.push(path.join("repodata/repomd.xml"));
-                }
-            }
+            files.extend(cached_manifests(directory)?);
         }
         files.sort_unstable();
         files.dedup();
@@ -171,6 +216,47 @@ impl RepositoryPaths {
         }
         Ok(hash.finalize().into())
     }
+}
+
+fn cached_manifests(directory: &Path) -> Result<Vec<PathBuf>> {
+    let mut manifests = Vec::new();
+    for entry in directory_entries(directory)?.into_iter().flatten() {
+        let entry = entry?;
+        let kind = entry.file_type()?;
+        if kind.is_dir() || kind.is_symlink() {
+            manifests.push(entry.path().join("repodata/repomd.xml"));
+        }
+    }
+    Ok(manifests)
+}
+
+fn advisory_revision(cache: &Path) -> Result<[u8; 32]> {
+    const MAX_MANIFEST_BYTES: usize = 8 * 1024 * 1024;
+
+    let mut manifests = cached_manifests(cache)?;
+    manifests.sort_unstable();
+    let mut hash = Sha256::new();
+    hash.update(b"OMG DNF advisory manifests v1\0");
+    for path in manifests {
+        let Some(observed) = RpmFileIdentity::read(&path)? else {
+            continue;
+        };
+        let mut bytes = Vec::new();
+        fs::File::open(&path)?
+            .take(MAX_MANIFEST_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)?;
+        anyhow::ensure!(
+            bytes.len() <= MAX_MANIFEST_BYTES && RpmFileIdentity::read(&path)? == Some(observed),
+            "DNF advisory manifest changed during observation or exceeds its byte limit"
+        );
+        // A normal DNF refresh can rewrite a byte-identical, authenticated
+        // manifest. It should not prevent publishing a stable advisory scan.
+        hash.update([1]);
+        hash.update(path.as_os_str().as_encoded_bytes());
+        hash.update([0]);
+        hash.update(Sha256::digest(bytes));
+    }
+    Ok(hash.finalize().into())
 }
 
 fn directory_entries(path: &Path) -> Result<Option<fs::ReadDir>> {
@@ -251,6 +337,22 @@ mod tests {
         };
         fs::write(&manifest, "updated metadata")?;
         assert!(!observed.is_current()?);
+        Ok(())
+    }
+
+    #[test]
+    fn advisory_revision_changes_with_manifest_bytes() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let manifest = fixture.path().join("repo/repodata/repomd.xml");
+        fs::create_dir_all(manifest.parent().context("manifest parent")?)?;
+        let absent = advisory_revision(fixture.path())?;
+        fs::write(&manifest, b"manifest with advisories")?;
+        let original = advisory_revision(fixture.path())?;
+        assert_ne!(absent, original);
+        fs::write(&manifest, b"manifest with advisories")?;
+        assert_eq!(original, advisory_revision(fixture.path())?);
+        fs::write(&manifest, b"changed advisory manifest")?;
+        assert_ne!(original, advisory_revision(fixture.path())?);
         Ok(())
     }
 

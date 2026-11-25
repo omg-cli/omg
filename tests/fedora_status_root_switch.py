@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify live Fedora caches across repository, installroot, and inventory changes.
+"""Verify live Fedora caches across repository, advisory, installroot, and inventory changes.
 
 Run as root in private mount and network namespaces without network routes.
 The arguments are the inert Fedora fixture directory and the built omg and
@@ -35,6 +35,35 @@ config = Path("/etc/dnf/dnf.conf")
 rpm = "/usr/bin/rpm"
 dnf = "/usr/bin/dnf"
 package = "omg-observer-fixture"
+advisory_id = "OMG-FIXTURE-STATUS-1"
+repo_ns = "{http://linux.duke.edu/metadata/repo}"
+ET.register_namespace("", repo_ns[1:-1])
+
+def append_metadata(manifest, kind, relative_path, payload):
+    compressed = gzip.compress(payload, mtime=0)
+    (repo / relative_path).write_bytes(compressed)
+    entry = ET.SubElement(manifest, f"{repo_ns}data", type=kind)
+    for key, contents in (("checksum", compressed), ("open-checksum", payload)):
+        ET.SubElement(entry, f"{repo_ns}{key}", type="sha256").text = hashlib.sha256(contents).hexdigest()
+    ET.SubElement(entry, f"{repo_ns}location", href=relative_path)
+    timestamp = str(int(time.time()))
+    for key, value in (("timestamp", timestamp), ("size", len(compressed)), ("open-size", len(payload))):
+        ET.SubElement(entry, f"{repo_ns}{key}").text = str(value)
+    manifest.find(f"{repo_ns}revision").text = timestamp
+
+def advisory_metadata(manifest):
+    payload = f"""<updates>
+      <update from="omg-fixture.invalid" status="stable" type="security" version="1">
+        <id>{advisory_id}</id><title>Synthetic local advisory</title>
+        <severity>Important</severity><description>Package-manager test fixture.</description>
+        <issued date="2026-10-02 00:00:00"/><updated date="2026-10-02 00:00:00"/>
+        <references/>
+        <pkglist><collection short="local"><name>Local fixture</name>
+          <package name="{package}" epoch="0" version="1" release="1" arch="noarch"/>
+        </collection></pkglist>
+      </update>
+    </updates>""".encode()
+    append_metadata(manifest, "updateinfo", "repodata/updateinfo.xml.gz", payload)
 
 def command(args, env=base_env, identity=None):
     return subprocess.run([str(part) for part in args], cwd=env.get("HOME", "/"),
@@ -239,6 +268,49 @@ with tempfile.TemporaryDirectory(prefix="omg-fedora-cache-scope-", dir="/tmp") a
                            value=daemon_searches))
         assert package not in checked([rpm, "-qa", "--qf", "%{NAME}\n"]).splitlines()
 
+    def inspect_update_status(phase, expected_updates, expected_findings):
+        native = ordinary_control([dnf, "--cacheonly", "repoquery", "--upgrades",
+                                   "--qf", r"%{name}\n"]).splitlines()
+        assert native == ([package] if expected_updates else []), (phase, native)
+        def advisory_status(value, finding):
+            summaries = [line.split(maxsplit=1)[1] for line in value.splitlines()
+                         if line.split() and line.split()[0] == "Security"]
+            return summaries == ["1 findings"] if finding else summaries in (
+                ["No reported findings"], ["Advisory coverage unreported"]
+            )
+
+        def updates_status(value):
+            counts = [line.split()[1] for line in value.splitlines()
+                      if line.split() and line.split()[0] == "Updates"]
+            return counts == [str(expected_updates)]
+
+        commands = [
+            ("uc-json", ["--json", "uc"], env, lambda value: json.loads(value) == {"count": expected_updates}),
+            ("uc", ["uc"], env, lambda value: int(value) == expected_updates),
+            ("direct-uc", ["--json", "uc"], disabled, lambda value: json.loads(value) == {"count": expected_updates}),
+            ("status-json", ["--json", "status"], env, lambda value: json.loads(value)["updates_available"] == expected_updates),
+            ("status-fast-json", ["--json", "status", "--fast"], env, lambda value: json.loads(value)["updates_available"] == expected_updates),
+            ("direct-status-json", ["--json", "status"], disabled, lambda value: json.loads(value)["updates_available"] == expected_updates),
+            ("tc", ["--json", "tc"], env, lambda value: json.loads(value) == {"count": 1}),
+            ("ec", ["--json", "ec"], env, lambda value: json.loads(value) == {"count": 1}),
+            ("advisory-status", ["status", "--fast"], env, lambda value: advisory_status(value, expected_findings)),
+            ("advisory-bare-status", ["status"], env, lambda value: advisory_status(value, expected_findings) and updates_status(value)),
+            ("direct-bare-status", ["status"], disabled, lambda value: advisory_status(value, False) and updates_status(value)),
+        ]
+        for label, args, mode, check in commands:
+            before = request_counters() if label == "status-json" else None
+            result = command([cli, *args], mode, ordinary)
+            try:
+                passed = result.returncode == 0 and check(result.stdout)
+            except (ValueError, KeyError, TypeError):
+                passed = False
+            checks.append(dict(phase=phase, case=label, passed=passed, value=result.stdout[-900:],
+                               diagnostic=result.stderr[-450:] if result.returncode else None))
+            if before is not None:
+                after = request_counters()
+                checks.append(dict(phase=phase, case="status-ipc", passed=(after[0] - before[0], after[1] - before[1]) == (2, 0),
+                                   value=(after[0] - before[0], after[1] - before[1])))
+
     @contextmanager
     def running_daemon(log):
         with subprocess.Popen([str(server)], cwd=work, env=env, stdout=log, stderr=subprocess.STDOUT,
@@ -278,8 +350,9 @@ with tempfile.TemporaryDirectory(prefix="omg-fedora-cache-scope-", dir="/tmp") a
                 checked([*gpg, "--armor", "--detach-sign", "--output", signature, manifest])
             sign_manifest()
             advisory_cache = work / "cache/omg/dnf-security"
+            advisory_options = [f"--setopt=cachedir={advisory_cache}", f"--setopt=system_cachedir={advisory_cache}"]
             def refresh_fixture():
-                for args in ([], [f"--setopt=cachedir={advisory_cache}", f"--setopt=system_cachedir={advisory_cache}"]):
+                for args in ([], advisory_options):
                     ordinary_control([dnf, *args, "--refresh", "-y", "makecache"])
             refresh_fixture()
             host_explicit = len(set(ordinary_control([dnf, "--cacheonly", "--setopt=disable_excludes=*",
@@ -321,23 +394,11 @@ with tempfile.TemporaryDirectory(prefix="omg-fedora-cache-scope-", dir="/tmp") a
                 inspect_repository("repository-exclusion-removed", True)
 
                 # Publish an empty signed catalogue at the original repo URL.
-                repo_ns = "{http://linux.duke.edu/metadata/repo}"
-                ET.register_namespace("", repo_ns[1:-1])
                 new_manifest = ET.fromstring(original_manifest)
                 for data in list(new_manifest.findall(f"{repo_ns}data")):
                     new_manifest.remove(data)
                 empty = b'<metadata xmlns="http://linux.duke.edu/metadata/common" packages="0"/>'
-                compressed = gzip.compress(empty, mtime=0)
-                relative_primary = "repodata/primary-empty.xml.gz"
-                (repo / relative_primary).write_bytes(compressed)
-                primary = ET.SubElement(new_manifest, f"{repo_ns}data", type="primary")
-                for key, payload in (("checksum", compressed), ("open-checksum", empty)):
-                    ET.SubElement(primary, f"{repo_ns}{key}", type="sha256").text = hashlib.sha256(payload).hexdigest()
-                ET.SubElement(primary, f"{repo_ns}location", href=relative_primary)
-                timestamp = str(int(time.time()))
-                for key, value in (("timestamp", timestamp), ("size", len(compressed)), ("open-size", len(empty))):
-                    ET.SubElement(primary, f"{repo_ns}{key}").text = str(value)
-                new_manifest.find(f"{repo_ns}revision").text = timestamp
+                append_metadata(new_manifest, "primary", "repodata/primary-empty.xml.gz", empty)
                 manifest.write_bytes(ET.tostring(new_manifest))
                 sign_manifest()
                 ordinary_control([dnf, "clean", "metadata"])
@@ -382,6 +443,82 @@ with tempfile.TemporaryDirectory(prefix="omg-fedora-cache-scope-", dir="/tmp") a
                 assert native_installed() == [package] and native_explicit() == [package]
                 assert (database.stat().st_dev, database.stat().st_ino) == identity
                 inspect("same-root-reinstalled", 1, 1, fixture_explicit=True)
+
+            fast.unlink(missing_ok=True)
+            persisted.unlink(missing_ok=True)
+            old_build = root / "old-rpm"
+            old_build.mkdir()
+            old_spec = old_build / "observer.spec"
+            spec = (fixture / "observer-fixture.spec").read_text()
+            assert spec.count("Version: 1\n") == 1
+            old_spec.write_text(spec.replace("Version: 1\n", "Version: 0\n"))
+            checked(["/usr/bin/rpmbuild", "--define", f"_topdir {old_build}", "-bb", old_spec])
+            old_rpm = old_build / f"RPMS/noarch/{package}-0-1.noarch.rpm"
+            checked([rpm, "--root", alternate, "-U", "--oldpackage", "--nosignature", old_rpm])
+            mark("user")
+            assert native_explicit() == [package]
+            version = checked([rpm, "--root", alternate, "-q", "--qf", "%{VERSION}", package])
+            assert version == "0"
+            metadata = ET.fromstring(original_manifest)
+            advisory_metadata(metadata)
+            manifest.write_bytes(ET.tostring(metadata))
+            sign_manifest()
+            ordinary_control([dnf, "clean", "metadata"])
+            ordinary_control([dnf, *advisory_options, "clean", "metadata"])
+            refresh_fixture()
+
+            def native_advisories(expected):
+                output = ordinary_control([dnf, *advisory_options, "--cacheonly", "advisory", "list",
+                                            "--security", "--available", "--json"])
+                assert [row["name"] for row in json.loads(output)] == expected
+
+            def cached_manifests(cache):
+                return {str(path.relative_to(cache)): (path.stat().st_mtime_ns, hashlib.sha256(path.read_bytes()).hexdigest())
+                        for path in cache.glob("*/repodata/repomd.xml")}
+
+            normal_cache = alternate / work.relative_to("/") / ".cache/libdnf5"
+            native_advisories([advisory_id])
+            ordinary_control([dnf, *advisory_options, "clean", "metadata"])
+            assert not cached_manifests(advisory_cache)
+            with running_daemon(log):
+                snapshot = json.loads(persisted.read_text())["status"]
+                assert snapshot["security_vulnerabilities"] == 1 and snapshot["updates_available"] == 1
+                inspect_update_status("status-repository-initial", 1, True)
+                normal_manifests = cached_manifests(normal_cache)
+                advisory_manifests = cached_manifests(advisory_cache)
+                assert normal_manifests and advisory_manifests
+
+                # Change the dedicated advisory cache while holding the package
+                # query cache, RPM database and repo configuration fixed.
+                manifest.write_bytes(original_manifest)
+                sign_manifest()
+                ordinary_control([dnf, *advisory_options, "clean", "metadata"])
+                ordinary_control([dnf, *advisory_options, "--refresh", "-y", "makecache"])
+                native_advisories([])
+                assert cached_manifests(normal_cache) == normal_manifests
+                assert cached_manifests(advisory_cache) != advisory_manifests
+                inspect_update_status("status-advisory-only", 1, False)
+                advisory_manifests = cached_manifests(advisory_cache)
+
+                # Hold installed RPM and reason state fixed while removing the
+                # package metadata from the normal DNF cache.
+                manifest.write_bytes(ET.tostring(new_manifest))
+                sign_manifest()
+                ordinary_control([dnf, "clean", "metadata"])
+                ordinary_control([dnf, "--refresh", "-y", "makecache"])
+                assert cached_manifests(advisory_cache) == advisory_manifests
+                assert cached_manifests(normal_cache) != normal_manifests
+                inspect_update_status("status-metadata-only", 0, False)
+
+                manifest.write_bytes(original_manifest)
+                sign_manifest()
+                ordinary_control([dnf, "clean", "metadata"])
+                ordinary_control([dnf, "--refresh", "-y", "makecache"])
+                inspect_update_status("status-metadata-restored", 1, False)
+                config.write_text(custom_config.replace("enabled=1", "enabled=0"))
+                (alternate / "etc/dnf/dnf.conf").write_text(config.read_text())
+                inspect_update_status("status-repository-disabled", 0, False)
+                assert checked([rpm, "--root", alternate, "-q", "--qf", "%{VERSION}", package]) == "0"
         except Exception:
             log.seek(0)
             print(log.read()[-4500:], file=sys.stderr)
@@ -396,5 +533,5 @@ assert inventory() == before
 report = dict(binaries=binaries, checks=checks, total=len(checks),
               passed=sum(entry["passed"] for entry in checks), host_unchanged=True)
 print(json.dumps(report))
-if report["passed"] != report["total"] or report["total"] != 193:
+if report["passed"] != report["total"] or report["total"] != 253:
     sys.exit(4)
