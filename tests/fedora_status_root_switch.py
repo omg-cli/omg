@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import pwd
+import shlex
 import shutil
 import signal
 import stat
@@ -157,7 +158,13 @@ with tempfile.TemporaryDirectory(prefix="omg-fedora-cache-scope-", dir="/tmp") a
         main.replace("reposdir=\n", "reposdir=/etc/dnf/omg-fixture-repos\n")
         + f"cachedir={work / 'custom-dnf-cache'}\n"
     )
-    alternate_config = main + f"installroot={alternate}\n" + repo_config
+    alternate_config = (
+        main.replace("reposdir=\n", "reposdir=/etc/dnf/omg-fixture-repos\n")
+        + f"installroot={alternate}\n"
+    )
+    alternate_repo = alternate / "etc/dnf/omg-fixture-repos/fixture.repo"
+    alternate_repo.parent.mkdir()
+    alternate_repo.write_text(repo_config)
     (alternate / "etc/dnf/dnf.conf").write_text(alternate_config)
     config.write_text(host_config)
     fast = runtime / "omg.status"
@@ -310,6 +317,53 @@ with tempfile.TemporaryDirectory(prefix="omg-fedora-cache-scope-", dir="/tmp") a
                 after = request_counters()
                 checks.append(dict(phase=phase, case="status-ipc", passed=(after[0] - before[0], after[1] - before[1]) == (2, 0),
                                    value=(after[0] - before[0], after[1] - before[1])))
+
+    def status_during(change):
+        # Pause the real counts query before libdnf5 takes any database locks.
+        # The wrapper and native executable are confined to this mount namespace.
+        target = Path(dnf).resolve(strict=True)
+        with tempfile.TemporaryDirectory(prefix="status-query-", dir=root) as directory:
+            gate = Path(directory)
+            gate.chmod(0o755)
+            handoff = gate / "handoff"
+            handoff.mkdir(mode=0o700)
+            os.chown(handoff, account.pw_uid, account.pw_gid)
+            native = gate / target.name
+            shutil.copy2(target, native)
+            arrived, resume = handoff / "arrived", handoff / "resume"
+            wrapper = gate / "hold-dnf"
+            wrapper.write_text(f"""#!/usr/bin/bash
+for argument in "$@"; do
+    if [[ "$argument" == --unneeded ]]; then
+        : > {shlex.quote(str(arrived))}
+        for ((attempt=0; attempt<240; attempt++)); do
+            [[ ! -f {shlex.quote(str(resume))} ]] || break
+            sleep 0.05
+        done
+        [[ -f {shlex.quote(str(resume))} ]] || exit 197
+        break
+    fi
+done
+exec {shlex.quote(str(native))} "$@"
+""")
+            wrapper.chmod(0o755)
+            checked(["/usr/bin/mount", "--bind", wrapper, target])
+            try:
+                with subprocess.Popen([str(cli), "daemon-status"], cwd=work, env=env,
+                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                      stdin=subprocess.DEVNULL, text=True, **ordinary) as status:
+                    try:
+                        wait_for(arrived.exists, status)
+                        change()
+                        resume.touch()
+                        stdout, stderr = status.communicate(timeout=25)
+                        return status.returncode, stdout, stderr
+                    finally:
+                        if status.poll() is None:
+                            status.kill()
+                            status.wait(4)
+            finally:
+                checked(["/usr/bin/umount", target])
 
     @contextmanager
     def running_daemon(log):
@@ -500,14 +554,38 @@ with tempfile.TemporaryDirectory(prefix="omg-fedora-cache-scope-", dir="/tmp") a
                 inspect_update_status("status-advisory-only", 1, False)
                 advisory_manifests = cached_manifests(advisory_cache)
 
-                # Hold installed RPM and reason state fixed while removing the
-                # package metadata from the normal DNF cache.
-                manifest.write_bytes(ET.tostring(new_manifest))
-                sign_manifest()
-                ordinary_control([dnf, "clean", "metadata"])
-                ordinary_control([dnf, "--refresh", "-y", "makecache"])
-                assert cached_manifests(advisory_cache) == advisory_manifests
-                assert cached_manifests(normal_cache) != normal_manifests
+                def refresh_advisory_while_counting():
+                    distinct = ET.fromstring(original_manifest)
+                    distinct.find(f"{repo_ns}revision").text = str(time.time_ns())
+                    manifest.write_bytes(ET.tostring(distinct))
+                    sign_manifest()
+                    ordinary_control([dnf, *advisory_options, "clean", "metadata"])
+                    ordinary_control([dnf, *advisory_options, "--refresh", "-y", "makecache"])
+                    assert cached_manifests(normal_cache) == normal_manifests
+                    assert cached_manifests(advisory_cache) != advisory_manifests
+
+                exit_code, stdout, stderr = status_during(refresh_advisory_while_counting)
+                counts = [line.split()[2] for line in stdout.splitlines()
+                          if line.split()[:2] == ["Updates", "available:"]]
+                checks.append(dict(phase="status-advisory-during-count", case="daemon-status",
+                                   passed=exit_code == 0 and counts == ["1"]
+                                   and "Advisory coverage:  unreported" in stdout,
+                                   status=exit_code, value=(stdout + stderr)[-1200:]))
+                advisory_manifests = cached_manifests(advisory_cache)
+
+                def refresh_packages_while_counting():
+                    manifest.write_bytes(ET.tostring(new_manifest))
+                    sign_manifest()
+                    ordinary_control([dnf, "clean", "metadata"])
+                    ordinary_control([dnf, "--refresh", "-y", "makecache"])
+                    assert cached_manifests(advisory_cache) == advisory_manifests
+                    assert cached_manifests(normal_cache) != normal_manifests
+
+                exit_code, stdout, stderr = status_during(refresh_packages_while_counting)
+                checks.append(dict(phase="status-package-change-during-count", case="daemon-status",
+                                   passed=exit_code != 0 and "Package Cache" not in stdout
+                                   and "Package status inputs changed during the query" in stderr,
+                                   status=exit_code, value=(stdout + stderr)[-1200:]))
                 inspect_update_status("status-metadata-only", 0, False)
 
                 manifest.write_bytes(original_manifest)
@@ -515,8 +593,18 @@ with tempfile.TemporaryDirectory(prefix="omg-fedora-cache-scope-", dir="/tmp") a
                 ordinary_control([dnf, "clean", "metadata"])
                 ordinary_control([dnf, "--refresh", "-y", "makecache"])
                 inspect_update_status("status-metadata-restored", 1, False)
-                config.write_text(custom_config.replace("enabled=1", "enabled=0"))
-                (alternate / "etc/dnf/dnf.conf").write_text(config.read_text())
+                normal_manifests = cached_manifests(normal_cache)
+
+                def disable_repository_while_counting():
+                    alternate_repo.write_text(repo_config.replace("enabled=1", "enabled=0"))
+                    assert cached_manifests(normal_cache) == normal_manifests
+                    assert cached_manifests(advisory_cache) == advisory_manifests
+
+                exit_code, stdout, stderr = status_during(disable_repository_while_counting)
+                checks.append(dict(phase="status-repo-config-during-count", case="daemon-status",
+                                   passed=exit_code != 0 and "Package Cache" not in stdout
+                                   and "Package status inputs changed during the query" in stderr,
+                                   status=exit_code, value=(stdout + stderr)[-1200:]))
                 inspect_update_status("status-repository-disabled", 0, False)
                 assert checked([rpm, "--root", alternate, "-q", "--qf", "%{VERSION}", package]) == "0"
         except Exception:
@@ -533,5 +621,5 @@ assert inventory() == before
 report = dict(binaries=binaries, checks=checks, total=len(checks),
               passed=sum(entry["passed"] for entry in checks), host_unchanged=True)
 print(json.dumps(report))
-if report["passed"] != report["total"] or report["total"] != 253:
+if report["passed"] != report["total"] or report["total"] != 256:
     sys.exit(4)

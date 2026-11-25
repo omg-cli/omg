@@ -2,6 +2,8 @@
 //!
 //! Shows detailed daemon information including uptime, metrics, and health.
 
+#[cfg(unix)]
+use anyhow::Context as _;
 use anyhow::Result;
 
 #[cfg(unix)]
@@ -144,70 +146,68 @@ pub async fn run() -> Result<()> {
 
         // Get system status from daemon
         println!();
-        if let Ok(ResponseResult::Status(status)) = client.call(Request::Status { id: 0 }).await {
-            println!("  {}", style::header("Package Cache"));
-            let total_str = status.total_packages.to_string();
-            let explicit_str = status.explicit_packages.to_string();
-            let orphan_str = status.orphan_packages.to_string();
-            let updates_str = status.updates_available.to_string();
-            println!("    Total packages:     {}", style::info(&total_str));
-            println!("    Explicit packages:  {}", style::info(&explicit_str));
-            println!(
-                "    Orphan packages:    {}",
-                if status.orphan_packages > 0 {
-                    style::warning(&orphan_str)
-                } else {
-                    style::dim(&orphan_str)
-                }
-            );
-            println!(
-                "    Updates available:  {}",
-                if status.updates_available > 0 {
-                    style::warning(&updates_str)
-                } else {
-                    style::success("0")
-                }
-            );
-            match status.scanned_vulnerability_summary() {
-                Some((findings, unknown)) => {
-                    println!(
-                        "    Findings:           {}",
-                        if findings == 0 {
-                            style::info("0")
-                        } else {
-                            style::error(&findings.to_string())
-                        }
-                    );
-                    println!(
-                        "    Unassessed packages: {}",
-                        if unknown == 0 {
-                            style::info("0")
-                        } else {
-                            style::warning(&unknown.to_string())
-                        }
-                    );
-                }
-                None => println!("    Advisory coverage:  {}", style::dim("unreported")),
+        let response = client
+            .call(Request::Status { id: 0 })
+            .await
+            .context("Failed to get package cache status from daemon")?;
+        let ResponseResult::Status(status) = response else {
+            anyhow::bail!("Daemon returned an unexpected package status response");
+        };
+        println!("  {}", style::header("Package Cache"));
+        let total_str = status.total_packages.to_string();
+        let explicit_str = status.explicit_packages.to_string();
+        let orphan_str = status.orphan_packages.to_string();
+        let updates_str = status.updates_available.to_string();
+        println!("    Total packages:     {}", style::info(&total_str));
+        println!("    Explicit packages:  {}", style::info(&explicit_str));
+        println!(
+            "    Orphan packages:    {}",
+            if status.orphan_packages > 0 {
+                style::warning(&orphan_str)
+            } else {
+                style::dim(&orphan_str)
             }
+        );
+        println!(
+            "    Updates available:  {}",
+            if status.updates_available > 0 {
+                style::warning(&updates_str)
+            } else {
+                style::success("0")
+            }
+        );
+        match status.scanned_vulnerability_summary() {
+            Some((findings, unknown)) => {
+                println!(
+                    "    Findings:           {}",
+                    if findings == 0 {
+                        style::info("0")
+                    } else {
+                        style::error(&findings.to_string())
+                    }
+                );
+                println!(
+                    "    Unassessed packages: {}",
+                    if unknown == 0 {
+                        style::info("0")
+                    } else {
+                        style::warning(&unknown.to_string())
+                    }
+                );
+            }
+            None => println!("    Advisory coverage:  {}", style::dim("unreported")),
+        }
 
-            if !status.runtime_versions.is_empty() {
-                println!();
-                println!("  {}", style::header("Runtime Versions"));
-                for (name, version) in &status.runtime_versions {
-                    println!(
-                        "    {}: {}",
-                        style::runtime(&style::sanitize_terminal_text(name)),
-                        style::version(&style::sanitize_terminal_text(version))
-                    );
-                }
+        if !status.runtime_versions.is_empty() {
+            println!();
+            println!("  {}", style::header("Runtime Versions"));
+            for (name, version) in &status.runtime_versions {
+                println!(
+                    "    {}: {}",
+                    style::runtime(&style::sanitize_terminal_text(name)),
+                    style::version(&style::sanitize_terminal_text(version))
+                );
             }
-        } else {
-            // Metrics failures are reported above; do the same for the
-            // package-cache request instead of silently omitting the section.
-            println!(
-                "  {} Failed to get package cache status from daemon",
-                style::warning("⚠")
-            );
         }
 
         println!();

@@ -15,7 +15,7 @@ use tokio::net::UnixListener;
 use tokio_util::codec::{FramedWrite, LengthDelimitedCodec};
 use tokio_util::sync::CancellationToken;
 
-use super::handlers::{DaemonState, handle_request};
+use super::handlers::{DaemonState, StatusInputs, handle_request};
 use super::protocol::{Request, Response, error_codes};
 use crate::core::metrics::GLOBAL_METRICS;
 use crate::core::security::{AuditEventType, AuditSeverity, audit_log_nonblocking};
@@ -247,7 +247,7 @@ async fn run_with_status_path(
                     return;
                 }
             };
-            let scopes = state.status_scopes(true).await;
+            let scopes = state.status_scopes(StatusInputs::Complete).await;
             state
                 .runtime_versions
                 .write()
@@ -264,7 +264,7 @@ async fn run_with_status_path(
                     return;
                 }
             };
-            let Some(current) = state.status_scopes(true).await else {
+            let Some(current) = state.status_scopes(StatusInputs::Complete).await else {
                 return;
             };
             if current.packages != scopes.packages {
@@ -308,7 +308,7 @@ async fn run_with_status_path(
                 if let Err(error) = &scan {
                     tracing::warn!("Vulnerability scan failed during status refresh: {error}");
                 }
-                let Some(current) = state.status_scopes(true).await else {
+                let Some(current) = state.status_scopes(StatusInputs::Complete).await else {
                     return;
                 };
                 if current.packages != scopes.packages {

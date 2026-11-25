@@ -864,23 +864,28 @@ impl DnfPackageManager {
 
     pub(crate) fn status_scopes(
         repositories: &mut StatusRepositories,
+        include_advisories: bool,
     ) -> Result<crate::core::fast_status::StatusScopes> {
         use crate::core::fast_status::{StatusScope, StatusScopes};
         use sha2::{Digest as _, Sha256};
 
         let (location, state) = RpmDatabase::detect_with_state_dir(Path::new(HOST_SQLITE))?;
         let installed = Self::status_scope_for(&location, &state)?;
-        let (normal, advisory) =
-            repositories.revisions(&location.root, &Self::advisory_cache_dir())?;
+        let normal = repositories.package_revision(&location.root)?;
         let mut hash = Sha256::new();
         hash.update(b"OMG Fedora package status v1\0");
         hash.update(installed.0);
         hash.update(normal);
         let packages = StatusScope(hash.finalize_reset().into());
-        hash.update(b"OMG Fedora complete status v1\0");
-        hash.update(packages.0);
-        hash.update(advisory);
-        let complete = StatusScope(hash.finalize().into());
+        let complete = if include_advisories {
+            let advisory = repository_observation::advisory_revision(&Self::advisory_cache_dir())?;
+            hash.update(b"OMG Fedora complete status v1\0");
+            hash.update(packages.0);
+            hash.update(advisory);
+            StatusScope(hash.finalize().into())
+        } else {
+            packages
+        };
         Ok(StatusScopes {
             installed,
             packages,

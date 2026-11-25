@@ -114,6 +114,13 @@ impl RefreshDebounce {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum StatusInputs {
+    Installed,
+    Packages,
+    Complete,
+}
+
 enum SystemBackendAccess {
     Isolated,
     Production {
@@ -516,7 +523,7 @@ impl DaemonState {
     }
 
     pub(super) async fn status_scope(&self) -> Option<StatusScope> {
-        self.status_scopes(false)
+        self.status_scopes(StatusInputs::Installed)
             .await
             .map(|scopes| scopes.installed)
     }
@@ -530,7 +537,7 @@ impl DaemonState {
     )]
     pub(super) async fn status_scopes(
         &self,
-        #[cfg_attr(not(feature = "fedora"), allow(unused_variables))] include_repositories: bool,
+        #[cfg_attr(not(feature = "fedora"), allow(unused_variables))] inputs: StatusInputs,
     ) -> Option<StatusScopes> {
         #[cfg(feature = "fedora")]
         if self.uses_production_backends() && self.package_manager.name() == "dnf" {
@@ -543,14 +550,16 @@ impl DaemonState {
                 let repositories = Arc::clone(&self.status_repositories);
                 tokio::task::spawn_blocking(move || {
                     let _permit = permit;
-                    if include_repositories {
-                        let mut repositories = repositories
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        DnfPackageManager::status_scopes(&mut repositories)
-                    } else {
-                        DnfPackageManager::status_scope().map(StatusScopes::installed)
+                    if inputs == StatusInputs::Installed {
+                        return DnfPackageManager::status_scope().map(StatusScopes::installed);
                     }
+                    let mut repositories = repositories
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    DnfPackageManager::status_scopes(
+                        &mut repositories,
+                        inputs == StatusInputs::Complete,
+                    )
                 })
                 .await
                 .context("DNF status observation task failed")?
@@ -1365,10 +1374,8 @@ async fn handle_status(state: Arc<DaemonState>, id: RequestId) -> Response {
     // METRICS: Track status requests
     GLOBAL_METRICS.inc_status_requests();
 
-    let scope = state
-        .status_scopes(true)
-        .await
-        .map(|scopes| scopes.complete);
+    let scopes = state.status_scopes(StatusInputs::Complete).await;
+    let scope = scopes.map(|scopes| scopes.complete);
     if let Some(cached) = scope.and_then(|scope| state.cache.get_scoped_status(scope)) {
         // METRICS: Cache hit (memory)
         GLOBAL_METRICS.inc_cache_hits();
@@ -1416,13 +1423,20 @@ async fn handle_status(state: Arc<DaemonState>, id: RequestId) -> Response {
     // 3. Query the selected backend. Production uses the optimized native
     // status paths; dependency-injected states stay behind the package-manager
     // interface and never access host package databases.
-    let status_result = state.status_counts().await;
-    if scope.is_some()
-        && state
-            .status_scopes(true)
+    let packages = match scopes {
+        Some(scopes) => Some(scopes.packages),
+        None => state
+            .status_scopes(StatusInputs::Packages)
             .await
-            .map(|scopes| scopes.complete)
-            != scope
+            .map(|scopes| scopes.packages),
+    };
+    let status_result = state.status_counts().await;
+    if packages.is_some()
+        && state
+            .status_scopes(StatusInputs::Packages)
+            .await
+            .map(|scopes| scopes.packages)
+            != packages
     {
         return internal_error(id, "Package status inputs changed during the query");
     }

@@ -79,27 +79,17 @@ pub(crate) struct StatusRepositories {
 }
 
 impl StatusRepositories {
-    pub(super) fn revisions(
-        &mut self,
-        root: &Path,
-        advisory_cache: &Path,
-    ) -> Result<([u8; 32], [u8; 32])> {
+    pub(super) fn package_revision(&mut self, root: &Path) -> Result<[u8; 32]> {
         if let Some(paths) = &self.paths
             && paths.current_for(root)?
         {
-            return Ok((
-                paths.paths.fingerprint()?,
-                advisory_revision(advisory_cache)?,
-            ));
+            return paths.paths.fingerprint();
         }
 
         let paths = ResolvedRepositoryPaths::capture(root)?;
-        let revisions = (
-            paths.paths.fingerprint()?,
-            advisory_revision(advisory_cache)?,
-        );
+        let revision = paths.paths.fingerprint()?;
         self.paths = Some(paths);
-        Ok(revisions)
+        Ok(revision)
     }
 }
 
@@ -141,10 +131,13 @@ impl RepositoryPaths {
         } else {
             root
         };
-        for directory in reported_paths(settings, "reposdir")? {
-            self.directories
-                .push((relative_to_root(config_root, &directory), Some("repo")));
-        }
+        // DNF5 has already applied installroot to reposdir and the cache
+        // directories by the time it dumps the main configuration.
+        self.directories.extend(
+            reported_paths(settings, "reposdir")?
+                .into_iter()
+                .map(|directory| (directory, Some("repo"))),
+        );
         for directory in reported_paths(settings, "varsdir")? {
             self.directories
                 .push((relative_to_root(config_root, &directory), None));
@@ -164,8 +157,7 @@ impl RepositoryPaths {
 
         // DNF may use either the caller's cache or valid system metadata.
         for option in ["cachedir", "system_cachedir"] {
-            let directory = Path::new(reported_setting(settings, option)?);
-            self.caches.push(relative_to_root(root, directory));
+            self.caches.push(parse_absolute_setting(settings, option)?);
         }
         Ok(())
     }
@@ -230,7 +222,7 @@ fn cached_manifests(directory: &Path) -> Result<Vec<PathBuf>> {
     Ok(manifests)
 }
 
-fn advisory_revision(cache: &Path) -> Result<[u8; 32]> {
+pub(super) fn advisory_revision(cache: &Path) -> Result<[u8; 32]> {
     const MAX_MANIFEST_BYTES: usize = 8 * 1024 * 1024;
 
     let mut manifests = cached_manifests(cache)?;
