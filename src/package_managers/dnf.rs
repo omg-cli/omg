@@ -404,6 +404,16 @@ struct VersionedPackage {
     repository: String,
 }
 
+impl VersionedPackage {
+    fn full_nevra(&self) -> String {
+        let epoch = if self.version.contains(':') { "" } else { "0:" };
+        format!(
+            "{}-{epoch}{}.{}",
+            self.name, self.version, self.architecture
+        )
+    }
+}
+
 /// Why a package was installed
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InstallReason {
@@ -2358,11 +2368,24 @@ impl DnfPackageManager {
         }
     }
 
-    pub(crate) async fn orphan_packages() -> Result<Vec<String>> {
+    async fn unneeded_packages() -> Result<Vec<VersionedPackage>> {
         let output = Self::repository_output(RepositoryQuery::Unneeded).await?;
-        Ok(Self::parse_versioned_packages(&output)?
+        Self::parse_versioned_packages(&output)
+    }
+
+    pub(crate) async fn orphan_packages() -> Result<Vec<String>> {
+        Ok(Self::unneeded_packages()
+            .await?
             .into_iter()
             .map(|package| format!("{}.{}", package.name, package.architecture))
+            .collect())
+    }
+
+    pub(crate) async fn orphan_builds() -> Result<Vec<String>> {
+        Ok(Self::unneeded_packages()
+            .await?
+            .iter()
+            .map(VersionedPackage::full_nevra)
             .collect())
     }
 
@@ -2707,9 +2730,8 @@ impl PackageManager for DnfPackageManager {
             let (orphans, updates) = if fast {
                 (0, 0)
             } else {
-                let unneeded = Self::repository_output(RepositoryQuery::Unneeded).await?;
                 (
-                    Self::parse_versioned_packages(&unneeded)?.len(),
+                    Self::unneeded_packages().await?.len(),
                     self.list_updates().await?.len(),
                 )
             };

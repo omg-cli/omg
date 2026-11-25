@@ -1807,10 +1807,17 @@ mod dnf_operations {
         manager.install(&packages).await?;
         let verified = (|| -> Result<()> {
             let native = std::process::Command::new("rpm")
-                .args(["-q", "tree", "--qf", "%{EPOCHNUM}:%{VERSION}-%{RELEASE}"])
+                .args([
+                    "-q",
+                    "tree",
+                    "--qf",
+                    "%{EPOCHNUM}:%{VERSION}-%{RELEASE}\t%{NAME}-%{EPOCHNUM}:%{VERSION}-%{RELEASE}.%{ARCH}",
+                ])
                 .output()?;
             anyhow::ensure!(native.status.success(), "Cannot read fixture version");
-            let version = String::from_utf8(native.stdout)?;
+            let native = std::str::from_utf8(&native.stdout)?;
+            let (version, full_identity) =
+                native.split_once('\t').context("Native RPM identity")?;
             let mark = std::process::Command::new("sudo")
                 .args(["-n", "dnf", "-y", "mark", "dependency", "tree"])
                 .stdin(std::process::Stdio::null())
@@ -1828,6 +1835,13 @@ mod dnf_operations {
             anyhow::ensure!(
                 preview.status.success() && installed()? && history.load()?.is_empty(),
                 "Preview mutated state or history"
+            );
+            let preview_stdout = String::from_utf8_lossy(&preview.stdout);
+            anyhow::ensure!(
+                preview_stdout
+                    .lines()
+                    .any(|line| line.trim() == full_identity),
+                "Preview omitted the full RPM identity: {preview_stdout}"
             );
             let decline = run(&["clean", "--orphans"], b"n\n")?;
             anyhow::ensure!(
@@ -1855,7 +1869,7 @@ mod dnf_operations {
             anyhow::ensure!(
                 records[1].changes.len() == 1
                     && records[1].changes[0].name == "tree"
-                    && records[1].changes[0].old_version.as_deref() == Some(version.as_str())
+                    && records[1].changes[0].old_version.as_deref() == Some(version)
                     && records[1].changes[0].new_version.is_none(),
                 "Cleanup history differs from native removal"
             );
