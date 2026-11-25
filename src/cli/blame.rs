@@ -392,10 +392,15 @@ mod ordering_tests {
         ]);
 
         let report = history_report(&[entry], "glibc");
-        let [Cmd::View(View::Spacer), Cmd::View(View::Card(title, rows))] = report.as_slice()
-        else {
-            panic!("expected one history card");
-        };
+        assert_eq!(report.len(), 2);
+        assert!(matches!(report.first(), Some(Cmd::View(View::Spacer))));
+        let (title, rows) = report
+            .iter()
+            .find_map(|command| match command {
+                Cmd::View(View::Card(title, rows)) => Some((title, rows)),
+                _ => None,
+            })
+            .expect("expected one history card");
         assert_eq!(title, "OMG Transaction History (1)");
         assert_eq!(rows.len(), 4);
         assert!(rows[0].contains("→ 3.0"));

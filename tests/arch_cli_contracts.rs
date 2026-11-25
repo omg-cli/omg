@@ -32,6 +32,120 @@ fn output_text(output: &CommandResult) -> String {
 }
 
 #[cfg(unix)]
+#[tokio::test]
+async fn native_daemon_supplies_info_and_prompt_counters() -> Result<()> {
+    use futures::{SinkExt, StreamExt};
+    use omg_lib::daemon::protocol::{
+        DetailedPackageInfo, ExplicitResult, Request, Response, ResponseResult, StatusResult,
+        WirePackageSource, encode_frame, split_frame,
+    };
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::time::Duration;
+    use tokio_util::codec::{Framed, LengthDelimitedCodec};
+
+    if !common::native_arch_fixture_available() {
+        return Ok(());
+    }
+    let project = common::TestProject::new();
+    prepare_native_size_fixture(&project, &[], &[])?;
+    let before = private_fixture_state(project.pacman_root.path())?;
+    let directory = tempfile::Builder::new()
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir_in("/tmp")?;
+    let socket = directory.path().join("daemon.sock");
+    omg_lib::core::client::validate_socket_with_context(&socket)?;
+    let listener = tokio::net::UnixListener::bind(&socket)?;
+    let server = tokio::spawn(async move {
+        for command in ["application", "repository-only", "oc", "ec", "explicit"] {
+            let (stream, _) =
+                tokio::time::timeout(Duration::from_secs(5), listener.accept()).await??;
+            let mut frames = Framed::new(stream, LengthDelimitedCodec::new());
+            let frame = tokio::time::timeout(Duration::from_secs(2), frames.next())
+                .await?
+                .context("missing private daemon request")??;
+            let (_, payload) = split_frame(&frame)?;
+            let request: Request = bitcode::deserialize(payload)?;
+            let id = request.id();
+            let result = match (command, request) {
+                (name, Request::Info { package, .. }) if package == name => {
+                    ResponseResult::Info(DetailedPackageInfo {
+                        name: name.to_owned(),
+                        version: "9.9-1".into(),
+                        description: "Private daemon info fixture".into(),
+                        url: String::new(),
+                        size: 1024,
+                        download_size: 512,
+                        repo: "private-fixture".into(),
+                        depends: Vec::new(),
+                        licenses: Vec::new(),
+                        source: WirePackageSource::Official,
+                    })
+                }
+                ("oc", Request::Status { .. }) => ResponseResult::Status(StatusResult {
+                    total_packages: 9,
+                    explicit_packages: 5,
+                    orphan_packages: 3,
+                    updates_available: 2,
+                    security_vulnerabilities: 0,
+                    vulnerabilities_scanned: false,
+                    security_unknown_packages: None,
+                    runtime_versions: Vec::new(),
+                }),
+                ("ec", Request::ExplicitCount { .. }) => ResponseResult::ExplicitCount(5),
+                ("explicit", Request::Explicit { .. }) => {
+                    ResponseResult::Explicit(ExplicitResult {
+                        packages: vec!["private-explicit-fixture".into()],
+                    })
+                }
+                (command, request) => {
+                    anyhow::bail!("unexpected private daemon request for {command}: {request:?}")
+                }
+            };
+            frames
+                .send(encode_frame(&Response::Success { id, result })?.into())
+                .await?;
+        }
+        Ok::<_, anyhow::Error>(())
+    });
+    let results = tokio::task::spawn_blocking(move || -> Result<_> {
+        let text = project.run_native_arch_daemon_query(&socket, &["info", "--", "application"]);
+        let json =
+            project.run_native_arch_daemon_query(&socket, &["--json", "info", "repository-only"]);
+        for (command, expected) in [
+            ("oc", "3"),
+            ("ec", "5"),
+            ("explicit", "· private-explicit-fixture"),
+        ] {
+            let output = project.run_native_arch_daemon_query(&socket, &[command]);
+            assert!(output.success, "{}", output_text(&output));
+            assert!(
+                output.stdout.lines().any(|line| line.trim() == expected),
+                "{}",
+                output.stdout
+            );
+        }
+        assert_eq!(private_fixture_state(project.pacman_root.path())?, before);
+        Ok((text, json))
+    })
+    .await??;
+    server.await??;
+    let (text, json) = results;
+    assert!(text.success, "{}", output_text(&text));
+    assert!(text.stdout.contains("Private daemon info fixture"));
+    assert!(text.stdout.contains("9.9-1"));
+    assert!(text.stdout.lines().any(|line| {
+        line.trim_start().starts_with("Installed") && line.trim_end().ends_with("yes")
+    }));
+    assert!(json.success, "{}", output_text(&json));
+    let json: serde_json::Value = serde_json::from_str(&json.stdout)?;
+    assert_eq!(json["description"], "Private daemon info fixture");
+    assert_eq!(json["name"], "repository-only");
+    assert_eq!(json["version"], "9.9-1");
+    assert_eq!(json["installed"], false);
+    Ok(())
+}
+
+#[cfg(unix)]
 #[test]
 fn native_status_without_daemon_preserves_unknown_security() -> Result<()> {
     use std::os::unix::fs::PermissionsExt as _;
@@ -47,7 +161,7 @@ fn native_status_without_daemon_preserves_unknown_security() -> Result<()> {
         .tempdir_in("/tmp")?;
     let socket = directory.path().join("absent.sock");
     for args in [&["status"][..], &["status", "--fast"][..]] {
-        let output = project.run_native_arch_status(&socket, args);
+        let output = project.run_native_arch_daemon_query(&socket, args);
         assert!(output.success, "{}", output_text(&output));
         let text = output_text(&output);
         assert!(text.contains("Advisory coverage unreported"), "{text}");
@@ -192,7 +306,7 @@ fn native_status_preserves_daemon_advisory_coverage() -> Result<()> {
                 }
                 Ok(())
             });
-            let output = project.run_native_arch_status(&socket, args);
+            let output = project.run_native_arch_daemon_query(&socket, args);
             let served = server.join().expect("private status server panicked");
             assert!(output.success, "{}", output_text(&output));
             served.with_context(|| format!("native status output: {}", output_text(&output)))?;

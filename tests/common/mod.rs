@@ -1212,10 +1212,14 @@ impl TestProject {
     }
 
     #[cfg(feature = "arch")]
-    pub fn run_native_arch_status(&self, socket: &Path, args: &[&str]) -> CommandResult {
+    pub fn run_native_arch_daemon_query(&self, socket: &Path, args: &[&str]) -> CommandResult {
         assert!(matches!(
             args,
-            ["status" | "daemon-status"] | ["status", "--fast"]
+            ["status" | "daemon-status"]
+                | ["status", "--fast"]
+                | ["info", "--", _]
+                | ["--json", "info", _]
+                | ["oc" | "ec" | "explicit"]
         ));
         self.run_native_arch_readonly_report(
             args,

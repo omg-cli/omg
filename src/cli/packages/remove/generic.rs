@@ -89,3 +89,37 @@ pub(super) fn report_preview(
         ui::print_dry_run_footer();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generic_preview_reports_selected_installed_targets_without_removing_them() -> Result<()> {
+        const NAME: &str = "cli::packages::remove::generic::tests::generic_preview_reports_selected_installed_targets_without_removing_them";
+        if crate::core::testing::run_isolated_test(NAME) {
+            return Ok(());
+        }
+        let fixture = tempfile::tempdir()?;
+        temp_env::with_vars(
+            [
+                ("OMG_TEST_MODE", Some(std::ffi::OsStr::new("1"))),
+                ("OMG_TEST_DISTRO", Some(std::ffi::OsStr::new("arch"))),
+                ("OMG_DATA_DIR", Some(fixture.path().as_os_str())),
+            ],
+            || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?
+                    .block_on(async {
+                        let manager = crate::package_managers::get_package_manager()?;
+                        let packages = ["git".to_owned()];
+                        manager.install(&packages).await?;
+                        assert_eq!(preview(&packages, true).await?, 1);
+                        assert!(manager.is_installed("git").await?);
+                        Ok(())
+                    })
+            },
+        )
+    }
+}
