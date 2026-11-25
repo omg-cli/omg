@@ -11,6 +11,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import zipfile
 
 REPOSITORY = "omg-cli/omg"
@@ -59,6 +60,38 @@ def validate_run(run, commit, event_name, workflow_id, base=False):
     if base and (run.get("head_branch") != "main" or run.get("status") != "completed"
                  or run.get("conclusion") != "success"):
         raise ValueError("Base coverage must come from a successful main push")
+
+
+def successful_base_run(commit, workflow_id):
+    endpoint = (f"repos/{REPOSITORY}/actions/workflows/coverage.yml/runs"
+                f"?head_sha={commit}&branch=main&event=push&per_page=100")
+    deadline = time.monotonic() + 240
+    waiting = False
+    while True:
+        runs = api(endpoint)["workflow_runs"]
+        for run in runs:
+            validate_run(run, commit, "push", workflow_id)
+            if run.get("head_branch") != "main" or type(run.get("id")) is not int:
+                raise ValueError("Unexpected main coverage run identity")
+        successful = [run for run in runs if run.get("status") == "completed"
+                      and run.get("conclusion") == "success"]
+        if successful:
+            base = max(successful, key=lambda run: run["id"])
+            validate_run(base, commit, "push", workflow_id, base=True)
+            return base
+
+        pending = [run for run in runs if run.get("status") in
+                   {"requested", "queued", "pending", "waiting", "in_progress"}]
+        if not pending:
+            raise ValueError("No successful main coverage run for the exact base commit")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(f"Main coverage for {commit} did not finish in time")
+        if not waiting:
+            run_ids = ", ".join(str(run["id"]) for run in pending)
+            print(f"Waiting for exact main coverage at {commit} (runs {run_ids})", flush=True)
+            waiting = True
+        time.sleep(min(10, remaining))
 
 
 def validate_artifact(artifacts, run_id, commit, name="coverage-lcov"):
@@ -234,12 +267,7 @@ def main():
         raise ValueError("Current coverage run attempt no longer matches this job")
     workflow_id = api(f"repos/{REPOSITORY}/actions/workflows/coverage.yml")["id"]
     validate_run(current, head_sha, event_name, workflow_id)
-    runs = api(f"repos/{REPOSITORY}/actions/workflows/coverage.yml/runs"
-               f"?head_sha={base_sha}&event=push&status=success&per_page=100")["workflow_runs"]
-    if not runs:
-        raise ValueError("No successful main coverage run for the exact base commit")
-    base = max(runs, key=lambda run: run["id"])
-    validate_run(base, base_sha, "push", workflow_id, base=True)
+    base = successful_base_run(base_sha, workflow_id)
     root = Path("coverage-comparison")
     root.mkdir(exist_ok=False)
     base_pair, base_attempt, base_job = coverage_artifacts(base, base_sha)
