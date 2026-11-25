@@ -54,9 +54,27 @@ def updateinfo(identity):
     return ET.tostring(root, encoding="unicode", xml_declaration=True) + "\n"
 
 
-def verify_native_result(result, fail=False):
+def verify_signature_rejection(result):
+    _require(
+        result.returncode == 1
+        and "Failed to query native security advisories" in result.stderr
+        and "signature" in result.stderr.lower()
+        and not any(summary in result.stdout for summary in ("No vulnerabilities found", "No findings were reported")),
+        "tampered metadata did not fail closed",
+    )
+
+
+def verify_native_result(result, fail=False, *, installed=None):
     _require(result.returncode == int(fail), "wrong actual native audit exit")
     text = re.sub(r"\x1b\[[0-9;]*m", "", result.stdout)
+    if installed is not None:
+        packages = sum(row["name"] != "gpg-pubkey" or row["arch"] != "(none)" for row in installed)
+        coverage = re.findall(
+            r"Advisory scope: (\d+) assessed package\(s\), (\d+) package\(s\) with unknown coverage;",
+            text,
+        )
+        _require(packages > 1 and coverage == [("1", str(packages - 1))],
+                 "native advisory coverage differs from the installed package inventory")
     _require(re.findall(r"^  (\S+) \(1 issues\):$", text, re.M) == ["glibc"], 'native Fedora advisory fixture check failed')
     _require("Found 1 vulnerabilities (1 high severity)" in text, 'native Fedora advisory fixture check failed')
     _require(re.findall(r"^    → (\S+) - .*\[Advisory severity: (\S+)\]$", text, re.M) == [("OMG-QEMU-FEDORA-616", "Important")], 'native Fedora advisory fixture check failed')
@@ -216,10 +234,10 @@ def main():
     try:
         repomd.write_bytes(original_repomd+b'\n<!-- invalidates exact detached signature -->\n')
         rejected = product('untrusted-metadata', ['audit','scan'], 1)
-        _require('Failed to query native security advisories' in rejected.stderr and 'signature' in rejected.stderr.lower() and 'No vulnerabilities found' not in rejected.stdout, 'native Fedora advisory fixture check failed')
+        verify_signature_rejection(rejected)
         repomd.write_bytes(original_repomd)
         for label, argv, code in [('direct-plain',['audit','scan'],0),('direct-findings',['audit','scan','--fail-on-findings'],1)]:
-            verify_native_result(product(label,argv,code),code==1)
+            verify_native_result(product(label,argv,code),code==1,installed=rows)
         daemon_env = dict(env); daemon_env.pop('OMG_DISABLE_DAEMON')
         with (logs/'daemon.log').open('wb') as output:
             daemon = subprocess.Popen([daemon_binary], env=daemon_env, user=uid, group=gid, extra_groups=[], stdout=output, stderr=subprocess.STDOUT)
@@ -237,7 +255,7 @@ def main():
                 return int(values[0])
             initial=counter('daemon-before')
             for label,argv,code in [('daemon-plain',['audit','scan'],0),('daemon-findings',['audit','scan','--fail-on-findings'],1)]:
-                verify_native_result(product(label,argv,code,daemon_env),code==1)
+                verify_native_result(product(label,argv,code,daemon_env),code==1,installed=rows)
             receipt['daemon_requests_delta']=counter('daemon-after')-initial
             _require(receipt['daemon_requests_delta']==2, 'native Fedora advisory fixture check failed')
         receipt['native_state_after']=state(); receipt['native_state_unchanged']=receipt['native_state_after']==before

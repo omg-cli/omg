@@ -36,7 +36,7 @@ class FedoraEvidenceTests(unittest.TestCase):
                 member = tarfile.TarInfo('omg-v0.1.224-x86_64-linux-fedora/'+name); member.size = len(data)
                 archive.addfile(member, io.BytesIO(data))
         self.identity = {'name': 'glibc', 'epoch': '0', 'version': '2.43', 'release': '2.fc44', 'arch': 'x86_64'}
-        self.native = 'glibc\t0\t2.43\t2.fc44\tx86_64\nrpm\t0\t6.0.2\t1.fc44\tx86_64\n'
+        self.native = 'glibc\t0\t2.43\t2.fc44\tx86_64\ngpg-pubkey\t0\t1234\t1\t(none)\nrpm\t0\t6.0.2\t1.fc44\tx86_64\n'
         state = {'installed': self.native, 'explicit': 'rpm\n', 'reason_sha256': {'packages.toml': 'a'*64}}
         original = '[main]\ninstall_weak_deps=True\n'; self.put('native-dnf-before.conf', original)
         config_hash = hashlib.sha256(original.encode()).hexdigest()
@@ -64,7 +64,7 @@ class FedoraEvidenceTests(unittest.TestCase):
         self.put('native-advisory-list.stdout', json.dumps([{'name': 'OMG-QEMU-FEDORA-616', 'type': 'security', 'severity': 'Important', 'nevra': 'glibc-2.43-2.fc44.omgqemu616.x86_64'}]))
         self.put('native-advisory-info.stdout', json.dumps([{'Name': 'OMG-QEMU-FEDORA-616', 'Severity': 'Important', 'Type': 'security', 'references': [{'Id': 'CVE-OMG-QEMU-616', 'Type': 'cve', 'Url': 'https://example.invalid/omg-qemu-616'}], 'collections': {'packages': ['glibc-2.43-2.fc44.omgqemu616.x86_64']}}]))
         self.put('native-repository.stdout', json.dumps([{'id': 'omg-qemu-616', 'is_enabled': True, 'skip_if_unavailable': False, 'repo_gpgcheck': True, 'pkg_gpgcheck': True, 'available_pkgs': 0, 'pkgs': 0, 'base_url': ['file:///tmp/omg-fedora-advisory-qemu-616/repo'], 'gpg_key': ['file:///tmp/omg-fedora-advisory-qemu-616/fixture-key.asc']}]))
-        output = 'Found 1 vulnerabilities (1 high severity)\n  glibc (1 issues):\n    → OMG-QEMU-FEDORA-616 - Synthetic native DNF advisory [Advisory severity: Important]\n'
+        output = 'Advisory scope: 1 assessed package(s), 1 package(s) with unknown coverage; absence of findings does not establish safety.\nFound 1 vulnerabilities (1 high severity)\n  glibc (1 issues):\n    → OMG-QEMU-FEDORA-616 - Synthetic native DNF advisory [Advisory severity: Important]\n'
         for phase in ('direct-plain', 'direct-findings', 'daemon-plain', 'daemon-findings', 'untrusted-metadata', 'daemon-before', 'daemon-after'):
             metrics = phase in ('daemon-before', 'daemon-after'); finding = phase.endswith('findings')
             self.receipt['product_results'][phase] = {'argv': ['metrics'] if metrics else ['audit', 'scan']+(['--fail-on-findings'] if finding else []), 'exit_code': int(finding or phase=='untrusted-metadata')}
@@ -109,6 +109,18 @@ class FedoraEvidenceTests(unittest.TestCase):
         try: admitted = self.check()
         except ValueError as error: self.fail('complete native metadata must replay: '+str(error))
         self.assertEqual(admitted, self.receipt)
+
+    def test_reported_coverage_must_match_native_inventory(self):
+        self.check()
+        path = self.evidence/'direct-findings.stdout'
+        valid = path.read_text()
+        for invalid in (
+                valid.split('\n', 1)[1],
+                valid.replace('1 assessed package(s)', '2 assessed package(s)'),
+                valid.replace('1 package(s) with unknown coverage', '2 package(s) with unknown coverage')):
+            with self.subTest(output=invalid), self.assertRaisesRegex(ValueError, 'coverage'):
+                path.write_text(invalid)
+                self.check()
 
     @unittest.skipUnless(shutil.which('bash') and shutil.which('install'), 'requires Linux evidence-copy tools')
     def test_guest_copy_loop_preserves_complete_native_advisory_evidence(self):
@@ -214,6 +226,12 @@ for result, fail in [(SimpleNamespace(returncode=0, stdout="No vulnerabilities f
             original = (self.evidence/name).read_bytes(); self.put(name, replacement)
             with self.subTest(name=name), self.assertRaises(ValueError): self.check()
             self.put(name, original)
+
+    def test_rejected_signature_cannot_produce_a_no_findings_summary(self):
+        self.check()
+        self.put('untrusted-metadata.stdout', 'No findings were reported; advisory coverage is incomplete.\n')
+        with self.assertRaisesRegex(ValueError, 'did not fail closed'):
+            self.check()
 
     def test_native_command_failures_and_incomplete_records_are_refused(self):
         for label in self.commands:
