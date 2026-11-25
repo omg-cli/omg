@@ -6,6 +6,7 @@ import os
 import sys
 import subprocess
 import tempfile
+import time
 import importlib.util
 from pathlib import Path
 import unittest
@@ -62,6 +63,37 @@ class BaseCoverageTests(unittest.TestCase):
             run[key] = value
             with self.subTest(key=key), self.assertRaises(ValueError):
                 coverage.validate_run(run, SHA, "push", 123, base=True)
+
+    def test_waits_for_the_exact_running_main_baseline(self):
+        completed = self.run_fixture()
+        pending = dict(completed, status="in_progress", conclusion=None)
+        with patch.object(coverage, "api", side_effect=[
+                {"workflow_runs": [pending]}, {"workflow_runs": [completed]}]) as request:
+            with patch.object(time, "sleep") as sleep:
+                self.assertEqual(coverage.successful_base_run(SHA, 123), completed)
+        sleep.assert_called_once()
+        endpoint = request.call_args.args[0]
+        self.assertIn(f"head_sha={SHA}", endpoint)
+        self.assertIn("branch=main", endpoint)
+        self.assertIn("event=push", endpoint)
+
+    def test_does_not_wait_for_missing_failed_or_substituted_baseline(self):
+        failed = dict(self.run_fixture(), conclusion="failure")
+        pending = dict(self.run_fixture(), status="queued", conclusion=None)
+        for runs in ([], [failed], [dict(pending, head_sha="b" * 40)],
+                     [dict(pending, head_branch="feature")]):
+            with self.subTest(runs=runs), patch.object(coverage, "api", return_value={"workflow_runs": runs}):
+                with patch.object(time, "sleep") as sleep, self.assertRaises(ValueError):
+                    coverage.successful_base_run(SHA, 123)
+                sleep.assert_not_called()
+
+    def test_wait_for_running_baseline_is_bounded(self):
+        pending = dict(self.run_fixture(), status="in_progress", conclusion=None)
+        with patch.object(coverage, "api", return_value={"workflow_runs": [pending]}):
+            with patch.object(time, "monotonic", side_effect=[0, 1000]), \
+                    patch.object(time, "sleep") as sleep, self.assertRaises(TimeoutError):
+                coverage.successful_base_run(SHA, 123)
+            sleep.assert_not_called()
 
     def test_current_run_can_be_in_progress_while_its_result_job_executes(self):
         run = self.run_fixture()
