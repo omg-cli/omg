@@ -707,6 +707,51 @@ git() { printf '%040d\\n' 1; }
                         self.assertNotEqual(result.returncode, 0)
                         self.assertFalse(summary.exists())
 
+    @unittest.skipIf(os.name == 'nt', 'native smoke commands need executable POSIX shims')
+    def test_distro_e2e_reuses_metadata_prepared_by_the_build(self):
+        smoke = ROOT / 'scripts/distro-e2e.sh'
+        prepare = step_script('distro-e2e.yml', 'Install distro build prerequisites and mold linker')
+        self.assertIn('pacman -Syu --noconfirm --needed base-devel', prepare)
+        self.assertIn('apt-get update -qq', prepare)
+        self.assertIn('dnf --refresh install -y', prepare)
+        workflow = (WORKFLOWS / 'distro-e2e.yml').read_text(encoding='utf-8')
+        self.assertIn('bash scripts/distro-e2e.sh "$MATRIX_DISTRO" "./target/ci/omg" --metadata-ready', workflow)
+        for distro, refresh, package in [
+            ('arch', 'pacman -Sy --noconfirm', 'pacman'),
+            ('debian-trixie', 'apt-get update -qq', 'bash'),
+            ('fedora', 'dnf makecache -q', 'bash'),
+        ]:
+            for ready in (False, True):
+                with self.subTest(distro=distro, ready=ready), tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    for manager in ('pacman', 'apt-get', 'dnf'):
+                        path = root / manager
+                        path.write_text('#!/usr/bin/env bash\nprintf "%s %s\\n" "${0##*/}" "$*" >> "$CALLS"\n')
+                        path.chmod(0o755)
+                    binary = root / 'omg'
+                    binary.write_text(textwrap.dedent('''\
+                        #!/usr/bin/env bash
+                        printf 'omg %s\\n' "$*" >> "$CALLS"
+                        case "$1" in
+                          search) printf '%s\\n' "$2" ;;
+                          info) printf 'Name: %s\\n' "$2" ;;
+                          outdated) printf '[]\\n' ;;
+                        esac
+                        '''))
+                    binary.chmod(0o755)
+                    calls = root / 'calls'
+                    args = [BASH, str(smoke), distro, str(binary)]
+                    if ready:
+                        args.append('--metadata-ready')
+                    result = subprocess.run(args, cwd=root, env=dict(os.environ, CALLS=str(calls),
+                                            PATH=f'{root}{os.pathsep}{os.environ["PATH"]}'),
+                                            capture_output=True, text=True, timeout=10)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    search = f'omg search {package}' + (' --no-aur' if distro == 'arch' else '') + ' --limit 5'
+                    expected = ['omg --version'] + ([] if ready else [refresh])
+                    expected += [search, f'omg info {package}', 'omg status', 'omg outdated --json', 'omg doctor']
+                    self.assertEqual(calls.read_text().splitlines(), expected)
+
     def test_region_artifact_survives_downstream_comparison_failure_with_short_retention(self):
         text = (WORKFLOWS / 'coverage.yml').read_text()
         for name in ('Generate region evidence', 'Preserve region evidence'):
