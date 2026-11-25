@@ -100,6 +100,20 @@ impl RpmFileIdentity {
             changed: (metadata.ctime(), metadata.ctime_nsec()),
         }))
     }
+
+    fn hash_generation(self, hash: &mut sha2::Sha256, include_ctime: bool) {
+        use sha2::Digest as _;
+
+        hash.update(self.device.to_le_bytes());
+        hash.update(self.inode.to_le_bytes());
+        hash.update(self.size.to_le_bytes());
+        hash.update(self.modified.0.to_le_bytes());
+        hash.update(self.modified.1.to_le_bytes());
+        if include_ctime {
+            hash.update(self.changed.0.to_le_bytes());
+            hash.update(self.changed.1.to_le_bytes());
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -827,24 +841,64 @@ impl DnfPackageManager {
     }
 
     pub(crate) fn status_scope() -> Result<crate::core::fast_status::StatusScope> {
-        use sha2::{Digest as _, Sha256};
-        use std::os::unix::fs::MetadataExt as _;
+        let (location, state) = RpmDatabase::detect_with_state_dir(Path::new(HOST_SQLITE))?;
+        Self::status_scope_for(&location, &state)
+    }
 
-        let location = RpmDatabase::detect(Path::new(HOST_SQLITE))?;
-        let identity = std::fs::metadata(&location.sqlite)
+    fn status_scope_for(
+        location: &RpmDatabase,
+        state: &Path,
+    ) -> Result<crate::core::fast_status::StatusScope> {
+        use sha2::{Digest as _, Sha256};
+
+        let identity = RpmDatabaseIdentity::read(&location.sqlite)
             .context("Cannot identify the RPM database for cached status")?;
-        anyhow::ensure!(
-            identity.is_file(),
-            "RPM status database must be a regular file"
-        );
         let mut hash = Sha256::new();
-        hash.update(b"OMG Fedora status database v1\0");
-        hash.update(location.root.as_os_str().as_encoded_bytes());
+        hash.update(b"OMG Fedora status inputs v2\0");
+        for path in [location.root.as_path(), location.sqlite.as_path(), state] {
+            hash.update(path.as_os_str().as_encoded_bytes());
+            hash.update([0]);
+        }
+        identity.database.hash_generation(&mut hash, true);
+        if let Some(wal) = identity.wal.filter(|wal| wal.size != 0) {
+            // Read-only SQLite opens can create an empty WAL or reapply its
+            // permissions. Only its contents and file identity matter here.
+            hash.update([1]);
+            wal.hash_generation(&mut hash, false);
+        } else {
+            hash.update([0]);
+        }
+
+        let reasons = match std::fs::read_dir(state) {
+            Ok(entries) => {
+                let mut paths = entries
+                    .map(|entry| entry.map(|file| file.path()))
+                    .filter(|entry| {
+                        entry.as_ref().map_or(true, |path| {
+                            path.extension()
+                                .is_some_and(|extension| extension == "toml")
+                        })
+                    })
+                    .collect::<std::io::Result<Vec<_>>>()?;
+                paths.sort_unstable();
+                paths
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => return Err(error).context("Cannot observe DNF install reasons"),
+        };
+        for path in reasons {
+            let name = path
+                .file_name()
+                .context("DNF state input has no file name")?;
+            let revision = RpmFileIdentity::read(&path)?
+                .context("DNF install-reason state changed during observation")?;
+            hash.update([1]);
+            hash.update(name.as_encoded_bytes());
+            hash.update([0]);
+            revision.hash_generation(&mut hash, true);
+        }
         hash.update([0]);
-        hash.update(location.sqlite.as_os_str().as_encoded_bytes());
-        hash.update([0]);
-        hash.update(identity.dev().to_le_bytes());
-        hash.update(identity.ino().to_le_bytes());
+
         Ok(crate::core::fast_status::StatusScope(
             hash.finalize().into(),
         ))
@@ -2907,6 +2961,43 @@ fn reject_unsealed_local_rpm_targets(packages: &[String]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn status_scope_changes_with_rpm_inventory_and_dnf_reason_files() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let root = fixture.path().to_path_buf();
+        let location = RpmDatabase {
+            sqlite: root.join("rpmdb.sqlite"),
+            root,
+        };
+        let wal = fixture.path().join("rpmdb.sqlite-wal");
+        let state = fixture.path().join("state");
+        std::fs::create_dir(&state)?;
+        std::fs::write(&location.sqlite, b"database")?;
+        let original = DnfPackageManager::status_scope_for(&location, &state)?;
+        std::fs::File::create(&wal)?;
+        assert_eq!(
+            original,
+            DnfPackageManager::status_scope_for(&location, &state)?
+        );
+        std::fs::write(&wal, b"committed pages")?;
+        let with_wal = DnfPackageManager::status_scope_for(&location, &state)?;
+        assert_ne!(original, with_wal);
+        std::fs::write(state.join("packages.toml"), b"reasons")?;
+        let with_state = DnfPackageManager::status_scope_for(&location, &state)?;
+        assert_ne!(with_wal, with_state);
+        std::fs::write(state.join("lock"), b"read lock")?;
+        assert_eq!(
+            with_state,
+            DnfPackageManager::status_scope_for(&location, &state)?
+        );
+        std::fs::write(&location.sqlite, b"changed rpm database")?;
+        assert_ne!(
+            with_state,
+            DnfPackageManager::status_scope_for(&location, &state)?
+        );
+        Ok(())
+    }
 
     #[tokio::test]
     #[ignore = "requires Fedora DNF5 with the installed leaf fixture tree; stores a plan only"]

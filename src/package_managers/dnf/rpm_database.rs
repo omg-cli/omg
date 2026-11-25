@@ -7,6 +7,7 @@ use anyhow::{Context as _, Result};
 use crate::core::privilege::system_command;
 
 pub(super) const HOST_SQLITE: &str = "/var/lib/rpm/rpmdb.sqlite";
+const SYSTEM_STATE_DIR: &str = "/usr/lib/sysimage/libdnf5";
 
 const CONFIG_DROP_INS: &[&str] = &["/etc/dnf/libdnf5.conf.d", "/usr/share/dnf5/libdnf.conf.d"];
 const PLUGIN_CONFIGS: &[&str] = &[
@@ -22,35 +23,58 @@ pub(super) struct RpmDatabase {
 
 impl RpmDatabase {
     pub(super) fn detect(host_sqlite: &Path) -> Result<Self> {
+        Self::resolve(host_sqlite, false).map(|(database, _)| database)
+    }
+
+    pub(super) fn detect_with_state_dir(host_sqlite: &Path) -> Result<(Self, PathBuf)> {
+        let (database, config) = Self::resolve(host_sqlite, true)?;
+        let directory = config.as_deref().map_or_else(
+            || Ok(PathBuf::from(SYSTEM_STATE_DIR)),
+            |config| parse_absolute_setting(config, "system_state_dir"),
+        )?;
+        let path = rooted_path(&database.root, &directory)?;
+        ensure_contained_path(&database.root, &path)?;
+        Ok((database, path))
+    }
+
+    fn resolve(host_sqlite: &Path, include_state_dir: bool) -> Result<(Self, Option<String>)> {
         #[cfg(test)]
         if host_sqlite != Path::new(HOST_SQLITE) {
-            return Ok(Self {
-                root: PathBuf::from("/"),
-                sqlite: host_sqlite.to_owned(),
-            });
+            return Ok((
+                Self {
+                    root: PathBuf::from("/"),
+                    sqlite: host_sqlite.to_owned(),
+                },
+                None,
+            ));
         }
-        let root = if default_installroot() {
-            PathBuf::from("/")
+        let config = if uses_default_paths(include_state_dir) {
+            None
         } else {
-            read_installroot()?
+            Some(read_path_settings()?)
         };
+        let root = config.as_deref().map_or_else(
+            || Ok(PathBuf::from("/")),
+            |config| parse_absolute_setting(config, "installroot"),
+        )?;
         let sqlite = if root == Path::new("/") && !has_custom_rpm_configuration() {
             host_sqlite.to_owned()
         } else {
             let database = rpm_database_directory()?;
             scoped_database_path(&root, &database)?
         };
-        Ok(Self { root, sqlite })
+        Ok((Self { root, sqlite }, config))
     }
 }
 
-fn default_installroot() -> bool {
+fn uses_default_paths(include_state_dir: bool) -> bool {
     let mut candidates = CONFIG_DROP_INS.iter().map(Path::new);
     let mut plugin_configs = PLUGIN_CONFIGS.iter().map(Path::new);
-    !can_configure_root(Path::new("/etc/dnf/dnf.conf"))
+    !can_configure_paths(Path::new("/etc/dnf/dnf.conf"), include_state_dir)
         && candidates.all(|dir| {
             !directory_has(dir, |path| {
-                path.extension().is_some_and(|ext| ext == "conf") && can_configure_root(path)
+                path.extension().is_some_and(|ext| ext == "conf")
+                    && can_configure_paths(path, include_state_dir)
             })
         })
         && plugin_configs.all(|dir| {
@@ -67,7 +91,7 @@ fn directory_has(dir: &Path, matches: impl Fn(&Path) -> bool) -> bool {
     }
 }
 
-fn can_configure_root(path: &Path) -> bool {
+fn can_configure_paths(path: &Path, include_state_dir: bool) -> bool {
     const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
     let metadata = match fs::metadata(path) {
         Ok(metadata) => metadata,
@@ -88,18 +112,19 @@ fn can_configure_root(path: &Path) -> bool {
         let Some((key, _)) = line.split_once('=') else {
             return false;
         };
+        let key = key.trim();
         matches!(
-            key.trim(),
+            key,
             "installroot"
                 | "config_file_path"
                 | "pluginpath"
                 | "pluginconfpath"
                 | "plugin_conf_dir"
-        )
+        ) || (include_state_dir && key == "system_state_dir")
     })
 }
 
-fn read_installroot() -> Result<PathBuf> {
+fn read_path_settings() -> Result<String> {
     let output = system_command("dnf")?
         .args(["--cacheonly", "--dump-main-config"])
         .stdin(std::process::Stdio::null())
@@ -110,22 +135,26 @@ fn read_installroot() -> Result<PathBuf> {
         "Could not resolve the configured DNF installroot: {}",
         output.status
     );
-    let config = std::str::from_utf8(&output.stdout).context("DNF configuration is not UTF-8")?;
-    parse_installroot(config)
+    String::from_utf8(output.stdout).context("DNF configuration is not UTF-8")
 }
 
-fn parse_installroot(config: &str) -> Result<PathBuf> {
-    let mut roots = config
+fn parse_absolute_setting(config: &str, key: &str) -> Result<PathBuf> {
+    let mut values = config
         .lines()
-        .filter_map(|line| line.strip_prefix("installroot = "));
-    let value = roots.next().context("DNF did not report an installroot")?;
-    anyhow::ensure!(roots.next().is_none(), "DNF reported multiple installroots");
-    let root = PathBuf::from(value);
+        .filter_map(|line| line.strip_prefix(key)?.strip_prefix(" = "));
+    let value = values
+        .next()
+        .with_context(|| format!("DNF did not report {key}"))?;
     anyhow::ensure!(
-        root.is_absolute() && !value.contains(['\0', '\r']),
-        "DNF installroot must be an absolute path"
+        values.next().is_none(),
+        "DNF reported multiple values for {key}"
     );
-    Ok(root)
+    let path = PathBuf::from(value);
+    anyhow::ensure!(
+        path.is_absolute() && !value.contains(['\0', '\r']),
+        "DNF {key} must be an absolute path"
+    );
+    Ok(path)
 }
 
 fn has_custom_rpm_configuration() -> bool {
@@ -163,35 +192,44 @@ fn rpm_database_directory() -> Result<PathBuf> {
 }
 
 fn scoped_database_path(root: &Path, directory: &Path) -> Result<PathBuf> {
-    let directory = directory.strip_prefix("/")?;
+    let database = rooted_path(root, directory)?.join("rpmdb.sqlite");
+    ensure_contained_path(root, &database)?;
+    Ok(database)
+}
+
+fn rooted_path(root: &Path, path: &Path) -> Result<PathBuf> {
+    let relative = path.strip_prefix("/")?;
     anyhow::ensure!(
-        directory
+        relative
             .components()
             .all(|part| !matches!(part, std::path::Component::ParentDir)),
-        "RPM database directory traverses a parent directory"
+        "DNF path traverses a parent directory"
     );
-    let database = root.join(directory).join("rpmdb.sqlite");
-    if root != Path::new("/") {
-        let canonical_root = root
-            .canonicalize()
-            .context("Cannot resolve DNF installroot")?;
-        // Check the database file and other existing ancestors when the root
-        // has been initialized, including symlinks resolving outside the root.
-        for ancestor in database.ancestors() {
-            match ancestor.canonicalize() {
-                Ok(resolved) => {
-                    anyhow::ensure!(
-                        resolved.starts_with(&canonical_root),
-                        "RPM database path escapes the DNF installroot"
-                    );
-                    break;
-                }
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error).context("Cannot resolve RPM database directory"),
+    Ok(root.join(relative))
+}
+
+fn ensure_contained_path(root: &Path, path: &Path) -> Result<()> {
+    if root == Path::new("/") {
+        return Ok(());
+    }
+    let canonical_root = root
+        .canonicalize()
+        .context("Cannot resolve DNF installroot")?;
+    // Check the file and the closest existing ancestor for symlink escapes.
+    for ancestor in path.ancestors() {
+        match ancestor.canonicalize() {
+            Ok(resolved) => {
+                anyhow::ensure!(
+                    resolved.starts_with(&canonical_root),
+                    "DNF path escapes the DNF installroot"
+                );
+                break;
             }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("Cannot resolve DNF path"),
         }
     }
-    Ok(database)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -202,12 +240,12 @@ mod tests {
     fn installed_root_scan_detects_configuration_overrides() -> Result<()> {
         let fixture = tempfile::tempdir()?;
         let config = fixture.path().join("dnf.conf");
-        assert!(!can_configure_root(&config));
+        assert!(!can_configure_paths(&config, false));
         fs::write(
             &config,
             "[main]\n# installroot = /imaginary\nreposdir=/repo\n",
         )?;
-        assert!(!can_configure_root(&config));
+        assert!(!can_configure_paths(&config, false));
         for option in [
             "installroot",
             "config_file_path",
@@ -215,17 +253,20 @@ mod tests {
             "plugin_conf_dir",
         ] {
             fs::write(&config, format!("[main]\n  {option} = /override\n"))?;
-            assert!(can_configure_root(&config), "missing {option}");
+            assert!(can_configure_paths(&config, false), "missing {option}");
         }
+        fs::write(&config, "[main]\nsystem_state_dir=/state\n")?;
+        assert!(!can_configure_paths(&config, false));
+        assert!(can_configure_paths(&config, true));
         fs::write(&config, [0xff])?;
-        assert!(can_configure_root(&config));
+        assert!(can_configure_paths(&config, false));
         Ok(())
     }
 
     #[test]
     fn installed_root_requires_exactly_one_absolute_native_path() -> Result<()> {
         assert_eq!(
-            parse_installroot("other = ignored\ninstallroot = /some root\n")?,
+            parse_absolute_setting("other = ignored\ninstallroot = /some root\n", "installroot")?,
             Path::new("/some root")
         );
         for invalid in [
@@ -233,7 +274,10 @@ mod tests {
             "installroot = relative",
             "installroot = /valid\ninstallroot = /other",
         ] {
-            assert!(parse_installroot(invalid).is_err(), "admitted {invalid}");
+            assert!(
+                parse_absolute_setting(invalid, "installroot").is_err(),
+                "admitted {invalid}"
+            );
         }
         Ok(())
     }

@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Verify a live Fedora daemon across a DNF installroot switch.
+"""Verify live Fedora status across root, inventory, and install-reason changes.
 
 Run as root in private mount and network namespaces without network routes.
 The arguments are the inert Fedora fixture directory and the built omg and
 omgd binaries. All RPM writes go to a disposable installroot.
 """
+from contextlib import contextmanager
 import hashlib
 import json
 import os
@@ -134,7 +135,7 @@ with tempfile.TemporaryDirectory(prefix="omg-fedora-cache-scope-", dir="/tmp") a
                         if line.startswith(("omg_requests_total ", "omg_requests_failed_total ")))
         return int(counters["omg_requests_total"]), int(counters["omg_requests_failed_total"])
 
-    def inspect(phase, expected_total, expected_explicit, expected_bash):
+    def inspect(phase, expected_total, expected_explicit, *, host=False, fixture_explicit=False):
         hook = work / "hook.bash"
         hook.write_text(checked([cli, "hook", "bash"], env, ordinary))
         shell = command(["/usr/bin/bash", "--noprofile", "--norc", "-c",
@@ -150,11 +151,11 @@ with tempfile.TemporaryDirectory(prefix="omg-fedora-cache-scope-", dir="/tmp") a
             ("tc-text", ["tc"], lambda value: value == expected_total),
             ("status-json", ["--json", "status"], lambda value: value["total_packages"] == expected_total and value["explicit_packages"] == expected_explicit),
             ("status-fast", ["--json", "status", "--fast"], lambda value: value["total_packages"] == expected_total),
-            ("explicit", ["--json", "explicit"], lambda value: len(value["packages"]) == expected_explicit and (package in value["packages"]) != expected_bash),
+            ("explicit", ["--json", "explicit"], lambda value: len(value["packages"]) == expected_explicit and (package in value["packages"]) == fixture_explicit),
             ("explicit-count", ["--json", "explicit", "--count"], lambda value: value["count"] == expected_explicit),
             ("ec-json", ["--json", "ec"], lambda value: value["count"] == expected_explicit),
             ("ec-text", ["ec"], lambda value: value == expected_explicit),
-            ("search", ["--json", "search", "bash"], lambda value: any(item["name"] == f"bash.{os.uname().machine}" for item in value) == expected_bash),
+            ("search", ["--json", "search", "bash"], lambda value: any(item["name"] == f"bash.{os.uname().machine}" for item in value) == host),
             ("tc-after-search", ["--json", "tc"], lambda value: value["count"] == expected_total),
             ("explicit-after-search", ["--json", "explicit"], lambda value: len(value["packages"]) == expected_explicit),
             ("status-after-search", ["--json", "status"], lambda value: value["total_packages"] == expected_total),
@@ -191,6 +192,34 @@ with tempfile.TemporaryDirectory(prefix="omg-fedora-cache-scope-", dir="/tmp") a
                            value=no_daemon.stdout[-600:].strip(), status=no_daemon.returncode,
                            diagnostic=no_daemon.stderr[-1000:] if no_daemon.returncode else None))
 
+    @contextmanager
+    def running_daemon(log):
+        with subprocess.Popen([str(server)], cwd=work, env=env, stdout=log, stderr=subprocess.STDOUT,
+                              stdin=subprocess.DEVNULL, **ordinary) as process:
+            try:
+                wait_for(lambda: fast.exists() and persisted.exists(), process)
+                assert stat.S_IMODE((runtime/"omg.sock").stat().st_mode) == 0o600
+                yield process
+                assert process.poll() is None
+            finally:
+                if process.poll() is None:
+                    process.send_signal(signal.SIGTERM)
+                    try:
+                        process.wait(8)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait(4)
+
+    def native_installed():
+        return checked([rpm, "--root", alternate, "-qa", "--qf", "%{NAME}\n"]).splitlines()
+
+    def native_explicit():
+        return ordinary_control([dnf, "--cacheonly", "--setopt=disable_excludes=*",
+                                 "repoquery", "--userinstalled", "--qf", r"%{name}\n"]).splitlines()
+
+    def mark(reason):
+        checked([dnf, "--cacheonly", "--disable-repo=*", "-y", "mark", reason, package])
+
     with (root / "daemon.log").open("w+") as log:
         try:
             checked([*gpg, "--quick-generate-key", "OMG Fedora status fixture <fixture@example.invalid>", "rsa2048", "sign", "1d"])
@@ -205,32 +234,53 @@ with tempfile.TemporaryDirectory(prefix="omg-fedora-cache-scope-", dir="/tmp") a
             host_explicit = len(set(ordinary_control([dnf, "--cacheonly", "--setopt=disable_excludes=*",
                                                       "repoquery", "--userinstalled", "--qf", r"%{name}\n"]).splitlines()))
             assert host_count > 1 and host_explicit > 1
-            with subprocess.Popen([str(server)], cwd=work, env=env, stdout=log, stderr=subprocess.STDOUT,
-                                  stdin=subprocess.DEVNULL, **ordinary) as process:
-                try:
-                    wait_for(lambda: fast.exists() and persisted.exists(), process)
-                    assert stat.S_IMODE((runtime/"omg.sock").stat().st_mode) == 0o600
-                    assert json.loads(persisted.read_text())["status"]["total_packages"] == host_count
-                    initial_status = persisted.read_bytes()
-                    inspect("initial-host", host_count, host_explicit, True)
-                    config.write_text(alternate_config)
-                    refresh_fixture()
-                    expected = sorted(ordinary_control([dnf, "--cacheonly", "repoquery",
-                                                        "--installed", "--qf", r"%{name}\n"]).splitlines())
-                    assert expected == [package], expected
-                    assert persisted.read_bytes() == initial_status
-                    inspect("switched-alternate", 1, 1, False)
-                    config.write_text(host_config)
-                    inspect("returned-host", host_count, host_explicit, True)
-                    assert process.poll() is None
-                finally:
-                    if process.poll() is None:
-                        process.send_signal(signal.SIGTERM)
-                        try:
-                            process.wait(8)
-                        except subprocess.TimeoutExpired:
-                            process.kill()
-                            process.wait(4)
+            with running_daemon(log):
+                assert json.loads(persisted.read_text())["status"]["total_packages"] == host_count
+                initial_status = persisted.read_bytes()
+                inspect("initial-host", host_count, host_explicit, host=True)
+                config.write_text(alternate_config)
+                refresh_fixture()
+                expected = ordinary_control([dnf, "--cacheonly", "repoquery",
+                                             "--installed", "--qf", r"%{name}\n"]).splitlines()
+                assert expected == [package], expected
+                assert persisted.read_bytes() == initial_status
+                inspect("switched-alternate", 1, 1, fixture_explicit=True)
+                config.write_text(host_config)
+                inspect("returned-host", host_count, host_explicit, host=True)
+
+            fast.unlink(missing_ok=True)
+            persisted.unlink(missing_ok=True)
+            state_option = "/var/lib/omg-fixture-dnf-state"
+            custom_state = alternate / Path(state_option).relative_to("/")
+            custom_state.mkdir(parents=True)
+            os.chown(custom_state, account.pw_uid, account.pw_gid)
+            custom_config = alternate_config.replace("plugins=0\n", f"plugins=0\nsystem_state_dir={state_option}\n")
+            (alternate / "etc/dnf/dnf.conf").write_text(custom_config)
+            config.write_text(custom_config)
+            database_directory = checked([rpm, "--eval", "%{_dbpath}"]).strip()
+            database = alternate / Path(database_directory).relative_to("/") / "rpmdb.sqlite"
+            identity = database.stat().st_dev, database.stat().st_ino
+            mark("user")
+            assert native_installed() == [package] and native_explicit() == [package]
+            with running_daemon(log):
+                cached = json.loads(persisted.read_text())["status"]
+                assert cached["total_packages"] == 1 and cached["explicit_packages"] == 1
+                inspect("same-root-initial", 1, 1, fixture_explicit=True)
+                reasons_before = (custom_state / "packages.toml").read_bytes()
+                mark("dependency")
+                assert (custom_state / "packages.toml").read_bytes() != reasons_before
+                assert native_installed() == [package] and native_explicit() == []
+                assert (database.stat().st_dev, database.stat().st_ino) == identity
+                inspect("same-root-dependency", 1, 0)
+                checked([rpm, "--root", alternate, "-e", package])
+                assert native_installed() == [] and native_explicit() == []
+                assert (database.stat().st_dev, database.stat().st_ino) == identity
+                inspect("same-root-erased", 0, 0)
+                checked([rpm, "--root", alternate, "-U", "--nosignature", fixture/"observer-fixture.rpm"])
+                mark("user")
+                assert native_installed() == [package] and native_explicit() == [package]
+                assert (database.stat().st_dev, database.stat().st_ino) == identity
+                inspect("same-root-reinstalled", 1, 1, fixture_explicit=True)
         except Exception:
             log.seek(0)
             print(log.read()[-4500:], file=sys.stderr)
@@ -245,5 +295,5 @@ assert inventory() == before
 report = dict(binaries=binaries, checks=checks, total=len(checks),
               passed=sum(entry["passed"] for entry in checks), host_unchanged=True)
 print(json.dumps(report))
-if report["passed"] != report["total"] or report["total"] != 48:
+if report["passed"] != report["total"] or report["total"] != 112:
     sys.exit(4)
