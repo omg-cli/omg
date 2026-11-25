@@ -41,6 +41,16 @@ fn main() {
 
 
 class MutationBuildBudget(unittest.TestCase):
+    def test_portable_baseline_uses_ci_profile_with_complete_target_selection(self):
+        workflow = (ROOT / '.github/workflows/mutation.yml').read_text(encoding='utf-8')
+        _, baseline = workflow.split('      - name: Validate portable mutation baseline\n', 1)
+        baseline = baseline.split('      - name:', 1)[0]
+        command = baseline.split('        run: ', 1)[1].splitlines()[0].split()
+        self.assertEqual(command, [
+            'cargo', 'test', '--package', 'omg', '--no-default-features',
+            '--features', 'pgp,license', '--locked', '--no-fail-fast', '--profile', 'ci',
+        ])
+
     def test_two_mutation_workers_keep_nested_cargo_jobs_within_four_slots(self):
         workflow = (ROOT / '.github/workflows/mutation.yml').read_text()
         job = workflow.split('  mutation:\n', 1)[1].split('  mutation-result:\n', 1)[0]
