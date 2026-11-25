@@ -5,6 +5,7 @@ set -euo pipefail
 # (and, inside the scenario loop, which scenario) so a hosted flake is
 # diagnosable from the job log alone.
 set -E
+unset OMG_UNINSTALL
 trap 'printf "installer_security: command failed (exit %s): %s\n" "$?" "$BASH_COMMAND" >&2' ERR
 # A killed probe needs a moment to actually die on a loaded runner. The
 # invariant is unchanged: nothing may survive the probe.
@@ -19,10 +20,12 @@ wait_until_dead() {
 cd "$(dirname "$0")/.."
 bash tests/installer_source_features.sh
 bash tests/native_make_targets.sh
+bash tests/installer_preflight.sh
 task_dir=$(mktemp -d)
 trap 'rm -rf "$task_dir"' EXIT
 sed '$d' install.sh > "$task_dir/functions.sh"
-for scenario in missing rejected wrong_tag accepted accepted_fedora loader_error wrong_version missing_daemon daemon_loader_error hung_probe forked_probe second_install_failure; do
+for scenario in missing rejected wrong_tag accepted accepted_fedora loader_error wrong_version missing_daemon daemon_loader_error hung_probe forked_probe second_install_failure \
+    marker_invalid temp_failure archive_transport archive_over_limit sidecar_transport sidecar_over_limit sidecar_format sidecar_mismatch attestation_timeout; do
   (
     set --
     source "$task_dir/functions.sh"
@@ -36,6 +39,12 @@ for scenario in missing rejected wrong_tag accepted accepted_fedora loader_error
     # Bash SECONDS has one-second resolution; a one-second deadline can expire
     # before a loaded runner starts the probe and writes its process receipt.
     MAX_VERSION_PROBE_SECONDS=2
+    MAX_ATTESTATION_SECONDS=2
+    case "$scenario" in
+      accepted_fedora | marker_invalid) OMG_VERSION=latest ;;
+      archive_over_limit) MAX_ARCHIVE_BYTES=16 ;;
+      sidecar_over_limit) MAX_CHECKSUM_BYTES=80 ;;
+    esac
     case "$scenario" in
       loader_error | wrong_version | missing_daemon | daemon_loader_error | hung_probe | forked_probe | second_install_failure)
         mkdir -p "$INSTALL_DIR"
@@ -47,6 +56,7 @@ for scenario in missing rejected wrong_tag accepted accepted_fedora loader_error
       eval "$name() { :; }"
     done
     check_runtime_dependencies() { return 0; }
+    if [[ "$scenario" == temp_failure ]]; then mktemp() { return 1; }; fi
     detect_os() { echo linux; }
     fake_distro=arch
     [[ "$scenario" != accepted_fedora ]] || fake_distro=fedora
@@ -56,19 +66,35 @@ for scenario in missing rejected wrong_tag accepted accepted_fedora loader_error
       resolve_version() { printf 'v1.2.2\n'; }
     fi
     curl() {
-      local url="${@: -1}"
-      if [[ "$url" == *.sha256 ]]; then
-        printf '%064d  archive\n' 0
-      elif [[ "$url" == "$RELEASES_BASE_URL/omg-v1.2.3-x86_64-linux-$fake_distro.tar.gz" ]]; then
-        printf 'fixture'
-      else
-        printf 'Unexpected fixture URL: %s\n' "$url" >&2
-        return 1
-      fi
+      local url="${@: -1}" resource
+      case "$url" in
+        "$LATEST_VERSION_URL") resource=marker ;;
+        *.sha256) resource=sidecar ;;
+        "$RELEASES_BASE_URL/omg-v1.2.3-x86_64-linux-$fake_distro.tar.gz") resource=archive ;;
+        *) printf 'Unexpected fixture URL: %s\n' "$url" >&2; return 1 ;;
+      esac
+      printf '%s\n' "$@" > "$scenario_dir/request-$resource"
+      case "$scenario/$resource" in
+        marker_invalid/marker) printf 'v1.2.3\n' ;;
+        archive_transport/archive | sidecar_transport/sidecar)
+          printf 'partial'
+          return 28 ;;
+        archive_over_limit/archive) printf '%017d' 0 ;;
+        sidecar_over_limit/sidecar) printf '%081d' 0 ;;
+        sidecar_format/sidecar) printf 'not-a-checksum\n' ;;
+        sidecar_mismatch/sidecar) printf '%064d  archive\n' 1 ;;
+        */marker) printf '1.2.3\r\n' ;;
+        */archive) printf 'fixture' ;;
+        */sidecar) printf '%064d  archive\n' 0 ;;
+      esac
     }
     calculate_sha256() { printf '%064d\n' 0; }
     printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$@" > "%s/gh-args"\n[[ "%s" != rejected ]]\n' \
       "$scenario_dir" "$scenario" > "$scenario_dir/gh"
+    if [[ "$scenario" == attestation_timeout ]]; then
+      printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$$" > "%s/gh-pid"\nexec sleep 5\n' \
+        "$scenario_dir" > "$scenario_dir/gh"
+    fi
     chmod +x "$scenario_dir/gh"
     trusted_gh() {
       [[ "$scenario" != missing ]] || return 1
@@ -112,6 +138,19 @@ for scenario in missing rejected wrong_tag accepted accepted_fedora loader_error
       grep -Fx 'omg-cli/omg/.github/workflows/release.yml' "$scenario_dir/gh-args"
       grep -F '/omg-v1.2.3-x86_64-linux-' "$scenario_dir/gh-args" |
         grep -Fq "linux-$fake_distro.tar.gz"
+      if [[ "$scenario" == accepted_fedora ]]; then
+        for resource in marker archive sidecar; do
+          case "$resource" in
+            marker) url="$LATEST_VERSION_URL"; bytes=256; seconds=20 ;;
+            archive) url="$RELEASES_BASE_URL/omg-v1.2.3-x86_64-linux-fedora.tar.gz"; bytes=268435456; seconds=300 ;;
+            sidecar) url="$RELEASES_BASE_URL/omg-v1.2.3-x86_64-linux-fedora.tar.gz.sha256"; bytes=1024; seconds=20 ;;
+          esac
+          cmp <(printf '%s\n' --disable -fsSL --proto '=https' --proto-redir '=https' \
+            --connect-timeout 10 --max-time "$seconds" --max-filesize "$bytes" "$url") \
+            "$scenario_dir/request-$resource"
+          printf 'PASS: Fedora %s request protocol and deadlines\n' "$resource"
+        done
+      fi
       printf 'PASS: authenticated %s release fixture installed both binaries\n' "$fake_distro"
     elif [[ "$scenario" == loader_error || "$scenario" == wrong_version || "$scenario" == missing_daemon || "$scenario" == daemon_loader_error || "$scenario" == hung_probe || "$scenario" == forked_probe || "$scenario" == second_install_failure ]]; then
       if [[ "$status" == 0 ]]; then
@@ -152,6 +191,42 @@ for scenario in missing rejected wrong_tag accepted accepted_fedora loader_error
       esac
     else
       [[ "$status" != 0 && ! -e "$scenario_dir/extracted" && ! -e "$INSTALL_DIR/omg" ]]
+      case "$scenario" in
+        marker_invalid)
+          [[ "$status" == 1 && ! -e "$scenario_dir/request-archive" ]]
+          grep -Fq 'not a valid bare semantic version' "$scenario_dir/output" ;;
+        temp_failure)
+          [[ "$status" == 1 && ! -e "$scenario_dir/request-archive" ]]
+          grep -Fq 'Failed to create a private release directory' "$scenario_dir/output" ;;
+        archive_transport)
+          [[ "$status" == 1 && ! -e "$scenario_dir/request-sidecar" ]] ;;
+        archive_over_limit)
+          [[ "$status" == 1 && ! -e "$scenario_dir/request-sidecar" ]]
+          grep -Fq 'exceeded the 16 byte bound' "$scenario_dir/output" ;;
+        sidecar_transport)
+          [[ "$status" == 2 ]]
+          grep -Fq 'Unable to fetch .sha256 sidecar' "$scenario_dir/output" ;;
+        sidecar_over_limit)
+          [[ "$status" == 2 ]]
+          grep -Fq 'exceeded the 80 byte bound' "$scenario_dir/output" ;;
+        sidecar_format)
+          [[ "$status" == 2 ]]
+          grep -Fq 'is malformed' "$scenario_dir/output" ;;
+        sidecar_mismatch)
+          [[ "$status" == 2 ]]
+          grep -Fq 'does not match its published sha256' "$scenario_dir/output" ;;
+        attestation_timeout)
+          [[ "$status" == 2 && -s "$scenario_dir/gh-pid" ]]
+          grep -Fq 'Build provenance verification timed out' "$scenario_dir/output"
+          if grep -Fq 'Possible supply-chain tampering' "$scenario_dir/output"; then exit 1; fi
+          wait_until_dead "$(cat "$scenario_dir/gh-pid")" ;;
+      esac
+      case "$scenario" in
+        marker_invalid | temp_failure | archive_* | sidecar_*)
+          [[ ! -e "$scenario_dir/gh-args" ]]
+          printf 'PASS: release refusal %s\n' "$scenario" ;;
+        attestation_timeout) printf 'PASS: release refusal %s\n' "$scenario" ;;
+      esac
     fi
   )
 done

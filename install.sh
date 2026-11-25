@@ -53,6 +53,11 @@ MAX_LATEST_VERSION_BYTES=256
 MAX_ARCHIVE_BYTES=$((256 * 1024 * 1024))
 MAX_CHECKSUM_BYTES=1024
 MAX_VERSION_PROBE_SECONDS=10
+MAX_VERSION_PROBE_BYTES=4096
+MAX_ATTESTATION_SECONDS=90
+MAX_RELEASE_CONNECT_SECONDS=10
+MAX_RELEASE_METADATA_SECONDS=20
+MAX_RELEASE_ARCHIVE_SECONDS=300
 
 # A PATH entry supplied by the caller must not select the release verifier.
 gh_path_components_trusted() {
@@ -369,45 +374,70 @@ detect_arch() {
   esac
 }
 
+wait_release_process() {
+  local pid="$1" seconds="$2" label="$3" status=0
+  local deadline=$((SECONDS + seconds))
+  while kill -0 "$pid" 2>/dev/null; do
+    if (( SECONDS >= deadline )); then
+      kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+      warn "$label timed out"
+      return 124
+    fi
+    sleep 0.1
+  done
+  wait "$pid" || status=$?
+  if kill -0 -- "-$pid" 2>/dev/null; then
+    kill -KILL -- "-$pid" 2>/dev/null || true
+    warn "$label left descendant processes running"
+    return 1
+  fi
+  return "$status"
+}
+
 probe_release_binary() (
   local binary="$1" name="$2" version="$3"
-  local output
-  output=$(mktemp "$tmp_dir/${name}-version-probe.XXXXXX") || return 1
+  local output errors status=0
   if [[ ! -f "$binary" || -L "$binary" || ! -x "$binary" ]]; then
     warn "Prebuilt ${name} is not a regular executable"
     return 1
   fi
-  # A candidate is untrusted until this probe succeeds. Give it an isolated
-  # process group so a forked helper cannot outlive a refusal or timeout.
+  output=$(mktemp "$tmp_dir/${name}-version-probe-stdout.XXXXXX") || return 1
+  errors=$(mktemp "$tmp_dir/${name}-version-probe-stderr.XXXXXX") || return 1
+
   set -m
-  "$binary" --version > "$output" 2>&1 &
-  local probe_pid=$!
-  local deadline=$((SECONDS + MAX_VERSION_PROBE_SECONDS))
-  while kill -0 "$probe_pid" 2>/dev/null; do
-    if (( SECONDS >= deadline )); then
-      kill -KILL -- "-$probe_pid" 2>/dev/null || true
-      wait "$probe_pid" 2>/dev/null || true
-      warn "Prebuilt ${name} version probe timed out; existing binaries were not replaced"
-      return 1
+  (
+    # Bash uses 1024-byte blocks, or 512 in POSIX mode. Cap disk writes in
+    # both modes, then enforce the same 4096-byte per-stream limit as Rust.
+    hard_limit=$(ulimit -Hf) || exit 1
+    if [[ "$hard_limit" == unlimited ]] || (( hard_limit > 8 )); then
+      ulimit -f 8 || exit 1
     fi
-    sleep 0.1
-  done
-  if ! wait "$probe_pid"; then
+    exec "$binary" --version
+  ) < /dev/null > "$output" 2> "$errors" &
+  wait_release_process "$!" "$MAX_VERSION_PROBE_SECONDS" "Prebuilt ${name} version probe" || status=$?
+  if ! check_file_size_bound "$output" "$MAX_VERSION_PROBE_BYTES" "$name version probe stdout" ||
+     ! check_file_size_bound "$errors" "$MAX_VERSION_PROBE_BYTES" "$name version probe stderr"; then
+    return 1
+  fi
+  if (( status != 0 )); then
     warn "Prebuilt ${name} cannot run on this system; existing binaries were not replaced"
-    head -c 4096 "$output" >&2
+    if [[ -s "$errors" ]]; then cat "$errors" >&2; else cat "$output" >&2; fi
     return 1
   fi
-  if kill -0 -- "-$probe_pid" 2>/dev/null; then
-    kill -KILL -- "-$probe_pid" 2>/dev/null || true
-    warn "Prebuilt ${name} version probe left descendant processes running; existing binaries were not replaced"
-    return 1
-  fi
+
   local reported
-  reported=$(head -c 4097 "$output")
+  reported=$(tr '\000' '\001' < "$output") || return 1
   if [[ "$reported" != "${name} ${version#v}" ]]; then
     warn "Prebuilt ${name} does not report ${name} ${version#v}; existing binaries were not replaced"
     return 1
   fi
+)
+
+verify_release_attestation() (
+  set -m
+  "$@" < /dev/null >/dev/null 2>&1 &
+  wait_release_process "$!" "$MAX_ATTESTATION_SECONDS" "Build provenance verification"
 )
 
 select_apt_release() {
@@ -518,6 +548,13 @@ validate_bare_version() {
   fi
 }
 
+fetch_release_bytes() {
+  local url="$1" max_bytes="$2" seconds="$3"
+  curl --disable -fsSL --proto '=https' --proto-redir '=https' \
+    --connect-timeout "$MAX_RELEASE_CONNECT_SECONDS" --max-time "$seconds" \
+    --max-filesize "$max_bytes" "$url" | head -c "$((max_bytes + 1))"
+}
+
 # GitHub's latest release cannot replace the R2 marker because rollback changes
 # only that marker.
 resolve_version() {
@@ -532,8 +569,8 @@ resolve_version() {
 
   local marker="" LC_ALL=C
   # Preserve trailing newlines and reject NULs that command substitution would discard.
-  if ! marker=$(curl -fsSL --max-filesize "$MAX_LATEST_VERSION_BYTES" "$LATEST_VERSION_URL" |
-    head -c "$((MAX_LATEST_VERSION_BYTES + 1))" | tr '\000' '\001' && printf .); then
+  if ! marker=$(fetch_release_bytes "$LATEST_VERSION_URL" "$MAX_LATEST_VERSION_BYTES" "$MAX_RELEASE_METADATA_SECONDS" |
+    tr '\000' '\001' && printf .); then
     warn "Unable to read the latest-version marker from ${LATEST_VERSION_URL}"
     return 1
   fi
@@ -593,14 +630,17 @@ install_from_release() {
 
   header "Installing Prebuilt OMG"
   info "Platform: ${detected_os}/${detected_distro}/${detected_arch}"
-  tmp_dir=$(mktemp -d)
+  if ! tmp_dir=$(mktemp -d); then
+    warn "Failed to create a private release directory"
+    return 1
+  fi
   trap 'cleanup_tmp_dir' RETURN
 
   start_spinner "Downloading prebuilt binary"
   local download_file="$tmp_dir/$artifact_name"
 
-  if curl -fsSL --max-filesize "$MAX_ARCHIVE_BYTES" "$asset_url" 2>/dev/null |
-    head -c "$((MAX_ARCHIVE_BYTES + 1))" > "$download_file"; then
+  if fetch_release_bytes "$asset_url" "$MAX_ARCHIVE_BYTES" "$MAX_RELEASE_ARCHIVE_SECONDS" \
+      > "$download_file" 2>/dev/null; then
     stop_spinner "Download complete"
   else
     fail_spinner "Download failed"
@@ -618,8 +658,8 @@ install_from_release() {
   # against a corrupted download, not against a compromised release.
   # The independent, release-bound provenance gate follows below.
   start_spinner "Verifying checksum"
-  if curl -fsSL --max-filesize "$MAX_CHECKSUM_BYTES" "${asset_url}.sha256" 2>/dev/null |
-    head -c "$((MAX_CHECKSUM_BYTES + 1))" > "${download_file}.sha256"; then
+  if fetch_release_bytes "${asset_url}.sha256" "$MAX_CHECKSUM_BYTES" "$MAX_RELEASE_METADATA_SECONDS" \
+      > "${download_file}.sha256" 2>/dev/null; then
     if ! check_file_size_bound "${download_file}.sha256" "$MAX_CHECKSUM_BYTES" "Checksum sidecar for ${artifact_name}"; then
       fail_spinner "Checksum verification failed"
       return 2
@@ -642,7 +682,7 @@ install_from_release() {
     fi
   else
     fail_spinner "Checksum unavailable"
-    warn "No .sha256 sidecar published for ${artifact_name}; refusing to install unverified binaries"
+    warn "Unable to fetch .sha256 sidecar for ${artifact_name}; refusing to install unverified binaries"
     return 2
   fi
 
@@ -654,12 +694,18 @@ install_from_release() {
     local signer_repo
     signer_repo=$(release_signer_repo "$actual_version") || return 1
     start_spinner "Verifying build provenance"
-    if "$gh_bin" attestation verify "$download_file" -R "$signer_repo" --source-ref "refs/tags/${actual_version}" --signer-workflow "$signer_repo/.github/workflows/release.yml" >/dev/null 2>&1; then
+    local attestation_status=0
+    verify_release_attestation "$gh_bin" attestation verify "$download_file" -R "$signer_repo" \
+      --source-ref "refs/tags/${actual_version}" --signer-workflow "$signer_repo/.github/workflows/release.yml" ||
+      attestation_status=$?
+    if (( attestation_status == 0 )); then
       stop_spinner "Build provenance verified"
     else
       fail_spinner "Build provenance verification failed"
-      warn "Sigstore attestation verification failed for ${artifact_name}"
-      warn "Possible supply-chain tampering — run manually: gh attestation verify <archive> -R $signer_repo"
+      if (( attestation_status != 124 )); then
+        warn "Sigstore attestation verification failed for ${artifact_name}"
+        warn "Possible supply-chain tampering — run manually: gh attestation verify <archive> -R $signer_repo"
+      fi
       return 2
     fi
   else
