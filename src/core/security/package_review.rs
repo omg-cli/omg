@@ -107,14 +107,17 @@ pub(crate) async fn review_async(
     inventory: &[SecurityPackage],
     context: &str,
     gaps: &[String],
+    transaction_summary: &str,
     source: &dyn VulnerabilitySource,
 ) -> Result<PackageReview> {
+    const MAX_TERMINAL_REVIEW_BYTES: usize = 60 * 1024;
     ensure!(
         !inventory.is_empty() && inventory.len() <= 4096,
         "Package admission requires a bounded, nonempty proposed inventory"
     );
     ensure!(
         context.len() <= 1024 * 1024
+            && transaction_summary.len() <= MAX_TERMINAL_REVIEW_BYTES
             && gaps.len() <= 128
             && gaps.iter().all(|gap| gap.len() <= 4096),
         "Package admission context exceeds its bound"
@@ -137,13 +140,17 @@ pub(crate) async fn review_async(
     let risk = AdvisoryRiskReview::new_with_unknown(&assessments, &context)?;
     if let Some(risk) = &risk {
         let mut details = risk.details().to_owned();
+        if !transaction_summary.is_empty() {
+            details.push('\n');
+            details.push_str(transaction_summary.trim_end());
+        }
         for gap in gaps {
             details.push_str("\nCoverage gap: ");
             details.push_str(&serde_json::to_string(gap)?);
         }
         details.push_str("\nAdvisory information: https://www.cve.org/\nMissing or partial evidence does not establish that these packages are safe.");
         ensure!(
-            details.len() <= 60 * 1024,
+            details.len() <= MAX_TERMINAL_REVIEW_BYTES,
             "Package advisory review exceeds the terminal bound"
         );
         let id = risk.id().to_owned();
@@ -192,7 +199,7 @@ pub(crate) fn review(
                 tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()?
-                    .block_on(review_async(inventory, context, gaps, source))
+                    .block_on(review_async(inventory, context, gaps, "", source))
             })
             .join()
             .map_err(|_| anyhow::anyhow!("Package admission worker failed"))?
@@ -573,7 +580,7 @@ print('controlling-PTY case passed:', kind)
         let reviewed = if matches!(case.as_str(), "clean-sync" | "initial-worker-panic") {
             review(&inventory, context, &gaps, &source)
         } else {
-            review_async(&inventory, context, &gaps, &source).await
+            review_async(&inventory, context, &gaps, "", &source).await
         };
         if matches!(
             case.as_str(),

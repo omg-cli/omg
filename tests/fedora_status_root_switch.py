@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import pwd
+import re
 import shlex
 import shutil
 import signal
@@ -23,9 +24,10 @@ import time
 from urllib.parse import parse_qs
 import xml.etree.ElementTree as ET
 
-if not __debug__ or len(sys.argv) != 4:
-    raise SystemExit("requires assertions and arguments FIXTURE_DIR OMG OMGD")
-fixture, candidate, daemon = (Path(value).resolve(strict=True) for value in sys.argv[1:])
+if not __debug__ or len(sys.argv) not in (4, 5):
+    raise SystemExit("requires assertions and arguments FIXTURE_DIR OMG OMGD [NATIVE_CONSENT_ORACLE]")
+fixture, candidate, daemon = (Path(value).resolve(strict=True) for value in sys.argv[1:4])
+consent_oracle = Path(sys.argv[4]).resolve(strict=True) if len(sys.argv) == 5 else None
 assert os.getuid() == 0
 for namespace in ("mnt", "net"):
     assert os.readlink(f"/proc/self/ns/{namespace}") != os.readlink(f"/proc/1/ns/{namespace}")
@@ -387,6 +389,76 @@ exec {shlex.quote(str(native_dnf))} "$@"
             finally:
                 checked(["/usr/bin/umount", target])
 
+    def inspect_upgrade_review(old_rpm):
+        # Only a disposable DNF root and a private mount receive transaction writes.
+        # The repository manifest remains signed. Its inert package is a fixture.
+        alternate_repo.write_text(repo_config.replace("gpgcheck=1\nrepo_gpgcheck=1", "gpgcheck=0\nrepo_gpgcheck=1"))
+        profile = root / "review-home"
+        state = root / "review-state"
+        (state / "omg").mkdir(parents=True, mode=0o700)
+        profile.mkdir(mode=0o700)
+        root_env = dict(base_env, HOME=str(profile), XDG_CONFIG_HOME=str(profile/"config"),
+                        OMG_DISABLE_DAEMON="1", OMG_DISABLE_TELEMETRY="1", NO_COLOR="1")
+        history = state / "omg/history.json"
+        native_command = [dnf, "history", "info", "last", "--json"]
+        rpm_query = [rpm, "--root", alternate, "-q", "--qf", "%{VERSION}", package]
+        update = [cli, "update", "--no-sync", "--yes"]
+        oracle = [sys.executable, "-I", "-B", consent_oracle, "--native", "--timeout", "22"]
+
+        def record(case, passed, detail):
+            checks.append(dict(phase="reviewed-upgrade", case=case, passed=passed, diagnostic=detail))
+
+        checked(["/usr/bin/mount", "--bind", state, "/var/lib"])
+        try:
+            checked([dnf, "--cacheonly", "--disable-repo=*", "--assumeyes", "remove", package], root_env)
+            checked([rpm, "--root", alternate, "-U", "--nosignature", old_rpm], root_env)
+            checked([dnf, "--refresh", "--assumeyes", "makecache"], root_env)
+            assert checked(rpm_query, root_env) == "0"
+            native_before = checked(native_command, root_env)
+            denied = command([*oracle, "--deny-only", "--", *update], root_env)
+            record("nonterminal-refusal",
+                   denied.returncode == 0 and checked(rpm_query, root_env) == "0"
+                   and checked(native_command, root_env) == native_before, denied.stderr[-900:])
+            refused_history = json.loads(history.read_text())
+            record("refusal-history",
+                   len(refused_history) == 1 and refused_history[0]["success"] is False
+                   and refused_history[0]["changes"] == [], str(refused_history)[-600:])
+
+            accepted = command([*oracle, "--accept-only", "--require-review", "--", *update], root_env)
+            plain = re.sub(r"\x1b\[[0-9;]*m", "", accepted.stdout)
+            preview = plain.partition("SECURITY WARNING:")[2].partition("Type ")[0]
+            installed = checked(rpm_query, root_env)
+            native_after = checked(native_command, root_env)
+            completed = json.loads(native_after)
+            expected_old = f"{package}-0:0-1.noarch"
+            expected_new = f"{package}-0:1-1.noarch"
+            record("exact-replacement-before-consent",
+                   accepted.returncode == 0 and "Type " in plain
+                   and f"Replaced: {expected_old}" in [line.strip(" │|") for line in preview.splitlines()],
+                   plain[-1300:])
+            record("exact-native-commit",
+                   accepted.returncode == 0 and installed == "1" and len(completed) == 1
+                   and completed[0]["status"] == "Ok" and "replay" in completed[0]["description"].split()
+                   and {(row["action"], row["nevra"]) for row in completed[0]["packages"]}
+                   == {("Replaced", expected_old), ("Upgrade", expected_new)},
+                   native_after[-1000:])
+            committed_history = history.read_bytes()
+            entries = json.loads(committed_history)
+            expected_change = {"name": package, "old_version": "0:0-1", "new_version": "0:1-1", "source": "dnf"}
+            record("exact-omg-commit",
+                   len(entries) == 2 and entries[0] == refused_history[0]
+                   and entries[1]["success"] is True and entries[1]["transaction_type"] == "Update"
+                   and entries[1]["changes"] == [expected_change], str(entries)[-1000:])
+
+            repeat = command(update, root_env)
+            record("successful-no-op",
+                   repeat.returncode == 0 and checked(rpm_query, root_env) == "1"
+                   and checked(native_command, root_env) == native_after
+                   and history.read_bytes() == committed_history,
+                   (repeat.stdout + repeat.stderr)[-900:])
+        finally:
+            checked(["/usr/bin/umount", "/var/lib"])
+
     def status_during(change):
         # Pause the real counts query before libdnf5 takes any database locks.
         # The wrapper and native executable are confined to this mount namespace.
@@ -682,6 +754,8 @@ exec {shlex.quote(str(native))} "$@"
             inspect_security_inventory("inventory-alternate-empty", 0)
             checked([rpm, "--root", alternate, "-U", "--nosignature", fixture/"observer-fixture.rpm"])
             inspect_security_inventory("inventory-alternate-restored", 1)
+            if consent_oracle is not None:
+                inspect_upgrade_review(old_rpm)
             config.write_text(host_config)
             inspect_security_inventory("inventory-host")
         except Exception:
@@ -698,5 +772,6 @@ assert inventory() == before
 report = dict(binaries=binaries, checks=checks, total=len(checks),
               passed=sum(entry["passed"] for entry in checks), host_unchanged=True)
 print(json.dumps(report))
-if report["passed"] != report["total"] or report["total"] != 264:
+expected_checks = 264 if consent_oracle is None else 270
+if report["passed"] != report["total"] or report["total"] != expected_checks:
     sys.exit(4)

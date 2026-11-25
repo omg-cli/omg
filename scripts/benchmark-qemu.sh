@@ -1128,7 +1128,7 @@ cat > "$work/guest-check.sh" <<'GUEST'
 set -euo pipefail
 export LC_ALL=C NO_COLOR=1
 cd "$HOME"
-distro=$1; tag=$2; digest=$3; benchmark=$4; guest_arch=$5; expected_uname=$6; inventory_tiers=$7; accel=$8
+distro=$1; tag=$2; digest=$3; benchmark=$4; guest_arch=$5; expected_uname=$6; inventory_tiers=$7; accel=$8; source_kind=$9
 case "$accel" in kvm) daemon_timeout=240 ;; tcg) daemon_timeout=900 ;; *) exit 120 ;; esac
 actual_id=$(awk -F= '$1 == "ID" {gsub(/"/, "", $2); print $2}' /etc/os-release)
 if [[ "$distro" == debian-trixie ]]; then
@@ -1438,9 +1438,13 @@ if [[ "$distro" == arch ]]; then
 fi
 if [[ "$distro" == fedora ]]; then
   bash "$HOME/qemu-fedora-advisory-check.sh" "$bin" "$daemon" "$digest" "$HOME/evidence"
+  fedora_review_args=()
+  if [[ "$source_kind" == staged ]]; then
+    fedora_review_args+=("$HOME/qemu-runtime-advisory-oracle.py")
+  fi
   timeout --kill-after=5s 120s sudo -n unshare --mount --net --propagation private \
     python3 -I -B "$HOME/fedora_status_root_switch.py" "$HOME/fedora-status-fixture" "$bin" "$daemon" \
-    > "$HOME/evidence/fedora-status-root-switch.json"
+    "${fedora_review_args[@]}" > "$HOME/evidence/fedora-status-root-switch.json"
   if [[ -f "$HOME/fedora_sync_cache.py" ]]; then
     sudo -n install -d -m 0700 /var/lib/omg
     sudo -n setsid --wait timeout --kill-after=5s 120s unshare --mount --net --propagation private \
@@ -1511,7 +1515,7 @@ if [[ "$benchmark" == true ]]; then
   timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 /work/attend-unknown-fixture.py bench@127.0.0.1:attend-unknown-fixture.py
 fi
 rc=0
-timeout "$guest_timeout" docker exec -w /work/guest "$controller" ssh "${opts[@]}" -p 2222 bench@127.0.0.1 "bash guest-check.sh '$distro' '$tag' '$digest' '$benchmark' '$arch' '$guest_uname' '$inventory_tiers' '$qemu_accel'" > "$work/guest-check.log" 2>&1 || rc=$?
+timeout "$guest_timeout" docker exec -w /work/guest "$controller" ssh "${opts[@]}" -p 2222 bench@127.0.0.1 "bash guest-check.sh '$distro' '$tag' '$digest' '$benchmark' '$arch' '$guest_uname' '$inventory_tiers' '$qemu_accel' '$source_kind'" > "$work/guest-check.log" 2>&1 || rc=$?
 if [[ "$distro" == fedora && "$rc" == 0 ]]; then
   timeout --kill-after=5s 30s docker exec -w /work/guest "$controller" ssh "${opts[@]}" -p 2222 bench@127.0.0.1 \
     "sudo -n python3 fedora-sqlite.py installed fedora-sqlite-bundle --policy fedora-sqlite-policy.json --arch '$arch' --revision '$fedora_sqlite_revision' $fedora_sqlite_remote_binding --output evidence/fedora-sqlite-after.json" \

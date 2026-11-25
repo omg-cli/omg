@@ -402,6 +402,11 @@ struct StoredRemovalTransaction {
     environments: Vec<serde_json::Value>,
 }
 
+struct DnfAdmissionPlan {
+    inventory: Vec<SecurityPackage>,
+    outgoing_builds: String,
+}
+
 #[derive(Default)]
 struct NativeVersionChanges {
     removed: BTreeSet<String>,
@@ -2316,8 +2321,8 @@ impl DnfPackageManager {
             crate::cli::modern_ui::print_info("No package changes needed");
             return Ok(());
         };
-        let inventory = Self::proposed_inventory(&bytes)?;
-        if inventory.is_empty() {
+        let plan = Self::proposed_admission(&bytes)?;
+        if plan.inventory.is_empty() {
             crate::cli::modern_ui::print_info("No package changes needed");
             return Ok(());
         }
@@ -2326,11 +2331,22 @@ impl DnfPackageManager {
             Ok((directory, digest))
         })
         .await??;
-        let context = serde_json::to_string(&("omg-native-dnf-stored-v1", args, &digest))?;
+        let context = serde_json::to_string(&(
+            "omg-native-dnf-stored-v1",
+            args,
+            &digest,
+            &plan.outgoing_builds,
+        ))?;
         let gaps = vec!["DNF5's native advisory CLI filters by currently installed package names; it cannot establish complete coverage for newly selected dependencies. Vendor fixed versions do not establish introduced ranges or branch applicability. Matching native advisories below remain possible; CVE/disclosed-zero-day coverage remains unknown. https://dnf5.readthedocs.io/en/stable/commands/advisory.8.html".into()];
         let source = PlannedDnfAdvisories;
-        crate::core::security::package_review::review_async(&inventory, &context, &gaps, &source)
-            .await?;
+        crate::core::security::package_review::review_async(
+            &plan.inventory,
+            &context,
+            &gaps,
+            &plan.outgoing_builds,
+            &source,
+        )
+        .await?;
         let (directory, checked) = tokio::task::spawn_blocking(move || -> Result<_> {
             let digest = Self::stored_tree_digest(&directory.path().join("plan"))?;
             Ok((directory, digest))
@@ -2377,7 +2393,9 @@ impl DnfPackageManager {
         .await?
     }
 
-    fn proposed_inventory(bytes: &[u8]) -> Result<Vec<super::types::SecurityPackage>> {
+    fn proposed_admission(bytes: &[u8]) -> Result<DnfAdmissionPlan> {
+        use std::fmt::Write as _;
+
         let transaction: StoredRemovalTransaction = serde_json::from_slice(bytes)
             .context("Invalid DNF5 stored installation transaction")?;
         anyhow::ensure!(
@@ -2389,30 +2407,39 @@ impl DnfPackageManager {
             "DNF group/environment changes require separate review support"
         );
         let mut inventory = Vec::new();
+        let mut outgoing_builds = String::new();
         let mut seen = BTreeSet::new();
         for package in transaction.rpms {
             anyhow::ensure!(
                 seen.insert((package.nevra.clone(), package.action.clone())),
                 "Duplicate DNF stored transaction operation"
             );
+            let (name, architecture) = super::dnf_advisory::package_identity(&package.nevra)?;
+            let version =
+                &package.nevra[name.len() + 1..package.nevra.len() - architecture.len() - 1];
             match package.action.as_str() {
-                "Remove" | "Replaced" => continue,
-                "Install" | "Upgrade" | "Downgrade" | "Reinstall" => {}
+                "Remove" | "Replaced" => {
+                    let epoch = if version.contains(':') { "" } else { "0:" };
+                    writeln!(
+                        outgoing_builds,
+                        "{}: {name}-{epoch}{version}.{architecture}",
+                        package.action
+                    )?;
+                }
+                "Install" | "Upgrade" | "Downgrade" | "Reinstall" => {
+                    inventory.push(Self::distribution_security_package(
+                        name.into(),
+                        architecture.into(),
+                        version.into(),
+                    ));
+                }
                 _ => anyhow::bail!("Unsupported DNF stored action: {}", package.action),
             }
-            let (name, architecture) = super::dnf_advisory::package_identity(&package.nevra)?;
-            inventory.push(super::types::SecurityPackage {
-                origin: super::types::SecurityOrigin::DistributionPackage,
-                name: name.into(),
-                version: package.nevra
-                    [name.len() + 1..package.nevra.len() - architecture.len() - 1]
-                    .into(),
-                advisory_source: None,
-                architecture: Some(architecture.into()),
-                description: String::new(),
-                licenses: Vec::new(),
-            });
         }
+        anyhow::ensure!(
+            !inventory.is_empty() || outgoing_builds.is_empty(),
+            "DNF prepared a removal-only transaction during install or upgrade"
+        );
         inventory.sort_by(|left, right| {
             (&left.name, &left.version, &left.architecture).cmp(&(
                 &right.name,
@@ -2420,7 +2447,10 @@ impl DnfPackageManager {
                 &right.architecture,
             ))
         });
-        Ok(inventory)
+        Ok(DnfAdmissionPlan {
+            inventory,
+            outgoing_builds,
+        })
     }
 
     fn stored_tree_digest(root: &Path) -> Result<String> {
@@ -3310,12 +3340,18 @@ mod tests {
     #[test]
     fn proposed_admission_inventory_preserves_solver_dependencies_epochs_and_multilib() -> Result<()>
     {
-        let inventory = DnfPackageManager::proposed_inventory(
+        let plan = DnfPackageManager::proposed_admission(
             br#"{"version":"1.0","rpms":[
             {"nevra":"app-2:1.0-1.fc44.x86_64","action":"Upgrade"},
             {"nevra":"app-1.0-1.fc44.x86_64","action":"Replaced"},
+            {"nevra":"legacy-5:3-1.i686","action":"Remove"},
             {"nevra":"lib-part-0:1.0~rc1-2.fc44.i686","action":"Install"}] }"#,
         )?;
+        assert_eq!(
+            plan.outgoing_builds,
+            "Replaced: app-0:1.0-1.fc44.x86_64\nRemove: legacy-5:3-1.i686\n"
+        );
+        let inventory = plan.inventory;
         assert_eq!(inventory.len(), 2);
         assert_eq!(
             (
@@ -3337,9 +3373,17 @@ mod tests {
             br#"{"version":"1.0","rpms":[{"nevra":"x-1-1.noarch","action":"Install"},{"nevra":"x-1-1.noarch","action":"Install"}]}"#.as_slice(),
             br#"{"version":"1.0","rpms":[{"nevra":"x-1-1.noarch","action":"FutureAction"}]}"#,
             br#"{"version":"1.0","rpms":[{"nevra":"broken","action":"Install"}]}"#,
+            br#"{"version":"1.0","rpms":[{"nevra":"x-1-1.noarch","action":"Install"},{"nevra":"broken","action":"Replaced"}]}"#,
+            br#"{"version":"1.0","rpms":[{"nevra":"x-1-1.noarch","action":"Remove"}]}"#,
+            br#"{"version":"1.0","rpms":[{"nevra":"x-1-1.noarch","action":"Replaced"}]}"#,
             br#"{"version":"2.0","rpms":[]}"#,
             br#"{"version":"1.0","groups":[{}]}"#,
-        ] { assert!(DnfPackageManager::proposed_inventory(bytes).is_err()); }
+        ] {
+            assert!(
+                DnfPackageManager::proposed_admission(bytes).is_err(),
+                "unexpectedly accepted {}", String::from_utf8_lossy(bytes)
+            );
+        }
         Ok(())
     }
 
