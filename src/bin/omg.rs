@@ -1122,12 +1122,6 @@ fn command_requires_root(command: &Commands) -> bool {
         // DNF refreshes the caller's cache before requesting elevation for
         // the system cache. Re-executing the whole command skips that refresh.
         Commands::Sync => !native_fedora,
-        // DNF5 --store resolves the complete plan without executing it, but
-        // requires root even for a preview. Keep invalid recursion on its
-        // existing unprivileged refusal path before any native plan is made.
-        Commands::Remove {
-            recursive: false, ..
-        } => native_fedora,
         Commands::Clean {
             orphans,
             cache,
@@ -2695,25 +2689,15 @@ mod tests {
     }
 
     #[test]
-    fn native_fedora_removal_preview_requires_root_before_dispatch() {
+    fn removal_preview_reaches_backend_before_elevation() {
         let cli = Cli::try_parse_from(["omg", "remove", "--dry-run", "jq"]).unwrap();
-        let native_fedora = cfg!(feature = "fedora")
-            && matches!(
-                omg_lib::core::env::distro::detect_distro(),
-                omg_lib::core::env::distro::Distro::Fedora
-            );
-        assert_eq!(command_requires_root(&cli.command), native_fedora);
+        assert!(!command_requires_root(&cli.command));
     }
 
     #[test]
-    fn native_fedora_removal_confirmation_requires_root_before_dispatch() {
+    fn removal_dispatch_retains_the_callers_history_context() {
         let cli = Cli::try_parse_from(["omg", "remove", "jq"]).unwrap();
-        let native_fedora = cfg!(feature = "fedora")
-            && matches!(
-                omg_lib::core::env::distro::detect_distro(),
-                omg_lib::core::env::distro::Distro::Fedora
-            );
-        assert_eq!(command_requires_root(&cli.command), native_fedora);
+        assert!(!command_requires_root(&cli.command));
     }
 
     #[tokio::test]

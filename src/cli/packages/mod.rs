@@ -29,6 +29,8 @@ pub use info::info_after_fast_miss;
 pub use info::{info, info_sync, info_with_json};
 pub use install::install;
 pub use remove::remove;
+#[cfg(feature = "fedora")]
+pub(crate) use remove::review_fedora_removal;
 pub use search::{search, search_sync_cli, search_sync_cli_with_limit, search_with_json};
 pub use status::{status, status_with_json};
 pub use sync_db::sync_databases as sync;

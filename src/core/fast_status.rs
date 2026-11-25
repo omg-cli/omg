@@ -111,8 +111,28 @@ impl FastStatus {
     /// Read status from file (sub-millisecond)
     #[must_use]
     pub fn read_from_file(path: &Path) -> Option<Self> {
-        let mut file = File::open(path).ok()?;
+        let mut options = File::options();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options
+                .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK | nix::libc::O_NOCTTY);
+        }
+        let mut file = options.open(path).ok()?;
+        let metadata = file.metadata().ok()?;
         let mut bytes = [0u8; std::mem::size_of::<Self>()];
+        if !metadata.is_file() || metadata.len() != bytes.len() as u64 {
+            return None;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            if metadata.uid() != rustix::process::getuid().as_raw() || metadata.mode() & 0o022 != 0
+            {
+                return None;
+            }
+        }
         file.read_exact(&mut bytes).ok()?;
 
         // Safe deserialization using zerocopy - no unsafe needed
@@ -135,14 +155,17 @@ impl FastStatus {
 
     /// Read the default status file with full validation.
     pub fn read_default() -> Option<Self> {
+        #[cfg(unix)]
+        if crate::core::client::DaemonClient::daemon_disabled() {
+            return None;
+        }
         Self::read_validated(&paths::fast_status_path())
     }
 
     /// Read a status file only when its parent directory passes the same
     /// runtime-directory validation the daemon applies before binding
-    /// (real, current-uid-owned, owner-only). The status path is selected by
-    /// environment, so an unvalidated read would accept a foreign or
-    /// symlinked cache file (csf_fdd4999c).
+    /// (real, current-uid-owned, owner-only). The opened file must also
+    /// pass the file type, size and ownership checks.
     pub fn read_validated(path: &Path) -> Option<Self> {
         #[cfg(unix)]
         paths::validate_socket_parent(path).ok()?;
@@ -222,6 +245,73 @@ mod tests {
         status.write_to_file(&path).unwrap();
 
         assert!(FastStatus::read_from_file(&path).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validated_reads_require_a_private_exact_status_file() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        let directory = tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap();
+        let path = directory.path().join("omg.status");
+        let status = FastStatus::new(100, 50, 0, 0);
+        status.write_to_file(&path).unwrap();
+        assert_eq!(
+            FastStatus::read_validated(&path).unwrap().total_packages,
+            100
+        );
+
+        let linked = directory.path().join("linked.status");
+        symlink(&path, &linked).unwrap();
+        assert!(FastStatus::read_validated(&linked).is_none());
+        assert!(FastStatus::read_from_file(directory.path()).is_none());
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o660)).unwrap();
+        assert!(FastStatus::read_validated(&path).is_none());
+        status.write_to_file(&path).unwrap();
+        let mut oversized = status.as_bytes().to_vec();
+        oversized.push(0);
+        std::fs::write(&path, oversized).unwrap();
+        assert!(FastStatus::read_validated(&path).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn default_status_respects_daemon_opt_out() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        const NAME: &str = "core::fast_status::tests::default_status_respects_daemon_opt_out";
+        if crate::core::testing::run_isolated_test(NAME)
+            || crate::config::Settings::rerun_test_unprivileged(NAME)
+        {
+            return;
+        }
+        let directory = tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap();
+        let socket = directory.path().join("omg.sock");
+        FastStatus::new(100, 50, 0, 0)
+            .write_to_file(&socket.with_file_name("omg.status"))
+            .unwrap();
+        for (value, expected) in [("1", None), ("0", Some(100))] {
+            temp_env::with_vars(
+                [
+                    ("OMG_SOCKET_PATH", Some(socket.as_os_str())),
+                    ("OMG_TEST_MODE", None),
+                    ("OMG_DISABLE_DAEMON", Some(std::ffi::OsStr::new(value))),
+                ],
+                || {
+                    assert_eq!(
+                        FastStatus::read_default().map(|status| status.total_packages),
+                        expected
+                    );
+                },
+            );
+        }
     }
 
     #[cfg(unix)]

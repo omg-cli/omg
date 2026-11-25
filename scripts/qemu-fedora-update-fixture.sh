@@ -155,6 +155,20 @@ else
 fi
 printf 'OMG_QEMU_UPDATE_FIXTURE:before:%s:1\n' "$mode"
 phase=product
+if [[ "$mode" == turbo ]]; then
+  install -d -m0555 "$base/outdated-data"
+  sudo -H -u "$guest_user" -- env -u OMG_DATA_DIR XDG_DATA_HOME="$base/outdated-data" \
+    timeout --kill-after=2s 30s "$binary" outdated --json > "$base/outdated.json"
+  jq -e --arg package "$package" --arg repo "$repo_id" '
+    length == 1 and .[0].name == $package and .[0].repo == $repo and
+    .[0].current_version == "1-1" and .[0].new_version == "2-1"
+  ' "$base/outdated.json" > /dev/null || {
+    echo 'OMG outdated did not report the cached DNF upgrade' >&2
+    cat "$base/outdated.json" >&2
+    exit 1
+  }
+  [[ ! -e "$base/outdated-data/omg" ]]
+fi
 sudo -H -u "$guest_user" -- python3 "$consent" --native --accept-only --require-review --timeout 600 -- "$binary" update "--$mode" --yes
 phase=verification
 [[ $(rpm -q --qf '%{VERSION}\n' "$package") == 2 ]] || { echo 'OMG did not upgrade fixture to version 2' >&2; exit 1; }

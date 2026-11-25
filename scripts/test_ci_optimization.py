@@ -667,6 +667,91 @@ git() { printf '%040d\\n' 1; }
                     with gzip.open(artifact, 'rt', encoding='utf-8') as handle:
                         self.assertEqual(json.load(handle)['data'][0]['functions'][0]['regions'][0][4], 10)
 
+    def test_coverage_summary_reuses_the_region_export(self):
+        coverage = job_block((WORKFLOWS / 'coverage.yml').read_text(), 'coverage')
+        block = coverage.split('      - name: Coverage summary\n', 1)[1]
+        self.assertIn("steps.coverage_sanity.outcome == 'success'", block)
+        script = textwrap.dedent(block.split('        run: |\n', 1)[1])
+        totals = {
+            'regions': {'count': 5, 'covered': 3},
+            'functions': {'count': 4, 'covered': 3},
+            'lines': {'count': 3, 'covered': 2},
+            'branches': {'count': 0, 'covered': 0},
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            scripts = root / 'scripts'
+            scripts.mkdir()
+            shutil.copyfile(ROOT / 'scripts/check-line-coverage.py', scripts / 'check-line-coverage.py')
+            summary = root / 'summary'
+            env = dict(os.environ, GITHUB_STEP_SUMMARY=str(summary), PYTHONOPTIMIZE='1')
+            for name, lines in [('valid', totals['lines']),
+                                ('inconsistent counts', {'count': 3, 'covered': 4}),
+                                ('boolean counter', {'count': 3, 'covered': True})]:
+                with self.subTest(name=name):
+                    summary.unlink(missing_ok=True)
+                    export = {'type': 'llvm.coverage.json.export', 'version': '3.1.0',
+                              'data': [{'totals': dict(totals, lines=lines)}]}
+                    with gzip.open(root / 'coverage-regions.json.gz', 'wt', encoding='utf-8') as stream:
+                        json.dump(export, stream)
+                    result = subprocess.run([BASH, '-e', '-c', 'cargo() { return 99; }\n' + script],
+                                            cwd=root, env=env, capture_output=True, text=True, timeout=10)
+                    if name == 'valid':
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        report = summary.read_text(encoding='utf-8')
+                        self.assertIn('| Regions | 5 | 3 | 2 | 60.00% |', report)
+                        self.assertIn('| Functions | 4 | 3 | 1 | 75.00% |', report)
+                        self.assertIn('| Lines | 3 | 2 | 1 | 66.67% |', report)
+                        self.assertIn('| Branches | 0 | 0 | 0 | — |', report)
+                    else:
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertFalse(summary.exists())
+
+    @unittest.skipIf(os.name == 'nt', 'native smoke commands need executable POSIX shims')
+    def test_distro_e2e_reuses_metadata_prepared_by_the_build(self):
+        smoke = ROOT / 'scripts/distro-e2e.sh'
+        prepare = step_script('distro-e2e.yml', 'Install distro build prerequisites and mold linker')
+        self.assertIn('pacman -Syu --noconfirm --needed base-devel', prepare)
+        self.assertIn('apt-get update -qq', prepare)
+        self.assertIn('dnf --refresh install -y', prepare)
+        workflow = (WORKFLOWS / 'distro-e2e.yml').read_text(encoding='utf-8')
+        self.assertIn('bash scripts/distro-e2e.sh "$MATRIX_DISTRO" "./target/ci/omg" --metadata-ready', workflow)
+        for distro, refresh, package in [
+            ('arch', 'pacman -Sy --noconfirm', 'pacman'),
+            ('debian-trixie', 'apt-get update -qq', 'bash'),
+            ('fedora', 'dnf makecache -q', 'bash'),
+        ]:
+            for ready in (False, True):
+                with self.subTest(distro=distro, ready=ready), tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    for manager in ('pacman', 'apt-get', 'dnf'):
+                        path = root / manager
+                        path.write_text('#!/usr/bin/env bash\nprintf "%s %s\\n" "${0##*/}" "$*" >> "$CALLS"\n')
+                        path.chmod(0o755)
+                    binary = root / 'omg'
+                    binary.write_text(textwrap.dedent('''\
+                        #!/usr/bin/env bash
+                        printf 'omg %s\\n' "$*" >> "$CALLS"
+                        case "$1" in
+                          search) printf '%s\\n' "$2" ;;
+                          info) printf 'Name: %s\\n' "$2" ;;
+                          outdated) printf '[]\\n' ;;
+                        esac
+                        '''))
+                    binary.chmod(0o755)
+                    calls = root / 'calls'
+                    args = [BASH, str(smoke), distro, str(binary)]
+                    if ready:
+                        args.append('--metadata-ready')
+                    result = subprocess.run(args, cwd=root, env=dict(os.environ, CALLS=str(calls),
+                                            PATH=f'{root}{os.pathsep}{os.environ["PATH"]}'),
+                                            capture_output=True, text=True, timeout=10)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    search = f'omg search {package}' + (' --no-aur' if distro == 'arch' else '') + ' --limit 5'
+                    expected = ['omg --version'] + ([] if ready else [refresh])
+                    expected += [search, f'omg info {package}', 'omg status', 'omg outdated --json', 'omg doctor']
+                    self.assertEqual(calls.read_text().splitlines(), expected)
+
     def test_region_artifact_survives_downstream_comparison_failure_with_short_retention(self):
         text = (WORKFLOWS / 'coverage.yml').read_text()
         for name in ('Generate region evidence', 'Preserve region evidence'):
@@ -733,10 +818,11 @@ git() { printf '%040d\\n' 1; }
         workflow = (WORKFLOWS / 'ci.yml').read_text(encoding='utf-8')
         ubuntu = job_block(workflow, 'ubuntu')
         artifact_names = re.findall(r'(?m)^          name: (.+)$', ubuntu)
-        for artifact in ('apt-daemon-catalog-ubuntu', 'native-release-ubuntu',
-                         'omg-ubuntu', 'cli-surfaces-ubuntu'):
+        for artifact in ('apt-daemon-catalog-ubuntu', 'native-release-ubuntu', 'cli-surfaces-ubuntu'):
             with self.subTest(artifact=artifact):
                 self.assertIn(artifact + '-${{ github.run_attempt }}', artifact_names)
+        self.assertNotIn('omg-ubuntu-${{ github.run_attempt }}', artifact_names)
+        self.assertIn('./target/release/omg --version', ubuntu)
         self.assertNotIn('overwrite:', ubuntu)
         self.assertRegex(ubuntu, r'(?m)^    timeout-minutes: (?:[4-5][0-9]|60)$')
         self.assertIn('cargo clippy --all-targets --no-default-features --features debian,pgp,license', ubuntu)
@@ -866,7 +952,6 @@ git() { printf '%040d\\n' 1; }
         self.assertIn('cargo llvm-cov nextest', coverage)
         self.assertIn('--no-report', coverage)
         self.assertIn('--lcov', coverage)
-        self.assertIn('--summary-only', coverage)
 
     def test_mutation_baseline_mode_cannot_weaken_full_score_gate(self):
         from test_mutation_reports import MutationReportsTests, SOURCE, mutant
