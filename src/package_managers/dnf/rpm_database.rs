@@ -9,10 +9,12 @@ use crate::core::privilege::system_command;
 pub(super) const HOST_SQLITE: &str = "/var/lib/rpm/rpmdb.sqlite";
 const SYSTEM_STATE_DIR: &str = "/usr/lib/sysimage/libdnf5";
 
-const CONFIG_DROP_INS: &[&str] = &["/etc/dnf/libdnf5.conf.d", "/usr/share/dnf5/libdnf.conf.d"];
-const PLUGIN_CONFIGS: &[&str] = &[
+pub(super) const CONFIG_DROP_INS: &[&str] =
+    &["/etc/dnf/libdnf5.conf.d", "/usr/share/dnf5/libdnf.conf.d"];
+pub(super) const PLUGIN_CONFIGS: &[&str] = &[
     "/etc/dnf/libdnf5-plugins",
     "/usr/share/dnf5/libdnf5-plugins",
+    "/usr/share/dnf5/libdnf.plugins.conf.d",
 ];
 
 #[derive(Debug, PartialEq, Eq)]
@@ -124,21 +126,21 @@ fn can_configure_paths(path: &Path, include_state_dir: bool) -> bool {
     })
 }
 
-fn read_path_settings() -> Result<String> {
+pub(super) fn read_path_settings() -> Result<String> {
     let output = system_command("dnf")?
         .args(["--cacheonly", "--dump-main-config"])
         .stdin(std::process::Stdio::null())
         .output()
-        .context("Could not resolve the configured DNF installroot")?;
+        .context("Could not read the effective DNF configuration")?;
     anyhow::ensure!(
         output.status.success(),
-        "Could not resolve the configured DNF installroot: {}",
+        "Could not read the effective DNF configuration: {}",
         output.status
     );
     String::from_utf8(output.stdout).context("DNF configuration is not UTF-8")
 }
 
-fn parse_absolute_setting(config: &str, key: &str) -> Result<PathBuf> {
+pub(super) fn reported_setting<'a>(config: &'a str, key: &str) -> Result<&'a str> {
     let mut values = config
         .lines()
         .filter_map(|line| line.strip_prefix(key)?.strip_prefix(" = "));
@@ -149,6 +151,11 @@ fn parse_absolute_setting(config: &str, key: &str) -> Result<PathBuf> {
         values.next().is_none(),
         "DNF reported multiple values for {key}"
     );
+    Ok(value)
+}
+
+pub(super) fn parse_absolute_setting(config: &str, key: &str) -> Result<PathBuf> {
+    let value = reported_setting(config, key)?;
     let path = PathBuf::from(value);
     anyhow::ensure!(
         path.is_absolute() && !value.contains(['\0', '\r']),
@@ -197,7 +204,7 @@ fn scoped_database_path(root: &Path, directory: &Path) -> Result<PathBuf> {
     Ok(database)
 }
 
-fn rooted_path(root: &Path, path: &Path) -> Result<PathBuf> {
+pub(super) fn rooted_path(root: &Path, path: &Path) -> Result<PathBuf> {
     let relative = path.strip_prefix("/")?;
     anyhow::ensure!(
         relative

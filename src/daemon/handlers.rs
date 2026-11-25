@@ -84,7 +84,9 @@ async fn load_observed_index(
         }
         return Ok((index, observation));
     }
-    anyhow::bail!("Installed inventory changed during three package index rebuild attempts")
+    anyhow::bail!(
+        "Package inventory or repositories changed during three package index rebuild attempts"
+    )
 }
 
 #[derive(Default)]
@@ -420,7 +422,7 @@ impl DaemonState {
                     Arc::clone(&self.catalog_observation_budget)
                 )
                 .await?,
-                "Installed inventory changed before package index publication"
+                "Package inventory or repositories changed before index publication"
             );
         }
         let packages = self.replace_observed_index(
@@ -454,8 +456,7 @@ impl DaemonState {
         }
     }
 
-    /// RPM observation covers installed rows. Repository changes are admitted
-    /// by explicit refresh, since RPM alone cannot certify repository freshness.
+    /// Rebuild when the backend's installed or repository inputs change.
     async fn heal_installed_catalog_if_changed(&self) -> anyhow::Result<()> {
         if !self.uses_production_backends() || self.package_manager.name() != "dnf" {
             return Ok(());
@@ -805,7 +806,7 @@ pub async fn handle_request(state: Arc<DaemonState>, request: Request) -> Respon
         if let Err(error) = state.heal_installed_catalog_if_changed().await {
             return internal_error(
                 request.id(),
-                format!("Failed to refresh stale installed package index: {error:#}"),
+                format!("Failed to refresh stale package index: {error:#}"),
             );
         }
     }

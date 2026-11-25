@@ -28,6 +28,8 @@ use crate::package_managers::types::{UpdateInfo, parse_version_or_zero};
 
 mod rpm_database;
 
+mod repository_observation;
+use repository_observation::RepositoryObservation;
 use rpm_database::{HOST_SQLITE, RpmDatabase};
 use rusqlite::{Connection, OpenFlags};
 use zerocopy::{FromBytes, Immutable, KnownLayout, big_endian::U32};
@@ -175,12 +177,20 @@ struct RpmInstalledCatalogObservation {
     host_sqlite: PathBuf,
     location: RpmDatabase,
     database: RpmDatabaseObservation,
+    repositories: Option<RepositoryObservation>,
 }
 
 impl super::InstalledCatalogObservation for RpmInstalledCatalogObservation {
     fn is_current(&self) -> Result<bool> {
-        Ok(RpmDatabase::detect(&self.host_sqlite)? == self.location
-            && self.database.is_current(&self.location.sqlite))
+        if RpmDatabase::detect(&self.host_sqlite)? != self.location {
+            return Ok(false);
+        }
+        if let Some(repositories) = &self.repositories
+            && !repositories.is_current()?
+        {
+            return Ok(false);
+        }
+        Ok(self.database.is_current(&self.location.sqlite))
     }
 }
 
@@ -2616,10 +2626,16 @@ impl PackageManager for DnfPackageManager {
         let location = RpmDatabase::detect(&self.rpm_db_path)?;
         let database = RpmDatabaseObservation::read(&location.sqlite)
             .context("Cannot observe RPM SQLite inventory for daemon catalog")?;
+        let repositories = if cfg!(test) && self.rpm_db_path != Path::new(HOST_SQLITE) {
+            None
+        } else {
+            Some(RepositoryObservation::capture(&location.root)?)
+        };
         Ok(Some(Arc::new(RpmInstalledCatalogObservation {
             host_sqlite: self.rpm_db_path.clone(),
             location,
             database,
+            repositories,
         })))
     }
     fn security_inventory(

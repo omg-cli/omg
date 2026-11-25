@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Verify live Fedora status across root, inventory, and install-reason changes.
+"""Verify live Fedora caches across repository, installroot, and inventory changes.
 
 Run as root in private mount and network namespaces without network routes.
 The arguments are the inert Fedora fixture directory and the built omg and
 omgd binaries. All RPM writes go to a disposable installroot.
 """
 from contextlib import contextmanager
+import gzip
 import hashlib
 import json
 import os
@@ -18,6 +19,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import xml.etree.ElementTree as ET
 
 if not __debug__ or len(sys.argv) != 4:
     raise SystemExit("requires assertions and arguments FIXTURE_DIR OMG OMGD")
@@ -114,11 +116,18 @@ with tempfile.TemporaryDirectory(prefix="omg-fedora-cache-scope-", dir="/tmp") a
     repo_config = (
         "[signed-fixture]\nname=Local signed fixture\n"
         f"baseurl={repo.as_uri()}\n"
-        "enabled=1\ngpgcheck=1\nrepo_gpgcheck=1\nskip_if_unavailable=false\n"
+        "enabled=1\ngpgcheck=1\nrepo_gpgcheck=1\nskip_if_unavailable=false\nbuild_cache=0\n"
         f"gpgkey={public.as_uri()}\n"
     )
     main = "[main]\nplugins=0\nreposdir=\n"
-    host_config = main + repo_config
+    repo_configs = private_dnf / "omg-fixture-repos"
+    repo_configs.mkdir()
+    repo_file = repo_configs / "fixture.repo"
+    repo_file.write_text(repo_config)
+    host_config = (
+        main.replace("reposdir=\n", "reposdir=/etc/dnf/omg-fixture-repos\n")
+        + f"cachedir={work / 'custom-dnf-cache'}\n"
+    )
     alternate_config = main + f"installroot={alternate}\n" + repo_config
     (alternate / "etc/dnf/dnf.conf").write_text(alternate_config)
     config.write_text(host_config)
@@ -192,6 +201,44 @@ with tempfile.TemporaryDirectory(prefix="omg-fedora-cache-scope-", dir="/tmp") a
                            value=no_daemon.stdout[-600:].strip(), status=no_daemon.returncode,
                            diagnostic=no_daemon.stderr[-1000:] if no_daemon.returncode else None))
 
+    def inspect_repository(phase, expected_available):
+        native = ordinary_control([dnf, "--cacheonly", "repoquery", "--available",
+                                   "--qf", r"%{name}.%{arch}\n", package]).splitlines()
+        identity = f"{package}.noarch"
+        assert native == ([identity] if expected_available else []), (phase, native)
+
+        def search_count():
+            metrics = checked([cli, "metrics"], env, ordinary)
+            return int(next(line.split()[1] for line in metrics.splitlines()
+                            if line.startswith("omg_search_requests_total ")))
+
+        before = search_count()
+        for role, mode in (("warm", env), ("direct", disabled)):
+            for query in (package, identity, "observer-fixture"):
+                result = command([cli, "--json", "search", "--limit", "2", query], mode, ordinary)
+                try:
+                    names = [row["name"] for row in json.loads(result.stdout)]
+                    matched = result.returncode == 0 and names == native
+                except (ValueError, KeyError, TypeError):
+                    names, matched = result.stdout[-600:], False
+                checks.append(dict(phase=phase, case=f"{role}-search-{query}", passed=matched,
+                                   value=names, status=result.returncode))
+            result = command([cli, "--json", "info", package], mode, ordinary)
+            if expected_available:
+                try:
+                    info = json.loads(result.stdout)
+                    matched = result.returncode == 0 and info["name"] == identity and info["installed"] is False
+                except (ValueError, KeyError, TypeError):
+                    matched = False
+            else:
+                matched = result.returncode != 0 and "not found" in result.stderr.lower() and not result.stdout.strip()
+            checks.append(dict(phase=phase, case=f"{role}-info", passed=matched,
+                               status=result.returncode, value=(result.stdout or result.stderr)[-650:]))
+        daemon_searches = search_count() - before
+        checks.append(dict(phase=phase, case="warm-search-ipc", passed=daemon_searches == 3,
+                           value=daemon_searches))
+        assert package not in checked([rpm, "-qa", "--qf", "%{NAME}\n"]).splitlines()
+
     @contextmanager
     def running_daemon(log):
         with subprocess.Popen([str(server)], cwd=work, env=env, stdout=log, stderr=subprocess.STDOUT,
@@ -225,7 +272,11 @@ with tempfile.TemporaryDirectory(prefix="omg-fedora-cache-scope-", dir="/tmp") a
             checked([*gpg, "--quick-generate-key", "OMG Fedora status fixture <fixture@example.invalid>", "rsa2048", "sign", "1d"])
             manifest = repo / "repodata/repomd.xml"
             public.write_text(checked([*gpg, "--armor", "--export"]))
-            checked([*gpg, "--armor", "--detach-sign", "--output", manifest.with_suffix(".xml.asc"), manifest])
+            def sign_manifest():
+                signature = manifest.with_suffix(".xml.asc")
+                signature.unlink(missing_ok=True)
+                checked([*gpg, "--armor", "--detach-sign", "--output", signature, manifest])
+            sign_manifest()
             advisory_cache = work / "cache/omg/dnf-security"
             def refresh_fixture():
                 for args in ([], [f"--setopt=cachedir={advisory_cache}", f"--setopt=system_cachedir={advisory_cache}"]):
@@ -247,6 +298,56 @@ with tempfile.TemporaryDirectory(prefix="omg-fedora-cache-scope-", dir="/tmp") a
                 inspect("switched-alternate", 1, 1, fixture_explicit=True)
                 config.write_text(host_config)
                 inspect("returned-host", host_count, host_explicit, host=True)
+                original_manifest = manifest.read_bytes()
+                inspect_repository("repository-initial", True)
+                repo_file.write_text(repo_config.replace("enabled=1", "enabled=0"))
+                inspect_repository("repository-disabled", False)
+                repo_file.write_text(repo_config)
+                refresh_fixture()
+                inspect_repository("repository-enabled-again", True)
+                overrides = private_dnf / "repos.override.d"
+                overrides.mkdir(exist_ok=True)
+                override = overrides / "99-omg-fixture.repo"
+                override.write_text("[signed-fixture]\nenabled=0\n")
+                inspect_repository("repository-override-disabled", False)
+                override.unlink()
+                refresh_fixture()
+                inspect_repository("repository-override-removed", True)
+                repo_file.write_text(repo_config + f"excludepkgs={package}\n")
+                refresh_fixture()
+                inspect_repository("repository-excluded", False)
+                repo_file.write_text(repo_config)
+                refresh_fixture()
+                inspect_repository("repository-exclusion-removed", True)
+
+                # Publish an empty signed catalogue at the original repo URL.
+                repo_ns = "{http://linux.duke.edu/metadata/repo}"
+                ET.register_namespace("", repo_ns[1:-1])
+                new_manifest = ET.fromstring(original_manifest)
+                for data in list(new_manifest.findall(f"{repo_ns}data")):
+                    new_manifest.remove(data)
+                empty = b'<metadata xmlns="http://linux.duke.edu/metadata/common" packages="0"/>'
+                compressed = gzip.compress(empty, mtime=0)
+                relative_primary = "repodata/primary-empty.xml.gz"
+                (repo / relative_primary).write_bytes(compressed)
+                primary = ET.SubElement(new_manifest, f"{repo_ns}data", type="primary")
+                for key, payload in (("checksum", compressed), ("open-checksum", empty)):
+                    ET.SubElement(primary, f"{repo_ns}{key}", type="sha256").text = hashlib.sha256(payload).hexdigest()
+                ET.SubElement(primary, f"{repo_ns}location", href=relative_primary)
+                timestamp = str(int(time.time()))
+                for key, value in (("timestamp", timestamp), ("size", len(compressed)), ("open-size", len(empty))):
+                    ET.SubElement(primary, f"{repo_ns}{key}").text = str(value)
+                new_manifest.find(f"{repo_ns}revision").text = timestamp
+                manifest.write_bytes(ET.tostring(new_manifest))
+                sign_manifest()
+                ordinary_control([dnf, "clean", "metadata"])
+                refresh_fixture()
+                inspect_repository("repository-metadata-empty", False)
+                manifest.write_bytes(original_manifest)
+                sign_manifest()
+                ordinary_control([dnf, "clean", "metadata"])
+                refresh_fixture()
+                inspect_repository("repository-metadata-restored", True)
 
             fast.unlink(missing_ok=True)
             persisted.unlink(missing_ok=True)
@@ -295,5 +396,5 @@ assert inventory() == before
 report = dict(binaries=binaries, checks=checks, total=len(checks),
               passed=sum(entry["passed"] for entry in checks), host_unchanged=True)
 print(json.dumps(report))
-if report["passed"] != report["total"] or report["total"] != 112:
+if report["passed"] != report["total"] or report["total"] != 193:
     sys.exit(4)
