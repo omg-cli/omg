@@ -747,7 +747,11 @@ fn draw_recent_activity(f: &mut Frame, area: Rect, app: &App) {
 
     let activity_list = if items.is_empty() {
         List::new(vec![ListItem::new(Line::from(Span::styled(
-            "No recent activity",
+            if app.history_loaded {
+                "No recent activity"
+            } else {
+                "Package history unavailable"
+            },
             Style::default().fg(colors::FG_MUTED),
         )))])
     } else {
@@ -1183,7 +1187,11 @@ fn draw_activity(f: &mut Frame, area: Rect, app: &App) {
 
     let activity_list = if items.is_empty() {
         List::new(vec![ListItem::new(Line::from(Span::styled(
-            "No activity recorded yet",
+            if app.history_loaded {
+                "No activity recorded yet"
+            } else {
+                "Package history unavailable"
+            },
             Style::default().fg(colors::FG_MUTED),
         )))])
     } else {
@@ -1903,6 +1911,24 @@ mod tests {
             .draw(|frame| draw(frame, &app))
             .expect("draw returned selection");
         assert_visible_selection(&terminal, "pkg-00");
+    }
+
+    #[test]
+    fn empty_activity_requires_a_loaded_history() {
+        let mut terminal = Terminal::new(TestBackend::new(160, 45)).expect("test terminal");
+        for (tab, empty_message) in [
+            (Tab::Dashboard, "No recent activity"),
+            (Tab::Activity, "No activity recorded yet"),
+        ] {
+            let mut app = app_on(tab);
+            app.history_loaded = false;
+            terminal.draw(|frame| draw(frame, &app)).expect("draw tab");
+            visible_name_cells(&terminal, "Package history unavailable");
+
+            app.history_loaded = true;
+            terminal.draw(|frame| draw(frame, &app)).expect("draw tab");
+            visible_name_cells(&terminal, empty_message);
+        }
     }
 
     #[test]

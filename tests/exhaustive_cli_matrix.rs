@@ -607,6 +607,47 @@ finally:
 mod boundary_matrix {
     use super::*;
 
+    #[cfg(all(target_os = "linux", debug_assertions))]
+    #[test]
+    fn dashboard_remains_responsive_during_history_write() -> anyhow::Result<()> {
+        let home = tempfile::tempdir_in("/var/tmp")?;
+        let data = home.path().join("data");
+        std::fs::create_dir(&data)?;
+        let mut command = std::process::Command::new("/usr/bin/python3");
+        command
+            .args([
+                "-I",
+                "-c",
+                include_str!("fixtures/dashboard_history_pty.py"),
+                env!("CARGO_BIN_EXE_omg"),
+            ])
+            .env_clear()
+            .env("HOME", home.path())
+            .env("XDG_CONFIG_HOME", home.path().join("config"))
+            .env("XDG_CACHE_HOME", home.path().join("cache"))
+            .env("OMG_NATIVE_TEST_DATA_DIR", "1")
+            .env("OMG_DATA_DIR", &data)
+            .env("OMG_SOCKET_PATH", home.path().join("omg.sock"))
+            .env("OMG_DISABLE_DAEMON", "1")
+            .env("OMG_DISABLE_TELEMETRY", "1")
+            .env("OMG_NO_UPDATE_CHECK", "1")
+            .env("TERM", "xterm-256color")
+            .env("PATH", "/usr/bin:/bin")
+            .current_dir(home.path());
+        for key in ["LLVM_PROFILE_FILE", "LD_LIBRARY_PATH"] {
+            if let Some(value) = std::env::var_os(key) {
+                command.env(key, value);
+            }
+        }
+        let output = command.output()?;
+        assert!(
+            output.status.success(),
+            "dashboard history PTY failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(())
+    }
+
     #[test]
     #[serial]
     fn test_nonexistent_command() {

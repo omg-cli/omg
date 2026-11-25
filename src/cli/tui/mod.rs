@@ -172,6 +172,8 @@ async fn run_app(
     let (search_tx, mut search_rx) = tokio::sync::mpsc::unbounded_channel::<SearchCompletion>();
     let (team_tx, mut team_rx) =
         tokio::sync::mpsc::unbounded_channel::<Option<crate::core::env::team::TeamStatus>>();
+    let mut history_refresh = None;
+    let mut history_refresh_requested = app.external_refresh_enabled;
     #[cfg(unix)]
     let (daemon_tx, mut daemon_rx) = tokio::sync::mpsc::unbounded_channel::<(
         bool,
@@ -221,6 +223,25 @@ async fn run_app(
                 app.team_status = Some(status);
                 app.team_status_is_remote = true;
             }
+        }
+
+        if history_refresh
+            .as_ref()
+            .is_some_and(std::thread::JoinHandle::is_finished)
+            && let Some(task) = history_refresh.take()
+            && let Ok(Ok(history)) = task.join()
+        {
+            app.history = history;
+            app.history_loaded = true;
+        }
+        if history_refresh_requested && history_refresh.is_none() {
+            history_refresh_requested = false;
+            // Dropping this thread's handle lets the terminal exit even if a
+            // package transaction still holds the history lock.
+            history_refresh = std::thread::Builder::new()
+                .name("omg-history".to_owned())
+                .spawn(app::App::read_recent_history)
+                .ok();
         }
 
         // Draw UI
@@ -311,7 +332,9 @@ async fn run_app(
         }
 
         // Update app state
+        let last_refresh = app.last_tick;
         app.tick()?;
+        history_refresh_requested |= app.external_refresh_enabled && app.last_tick != last_refresh;
 
         #[cfg(unix)]
         if should_refresh_daemon(daemon_refresh_in_flight, last_daemon_refresh.elapsed()) {
