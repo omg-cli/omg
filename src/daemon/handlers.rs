@@ -12,7 +12,7 @@ use super::cache::PackageCache;
 use super::index::PackageIndex;
 use super::protocol::{
     DetailedPackageInfo, ExplicitResult, HealthStatus, PackageInfo, Request, RequestId, Response,
-    ResponseResult, SearchResult, UpdateEntry, WirePackageSource, error_codes,
+    ResponseResult, SearchResult, StatusResult, UpdateEntry, WirePackageSource, error_codes,
 };
 use crate::core::metrics::GLOBAL_METRICS;
 use crate::core::security::{AuditEventType, AuditSeverity, audit_log_nonblocking};
@@ -388,6 +388,58 @@ impl DaemonState {
             .is_production()
     }
 
+    pub(super) fn uses_rpm_catalog(&self) -> bool {
+        self.uses_production_backends() && self.package_manager.name() == "dnf"
+    }
+
+    #[cfg(feature = "fedora")]
+    pub(super) async fn observe_status_rpm_catalog(
+        &self,
+    ) -> anyhow::Result<Arc<dyn InstalledCatalogObservation>> {
+        observe_installed_catalog(
+            Arc::clone(&self.package_manager),
+            Arc::clone(&self.catalog_observation_budget),
+        )
+        .await?
+        .context("RPM status inventory observation is unavailable")
+    }
+
+    #[cfg(feature = "fedora")]
+    pub(super) async fn status_rpm_catalog_is_current(
+        &self,
+        observation: Arc<dyn InstalledCatalogObservation>,
+    ) -> bool {
+        match installed_catalog_is_current(
+            observation,
+            Arc::clone(&self.catalog_observation_budget),
+        )
+        .await
+        {
+            Ok(current) => current,
+            Err(error) => {
+                tracing::warn!("Cannot validate cached RPM status: {error:#}");
+                false
+            }
+        }
+    }
+
+    #[cfg(feature = "fedora")]
+    pub(super) async fn publish_observed_status(
+        &self,
+        index: &Arc<PackageIndex>,
+        status: Arc<StatusResult>,
+        observation: Arc<dyn InstalledCatalogObservation>,
+    ) {
+        if self
+            .status_rpm_catalog_is_current(Arc::clone(&observation))
+            .await
+        {
+            self.with_current_index(index, || {
+                self.cache.update_observed_status(status, observation);
+            });
+        }
+    }
+
     /// Rebuild the published index and reincarnate libalpm while owning refresh
     /// serialization through native work and index publication.
     async fn rebuild_production_index(
@@ -470,7 +522,7 @@ impl DaemonState {
     /// RPM observation covers installed rows. Repository changes are admitted
     /// by explicit refresh, since RPM alone cannot certify repository freshness.
     async fn heal_installed_catalog_if_changed(&self) -> anyhow::Result<()> {
-        if !self.uses_production_backends() || self.package_manager.name() != "dnf" {
+        if !self.uses_rpm_catalog() {
             return Ok(());
         }
         if !self.installed_catalog_needs_heal().await? {
@@ -1314,25 +1366,21 @@ async fn handle_info(state: Arc<DaemonState>, id: RequestId, package: String) ->
     not_found_error(id, format!("Package not found: {package}"))
 }
 
-/// Handle status request
-#[tracing::instrument(skip(state))]
-async fn handle_status(state: Arc<DaemonState>, id: RequestId) -> Response {
-    // METRICS: Track status requests
-    GLOBAL_METRICS.inc_status_requests();
-
-    // 1. Check MEMORY cache first (instant - sub-microsecond, Arc clone is cheap)
+async fn cached_status(state: &Arc<DaemonState>) -> Option<StatusResult> {
+    #[cfg(feature = "fedora")]
+    if state.uses_rpm_catalog() {
+        // Persisted status carries no live RPM observation after a restart.
+        let (cached, observation) = state.cache.observed_status()?;
+        return state
+            .status_rpm_catalog_is_current(observation)
+            .await
+            .then(|| Arc::unwrap_or_clone(cached));
+    }
     if let Some(cached) = state.cache.get_status() {
-        // METRICS: Cache hit (memory)
-        GLOBAL_METRICS.inc_cache_hits();
-        return Response::Success {
-            id,
-            result: ResponseResult::Status(Arc::unwrap_or_clone(cached)),
-        };
+        return Some(Arc::unwrap_or_clone(cached));
     }
 
-    // 2. Check persistent cache (disk - slower)
-    // Runs in blocking thread to avoid stalling async runtime
-    let state_clone = Arc::clone(&state);
+    let state_clone = Arc::clone(state);
     let cached_result = tokio::task::spawn_blocking(move || {
         state_clone
             .persistent
@@ -1341,23 +1389,28 @@ async fn handle_status(state: Arc<DaemonState>, id: RequestId) -> Response {
     .await;
 
     match cached_result {
-        Ok(Ok(Some(cached))) => {
-            // METRICS: Cache hit (persistent)
-            GLOBAL_METRICS.inc_cache_hits();
-            // Do not restart its lifetime by promoting an old snapshot into
-            // the memory cache. Only a new backend refresh starts a new TTL.
-            return Response::Success {
-                id,
-                result: ResponseResult::Status(cached),
-            };
-        }
-        Ok(Ok(None)) => {}
+        // A disk hit does not promote the old status into a fresh memory TTL.
+        Ok(Ok(cached)) => return cached,
         Ok(Err(error)) => {
             tracing::warn!("Failed to read persisted status cache: {error}");
         }
         Err(error) => {
             tracing::warn!("Status cache task failed: {error}");
         }
+    }
+    None
+}
+
+/// Handle status request
+#[tracing::instrument(skip(state))]
+async fn handle_status(state: Arc<DaemonState>, id: RequestId) -> Response {
+    GLOBAL_METRICS.inc_status_requests();
+    if let Some(cached) = cached_status(&state).await {
+        GLOBAL_METRICS.inc_cache_hits();
+        return Response::Success {
+            id,
+            result: ResponseResult::Status(cached),
+        };
     }
 
     // METRICS: Cache miss - need to query system
@@ -1996,6 +2049,77 @@ pub(super) mod tests {
             builds,
             fault,
         ))
+    }
+
+    #[cfg(feature = "fedora")]
+    #[tokio::test]
+    async fn fedora_status_refuses_unbound_cached_security_scope() -> anyhow::Result<()> {
+        let (_directory, state, _, revision, _, _) = mutable_fedora_catalog(true, None)?;
+        let status =
+            super::super::status_policy::status_snapshot(42, 20, 1, 2, vec![], Some((0, 0))).0;
+        state.persistent.set_status(&status)?;
+        let disk = handle_request(Arc::clone(&state), Request::Status { id: 1 }).await;
+
+        state.cache.update_status(Arc::new(status));
+        revision.fetch_add(1, Ordering::AcqRel);
+        let memory = handle_request(state, Request::Status { id: 2 }).await;
+
+        for (source, response) in [("disk", disk), ("memory", memory)] {
+            let Response::Success {
+                result: ResponseResult::Status(status),
+                ..
+            } = response
+            else {
+                anyhow::bail!("unbound {source} status should fall back to live package counts");
+            };
+            assert_ne!(status.total_packages, 42, "unbound {source} counts");
+            assert_eq!(
+                status.scanned_vulnerability_summary(),
+                None,
+                "unbound {source} status cannot attest advisory coverage"
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "fedora")]
+    #[tokio::test]
+    async fn fedora_status_drops_scope_when_inventory_changes() -> anyhow::Result<()> {
+        let (_directory, state, _, revision, _, _) = mutable_fedora_catalog(true, None)?;
+        let observation = state.observe_status_rpm_catalog().await?;
+        let index = state.index_snapshot();
+        let status = Arc::new(
+            super::super::status_policy::status_snapshot(42, 20, 1, 2, vec![], Some((5, 2))).0,
+        );
+        state
+            .publish_observed_status(&index, Arc::clone(&status), Arc::clone(&observation))
+            .await;
+        assert_eq!(
+            cached_status(&state)
+                .await
+                .context("valid RPM scope should be reusable")?
+                .scanned_vulnerability_summary(),
+            Some((5, 2))
+        );
+
+        revision.fetch_add(1, Ordering::AcqRel);
+        let response = handle_request(Arc::clone(&state), Request::Status { id: 1 }).await;
+        let Response::Success {
+            result: ResponseResult::Status(current),
+            ..
+        } = response
+        else {
+            anyhow::bail!("stale observed status should fall back to live package counts");
+        };
+        assert_ne!(current.total_packages, 42);
+        assert_eq!(current.scanned_vulnerability_summary(), None);
+
+        state.cache.clear();
+        state
+            .publish_observed_status(&index, status, observation)
+            .await;
+        assert!(state.cache.get_status().is_none());
+        Ok(())
     }
 
     #[cfg(feature = "fedora")]

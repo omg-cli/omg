@@ -248,6 +248,18 @@ async fn run_with_status_path(
                     return;
                 }
             };
+            #[cfg(feature = "fedora")]
+            let rpm_observation = if state.uses_rpm_catalog() {
+                match state.observe_status_rpm_catalog().await {
+                    Ok(observation) => Some(observation),
+                    Err(error) => {
+                        tracing::warn!("Cannot observe RPM inventory before status refresh: {error:#}");
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
             let status = state.status_counts().await;
             state
                 .runtime_versions
@@ -316,6 +328,13 @@ async fn run_with_status_path(
                 res.invalidate_security_scope();
             }
             let res_arc = Arc::new(res);
+            #[cfg(feature = "fedora")]
+            if let Some(observation) = rpm_observation {
+                state
+                    .publish_observed_status(&index, res_arc, observation)
+                    .await;
+                return;
+            }
             // The in-memory cache is authoritative, so persistence is best-effort.
             state.with_current_index(&index, || {
                 if let Err(error) = state.persistent.set_status(&res_arc) {
