@@ -53,6 +53,8 @@ class HelperExecutionTests(unittest.TestCase):
                                *arguments], capture_output=True, text=True, timeout=25, env=environment)
 
     def test_two_real_shards_execute_exact_disjoint_complete_identity_union(self):
+        slow_test = 'test_qemu_output_contracts.Checks.test_ok'
+        (self.root / 'scripts/test_qemu_output_contracts.py').write_text(self.body)
         receipts = []
         for shard in (0, 1):
             output = self.root / f'out-{shard}'
@@ -63,6 +65,7 @@ class HelperExecutionTests(unittest.TestCase):
         selected = [row for receipt in receipts for row in receipt['selected']]
         self.assertEqual(sorted(selected), receipts[0]['discovered'])
         self.assertEqual(len(selected), len(set(selected)))
+        self.assertEqual(receipts[1]['selected'], [slow_test])
         for receipt in receipts:
             self.assertEqual(sorted(row['id'] for row in receipt['executed']), receipt['selected'])
             self.assertTrue(all(row['status'] == 'passed' and row['elapsed_seconds'] >= 0
@@ -378,6 +381,17 @@ class HelperAdmissionTests(unittest.TestCase):
         self.assertTrue(receipt['success'])
         self.assertEqual([row['producer_job'] for row in receipt['producers']], [30, 31])
 
+    def test_pending_second_owner_does_not_fetch_the_first_receipt(self):
+        self.jobs[1].update(status='in_progress', conclusion=None)
+        api = self.api()
+        with patch.object(api, 'listing', wraps=api.listing) as listing, \
+                patch.object(api, 'request', wraps=api.request) as request, \
+                patch.object(self.module.subprocess, 'check_output', return_value=self.tree):
+            with self.assertRaises(self.module.Pending):
+                self.module.admit_pair(api, self.root, self.repository, self.run, self.sha)
+        self.assertTrue(all(call.args[1] == 'jobs' for call in listing.call_args_list))
+        request.assert_not_called()
+
     def test_latest_failed_or_incomplete_owner_never_uses_old_green_proof(self):
         for status, conclusion in [('completed', 'failure'), ('in_progress', None), ('completed', 'cancelled')]:
             with self.subTest(status=status, conclusion=conclusion):
@@ -498,6 +512,24 @@ class HelperAdmissionTests(unittest.TestCase):
                 api.request('fixture')
         self.assertEqual(len(calls), 1)
         self.assertEqual(rejected.exception.stderr, b'fixture HTTP 429\n')
+
+    def test_artifact_retry_uses_the_same_immutable_download(self):
+        api = self.module.GitHub(time.monotonic() + 20)
+        endpoint = f'repos/{self.repository}/actions/artifacts/40/zip'
+        archive = b'PK\x03\x04fixture'
+        calls = []
+
+        def request(arguments, *, stdout, stderr, check, timeout):
+            calls.append(arguments)
+            if len(calls) == 1:
+                stdout.write(b'HTTP/2.0 503 unavailable\ncontent-type: application/json\n\n{}')
+                stderr.write(b'fixture HTTP 503\n')
+                raise subprocess.CalledProcessError(1, arguments)
+            stdout.write(b'HTTP/2.0 200 OK\ncontent-type: application/zip\n\n' + archive)
+
+        with patch.object(self.module.subprocess, 'run', side_effect=request), patch.object(self.module.time, 'sleep'):
+            self.assertEqual(api.request(endpoint, binary=True), archive)
+        self.assertEqual(calls, [['gh', 'api', endpoint, '--include']] * 2)
 
     def test_current_pr_run_binds_api_head_and_actual_merge_source_separately(self):
         event = self.root / 'event.json'
