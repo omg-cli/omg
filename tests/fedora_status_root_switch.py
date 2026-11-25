@@ -20,6 +20,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from urllib.parse import parse_qs
 import xml.etree.ElementTree as ET
 
 if not __debug__ or len(sys.argv) != 4:
@@ -318,6 +319,74 @@ with tempfile.TemporaryDirectory(prefix="omg-fedora-cache-scope-", dir="/tmp") a
                 checks.append(dict(phase=phase, case="status-ipc", passed=(after[0] - before[0], after[1] - before[1]) == (2, 0),
                                    value=(after[0] - before[0], after[1] - before[1])))
 
+    def inspect_security_inventory(phase, expected_count=None):
+        native = ordinary_control([dnf, "--cacheonly", "--setopt=disable_excludes=*",
+                                   "repoquery", "--installed", "--qf",
+                                   "%{name}\t%{arch}\t%{epoch}:%{version}-%{release}\\n"])
+        expected = sorted(tuple(row.split("\t")) for row in native.splitlines())
+        if expected_count is None:
+            assert len(expected) > 25, (phase, len(expected))
+        else:
+            assert len(expected) == expected_count, (phase, expected_count, len(expected))
+
+        def inspect(mode):
+            output = work / f"inventory-{phase}-{mode}.json"
+            started = time.monotonic()
+            result = command([cli, "audit", "sbom", "--inventory-only", "--output", output], disabled, ordinary)
+            elapsed_ms = round((time.monotonic() - started) * 1000, 2)
+            actual = []
+            passed = False
+            diagnostic = result.stderr[-900:]
+            try:
+                report = json.loads(output.read_text())
+                assert report["bomFormat"] == "CycloneDX" and report["specVersion"] == "1.5"
+                properties = {entry["name"]: entry["value"]
+                              for entry in report["metadata"]["component"]["properties"]}
+                for item in report["components"]:
+                    assert item["bom-ref"] == item["purl"]
+                    queries = parse_qs(item["purl"].partition("?")[2], strict_parsing=True)
+                    assert queries["epoch"] == [item["version"].split(":", 1)[0]]
+                    actual.append((item["name"], queries["arch"][0], item["version"]))
+                passed = (result.returncode == 0 and sorted(actual) == expected
+                          and properties["omg:advisory-scan"] == "not-performed"
+                          and not report.get("vulnerabilities")
+                          and stat.S_IMODE(output.stat().st_mode) == 0o600)
+            except (AssertionError, KeyError, OSError, ValueError) as error:
+                if not diagnostic:
+                    diagnostic = f"{type(error).__name__}: {error}"
+            checks.append(dict(phase=phase, case=f"sbom-inventory-{mode}", passed=passed,
+                               status=result.returncode, expected_count=len(expected),
+                               actual_count=len(actual), elapsed_ms=elapsed_ms,
+                               diagnostic=diagnostic))
+
+        inspect("ordinary")
+        target = Path(dnf).resolve(strict=True)
+        with tempfile.TemporaryDirectory(prefix="dnf-inventory-", dir=root) as directory:
+            gate = Path(directory)
+            gate.chmod(0o755)
+            native_dnf = gate / target.name
+            shutil.copy2(target, native_dnf)
+            wrapper = gate / "detect-inventory"
+            wrapper.write_text(f"""#!/usr/bin/bash
+installed=false
+query=false
+for argument in "$@"; do
+    if [[ "$argument" == --installed ]]; then installed=true; fi
+    if [[ "$argument" == repoquery ]]; then query=true; fi
+done
+if "$installed" && "$query"; then
+    printf '%s\\n' 'Unexpected DNF inventory subprocess' >&2
+    exit 197
+fi
+exec {shlex.quote(str(native_dnf))} "$@"
+""")
+            wrapper.chmod(0o755)
+            checked(["/usr/bin/mount", "--bind", wrapper, target])
+            try:
+                inspect("without-dnf-inventory")
+            finally:
+                checked(["/usr/bin/umount", target])
+
     def status_during(change):
         # Pause the real counts query before libdnf5 takes any database locks.
         # The wrapper and native executable are confined to this mount namespace.
@@ -607,6 +676,14 @@ exec {shlex.quote(str(native))} "$@"
                                    status=exit_code, value=(stdout + stderr)[-1200:]))
                 inspect_update_status("status-repository-disabled", 0, False)
                 assert checked([rpm, "--root", alternate, "-q", "--qf", "%{VERSION}", package]) == "0"
+
+            inspect_security_inventory("inventory-alternate-old", 1)
+            checked([rpm, "--root", alternate, "-e", package])
+            inspect_security_inventory("inventory-alternate-empty", 0)
+            checked([rpm, "--root", alternate, "-U", "--nosignature", fixture/"observer-fixture.rpm"])
+            inspect_security_inventory("inventory-alternate-restored", 1)
+            config.write_text(host_config)
+            inspect_security_inventory("inventory-host")
         except Exception:
             log.seek(0)
             print(log.read()[-4500:], file=sys.stderr)
@@ -621,5 +698,5 @@ assert inventory() == before
 report = dict(binaries=binaries, checks=checks, total=len(checks),
               passed=sum(entry["passed"] for entry in checks), host_unchanged=True)
 print(json.dumps(report))
-if report["passed"] != report["total"] or report["total"] != 256:
+if report["passed"] != report["total"] or report["total"] != 264:
     sys.exit(4)

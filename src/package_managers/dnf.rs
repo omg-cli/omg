@@ -24,7 +24,9 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use crate::core::{Package, PackageSource, is_root};
 use crate::package_managers::PackageManager;
-use crate::package_managers::types::{UpdateInfo, parse_version_or_zero};
+use crate::package_managers::types::{
+    SecurityOrigin, SecurityPackage, UpdateInfo, parse_version_or_zero,
+};
 
 mod rpm_database;
 
@@ -1471,6 +1473,59 @@ impl DnfPackageManager {
         candidates
     }
 
+    fn sqlite_security_inventory(&self) -> Result<Vec<SecurityPackage>> {
+        let location = RpmDatabase::detect(&self.rpm_db_path)?;
+        Self::read_rpm_sqlite(&location.sqlite)?
+            .into_iter()
+            // Architecture-less gpg-pubkey records represent RPM trust keys.
+            .filter(|package| package.name != "gpg-pubkey" || !package.architecture.is_empty())
+            .map(|package| {
+                anyhow::ensure!(
+                    [
+                        &package.name,
+                        &package.version,
+                        &package.release,
+                        &package.architecture,
+                    ]
+                    .into_iter()
+                    .all(|field| !field.is_empty()
+                        && !field
+                            .chars()
+                            .any(|ch| ch.is_whitespace() || ch.is_control() || ch == '\u{fffd}')),
+                    "Incomplete installed RPM security identity"
+                );
+
+                let epoch = if package.version.contains(':') {
+                    ""
+                } else {
+                    "0:"
+                };
+                let version = format!("{epoch}{}-{}", package.version, package.release);
+                Ok(Self::distribution_security_package(
+                    package.name,
+                    package.architecture,
+                    version,
+                ))
+            })
+            .collect()
+    }
+
+    fn distribution_security_package(
+        name: String,
+        architecture: String,
+        version: String,
+    ) -> SecurityPackage {
+        SecurityPackage {
+            origin: SecurityOrigin::DistributionPackage,
+            name,
+            version,
+            advisory_source: None,
+            architecture: Some(architecture),
+            description: String::new(),
+            licenses: Vec::new(),
+        }
+    }
+
     pub(crate) async fn installed_package_sizes(
         query: InstalledSizeQuery<'_>,
     ) -> Result<Vec<(String, i64)>> {
@@ -2693,8 +2748,19 @@ impl PackageManager for DnfPackageManager {
     }
     fn security_inventory(
         &self,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<super::types::SecurityPackage>>> + Send + '_>> {
-        Box::pin(async {
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<SecurityPackage>>> + Send + '_>> {
+        Box::pin(async move {
+            let manager = self.cache_handle();
+            match tokio::task::spawn_blocking(move || manager.sqlite_security_inventory())
+                .await
+                .context("RPM security inventory worker failed")?
+            {
+                Ok(packages) => return Ok(packages),
+                Err(error) => {
+                    tracing::debug!("RPM SQLite security inventory unavailable: {error:#}");
+                }
+            }
+
             let mut command =
                 tokio::process::Command::from(crate::core::privilege::system_command("dnf")?);
             // Query every installed version and architecture, even excluded
@@ -2710,14 +2776,12 @@ impl PackageManager for DnfPackageManager {
             let output = Self::query_output(command).await?;
             Ok(Self::parse_versioned_packages(&output)?
                 .into_iter()
-                .map(|package| super::types::SecurityPackage {
-                    origin: crate::package_managers::types::SecurityOrigin::DistributionPackage,
-                    name: package.name,
-                    version: package.version,
-                    advisory_source: None,
-                    architecture: Some(package.architecture),
-                    description: String::new(),
-                    licenses: Vec::new(),
+                .map(|package| {
+                    Self::distribution_security_package(
+                        package.name,
+                        package.architecture,
+                        package.version,
+                    )
                 })
                 .collect())
         })
