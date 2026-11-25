@@ -2076,21 +2076,23 @@ mod tests {
         const ERROR: &[u8] =
             b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 
-        let (bad_url, bad_server) = serve_probe_response(ERROR, Duration::ZERO).await;
-        // Let the failing site answer first: the alternate must still be
-        // awaited and allowed to establish connectivity.
-        let (good_url, good_server) = serve_probe_response(OK, Duration::from_millis(50)).await;
-        assert_eq!(
-            probe_connectivity(
-                &client,
-                [("primary", &bad_url), ("alternate", &good_url)],
-                Duration::from_secs(1)
-            )
-            .await,
-            Ok("alternate")
-        );
-        finish_probe_server(bad_server).await;
-        finish_probe_server(good_server).await;
+        // Either endpoint can fail first. The other must still be awaited.
+        for (healthy, failing) in [("primary", "alternate"), ("alternate", "primary")] {
+            let (bad_url, bad_server) = serve_probe_response(ERROR, Duration::ZERO).await;
+            let (good_url, good_server) =
+                serve_probe_response(OK, Duration::from_millis(100)).await;
+            let endpoints = if healthy == "primary" {
+                [(healthy, good_url.as_str()), (failing, bad_url.as_str())]
+            } else {
+                [(failing, bad_url.as_str()), (healthy, good_url.as_str())]
+            };
+            assert_eq!(
+                probe_connectivity(&client, endpoints, Duration::from_secs(2)).await,
+                Ok(healthy)
+            );
+            finish_probe_server(bad_server).await;
+            finish_probe_server(good_server).await;
+        }
 
         let (first_url, first_server) = serve_probe_response(ERROR, Duration::ZERO).await;
         let (second_url, second_server) = serve_probe_response(ERROR, Duration::ZERO).await;

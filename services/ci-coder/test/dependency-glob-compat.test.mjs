@@ -63,8 +63,8 @@ test("installed rimraf async and sync glob deletion stay inside the private fixt
   const root = await mkdtemp(join(tmpdir(), "omg-rimraf-dependencies-"));
   try {
     for (const name of ["async.tmp", "sync.tmp", "keep.txt"]) await writeFile(join(root, name), name);
-    expect(await rimraf(join(root, "async.*"), { glob: true })).toBe(true);
-    expect(rimrafSync(join(root, "sync.*"), { glob: true })).toBe(true);
+    expect(await rimraf("async.*", { glob: { cwd: root } })).toBe(true);
+    expect(rimrafSync("sync.*", { glob: { cwd: root } })).toBe(true);
     expect(fs.existsSync(join(root, "async.tmp"))).toBe(false);
     expect(fs.existsSync(join(root, "sync.tmp"))).toBe(false);
     expect(await readFile(join(root, "keep.txt"), "utf8")).toBe("keep.txt");

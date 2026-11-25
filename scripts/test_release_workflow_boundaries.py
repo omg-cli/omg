@@ -132,7 +132,6 @@ class ReleaseWorkflowBoundaryTests(unittest.TestCase):
                            '      state=$BEFORE_TAG\n'
                            '      if [ -f pushed ]; then state=$AFTER_TAG; fi\n'
                            '      printf "%s\\n" "$state" >> main-reads\n'
-                           '      test -f archive-checked || exit 98\n'
                            '      case "$state" in\n'
                            '        unreadable) exit 128;;\n'
                            '        drifted) printf "%040d\\trefs/heads/main\\n" 0;;\n'
@@ -145,7 +144,7 @@ class ReleaseWorkflowBoundaryTests(unittest.TestCase):
                            '  *) exit 99;;\n'
                            'esac\n',
                     'gh': 'printf "%s\\n" "$*" > dispatched\n',
-                    'python3': 'test "$*" = "scripts/advisory-baseline.py status" && touch archive-checked\n',
+                    'python3': 'touch advisory-status-called\nexit 1\n',
                     'scripts/require-workflow-success.sh': 'printf "%s %s\\n" "$1" "$2" >> lookups\n'
                                                            'test "$1" != ci.yml || test "$PUSH_CI" = success\n',
                 }
@@ -167,7 +166,7 @@ class ReleaseWorkflowBoundaryTests(unittest.TestCase):
                 self.assertEqual(lookups.read_text().splitlines() if lookups.exists() else [],
                                  [f'{name} {sha}' for name in expected_lookups])
                 self.assertEqual(result.returncode == 0, dispatched, result.stdout + result.stderr)
-                self.assertEqual((root / 'archive-checked').exists(), expected_lookups == all_lookups)
+                self.assertFalse((root / 'advisory-status-called').exists())
                 reads = root / 'main-reads'
                 expected_reads = [env['BEFORE_TAG']] if expected_lookups == all_lookups else []
                 if tagged:

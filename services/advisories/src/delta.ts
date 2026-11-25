@@ -7,7 +7,7 @@ export async function deltaBatch(
     cursor: Cursor | null,
     limit = LIMITS.deltaRecords,
 ) {
-    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 32)
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 128)
         throw new Error("invalid delta batch limit");
     if (!body) throw new Error("missing delta body");
     const parser = new JSONParser({

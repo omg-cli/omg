@@ -299,16 +299,11 @@ class AdvisoryReleaseBoundaryTests(unittest.TestCase):
         self.assertIn("warm --max-steps 256", job)
         self.assertIn("timeout-minutes: 10", job)
 
-    def test_each_publication_boundary_rechecks_status(self):
+    def test_publication_has_no_live_advisory_readiness_dependency(self):
         release = (ROOT / ".github/workflows/release.yml").read_text(encoding="utf-8")
-        create = job_block(release, "release")
-        self.assertLess(create.index("python3 scripts/advisory-baseline.py status"), create.index("- name: Publish GitHub Release"))
-        sync = job_block(release, "sync-r2")
-        self.assertLess(sync.index("python3 scripts/advisory-baseline.py status"), sync.index("- name: Upload release artifacts to R2"))
-        marker = step_script(sync, "Upload latest-version marker")
-        self.assertLess(marker.index("python3 scripts/advisory-baseline.py status"), marker.index('r2 object put "omg-releases/latest-version"'))
+        self.assertNotIn("advisory-baseline.py status", release)
 
-    def test_pending_advisory_baseline_prevents_immutable_tag_creation(self):
+    def test_pending_advisory_baseline_does_not_block_verified_tag_creation(self):
         workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
         script = step_script(job_block(workflow, "release-tag"),
                              "Tag Cargo.toml version when all platform builds succeeded")
@@ -318,7 +313,11 @@ class AdvisoryReleaseBoundaryTests(unittest.TestCase):
             (root / "bin").mkdir()
             (root / "scripts").mkdir()
             fixtures = {
-                "bin/git": '#!/bin/sh\ncase "$1" in ls-remote) test -f tag-created;; tag) touch tag-created;; push) touch pushed;; esac\n',
+                "bin/git": '#!/bin/sh\ncase "$1" in\n'
+                           'ls-remote) case "$*" in\n'
+                           '*refs/heads/main) printf "%s\\trefs/heads/main\\n" "$GITHUB_SHA";;\n'
+                           '*) test -f pushed;; esac;;\n'
+                           'tag) touch tag-created;; push) touch pushed;; esac\n',
                 "bin/gh": "#!/bin/sh\nexit 0\n",
                 "bin/python3": "#!/bin/sh\ntouch readiness-called\nexit 1\n",
                 "scripts/require-workflow-success.sh": "#!/bin/sh\nexit 0\n",
@@ -336,10 +335,10 @@ class AdvisoryReleaseBoundaryTests(unittest.TestCase):
                                FEATURE_INTERSECTIONS="success", MACOS="success", UBUNTU="success")
             result = subprocess.run([BASH, "-e", "-o", "pipefail", "-c", script], cwd=root,
                                     env=environment, capture_output=True, text=True, timeout=10)
-            self.assertNotEqual(result.returncode, 0)
-            self.assertFalse((root / "tag-created").exists(), "pending baseline consumed the release tag")
-            self.assertFalse((root / "pushed").exists())
-            self.assertTrue((root / "readiness-called").exists())
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertTrue((root / "tag-created").exists())
+            self.assertTrue((root / "pushed").exists())
+            self.assertFalse((root / "readiness-called").exists())
 
 
 if __name__ == "__main__":
