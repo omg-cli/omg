@@ -153,21 +153,22 @@ check_backend_refusal() {
 # END BACKEND FAULT ORACLE
 # BEGIN BACKEND FAULT PROBE
 check_fedora_reason_refusal() {
-  local binary=$1 state=$2 evidence=$3 uid=$4 gid=$5 status=0
+  local binary=$1 state=$2 evidence=$3 uid gid status=0
   local fixture="$state/backend-fault"
+  uid=$(id -u)
+  gid=$(id -g)
   [[ "$uid" =~ ^[0-9]+$ && "$uid" != 0 && "$gid" =~ ^[0-9]+$ ]] || return 2
   mkdir "$fixture"
-  # Corrupt an install-reason file in a private mount. Exercise both the
-  # direct reader and DNF's native error with the real package database.
+  # Keep the root-owned fault files on a temporary filesystem in the private
+  # mount namespace. The unprivileged runner owns everything it must remove.
   timeout --kill-after=5s 30s sudo -n unshare --mount --propagation private -- bash -euc '
     settings=$(/usr/bin/dnf --cacheonly --dump-main-config)
     install_root=$(sed -n "s/^installroot = //p" <<< "$settings")
     state_dir=$(sed -n "s/^system_state_dir = //p" <<< "$settings")
     [[ "$install_root" == / && "$state_dir" == /* && "$state_dir" != / && -d "$state_dir" ]]
-    mkdir -m 0755 "$1/dnf-state"
-    printf "%s\n" "[packages" > "$1/dnf-state/packages.toml"
-    install -m 0644 /dev/null "$1/dnf-state/system-repo.lock"
-    mount --bind "$1/dnf-state" "$state_dir"
+    mount -t tmpfs -o size=1m,mode=0755,nodev,nosuid,noexec tmpfs "$state_dir"
+    printf "%s\n" "[packages" > "$state_dir/packages.toml"
+    install -m 0644 /dev/null "$state_dir/system-repo.lock"
     exec setpriv --reuid="$3" --regid="$4" --clear-groups --no-new-privs \
       --bounding-set=-all --inh-caps=-all --ambient-caps=-all \
       env -i PATH=/usr/bin:/bin HOME="$1" LC_ALL=C NO_COLOR=1 \
@@ -470,7 +471,7 @@ if ! check_text_info_outputs "$package_identity" \
 fi
 backend_faults='[]'
 if [[ "$ID" == fedora ]]; then
-  check_fedora_reason_refusal "$bin" "$state" "$evidence" "$(id -u)" "$(id -g)"
+  check_fedora_reason_refusal "$bin" "$state" "$evidence"
   backend_faults='["dnf-reason-refusal"]'
 fi
 # Cleanup is part of success, so it must precede the positive receipt.

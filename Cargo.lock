@@ -3559,6 +3559,7 @@ dependencies = [
  "regex",
  "reqwest",
  "rkyv",
+ "roxmltree",
  "rsa",
  "rusqlite",
  "rust-apt",
@@ -4597,6 +4598,15 @@ name = "roff"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "323c417e1d9665a65b263ec744ba09030cfb277e9daa0b018a4ab62e57bc8189"
+
+[[package]]
+name = "roxmltree"
+version = "0.21.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9da7f59328b09405b181fee1018925fad50f157afb43c0c0f5c522c256dd5907"
+dependencies = [
+ "memchr",
+]
 
 [[package]]
 name = "rsa"

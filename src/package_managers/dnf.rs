@@ -31,6 +31,7 @@ use crate::package_managers::types::{
 mod install_reasons;
 mod rpm_database;
 
+mod repository_freshness;
 mod repository_observation;
 use repository_observation::RepositoryObservation;
 pub(crate) use repository_observation::StatusRepositories;
@@ -238,6 +239,15 @@ impl super::InstalledCatalogObservation for RpmInstalledCatalogObservation {
             return Ok(false);
         }
         Ok(self.database.is_current(&self.location.sqlite))
+    }
+
+    fn can_reuse(&self) -> Result<bool> {
+        if let Some(repositories) = &self.repositories
+            && !repositories.metadata_is_fresh()?
+        {
+            return Ok(false);
+        }
+        self.is_current()
     }
 }
 

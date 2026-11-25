@@ -697,6 +697,107 @@ exec {shlex.quote(str(native))} "$@"
                 finally:
                     restore_test_summary(original)
 
+            def inspect_aged_catalog(phase, original, ttl):
+                cache = work/f"{phase}-cache"
+                oracle = work/f"{phase}-control"
+                old_summary = "Catalog-QZ Fresh Generation ΩΣ"
+                updated = "Catalog-QZ Elapsed Generation ΩΣ"
+                try:
+                    repo_file.write_text(repo_config + f"cachedir={cache}\nmetadata_expire={ttl}\n")
+                    publish_test_summary(original, old_summary, "age-initial")
+                    refresh_fixture()
+                    cached, = cache.glob("signed-fixture-*/repodata/repomd.xml")
+                    primary = cached.with_name("primary-age-initial.xml.gz")
+                    marker = cached.parent.parent/"attrs/expired"
+                    seeded = checked([cli, "--json", "search", "--limit", "1", package], env, ordinary)
+                    row, = json.loads(seeded)
+                    assert row["description"] == old_summary
+                    modified = primary.stat()
+                    deadline = int(modified.st_mtime) + ttl
+                    assert (ttl == 0 or time.time() < deadline) and not marker.exists()
+                    if ttl:
+                        requests_before = request_counters()
+                        with reject_native_selection("--available"):
+                            reused = command([cli, "--json", "search", "--limit", "1", package], env, ordinary)
+                        total, failed = request_counters()
+                        checks.append(dict(phase=phase, case="reuse-before-deadline",
+                                           passed=reused.returncode == 0 and reused.stdout == seeded
+                                                  and total - requests_before[0] == 2
+                                                  and failed == requests_before[1],
+                                           value=reused.stdout, diagnostic=reused.stderr[-650:]))
+                        assert time.time() < deadline
+                    before = cached.read_bytes()
+                    publish_test_summary(original, updated, "age-elapsed")
+                    native_test_summary([f"--setopt=signed-fixture.cachedir={oracle}",
+                                         f"--setopt=system_cachedir={oracle}", "--refresh", "-y"], updated)
+                    while time.time() < deadline + 0.05:
+                        time.sleep(0.05)
+                    # Only elapsed time can invalidate this in-place snapshot.
+                    assert primary.stat() == modified and cached.read_bytes() == before and not marker.exists()
+                    queries = (
+                        package, f"{package}.noarch", "OMG-OBSERVER", "observer-fixture",
+                        "Catalog-QZ", "CATALOG-QZ", "qz elapsed", "elapsed generation",
+                        "catalog-qz elapsed generation", "QZ ELAPSED GENERATION", "generation ΩΣ",
+                        "GENERATION ως", "catalog-qz elapsed generation ΩΣ", "catalog-qz absent",
+                    )
+                    inspect_summary_results(phase, updated, queries, "catalog-qz absent",
+                                            (("daemon", env), ("direct", disabled)))
+                finally:
+                    repo_file.write_text(repo_config)
+                    restore_test_summary(original)
+
+            def inspect_cached_age_policy(original, policy):
+                phase = f"repository-age-{policy}"
+                cache = work/f"{phase}-cache"
+                old_summary = "Catalog-QZ Persisted Generation ΩΣ"
+                try:
+                    ttl = -1 if policy == "never" else 3
+                    repo_file.write_text(repo_config + f"cachedir={cache}\nmetadata_expire={ttl}\n")
+                    publish_test_summary(original, old_summary, f"{policy}-prepared")
+                    refresh_fixture()
+                    manifest_in_cache, = cache.glob("signed-fixture-*/repodata/repomd.xml")
+                    primary = manifest_in_cache.with_name(f"primary-{policy}-prepared.xml.gz")
+                    modified = primary.stat()
+                    os.utime(primary, ns=(modified.st_atime_ns, modified.st_mtime_ns - 60_000_000_000))
+                    if policy != "never":
+                        config.write_text(host_config + f"cacheonly={policy}\n")
+                    identity = f"{package}.noarch"
+                    control = checked([cli, "--json", "search", "--limit", "1", package], env, ordinary)
+                    assert [row["description"] for row in json.loads(control)] == [old_summary]
+                    publish_test_summary(original, "Catalog-QZ Future Generation ΩΣ", f"{policy}-changed")
+                    native_test_summary([], old_summary)
+                    queries = (
+                        package, identity, "catalog-qz", "persisted generation",
+                        "CATALOG-QZ PERSISTED", "generation ΩΣ", "GENERATION ως", "future generation",
+                    )
+                    requests_before = request_counters()
+                    with reject_native_selection("--available"):
+                        for query in queries:
+                            result = command([cli, "--json", "search", "--limit", "1", query], env, ordinary)
+                            value = None
+                            try:
+                                value = json.loads(result.stdout)
+                                if query == queries[-1]:
+                                    matched = value == []
+                                else:
+                                    row, = value
+                                    matched = (row["name"], row["description"]) == (identity, old_summary)
+                            except (ValueError, KeyError, TypeError):
+                                matched = False
+                            checks.append(dict(phase=phase, case=f"daemon-{query}",
+                                               passed=result.returncode == 0 and matched,
+                                               value=value, diagnostic=result.stderr[-650:]))
+                    total, failed = request_counters()
+                    calls = total - requests_before[0] - 1
+                    failures = failed - requests_before[1]
+                    checks.append(dict(phase=phase, case="daemon-ipc",
+                                       passed=calls == len(queries) and failures == 0,
+                                       value={"calls": calls, "failures": failures}))
+                finally:
+                    config.write_text(host_config)
+                    repo_file.write_text(repo_config)
+                    restore_test_summary(original)
+
             refresh_fixture()
             host_explicit = len(set(ordinary_control([dnf, "--cacheonly", "--setopt=disable_excludes=*",
                                                       "repoquery", "--userinstalled", "--qf", r"%{name}\n"]).splitlines()))
@@ -764,6 +865,10 @@ exec {shlex.quote(str(native))} "$@"
                     finally:
                         repo_file.write_text(repo_config)
                         refresh_fixture()
+                    inspect_aged_catalog("repository-aged", original_manifest, 6)
+                    inspect_aged_catalog("repository-age-zero", original_manifest, 0)
+                    for policy in ("never", "all", "metadata"):
+                        inspect_cached_age_policy(original_manifest, policy)
 
             fast.unlink(missing_ok=True)
             persisted.unlink(missing_ok=True)
@@ -980,6 +1085,6 @@ assert inventory() == before
 report = dict(binaries=binaries, checks=checks, total=len(checks),
               passed=sum(entry["passed"] for entry in checks), host_unchanged=True)
 print(json.dumps(report))
-expected_checks = 264 if consent_oracle is None else 393
+expected_checks = 264 if consent_oracle is None else 485
 if report["passed"] != report["total"] or report["total"] != expected_checks:
     sys.exit(4)

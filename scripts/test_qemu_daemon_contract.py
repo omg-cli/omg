@@ -48,6 +48,26 @@ class DaemonContractTests(unittest.TestCase):
                                         cwd=root, capture_output=True, text=True, timeout=10)
                 self.assertEqual(result.returncode == 0, passed, result.stderr)
 
+    @unittest.skipIf(os.name == 'nt', 'guest fault probe requires POSIX credentials')
+    def test_fedora_fault_probe_rejects_root_before_creating_a_fixture(self):
+        source = (ROOT / 'scripts/qemu-daemon-check.sh').read_text(encoding='utf-8')
+        probe = source.split('# BEGIN BACKEND FAULT PROBE', 1)[1].split('# END BACKEND FAULT PROBE', 1)[0]
+        caller = r"""
+id() { printf '0\n'; }
+timeout() { printf 'root attempted privileged fault setup\n' >&2; return 99; }
+check_fedora_reason_refusal unused state evidence 1000 1000
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'state').mkdir()
+            (root / 'evidence').mkdir()
+            result = subprocess.run([BASH, '-euc', probe + caller], cwd=root,
+                                    capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertFalse(result.stdout or result.stderr)
+            self.assertFalse(list((root / 'state').iterdir()))
+            self.assertFalse(list((root / 'evidence').iterdir()))
+
     @unittest.skipIf(os.name == 'nt', 'guest dependency setup requires POSIX bash')
     def test_guest_daemon_and_doctor_tools_are_installed_without_benchmark(self):
         source = (ROOT / 'scripts/benchmark-qemu.sh').read_text(encoding='utf-8')

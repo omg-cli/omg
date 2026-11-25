@@ -293,6 +293,7 @@ sentry = { version = "0.49.0", default-features = false, features = [
 sentry-tracing = "0.49.0"
 
 # Cross-platform package manager support
+roxmltree = { version = "0.21.2", optional = true, default-features = false, features = ["std"] }
 rusqlite = { version = "0.41.1", features = [
   "bundled",
 ], optional = true } # SQLite for RPM db
@@ -408,7 +409,7 @@ debian = ["ar", "rust-apt"]
 debian-pure = ["ar"]
 
 # Fedora/RHEL support (DNF/RPM) with bundled SQLite.
-fedora = ["rusqlite"]
+fedora = ["rusqlite", "dep:roxmltree"]
 
 # macOS/Homebrew support.
 macos = []

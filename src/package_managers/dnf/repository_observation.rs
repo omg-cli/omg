@@ -3,11 +3,13 @@
 use std::fs;
 use std::io::{self, Read as _};
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 
 use super::RpmFileIdentity;
+use super::repository_freshness::{RepositoryAge, RepositoryAgePolicy};
 use super::rpm_database::{
     CONFIG_DROP_INS, PLUGIN_CONFIGS, parse_absolute_setting, read_dnf_settings, reported_setting,
     rooted_path,
@@ -19,25 +21,54 @@ struct RepositoryPaths {
     directories: Vec<(PathBuf, Option<&'static str>)>,
     caches: Vec<PathBuf>,
     observe_expiration: bool,
+    age_policies: Option<Vec<RepositoryAgePolicy>>,
 }
 
 pub(super) struct RepositoryObservation {
     paths: RepositoryPaths,
     fingerprint: [u8; 32],
+    metadata_ages: Option<Vec<RepositoryAge>>,
 }
 
 impl RepositoryObservation {
     pub(super) fn capture(root: &Path) -> Result<Self> {
-        let mut paths = ResolvedRepositoryPaths::capture(root)?.paths;
-        // Package searches use DNF's normal refresh policy. Cache-only
-        // status queries still use the present metadata after expiration.
-        paths.observe_expiration = true;
+        let paths = ResolvedRepositoryPaths::capture(root, true)?.paths;
         let fingerprint = paths.fingerprint()?;
-        Ok(Self { paths, fingerprint })
+        let metadata_ages = paths.age_policies.as_ref().and_then(|policies| {
+            match policies
+                .iter()
+                .map(RepositoryAgePolicy::read)
+                .collect::<Result<Vec<_>>>()
+            {
+                Ok(ages) => Some(ages),
+                Err(error) => {
+                    tracing::debug!(%error, "DNF repository age could not be observed");
+                    None
+                }
+            }
+        });
+        Ok(Self {
+            paths,
+            fingerprint,
+            metadata_ages,
+        })
     }
 
     pub(super) fn is_current(&self) -> Result<bool> {
         Ok(self.paths.fingerprint()? == self.fingerprint)
+    }
+
+    pub(super) fn metadata_is_fresh(&self) -> Result<bool> {
+        let Some(ages) = &self.metadata_ages else {
+            return Ok(false);
+        };
+        let now = i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs())?;
+        for age in ages {
+            if !age.is_fresh(now)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 }
 
@@ -48,13 +79,13 @@ struct ResolvedRepositoryPaths {
 }
 
 impl ResolvedRepositoryPaths {
-    fn capture(root: &Path) -> Result<Self> {
-        let paths = RepositoryPaths::effective(root)?;
+    fn capture(root: &Path, for_search: bool) -> Result<Self> {
+        let paths = RepositoryPaths::effective(root, for_search)?;
         let control_revision = paths.configuration_fingerprint()?;
         // The first native dump discovers custom configuration directories.
         // Resolve again within the observed configuration generation.
         anyhow::ensure!(
-            paths == RepositoryPaths::effective(root)?
+            paths == RepositoryPaths::effective(root, for_search)?
                 && paths.configuration_fingerprint()? == control_revision,
             "DNF configuration changed while resolving repository paths"
         );
@@ -83,7 +114,7 @@ impl StatusRepositories {
             }
         }
 
-        let paths = ResolvedRepositoryPaths::capture(root)?;
+        let paths = ResolvedRepositoryPaths::capture(root, false)?;
         let revision = paths.paths.catalog_fingerprint(paths.control_revision)?;
         self.paths = Some(paths);
         Ok(revision)
@@ -91,16 +122,58 @@ impl StatusRepositories {
 }
 
 impl RepositoryPaths {
-    fn effective(root: &Path) -> Result<Self> {
-        let report = read_dnf_settings(&["--dump-repo-config=*"])?;
-        let (main, cache_paths) = repository_cache_paths(&report)?;
+    fn effective(root: &Path, for_search: bool) -> Result<Self> {
+        let options: &[&str] = if for_search {
+            &["--dump-repo-config=*"]
+        } else {
+            &["--cacheonly", "--dump-repo-config=*"]
+        };
+        let report = read_dnf_settings(options)?;
+        let (main, repositories) = reported_repositories(&report)?;
         anyhow::ensure!(
             parse_absolute_setting(main, "installroot")? == root,
             "DNF installroot changed while resolving repository paths"
         );
         let mut paths = Self::controls(root)?;
         paths.add_effective_paths(root, main)?;
-        paths.caches.extend(cache_paths);
+        paths.observe_expiration = for_search;
+        let check_age = if for_search {
+            match reported_setting(main, "cacheonly")? {
+                "none" => true,
+                "all" | "metadata" => false,
+                _ => anyhow::bail!("Unsupported DNF metadata cache policy"),
+            }
+        } else {
+            false
+        };
+        let prefer_zchunk = if check_age {
+            match reported_setting(main, "zchunk")? {
+                "1" => true,
+                "0" => false,
+                _ => anyhow::bail!("Unsupported DNF zchunk setting"),
+            }
+        } else {
+            false
+        };
+        let mut policies = Some(Vec::new());
+        for (id, settings) in repositories {
+            let cache = parse_absolute_setting(settings, "cachedir")?;
+            if check_age && let Some(ages) = &mut policies {
+                match RepositoryAgePolicy::from_dnf(id, settings, &cache, prefer_zchunk) {
+                    Ok(Some(age)) => ages.push(age),
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::debug!(%error, repository = id, "Unsupported DNF repository age policy");
+                        policies = None;
+                    }
+                }
+            }
+            paths.caches.push(cache);
+        }
+        if let Some(ages) = &mut policies {
+            ages.sort_unstable();
+        }
+        paths.age_policies = policies;
         paths.caches.sort_unstable();
         paths.caches.dedup();
         Ok(paths)
@@ -241,7 +314,7 @@ fn fingerprint_files(mut files: Vec<PathBuf>) -> Result<[u8; 32]> {
     Ok(hash.finalize().into())
 }
 
-fn repository_cache_paths(report: &str) -> Result<(&str, Vec<PathBuf>)> {
+fn reported_repositories(report: &str) -> Result<(&str, Vec<(&str, &str)>)> {
     let report = report
         .strip_prefix("======== Main configuration: ========\n")
         .context("DNF did not report the main repository configuration")?;
@@ -249,7 +322,7 @@ fn repository_cache_paths(report: &str) -> Result<(&str, Vec<PathBuf>)> {
     let main = sections
         .next()
         .context("DNF main configuration is missing")?;
-    let mut caches = Vec::new();
+    let mut repositories = Vec::new();
     for section in sections {
         let (header, settings) = section
             .split_once('\n')
@@ -266,12 +339,12 @@ fn repository_cache_paths(report: &str) -> Result<(&str, Vec<PathBuf>)> {
             "DNF reported an invalid repository ID"
         );
         match reported_setting(settings, "enabled")? {
-            "1" => caches.push(parse_absolute_setting(settings, "cachedir")?),
+            "1" => repositories.push((id, settings)),
             "0" => {}
             _ => anyhow::bail!("DNF reported an invalid repository enabled flag"),
         }
     }
-    Ok((main, caches))
+    Ok((main, repositories))
 }
 
 fn cached_repositories(directory: &Path) -> Result<Vec<PathBuf>> {
@@ -381,7 +454,11 @@ mod tests {
         fs::write(&policy, "enabled=1")?;
         fs::write(&manifest, "original")?;
         let fingerprint = paths.fingerprint()?;
-        let observed = RepositoryObservation { paths, fingerprint };
+        let observed = RepositoryObservation {
+            paths,
+            fingerprint,
+            metadata_ages: None,
+        };
 
         fs::create_dir(repository.join("solv"))?;
         fs::write(repository.join("solv/fixture.solv"), "generated")?;
@@ -392,6 +469,7 @@ mod tests {
         let catalog = RepositoryObservation {
             fingerprint: catalog_paths.fingerprint()?,
             paths: catalog_paths,
+            metadata_ages: None,
         };
         let expired = repository.join("attrs/expired");
         fs::create_dir(expired.parent().context("expiration marker parent")?)?;
@@ -407,6 +485,7 @@ mod tests {
         let observed = RepositoryObservation {
             paths: observed.paths,
             fingerprint,
+            metadata_ages: None,
         };
         fs::write(&manifest, "updated metadata")?;
         assert!(!observed.is_current()?);

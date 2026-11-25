@@ -7,12 +7,16 @@ use anyhow::Result;
 
 use crate::core::Package;
 
-/// A retained observation of the installed inventory used by a package index.
-///
-/// Repository metadata is outside this observation and needs explicit refresh.
-/// Observation checks can perform native I/O; callers must use a blocking task.
+/// Inputs observed when building a package index.
 pub trait InstalledCatalogObservation: Send + Sync {
+    /// Check that the files used for index publication have stayed stable.
     fn is_current(&self) -> Result<bool>;
+
+    /// Check whether an existing index can serve a new request. Backends
+    /// can require a native refresh even when the observed files are unchanged.
+    fn can_reuse(&self) -> Result<bool> {
+        self.is_current()
+    }
 }
 
 /// Trait for package manager backends (object-safe for dynamic dispatch)

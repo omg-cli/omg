@@ -52,15 +52,25 @@ async fn observe_installed_catalog(
     .context("Installed catalog observation exceeded its deadline")?
 }
 
-async fn installed_catalog_is_current(
+#[derive(Clone, Copy)]
+enum CatalogCheck {
+    Publish,
+    Reuse,
+}
+
+async fn check_installed_catalog(
     observation: Arc<dyn InstalledCatalogObservation>,
     budget: Arc<tokio::sync::Semaphore>,
+    check: CatalogCheck,
 ) -> anyhow::Result<bool> {
     tokio::time::timeout(CATALOG_OBSERVATION_TIMEOUT, async move {
         let permit = budget.acquire_owned().await?;
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            observation.is_current()
+            match check {
+                CatalogCheck::Publish => observation.is_current(),
+                CatalogCheck::Reuse => observation.can_reuse(),
+            }
         })
         .await
         .context("Installed catalog check task failed")?
@@ -78,7 +88,12 @@ async fn load_observed_index(
             observe_installed_catalog(Arc::clone(&manager), Arc::clone(&budget)).await?;
         let index = PackageIndex::for_package_manager(Arc::clone(&manager)).await?;
         if let Some(observation) = &observation
-            && !installed_catalog_is_current(Arc::clone(observation), Arc::clone(&budget)).await?
+            && !check_installed_catalog(
+                Arc::clone(observation),
+                Arc::clone(&budget),
+                CatalogCheck::Publish,
+            )
+            .await?
         {
             continue;
         }
@@ -426,9 +441,10 @@ impl DaemonState {
         }
         if let Some(observation) = &installed_observation {
             anyhow::ensure!(
-                installed_catalog_is_current(
+                check_installed_catalog(
                     Arc::clone(observation),
-                    Arc::clone(&self.catalog_observation_budget)
+                    Arc::clone(&self.catalog_observation_budget),
+                    CatalogCheck::Publish,
                 )
                 .await?,
                 "Package inventory or repositories changed before index publication"
@@ -451,9 +467,10 @@ impl DaemonState {
             .installed_observation
             .clone();
         match observation {
-            Some(observation) => Ok(!installed_catalog_is_current(
+            Some(observation) => Ok(!check_installed_catalog(
                 observation,
                 Arc::clone(&self.catalog_observation_budget),
+                CatalogCheck::Reuse,
             )
             .await?),
             None => Ok(observe_installed_catalog(
