@@ -51,7 +51,7 @@ use crate::package_managers::pacman_db;
 use crate::runtimes::common::MAX_DECOMPRESSED_BYTES;
 
 use crate::core::security::artifact::ArchiveSnapshot;
-const AUR_RPC_URL: &str = "https://aur.archlinux.org/rpc";
+pub(crate) const AUR_RPC_URL: &str = "https://aur.archlinux.org/rpc";
 // makepkg records BUILDDIR in .BUILDINFO; physical invocation storage stays private.
 const SANDBOX_BUILD_ROOT: &str = "/omg-build";
 
@@ -1471,17 +1471,17 @@ impl AurClient {
         // configured TTL. Stale indexes fall through to the live RPC.
         if let Some(index) = self.fresh_metadata_index().await {
             let query_owned = query.to_string();
-            let result = tokio::task::spawn_blocking(move || -> Result<Vec<Package>> {
+            let packages = tokio::task::spawn_blocking(move || -> Vec<Package> {
                 // Install resolution consumes this bounded search: reserve its
                 // exact source/binary identities before substring matches fill it.
                 let binary_name = format!("{query_owned}-bin");
                 let mut entries = Vec::with_capacity(50);
                 for name in [query_owned.as_str(), binary_name.as_str()] {
-                    if let Some(entry) = index.get(name)? {
+                    if let Some(entry) = index.get(name) {
                         entries.push(entry);
                     }
                 }
-                for entry in index.search(&query_owned, 50)? {
+                for entry in index.search(&query_owned, 50) {
                     if entries.len() == 50 {
                         break;
                     }
@@ -1492,7 +1492,7 @@ impl AurClient {
                         entries.push(entry);
                     }
                 }
-                Ok(entries
+                entries
                     .into_iter()
                     .filter_map(|entry| {
                         let name = entry.name.as_str();
@@ -1524,13 +1524,11 @@ impl AurClient {
                             installed: false,
                         })
                     })
-                    .collect())
+                    .collect()
             })
             .await?;
 
-            if let Ok(packages) = result
-                && !packages.is_empty()
-            {
+            if !packages.is_empty() {
                 return Ok(packages);
             }
         }
@@ -1635,7 +1633,7 @@ impl AurClient {
         if let Some(index) = self.fresh_metadata_index().await {
             let package_owned = package.to_string();
             let result = tokio::task::spawn_blocking(move || -> Result<Option<Package>> {
-                if let Some(entry) = index.get(&package_owned)? {
+                if let Some(entry) = index.get(&package_owned) {
                     validate_index_entry_name(entry.name.as_str(), Some(&package_owned))?;
                     // A corrupt index version must not compare as a fabricated
                     // 0 (ARCH-R14); surface a typed error so the caller falls
@@ -1755,42 +1753,38 @@ impl AurClient {
 
         // 2. Try the binary index only while its source archive is fresh.
         // Update discovery never synchronously refreshes global metadata: if
-        // the index is stale, absent, unreadable, or errors, fall straight
+        // the index is stale, absent, or unreadable, fall straight
         // through to the AUR RPC instead.
         if let Some(index) = self.fresh_metadata_index().await {
             let local_names = foreign_packages.clone();
             let local_installed = Arc::clone(&installed);
-            let result = tokio::task::spawn_blocking(
-                move || -> Result<(Vec<(String, Version, Version)>, Vec<String>)> {
-                    let mut local_pkgs = Vec::with_capacity(local_names.len());
-                    for name in local_names {
-                        if let Some(version) = local_installed.get(&name) {
-                            local_pkgs.push((name, version.clone()));
-                        }
+            let (mut updates, missing) = tokio::task::spawn_blocking(move || {
+                let mut local_pkgs = Vec::with_capacity(local_names.len());
+                for name in local_names {
+                    if let Some(version) = local_installed.get(&name) {
+                        local_pkgs.push((name, version.clone()));
                     }
+                }
 
-                    index.updates_for(&local_pkgs)
-                },
-            )
+                index.updates_for(&local_pkgs)
+            })
             .await?;
 
-            if let Ok((mut updates, missing)) = result {
-                if missing.is_empty() {
-                    tracing::debug!("AUR update check completed via binary index");
-                    return Ok(updates);
-                }
-                // The index is partially stale: query the RPC for exactly the
-                // names it lacks instead of silently treating them as current.
-                tracing::debug!(
-                    "Binary index missing {} package(s); querying RPC for those",
-                    missing.len()
-                );
-                let rpc_updates = self
-                    .query_aur_updates_at(AUR_RPC_URL, &missing, installed)
-                    .await?;
-                updates.extend(rpc_updates);
+            if missing.is_empty() {
+                tracing::debug!("AUR update check completed via binary index");
                 return Ok(updates);
             }
+            // The index is partially stale: query the RPC for exactly the
+            // names it lacks instead of silently treating them as current.
+            tracing::debug!(
+                "Binary index missing {} package(s); querying RPC for those",
+                missing.len()
+            );
+            let rpc_updates = self
+                .query_aur_updates_at(AUR_RPC_URL, &missing, installed)
+                .await?;
+            updates.extend(rpc_updates);
+            return Ok(updates);
         }
 
         // 3. Fallback: Query AUR RPC directly for all foreign packages.
@@ -4753,6 +4747,32 @@ pub async fn search_detailed(query: &str) -> Result<Vec<AurPackageDetail>> {
     Ok(results)
 }
 
+pub(crate) async fn info_detailed_at(
+    endpoint: &str,
+    package: &str,
+) -> Result<Option<AurPackageDetail>> {
+    crate::core::security::validate_package_name(package)?;
+    let url = format!(
+        "{endpoint}?v=5&type=info&arg[]={}",
+        urlencoding::encode(package)
+    );
+    let response = shared_client()
+        .get(url)
+        .send()
+        .await
+        .map_err(redact_aur_transport_error)?;
+    let mut response: AurDetailedResponse = decode_aur_rpc_response(response).await?;
+    anyhow::ensure!(
+        response.results.iter().all(|row| row.name == package),
+        "AUR RPC info response contained an unrequested package"
+    );
+    anyhow::ensure!(
+        response.results.len() <= 1,
+        "AUR RPC info response contained a duplicate package"
+    );
+    Ok(response.results.pop())
+}
+
 #[derive(Debug, Deserialize)]
 struct AurDetailedResponse {
     results: Vec<AurPackageDetail>,
@@ -4840,6 +4860,44 @@ mod tests {
         .await?;
         tokio::time::timeout(Duration::from_secs(5), server).await???;
         result
+    }
+
+    #[tokio::test]
+    async fn exact_aur_info_accepts_one_character_and_rejects_unrelated_rows() -> Result<()> {
+        let row = |name| {
+            serde_json::json!({
+                "Name": name, "Version": "2.0-1", "Description": "Fixture package",
+                "Maintainer": "fixture", "NumVotes": 2, "Popularity": 0.1,
+                "OutOfDate": null, "FirstSubmitted": 1, "LastModified": 2
+            })
+        };
+        for (rows, expected) in [
+            (vec![row("x")], None),
+            (vec![], None),
+            (vec![row("xx")], Some("unrequested package")),
+            (vec![row("x"), row("x")], Some("duplicate package")),
+        ] {
+            let has_rows = !rows.is_empty();
+            let body =
+                serde_json::to_vec(&serde_json::json!({"type": "multiinfo", "results": rows}))?;
+            let (endpoint, server) =
+                rpc_body_server_with_path(body, false, Some("/rpc?v=5&type=info&arg[]=x")).await?;
+            let result =
+                tokio::time::timeout(Duration::from_secs(5), info_detailed_at(&endpoint, "x"))
+                    .await?;
+            match expected {
+                Some(message) => assert!(result.expect_err(message).to_string().contains(message)),
+                None if has_rows => {
+                    let info = result?.expect("exact one-character package");
+                    assert_eq!(info.name, "x");
+                    assert_eq!(info.version, "2.0-1");
+                    assert_eq!(info.maintainer.as_deref(), Some("fixture"));
+                }
+                None => assert!(result?.is_none()),
+            }
+            tokio::time::timeout(Duration::from_secs(5), server).await???;
+        }
+        Ok(())
     }
 
     #[tokio::test]
@@ -5016,7 +5074,7 @@ mod tests {
                 .context("published metadata must be readable before the lock fault")?;
             assert_eq!(
                 snapshot
-                    .get("metadata-demo")?
+                    .get("metadata-demo")
                     .context("published package")?
                     .version
                     .as_str(),
@@ -5062,7 +5120,7 @@ mod tests {
             assert_eq!(std::fs::read(&index)?, index_before);
             assert_eq!(fixture.local_bytes()?, local_before);
             assert!(
-                snapshot.get("metadata-demo")?.is_some(),
+                snapshot.get("metadata-demo").is_some(),
                 "an earlier owned snapshot stays usable"
             );
 
@@ -5099,7 +5157,7 @@ mod tests {
                 .context("a successful metadata worker must retain its owned snapshot")?;
             assert_eq!(
                 snapshot
-                    .get("metadata-demo")?
+                    .get("metadata-demo")
                     .context("published package")?
                     .version
                     .as_str(),
@@ -5154,7 +5212,7 @@ mod tests {
                 );
             }
             assert!(
-                snapshot.get("metadata-demo")?.is_some(),
+                snapshot.get("metadata-demo").is_some(),
                 "task failures must not invalidate a separately owned index"
             );
             Ok(())
@@ -5332,21 +5390,25 @@ mod tests {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
             let endpoint = format!("http://{}/rpc", listener.local_addr()?);
             let desc = fixture.db.join("local/aur-demo-1.0-1/desc");
-            let server =
-                tokio::spawn(async move {
-                    let (mut stream, _) = listener.accept().await?;
-                    let mut request = [0; 4096];
-                    anyhow::ensure!(stream.read(&mut request).await? > 0, "empty request");
-                    let updated = std::fs::read_to_string(&desc)?.replace("1.0-1", "9.0-1");
-                    std::fs::write(desc, updated)?;
-                    let body = s72_rpc_json(&[("aur-demo", "2.0-1")]);
-                    stream.write_all(format!(
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    body.len(),
-                ).as_bytes()).await?;
-                    stream.write_all(&body).await?;
-                    anyhow::Ok(())
-                });
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await?;
+                let mut request = [0; 4096];
+                anyhow::ensure!(stream.read(&mut request).await? > 0, "empty request");
+                let updated = std::fs::read_to_string(&desc)?.replace("1.0-1", "9.0-1");
+                std::fs::write(desc, updated)?;
+                let body = s72_rpc_json(&[("aur-demo", "2.0-1")]);
+                stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len(),
+                        )
+                        .as_bytes(),
+                    )
+                    .await?;
+                stream.write_all(&body).await?;
+                anyhow::Ok(())
+            });
             let updates = tokio::time::timeout(
                 Duration::from_secs(5),
                 fixture.client().query_aur_updates_at(
@@ -5445,14 +5507,28 @@ mod tests {
         body: Vec<u8>,
         chunked: bool,
     ) -> Result<(String, tokio::task::JoinHandle<Result<()>>)> {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        rpc_body_server_with_path(body, chunked, None).await
+    }
+
+    async fn rpc_body_server_with_path(
+        body: Vec<u8>,
+        chunked: bool,
+        expected_path: Option<&'static str>,
+    ) -> Result<(String, tokio::task::JoinHandle<Result<()>>)> {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let endpoint = format!("http://{}/rpc", listener.local_addr()?);
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await?;
-            let mut request = [0_u8; 4096];
-            anyhow::ensure!(stream.read(&mut request).await? > 0, "empty request");
+            if let Some(expected_path) = expected_path {
+                let mut request = String::new();
+                BufReader::new(&mut stream).read_line(&mut request).await?;
+                assert_eq!(request.trim_end(), format!("GET {expected_path} HTTP/1.1"));
+            } else {
+                let mut request = [0_u8; 4096];
+                anyhow::ensure!(stream.read(&mut request).await? > 0, "empty request");
+            }
             let mut wire = if chunked {
                 b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
                     .to_vec()
@@ -10958,8 +11034,9 @@ finally:
         assert_eq!(resolve_official_dependency(&alpm, "aur-helper")?, None);
         missing.set_usage(alpm::Usage::INSTALL)?;
         for relation in ["aur-helper", "helper>=2"] {
-            let error = resolve_official_dependency(&alpm, relation)
-                .expect_err("an unavailable eligible repository cannot prove absence or select a lower repository");
+            let error = resolve_official_dependency(&alpm, relation).expect_err(
+                "an unavailable eligible repository cannot prove absence or select a lower repository",
+            );
             assert!(
                 format!("{error:#}").contains("missing"),
                 "{relation}: {error:#}"

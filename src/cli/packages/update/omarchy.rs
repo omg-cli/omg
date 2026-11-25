@@ -1625,7 +1625,7 @@ fn reboot_reason_at(
         "Invalid running kernel release"
     );
     let modules = format!("usr/lib/modules/{running}/modules.builtin");
-    if !owns_modules(&modules)? || !inspection.root.join(&modules).is_file() {
+    if !inspection.root.join(&modules).is_file() || !owns_modules(&modules)? {
         return Ok(Some(
             "The installed kernel differs from the running kernel.",
         ));
@@ -5003,7 +5003,11 @@ omarchy-state set reboot-required
         }
         let owner = private_directory();
         let output = std::process::Command::new(std::env::current_exe()?)
-            .args(["--exact", "cli::packages::update::omarchy::tests::migration_state_defaults_to_the_session_home", "--nocapture"])
+            .args([
+                "--exact",
+                "cli::packages::update::omarchy::tests::migration_state_defaults_to_the_session_home",
+                "--nocapture",
+            ])
             .env(CHILD, "1")
             .env("HOME", owner.path())
             .env_remove("OMARCHY_MIGRATION_STATE")

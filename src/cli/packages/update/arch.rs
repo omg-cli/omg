@@ -307,12 +307,9 @@ async fn update_packages(
         // Do not animate here. `pm.sync()` elevates and the child owns the
         // per-repository lanes; a parent spinner hides the sudo prompt and
         // reprints itself as a second "Syncing package databases" bar.
+        // `pm.sync()` already refreshes the daemon index after writing.
         println!();
         pm.sync().await?;
-        // The daemon serves its frozen pre-sync snapshot until told
-        // otherwise; refresh it before probing so the update list
-        // below reflects the sync that just finished.
-        crate::cli::packages::common::refresh_daemon_index_after_sync().await?;
     }
 
     let mut all_updates: Vec<UpdateInfo> = Vec::with_capacity(32);

@@ -5,12 +5,8 @@ use futures::future::BoxFuture;
 use crate::cli::{modern_ui, style, ui};
 #[cfg(unix)]
 use crate::core::client::DaemonClient;
-#[cfg(unix)]
-use crate::core::client::SyncDaemonClient;
 use crate::core::security::is_local_package_file;
-#[cfg(unix)]
-use crate::daemon::protocol::WirePackageSource;
-use crate::package_managers::alpm_ops::MISSING_FROM_REPOS_MARKER;
+use crate::package_managers::alpm_ops::{MISSING_FROM_REPOS_MARKER, get_install_pkg_info};
 use crate::package_managers::{AurClient, get_package_manager};
 
 use super::{MAX_REPLACEMENT_HOPS, enforce_install_policy};
@@ -37,13 +33,6 @@ pub async fn install(packages: &[String], yes: bool, replacement_hops: u32) -> R
 
     let pb = modern_ui::modern_spinner("Resolving", "package sources");
 
-    #[cfg(unix)]
-    let mut daemon_client = if permits_live_lookup(crate::package_managers::resolve_backend()?) {
-        DaemonClient::connect().await.ok()
-    } else {
-        None
-    };
-
     let mut missing_packages = Vec::new();
     for pkg in packages {
         if is_local_package_file(pkg) {
@@ -66,16 +55,9 @@ pub async fn install(packages: &[String], yes: bool, replacement_hops: u32) -> R
             continue;
         }
 
-        let is_official = lookup_official_package(
-            #[cfg(unix)]
-            daemon_client.as_mut(),
-            pkg,
-        )
-        .await?;
+        let official_info = lookup_official_package(pkg).await?;
 
-        if is_official {
-            let info = get_official_package_info(pkg)?
-                .with_context(|| format!("Official package metadata disappeared for {pkg}"))?;
+        if let Some(info) = official_info {
             enforce_install_policy(
                 &policy,
                 &vulnerability_scanner,
@@ -252,13 +234,6 @@ pub async fn install_dry_run(packages: &[String]) -> Result<()> {
         .set_header(vec!["Package", "Version", "Size", "Status"]);
 
     let mut total_size: u64 = 0;
-    #[cfg(unix)]
-    let mut daemon_client = if permits_live_lookup(crate::package_managers::resolve_backend()?) {
-        SyncDaemonClient::acquire().ok()
-    } else {
-        None
-    };
-
     for pkg_name in packages {
         if let Some(info) = local_archive_preview(pkg_name)? {
             let size_mb = info.installed_size as f64 / 1024.0 / 1024.0;
@@ -271,44 +246,7 @@ pub async fn install_dry_run(packages: &[String]) -> Result<()> {
             continue;
         }
 
-        #[cfg(unix)]
-        {
-            if let Some(client) = daemon_client.as_mut() {
-                let search_result = client.search(pkg_name, Some(8));
-                match search_result {
-                    Ok(search_result) => {
-                        let is_official = search_result.packages.iter().any(|pkg| {
-                            pkg.name == pkg_name.as_str()
-                                && pkg.source == WirePackageSource::Official
-                        });
-
-                        if is_official
-                            && let Ok(info) = client.info(pkg_name)
-                            && info.source == WirePackageSource::Official
-                        {
-                            let size_mb = info.download_size as f64 / 1024.0 / 1024.0;
-                            total_size += info.download_size;
-
-                            table.add_row(vec![
-                                style::emphasis(&info.name),
-                                style::accent(&info.version),
-                                format!("{size_mb:.2} MB"),
-                                format!("{} Official", style::positive("✓")),
-                            ]);
-                            continue;
-                        }
-
-                        // Unknown official packages fall through to an AUR
-                        // lookup instead of being reported as a successful guess.
-                    }
-                    Err(_) => {
-                        daemon_client = None;
-                    }
-                }
-            }
-        }
-
-        match crate::package_managers::get_sync_pkg_info(pkg_name) {
+        match lookup_official_package(pkg_name).await {
             Ok(Some(info)) => {
                 let size_mb = info.download_size.unwrap_or(0) as f64 / 1024.0 / 1024.0;
                 total_size += info.download_size.unwrap_or(0);
@@ -334,11 +272,7 @@ pub async fn install_dry_run(packages: &[String]) -> Result<()> {
                     format!("{} AUR", style::positive("✓")),
                 ]);
             }
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!("Failed to look up {pkg_name} in official repositories")
-                });
-            }
+            Err(error) => return Err(error),
         }
     }
 
@@ -377,42 +311,15 @@ fn extract_missing_package(msg: &str, packages: &[String]) -> Option<String> {
     packages.iter().find(|p| p.as_str() == reported).cloned()
 }
 
-#[cfg(unix)]
-async fn daemon_has_official_package(client: &mut DaemonClient, package: &str) -> Result<bool> {
-    let result = client.search(package, Some(8)).await?;
-    Ok(result
-        .packages
-        .iter()
-        .any(|pkg| pkg.name == package && pkg.source == WirePackageSource::Official))
-}
-
+/// Resolve against the local install catalog, whose order and usage match ALPM.
 async fn lookup_official_package(
-    #[cfg(unix)] daemon_client: Option<&mut DaemonClient>,
-    package: &str,
-) -> Result<bool> {
-    #[cfg(unix)]
-    if let Some(client) = daemon_client {
-        match daemon_has_official_package(client, package).await {
-            Ok(found) => return Ok(found),
-            Err(error) => {
-                tracing::debug!("Daemon official-package lookup failed for {package}: {error}");
-            }
-        }
-    }
-
-    get_official_package_info(package)
-        .map(|info| info.is_some())
-        .with_context(|| format!("Failed to look up {package} in official repositories"))
-}
-
-fn get_official_package_info(
     package: &str,
 ) -> Result<Option<crate::package_managers::types::PackageInfo>> {
-    if crate::core::paths::test_mode() {
-        crate::package_managers::get_package_info(package)
-    } else {
-        crate::package_managers::get_sync_pkg_info(package)
-    }
+    let pkg = package.to_string();
+    tokio::task::spawn_blocking(move || get_install_pkg_info(&pkg))
+        .await
+        .context("Official package lookup task failed")?
+        .with_context(|| format!("Failed to look up {package} in official repositories"))
 }
 
 /// Handle a package that could not be resolved in the official repositories:
@@ -1274,9 +1181,9 @@ mod tests {
             let index = crate::package_managers::TestAurIndex::open(&index_path)?;
             // Independent producer/legacy-order controls: exact records exist,
             // while the generic capped substring API has fifty earlier matches.
-            assert_eq!(index.get("ztool")?.is_some(), source_version.is_some());
-            assert_eq!(index.get("ztool-bin")?.is_some(), binary_version.is_some());
-            let decoys = index.search("ztool", 50)?;
+            assert_eq!(index.get("ztool").is_some(), source_version.is_some());
+            assert_eq!(index.get("ztool-bin").is_some(), binary_version.is_some());
+            let decoys = index.search("ztool", 50);
             let visible = if decoy_count == 50 { 50 } else { 5 };
             assert_eq!(decoys.len(), visible);
             for (number, entry) in decoys.iter().take(decoy_count).enumerate() {

@@ -84,3 +84,13 @@ pub(crate) fn probe_version(runtime: &str) -> Option<String> {
 pub(crate) fn probe_version_in(runtime: &str, data_dir: &std::path::Path) -> Option<String> {
     common::get_current_version(&data_dir.join("versions").join(runtime))
 }
+
+pub(crate) fn installed_version_info(
+    runtime: &str,
+) -> (anyhow::Result<Vec<String>>, Option<String>) {
+    let versions_dir = DATA_DIR.join("versions").join(runtime);
+    (
+        common::list_installed_versions(&versions_dir),
+        common::get_current_version(&versions_dir),
+    )
+}

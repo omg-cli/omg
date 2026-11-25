@@ -165,13 +165,7 @@ pub fn get_update_list() -> Result<Vec<UpdateInfo>> {
             .collect());
     }
 
-    let pacman_config = crate::core::pacman_conf::PacmanConfig::parse(paths::pacman_conf_path())
-        .context("Failed to load update filters from pacman.conf")?;
-
-    crate::package_managers::alpm_direct::with_handle_mut(|alpm| {
-        configure_package_filters(alpm, &pacman_config)?;
-        collect_updates(alpm)
-    })
+    crate::package_managers::alpm_direct::with_handle(collect_updates)
 }
 
 /// Collect available updates from an ALPM handle whose ignore filters are
@@ -185,21 +179,16 @@ pub(crate) fn collect_updates(alpm: &alpm::Alpm) -> Result<Vec<UpdateInfo>> {
     let syncdbs = alpm.syncdbs();
     let local_pkg_count = localdb.pkgs().len();
 
-    // Build HashMap of sync packages: name -> (package, repo_name)
-    // This converts O(n×m) lookups to O(n+m) with single HashMap lookup per package
-    let mut sync_map: ahash::AHashMap<&str, (&alpm::Package, &str)> =
-        ahash::AHashMap::with_capacity(local_pkg_count);
-
+    // Validate upgrade-eligible sync DBs once; probe libalpm's internal pkghash
+    // directly per installed package instead of copying all ~15k sync entries
+    // into a temporary HashMap.
+    let mut upgrade_dbs = Vec::with_capacity(syncdbs.len());
     for db in syncdbs {
         if !db.usage()?.contains(alpm::Usage::UPGRADE) {
             continue;
         }
         validate_sync_database(alpm, db)?;
-        let repo_name = db.name();
-        for pkg in db.pkgs() {
-            // First repo wins (core > extra > multilib priority)
-            sync_map.entry(pkg.name()).or_insert((pkg, repo_name));
-        }
+        upgrade_dbs.push(db);
     }
 
     let mut updates = Vec::with_capacity(local_pkg_count / 20); // ~5% typically have updates
@@ -211,7 +200,11 @@ pub(crate) fn collect_updates(alpm: &alpm::Alpm) -> Result<Vec<UpdateInfo>> {
         let name = pkg.name();
         let local_ver_str = pkg.version().as_str();
 
-        if let Some(&(sync_pkg, repo)) = sync_map.get(name)
+        // First repo wins (core > extra > multilib priority)
+        let selected = upgrade_dbs
+            .iter()
+            .find_map(|db| db.pkg(name).ok().map(|sync_pkg| (sync_pkg, db.name())));
+        if let Some((sync_pkg, repo)) = selected
             && !sync_pkg.should_ignore()
             && alpm::vercmp(sync_pkg.version().as_str(), local_ver_str)
                 == std::cmp::Ordering::Greater
@@ -230,10 +223,20 @@ pub(crate) fn collect_updates(alpm: &alpm::Alpm) -> Result<Vec<UpdateInfo>> {
 
 /// Read sync package-info under the configured native repository policy.
 pub fn get_sync_pkg_info(name: &str) -> Result<Option<PackageInfo>> {
+    query_sync_pkg_info(name, alpm::Usage::SEARCH)
+}
+
+pub(crate) fn get_install_pkg_info(name: &str) -> Result<Option<PackageInfo>> {
+    query_sync_pkg_info(name, alpm::Usage::INSTALL)
+}
+
+fn query_sync_pkg_info(name: &str, usage: alpm::Usage) -> Result<Option<PackageInfo>> {
     if paths::test_mode() {
         let manager = crate::package_managers::get_package_manager()?;
         let package = futures::executor::block_on(manager.info(name))?;
-        if let Some(pkg) = package {
+        if let Some(pkg) = package.filter(|pkg| {
+            usage != alpm::Usage::INSTALL || pkg.source == crate::core::PackageSource::Official
+        }) {
             return Ok(Some(PackageInfo {
                 name: pkg.name,
                 version: pkg.version,
@@ -257,7 +260,7 @@ pub fn get_sync_pkg_info(name: &str) -> Result<Option<PackageInfo>> {
 
     let epoch = super::pacman_db::SyncDbEpoch::observe()?;
     let alpm = crate::package_managers::alpm_direct::create_alpm_handle()?;
-    let package = get_pkg_info_from_db(&alpm, name)?;
+    let package = get_pkg_info_in_scope(&alpm, name, usage)?;
     anyhow::ensure!(
         epoch == super::pacman_db::SyncDbEpoch::observe()?,
         "Package databases or configuration changed while querying; retry the operation"
@@ -267,6 +270,14 @@ pub fn get_sync_pkg_info(name: &str) -> Result<Option<PackageInfo>> {
 
 /// Read Rust metadata within a caller-supplied native handle's repository scope.
 pub fn get_pkg_info_from_db(alpm: &alpm::Alpm, name: &str) -> Result<Option<PackageInfo>> {
+    get_pkg_info_in_scope(alpm, name, alpm::Usage::SEARCH)
+}
+
+fn get_pkg_info_in_scope(
+    alpm: &alpm::Alpm,
+    name: &str,
+    usage: alpm::Usage,
+) -> Result<Option<PackageInfo>> {
     let sync_dir = std::path::Path::new(alpm.dbpath()).join("sync");
     let epoch = super::pacman_db::SyncDbEpoch::from_sync_dir(&sync_dir)?;
     // A fresh verifier binds current source reads to current signature checks,
@@ -279,7 +290,7 @@ pub fn get_pkg_info_from_db(alpm: &alpm::Alpm, name: &str) -> Result<Option<Pack
     }
     let mut selected = None;
     for db in alpm.syncdbs() {
-        if !db.usage()?.contains(alpm::Usage::SEARCH) {
+        if !db.usage()?.contains(usage) {
             continue;
         }
         let verified = verifier.register_syncdb(db.name(), db.siglevel())?;
@@ -3389,6 +3400,118 @@ mod tests {
 
     struct RepositoryFixture {
         directory: tempfile::TempDir,
+    }
+
+    #[test]
+    fn install_catalog_uses_the_transaction_repository_order() -> anyhow::Result<()> {
+        let fixture = RepositoryFixture::new()?;
+        fixture.write_sync("lookup", &[("demo", "1-1", ""), ("search-only", "1-1", "")])?;
+        fixture.write_sync("preferred", &[("demo", "2-1", "")])?;
+        fixture.write_sync("fallback", &[("demo", "3-1", "")])?;
+        let alpm = fixture.open();
+        alpm.register_syncdb("lookup", alpm::SigLevel::NONE)?
+            .set_usage(alpm::Usage::SEARCH)?;
+        alpm.register_syncdb("preferred", alpm::SigLevel::NONE)?
+            .set_usage(alpm::Usage::INSTALL)?;
+        alpm.register_syncdb("fallback", alpm::SigLevel::NONE)?
+            .set_usage(alpm::Usage::ALL)?;
+
+        let lookup = |name| super::get_pkg_info_in_scope(&alpm, name, alpm::Usage::INSTALL);
+        let info = lookup("demo")?.expect("installable package");
+        assert_eq!(info.repo, "preferred");
+        assert_eq!(info.version.to_string(), "2-1");
+        assert!(lookup("search-only")?.is_none());
+        assert_eq!(
+            super::get_pkg_info_from_db(&alpm, "demo")?.unwrap().repo,
+            "lookup"
+        );
+
+        std::fs::remove_file(fixture.database().join("sync/preferred.db"))?;
+        let error =
+            lookup("absent").expect_err("an incomplete install catalog cannot establish absence");
+        assert!(format!("{error:#}").contains("preferred"));
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires an explicitly selected native Arch host with a private catalog fixture"]
+    fn native_install_and_preview_resolve_locally_with_daemon_available() -> anyhow::Result<()> {
+        use std::os::unix::net::UnixListener;
+
+        const NAME: &str = "package_managers::alpm_ops::tests::native_install_and_preview_resolve_locally_with_daemon_available";
+        if crate::core::testing::run_isolated_test(NAME)
+            || crate::config::Settings::rerun_test_unprivileged(NAME)
+        {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            crate::package_managers::resolve_backend()? == crate::package_managers::Backend::Arch,
+            "native Arch backend required"
+        );
+        let fixture = RepositoryFixture::new()?;
+        fixture.write_sync("fixture", &[("install-routing-demo", "2-1", "")])?;
+        let directory = fixture.directory.path();
+        let root = directory.join("root");
+        let conf = directory.join("pacman.conf");
+        let config = format!(
+            "[options]\nRootDir = {}\nDBPath = {}\nSigLevel = Required DatabaseOptional\n\
+             [fixture]\nUsage = Install\nServer = file://{}\n",
+            root.display(),
+            fixture.database().display(),
+            directory.display()
+        );
+        std::fs::write(&conf, config)?;
+        let policy = "banned_packages = ['install-routing-demo']\n";
+        std::fs::write(directory.join("policy.toml"), policy)?;
+        let socket = directory.join("run/omg.sock");
+        crate::core::paths::prepare_socket_parent(&socket)?;
+        let listener = UnixListener::bind(&socket)?;
+        listener.set_nonblocking(true)?;
+        temp_env::with_vars(
+            [
+                ("OMG_CONFIG_DIR", Some(directory.as_os_str())),
+                ("OMG_PACMAN_CONF", Some(conf.as_os_str())),
+                ("OMG_SOCKET_PATH", Some(socket.as_os_str())),
+                ("OMG_DISABLE_DAEMON", None),
+            ],
+            || -> anyhow::Result<()> {
+                assert_eq!(crate::core::paths::socket_path(), socket);
+                crate::core::paths::validate_socket_parent(&socket)?;
+                assert_eq!(
+                    crate::core::paths::pacman_db_dir_result()?,
+                    fixture.database()
+                );
+                tokio::runtime::Builder::new_current_thread().enable_all().build()?.block_on(async {
+                    let packages = ["install-routing-demo".to_owned()];
+                    crate::cli::packages::install(&packages, true, true, false).await?;
+                    let error = crate::cli::packages::install(&packages, true, false, false)
+                        .await
+                        .expect_err("source policy must stop the local package before a transaction");
+                    assert!(matches!(
+                        error.downcast_ref::<crate::core::security::PolicyError>(),
+                        Some(crate::core::security::PolicyError::Banned { name }) if name == &packages[0]
+                    ), "{error:#}");
+                    std::fs::remove_file(fixture.database().join("sync/fixture.db"))?;
+                    let error = crate::cli::packages::install(&packages, true, true, false)
+                        .await
+                        .expect_err("a missing install database must stop the preview");
+                    assert!(format!("{error:#}").contains("Repository 'fixture' is unavailable"));
+                    Ok::<(), anyhow::Error>(())
+                })?;
+                assert_eq!(
+                    listener
+                        .accept()
+                        .expect_err("install must not query daemon search")
+                        .kind(),
+                    std::io::ErrorKind::WouldBlock
+                );
+                assert_eq!(
+                    std::fs::read_dir(fixture.database().join("local"))?.count(),
+                    1
+                );
+                Ok(())
+            },
+        )
     }
 
     impl RepositoryFixture {

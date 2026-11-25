@@ -42,6 +42,7 @@ pub(crate) fn create_alpm_handle() -> Result<Alpm> {
     let config = crate::core::pacman_conf::PacmanConfig::parse(paths::pacman_conf_path())
         .context("Failed to load repositories from pacman.conf")?;
     crate::package_managers::alpm_ops::configure_signature_policy(&mut alpm, &config)?;
+    crate::package_managers::alpm_ops::configure_package_filters(&mut alpm, &config)?;
     crate::package_managers::alpm_ops::register_configured_syncdbs(&alpm, &config)
         .context("Failed to register the complete pacman repository set")?;
 

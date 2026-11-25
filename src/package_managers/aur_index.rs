@@ -72,40 +72,47 @@ impl AurIndex {
         let mut extra = [0];
         anyhow::ensure!(file.read(&mut extra)? == 0, "AUR index exceeds size limit");
         let index = Self { bytes };
-        index.archive()?;
+        // Validate the archived representation once at open time; `self.bytes`
+        // is private and immutable thereafter, so subsequent lookups can use
+        // `access_unchecked` without re-validating all ~90k entries.
+        rkyv::access::<rkyv::Archived<AurArchive>, rkyv::rancor::Error>(&index.bytes)
+            .map_err(|e| anyhow::anyhow!("Corrupted AUR index: {e}"))?;
         Ok(index)
     }
 
-    /// Access the archived data with validation
-    fn archive(&self) -> Result<&ArchivedAurArchive> {
-        rkyv::access::<rkyv::Archived<AurArchive>, rkyv::rancor::Error>(&self.bytes)
-            .map_err(|e| anyhow::anyhow!("Corrupted AUR index: {e}"))
+    /// Access the pre-validated archived data without repeating full bytecheck.
+    #[expect(
+        unsafe_code,
+        reason = "AurIndex::open validates `self.bytes` via `rkyv::access` before construction and `bytes` is private and never mutated"
+    )]
+    fn archive(&self) -> &ArchivedAurArchive {
+        // SAFETY: `self.bytes` was validated by `rkyv::access::<Archived<AurArchive>, _>` in `open`
+        // and is never modified after construction.
+        unsafe { rkyv::access_unchecked::<rkyv::Archived<AurArchive>>(&self.bytes) }
     }
 
     /// Get metadata for a specific package (zero-copy)
     ///
     /// Returns a reference into the owned snapshot, independent of later file writes.
-    pub fn get(&self, name: &str) -> Result<Option<&ArchivedAurEntry>> {
-        let archive = self.archive()?;
-        let Ok(idx) = archive
+    pub fn get(&self, name: &str) -> Option<&ArchivedAurEntry> {
+        let archive = self.archive();
+        let idx = archive
             .entries
             .binary_search_by_key(&name, |e: &ArchivedAurEntry| e.name.as_str())
-        else {
-            return Ok(None);
-        };
-        Ok(Some(&archive.entries[idx]))
+            .ok()?;
+        Some(&archive.entries[idx])
     }
 
     /// Search for packages matching a query (substring match in name or description).
     ///
     /// Case-insensitive comparison reuses a single scratch buffer instead of
     /// allocating two lowercase copies per entry (the index holds ~90k rows).
-    pub fn search(&self, query: &str, limit: usize) -> Result<Vec<&ArchivedAurEntry>> {
-        let archive = self.archive()?;
+    pub fn search(&self, query: &str, limit: usize) -> Vec<&ArchivedAurEntry> {
+        let archive = self.archive();
         let query_lower = query.to_lowercase();
         let mut lower_buf = String::new();
 
-        Ok(archive
+        archive
             .entries
             .iter()
             .filter(|e| {
@@ -124,7 +131,7 @@ impl AurIndex {
                 }
             })
             .take(limit)
-            .collect())
+            .collect()
     }
 
     /// Batch update check against the index.
@@ -139,13 +146,13 @@ impl AurIndex {
     pub fn updates_for(
         &self,
         local_pkgs: &[(String, alpm_types::Version)],
-    ) -> Result<(
+    ) -> (
         Vec<(String, alpm_types::Version, alpm_types::Version)>,
         Vec<String>,
-    )> {
+    ) {
         let mut updates = Vec::new();
         let mut missing = Vec::new();
-        let archive = self.archive()?;
+        let archive = self.archive();
 
         for (name, local_version) in local_pkgs {
             match archive
@@ -180,7 +187,7 @@ impl AurIndex {
             }
         }
 
-        Ok((updates, missing))
+        (updates, missing)
     }
 }
 
@@ -326,21 +333,17 @@ mod tests {
         let replacement = std::fs::read(replacement_directory.path().join("metadata.rkyv"))?;
         assert_eq!(std::fs::metadata(&path)?.len(), replacement.len() as u64);
         let mut writer = std::fs::OpenOptions::new().write(true).open(&path)?;
-        let entry = index.get("demo")?.expect("fixture entry");
+        let entry = index.get("demo").expect("fixture entry");
         assert_eq!(entry.version.as_str(), "1.0");
         writer.write_all(&replacement)?;
         assert_eq!(entry.version.as_str(), "1.0");
         assert_eq!(
-            AurIndex::open(&path)?
-                .get("demo")?
-                .unwrap()
-                .version
-                .as_str(),
+            AurIndex::open(&path)?.get("demo").unwrap().version.as_str(),
             "2.0"
         );
         writer.set_len(0)?;
         assert_eq!(entry.version.as_str(), "1.0");
-        assert_eq!(index.search("demo", 1)?.len(), 1);
+        assert_eq!(index.search("demo", 1).len(), 1);
         assert!(AurIndex::open(&path).is_err());
         Ok(())
     }
@@ -350,7 +353,7 @@ mod tests {
         let (directory, previous) = open_test_index(r#"[{"Name":"previous","Version":"1.0-1"}]"#)?;
         let json_path = directory.path().join("source.gz");
         let index_path = directory.path().join("metadata.rkyv");
-        assert_eq!(previous.get("previous")?.unwrap().version.as_str(), "1.0-1");
+        assert_eq!(previous.get("previous").unwrap().version.as_str(), "1.0-1");
         drop(previous);
         let before = std::fs::read(&index_path)?;
         let data = serde_json::json!([{"Name":"example", "Version":"1", "Description":"x".repeat(65537), "LastModified":1}]);
@@ -369,10 +372,7 @@ mod tests {
         assert!(format!("{error:#}").contains("AUR metadata exceeds record/field limit"));
         assert_eq!(std::fs::read(&index_path)?, before);
         let preserved = AurIndex::open(&index_path)?;
-        assert_eq!(
-            preserved.get("previous")?.unwrap().version.as_str(),
-            "1.0-1"
-        );
+        assert_eq!(preserved.get("previous").unwrap().version.as_str(), "1.0-1");
         Ok(())
     }
 
@@ -384,18 +384,18 @@ mod tests {
             {"Name": "Another-Pkg", "Version": "0.1", "Maintainer": "user2", "LastModified": 300, "Description": "another", "NumVotes": 0, "Popularity": 0.0}
         ]"#;
         let (_temp_dir, index) = open_test_index(data)?;
-        assert!(index.get("pkg-a")?.is_some());
-        assert!(index.get("pkg-b")?.is_some());
-        assert!(index.get("Another-Pkg")?.is_some());
+        assert!(index.get("pkg-a").is_some());
+        assert!(index.get("pkg-b").is_some());
+        assert!(index.get("Another-Pkg").is_some());
 
-        let pkg_a = index.get("pkg-a")?.unwrap();
+        let pkg_a = index.get("pkg-a").unwrap();
         assert_eq!(pkg_a.name.as_str(), "pkg-a");
         assert_eq!(pkg_a.version.as_str(), "1.0");
         assert_eq!(pkg_a.description.as_ref().unwrap().as_str(), "desc a");
         assert_eq!(pkg_a.num_votes, 10);
 
         // Test search
-        let results = index.search("pkg", 10)?;
+        let results = index.search("pkg", 10);
         assert_eq!(results.len(), 3); // pkg-a, pkg-b, Another-Pkg (contains 'pkg')
         assert_eq!(
             results
@@ -406,14 +406,14 @@ mod tests {
         );
         assert_eq!(
             index
-                .search("pkg", 2)?
+                .search("pkg", 2)
                 .iter()
                 .map(|entry| entry.name.as_str())
                 .collect::<Vec<_>>(),
             ["Another-Pkg", "pkg-a"]
         );
 
-        let results = index.search("another", 10)?;
+        let results = index.search("another", 10);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].name.as_str(), "Another-Pkg");
 
@@ -441,7 +441,7 @@ mod tests {
             ("another-missing".to_string(), v("0.5")),
         ];
 
-        let (updates, missing) = index.updates_for(&local_pkgs)?;
+        let (updates, missing) = index.updates_for(&local_pkgs);
         assert_eq!(
             missing,
             vec!["my-custom-pkg".to_string(), "another-missing".to_string()],
@@ -469,7 +469,7 @@ mod tests {
             ("stale-only".to_string(), v("0.5")), // absent from index
         ];
 
-        let (updates, missing) = index.updates_for(&local_pkgs)?;
+        let (updates, missing) = index.updates_for(&local_pkgs);
         assert_eq!(
             updates.len(),
             1,
@@ -507,7 +507,7 @@ mod tests {
             ("pkg-b".to_string(), v("1.0")), // remote 1.0 == local 1.0
         ];
 
-        let (updates, missing) = index.updates_for(&local_pkgs)?;
+        let (updates, missing) = index.updates_for(&local_pkgs);
         assert!(missing.is_empty());
         assert_eq!(updates.len(), 1, "Only pkg-a should have an update");
         assert_eq!(updates[0].0, "pkg-a");
@@ -537,13 +537,13 @@ mod tests {
 
         // Local version matches remote — no update
         let local_same = vec![("pkg-a".to_string(), v("1.0"))];
-        let (updates_same, missing_same) = index.updates_for(&local_same)?;
+        let (updates_same, missing_same) = index.updates_for(&local_same);
         assert!(updates_same.is_empty());
         assert!(missing_same.is_empty());
 
         // Local version ahead of remote — no update
         let local_ahead = vec![("pkg-a".to_string(), v("2.0"))];
-        let (updates_ahead, missing_ahead) = index.updates_for(&local_ahead)?;
+        let (updates_ahead, missing_ahead) = index.updates_for(&local_ahead);
         assert!(updates_ahead.is_empty());
         assert!(missing_ahead.is_empty());
 
@@ -567,7 +567,7 @@ mod tests {
             ("pkg-ok".to_string(), v("1.0")),
         ];
 
-        let (updates, missing) = index.updates_for(&local_pkgs)?;
+        let (updates, missing) = index.updates_for(&local_pkgs);
         assert_eq!(
             missing,
             vec!["pkg-bad".to_string()],

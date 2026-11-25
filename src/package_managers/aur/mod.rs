@@ -15,6 +15,6 @@ mod parallel_build;
 pub(crate) mod source_file;
 pub(super) mod utils;
 
-pub(crate) use client::update_source_unavailable;
+pub(crate) use client::{AUR_RPC_URL, info_detailed_at, update_source_unavailable};
 pub use client::{AurClient, AurPackageDetail, search_detailed};
 pub use parallel_build::{BuildJob, ParallelBuildSummary, ParallelBuilder};

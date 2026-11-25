@@ -299,34 +299,12 @@ pub fn uninstall_version(runtime: &str, version: &str) -> Result<()> {
     Ok(())
 }
 
-/// Probe one natively supported runtime's installed and active versions.
-/// Aliases (`nodejs`, `golang`, `jdk`, ...) are normalized via
-/// `canonical_runtime_name` before dispatch.
+/// Read the local inventory without initializing a downloader.
 fn native_version_info(runtime: &str) -> Option<(Result<Vec<String>>, Option<String>)> {
-    macro_rules! probe {
-        ($mgr:expr) => {{
-            let mgr = $mgr;
-            Some((mgr.list_installed(), mgr.current_version()))
-        }};
-    }
-    match canonical_runtime_name(runtime).as_str() {
-        "node" => probe!(NodeManager::new()),
-        "python" => probe!(PythonManager::new()),
-        "rust" => probe!(RustManager::new()),
-        "go" => probe!(GoManager::new()),
-        "ruby" => probe!(RubyManager::new()),
-        "java" => probe!(JavaManager::new()),
-        "bun" => probe!(BunManager::new()),
-        "pi" => probe!(PiManager::new()),
-        "deno" => probe!(DenoManager::new()),
-        "zig" => probe!(ZigManager::new()),
-        "dotnet" => probe!(DotnetManager::new()),
-        "erlang" => probe!(ErlangManager::new()),
-        "php" => probe!(PhpManager::new()),
-        "swift" => probe!(SwiftManager::new()),
-        other => GenericToolManager::for_name(other)
-            .map(|manager| (manager.list_installed(), manager.current_version())),
-    }
+    let runtime = canonical_runtime_name(runtime);
+    (SUPPORTED_RUNTIMES.contains(&runtime.as_str())
+        || crate::runtimes::tool_registry::is_registry_tool(&runtime))
+    .then(|| crate::runtimes::installed_version_info(&runtime))
 }
 
 fn print_installed_versions(installed: Vec<String>, current: Option<&str>) {
@@ -345,10 +323,15 @@ fn print_listed_versions(
     installed: Result<Vec<String>>,
     current: Option<&str>,
 ) -> Result<()> {
-    print_installed_versions(
-        installed.with_context(|| format!("Failed to list installed {runtime} versions"))?,
-        current,
-    );
+    let installed =
+        installed.with_context(|| format!("Failed to list installed {runtime} versions"))?;
+    if installed.is_empty() {
+        ui::print_info(format!(
+            "No installed versions. Run `omg list {runtime} --available` to see available versions."
+        ));
+    } else {
+        print_installed_versions(installed, current);
+    }
     Ok(())
 }
 

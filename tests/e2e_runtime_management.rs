@@ -473,6 +473,17 @@ fn test_list_specific_runtime() {
 }
 
 #[test]
+fn test_list_empty_runtime_suggests_the_canonical_available_command() {
+    let project = TestProject::new();
+    let result = project.run_with_env(&["list", "nodejs"], &[("NO_COLOR", "1")]);
+
+    result.assert_success();
+    result.assert_stdout_contains("No installed versions");
+    result.assert_stdout_contains("omg list node --available");
+    assert!(installed_rows(&result.stdout).is_empty());
+}
+
+#[test]
 #[cfg(unix)]
 fn list_reports_exact_installed_versions_for_every_runtime_and_excludes_incomplete_state() {
     let project = TestProject::new();

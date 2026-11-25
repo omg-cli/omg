@@ -400,8 +400,11 @@ impl RustManager {
     }
 }
 
-// Generate common runtime manager methods (list_installed, current_version)
-crate::runtimes::common::impl_runtime_common!(RustManager);
+impl RustManager {
+    pub fn current_version(&self) -> Option<String> {
+        super::common::get_current_version(&self.versions_dir)
+    }
+}
 
 impl RustManager {
     pub(crate) fn parse_toolchain_content(
@@ -1635,7 +1638,10 @@ mod tests {
             || {
                 let mgr = RustManager::new();
                 assert!(mgr.versions_dir.ends_with("rust"));
-                Ok((mgr.list_installed()?, mgr.current_version()))
+                Ok((
+                    crate::runtimes::common::list_installed_versions(&mgr.versions_dir)?,
+                    mgr.current_version(),
+                ))
             },
         )
     }

@@ -62,6 +62,35 @@ struct RepositoryPackages {
 }
 
 impl DbCache {
+    fn validate_usage(&self, usage: RepoUsage) -> Result<()> {
+        for repository in &self.packages {
+            if !repository.usage.intersects(usage) {
+                continue;
+            }
+            repository.packages.as_ref().map_err(|error| {
+                anyhow::anyhow!(
+                    "Repository '{}' is unavailable or incomplete: {error}. Run 'omg sync' and retry",
+                    repository.name
+                )
+            })?;
+        }
+        Ok(())
+    }
+
+    fn get_validated(&self, name: &str, usage: RepoUsage) -> Option<&SyncDbPackage> {
+        for repository in &self.packages {
+            if !repository.usage.intersects(usage) {
+                continue;
+            }
+            if let Ok(packages) = repository.packages.as_ref()
+                && let Some(package) = packages.get(name)
+            {
+                return Some(package);
+            }
+        }
+        None
+    }
+
     fn select(&self, usage: RepoUsage) -> Result<HashMap<&str, &SyncDbPackage>> {
         let mut selected = HashMap::with_capacity(20_000);
         for repository in &self.packages {
@@ -85,7 +114,7 @@ impl DbCache {
 fn load_sync_packages(sync_dir: &Path) -> Result<Vec<RepositoryPackages>> {
     let config = PacmanConfig::parse(paths::pacman_conf_path())
         .context("Failed to read pacman repository policy")?;
-    let available: HashMap<_, _> = collect_sync_db_paths(sync_dir)?
+    let available: HashMap<_, _> = collect_sync_db_paths_with_config(sync_dir, &config)?
         .into_iter()
         .map(|(path, name)| (name, path))
         .collect();
@@ -107,13 +136,24 @@ fn load_sync_packages(sync_dir: &Path) -> Result<Vec<RepositoryPackages>> {
         .collect())
 }
 
+#[cfg(test)]
 fn collect_sync_db_paths(sync_dir: &Path) -> Result<Vec<(PathBuf, String)>> {
     if !sync_dir.exists() {
         return Ok(Vec::new());
     }
-
     let config = crate::core::pacman_conf::PacmanConfig::parse(paths::pacman_conf_path())
         .context("Failed to read pacman repository priority")?;
+    collect_sync_db_paths_with_config(sync_dir, &config)
+}
+
+fn collect_sync_db_paths_with_config(
+    sync_dir: &Path,
+    config: &PacmanConfig,
+) -> Result<Vec<(PathBuf, String)>> {
+    if !sync_dir.exists() {
+        return Ok(Vec::new());
+    }
+
     let repo_order = config.get_repo_names();
     let mut available = HashMap::with_capacity(repo_order.len());
 
@@ -1132,17 +1172,16 @@ impl LocalHealthSnapshot {
 /// Parse the local package database (/var/lib/pacman/local/)
 /// Returns a `HashMap` of package name -> `LocalDbPackage`
 pub fn parse_local_db(path: &Path) -> Result<HashMap<String, LocalDbPackage>> {
-    let mut packages = HashMap::with_capacity(2000); // Pre-allocate for typical system
-
     if !path.try_exists().with_context(|| {
         format!(
             "Failed to inspect pacman local directory {}",
             path.display()
         )
     })? {
-        return Ok(packages);
+        return Ok(HashMap::new());
     }
 
+    let mut desc_paths = Vec::with_capacity(2000);
     for entry in std::fs::read_dir(path)
         .with_context(|| format!("Failed to read pacman local directory {}", path.display()))?
     {
@@ -1155,9 +1194,19 @@ pub fn parse_local_db(path: &Path) -> Result<HashMap<String, LocalDbPackage>> {
         if !meta.is_dir() {
             continue;
         }
-        let desc_path = pkg_path.join("desc");
-        let pkg = parse_local_desc(&desc_path)
-            .with_context(|| format!("Incomplete local package entry {}", desc_path.display()))?;
+        desc_paths.push(pkg_path.join("desc"));
+    }
+
+    let parsed: Vec<LocalDbPackage> = desc_paths
+        .into_par_iter()
+        .map(|desc_path| {
+            parse_local_desc(&desc_path)
+                .with_context(|| format!("Incomplete local package entry {}", desc_path.display()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut packages = HashMap::with_capacity(parsed.len());
+    for pkg in parsed {
         packages.insert(pkg.name.clone(), pkg);
     }
 
@@ -1589,7 +1638,20 @@ fn ensure_cache_loaded<C: PackageCache>(
     };
     let now = || Some(SystemTime::now());
 
-    // Fast path: in-memory hit (brief write lock only to refresh the TTL).
+    // Fast path: in-memory hit under shared read lock when recently accessed.
+    {
+        let cache = read_lock(cache_lock);
+        if reusable(&cache)
+            && cache
+                .last_accessed()
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|elapsed| elapsed.as_secs() < 5)
+        {
+            return Ok(());
+        }
+    }
+
+    // Refresh TTL under brief write lock on warm hit.
     {
         let mut cache = write_lock(cache_lock);
         if reusable(&cache) {
@@ -1634,9 +1696,8 @@ fn ensure_cache_loaded<C: PackageCache>(
     Ok(())
 }
 
-/// Ensure sync cache is loaded (fast if already loaded)
-fn ensure_sync_cache_loaded(sync_dir: &Path) -> Result<()> {
-    let current_epoch = SyncDbEpoch::from_configured_sync_dir(sync_dir)?;
+/// Ensure sync cache is loaded for an already-observed epoch.
+fn ensure_sync_cache_loaded_at(sync_dir: &Path, current_epoch: SyncDbEpoch) -> Result<()> {
     // Older cache generations may contain descriptors accepted before cardinality checks.
     ensure_cache_loaded(&SYNC_DB_CACHE, SYNC_CACHE_NAME, current_epoch, || {
         let packages = load_sync_packages(sync_dir)?;
@@ -1645,19 +1706,11 @@ fn ensure_sync_cache_loaded(sync_dir: &Path) -> Result<()> {
             "Package databases or configuration changed while loading; retry the operation"
         );
         Ok(packages)
-    })?;
-    // Reject observed changes before returning derived state, without claiming
-    // to lock external catalog or configuration writers.
-    anyhow::ensure!(
-        current_epoch == SyncDbEpoch::from_configured_sync_dir(sync_dir)?,
-        "Package databases or configuration changed while loading; retry the operation"
-    );
-    Ok(())
+    })
 }
 
-/// Ensure local cache is loaded (fast if already loaded)
-fn ensure_local_cache_loaded(local_dir: &Path) -> Result<()> {
-    let current_epoch = LocalDbEpoch::from_local_dir(local_dir)?;
+/// Ensure local cache is loaded for an already-observed epoch.
+fn ensure_local_cache_loaded_at(local_dir: &Path, current_epoch: LocalDbEpoch) -> Result<()> {
     // Revalidate installed descriptors before using fields from an older generation.
     ensure_cache_loaded(&LOCAL_DB_CACHE, LOCAL_CACHE_NAME, current_epoch, || {
         let packages = parse_local_db(local_dir)?;
@@ -1672,12 +1725,7 @@ fn ensure_local_cache_loaded(local_dir: &Path) -> Result<()> {
             "Local package database changed while loading; retry the operation"
         );
         Ok(packages)
-    })?;
-    anyhow::ensure!(
-        current_epoch == LocalDbEpoch::from_local_dir(local_dir)?,
-        "Local package database changed while loading; retry the operation"
-    );
-    Ok(())
+    })
 }
 
 #[cfg(test)]
@@ -1932,7 +1980,8 @@ fn remove_cache_file(path: &Path) -> Result<()> {
 /// Search-eligible packages, with duplicate names selected by repository priority.
 pub fn get_detailed_packages() -> Result<Vec<SyncDbPackage>> {
     let sync_dir = paths::pacman_sync_dir_result()?;
-    ensure_sync_cache_loaded(&sync_dir)?;
+    let epoch = SyncDbEpoch::from_configured_sync_dir(&sync_dir)?;
+    ensure_sync_cache_loaded_at(&sync_dir, epoch)?;
 
     let cache = read_lock(&SYNC_DB_CACHE);
     let packages = cache
@@ -1967,14 +2016,14 @@ pub fn check_updates_cached() -> Result<Vec<CachedUpdate>> {
     let sync_dir = paths::pacman_sync_dir_result()?;
     let local_dir = paths::pacman_local_dir_result()?;
 
-    // Ensure caches are loaded (will be fast if already loaded)
-    ensure_sync_cache_loaded(&sync_dir)?;
-    ensure_local_cache_loaded(&local_dir)?;
+    // Ensure caches are loaded using the already-observed epoch
+    ensure_sync_cache_loaded_at(&sync_dir, before.sync)?;
+    ensure_local_cache_loaded_at(&local_dir, before.local)?;
 
-    // Hold both cache locks simultaneously - no cloning!
+    // Hold both cache locks simultaneously - no cloning or 20k-entry map rebuild!
     let sync_cache = read_lock(&SYNC_DB_CACHE);
     let local_cache = read_lock(&LOCAL_DB_CACHE);
-    let sync_packages = sync_cache.select(RepoUsage::UPGRADE)?;
+    sync_cache.validate_usage(RepoUsage::UPGRADE)?;
 
     // Compare versions - Parallelized with Rayon for <1ms update check on 2000+ pkgs
     // Optimized: filter references first, then clone only needed data at the end
@@ -1990,8 +2039,8 @@ pub fn check_updates_cached() -> Result<Vec<CachedUpdate>> {
             ) {
                 return None;
             }
-            sync_packages
-                .get(name.as_str())
+            sync_cache
+                .get_validated(name.as_str(), RepoUsage::UPGRADE)
                 .filter(|sync_pkg| {
                     !package_is_ignored(
                         &sync_pkg.name,
@@ -2128,7 +2177,8 @@ fn find_local_package(local_dir: &Path, name: &str) -> Result<Option<LocalDbPack
 #[inline]
 pub fn get_local_package(name: &str) -> Result<Option<LocalDbPackage>> {
     let local_dir = paths::pacman_local_dir_result()?;
-    ensure_local_cache_loaded(&local_dir)?;
+    let epoch = LocalDbEpoch::from_local_dir(&local_dir)?;
+    ensure_local_cache_loaded_at(&local_dir, epoch)?;
 
     let cache = read_lock(&LOCAL_DB_CACHE);
     let package = cache.packages.get(name).cloned();
@@ -2143,14 +2193,12 @@ pub fn get_local_package(name: &str) -> Result<Option<LocalDbPackage>> {
 #[inline]
 pub fn get_sync_package(name: &str) -> Result<Option<SyncDbPackage>> {
     let sync_dir = paths::pacman_sync_dir_result()?;
-    ensure_sync_cache_loaded(&sync_dir)?;
+    let epoch = SyncDbEpoch::from_configured_sync_dir(&sync_dir)?;
+    ensure_sync_cache_loaded_at(&sync_dir, epoch)?;
 
     let cache = read_lock(&SYNC_DB_CACHE);
-    let package = cache
-        .select(RepoUsage::INSTALL)?
-        .get(name)
-        .copied()
-        .cloned();
+    cache.validate_usage(RepoUsage::INSTALL)?;
+    let package = cache.get_validated(name, RepoUsage::INSTALL).cloned();
     anyhow::ensure!(
         cache.last_modified == Some(SyncDbEpoch::from_configured_sync_dir(&sync_dir)?),
         "Package databases changed while querying; retry the operation"
@@ -2161,7 +2209,8 @@ pub fn get_sync_package(name: &str) -> Result<Option<SyncDbPackage>> {
 /// List all local packages using cache - FAST (<1ms)
 pub fn list_local_cached() -> Result<Vec<LocalDbPackage>> {
     let local_dir = paths::pacman_local_dir_result()?;
-    ensure_local_cache_loaded(&local_dir)?;
+    let epoch = LocalDbEpoch::from_local_dir(&local_dir)?;
+    ensure_local_cache_loaded_at(&local_dir, epoch)?;
 
     let cache = read_lock(&LOCAL_DB_CACHE);
     let packages = cache.packages.values().cloned().collect();
@@ -2317,16 +2366,19 @@ pub(crate) fn get_potential_aur_package_records() -> Result<Vec<LocalDbPackage>>
     let sync_dir = paths::pacman_sync_dir_result()?;
     let local_dir = paths::pacman_local_dir_result()?;
 
-    ensure_sync_cache_loaded(&sync_dir)?;
-    ensure_local_cache_loaded(&local_dir)?;
+    ensure_sync_cache_loaded_at(&sync_dir, before.sync)?;
+    ensure_local_cache_loaded_at(&local_dir, before.local)?;
 
     let sync_cache = read_lock(&SYNC_DB_CACHE);
     let local_cache = read_lock(&LOCAL_DB_CACHE);
 
-    let sync_packages = sync_cache.select(RepoUsage::ALL)?;
+    sync_cache.validate_usage(RepoUsage::ALL)?;
     let mut potential = Vec::with_capacity(local_cache.packages.len() / 10);
     for package in local_cache.packages.values() {
-        if !sync_packages.contains_key(package.name.as_str()) {
+        if sync_cache
+            .get_validated(package.name.as_str(), RepoUsage::ALL)
+            .is_none()
+        {
             potential.push(package.clone());
         }
     }
@@ -2407,7 +2459,8 @@ fn compute_required_names(
 #[inline]
 pub fn get_counts_fast() -> Result<(usize, usize, usize)> {
     let local_dir = paths::pacman_local_dir_result()?;
-    ensure_local_cache_loaded(&local_dir)?;
+    let epoch = LocalDbEpoch::from_local_dir(&local_dir)?;
+    ensure_local_cache_loaded_at(&local_dir, epoch)?;
 
     let cache = read_lock(&LOCAL_DB_CACHE);
     let total = cache.packages.len();
@@ -2432,10 +2485,20 @@ pub fn get_counts_fast() -> Result<(usize, usize, usize)> {
     Ok((total, explicit, orphans))
 }
 
-/// Get explicit package count only - INSTANT
+/// Get explicit package count only - INSTANT (skips orphan dependency graph)
 #[inline]
 pub fn get_explicit_count() -> Result<usize> {
-    let (_, explicit, _) = get_counts_fast()?;
+    let local_dir = paths::pacman_local_dir_result()?;
+    let epoch = LocalDbEpoch::from_local_dir(&local_dir)?;
+    ensure_local_cache_loaded_at(&local_dir, epoch)?;
+
+    let cache = read_lock(&LOCAL_DB_CACHE);
+    let explicit = cache.packages.values().filter(|pkg| pkg.explicit).count();
+
+    anyhow::ensure!(
+        cache.last_modified == Some(LocalDbEpoch::from_local_dir(&local_dir)?),
+        "Local package database changed while counting; retry the operation"
+    );
     Ok(explicit)
 }
 
@@ -2974,7 +3037,9 @@ mod tests {
                 for (groups, expected) in [("pinned", 0), ("other", 1), ("misc\npinned", 0)] {
                     fs::write(
                         db.join("local/widget-1/desc"),
-                        format!("%NAME%\nwidget\n\n%VERSION%\n1-1\n\n%REASON%\n0\n\n%GROUPS%\n{groups}\n\n"),
+                        format!(
+                            "%NAME%\nwidget\n\n%VERSION%\n1-1\n\n%REASON%\n0\n\n%GROUPS%\n{groups}\n\n"
+                        ),
                     )
                     .unwrap();
                     batch2_write_sync(&db.join("sync/core.db"), "2-1");
@@ -5893,6 +5958,7 @@ mod tests {
                 assert_eq!(ffi, expected, "libalpm path diverged on fixture");
                 assert_eq!(public, expected, "public count routing diverged on fixture");
                 assert_eq!(fast, ffi, "fast path and libalpm path must agree");
+                assert_eq!(get_explicit_count().unwrap(), expected.1);
             },
         );
     }
