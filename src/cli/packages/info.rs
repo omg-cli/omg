@@ -70,7 +70,7 @@ pub fn info_sync(package: &str) -> Result<bool> {
     if let Ok(mut client) = SyncDaemonClient::acquire_with_timeout(DAEMON_INFO_TIMEOUT)
         && let Ok(info) = client.info(package)
     {
-        display_detailed_info(&info)?;
+        display_detailed_info(&info, backend)?;
 
         // Track usage
         crate::core::usage::track_info();
@@ -120,19 +120,39 @@ fn display_debian_fixture_info(package: &str) -> Result<bool> {
     Ok(false)
 }
 
+#[cfg(unix)]
+fn daemon_installation_selector(
+    backend: crate::package_managers::Backend,
+    info: &crate::daemon::protocol::DetailedPackageInfo,
+) -> std::borrow::Cow<'_, str> {
+    if backend == crate::package_managers::Backend::Fedora
+        && let Some((name, arch)) = info.name.rsplit_once('.')
+        && !name.is_empty()
+        && !arch.is_empty()
+    {
+        let epoch = if info.version.contains(':') { "" } else { "0:" };
+        return std::borrow::Cow::Owned(format!("{name}-{epoch}{}.{arch}", info.version));
+    }
+    std::borrow::Cow::Borrowed(&info.name)
+}
+
 /// Helper to display detailed info from daemon
 #[cfg(unix)]
-fn display_detailed_info(info: &crate::daemon::protocol::DetailedPackageInfo) -> Result<()> {
+fn display_detailed_info(
+    info: &crate::daemon::protocol::DetailedPackageInfo,
+    backend: crate::package_managers::Backend,
+) -> Result<()> {
+    let selector = daemon_installation_selector(backend, info);
     let source_label = if info.source == WirePackageSource::Official {
         format!("Official repository ({})", style::info(&info.repo))
     } else {
         style::warning("AUR (Arch User Repository)")
     };
     #[cfg(not(target_os = "macos"))]
-    let installed = crate::package_managers::is_installed_fast(&info.name)
+    let installed = crate::package_managers::is_installed_fast(&selector)
         .context("Failed to query local package installation state")?;
     #[cfg(target_os = "macos")]
-    let installed = crate::package_managers::is_installed_fast(&info.name).unwrap_or(false);
+    let installed = crate::package_managers::is_installed_fast(&selector).unwrap_or(false);
     ui::print_package_info(
         &ui::InfoCore {
             name: &info.name,
@@ -192,7 +212,8 @@ pub async fn info_with_json(package: &str, json: bool) -> Result<()> {
 }
 
 async fn info_json(package: &str) -> Result<()> {
-    if crate::package_managers::resolve_backend()? == crate::package_managers::Backend::Mock {
+    let backend = crate::package_managers::resolve_backend()?;
+    if backend == crate::package_managers::Backend::Mock {
         let pm = get_package_manager()?;
         let info = manager_info(pm.as_ref(), package)
             .await?
@@ -214,8 +235,9 @@ async fn info_json(package: &str) -> Result<()> {
     {
         // Installation state belongs to the local package database, not the
         // daemon's warm repository record.
+        let selector = daemon_installation_selector(backend, &info);
         let installed = get_package_manager()?
-            .is_installed(&info.name)
+            .is_installed(&selector)
             .await
             .context("Failed to query local package installation state")?;
         let json_str = serde_json::to_string_pretty(&daemon_info_json(&info, installed)?)
@@ -542,6 +564,38 @@ mod tests {
             assert_eq!(value["name"], "bash");
             assert_eq!(value["installed"], installed);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fedora_daemon_info_checks_the_returned_package_build() {
+        use crate::package_managers::Backend;
+
+        let mut info = DetailedPackageInfo {
+            name: "example.libs.x86_64".into(),
+            version: "2.0-3.fc44".into(),
+            description: String::new(),
+            url: String::new(),
+            size: 0,
+            download_size: 0,
+            repo: "updates".into(),
+            depends: Vec::new(),
+            licenses: Vec::new(),
+            source: WirePackageSource::Official,
+        };
+        assert_eq!(
+            super::daemon_installation_selector(Backend::Fedora, &info),
+            "example.libs-0:2.0-3.fc44.x86_64"
+        );
+        info.version = "1:2.0-3.fc44".into();
+        assert_eq!(
+            super::daemon_installation_selector(Backend::Fedora, &info),
+            "example.libs-1:2.0-3.fc44.x86_64"
+        );
+        assert_eq!(
+            super::daemon_installation_selector(Backend::Arch, &info),
+            "example.libs.x86_64"
+        );
     }
 
     #[tokio::test]
