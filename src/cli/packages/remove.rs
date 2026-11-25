@@ -22,6 +22,14 @@ pub async fn remove(packages: &[String], recursive: bool, yes: bool, dry_run: bo
         anyhow::bail!("No packages specified");
     }
 
+    #[cfg(feature = "fedora")]
+    if crate::package_managers::resolve_backend()
+        .is_ok_and(|backend| backend == crate::package_managers::Backend::Fedora)
+    {
+        validate_removal_mode(recursive)?;
+        return remove_fedora(packages, yes, dry_run).await;
+    }
+
     for pkg in packages {
         if let Err(e) = crate::core::security::validate_package_name(pkg) {
             anyhow::bail!("Invalid package name '{pkg}': {e}");
@@ -29,11 +37,6 @@ pub async fn remove(packages: &[String], recursive: bool, yes: bool, dry_run: bo
     }
 
     validate_removal_mode(recursive)?;
-
-    #[cfg(feature = "fedora")]
-    if crate::package_managers::resolve_backend()? == crate::package_managers::Backend::Fedora {
-        return remove_fedora(packages, yes, dry_run).await;
-    }
 
     if dry_run {
         return remove_dry_run(

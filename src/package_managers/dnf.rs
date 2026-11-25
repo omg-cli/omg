@@ -663,7 +663,7 @@ impl DnfPackageManager {
     }
 
     pub(crate) async fn prepare_removal(packages: &[String]) -> Result<PreparedDnfRemoval> {
-        crate::core::security::validate_package_names(packages)?;
+        Self::validate_package_selectors(packages)?;
         let directory = Self::removal_preview_directory()?;
         let mut command =
             tokio::process::Command::from(crate::core::privilege::system_command("dnf")?);
@@ -1546,10 +1546,15 @@ impl DnfPackageManager {
     #[doc(hidden)]
     pub fn validate_install_selectors(packages: &[String]) -> Result<()> {
         reject_unsealed_local_rpm_targets(packages)?;
-        for package in packages {
-            Self::validate_query_selector(package)?;
-        }
-        Ok(())
+        Self::validate_package_selectors(packages)
+    }
+
+    /// Validate operands passed to a native DNF package command.
+    #[doc(hidden)]
+    pub fn validate_package_selectors(packages: &[String]) -> Result<()> {
+        packages
+            .iter()
+            .try_for_each(|package| Self::validate_query_selector(package))
     }
 
     async fn query_output(command: tokio::process::Command) -> Result<Vec<u8>> {
@@ -2518,7 +2523,7 @@ impl PackageManager for DnfPackageManager {
             if kind == TransactionType::Install {
                 Self::validate_install_selectors(packages)?;
             } else {
-                crate::core::security::validate_package_names(packages)?;
+                Self::validate_package_selectors(packages)?;
             }
             let mut args = vec![action.to_owned(), "-y".to_owned()];
             args.extend_from_slice(packages);
@@ -2576,7 +2581,7 @@ impl PackageManager for DnfPackageManager {
     fn remove(&self, packages: &[String]) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
         let packages = packages.to_vec();
         Box::pin(async move {
-            crate::core::security::validate_package_names(&packages)?;
+            Self::validate_package_selectors(&packages)?;
 
             let mut args = vec!["remove".to_owned(), "-y".to_owned()];
             args.extend(packages);
@@ -2757,7 +2762,12 @@ mod tests {
         );
         let before = manager.security_inventory().await?;
         let plan = manager.removal_plan(&["tree".into()]).await?;
-        assert!(plan.iter().any(|package| package.name == "tree.x86_64"));
+        let tree = plan
+            .iter()
+            .find(|package| package.name == "tree.x86_64")
+            .context("tree missing from the native removal plan")?;
+        let exact = format!("tree-{}.x86_64", tree.version);
+        assert_eq!(manager.removal_plan(&[exact]).await?, plan);
         assert_eq!(manager.security_inventory().await?, before);
         Ok(())
     }

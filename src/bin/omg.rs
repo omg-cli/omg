@@ -1157,6 +1157,14 @@ fn validate_package_security(command: &Commands) -> Result<()> {
             omg_lib::core::security::validate_package_names_or_files(packages)?;
         }
         Commands::Remove { packages, .. } => {
+            #[cfg(feature = "fedora")]
+            if omg_lib::package_managers::resolve_backend()?
+                == omg_lib::package_managers::Backend::Fedora
+            {
+                return omg_lib::package_managers::DnfPackageManager::validate_package_selectors(
+                    packages,
+                );
+            }
             omg_lib::core::security::validate_package_names(packages)?;
         }
         Commands::Info { package }
@@ -2722,6 +2730,15 @@ mod tests {
             if packages == &["jq"])
         );
         validate_package_security(&cli.command).unwrap();
+        #[cfg(feature = "fedora")]
+        if omg_lib::package_managers::resolve_backend()
+            .is_ok_and(|backend| backend == omg_lib::package_managers::Backend::Fedora)
+        {
+            let exact =
+                Cli::try_parse_from(["omg", "remove", "--dry-run", "jq-0:1.8-1.fc44.x86_64"])
+                    .unwrap();
+            validate_package_security(&exact.command).unwrap();
+        }
         let invalid = Cli::try_parse_from(["omg", "remove", "--dry-run", "--", "jq;id"]).unwrap();
         assert!(validate_package_security(&invalid.command).is_err());
         for args in [["omg", "search", "jq"], ["omg", "info", "jq"]] {
