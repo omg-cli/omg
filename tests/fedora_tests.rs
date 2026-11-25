@@ -646,22 +646,48 @@ mod dnf_integration {
         use std::os::unix::net::UnixListener;
 
         let (selector, name, version) = installed_bash_full_nevra()?;
-        let runtime = tempfile::tempdir()?;
-        std::fs::set_permissions(runtime.path(), std::fs::Permissions::from_mode(0o700))?;
-        let socket = runtime.path().join("omg.sock");
+        let fixture = tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o711))
+            .tempdir_in("/tmp")?;
+        let runtime = fixture.path().join("runtime");
+        std::fs::create_dir(&runtime)?;
+        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700))?;
+        let socket = runtime.join("omg.sock");
         let listener = UnixListener::bind(&socket)?;
         listener.set_nonblocking(true)?;
+        let cli = std::path::Path::new(assert_cmd::cargo::cargo_bin!("omg"));
+        let mut command = if omg_lib::core::is_root() {
+            let account = nix::unistd::User::from_name("nobody")?.context("native test user")?;
+            nix::unistd::chown(&socket, Some(account.uid), Some(account.gid))?;
+            nix::unistd::chown(&runtime, Some(account.uid), Some(account.gid))?;
+            let executable = fixture.path().join("omg");
+            std::fs::copy(cli, &executable)?;
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755))?;
+            let mut command = std::process::Command::new("/usr/bin/setpriv");
+            command
+                .arg(format!("--reuid={}", account.uid.as_raw()))
+                .arg(format!("--regid={}", account.gid.as_raw()))
+                .args(["--clear-groups", "--no-new-privs"])
+                .arg(executable);
+            command
+        } else {
+            std::process::Command::new(cli)
+        };
+        command
+            .args(["info", &selector])
+            .env("HOME", &runtime)
+            .env("XDG_CONFIG_HOME", runtime.join("config"))
+            .env("XDG_DATA_HOME", runtime.join("data"))
+            .env("XDG_CACHE_HOME", runtime.join("cache"))
+            .env("XDG_STATE_HOME", runtime.join("state"))
+            .env("OMG_SOCKET_PATH", &socket)
+            .env("OMG_TEST_MODE", "0")
+            .env("OMG_DISABLE_TELEMETRY", "1")
+            .env_remove("OMG_DISABLE_DAEMON")
+            .env_remove("OMG_TEST_DISTRO")
+            .env_remove("OMG_TEST_BACKEND");
         let (output, connections) = std::thread::scope(|scope| -> Result<_> {
-            let invocation = scope.spawn(|| {
-                std::process::Command::new(assert_cmd::cargo::cargo_bin!("omg"))
-                    .args(["info", &selector])
-                    .env("OMG_SOCKET_PATH", &socket)
-                    .env("OMG_TEST_MODE", "0")
-                    .env_remove("OMG_DISABLE_DAEMON")
-                    .env_remove("OMG_TEST_DISTRO")
-                    .env_remove("OMG_TEST_BACKEND")
-                    .output()
-            });
+            let invocation = scope.spawn(move || command.output());
             let mut connections = 0;
             while !invocation.is_finished() {
                 match listener.accept() {

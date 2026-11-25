@@ -1,5 +1,7 @@
 //! Remove functionality for packages
 
+#[cfg(feature = "fedora")]
+use anyhow::Context as _;
 use anyhow::Result;
 
 use super::dispatch_backend;
@@ -26,6 +28,8 @@ pub async fn remove(packages: &[String], recursive: bool, yes: bool, dry_run: bo
     if crate::package_managers::resolve_backend()
         .is_ok_and(|backend| backend == crate::package_managers::Backend::Fedora)
     {
+        crate::package_managers::DnfPackageManager::validate_package_selectors(packages)
+            .context("Invalid package name")?;
         validate_removal_mode(recursive)?;
         return remove_fedora(packages, yes, dry_run).await;
     }
