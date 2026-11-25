@@ -1268,6 +1268,28 @@ impl DnfPackageManager {
         Self::parse_available_packages(&bytes)
     }
 
+    fn select_available_info(
+        selector: &str,
+        mut candidates: Vec<Package>,
+    ) -> Result<Option<Package>> {
+        let preferred = |package: &Package| {
+            package
+                .name
+                .rsplit_once('.')
+                .is_some_and(|(_, arch)| arch == std::env::consts::ARCH || arch == "noarch")
+        };
+        // DNF resolves an architecture-qualified selector before returning rows.
+        // Bare names can include several architectures for the same package.
+        if candidates.iter().any(preferred) {
+            candidates.retain(preferred);
+        }
+        anyhow::ensure!(
+            candidates.len() <= 1,
+            "Package '{selector}' has multiple available builds; specify the full NEVRA"
+        );
+        Ok(candidates.pop())
+    }
+
     fn search_candidates(
         installed: Vec<InstalledPackage>,
         available: Vec<Package>,
@@ -1468,7 +1490,7 @@ impl DnfPackageManager {
         ) {
             args.push("--latest-limit=1".to_owned());
         }
-        if matches!(query, RepositoryQuery::Available(_)) {
+        if matches!(query, RepositoryQuery::Available(None)) {
             args.push(format!("--arch={},noarch", std::env::consts::ARCH));
         }
         let package = match query {
@@ -2651,11 +2673,7 @@ impl PackageManager for DnfPackageManager {
             }
 
             let available = Self::available_packages(Some(&package)).await?;
-            anyhow::ensure!(
-                available.len() <= 1,
-                "Package '{package}' has multiple available builds; specify the full NEVRA"
-            );
-            Ok(available.into_iter().next())
+            Self::select_available_info(&package, available)
         })
     }
 
@@ -3670,6 +3688,54 @@ mod tests {
                 "%{name}\t%{evr}\t%{full_nevra}\t%{reason}\\n",
                 "tree",
             ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn available_info_passes_the_exact_selector_without_an_architecture_override() -> Result<()> {
+        for selector in ["widget.lib.i686", "widget.lib-0:1.2-3.fc44.i686"] {
+            let args = DnfPackageManager::repository_query_args(RepositoryQuery::Available(Some(
+                selector,
+            )))?;
+            assert_eq!(args.last().map(String::as_str), Some(selector));
+            assert!(
+                !args.iter().any(|arg| arg.starts_with("--arch=")),
+                "{args:?}"
+            );
+        }
+        let search = DnfPackageManager::repository_query_args(RepositoryQuery::Available(None))?;
+        assert!(search.contains(&format!("--arch={},noarch", std::env::consts::ARCH)));
+        Ok(())
+    }
+
+    #[test]
+    fn available_info_keeps_native_preference_and_accepts_a_unique_multilib_build() -> Result<()> {
+        let manager = DnfPackageManager::select_available_info;
+        let parse = DnfPackageManager::parse_available_packages;
+        let host = std::env::consts::ARCH;
+        let foreign = if host == "i686" { "x86_64" } else { "i686" };
+        let foreign_row = format!("widget.lib.{foreign}\t1.2-3.fc44\tMultilib package\n");
+        let native_row = format!("widget.lib.{host}\t2.0-1.fc44\tNative package\n");
+        let combined = format!("{foreign_row}{native_row}");
+        let selected =
+            manager("widget.lib", parse(combined.as_bytes())?)?.context("native build")?;
+        assert_eq!(selected.name, format!("widget.lib.{host}"));
+        assert_eq!(selected.version.to_string(), "2.0-1.fc44");
+
+        let selector = format!("widget.lib-0:1.2-3.fc44.{foreign}");
+        let selected =
+            manager(&selector, parse(foreign_row.as_bytes())?)?.context("explicit build")?;
+        assert_eq!(selected.name, format!("widget.lib.{foreign}"));
+        assert!(!selected.installed);
+        let independent_row = b"widget.lib.noarch\t2.0-1.fc44\tArchitecture-independent\n";
+        let mut ambiguous = parse(native_row.as_bytes())?;
+        ambiguous.extend(parse(independent_row)?);
+        assert!(
+            manager("widget.lib", ambiguous)
+                .expect_err("multiple default builds are ambiguous")
+                .to_string()
+                .contains("multiple available builds")
         );
         Ok(())
     }
