@@ -51,6 +51,10 @@ RELEASES_BASE_URL="https://releases.omg.latham.cloud"
 LATEST_VERSION_URL="${RELEASES_BASE_URL}/latest-version"
 MAX_LATEST_VERSION_BYTES=256
 MAX_ARCHIVE_BYTES=$((256 * 1024 * 1024))
+MAX_RELEASE_TAR_BYTES=$((130 * 1024 * 1024))
+MAX_RELEASE_BINARY_BYTES=$((64 * 1024 * 1024))
+MAX_RELEASE_LIST_BYTES=16384
+MAX_RELEASE_ENTRIES=16
 MAX_CHECKSUM_BYTES=1024
 MAX_VERSION_PROBE_SECONDS=10
 MAX_VERSION_PROBE_BYTES=4096
@@ -286,7 +290,7 @@ rename_install_binary() {
 
 check_runtime_dependencies() {
   local missing=()
-  local deps=("curl" "tar" "head" "tr")
+  local deps=("curl" "gzip" "tar" "head" "tr")
 
   for dep in "${deps[@]}"; do
     if ! command -v "$dep" >/dev/null 2>&1; then
@@ -588,6 +592,81 @@ resolve_version() {
   echo "v${marker}"
 }
 
+stage_release_binary() {
+  local tar_file="$1" member="$2" destination="$3"
+  if ! LC_ALL=C TAR_OPTIONS= tar --no-recursion -xOf "$tar_file" -- "$member" |
+      head -c "$((MAX_RELEASE_BINARY_BYTES + 1))" > "$destination"; then
+    warn "Failed to read release member $member within the binary byte bound"
+    return 1
+  fi
+  if [[ ! -s "$destination" ]]; then
+    warn "Release member $member is empty"
+    return 1
+  fi
+  check_file_size_bound "$destination" "$MAX_RELEASE_BINARY_BYTES" "Release member $member" &&
+    chmod 755 "$destination"
+}
+
+extract_release_pair() {
+  local compressed="$1" asset="$2" payload="$3"
+  local tar_file="$tmp_dir/release.tar" listing="$tmp_dir/release-members"
+  local wrapper="${asset%.tar.gz}" member path entries=0
+  local cli="" daemon="" cli_parent="" daemon_parent=""
+
+  # Bound decompression once. Read the full gzip stream to validate its trailer.
+  if ! gzip -dc "$compressed" | head -c "$((MAX_RELEASE_TAR_BYTES + 1))" > "$tar_file"; then
+    warn "Failed to decompress release archive within the byte bound"
+    return 1
+  fi
+  check_file_size_bound "$tar_file" "$MAX_RELEASE_TAR_BYTES" "Decompressed release archive" || return 1
+  if ! LC_ALL=C TAR_OPTIONS= tar -tf "$tar_file" |
+      head -c "$((MAX_RELEASE_LIST_BYTES + 1))" > "$listing"; then
+    warn "Failed to list release archive members"
+    return 1
+  fi
+  check_file_size_bound "$listing" "$MAX_RELEASE_LIST_BYTES" "Release member listing" || return 1
+
+  while IFS= read -r member; do
+    entries=$((entries + 1))
+    if (( entries > MAX_RELEASE_ENTRIES )); then
+      warn "Prebuilt archive contains too many members"
+      return 1
+    fi
+    path="$member"
+    while [[ "$path" == ./* ]]; do path="${path#./}"; done
+    case "$path" in
+      omg | "$wrapper/omg")
+        if [[ -n "$cli" ]]; then warn "Prebuilt archive contains duplicate omg binaries"; return 1; fi
+        cli="$member"
+        cli_parent="${path%omg}"
+        ;;
+      omgd | "$wrapper/omgd")
+        if [[ -n "$daemon" ]]; then warn "Prebuilt archive contains duplicate omgd binaries"; return 1; fi
+        daemon="$member"
+        daemon_parent="${path%omgd}"
+        ;;
+    esac
+  done < "$listing"
+  if [[ -z "$cli" ]]; then warn "Prebuilt archive missing omg binary"; return 1; fi
+  if [[ -z "$daemon" ]]; then warn "Prebuilt archive missing omgd binary"; return 1; fi
+  if [[ "$cli_parent" != "$daemon_parent" ]]; then
+    warn "Prebuilt archive contains mixed binary layouts"
+    return 1
+  fi
+
+  # GNU tar and bsdtar mark ordinary files with a leading '-' in verbose listing.
+  if ! LC_ALL=C TAR_OPTIONS= tar --no-recursion -tvf "$tar_file" -- "$cli" "$daemon" |
+      awk 'substr($0, 1, 1) != "-" { other = 1 } END { exit !(NR == 2 && !other) }'; then
+    warn "Prebuilt archive members must both be regular files"
+    return 1
+  fi
+  # Stream only the selected bytes. Archive metadata never defines a staged path.
+  mkdir "$payload" &&
+    stage_release_binary "$tar_file" "$cli" "$payload/omg" &&
+    stage_release_binary "$tar_file" "$daemon" "$payload/omgd" &&
+    rm -f "$tar_file" "$listing"
+}
+
 install_from_release() {
   if ! check_runtime_dependencies; then
     return 1
@@ -714,26 +793,15 @@ install_from_release() {
   fi
 
   start_spinner "Extracting binaries"
-  if tar -xzf "$download_file" -C "$tmp_dir" >/dev/null 2>&1; then
+  local payload="$tmp_dir/payload"
+  if extract_release_pair "$download_file" "$artifact_name" "$payload"; then
     stop_spinner "Extraction complete"
   else
     fail_spinner "Extraction failed"
     return 1
   fi
 
-  local omg_path
-  local omgd_path
-  omg_path=$(find "$tmp_dir" -maxdepth 3 -type f -name omg | head -n1)
-  omgd_path=$(find "$tmp_dir" -maxdepth 3 -type f -name omgd | head -n1)
-
-  if [[ -z "$omg_path" ]]; then
-    warn "Prebuilt archive missing omg binary"
-    return 1
-  fi
-  if [[ -z "$omgd_path" ]]; then
-    warn "Prebuilt archive missing omgd binary; existing binaries were not replaced"
-    return 1
-  fi
+  local omg_path="$payload/omg" omgd_path="$payload/omgd"
   # Both authenticated candidates must start and match the requested release
   # before the first destination write. A distro name alone does not prove ABI.
   probe_release_binary "$omg_path" omg "$actual_version" || return 1

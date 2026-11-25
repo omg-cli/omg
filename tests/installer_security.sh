@@ -21,6 +21,7 @@ cd "$(dirname "$0")/.."
 bash tests/installer_source_features.sh
 bash tests/native_make_targets.sh
 bash tests/installer_preflight.sh
+bash tests/installer_archive.sh
 task_dir=$(mktemp -d)
 trap 'rm -rf "$task_dir"' EXIT
 sed '$d' install.sh > "$task_dir/functions.sh"
@@ -84,7 +85,7 @@ for scenario in missing rejected wrong_tag accepted accepted_fedora loader_error
         sidecar_format/sidecar) printf 'not-a-checksum\n' ;;
         sidecar_mismatch/sidecar) printf '%064d  archive\n' 1 ;;
         */marker) printf '1.2.3\r\n' ;;
-        */archive) printf 'fixture' ;;
+        */archive) cat "$scenario_dir/fixture.tar.gz" ;;
         */sidecar) printf '%064d  archive\n' 0 ;;
       esac
     }
@@ -100,26 +101,32 @@ for scenario in missing rejected wrong_tag accepted accepted_fedora loader_error
       [[ "$scenario" != missing ]] || return 1
       printf '%s\n' "$scenario_dir/gh"
     }
+    prepare_release_fixture() {
+      mkdir "$scenario_dir/payload"
+      printf '#!/bin/sh\nprintf "omg 1.2.3\\n"\n' > "$scenario_dir/payload/omg"
+      if [[ "$scenario" == loader_error ]]; then
+        printf '#!/bin/sh\necho "missing libapt-pkg.so.6.0" >&2\nexit 127\n' > "$scenario_dir/payload/omg"
+      elif [[ "$scenario" == wrong_version ]]; then
+        printf '#!/bin/sh\nprintf "omg 1.2.2\\n"\n' > "$scenario_dir/payload/omg"
+      elif [[ "$scenario" == hung_probe ]]; then
+        printf '#!/bin/sh\necho "$$" > "%s/probe.pid"\nexec sleep 30\n' "$scenario_dir" > "$scenario_dir/payload/omg"
+      elif [[ "$scenario" == forked_probe ]]; then
+        printf '#!/bin/sh\n(while :; do printf x >> "%s/descendant.heartbeat"; sleep 0.01; done) >/dev/null 2>&1 &\necho "$!" > "%s/descendant.pid"\nwhile [ ! -s "%s/descendant.heartbeat" ]; do :; done\nprintf "omg 1.2.3\\n"\n' "$scenario_dir" "$scenario_dir" "$scenario_dir" > "$scenario_dir/payload/omg"
+      fi
+      chmod +x "$scenario_dir/payload/omg"
+      if [[ "$scenario" != missing_daemon ]]; then
+        printf '#!/bin/sh\nprintf "omgd 1.2.3\\n"\n' > "$scenario_dir/payload/omgd"
+        if [[ "$scenario" == daemon_loader_error ]]; then
+          printf '#!/bin/sh\necho "daemon missing native library" >&2\nexit 127\n' > "$scenario_dir/payload/omgd"
+        fi
+        chmod +x "$scenario_dir/payload/omgd"
+      fi
+      command tar -czf "$scenario_dir/fixture.tar.gz" -C "$scenario_dir/payload" .
+    }
+    prepare_release_fixture
     tar() {
       touch "$scenario_dir/extracted"
-      printf '#!/bin/sh\nprintf "omg 1.2.3\\n"\n' > "$tmp_dir/omg"
-      if [[ "$scenario" == loader_error ]]; then
-        printf '#!/bin/sh\necho "missing libapt-pkg.so.6.0" >&2\nexit 127\n' > "$tmp_dir/omg"
-      elif [[ "$scenario" == wrong_version ]]; then
-        printf '#!/bin/sh\nprintf "omg 1.2.2\\n"\n' > "$tmp_dir/omg"
-      elif [[ "$scenario" == hung_probe ]]; then
-        printf '#!/bin/sh\necho "$$" > "%s/probe.pid"\nexec sleep 30\n' "$scenario_dir" > "$tmp_dir/omg"
-      elif [[ "$scenario" == forked_probe ]]; then
-        printf '#!/bin/sh\n(while :; do printf x >> "%s/descendant.heartbeat"; sleep 0.01; done) >/dev/null 2>&1 &\necho "$!" > "%s/descendant.pid"\nwhile [ ! -s "%s/descendant.heartbeat" ]; do :; done\nprintf "omg 1.2.3\\n"\n' "$scenario_dir" "$scenario_dir" "$scenario_dir" > "$tmp_dir/omg"
-      fi
-      chmod +x "$tmp_dir/omg"
-      if [[ "$scenario" != missing_daemon ]]; then
-        printf '#!/bin/sh\nprintf "omgd 1.2.3\\n"\n' > "$tmp_dir/omgd"
-        if [[ "$scenario" == daemon_loader_error ]]; then
-          printf '#!/bin/sh\necho "daemon missing native library" >&2\nexit 127\n' > "$tmp_dir/omgd"
-        fi
-        chmod +x "$tmp_dir/omgd"
-      fi
+      command tar "$@"
     }
     if [[ "$scenario" == second_install_failure ]]; then
       eval "$(declare -f rename_install_binary | sed '1s/^rename_install_binary/real_release_rename/')"

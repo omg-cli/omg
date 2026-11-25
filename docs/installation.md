@@ -43,7 +43,7 @@ If your computer is not in the table, OMG cannot run on it yet. Do not install a
 - A supported computer from the table above.
 - An internet connection.
 - Permission to install programs into your own home folder. This is the standard way for this installer, and it does not need an administrator account for the install itself.
-- Small helper programs that the installer uses to check the download: `curl`, `tar`, `head`, `tr`, and either `sha256sum` or `shasum`.
+- The installer uses `curl`, `gzip`, `tar`, `head`, `tr`, and either `sha256sum` or `shasum` to download, verify, and unpack the release.
 - The GitHub CLI program, `gh`, for the build-provenance check. Without it, the installer refuses to install a release.
 - On macOS, the system file `/usr/bin/perl` must exist; the installer uses it to move the programs into place safely.
 
