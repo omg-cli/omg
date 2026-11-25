@@ -103,21 +103,17 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
 
-      - name: Test debt baseline and classification guards on docs-only changes
+      - name: Test workflow guards on docs-only changes
         if: matrix.shard == 0 && github.event_name != 'push' && needs.quick-gate.outputs.checks-required != 'true'
         run: |
           python3 -m unittest discover -s scripts -p 'test_debt*.py'
           python3 -m unittest discover -s scripts -p test_ci_change_scope.py
-
-      - name: Test advisory baseline publication guards
-        if: matrix.shard == 0
-        run: python3 -m unittest discover -s scripts -p test_advisory_baseline.py
+          python3 -m unittest discover -s scripts -p test_advisory_baseline.py
+          python3 scripts/test_alpm_pins.py
 
       - name: Check Rust ALPM snapshot consistency
         if: matrix.shard == 0
-        run: |
-          python3 scripts/check-alpm-pins.py
-          python3 scripts/test_alpm_pins.py
+        run: python3 scripts/check-alpm-pins.py
 
       - name: Debt ratchet (gating)
         if: matrix.shard == 0

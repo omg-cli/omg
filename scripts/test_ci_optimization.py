@@ -717,6 +717,18 @@ git() { printf '%040d\\n' 1; }
                 self.assertNotIn('\n        if:', cache)
                 self.assertIn("save-if: ${{ github.ref == 'refs/heads/main' }}", cache)
 
+    def test_publication_and_alpm_unit_suites_have_one_ci_owner(self):
+        workflow = (WORKFLOWS / 'ci.yml').read_text(encoding='utf-8')
+        helpers = job_block(workflow, 'workflow-checks')
+        docs_step = helpers.split('      - name: Test workflow guards on docs-only changes\n', 1)[1]
+        docs_step = docs_step.split('\n      - ', 1)[0]
+        self.assertIn("if: matrix.shard == 0 && github.event_name != 'push' && needs.quick-gate.outputs.checks-required != 'true'", docs_step)
+        for module in ('test_advisory_baseline.py', 'test_alpm_pins.py'):
+            self.assertIn(module, docs_step)
+            self.assertEqual(helpers.count(module), 1)
+            self.assertTrue((ROOT / 'scripts' / module).is_file())
+        self.assertIn('run: python3 scripts/check-alpm-pins.py', helpers)
+
     def test_ubuntu_can_rerun_without_overwriting_evidence_from_the_failed_attempt(self):
         workflow = (WORKFLOWS / 'ci.yml').read_text(encoding='utf-8')
         ubuntu = job_block(workflow, 'ubuntu')
