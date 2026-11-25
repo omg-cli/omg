@@ -485,13 +485,19 @@ async fn update_packages(
         if official_count > 0 {
             if needs_deferred_sync {
                 // Databases were refreshed before the prompt (or skipped via
-                // `--no-sync`). Avoid starting a parent spinner while `pm.update()`
-                // elevates so the sudo prompt stays visible.
+                // `--no-sync`). The child only commits the upgrade. `fullupdate`
+                // would download every repository again.
                 println!(
                     "  {} Upgrading {official_count} official packages...",
                     style::community("→")
                 );
-                pm.update().await?;
+                crate::package_managers::arch::run_privileged_operation(
+                    "update",
+                    &[],
+                    &[],
+                    || async { Ok(()) },
+                )
+                .await?;
             } else {
                 let pb = modern_ui::modern_spinner(
                     "Upgrading",
