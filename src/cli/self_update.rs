@@ -133,22 +133,23 @@ pub async fn run(force: bool, version: Option<String>) -> Result<()> {
 
     let archive_name = artifact.object_name();
 
-    // Perform blocking extraction and binary replacement in a separate thread
-    // to avoid blocking the tokio async runtime
-    let attestation_tag = format!("v{target_version}");
-    let probe_version = target_version.clone();
-    tokio::task::spawn_blocking(move || -> Result<()> {
-        // Provenance gate: `gh attestation verify` requires a file on disk, so
-        // stage the digest-verified bytes for both the verification and the
-        // subsequent extraction.
+    // The verifier and extractor use the same digest-verified bytes.
+    let (attestation_file, bytes) = tokio::task::spawn_blocking(move || -> Result<_> {
         let attestation_file = tempfile::NamedTempFile::new()
             .context("Failed to stage archive for attestation verification")?;
         fs::write(attestation_file.path(), &bytes)
             .context("Failed to write archive for attestation verification")?;
-        if !verify_attestation(attestation_file.path(), &attestation_tag)? {
-            refuse_unverified_provenance()?;
-        }
+        Ok((attestation_file, bytes))
+    })
+    .await??;
+    let attestation_tag = format!("v{target_version}");
+    if !verify_attestation(attestation_file.path(), &attestation_tag).await? {
+        refuse_unverified_provenance()?;
+    }
+    drop(attestation_file);
 
+    let probe_version = target_version.clone();
+    tokio::task::spawn_blocking(move || -> Result<()> {
         let temp_dir = tempfile::tempdir().context("Failed to create temp directory for update")?;
         let (new_binary, new_daemon) = extract_update_pair(&bytes, temp_dir.path(), &archive_name)?;
 
@@ -269,9 +270,7 @@ async fn probe_update_binary(
     deadline: std::time::Duration,
 ) -> Result<()> {
     use std::process::Stdio;
-    use tokio::io::AsyncReadExt;
 
-    const OUTPUT_LIMIT: u64 = 4096;
     anyhow::ensure!(
         fs::symlink_metadata(binary)
             .with_context(|| format!("Missing {name} update candidate"))?
@@ -279,20 +278,13 @@ async fn probe_update_binary(
             .is_file(),
         "{name} update candidate is not a regular file"
     );
-    let mut command = tokio::process::Command::new(binary);
-    command
+    let label = format!("{name} version probe");
+    let mut child = release_command(binary)
         .arg("--version")
-        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    #[cfg(unix)]
-    command.process_group(0);
-    let mut child = command
         .spawn()
-        .with_context(|| format!("Failed to execute {name} version probe"))?;
-    #[cfg(unix)]
-    let probe_group = child.id().context("Version probe has no process ID")?;
+        .with_context(|| format!("Failed to execute {label}"))?;
     let stdout = child
         .stdout
         .take()
@@ -301,57 +293,13 @@ async fn probe_update_binary(
         .stderr
         .take()
         .context("Missing version probe stderr")?;
-    let read_output = |stream: std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send>>| async move {
-        let mut bytes = Vec::new();
-        stream
-            .take(OUTPUT_LIMIT + 1)
-            .read_to_end(&mut bytes)
-            .await?;
-        anyhow::ensure!(
-            bytes.len() <= OUTPUT_LIMIT as usize,
-            "version probe output exceeds {OUTPUT_LIMIT} bytes"
-        );
-        Ok::<_, anyhow::Error>(bytes)
-    };
-    let probe = tokio::time::timeout(deadline, async {
-        tokio::try_join!(
-            read_output(Box::pin(stdout)),
-            read_output(Box::pin(stderr)),
-            wait_for_probe_exit_without_reaping(probe_group),
-        )
+    let (status, (stdout, stderr)) = finish_release_process(child, &label, deadline, async {
+        tokio::try_join!(read_version_output(stdout), read_version_output(stderr))
     })
-    .await
-    .with_context(|| format!("{name} version probe timed out"))
-    .and_then(std::convert::identity);
-    let (stdout, stderr, ()) = match probe {
-        Ok(result) => result,
-        Err(error) => {
-            // Kill the isolated group before reaping the leader. A candidate
-            // may fork a helper which inherits the output pipes and otherwise
-            // keeps the timed-out probe alive after its direct child exits.
-            #[cfg(unix)]
-            if probe_group_has_descendants(probe_group)? {
-                kill_probe_group(probe_group)?;
-            } else {
-                kill_probe_leader(probe_group)?;
-            }
-            child
-                .wait()
-                .await
-                .with_context(|| format!("Failed to reap {name} version probe after {error:#}"))?;
-            return Err(error);
-        }
-    };
-    #[cfg(unix)]
-    if probe_group_has_descendants(probe_group)? {
-        kill_probe_group(probe_group)?;
-        child.wait().await.context("Failed to reap version probe")?;
-        anyhow::bail!("{name} version probe left descendant processes running");
-    }
-    let status = child.wait().await.context("Failed to reap version probe")?;
+    .await?;
     anyhow::ensure!(
         status.success(),
-        "{name} version probe failed ({status}): {}",
+        "{label} failed ({status}): {}",
         style::sanitize_terminal_text(&String::from_utf8_lossy(&stderr))
     );
     let expected = format!("{name} {version}");
@@ -362,29 +310,179 @@ async fn probe_update_binary(
     Ok(())
 }
 
-#[cfg(unix)]
-async fn wait_for_probe_exit_without_reaping(group: u32) -> Result<()> {
-    use rustix::process::{Pid, WaitId, WaitIdOptions, waitid};
+async fn read_version_output(stream: impl tokio::io::AsyncRead + Unpin) -> Result<Vec<u8>> {
+    use tokio::io::AsyncReadExt;
 
-    let pid = i32::try_from(group)
-        .ok()
+    const OUTPUT_LIMIT: u64 = 4096;
+    let mut bytes = Vec::new();
+    stream
+        .take(OUTPUT_LIMIT + 1)
+        .read_to_end(&mut bytes)
+        .await?;
+    anyhow::ensure!(
+        bytes.len() <= OUTPUT_LIMIT as usize,
+        "version probe output exceeds {OUTPUT_LIMIT} bytes"
+    );
+    Ok(bytes)
+}
+
+fn release_command(binary: &std::path::Path) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new(binary);
+    command
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    command.process_group(0);
+    command
+}
+
+#[cfg(unix)]
+struct ReleaseProcessGroup {
+    pid: rustix::process::Pid,
+    armed: bool,
+}
+
+#[cfg(unix)]
+impl ReleaseProcessGroup {
+    fn stop(&self) -> Result<()> {
+        use rustix::io::Errno;
+        use rustix::process::{Signal, kill_process_group};
+
+        match kill_process_group(self.pid, Signal::KILL) {
+            Ok(()) | Err(Errno::SRCH) => Ok(()),
+            Err(error) => Err(error).context("Failed to stop release process group"),
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ReleaseProcessGroup {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.stop();
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn finish_release_process<T>(
+    mut child: tokio::process::Child,
+    label: &str,
+    deadline: std::time::Duration,
+    output: impl std::future::Future<Output = Result<T>>,
+) -> Result<(std::process::ExitStatus, T)> {
+    use rustix::process::Pid;
+
+    let pid = child
+        .id()
+        .and_then(|id| i32::try_from(id).ok())
         .and_then(Pid::from_raw)
-        .context("Version probe process ID was invalid")?;
+        .filter(|pid| *pid != Pid::INIT)
+        .with_context(|| format!("Invalid process ID for {label}"))?;
+    let mut group = ReleaseProcessGroup { pid, armed: true };
+    let outcome = tokio::time::timeout(deadline, async {
+        tokio::try_join!(wait_for_release_exit_without_reaping(pid), output)
+    })
+    .await
+    .with_context(|| format!("{label} timed out"))
+    .and_then(std::convert::identity)
+    .and_then(|((), output)| {
+        anyhow::ensure!(
+            !release_group_has_descendants(pid)?,
+            "{label} left descendant processes running"
+        );
+        Ok(output)
+    });
+    if let Err(error) = &outcome {
+        group
+            .stop()
+            .with_context(|| format!("Failed to stop {label} after {error:#}"))?;
+    }
+    // The unreaped leader keeps the group ID reserved until its cleanup is complete.
+    group.armed = false;
+    let status = child
+        .wait()
+        .await
+        .with_context(|| format!("Failed to reap {label}"))?;
+    Ok((status, outcome?))
+}
+
+#[cfg(not(unix))]
+async fn finish_release_process<T>(
+    mut child: tokio::process::Child,
+    label: &str,
+    deadline: std::time::Duration,
+    output: impl std::future::Future<Output = Result<T>>,
+) -> Result<(std::process::ExitStatus, T)> {
+    let outcome = tokio::time::timeout(deadline, async {
+        tokio::try_join!(
+            async {
+                child
+                    .wait()
+                    .await
+                    .with_context(|| format!("Failed to reap {label}"))
+            },
+            output
+        )
+    })
+    .await
+    .with_context(|| format!("{label} timed out"))
+    .and_then(std::convert::identity);
+    if outcome.is_err() {
+        child
+            .kill()
+            .await
+            .with_context(|| format!("Failed to stop {label}"))?;
+    }
+    outcome
+}
+
+#[cfg(unix)]
+async fn wait_for_release_exit_without_reaping(pid: rustix::process::Pid) -> Result<()> {
+    use rustix::process::{WaitId, WaitIdOptions, waitid};
+
     tokio::task::spawn_blocking(move || {
         waitid(
             WaitId::Pid(pid),
             WaitIdOptions::EXITED | WaitIdOptions::NOWAIT,
         )
-        .context("Failed to observe version probe exit without reaping")?
-        .context("Version probe exit was not reported")?;
+        .context("Failed to observe release command exit without reaping")?
+        .context("Release command exit was not reported")?;
         Ok(())
     })
     .await
-    .context("Version probe exit observer panicked")?
+    .context("Release command exit observer panicked")?
 }
 
-#[cfg(unix)]
-fn probe_group_has_descendants(group: u32) -> Result<bool> {
+#[cfg(target_os = "linux")]
+fn release_group_has_descendants(group: rustix::process::Pid) -> Result<bool> {
+    use nix::errno::Errno;
+    use nix::unistd::{Pid, getpgid};
+
+    let group = Pid::from_raw(group.as_raw_nonzero().get());
+    for entry in fs::read_dir("/proc").context("Failed to list release process groups")? {
+        let Some(raw) = entry?
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        if raw <= 0 || raw == group.as_raw() {
+            continue;
+        }
+        // A group outside this PID namespace can appear as zero.
+        match getpgid(Some(Pid::from_raw(raw))) {
+            Ok(actual) if actual == group => return Ok(true),
+            Ok(_) | Err(Errno::ESRCH) => {}
+            Err(error) => return Err(error).context("Failed to inspect release process group"),
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn release_group_has_descendants(group: rustix::process::Pid) -> Result<bool> {
     let ps = if cfg!(target_os = "macos") {
         "/bin/ps"
     } else {
@@ -393,52 +491,24 @@ fn probe_group_has_descendants(group: u32) -> Result<bool> {
     let output = std::process::Command::new(ps)
         .args(["-eo", "pid=,pgid="])
         .output()
-        .context("Failed to inspect version probe process group")?;
+        .context("Failed to inspect release process group")?;
     anyhow::ensure!(
         output.status.success(),
         "Process-group inspection failed with {}",
         output.status
     );
-    for line in String::from_utf8(output.stdout)?.lines() {
+    for line in std::str::from_utf8(&output.stdout)?.lines() {
         let mut fields = line.split_whitespace();
-        let Some(pid) = fields.next() else { continue };
-        let Some(pgid) = fields.next() else {
+        let (Some(pid), Some(pgid)) = (fields.next(), fields.next()) else {
             continue;
         };
-        let pid = pid.parse::<u32>().context("Invalid PID from ps")?;
-        let pgid = pgid.parse::<u32>().context("Invalid PGID from ps")?;
-        if pgid == group && pid != group {
+        let pid = pid.parse::<i32>().context("Invalid PID from ps")?;
+        let pgid = pgid.parse::<i32>().context("Invalid PGID from ps")?;
+        if pgid == group.as_raw_nonzero().get() && pid != pgid {
             return Ok(true);
         }
     }
     Ok(false)
-}
-
-#[cfg(unix)]
-fn kill_probe_group(group: u32) -> Result<()> {
-    use nix::errno::Errno;
-    use nix::sys::signal::{Signal, killpg};
-    use nix::unistd::Pid;
-
-    let group = i32::try_from(group).context("Version probe process ID exceeded i32")?;
-    let group_pid = Pid::from_raw(group);
-    match killpg(group_pid, Signal::SIGKILL) {
-        Ok(()) | Err(Errno::ESRCH) => Ok(()),
-        Err(error) => Err(error).context("Failed to kill version probe group"),
-    }
-}
-
-#[cfg(unix)]
-fn kill_probe_leader(pid: u32) -> Result<()> {
-    use nix::errno::Errno;
-    use nix::sys::signal::{Signal, kill};
-    use nix::unistd::Pid;
-
-    let pid = i32::try_from(pid).context("Version probe process ID exceeded i32")?;
-    match kill(Pid::from_raw(pid), Signal::SIGKILL) {
-        Ok(()) | Err(Errno::ESRCH) => Ok(()),
-        Err(error) => Err(error).context("Failed to kill version probe leader"),
-    }
 }
 
 fn extract_update_pair(
@@ -1024,21 +1094,30 @@ fn trusted_attestation_helper(path: &std::path::Path) -> Option<std::path::PathB
     }
 }
 
-fn verify_attestation(archive_path: &std::path::Path, tag: &str) -> Result<bool> {
-    verify_attestation_with_candidates(archive_path, tag, GH_CANDIDATES)
+async fn verify_attestation(archive_path: &std::path::Path, tag: &str) -> Result<bool> {
+    verify_attestation_with_candidates(
+        archive_path,
+        tag,
+        GH_CANDIDATES,
+        std::time::Duration::from_secs(90),
+    )
+    .await
 }
 
-fn verify_attestation_with_candidates(
+async fn verify_attestation_with_candidates(
     archive_path: &std::path::Path,
     tag: &str,
     candidates: &[&str],
+    deadline: std::time::Duration,
 ) -> Result<bool> {
+    use std::process::Stdio;
+
     let repository = attestation_repository(tag)?;
     let signer_workflow = format!("{repository}/.github/workflows/release.yml");
     let Some(gh) = locate_gh(candidates) else {
         return Ok(false);
     };
-    let output = std::process::Command::new(gh)
+    let child = release_command(&gh)
         .args(["attestation", "verify"])
         .arg(archive_path)
         .args([
@@ -1049,16 +1128,24 @@ fn verify_attestation_with_candidates(
             "--signer-workflow",
             &signer_workflow,
         ])
-        .stdin(std::process::Stdio::null())
-        .output();
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
 
-    let output = match output {
-        Ok(output) => output,
+    let child = match child {
+        Ok(child) => child,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(error).context("Failed to execute GitHub CLI attestation check"),
     };
+    let (status, ()) = finish_release_process(
+        child,
+        "GitHub CLI attestation check",
+        deadline,
+        std::future::ready(Ok(())),
+    )
+    .await?;
 
-    if output.status.success() {
+    if status.success() {
         println!(
             "  {} build provenance verified",
             style::maybe_color("🔒", |t| t.green().to_string())
@@ -1562,9 +1649,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn attestation_rejects_an_invalid_tag_before_tool_lookup() {
+    #[tokio::test]
+    async fn attestation_rejects_an_invalid_tag_before_tool_lookup() {
         let error = verify_attestation(std::path::Path::new("unused-archive"), "../release")
+            .await
             .expect_err("invalid release tag must refuse attestation");
         assert_eq!(error.to_string(), "Invalid release tag");
     }
@@ -2316,6 +2404,10 @@ mod tests {
         let archive = fixture.path().join("archive.tar.gz");
         fs::write(&archive, b"unverified archive").expect("archive fixture");
         let absent = fixture.path().join("no-trusted-gh");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
         temp_env::with_vars(
             [
                 ("PATH", Some(fixture.path().to_str().expect("fixture path"))),
@@ -2325,25 +2417,195 @@ mod tests {
                 ),
             ],
             || {
-                let verified = verify_attestation_with_candidates(
-                    &archive,
-                    "v0.0.0-test",
-                    &[absent.to_str().expect("candidate path")],
-                )
-                .expect("impostor must not error");
-                assert!(!verified, "PATH impostor must not approve the archive");
-                assert!(!marker.exists(), "PATH impostor must never run");
+                runtime.block_on(async {
+                    let verified = verify_attestation_with_candidates(
+                        &archive,
+                        "v0.0.0-test",
+                        &[absent.to_str().expect("candidate path")],
+                        std::time::Duration::from_secs(5),
+                    )
+                    .await
+                    .expect("impostor must not error");
+                    assert!(!verified, "PATH impostor must not approve the archive");
+                    assert!(!marker.exists(), "PATH impostor must never run");
 
-                let verified = verify_attestation_with_candidates(
-                    &archive,
-                    "v0.0.0-test",
-                    &[impostor.to_str().expect("trusted candidate path")],
-                )
-                .expect("trusted fixture must execute");
-                assert!(verified, "explicit trusted fixture must be accepted");
-                assert_eq!(fs::read(&marker).expect("trusted marker"), b"executed");
+                    let verified = verify_attestation_with_candidates(
+                        &archive,
+                        "v0.0.0-test",
+                        &[impostor.to_str().expect("trusted candidate path")],
+                        std::time::Duration::from_secs(5),
+                    )
+                    .await
+                    .expect("trusted fixture must execute");
+                    assert!(verified, "explicit trusted fixture must be accepted");
+                    assert_eq!(fs::read(&marker).expect("trusted marker"), b"executed");
+                })
             },
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn trusted_attestation_checks_exact_arguments_and_exit_status() {
+        let root = tempfile::tempdir_in("/var/tmp").expect("private fixture");
+        let arguments = root.path().join("arguments");
+        for (tag, repo) in [
+            ("v0.1.221", "PyRo1121/omg"),
+            ("v0.1.222", "omg-cli/omg"),
+            ("v0.1.227-rc.2", "omg-cli/omg"),
+            ("v1.2.3+build.6", "omg-cli/omg"),
+        ] {
+            for filename in ["release.tar.gz", "release with spaces.tar.gz"] {
+                let archive = root.path().join(filename);
+                fs::write(&archive, b"fixture archive").expect("archive fixture");
+                for status in [0, 1, 23] {
+                    let helper = root.path().join(format!("gh-{status}"));
+                    write_version_probe(
+                        &helper,
+                        &format!(
+                            "printf '%s\\n' \"$@\" > '{}'; printf 'verified\\n'; exit {status}",
+                            arguments.display()
+                        ),
+                    );
+                    let result = verify_attestation_with_candidates(
+                        &archive,
+                        tag,
+                        &[helper.to_str().expect("fixture path")],
+                        std::time::Duration::from_secs(3),
+                    )
+                    .await;
+                    if status == 0 {
+                        assert!(result.expect("successful verifier"), "{tag} {filename}");
+                    } else {
+                        let error = result.expect_err("explicit verification failure");
+                        assert!(format!("{error:#}").contains("attestation verification FAILED"));
+                    }
+                    assert_eq!(
+                        fs::read_to_string(&arguments).expect("recorded verifier arguments"),
+                        format!(
+                            "attestation\nverify\n{}\n-R\n{repo}\n--source-ref\nrefs/tags/{tag}\n--signer-workflow\n{repo}/.github/workflows/release.yml\n",
+                            archive.display()
+                        )
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn trusted_attestation_times_out_and_reaps_the_verifier() {
+        let root = tempfile::tempdir_in("/var/tmp").expect("private fixture");
+        let helper = root.path().join("gh");
+        let receipt = root.path().join("verifier.pid");
+        write_version_probe(
+            &helper,
+            &format!("echo $$ > '{}'; exec sleep 2", receipt.display()),
+        );
+        let result = verify_attestation_with_candidates(
+            &root.path().join("archive.tar.gz"),
+            "v0.1.227",
+            &[helper.to_str().expect("fixture path")],
+            std::time::Duration::from_secs(1),
+        )
+        .await;
+        let error = result.expect_err("a hung verifier must never approve an update");
+        assert!(
+            format!("{error:#}").contains("attestation check timed out"),
+            "{error:#}"
+        );
+        let pid = fs::read_to_string(receipt)
+            .expect("verifier ran")
+            .trim()
+            .parse::<i32>()
+            .expect("verifier pid");
+        assert_eq!(
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None),
+            Err(nix::errno::Errno::ESRCH)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn trusted_attestation_refuses_when_a_helper_is_left_running() {
+        let root = tempfile::tempdir_in("/var/tmp").expect("private fixture");
+        let helper = root.path().join("gh");
+        let heartbeat = root.path().join("helper.heartbeat");
+        let receipt = root.path().join("helper.pid");
+        write_version_probe(
+            &helper,
+            &format!(
+                "(for tick in $(seq 100); do printf x >> '{}'; sleep 0.02; done) >/dev/null 2>&1 & \
+                 echo $! > '{}'; while [ ! -s '{}' ]; do sleep 0.01; done; exit 0",
+                heartbeat.display(),
+                receipt.display(),
+                heartbeat.display(),
+            ),
+        );
+        let error = verify_attestation_with_candidates(
+            &root.path().join("archive.tar.gz"),
+            "v0.1.227",
+            &[helper.to_str().expect("fixture path")],
+            std::time::Duration::from_secs(2),
+        )
+        .await
+        .expect_err("a verifier must not leave helpers");
+        assert!(format!("{error:#}").contains("left descendant processes running"));
+        assert!(receipt.is_file(), "the helper actually ran");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let before = fs::read(&heartbeat).expect("helper wrote heartbeat");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(fs::read(&heartbeat).expect("helper heartbeat"), before);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelling_attestation_stops_the_running_group() {
+        use std::time::Duration;
+
+        let root = tempfile::tempdir_in("/var/tmp").expect("private fixture");
+        let helper = root.path().join("gh");
+        let receipt = root.path().join("verifier.pid");
+        let heartbeat = root.path().join("helper.heartbeat");
+        let archive = root.path().join("archive.tar.gz");
+        write_version_probe(
+            &helper,
+            &format!(
+                "(for tick in $(seq 100); do printf x >> '{}'; sleep 0.02; done) >/dev/null 2>&1 & \
+                 echo $$ > '{}'; wait",
+                heartbeat.display(),
+                receipt.display(),
+            ),
+        );
+        let verifier = tokio::spawn(async move {
+            verify_attestation_with_candidates(
+                &archive,
+                "v0.1.227",
+                &[helper.to_str().expect("fixture path")],
+                Duration::from_secs(5),
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !receipt.is_file()
+                || fs::metadata(&heartbeat).map_or(true, |file| file.len() == 0)
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("verifier and its helper started");
+        verifier.abort();
+        assert!(
+            verifier
+                .await
+                .expect_err("the task was cancelled")
+                .is_cancelled()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let before = fs::read(&heartbeat).expect("helper heartbeat");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(fs::read(&heartbeat).expect("helper heartbeat"), before);
     }
 
     #[test]
