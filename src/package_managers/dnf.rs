@@ -1017,7 +1017,17 @@ impl DnfPackageManager {
         }
 
         let epoch: u32 = fields[4].parse().context("Malformed RPM epoch")?;
-        anyhow::ensure!(!fields[5].is_empty(), "RPM architecture is missing");
+        let missing = |value: &str| value.is_empty() || value == "(none)";
+        anyhow::ensure!(
+            ![fields[0], fields[1], fields[2]].into_iter().any(missing),
+            "Incomplete package identity in rpm -qa output"
+        );
+        let architecture = if missing(fields[5]) {
+            anyhow::ensure!(fields[0] == "gpg-pubkey", "RPM architecture is missing");
+            String::new()
+        } else {
+            fields[5].to_owned()
+        };
         Ok(InstalledPackage {
             name: fields[0].to_string(),
             version: if epoch == 0 {
@@ -1026,7 +1036,7 @@ impl DnfPackageManager {
                 format!("{epoch}:{}", fields[1])
             },
             release: fields[2].to_string(),
-            architecture: fields[5].to_owned(),
+            architecture,
             summary: fields[3].to_string(),
             // Install reasons are populated separately from DNF's state.
             reason: InstallReason::Dependency,
@@ -1191,6 +1201,15 @@ impl DnfPackageManager {
             .transpose()?
             .unwrap_or(0);
         let version = get_string(rpm_tags::VERSION);
+        let release = get_string(rpm_tags::RELEASE);
+        let architecture = get_string(rpm_tags::ARCH);
+        anyhow::ensure!(!version.is_empty(), "RPM header missing VERSION tag");
+        anyhow::ensure!(!release.is_empty(), "RPM header missing RELEASE tag");
+        // Legacy RPM databases store imported keys as architecture-less records.
+        anyhow::ensure!(
+            !architecture.is_empty() || name == "gpg-pubkey",
+            "RPM header missing ARCH tag"
+        );
         Ok(InstalledPackage {
             name,
             version: if epoch == 0 {
@@ -1198,8 +1217,8 @@ impl DnfPackageManager {
             } else {
                 format!("{epoch}:{version}")
             },
-            release: get_string(rpm_tags::RELEASE),
-            architecture: get_string(rpm_tags::ARCH),
+            release,
+            architecture,
             summary: get_string(rpm_tags::SUMMARY),
             reason: InstallReason::Dependency,
         })
@@ -5172,9 +5191,8 @@ mod tests {
 
     #[test]
     fn sqlite_string_values_exclude_rpm_terminators() {
-        let package =
-            DnfPackageManager::parse_package_from_blob(&minimal_named_rpm_header(b"bash\0"))
-                .expect("valid RPM name header");
+        let package = DnfPackageManager::parse_package_from_blob(&named_rpm_header("bash"))
+            .expect("valid RPM name header");
         assert_eq!(package.name, "bash");
     }
 
@@ -5188,8 +5206,76 @@ mod tests {
         );
     }
 
-    fn minimal_named_rpm_header(name: &[u8]) -> Vec<u8> {
-        strict_header(&[(1000, 6, 0, 1)], name)
+    #[test]
+    fn rpm_query_rejects_incomplete_installed_identity() {
+        let complete = ["bash", "5.2.15", "1.fc39", "GNU shell", "0", "x86_64"];
+        for field in [0, 1, 2, 5] {
+            for missing in ["", "(none)"] {
+                let mut fields = complete;
+                fields[field] = missing;
+                assert!(
+                    DnfPackageManager::parse_rpm_qa_line(&fields.join("\t")).is_err(),
+                    "incomplete installed RPM identity accepted: {fields:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rpm_sqlite_rejects_incomplete_installed_identity() {
+        let fields = [
+            (rpm_tags::NAME, "bash"),
+            (rpm_tags::VERSION, "5.2.15"),
+            (rpm_tags::RELEASE, "1.fc39"),
+            (rpm_tags::ARCH, "x86_64"),
+        ];
+        for (missing, _) in fields {
+            let header = rpm_string_header(fields.into_iter().filter(|(tag, _)| *tag != missing));
+            let directory = write_packages_db(&[&header]);
+            assert!(
+                DnfPackageManager::read_rpm_sqlite(&directory.path().join("rpmdb.sqlite")).is_err(),
+                "installed RPM identity accepted without tag {missing}"
+            );
+        }
+    }
+
+    #[test]
+    fn rpm_keeps_legacy_architectureless_trust_records() -> Result<()> {
+        let header = rpm_string_header([
+            (rpm_tags::NAME, "gpg-pubkey"),
+            (rpm_tags::VERSION, "3b94a80e"),
+            (rpm_tags::RELEASE, "6665a2fc"),
+        ]);
+        let stored_key = DnfPackageManager::parse_package_from_blob(&header)?;
+        let queried_key = DnfPackageManager::parse_rpm_qa_line(
+            "gpg-pubkey\t3b94a80e\t6665a2fc\tOpenPGP key\t0\t(none)",
+        )?;
+        for key in [stored_key, queried_key] {
+            assert_eq!(key.identity(), "gpg-pubkey");
+            assert_eq!(key.version, "3b94a80e");
+            assert_eq!(key.release, "6665a2fc");
+        }
+        Ok(())
+    }
+
+    fn named_rpm_header(name: &str) -> Vec<u8> {
+        rpm_string_header([
+            (rpm_tags::NAME, name),
+            (rpm_tags::VERSION, "1.0"),
+            (rpm_tags::RELEASE, "1.fc44"),
+            (rpm_tags::ARCH, "noarch"),
+        ])
+    }
+
+    fn rpm_string_header<'a>(fields: impl IntoIterator<Item = (u32, &'a str)>) -> Vec<u8> {
+        let mut entries = Vec::new();
+        let mut data = Vec::new();
+        for (tag, value) in fields {
+            entries.push((tag, 6, i32::try_from(data.len()).unwrap(), 1));
+            data.extend_from_slice(value.as_bytes());
+            data.push(0);
+        }
+        strict_header(&entries, &data)
     }
 
     fn write_packages_db(blobs: &[&[u8]]) -> tempfile::TempDir {
@@ -5211,7 +5297,7 @@ mod tests {
     #[tokio::test]
     async fn installed_lookup_reads_one_package_when_an_unrelated_header_is_unreadable()
     -> Result<()> {
-        let header = minimal_named_rpm_header(b"omg-indexed-read-fixture\0");
+        let header = named_rpm_header("omg-indexed-read-fixture");
         let directory = write_packages_db(&[header.as_slice(), &[0; 32]]);
         let mut manager = DnfPackageManager::new();
         manager.rpm_db_path = directory.path().join("rpmdb.sqlite");
@@ -5230,7 +5316,7 @@ mod tests {
     #[tokio::test]
     async fn indexed_installed_info_preserves_qualified_and_literal_matches() -> Result<()> {
         let native = include_bytes!("../../tests/data/fedora-publicsuffix.rpmhdr");
-        let literal = minimal_named_rpm_header(b"publicsuffix-list-dafsa.noarch\0");
+        let literal = named_rpm_header("publicsuffix-list-dafsa.noarch");
         let directory = write_packages_db(&[native.as_slice(), &literal]);
         let mut manager = DnfPackageManager::new();
         manager.rpm_db_path = directory.path().join("rpmdb.sqlite");
@@ -5261,7 +5347,7 @@ mod tests {
 
     #[tokio::test]
     async fn indexed_installed_lookup_falls_back_on_inconsistent_rows() -> Result<()> {
-        let header = minimal_named_rpm_header(b"indexed-fallback-fixture\0");
+        let header = named_rpm_header("indexed-fallback-fixture");
         let directory = write_packages_db(&[&header]);
         let mut manager = DnfPackageManager::new();
         manager.rpm_db_path = directory.path().join("rpmdb.sqlite");
@@ -5292,7 +5378,7 @@ mod tests {
 
     #[test]
     fn test_read_rpm_sqlite_mixed_blobs_do_not_drop_corrupt_row() {
-        let valid = minimal_named_rpm_header(b"bash\0");
+        let valid = named_rpm_header("bash");
         let dir = write_packages_db(&[valid.as_slice(), &[0u8; 32]]);
         let error = DnfPackageManager::read_rpm_sqlite(&dir.path().join("rpmdb.sqlite"))
             .expect_err("one corrupt row must not omit that package from the catalog");
@@ -5305,7 +5391,7 @@ mod tests {
 
     #[test]
     fn malformed_row_reports_position_decoded_count_and_cause() {
-        let valid = minimal_named_rpm_header(b"bash\0");
+        let valid = named_rpm_header("bash");
         let dir = write_packages_db(&[valid.as_slice(), &[0u8; 32]]);
         let error = DnfPackageManager::read_rpm_sqlite(&dir.path().join("rpmdb.sqlite"))
             .expect_err("corrupt row must fail loudly");
