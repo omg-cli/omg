@@ -1130,6 +1130,14 @@ const fn command_uses_package_backend(command: &Commands) -> bool {
 fn validate_package_security(command: &Commands) -> Result<()> {
     match command {
         Commands::Install { packages, .. } => {
+            #[cfg(feature = "fedora")]
+            if omg_lib::package_managers::resolve_backend()?
+                == omg_lib::package_managers::Backend::Fedora
+            {
+                return omg_lib::package_managers::DnfPackageManager::validate_install_selectors(
+                    packages,
+                );
+            }
             #[cfg(any(feature = "debian", feature = "debian-pure"))]
             if omg_lib::core::env::distro::is_debian_like() {
                 omg_lib::core::security::validate_debian_package_names_or_files(packages)?;

@@ -597,6 +597,30 @@ mod dnf_integration {
         Ok(())
     }
 
+    #[test]
+    fn cli_install_preview_accepts_native_full_nevra() -> Result<()> {
+        let (selector, name, version) = installed_bash_full_nevra()?;
+        let output = std::process::Command::new(assert_cmd::cargo::cargo_bin!("omg"))
+            .args(["install", &selector, "--dry-run"])
+            .env("OMG_DISABLE_DAEMON", "1")
+            .env("OMG_TEST_MODE", "0")
+            .env_remove("OMG_TEST_DISTRO")
+            .output()?;
+        assert!(
+            output.status.success(),
+            "preview rejected native selector {selector}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = std::str::from_utf8(&output.stdout)?;
+        assert!(
+            stdout.contains(&name) && stdout.contains(&version),
+            "{stdout}"
+        );
+        assert!(stdout.contains("No changes will be made"), "{stdout}");
+        assert_eq!(installed_bash_full_nevra()?, (selector, name, version));
+        Ok(())
+    }
+
     #[tokio::test]
     async fn installed_status_resolves_native_full_nevra_with_zero_epoch() -> Result<()> {
         let (selector, name, _) = installed_bash_full_nevra()?;

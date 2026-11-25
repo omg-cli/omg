@@ -1411,7 +1411,7 @@ impl DnfPackageManager {
         Ok(args)
     }
 
-    /// Validate a read-only DNF package name, architecture identity, or full NEVRA.
+    /// Validate a DNF package name, architecture identity, or full NEVRA.
     /// RPM version syntax is local to this backend; generic package validators
     /// continue to reject epochs and RPM prerelease/postrelease modifiers.
     pub fn validate_query_selector(selector: &str) -> Result<()> {
@@ -1452,6 +1452,16 @@ impl DnfPackageManager {
                         .all(|byte| byte.is_ascii_alphanumeric() || b"._+~^".contains(&byte)),
                 "Invalid DNF selector version or release"
             );
+        }
+        Ok(())
+    }
+
+    /// Validate DNF install selectors without allowing unsealed local RPMs.
+    #[doc(hidden)]
+    pub fn validate_install_selectors(packages: &[String]) -> Result<()> {
+        reject_unsealed_local_rpm_targets(packages)?;
+        for package in packages {
+            Self::validate_query_selector(package)?;
         }
         Ok(())
     }
@@ -1583,37 +1593,58 @@ impl DnfPackageManager {
         Ok(command)
     }
 
-    async fn affected_installed_packages(
-        row: &super::dnf_advisory::ApplicableAdvisory,
+    async fn affected_installed_packages<'a>(
+        rows: impl IntoIterator<Item = &'a super::dnf_advisory::ApplicableAdvisory>,
         installed: &[super::types::SecurityPackage],
-    ) -> Result<Vec<super::types::SecurityPackage>> {
-        let (name, architecture) = super::dnf_advisory::package_identity(&row.nevra)?;
-        let evr = &row.nevra[name.len() + 1..row.nevra.len() - architecture.len() - 1];
-        let mut affected = Vec::new();
-        for package in installed.iter().filter(|package| {
-            package.name == name && package.architecture.as_deref() == Some(architecture)
-        }) {
-            let mut command =
-                tokio::process::Command::from(crate::core::privilege::system_command("rpm")?);
-            // Package values are data, never interpolated into RPM macros or Lua.
-            command
-                .env("OMG_LEFT_EVR", &package.version)
-                .env("OMG_RIGHT_EVR", evr);
-            command.args(["--eval", r#"%{lua:print(rpm.vercmp(os.getenv("OMG_LEFT_EVR"), os.getenv("OMG_RIGHT_EVR")))}"#]);
-            let output = Self::query_output(command).await?;
-            match std::str::from_utf8(&output)?.trim() {
-                "-1" => affected.push(package.clone()),
-                "0" | "1" => {}
-                _ => anyhow::bail!("Invalid native RPM version comparison result"),
+    ) -> Result<BTreeMap<String, Vec<crate::core::security::scan::InstalledIdentity>>> {
+        use crate::core::security::scan::InstalledIdentity;
+        use std::collections::btree_map::Entry;
+
+        let mut by_identity: HashMap<_, Vec<_>> = HashMap::new();
+        for package in installed {
+            if let Some(architecture) = package.architecture.as_deref() {
+                by_identity
+                    .entry((package.name.as_str(), architecture))
+                    .or_default()
+                    .push(package);
             }
         }
-        anyhow::ensure!(
-            !affected.is_empty(),
-            "Advisory {} has no affected installed identity: {}",
-            row.name,
-            row.nevra
-        );
-        Ok(affected)
+
+        let mut selected = BTreeMap::new();
+        let mut comparisons = Vec::new();
+        let mut candidates = Vec::new();
+        for row in rows {
+            let Entry::Vacant(entry) = selected.entry(row.nevra.as_str()) else {
+                continue;
+            };
+            let (name, architecture) = super::dnf_advisory::package_identity(&row.nevra)?;
+            let evr = &row.nevra[name.len() + 1..row.nevra.len() - architecture.len() - 1];
+            for &package in by_identity.get(&(name, architecture)).into_iter().flatten() {
+                comparisons.push((package.version.clone(), evr.to_owned()));
+                candidates.push((row.nevra.as_str(), package));
+            }
+            entry.insert((row.name.as_str(), Vec::new()));
+        }
+        let compared = Self::compare_native_evrs(&comparisons).await?;
+        for ((nevra, package), order) in candidates.into_iter().zip(compared) {
+            if order < 0 {
+                selected
+                    .get_mut(nevra)
+                    .context("Missing native advisory selection")?
+                    .1
+                    .push(InstalledIdentity::from(package));
+            }
+        }
+        selected
+            .into_iter()
+            .map(|(nevra, (advisory, affected))| {
+                anyhow::ensure!(
+                    !affected.is_empty(),
+                    "Advisory {advisory} has no affected installed identity: {nevra}"
+                );
+                Ok((nevra.to_owned(), affected))
+            })
+            .collect()
     }
 
     async fn native_advisories() -> Result<
@@ -1849,8 +1880,7 @@ impl DnfPackageManager {
             action != "install" || !packages.is_empty(),
             "Install requires package operands"
         );
-        crate::core::security::validate_package_names(packages)?;
-        reject_unsealed_local_rpm_targets(packages)
+        Self::validate_install_selectors(packages)
     }
 
     #[doc(hidden)]
@@ -2308,17 +2338,9 @@ impl PackageManager for DnfPackageManager {
             async {
                 let installed = self.security_inventory().await?;
                 let rows = Self::native_advisories().await?;
-                let mut affected = std::collections::BTreeMap::new();
-                for (row, _) in &rows {
-                    let packages = Self::affected_installed_packages(row, &installed).await?;
-                    affected.insert(
-                        row.nevra.clone(),
-                        packages
-                            .iter()
-                            .map(crate::core::security::scan::InstalledIdentity::from)
-                            .collect::<Vec<_>>(),
-                    );
-                }
+                let affected =
+                    Self::affected_installed_packages(rows.iter().map(|(row, _)| row), &installed)
+                        .await?;
                 let mut after = self.security_inventory().await?;
                 let mut before = installed;
                 let identity = |package: &super::types::SecurityPackage| {
@@ -2384,9 +2406,10 @@ impl PackageManager for DnfPackageManager {
                 kind != TransactionType::Update || packages.is_empty(),
                 "System updates do not accept package operands"
             );
-            crate::core::security::validate_package_names(packages)?;
             if kind == TransactionType::Install {
-                reject_unsealed_local_rpm_targets(packages)?;
+                Self::validate_install_selectors(packages)?;
+            } else {
+                crate::core::security::validate_package_names(packages)?;
             }
             let mut args = vec![action.to_owned(), "-y".to_owned()];
             args.extend_from_slice(packages);
@@ -2433,8 +2456,7 @@ impl PackageManager for DnfPackageManager {
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
         let packages = packages.to_vec();
         Box::pin(async move {
-            crate::core::security::validate_package_names(&packages)?;
-            reject_unsealed_local_rpm_targets(&packages)?;
+            Self::validate_install_selectors(&packages)?;
 
             let mut args = vec!["install".to_owned(), "-y".to_owned()];
             args.extend(packages);
@@ -2743,6 +2765,7 @@ mod tests {
         };
         for values in [
             vec!["install", "-y", "example"],
+            vec!["install", "-y", "example-2:1.0~rc1-1.fc44.x86_64"],
             vec!["--setopt=cacheonly=metadata", "upgrade", "-y"],
             vec![
                 "--comment=omg-550e8400-e29b-41d4-a716-446655440000",
@@ -2761,6 +2784,7 @@ mod tests {
             vec!["upgrade", "-y", "unexpected-package"],
             vec!["install", "-y"],
             vec!["install", "-y", "/tmp/local.rpm"],
+            vec!["install", "-y", "example-2:1.0-1.fc44.rpm"],
         ] {
             assert!(
                 DnfPackageManager::validate_admission_args(&args(&values)).is_err(),
@@ -3053,6 +3077,8 @@ mod tests {
 
     #[tokio::test]
     async fn native_advisory_identity_excludes_patched_versions_and_other_architectures() {
+        use crate::core::security::scan::InstalledIdentity;
+
         let package = |version: &str, architecture: &str| super::super::types::SecurityPackage {
             origin: crate::package_managers::types::SecurityOrigin::DistributionPackage,
             name: "fixture".into(),
@@ -3074,14 +3100,38 @@ mod tests {
             package("1:1.0-3", "x86_64"),
             package("0:99.0-1", "i686"),
         ];
-        let affected = DnfPackageManager::affected_installed_packages(&row, &installed)
-            .await
-            .unwrap();
-        assert_eq!(affected, vec![installed[0].clone()]);
+        let other_architecture = super::super::dnf_advisory::ApplicableAdvisory {
+            name: "FEDORA-other-architecture".into(),
+            kind: "security".into(),
+            severity: "Important".into(),
+            nevra: "fixture-0:99.0-2.i686".into(),
+        };
+        let affected = DnfPackageManager::affected_installed_packages(
+            [&row, &other_architecture, &row],
+            &installed,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            affected,
+            BTreeMap::from([
+                (
+                    row.nevra.clone(),
+                    vec![InstalledIdentity::from(&installed[0])]
+                ),
+                (
+                    other_architecture.nevra.clone(),
+                    vec![InstalledIdentity::from(&installed[3])],
+                ),
+            ])
+        );
         assert!(
-            DnfPackageManager::affected_installed_packages(&row, &installed[1..])
-                .await
-                .is_err()
+            DnfPackageManager::affected_installed_packages(
+                [&other_architecture, &row],
+                &installed[1..]
+            )
+            .await
+            .is_err()
         );
     }
 

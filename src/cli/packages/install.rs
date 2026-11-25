@@ -184,6 +184,10 @@ fn validate_install_targets(packages: &[String]) -> Result<()> {
         crate::core::env::distro::Distro::Arch => {
             crate::core::security::validate_package_names_or_files(packages)?;
         }
+        #[cfg(feature = "fedora")]
+        crate::core::env::distro::Distro::Fedora => {
+            crate::package_managers::DnfPackageManager::validate_install_selectors(packages)?;
+        }
         _ => {
             crate::core::security::validate_package_names(packages)?;
         }
