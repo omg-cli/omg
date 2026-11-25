@@ -98,7 +98,7 @@ Checks configured in `.github/workflows/release.yml`:
   with `npm ci` from a committed lockfile (`.github/deps/release-tools`), so
   downloaded npm packages are checked against their locked integrity hashes.
 
-The dependency SBOM is real generated output from pinned `cargo-cyclonedx`, using all Cargo features and targets. It is published with the GitHub Release and attested alongside the archives. It is not an installed-system SBOM or an exact per-platform binary dependency subset. The current R2 upload loops publish archives and checksum sidecars, not the SBOM.
+Pinned `cargo-cyclonedx` generates a CycloneDX 1.5 dependency SBOM from all Cargo features and targets. GitHub Releases publishes the SBOM and attests it alongside the archives. R2 publishes the archives and checksum sidecars. Each archive contains a platform build, and the dependency SBOM describes the combined Cargo dependency graph. [Snyk Enterprise accepts CycloneDX 1.5 for Cargo dependency scans](https://docs.snyk.io/developer-tools/snyk-cli/commands/sbom-test).
 
 GitHub Actions attestations do not by themselves establish SLSA Levels 1–3 or hardened-builder compliance. The separate `omg audit slsa` implementation does not verify these in-toto build attestations. Use the release-specific `gh attestation verify` checks instead.
 

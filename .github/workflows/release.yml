@@ -640,7 +640,7 @@ jobs:
           fi
           test -n "$VERSION"
           cargo metadata --locked --format-version 1 > /dev/null
-          cargo cyclonedx --format json --all-features --target all \
+          cargo cyclonedx --format json --spec-version 1.5 --all-features --target all \
             --override-filename "omg-v${VERSION}.cdx"
           test -s "omg-v${VERSION}.cdx.json"
           git diff --exit-code -- Cargo.lock
