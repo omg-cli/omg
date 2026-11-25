@@ -16,19 +16,22 @@ How releases are built, published, verified, and rolled back.
 
 Main pushes run CI but do not tag or publish. When a release is approved,
 confirm the candidate is the current `main` commit and that its push-triggered
-CI, Benchmark, Security Audit, Secret Scanning, CodeQL, Coverage, Docker E2E,
-and publisher archive proof have passed. Then a maintainer with repository
+CI, Benchmark, Security Audit, Secret Scanning, CodeQL, Coverage, and Docker E2E
+have passed. Then a maintainer with repository
 write access can run the **CI** workflow on `main` and fill in
 `release-candidate` with `vVERSION@FULL_COMMIT_SHA` (the Cargo.toml version,
 prefixed with `v`, and the full SHA of that exact commit). Leave the input
-blank for a nonpublishing CI dispatch.
+blank for a nonpublishing CI dispatch. Select `run-qemu` to include staged
+guest verification in the dispatch.
 
 The tag job runs only on the dispatch's first attempt. It refuses a mismatched
-candidate and still requires successful push checks for that exact SHA,
-including staged guest verification, and publisher archive proof. It checks
+candidate and requires successful push checks for that exact SHA. It checks
 the live `main` ref immediately before creating the tag and again before
 dispatching **Release** on that tag. If `main` moves after the tag is pushed,
 the tag stays immutable and Release is not dispatched.
+
+Advisory import and freshness are verified separately by the advisory service.
+OMG enforces its advisory policy during package and runtime operations.
 
 Keep `main` frozen from dispatch until **Tag Release** finishes: each live-ref
 check and the following write are separate operations, so a check cannot lock
