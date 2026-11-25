@@ -70,7 +70,7 @@ check_reason_delta() {
 
 verify_configured_installroot() {
   local root="$base/alternate-root"
-  local report="$base/alternate-report" home
+  local report="$base/alternate-report" home explicit
   local -a omg=(sudo -H -u "$guest_user" -- env OMG_DISABLE_DAEMON=1 "$binary")
   home=$(getent passwd "$guest_user" | cut -d: -f6)
   [[ "$home" == /* && "$home" != / ]] || return 1
@@ -83,6 +83,18 @@ verify_configured_installroot() {
   [[ $(rpm --root "$root" -qa --qf '%{NAME}\n') == "$package" ]]
   ! rpm -q "$package" >/dev/null 2>&1
   rpm -q rpm >/dev/null
+  # RPM installs the package payload. DNF owns its install reasons and state.
+  if ! dnf --cacheonly --assumeyes mark user "$package" > "$base/alternate-mark.log" 2>&1; then
+    cat "$base/alternate-mark.log" >&2
+    return 120
+  fi
+  if ! explicit=$(sudo -H -u "$guest_user" -- dnf --cacheonly \
+      --setopt=disable_excludes='*' repoquery --userinstalled --qf '%{name}\n') \
+    || [[ "$explicit" != "$package" ]]; then
+    printf 'Could not establish the alternate-root DNF install reason\n' >&2
+    return 120
+  fi
+  phase=product
   "${omg[@]}" --json tc | jq -e '.count == 1' > /dev/null
   "${omg[@]}" --json status --fast |
     jq -e '.total_packages == 1 and .explicit_packages == 1 and .orphan_packages == 0 and .updates_available == 0' > /dev/null
@@ -175,7 +187,6 @@ SPEC
 }
 v1=$(build_rpm 1); v2=$(build_rpm 2); v3=$(build_rpm 3)
 [[ -f "$v1" && -f "$v2" && -f "$v3" ]] || exit 120
-phase=product
 verify_configured_installroot
 phase=setup
 rpm -Uvh --nosignature "$v1" > "$base/install-v1.log" 2>&1 || { cat "$base/install-v1.log" >&2; exit 120; }
