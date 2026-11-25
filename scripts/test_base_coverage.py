@@ -69,7 +69,7 @@ class BaseCoverageTests(unittest.TestCase):
         pending = dict(completed, status="in_progress", conclusion=None)
         with patch.object(coverage, "api", side_effect=[
                 {"workflow_runs": [pending]}, {"workflow_runs": [completed]}]) as request:
-            with patch.object(time, "sleep") as sleep:
+            with patch.object(time, "monotonic", side_effect=[0, 260]), patch.object(time, "sleep") as sleep:
                 self.assertEqual(coverage.successful_base_run(SHA, 123), completed)
         sleep.assert_called_once()
         endpoint = request.call_args.args[0]

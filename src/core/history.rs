@@ -646,6 +646,8 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn failed_archive_append_restores_its_original_bytes() -> Result<()> {
+        use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
+
         const CHILD: &str = "OMG_TEST_PARTIAL_ARCHIVE_CHILD";
         if std::env::var_os(CHILD).is_none() {
             let output = std::process::Command::new("bash")
@@ -653,7 +655,7 @@ mod tests {
                     "--noprofile",
                     "--norc",
                     "-c",
-                    "trap '' XFSZ; ulimit -f 1 || exit; exec \"$@\"",
+                    "trap '' XFSZ; exec \"$@\"",
                     "archive-size-limit",
                 ])
                 .arg(std::env::current_exe()?)
@@ -663,8 +665,6 @@ mod tests {
                     "--nocapture",
                 ])
                 .env_remove("BASH_ENV")
-                // The intentional file limit must not truncate an inherited coverage profile.
-                .env("LLVM_PROFILE_FILE", "/dev/null")
                 .env(CHILD, "1")
                 .output()?;
             print!("{}", String::from_utf8_lossy(&output.stdout));
@@ -698,9 +698,18 @@ mod tests {
             manager.save(std::slice::from_ref(&transaction))?;
             let live = fs::read(&manager.log_path)?;
             fs::write(manager.archive_path(), original)?;
-            let error = manager
-                .with_history_lock(|| manager.archive_drained(&retiring))
-                .expect_err("the file-size limit must interrupt the append");
+            let saved = getrlimit(Resource::Fsize);
+            setrlimit(
+                Resource::Fsize,
+                Rlimit {
+                    current: Some(1024),
+                    maximum: saved.maximum,
+                },
+            )
+            .expect("limit writes in the disposable archive child");
+            let append = manager.with_history_lock(|| manager.archive_drained(&retiring));
+            setrlimit(Resource::Fsize, saved).expect("restore the limit before coverage flush");
+            let error = append.expect_err("the file-size limit must interrupt the append");
             assert_eq!(
                 error
                     .downcast_ref::<std::io::Error>()

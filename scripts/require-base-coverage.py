@@ -65,7 +65,7 @@ def validate_run(run, commit, event_name, workflow_id, base=False):
 def successful_base_run(commit, workflow_id):
     endpoint = (f"repos/{REPOSITORY}/actions/workflows/coverage.yml/runs"
                 f"?head_sha={commit}&branch=main&event=push&per_page=100")
-    deadline = time.monotonic() + 240
+    deadline = time.monotonic() + 300
     waiting = False
     while True:
         runs = api(endpoint)["workflow_runs"]

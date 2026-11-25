@@ -1848,6 +1848,45 @@ pub(super) mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn malformed_status_snapshot_falls_back_to_the_backend() -> anyhow::Result<()> {
+        let (directory, state) = isolated_state();
+        let cache = directory.path().join("status-cache.json");
+        std::fs::write(&cache, b"invalid snapshot")?;
+
+        assert!(matches!(
+            handle_status(state, 84).await,
+            Response::Success {
+                result: ResponseResult::Status(result),
+                ..
+            } if result.total_packages == 0 && !result.vulnerabilities_scanned
+        ));
+        assert_eq!(std::fs::read(cache)?, b"invalid snapshot");
+        Ok(())
+    }
+
+    #[test]
+    fn index_refresh_preserves_non_file_fast_status_path() -> anyhow::Result<()> {
+        let (directory, state) = isolated_state();
+        let path = directory.path().join("fast-status");
+        std::fs::create_dir(&path)?;
+        let sentinel = path.join("sentinel");
+        std::fs::write(&sentinel, b"keep")?;
+        state.remember_fast_status_path(path);
+
+        let subscriber = tracing_subscriber::fmt().with_test_writer().finish();
+        let published = tracing::subscriber::with_default(subscriber, || {
+            state.replace_index(
+                PackageIndex::from_records(&[("fresh-package", "2", "fresh snapshot")]),
+                #[cfg(feature = "arch")]
+                crate::package_managers::pacman_db::AlpmCatalogEpoch::UNIX_EPOCH,
+            )
+        });
+        assert_eq!(published, 1);
+        assert_eq!(std::fs::read(sentinel)?, b"keep");
+        Ok(())
+    }
+
     type BackendFuture<'a, T> =
         std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<T>> + Send + 'a>>;
 
