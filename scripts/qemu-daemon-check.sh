@@ -146,7 +146,9 @@ check_text_info_outputs() {
 check_backend_refusal() {
   local status=$1 stdout=$2 stderr=$3
   [[ "$status" == 1 && ! -s "$stdout" ]] &&
-    grep -Fq 'Could not load DNF install reasons: dnf repoquery --userinstalled failed: omg-injected-dnf-reason-failure' "$stderr"
+    grep -Fq 'Could not load DNF install reasons: dnf repoquery --userinstalled failed:' "$stderr" &&
+    grep -Fq 'Loading system state TOML file' "$stderr" &&
+    grep -Fq '/packages.toml' "$stderr"
 }
 # END BACKEND FAULT ORACLE
 # BEGIN BACKEND FAULT PROBE
@@ -155,15 +157,17 @@ check_fedora_reason_refusal() {
   local fixture="$state/backend-fault"
   [[ "$uid" =~ ^[0-9]+$ && "$uid" != 0 && "$gid" =~ ^[0-9]+$ ]] || return 2
   mkdir "$fixture"
-  printf '#!/bin/sh\necho omg-injected-dnf-reason-failure >&2\nexit 17\n' > "$fixture/dnf"
-  chmod 755 "$fixture/dnf"
-  # The mount is private to this process tree. Drop all capabilities and return
-  # to the guest user's identity before running the actual submitted binary.
+  # Corrupt an install-reason file in a private mount. Exercise both the
+  # direct reader and DNF's native error with the real package database.
   timeout --kill-after=5s 30s sudo -n unshare --mount --propagation private -- bash -euc '
-    chown 0:0 "$1/dnf"
-    chmod 755 "$1/dnf"
-    mount --bind "$1/dnf" /usr/bin/dnf
-    chown "$3:$4" "$1"
+    settings=$(/usr/bin/dnf --cacheonly --dump-main-config)
+    install_root=$(sed -n "s/^installroot = //p" <<< "$settings")
+    state_dir=$(sed -n "s/^system_state_dir = //p" <<< "$settings")
+    [[ "$install_root" == / && "$state_dir" == /* && "$state_dir" != / && -d "$state_dir" ]]
+    mkdir -m 0755 "$1/dnf-state"
+    printf "%s\n" "[packages" > "$1/dnf-state/packages.toml"
+    install -m 0644 /dev/null "$1/dnf-state/system-repo.lock"
+    mount --bind "$1/dnf-state" "$state_dir"
     exec setpriv --reuid="$3" --regid="$4" --clear-groups --no-new-privs \
       --bounding-set=-all --inh-caps=-all --ambient-caps=-all \
       env -i PATH=/usr/bin:/bin HOME="$1" LC_ALL=C NO_COLOR=1 \

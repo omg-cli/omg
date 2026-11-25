@@ -6,6 +6,7 @@ The arguments are the inert Fedora fixture directory and the built omg and
 omgd binaries. All RPM writes go to a disposable installroot.
 """
 from contextlib import contextmanager
+import fcntl
 import gzip
 import hashlib
 import json
@@ -321,6 +322,31 @@ with tempfile.TemporaryDirectory(prefix="omg-fedora-cache-scope-", dir="/tmp") a
                 checks.append(dict(phase=phase, case="status-ipc", passed=(after[0] - before[0], after[1] - before[1]) == (2, 0),
                                    value=(after[0] - before[0], after[1] - before[1])))
 
+    @contextmanager
+    def reject_native_selection(option):
+        target = Path(dnf).resolve(strict=True)
+        with tempfile.TemporaryDirectory(prefix="dnf-selection-", dir=root) as directory:
+            gate = Path(directory)
+            gate.chmod(0o755)
+            native_dnf = gate / target.name
+            shutil.copy2(target, native_dnf)
+            wrapper = gate / "check-native-query"
+            wrapper.write_text(f"""#!/usr/bin/bash
+for argument in "$@"; do
+    if [[ "$argument" == {shlex.quote(option)} ]]; then
+        printf '%s\\n' 'Unexpected DNF selection subprocess' >&2
+        exit 197
+    fi
+done
+exec {shlex.quote(str(native_dnf))} "$@"
+""")
+            wrapper.chmod(0o755)
+            checked(["/usr/bin/mount", "--bind", wrapper, target])
+            try:
+                yield
+            finally:
+                checked(["/usr/bin/umount", target])
+
     def inspect_security_inventory(phase, expected_count=None):
         native = ordinary_control([dnf, "--cacheonly", "--setopt=disable_excludes=*",
                                    "repoquery", "--installed", "--qf",
@@ -362,32 +388,40 @@ with tempfile.TemporaryDirectory(prefix="omg-fedora-cache-scope-", dir="/tmp") a
                                diagnostic=diagnostic))
 
         inspect("ordinary")
-        target = Path(dnf).resolve(strict=True)
-        with tempfile.TemporaryDirectory(prefix="dnf-inventory-", dir=root) as directory:
-            gate = Path(directory)
-            gate.chmod(0o755)
-            native_dnf = gate / target.name
-            shutil.copy2(target, native_dnf)
-            wrapper = gate / "detect-inventory"
-            wrapper.write_text(f"""#!/usr/bin/bash
-installed=false
-query=false
-for argument in "$@"; do
-    if [[ "$argument" == --installed ]]; then installed=true; fi
-    if [[ "$argument" == repoquery ]]; then query=true; fi
-done
-if "$installed" && "$query"; then
-    printf '%s\\n' 'Unexpected DNF inventory subprocess' >&2
-    exit 197
-fi
-exec {shlex.quote(str(native_dnf))} "$@"
-""")
-            wrapper.chmod(0o755)
-            checked(["/usr/bin/mount", "--bind", wrapper, target])
-            try:
-                inspect("without-dnf-inventory")
-            finally:
-                checked(["/usr/bin/umount", target])
+        with reject_native_selection("--installed"):
+            inspect("without-dnf-inventory")
+
+    def inspect_explicit_without_query(phase, expected=None):
+        control = ordinary_control([dnf, "--cacheonly", "--setopt=disable_excludes=*",
+                                    "repoquery", "--userinstalled", "--qf", r"%{name}\n"])
+        names = sorted(set(control.splitlines()))
+        if expected is None:
+            assert len(names) > 25, (phase, names)
+        else:
+            assert names == expected, (phase, names, expected)
+
+        with reject_native_selection("--userinstalled"):
+            for label, args, predicate in [
+                ("explicit-rust-list", ["explicit"], lambda value: value == {"count": len(names), "packages": names}),
+                ("explicit-rust-count", ["explicit", "--count"], lambda value: value == {"count": len(names)}),
+                ("explicit-rust-shortcut", ["ec"], lambda value: value == {"count": len(names)}),
+                ("status-rust-explicit", ["status", "--fast"], lambda value: value["explicit_packages"] == len(names)),
+            ]:
+                result = command([cli, "--json", *args], disabled, ordinary)
+                try:
+                    passed = result.returncode == 0 and predicate(json.loads(result.stdout))
+                except (KeyError, TypeError, ValueError):
+                    passed = False
+                checks.append(dict(phase=phase, case=label, passed=passed, status=result.returncode,
+                                   diagnostic=(result.stderr or result.stdout)[-600:]))
+
+    def inspect_explicit_refusal(phase, reason, expected_failure=None):
+        result = command([cli, "--json", "status", "--fast"], disabled, ordinary)
+        passed = (result.returncode != 0 and not result.stdout.strip()
+                  and "Could not load DNF install reasons" in result.stderr
+                  and (expected_failure is None or expected_failure in result.stderr))
+        checks.append(dict(phase=phase, case=reason, passed=passed, status=result.returncode,
+                           diagnostic=(result.stderr or result.stdout)[-850:]))
 
     def inspect_upgrade_review(old_rpm):
         # Only a disposable DNF root and a private mount receive transaction writes.
@@ -754,10 +788,58 @@ exec {shlex.quote(str(native))} "$@"
             inspect_security_inventory("inventory-alternate-empty", 0)
             checked([rpm, "--root", alternate, "-U", "--nosignature", fixture/"observer-fixture.rpm"])
             inspect_security_inventory("inventory-alternate-restored", 1)
+
             if consent_oracle is not None:
+                mark("user")
+                inspect_explicit_without_query("explicit-native-user", [package])
+                mark("dependency")
+                inspect_explicit_without_query("explicit-native-dependency", [])
+                groups = custom_state / "groups.toml"
+                packages_state = custom_state / "packages.toml"
+                initial_groups = groups.read_bytes()
+                initial_packages = packages_state.read_bytes()
+                try:
+                    packages_state.write_bytes(initial_packages.replace(b'"Dependency"', b'"Weak Dependency"'))
+                    assert packages_state.read_bytes() != initial_packages
+                    inspect_explicit_without_query("explicit-native-weak-dependency", [])
+                    packages_state.write_bytes(initial_packages)
+                    with groups.open("a") as group_file:
+                        group_file.write(f'\n[groups.omg-fixture]\nuserinstalled = false\n'
+                                         f'packages = ["{package}"]\npackage_types = ["mandatory"]\n')
+                    inspect_explicit_without_query("explicit-native-group", [package])
+                    groups.write_bytes(initial_groups)
+                    packages_state.write_text('version = "1.0"\n[packages]\n')
+                    inspect_explicit_without_query("explicit-native-external", [package])
+                    packages_state.write_text("[packages")
+                    inspect_explicit_refusal("explicit-unsupported-state", "malformed-reasons", "packages.toml")
+                    packages_state.write_bytes(initial_packages)
+                    with (custom_state / "system-repo.lock").open("r+") as lock:
+                        fcntl.lockf(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        with reject_native_selection("--userinstalled"):
+                            inspect_explicit_refusal("explicit-locked-state", "native-fallback",
+                                                     "Unexpected DNF selection subprocess")
+                    legacy_dir = alternate / "var/lib/omg-fixture-legacy"
+                    legacy_dir.mkdir()
+                    (legacy_dir / "history.sqlite").touch()
+                    legacy_config = custom_config.replace("plugins=0\n",
+                                                          "plugins=0\npersistdir=/var/lib/omg-fixture-legacy\n")
+                    config.write_text(legacy_config)
+                    (alternate / "etc/dnf/dnf.conf").write_text(legacy_config)
+                    try:
+                        with reject_native_selection("--userinstalled"):
+                            inspect_explicit_refusal("explicit-legacy-history", "native-fallback",
+                                                     "Unexpected DNF selection subprocess")
+                    finally:
+                        config.write_text(custom_config)
+                        (alternate / "etc/dnf/dnf.conf").write_text(custom_config)
+                finally:
+                    groups.write_bytes(initial_groups)
+                    packages_state.write_bytes(initial_packages)
                 inspect_upgrade_review(old_rpm)
             config.write_text(host_config)
             inspect_security_inventory("inventory-host")
+            if consent_oracle is not None:
+                inspect_explicit_without_query("explicit-native-host")
         except Exception:
             log.seek(0)
             print(log.read()[-4500:], file=sys.stderr)
@@ -772,6 +854,6 @@ assert inventory() == before
 report = dict(binaries=binaries, checks=checks, total=len(checks),
               passed=sum(entry["passed"] for entry in checks), host_unchanged=True)
 print(json.dumps(report))
-expected_checks = 264 if consent_oracle is None else 270
+expected_checks = 264 if consent_oracle is None else 297
 if report["passed"] != report["total"] or report["total"] != expected_checks:
     sys.exit(4)

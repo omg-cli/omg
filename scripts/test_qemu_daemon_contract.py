@@ -28,12 +28,15 @@ class DaemonContractTests(unittest.TestCase):
     def test_backend_refusal_requires_product_exit_cause_and_no_success_output(self):
         source = (ROOT / 'scripts/qemu-daemon-check.sh').read_text(encoding='utf-8')
         function = source.split('# BEGIN BACKEND FAULT ORACLE', 1)[-1].split('# END BACKEND FAULT ORACLE', 1)[0]
-        diagnostic = 'Error: Could not load DNF install reasons: dnf repoquery --userinstalled failed: omg-injected-dnf-reason-failure\n'
+        diagnostic = ('Error: Could not load DNF install reasons: dnf repoquery --userinstalled failed: '
+                      'Loading system state TOML file /private-dnf-state/packages.toml failed: invalid TOML\n')
         for code, stdout, stderr, passed in (
             (1, '', diagnostic, True),
             (0, '{"explicit_packages":0}\n', '', False),
             (1, '{"explicit_packages":0}\n', diagnostic, False),
             (1, '', 'permission denied\n', False),
+            (1, '', diagnostic.replace('packages.toml', 'groups.toml'), False),
+            (1, '', diagnostic.replace('Loading system state TOML file', 'Could not find'), False),
             (127, '', diagnostic, False),
             (124, '', diagnostic, False),
         ):

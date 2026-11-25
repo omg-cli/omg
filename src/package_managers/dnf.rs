@@ -28,6 +28,7 @@ use crate::package_managers::types::{
     SecurityOrigin, SecurityPackage, UpdateInfo, parse_version_or_zero,
 };
 
+mod install_reasons;
 mod rpm_database;
 
 mod repository_observation;
@@ -1145,6 +1146,13 @@ impl DnfPackageManager {
     const USER_INSTALLED_QUERY_FORMAT: &str = "%{name}\\n";
 
     pub(crate) fn read_user_installed_names() -> Result<HashSet<String>> {
+        let local = RpmDatabase::detect_with_state_dir(Path::new(HOST_SQLITE))
+            .and_then(|(location, state)| install_reasons::explicit_names(&location, &state));
+        match local {
+            Ok(names) => return Ok(names),
+            Err(error) => tracing::debug!("Direct DNF install reasons unavailable: {error:#}"),
+        }
+
         // The user-installed filter loads only the installed repository, even
         // when the system has no available repositories configured.
         let output = crate::core::privilege::system_command("dnf")?
@@ -3077,9 +3085,13 @@ impl PackageManager for DnfPackageManager {
 
     fn list_explicit(&self) -> Pin<Box<dyn Future<Output = Result<Vec<String>>> + Send + '_>> {
         Box::pin(async move {
-            let mut installed = self.load_installed_packages().await?;
-            Self::apply_current_install_reasons(&mut installed).await?;
-            Ok(Self::explicit_package_names(installed))
+            let names = tokio::task::spawn_blocking(Self::read_user_installed_names)
+                .await
+                .context("DNF install-reason worker failed")?
+                .context("Could not load DNF install reasons")?;
+            let mut names: Vec<_> = names.into_iter().collect();
+            names.sort_unstable();
+            Ok(names)
         })
     }
 
