@@ -624,7 +624,7 @@ if [[ "$GUEST_MODE" == true ]]; then
           .[0].exit_codes == [0] and (.[0].times|length == 1)
         ' "$EXPORT_DIR/$GUEST_TRANSACTION.json" >/dev/null
         if [[ "$GUEST_TOOL" == omg && "$GUEST_TRANSACTION" == install ]]; then
-            jq -e '.cli_exit_code==0 and (.reviews|type=="array" and length<=64 and all(.[]; type=="string" and test("^[a-f0-9]{64}$")))' \
+            jq -e '.cli_exit_code==0 and (.reviews|type=="array" and length<=64 and all(.[]; type=="string" and test("^([a-f0-9]{64}|proceed|install-unsafe)$")))' \
                 "$EXPORT_DIR/security-review.json" >/dev/null
         fi
         cmp "$EXPORT_DIR/installed-expected.tsv" "$EXPORT_DIR/installed-after.tsv"

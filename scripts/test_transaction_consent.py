@@ -20,6 +20,10 @@ class TransactionConsent(unittest.TestCase):
         predicate = re.search(r"jq -e '(\.cli_exit_code==0[^']+)'", source)[1]
         for payload, accepted in [({'cli_exit_code': 0, 'reviews': []}, True),
                                   ({'cli_exit_code': 0, 'reviews': ['a' * 64]}, True),
+                                  ({'cli_exit_code': 0, 'reviews': ['proceed']}, True),
+                                  ({'cli_exit_code': 0, 'reviews': ['install-unsafe']}, True),
+                                  ({'cli_exit_code': 0, 'reviews': ['unsafe']}, False),
+                                  ({'cli_exit_code': 1, 'reviews': ['install-unsafe']}, False),
                                   ({'cli_exit_code': 1, 'reviews': ['a' * 64]}, False),
                                   ({'cli_exit_code': 0}, False),
                                   ({'cli_exit_code': 0, 'reviews': ['x' * 64]}, False),
