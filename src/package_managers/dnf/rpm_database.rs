@@ -127,8 +127,14 @@ fn can_configure_paths(path: &Path, include_state_dir: bool) -> bool {
 }
 
 pub(super) fn read_path_settings() -> Result<String> {
+    read_dnf_settings(&[])
+}
+
+pub(super) fn read_dnf_settings(options: &[&str]) -> Result<String> {
     let output = system_command("dnf")?
+        .env("LC_ALL", "C")
         .args(["--cacheonly", "--dump-main-config"])
+        .args(options)
         .stdin(std::process::Stdio::null())
         .output()
         .context("Could not read the effective DNF configuration")?;

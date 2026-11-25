@@ -9,15 +9,16 @@ use sha2::{Digest, Sha256};
 
 use super::RpmFileIdentity;
 use super::rpm_database::{
-    CONFIG_DROP_INS, PLUGIN_CONFIGS, parse_absolute_setting, read_path_settings, reported_setting,
+    CONFIG_DROP_INS, PLUGIN_CONFIGS, parse_absolute_setting, read_dnf_settings, reported_setting,
     rooted_path,
 };
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, PartialEq, Eq)]
 struct RepositoryPaths {
     files: Vec<PathBuf>,
     directories: Vec<(PathBuf, Option<&'static str>)>,
     caches: Vec<PathBuf>,
+    observe_expiration: bool,
 }
 
 pub(super) struct RepositoryObservation {
@@ -27,7 +28,10 @@ pub(super) struct RepositoryObservation {
 
 impl RepositoryObservation {
     pub(super) fn capture(root: &Path) -> Result<Self> {
-        let paths = ResolvedRepositoryPaths::capture(root)?.paths;
+        let mut paths = ResolvedRepositoryPaths::capture(root)?.paths;
+        // Package searches use DNF's normal refresh policy. Cache-only
+        // status queries still use the present metadata after expiration.
+        paths.observe_expiration = true;
         let fingerprint = paths.fingerprint()?;
         Ok(Self { paths, fingerprint })
     }
@@ -39,36 +43,26 @@ impl RepositoryObservation {
 
 struct ResolvedRepositoryPaths {
     root: PathBuf,
-    controls: RepositoryPaths,
     control_revision: [u8; 32],
     paths: RepositoryPaths,
 }
 
 impl ResolvedRepositoryPaths {
     fn capture(root: &Path) -> Result<Self> {
-        let controls = RepositoryPaths::controls(root)?;
-        let control_revision = controls.fingerprint()?;
-        let settings = read_path_settings()?;
+        let paths = RepositoryPaths::effective(root)?;
+        let control_revision = paths.configuration_fingerprint()?;
+        // The first native dump discovers custom configuration directories.
+        // Resolve again within the observed configuration generation.
         anyhow::ensure!(
-            parse_absolute_setting(&settings, "installroot")? == root,
-            "DNF installroot changed while resolving repository paths"
-        );
-        let mut paths = controls.clone();
-        paths.add_effective_paths(root, &settings)?;
-        anyhow::ensure!(
-            controls.fingerprint()? == control_revision,
+            paths == RepositoryPaths::effective(root)?
+                && paths.configuration_fingerprint()? == control_revision,
             "DNF configuration changed while resolving repository paths"
         );
         Ok(Self {
             root: root.to_path_buf(),
-            controls,
             control_revision,
             paths,
         })
-    }
-
-    fn current_for(&self, root: &Path) -> Result<bool> {
-        Ok(self.root == root && self.controls.fingerprint()? == self.control_revision)
     }
 }
 
@@ -81,19 +75,37 @@ pub(crate) struct StatusRepositories {
 impl StatusRepositories {
     pub(super) fn package_revision(&mut self, root: &Path) -> Result<[u8; 32]> {
         if let Some(paths) = &self.paths
-            && paths.current_for(root)?
+            && paths.root == root
         {
-            return paths.paths.fingerprint();
+            let controls = paths.paths.configuration_fingerprint()?;
+            if controls == paths.control_revision {
+                return paths.paths.catalog_fingerprint(controls);
+            }
         }
 
         let paths = ResolvedRepositoryPaths::capture(root)?;
-        let revision = paths.paths.fingerprint()?;
+        let revision = paths.paths.catalog_fingerprint(paths.control_revision)?;
         self.paths = Some(paths);
         Ok(revision)
     }
 }
 
 impl RepositoryPaths {
+    fn effective(root: &Path) -> Result<Self> {
+        let report = read_dnf_settings(&["--dump-repo-config=*"])?;
+        let (main, cache_paths) = repository_cache_paths(&report)?;
+        anyhow::ensure!(
+            parse_absolute_setting(main, "installroot")? == root,
+            "DNF installroot changed while resolving repository paths"
+        );
+        let mut paths = Self::controls(root)?;
+        paths.add_effective_paths(root, main)?;
+        paths.caches.extend(cache_paths);
+        paths.caches.sort_unstable();
+        paths.caches.dedup();
+        Ok(paths)
+    }
+
     fn controls(root: &Path) -> Result<Self> {
         let mut paths = Self::default();
         for prefix in [Path::new("/"), root] {
@@ -162,7 +174,7 @@ impl RepositoryPaths {
         Ok(())
     }
 
-    fn fingerprint(&self) -> Result<[u8; 32]> {
+    fn configuration_fingerprint(&self) -> Result<[u8; 32]> {
         let mut files = self.files.clone();
         let mut directories: Vec<_> = self.directories.iter().collect();
         directories.sort_unstable();
@@ -180,52 +192,107 @@ impl RepositoryPaths {
                 }
             }
         }
-        let mut caches: Vec<_> = self.caches.iter().collect();
-        caches.sort_unstable();
-        caches.dedup();
-        for directory in caches {
-            files.extend(cached_manifests(directory)?);
-        }
-        files.sort_unstable();
-        files.dedup();
-        let mut hash = Sha256::new();
-        hash.update(b"OMG DNF repository catalog v1\0");
-        for path in files {
-            match RpmFileIdentity::read(&path) {
-                Ok(Some(identity)) => {
-                    hash.update([1]);
-                    hash.update(path.as_os_str().as_encoded_bytes());
-                    hash.update([0]);
-                    identity.hash_generation(&mut hash, true);
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    return Err(error).with_context(|| {
-                        format!("Cannot observe DNF repository input {}", path.display())
-                    });
+        fingerprint_files(files)
+    }
+
+    fn catalog_fingerprint(&self, controls: [u8; 32]) -> Result<[u8; 32]> {
+        let mut files = Vec::new();
+        for directory in &self.caches {
+            for repository in cached_repositories(directory)? {
+                files.push(repository.join("repodata/repomd.xml"));
+                if self.observe_expiration {
+                    files.push(repository.join("attrs/expired"));
                 }
             }
         }
+        let mut hash = Sha256::new();
+        hash.update(b"OMG DNF repository catalog v2\\0");
+        hash.update(controls);
+        hash.update(fingerprint_files(files)?);
         Ok(hash.finalize().into())
+    }
+
+    fn fingerprint(&self) -> Result<[u8; 32]> {
+        self.catalog_fingerprint(self.configuration_fingerprint()?)
     }
 }
 
-fn cached_manifests(directory: &Path) -> Result<Vec<PathBuf>> {
-    let mut manifests = Vec::new();
+fn fingerprint_files(mut files: Vec<PathBuf>) -> Result<[u8; 32]> {
+    files.sort_unstable();
+    files.dedup();
+    let mut hash = Sha256::new();
+    hash.update(b"OMG DNF observed inputs v1\\0");
+    for path in files {
+        match RpmFileIdentity::read(&path) {
+            Ok(Some(identity)) => {
+                hash.update([1]);
+                hash.update(path.as_os_str().as_encoded_bytes());
+                hash.update([0]);
+                identity.hash_generation(&mut hash, true);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("Cannot observe DNF repository input {}", path.display())
+                });
+            }
+        }
+    }
+    Ok(hash.finalize().into())
+}
+
+fn repository_cache_paths(report: &str) -> Result<(&str, Vec<PathBuf>)> {
+    let report = report
+        .strip_prefix("======== Main configuration: ========\n")
+        .context("DNF did not report the main repository configuration")?;
+    let mut sections = report.split("\n======== ");
+    let main = sections
+        .next()
+        .context("DNF main configuration is missing")?;
+    let mut caches = Vec::new();
+    for section in sections {
+        let (header, settings) = section
+            .split_once('\n')
+            .context("Incomplete DNF repository configuration section")?;
+        let id = header
+            .strip_prefix('"')
+            .and_then(|name| name.strip_suffix("\" repository configuration: ========"))
+            .context("Unexpected DNF repository configuration section")?;
+        anyhow::ensure!(
+            !id.is_empty()
+                && id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"-_.:".contains(&byte)),
+            "DNF reported an invalid repository ID"
+        );
+        match reported_setting(settings, "enabled")? {
+            "1" => caches.push(parse_absolute_setting(settings, "cachedir")?),
+            "0" => {}
+            _ => anyhow::bail!("DNF reported an invalid repository enabled flag"),
+        }
+    }
+    Ok((main, caches))
+}
+
+fn cached_repositories(directory: &Path) -> Result<Vec<PathBuf>> {
+    let mut repositories = Vec::new();
     for entry in directory_entries(directory)?.into_iter().flatten() {
         let entry = entry?;
         let kind = entry.file_type()?;
         if kind.is_dir() || kind.is_symlink() {
-            manifests.push(entry.path().join("repodata/repomd.xml"));
+            repositories.push(entry.path());
         }
     }
-    Ok(manifests)
+    Ok(repositories)
 }
 
 pub(super) fn advisory_revision(cache: &Path) -> Result<[u8; 32]> {
     const MAX_MANIFEST_BYTES: usize = 8 * 1024 * 1024;
 
-    let mut manifests = cached_manifests(cache)?;
+    let mut manifests: Vec<_> = cached_repositories(cache)?
+        .into_iter()
+        .map(|repository| repository.join("repodata/repomd.xml"))
+        .collect();
     manifests.sort_unstable();
     let mut hash = Sha256::new();
     hash.update(b"OMG DNF advisory manifests v1\0");
@@ -319,6 +386,20 @@ mod tests {
         fs::create_dir(repository.join("solv"))?;
         fs::write(repository.join("solv/fixture.solv"), "generated")?;
         assert!(observed.is_current()?);
+
+        let mut catalog_paths = observed.paths.clone();
+        catalog_paths.observe_expiration = true;
+        let catalog = RepositoryObservation {
+            fingerprint: catalog_paths.fingerprint()?,
+            paths: catalog_paths,
+        };
+        let expired = repository.join("attrs/expired");
+        fs::create_dir(expired.parent().context("expiration marker parent")?)?;
+        fs::write(&expired, [])?;
+        assert!(!catalog.is_current()?);
+        assert!(observed.is_current()?);
+        fs::remove_file(expired)?;
+        assert!(catalog.is_current()?);
 
         fs::write(&policy, "enabled=0\n")?;
         assert!(!observed.is_current()?);
