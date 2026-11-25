@@ -22,6 +22,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
+use crate::cli::modern_ui::OutputMode;
 use crate::core::{Package, PackageSource, is_root};
 use crate::package_managers::PackageManager;
 use crate::package_managers::types::{UpdateInfo, parse_version_or_zero};
@@ -375,6 +376,7 @@ enum DnfAdmission<'a> {
         comment: Option<&'a str>,
         yes: bool,
         dry_run: bool,
+        output: OutputMode,
     },
 }
 
@@ -759,9 +761,15 @@ impl DnfPackageManager {
         } else {
             "--confirm"
         };
+        let output = match crate::cli::modern_ui::output_mode() {
+            OutputMode::Quiet => Some("--quiet"),
+            OutputMode::Verbose => Some("--verbose"),
+            OutputMode::Plain | OutputMode::Interactive => None,
+        };
         let operation = |comment: Option<String>| async move {
             let mut args: Vec<_> = comment.into_iter().collect();
             args.extend(["remove".to_owned(), mode.to_owned()]);
+            args.extend(output.map(str::to_owned));
             args.extend_from_slice(packages);
             crate::core::privilege::run_privileged_dnf(&args).await
         };
@@ -2097,6 +2105,11 @@ impl DnfPackageManager {
             "Cached metadata mode is only supported for upgrades"
         );
         if action == "remove" {
+            let (output, packages) = match packages {
+                [flag, rest @ ..] if flag == "--quiet" => (OutputMode::Quiet, rest),
+                [flag, rest @ ..] if flag == "--verbose" => (OutputMode::Verbose, rest),
+                _ => (OutputMode::Plain, packages),
+            };
             anyhow::ensure!(!packages.is_empty(), "Remove requires package operands");
             let (yes, dry_run) = match mode.as_str() {
                 "-y" => (true, false),
@@ -2110,6 +2123,7 @@ impl DnfPackageManager {
                 comment: correlation,
                 yes,
                 dry_run,
+                output,
             });
         }
         anyhow::ensure!(
@@ -2143,7 +2157,12 @@ impl DnfPackageManager {
                 comment,
                 yes,
                 dry_run,
+                output,
             } => {
+                crate::cli::modern_ui::configure_output(
+                    u8::from(output == OutputMode::Verbose),
+                    output == OutputMode::Quiet,
+                );
                 let Some(plan) =
                     crate::cli::packages::review_fedora_removal(packages, yes, dry_run).await?
                 else {
@@ -3068,7 +3087,9 @@ mod tests {
             vec!["install", "-y", "example"],
             vec!["install", "-y", "example-2:1.0~rc1-1.fc44.x86_64"],
             vec!["remove", "--dry-run", "example"],
+            vec!["remove", "--dry-run", "--quiet", "example"],
             vec!["remove", "--confirm", "example"],
+            vec!["remove", "--confirm", "--verbose", "example"],
             vec!["remove", "-y", "example"],
             vec![
                 "--comment=omg-550e8400-e29b-41d4-a716-446655440000",
@@ -3096,6 +3117,8 @@ mod tests {
             vec!["install", "-y", "/tmp/local.rpm"],
             vec!["install", "-y", "example-2:1.0-1.fc44.rpm"],
             vec!["remove", "-y"],
+            vec!["remove", "-y", "--quiet"],
+            vec!["remove", "-y", "--quiet", "--verbose", "example"],
             vec!["remove", "--confirm", "/tmp/caller-plan"],
             vec!["remove", "--dry-run", "--installroot=/tmp/root"],
             vec!["--setopt=cacheonly=metadata", "remove", "-y", "example"],
