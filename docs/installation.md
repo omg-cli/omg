@@ -159,6 +159,8 @@ Use the toolchain pinned in `rust-toolchain.toml`, currently Rust 1.95.0. Build 
 
 The installer's own source-build path (`bash ./install.sh --from-source`) checks for `git`, `cargo`, `pkg-config`, and `gcc`, and additionally requires the `libarchive` and `openssl` development libraries on Arch. Install those through your platform's package tool first.
 
+From a reviewed checkout, `make install` builds for your detected platform and installs `omg` and `omgd` to `~/.local/bin`. This target assumes the build prerequisites are already installed and only installs the executables.
+
 From a reviewed checkout, select exactly one backend:
 
 ```bash

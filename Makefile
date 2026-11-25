@@ -71,13 +71,7 @@ release:
 
 # Install to ~/.local/bin
 install:
-	@set -eu; \
-	host="$$(rustc --print host-tuple)"; \
-	target_dir="$${CARGO_TARGET_DIR:-target}"; \
-	cargo build --release --features arch --target "$$host" --target-dir "$$target_dir"; \
-	mkdir -p "$$HOME/.local/bin"; \
-	cp "$$target_dir/$$host/release/omg" "$$target_dir/$$host/release/omgd" "$$HOME/.local/bin/"
-	@echo "✓ Installed omg and omgd to ~/.local/bin"
+	@INSTALL_DIR="$$HOME/.local/bin" OMG_UNINSTALL=0 bash ./install.sh --from-source --binaries-only
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Testing

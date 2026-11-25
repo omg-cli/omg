@@ -115,6 +115,10 @@ if [[ -n "$SCRIPT_SOURCE" && -f "$SCRIPT_SOURCE" ]]; then
   SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_SOURCE")" && pwd)"
 fi
 IS_SOURCE_INSTALL=false
+SOURCE_BINARIES_ONLY=false
+if [[ "${1:-}" == "--from-source" && "${2:-}" == "--binaries-only" ]]; then
+  SOURCE_BINARIES_ONLY=true
+fi
 if [[ "${1:-}" == "--from-source" && -n "$SCRIPT_DIR" && -f "$SCRIPT_DIR/Cargo.toml" ]]; then
   if grep -q 'name = "omg"' "$SCRIPT_DIR/Cargo.toml" 2>/dev/null; then
     IS_SOURCE_INSTALL=true
@@ -954,17 +958,14 @@ build_omg() {
   host_target=$(rustc --print host-tuple) || return 1
   target_dir="${CARGO_TARGET_DIR:-target}"
   info "Build features: ${cargo_features}"
-  export RUSTFLAGS="-C target-cpu=native"
-  start_spinner "Compiling binary (release)"
+  if [[ "$SOURCE_BINARIES_ONLY" == false && -z "${RUSTFLAGS+x}" && -z "${CARGO_ENCODED_RUSTFLAGS+x}" ]]; then
+    export RUSTFLAGS="-C target-cpu=native"
+  fi
+  info "Compiling binary (release)"
   # shellcheck disable=SC2086
-  if cargo build --release --quiet --target "$host_target" --target-dir "$target_dir" ${cargo_features} >/dev/null 2>&1; then
-    stop_spinner "Build successful"
-  else
-    fail_spinner "Build failed"
-    printf "\n${RED}Build output:${RESET}\n"
-    # shellcheck disable=SC2086
-    cargo build --release --target "$host_target" --target-dir "$target_dir" ${cargo_features}
-    exit 1
+  if ! cargo build --locked --release --target "$host_target" --target-dir "$target_dir" ${cargo_features}; then
+    warn "Build failed"
+    return 1
   fi
 
   # Install
@@ -1257,10 +1258,16 @@ fi
 main() {
   print_banner
   validate_install_dir_path
-  if [[ "$IS_SOURCE_INSTALL" == "true" ]]; then
+  if [[ "${1:-}" == "--from-source" ]]; then
+    [[ "$IS_SOURCE_INSTALL" == true ]] || error "--from-source requires an OMG source checkout"
     check_platform
-    check_dependencies
+    if [[ "$SOURCE_BINARIES_ONLY" == false ]]; then
+      check_dependencies
+    fi
     build_omg || error "Source build or installation failed"
+    if [[ "$SOURCE_BINARIES_ONLY" == true ]]; then
+      return 0
+    fi
   else
     install_from_release || error "No verified prebuilt release is available; refusing unverified installation or source fallback"
   fi
@@ -1270,4 +1277,4 @@ main() {
   finish
 }
 
-main
+main "$@"

@@ -61,6 +61,7 @@ EOF
   build_omg
   grep -qx 'fresh omg' "$INSTALL_DIR/omg" || fail 'source installer copied a stale binary'
   grep -qx 'fresh omgd' "$INSTALL_DIR/omgd" || fail 'source installer copied a stale daemon'
+  cp "$repo_root/install.sh" "$repo_root/Cargo.toml" "$work/project/"
   make -f "$repo_root/Makefile" install >/dev/null
   grep -qx 'fresh omg' "$HOME/.local/bin/omg" || fail 'make install copied a stale binary'
   grep -qx 'fresh omgd' "$HOME/.local/bin/omgd" || fail 'make install copied a stale daemon'
