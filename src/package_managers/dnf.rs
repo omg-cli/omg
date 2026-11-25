@@ -61,7 +61,7 @@ pub struct DnfPackageManager {
 #[derive(Debug)]
 struct InstalledSnapshot {
     observation: RpmDatabaseObservation,
-    packages: HashMap<String, Vec<InstalledPackage>>,
+    packages: Arc<Vec<InstalledPackage>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -259,7 +259,6 @@ struct InstalledPackage {
     release: String,
     architecture: String,
     summary: String,
-    reason: InstallReason,
 }
 
 impl InstalledPackage {
@@ -287,6 +286,16 @@ impl InstalledPackage {
                     "{}-0:{}-{}.{}",
                     self.name, self.version, self.release, self.architecture
                 ) == selector)
+    }
+
+    fn as_package(&self) -> Package {
+        Package {
+            name: self.identity(),
+            version: parse_version_or_zero(&format!("{}-{}", self.version, self.release)),
+            description: self.summary.clone(),
+            source: PackageSource::Official,
+            installed: true,
+        }
     }
 }
 
@@ -412,13 +421,6 @@ impl VersionedPackage {
             self.name, self.version, self.architecture
         )
     }
-}
-
-/// Why a package was installed
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum InstallReason {
-    User,
-    Dependency,
 }
 
 struct PlannedDnfAdvisories;
@@ -758,16 +760,16 @@ impl DnfPackageManager {
         *self.cache_write() = None;
     }
 
-    fn cached_installed_packages(&self) -> Option<Vec<InstalledPackage>> {
+    fn cached_installed_packages(&self) -> Option<Arc<Vec<InstalledPackage>>> {
         self.cache_read()
             .as_ref()
             .filter(|snapshot| snapshot.observation.is_current(&self.rpm_db_path))
-            .map(|snapshot| snapshot.packages.values().flatten().cloned().collect())
+            .map(|snapshot| Arc::clone(&snapshot.packages))
     }
 
     fn publish_installed_packages(
         &self,
-        packages: &[InstalledPackage],
+        packages: Arc<Vec<InstalledPackage>>,
         observed_identity: Option<RpmDatabaseObservation>,
     ) {
         // Never label an old read with a newer generation, or cache a CLI
@@ -775,49 +777,30 @@ impl DnfPackageManager {
         // are valid snapshots too.
         let snapshot = observed_identity
             .filter(|observation| observation.is_current(&self.rpm_db_path))
-            .map(|observation| {
-                let mut grouped: HashMap<String, Vec<InstalledPackage>> = HashMap::new();
-                for package in packages {
-                    grouped
-                        .entry(package.name.clone())
-                        .or_default()
-                        .push(package.clone());
-                }
-                InstalledSnapshot {
-                    observation,
-                    packages: grouped,
-                }
+            .map(|observation| InstalledSnapshot {
+                observation,
+                packages,
             });
         *self.cache_write() = snapshot;
-    }
-
-    fn apply_install_reasons(
-        packages: &mut [InstalledPackage],
-        user_installed: Result<HashSet<String>>,
-    ) -> Result<()> {
-        let user_installed = user_installed.context("Could not load DNF install reasons")?;
-        for package in packages {
-            package.reason = if user_installed.contains(&package.name) {
-                InstallReason::User
-            } else {
-                InstallReason::Dependency
-            };
-        }
-        Ok(())
     }
 
     /// DNF reports install reasons by package name, while RPM can retain
     /// multiple installed versions of the same name (notably kernels).
     /// Explicit-package APIs are name inventories, so collapse those parallel
     /// versions before returning a listing or count.
-    fn explicit_package_names(packages: impl IntoIterator<Item = InstalledPackage>) -> Vec<String> {
-        packages
-            .into_iter()
-            .filter(|package| package.reason == InstallReason::User)
-            .map(|package| package.name)
+    fn explicit_package_names(
+        packages: &[InstalledPackage],
+        user_installed: Result<HashSet<String>>,
+    ) -> Result<Vec<String>> {
+        let user_installed = user_installed.context("Could not load DNF install reasons")?;
+        Ok(packages
+            .iter()
+            .map(|package| package.name.as_str())
+            .filter(|name| user_installed.contains(*name))
             .collect::<BTreeSet<_>>()
             .into_iter()
-            .collect()
+            .map(str::to_owned)
+            .collect())
     }
 
     /// Count installed RPM entries without querying DNF repositories.
@@ -832,17 +815,18 @@ impl DnfPackageManager {
     ///
     /// Reads directly from `/var/lib/rpm/rpmdb.sqlite` and parses RPM header blobs
     /// to extract package metadata. Caches results in memory for subsequent calls.
-    async fn load_installed_packages(&self) -> Result<Vec<InstalledPackage>> {
+    async fn load_installed_packages(&self) -> Result<Arc<Vec<InstalledPackage>>> {
         let manager = self.cache_handle();
         tokio::task::spawn_blocking(move || manager.load_installed_packages_blocking()).await?
     }
 
-    fn load_installed_packages_blocking(&self) -> Result<Vec<InstalledPackage>> {
+    fn load_installed_packages_blocking(&self) -> Result<Arc<Vec<InstalledPackage>>> {
         if let Some(cached) = self.cached_installed_packages() {
             return Ok(cached);
         }
         let (packages, identity) = Self::read_rpm_database(&self.rpm_db_path)?;
-        self.publish_installed_packages(&packages, identity);
+        let packages = Arc::new(packages);
+        self.publish_installed_packages(Arc::clone(&packages), identity);
         Ok(packages)
     }
 
@@ -858,8 +842,9 @@ impl DnfPackageManager {
         }
         Ok(self
             .load_installed_packages_blocking()?
-            .into_iter()
+            .iter()
             .filter(|package| package.matches_selector(selector))
+            .cloned()
             .collect())
     }
 
@@ -898,11 +883,11 @@ impl DnfPackageManager {
         Ok(packages)
     }
 
-    async fn apply_current_install_reasons(packages: &mut [InstalledPackage]) -> Result<()> {
+    async fn current_explicit_package_names(packages: &[InstalledPackage]) -> Result<Vec<String>> {
         let user_installed = tokio::task::spawn_blocking(Self::read_user_installed_names)
             .await
             .context("DNF install-reason worker failed")?;
-        Self::apply_install_reasons(packages, user_installed)
+        Self::explicit_package_names(packages, user_installed)
     }
 
     /// Read RPM database, trying `SQLite` first then falling back to subprocess
@@ -1038,8 +1023,6 @@ impl DnfPackageManager {
             release: fields[2].to_string(),
             architecture,
             summary: fields[3].to_string(),
-            // Install reasons are populated separately from DNF's state.
-            reason: InstallReason::Dependency,
         })
     }
 
@@ -1220,7 +1203,6 @@ impl DnfPackageManager {
             release,
             architecture,
             summary: get_string(rpm_tags::SUMMARY),
-            reason: InstallReason::Dependency,
         })
     }
 
@@ -1241,7 +1223,7 @@ impl DnfPackageManager {
     fn read_rpm_sqlite_connection(conn: &Connection) -> Result<Vec<InstalledPackage>> {
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
 
-        let mut stmt = conn.prepare("SELECT blob FROM Packages")?;
+        let mut stmt = conn.prepare("SELECT blob FROM Packages ORDER BY hnum")?;
         let mut packages = Vec::with_capacity(2048);
 
         let mut rows = stmt.query([])?;
@@ -1319,20 +1301,8 @@ impl DnfPackageManager {
         Ok(candidates.pop())
     }
 
-    fn search_candidates(
-        installed: Vec<InstalledPackage>,
-        available: Vec<Package>,
-    ) -> Vec<Package> {
-        let mut candidates: Vec<_> = installed
-            .into_iter()
-            .map(|pkg| Package {
-                name: pkg.identity(),
-                version: parse_version_or_zero(&format!("{}-{}", pkg.version, pkg.release)),
-                description: pkg.summary,
-                source: PackageSource::Official,
-                installed: true,
-            })
-            .collect();
+    fn search_candidates(installed: &[InstalledPackage], available: Vec<Package>) -> Vec<Package> {
+        let mut candidates: Vec<_> = installed.iter().map(InstalledPackage::as_package).collect();
         candidates.extend(available);
         candidates
     }
@@ -2629,7 +2599,7 @@ impl PackageManager for DnfPackageManager {
         Box::pin(async move {
             let installed = self.load_installed_packages().await?;
             let available = Self::available_packages(None).await?;
-            Ok(Self::search_candidates(installed, available))
+            Ok(Self::search_candidates(&installed, available))
         })
     }
 
@@ -2728,16 +2698,7 @@ impl PackageManager for DnfPackageManager {
         Box::pin(async move {
             let installed = self.load_installed_packages().await?;
 
-            Ok(installed
-                .into_iter()
-                .map(|pkg| Package {
-                    name: pkg.identity(),
-                    version: parse_version_or_zero(&format!("{}-{}", pkg.version, pkg.release)),
-                    description: pkg.summary,
-                    source: PackageSource::Official,
-                    installed: true,
-                })
-                .collect())
+            Ok(installed.iter().map(InstalledPackage::as_package).collect())
         })
     }
 
@@ -2746,10 +2707,11 @@ impl PackageManager for DnfPackageManager {
         fast: bool,
     ) -> Pin<Box<dyn Future<Output = Result<(usize, usize, usize, usize)>> + Send + '_>> {
         Box::pin(async move {
-            let mut installed = self.load_installed_packages().await?;
-            Self::apply_current_install_reasons(&mut installed).await?;
+            let installed = self.load_installed_packages().await?;
             let total = installed.len();
-            let explicit = Self::explicit_package_names(installed).len();
+            let explicit = Self::current_explicit_package_names(&installed)
+                .await?
+                .len();
 
             let (orphans, updates) = if fast {
                 (0, 0)
@@ -2766,9 +2728,8 @@ impl PackageManager for DnfPackageManager {
 
     fn list_explicit(&self) -> Pin<Box<dyn Future<Output = Result<Vec<String>>> + Send + '_>> {
         Box::pin(async move {
-            let mut installed = self.load_installed_packages().await?;
-            Self::apply_current_install_reasons(&mut installed).await?;
-            Ok(Self::explicit_package_names(installed))
+            let installed = self.load_installed_packages().await?;
+            Self::current_explicit_package_names(&installed).await
         })
     }
 
@@ -3883,7 +3844,6 @@ mod tests {
                     version: "1".to_owned(),
                     release: "1".to_owned(),
                     summary: "Installed summary".to_owned(),
-                    reason: InstallReason::Dependency,
                 }
             });
         let available = DnfPackageManager::parse_available_packages(
@@ -3892,7 +3852,7 @@ mod tests {
               widget.lib.i686\t2-1\tRepository keyword\n",
         )
         .expect("valid repository rows");
-        DnfPackageManager::search_candidates(Vec::from(installed), available)
+        DnfPackageManager::search_candidates(&installed, available)
     }
 
     #[test]
@@ -4828,17 +4788,16 @@ mod tests {
 
     #[test]
     fn install_reason_failure_preserves_the_rpm_inventory() {
-        let mut packages = vec![InstalledPackage {
+        let packages = [InstalledPackage {
             name: "bash".to_string(),
             version: "5.2".to_string(),
             release: "1.fc42".to_string(),
             architecture: "x86_64".to_string(),
             summary: "GNU shell".to_string(),
-            reason: InstallReason::Dependency,
         }];
 
-        let error = DnfPackageManager::apply_install_reasons(
-            &mut packages,
+        let error = DnfPackageManager::explicit_package_names(
+            &packages,
             Err(anyhow::anyhow!("repoquery unavailable")),
         )
         .expect_err(
@@ -4847,25 +4806,20 @@ mod tests {
         assert!(format!("{error:#}").contains("repoquery unavailable"));
 
         assert_eq!(packages.len(), 1);
-        assert_eq!(packages[0].reason, InstallReason::Dependency);
         assert_eq!(packages[0].name, "bash");
         assert_eq!(packages[0].version, "5.2");
         assert_eq!(packages[0].release, "1.fc42");
         assert_eq!(packages[0].summary, "GNU shell");
 
-        // A successful empty set is different from an unavailable query.
-        // A later successful observation must still be able to update reasons.
-        DnfPackageManager::apply_install_reasons(
-            &mut packages,
-            Ok(HashSet::from([
-                "bash".to_string(),
-                "not-installed".to_string(),
-            ])),
+        let explicit = DnfPackageManager::explicit_package_names(
+            &packages,
+            Ok(HashSet::from(["bash".into(), "not-installed".into()])),
         )
         .unwrap();
-        assert_eq!(packages[0].reason, InstallReason::User);
-        DnfPackageManager::apply_install_reasons(&mut packages, Ok(HashSet::new())).unwrap();
-        assert_eq!(packages[0].reason, InstallReason::Dependency);
+        assert_eq!(explicit, ["bash"]);
+        let explicit =
+            DnfPackageManager::explicit_package_names(&packages, Ok(HashSet::new())).unwrap();
+        assert!(explicit.is_empty());
     }
 
     #[tokio::test]
@@ -4886,6 +4840,32 @@ mod tests {
         );
         assert!(!manager.is_installed_fast("publicsuffix-list-dafsa")?);
         assert!(manager.list_installed().await?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn installed_inventory_preserves_database_order_across_cache_hits() -> Result<()> {
+        let first = named_rpm_header("first");
+        let middle = named_rpm_header("middle");
+        let last = rpm_string_header([
+            (rpm_tags::NAME, "first"),
+            (rpm_tags::VERSION, "1.0"),
+            (rpm_tags::RELEASE, "1.fc44"),
+            (rpm_tags::ARCH, "i686"),
+        ]);
+        let directory = write_packages_db(&[&first, &middle, &last]);
+        let mut manager = DnfPackageManager::new();
+        manager.rpm_db_path = directory.path().join("rpmdb.sqlite");
+
+        for _ in 0..2 {
+            let names: Vec<_> = manager
+                .list_installed()
+                .await?
+                .into_iter()
+                .map(|package| package.name)
+                .collect();
+            assert_eq!(names, ["first.noarch", "middle.noarch", "first.i686"]);
+        }
         Ok(())
     }
 
@@ -5022,9 +5002,10 @@ mod tests {
         // and publication, the original observer must reject the old inventory.
         observed.as_mut().expect("database observer").identity =
             RpmDatabaseIdentity::read(&manager.rpm_db_path).expect("database identity");
-        manager.publish_installed_packages(&packages, observed);
+        let packages = Arc::new(packages);
+        manager.publish_installed_packages(Arc::clone(&packages), observed);
         assert!(manager.cached_installed_packages().is_none());
-        manager.publish_installed_packages(&packages, None);
+        manager.publish_installed_packages(packages, None);
         assert!(manager.cached_installed_packages().is_none());
         Ok(())
     }
@@ -5074,12 +5055,12 @@ mod tests {
                 release: "1.fc42".to_string(),
                 architecture: architecture.to_string(),
                 summary: "C library".to_string(),
-                reason: InstallReason::Dependency,
             })
             .collect();
 
-        manager.publish_installed_packages(&packages, identity.clone());
-        manager.publish_installed_packages(&packages, identity);
+        let packages = Arc::new(packages);
+        manager.publish_installed_packages(Arc::clone(&packages), identity.clone());
+        manager.publish_installed_packages(packages, identity);
 
         let cached = manager
             .cached_installed_packages()
@@ -5115,7 +5096,6 @@ mod tests {
                 release: "1.fc44".to_string(),
                 architecture: "x86_64".to_string(),
                 summary: "Kernel".to_string(),
-                reason: InstallReason::User,
             },
             InstalledPackage {
                 name: "kernel-core".to_string(),
@@ -5123,7 +5103,6 @@ mod tests {
                 release: "1.fc44".to_string(),
                 architecture: "x86_64".to_string(),
                 summary: "Kernel".to_string(),
-                reason: InstallReason::User,
             },
             InstalledPackage {
                 name: "kernel-modules".to_string(),
@@ -5131,12 +5110,15 @@ mod tests {
                 release: "1.fc44".to_string(),
                 architecture: "x86_64".to_string(),
                 summary: "Kernel modules".to_string(),
-                reason: InstallReason::Dependency,
             },
         ];
 
         assert_eq!(
-            DnfPackageManager::explicit_package_names(packages),
+            DnfPackageManager::explicit_package_names(
+                &packages,
+                Ok(HashSet::from(["kernel-core".into()])),
+            )
+            .unwrap(),
             vec!["kernel-core"]
         );
     }
@@ -5148,25 +5130,23 @@ mod tests {
         manager.rpm_db_path = directory.path().join("rpmdb.sqlite");
         let identity = RpmDatabaseObservation::read(&manager.rpm_db_path);
         manager.publish_installed_packages(
-            &[InstalledPackage {
+            Arc::new(vec![InstalledPackage {
                 name: "glibc".to_string(),
                 version: "2.41".to_string(),
                 release: "1.fc42.x86_64".to_string(),
                 architecture: "x86_64".to_string(),
                 summary: "C library".to_string(),
-                reason: InstallReason::Dependency,
-            }],
+            }]),
             identity.clone(),
         );
         manager.publish_installed_packages(
-            &[InstalledPackage {
+            Arc::new(vec![InstalledPackage {
                 name: "bash".to_string(),
                 version: "5.2".to_string(),
                 release: "1.fc42".to_string(),
                 architecture: "x86_64".to_string(),
                 summary: "GNU shell".to_string(),
-                reason: InstallReason::User,
-            }],
+            }]),
             identity,
         );
 
@@ -5175,7 +5155,7 @@ mod tests {
             .expect("populated cache");
         assert_eq!(cached.len(), 1);
         assert_eq!(cached[0].name, "bash");
-        assert_eq!(cached[0].reason, InstallReason::User);
+        assert_eq!(cached[0].summary, "GNU shell");
     }
 
     #[test]
@@ -5186,7 +5166,7 @@ mod tests {
         .expect("valid rpm -qa line");
         assert_eq!(pkg.name, "bash");
         assert_eq!(pkg.version, "5.2.15");
-        assert_eq!(pkg.reason, InstallReason::Dependency);
+        assert_eq!(pkg.architecture, "x86_64");
     }
 
     #[test]
