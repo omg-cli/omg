@@ -42,6 +42,7 @@ test("production batch drains 128 changes before resuming from its last committe
     const raw = JSON.stringify([
         event(Array.from({ length: 129 }, (_, i) => `CVE-2026-${1234 + i}`)),
     ]);
+
     const first = await deltaBatch(new Response(raw).body, null, 128);
 
     expect(first.batch).toHaveLength(128);
