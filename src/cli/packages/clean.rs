@@ -46,6 +46,7 @@ pub async fn clean(
         backend != crate::package_managers::Backend::MacOS,
         "Package cleanup is not implemented for the Homebrew backend"
     );
+    #[cfg(feature = "fedora")]
     if aur && backend == crate::package_managers::Backend::Fedora {
         anyhow::bail!("AUR cleanup is not available on Fedora");
     }
