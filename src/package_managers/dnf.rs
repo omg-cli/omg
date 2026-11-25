@@ -346,6 +346,17 @@ struct NativeTransactionPackage {
     action: String,
 }
 
+pub(crate) struct PreparedDnfRemoval {
+    directory: tempfile::TempDir,
+    packages: Vec<super::types::RemovalPackage>,
+}
+
+impl PreparedDnfRemoval {
+    pub(crate) fn packages(&self) -> &[super::types::RemovalPackage] {
+        &self.packages
+    }
+}
+
 #[derive(serde::Deserialize)]
 struct StoredRemovalTransaction {
     version: String,
@@ -648,6 +659,10 @@ impl DnfPackageManager {
     }
 
     async fn simulate_removal(packages: &[String]) -> Result<Vec<super::types::RemovalPackage>> {
+        Ok(Self::prepare_removal(packages).await?.packages)
+    }
+
+    pub(crate) async fn prepare_removal(packages: &[String]) -> Result<PreparedDnfRemoval> {
         crate::core::security::validate_package_names(packages)?;
         let directory = Self::removal_preview_directory()?;
         let mut command =
@@ -662,11 +677,41 @@ impl DnfPackageManager {
                 format!("--store={}", directory.path().display()),
             ])
             .args(packages);
-        let (_directory, bytes) =
+        let (directory, bytes) =
             Self::owned_stored_transaction(command, directory, std::time::Duration::from_mins(1))
                 .await
                 .context("Could not simulate removal with DNF5 --store")?;
-        Self::parse_removal_plan(&bytes)
+        let packages = Self::parse_removal_plan(&bytes)?;
+        Ok(PreparedDnfRemoval {
+            directory,
+            packages,
+        })
+    }
+
+    pub(crate) async fn replay_removal(
+        &self,
+        plan: PreparedDnfRemoval,
+        history: &crate::core::history::HistoryManager,
+    ) -> Result<()> {
+        // Replay normally loads available repositories. Removal uses only
+        // installed packages, and DNF rejects a disable glob with no matches.
+        let mut command =
+            tokio::process::Command::from(crate::core::privilege::system_command("dnf")?);
+        command.args(["repo", "list", "--all", "--json"]);
+        let output = Self::query_output(command).await?;
+        let repositories: Vec<serde::de::IgnoredAny> =
+            serde_json::from_slice(&output).context("Invalid DNF repository list")?;
+        let options: &'static [&'static str] = if repositories.is_empty() {
+            &[]
+        } else {
+            &["--disable-repo=*"]
+        };
+        Self::record_native_mutation(
+            crate::core::history::TransactionType::Remove,
+            Some(history),
+            |comment| self.replay_stored_transaction(plan.directory, options, comment),
+        )
+        .await
     }
     fn cached_update_args() -> Vec<String> {
         ["--setopt=cacheonly=metadata", "upgrade", "-y"]
@@ -1978,21 +2023,38 @@ impl DnfPackageManager {
             checked == digest,
             "DNF stored artifacts or repository evidence changed after review"
         );
-        let mut replay = vec![
-            "replay".to_owned(),
-            directory.path().to_string_lossy().into_owned(),
-            "-y".into(),
-        ];
-        if let Some(comment) = args
+        let comment = args
             .first()
             .filter(|value| value.starts_with("--comment=omg-"))
-        {
-            replay.insert(0, comment.clone());
-        }
+            .cloned();
+        self.replay_stored_transaction(directory, &[], comment)
+            .await
+    }
+
+    async fn replay_stored_transaction(
+        &self,
+        directory: tempfile::TempDir,
+        options: &'static [&'static str],
+        comment: Option<String>,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            is_root(),
+            "DNF stored transactions require their root owner"
+        );
         let manager = self.cache_handle();
         tokio::task::spawn_blocking(move || {
-            let _stored_artifacts = directory;
-            manager.run_dnf(&replay.iter().map(String::as_str).collect::<Vec<_>>())
+            let mut args = options.to_vec();
+            args.extend([
+                "replay",
+                directory.path().to_str().context("Invalid DNF plan path")?,
+                "-y",
+            ]);
+            if let Some(comment) = comment.as_deref() {
+                args.insert(0, comment);
+            }
+            let result = manager.run_dnf(&args);
+            manager.invalidate_installed_cache();
+            result
         })
         .await?
     }
@@ -2113,9 +2175,27 @@ impl DnfPackageManager {
         args: Vec<String>,
         history: Option<&crate::core::history::HistoryManager>,
     ) -> Result<()> {
+        Self::record_native_mutation(kind, history, |comment| {
+            let mut args = args;
+            if let Some(comment) = comment {
+                args.insert(0, comment);
+            }
+            self.execute_dnf(args)
+        })
+        .await
+    }
+
+    async fn record_native_mutation<F>(
+        kind: crate::core::history::TransactionType,
+        history: Option<&crate::core::history::HistoryManager>,
+        operation: impl FnOnce(Option<String>) -> F,
+    ) -> Result<()>
+    where
+        F: Future<Output = Result<()>>,
+    {
         let Some(history) = history.filter(|_| !crate::core::privilege::parent_owns_history())
         else {
-            return self.execute_dnf(args).await;
+            return operation(None).await;
         };
         let before = Self::native_history(None)
             .await?
@@ -2124,9 +2204,7 @@ impl DnfPackageManager {
             .max()
             .unwrap_or(0);
         let comment = format!("omg-{}", uuid::Uuid::new_v4());
-        let mut command_args = vec![format!("--comment={comment}")];
-        command_args.extend(args);
-        let operation = self.execute_dnf(command_args).await;
+        let operation = operation(Some(format!("--comment={comment}"))).await;
         let observed = match Self::native_history(Some(before)).await {
             Ok(transactions) => Self::native_outcome(&transactions, &comment),
             Err(error) => Err(error),

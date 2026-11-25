@@ -1324,6 +1324,21 @@ mod dnf_integration {
         verified?;
         let records = history.load()?;
         anyhow::ensure!(records.len() == 2, "Expected install and remove history");
+        let native_history = std::process::Command::new("dnf")
+            .args(["history", "info", "last", "--json"])
+            .output()?;
+        anyhow::ensure!(
+            native_history.status.success(),
+            "Cannot read native removal history: {}",
+            String::from_utf8_lossy(&native_history.stderr)
+        );
+        let transactions: Vec<serde_json::Value> = serde_json::from_slice(&native_history.stdout)?;
+        anyhow::ensure!(
+            matches!(transactions.as_slice(), [transaction] if transaction["description"]
+                .as_str()
+                .is_some_and(|description| description.split_whitespace().any(|word| word == "replay"))),
+            "Native removal must replay the reviewed plan"
+        );
         let removed = &records[1];
         anyhow::ensure!(
             removed.success && removed.transaction_type == TransactionType::Remove,
