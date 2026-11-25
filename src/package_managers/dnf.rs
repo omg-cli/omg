@@ -979,7 +979,7 @@ impl DnfPackageManager {
     }
 
     /// Database blobs omit the magic/reserved prefix used in RPM archive headers.
-    /// Tag data borrows from the validated payload rather than copying unused fields.
+    /// All entries are validated, but only the package fields are retained.
     fn parse_rpm_header(blob: &[u8]) -> Result<HashMap<u32, &[u8]>> {
         const MAX_HEADER_ENTRIES: u32 = 100_000;
 
@@ -1026,7 +1026,7 @@ impl DnfPackageManager {
         );
 
         let payload = &rest[data_start..data_start + data_size];
-        let mut tags = HashMap::with_capacity(num_entries as usize);
+        let mut tags = HashMap::with_capacity(6);
         for chunk in rest[..data_start].chunks_exact(size_of::<IndexEntry>()) {
             let entry =
                 IndexEntry::ref_from_bytes(chunk).expect("chunk length checked by chunks_exact");
@@ -1076,10 +1076,7 @@ impl DnfPackageManager {
                 7 => count,
                 6 | 8 | 9 => {
                     let last = count.checked_sub(1).context("RPM string array is empty")?;
-                    payload[base..]
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(index, &byte)| (byte == 0).then_some(index))
+                    memchr::memchr_iter(0, &payload[base..])
                         .nth(last)
                         .ok_or_else(|| anyhow::anyhow!("RPM tag {tag} string missing terminator"))?
                 }
@@ -1094,7 +1091,17 @@ impl DnfPackageManager {
                 "RPM tag {tag} data region exceeds payload"
             );
 
-            tags.insert(tag, &payload[base..abs_end]);
+            if matches!(
+                tag,
+                rpm_tags::NAME
+                    | rpm_tags::VERSION
+                    | rpm_tags::RELEASE
+                    | rpm_tags::EPOCH
+                    | rpm_tags::SUMMARY
+                    | rpm_tags::ARCH
+            ) {
+                tags.insert(tag, &payload[base..abs_end]);
+            }
         }
 
         Ok(tags)
@@ -1163,14 +1170,10 @@ impl DnfPackageManager {
         let mut stmt = conn.prepare("SELECT blob FROM Packages")?;
         let mut packages = Vec::with_capacity(2048);
 
-        let rows = stmt.query_map([], |row| {
-            let blob: Vec<u8> = row.get(0)?;
-            Ok(blob)
-        })?;
-
-        for row in rows {
-            let blob = row?;
-            let pkg = Self::parse_package_from_blob(&blob).with_context(|| {
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let blob = row.get_ref(0)?.as_blob()?;
+            let pkg = Self::parse_package_from_blob(blob).with_context(|| {
                 format!(
                     "Malformed RPM header in Packages table (row {}, {} packages decoded before the failure)",
                     packages.len() + 1,
