@@ -760,6 +760,7 @@ fn draw_recent_activity(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_packages(f: &mut Frame, area: Rect, app: &App) {
+    const HEADER_HEIGHT: u16 = 1;
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -815,13 +816,22 @@ fn draw_packages(f: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
-    // Package table with modern styling
-    let rows: Vec<Row> = app
+    let block = styled_block(" Packages");
+    // Each package occupies one line. Build cells only for the rows the table can display.
+    let visible_rows = usize::from(block.inner(*list_area).height.saturating_sub(HEADER_HEIGHT));
+    let selected = app
+        .selected_index
+        .min(app.search_results.len().saturating_sub(1));
+    let start = (selected + 1).saturating_sub(visible_rows);
+    let visible_selection = selected.checked_sub(start);
+    let rows = app
         .search_results
         .iter()
+        .skip(start)
+        .take(visible_rows)
         .enumerate()
         .map(|(i, pkg)| {
-            let is_selected = i == app.selected_index;
+            let is_selected = visible_selection == Some(i);
             let base_style = if is_selected {
                 Style::default().bg(colors::BG_HIGHLIGHT)
             } else {
@@ -856,8 +866,7 @@ fn draw_packages(f: &mut Frame, area: Rect, app: &App) {
                 )),
             ])
             .style(base_style)
-        })
-        .collect();
+        });
 
     let header = Row::new(vec![
         Cell::from(Span::styled(
@@ -885,6 +894,7 @@ fn draw_packages(f: &mut Frame, area: Rect, app: &App) {
                 .add_modifier(Modifier::BOLD),
         )),
     ])
+    .height(HEADER_HEIGHT)
     .style(Style::default().bg(colors::BG_LIGHT));
 
     let table = Table::new(
@@ -897,9 +907,9 @@ fn draw_packages(f: &mut Frame, area: Rect, app: &App) {
         ],
     )
     .header(header)
-    .block(styled_block(" Packages"));
+    .block(block);
 
-    let mut state = TableState::default().with_selected(Some(app.selected_index));
+    let mut state = TableState::default().with_selected(visible_selection);
     f.render_stateful_widget(table, *list_area, &mut state);
 }
 
