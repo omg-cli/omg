@@ -179,6 +179,65 @@ with tempfile.TemporaryDirectory(prefix="omg-fedora-cache-scope-", dir="/tmp") a
     def ordinary_control(command_line):
         return checked(command_line, native_env, ordinary)
 
+    def inspect_doctor(phase, installroot, expected_packages):
+        rpm_installed = checked(
+            [rpm, "--root", installroot, "-qa", "--qf", "%{NAME}\n"],
+            native_env, ordinary,
+        ).splitlines()
+        assert len(rpm_installed) == expected_packages, (phase, rpm_installed[:10])
+        total = checked([cli, "tc"], disabled, ordinary).strip()
+        assert total == str(expected_packages), (phase, total)
+        settings = checked([dnf, "--cacheonly", "--dump-main-config"], native_env, ordinary)
+        assert f"installroot = {installroot}" in settings.splitlines(), (phase, installroot)
+        dnf_check = command([dnf, "--cacheonly", "check"], native_env, ordinary)
+        assert dnf_check.returncode == 0, (phase, dnf_check.stdout, dnf_check.stderr)
+        result = command([cli, "doctor"], disabled, ordinary)
+        rpm_verdicts = [line.strip() for line in result.stdout.splitlines()
+                        if "RPM installed package" in line]
+        expected = "RPM installed package database nonempty" if expected_packages else (
+            "✗ RPM installed package database is empty"
+        )
+        lines = result.stdout.splitlines()
+        passed = (result.returncode == 1 and len(rpm_verdicts) == 1
+                  and rpm_verdicts[0].endswith(expected)
+                  and any("DNF local package database healthy" in line for line in lines)
+                  and any("Connectivity probes failed" in line for line in lines)
+                  and any(f"{1 + (expected_packages == 0)} health issue" in line
+                          for line in result.stderr.splitlines()))
+        checks.append(dict(phase=phase, case="doctor checks active RPM inventory",
+                           passed=passed, status=result.returncode,
+                           diagnostic=(rpm_verdicts,
+                                       [line.strip() for line in lines if "DNF local package" in line],
+                                       result.stderr[-500:])))
+
+    inspect_doctor("doctor-host", "/", host_count)
+    config.write_text(host_config.replace("/etc/dnf/omg-fixture-repos", "/etc/dnf/no-repos"))
+    inspect_doctor("doctor-host-without-repositories", "/", host_count)
+    config.write_text(alternate_config)
+    inspect_doctor("doctor-populated-installroot", alternate, 1)
+    alternate_repo.unlink()
+    try:
+        inspect_doctor("doctor-populated-installroot-without-repositories", alternate, 1)
+    finally:
+        alternate_repo.write_text(repo_config)
+    empty = root / "empty-installroot"
+    (empty / "etc/dnf").mkdir(parents=True)
+    for suffix in (".local/state", ".cache", "state"):
+        directory = empty / work.relative_to("/") / suffix
+        directory.mkdir(parents=True)
+        directory.chmod(0o700)
+        os.chown(directory, account.pw_uid, account.pw_gid)
+    empty_config = alternate_config.replace(f"installroot={alternate}\n", f"installroot={empty}\n")
+    (empty / "etc/dnf/dnf.conf").write_text(empty_config)
+    (empty / "etc/dnf/omg-fixture-repos").mkdir()
+    (empty / "etc/dnf/omg-fixture-repos/fixture.repo").write_text(repo_config)
+    checked([rpm, "--root", empty, "--initdb"])
+    config.write_text(empty_config)
+    inspect_doctor("doctor-empty-installroot", empty, 0)
+    (empty / "etc/dnf/omg-fixture-repos/fixture.repo").unlink()
+    inspect_doctor("doctor-empty-installroot-without-repositories", empty, 0)
+    config.write_text(host_config)
+
     def request_counters():
         counters = dict(line.split() for line in checked([cli, "metrics"], env, ordinary).splitlines()
                         if line.startswith(("omg_requests_total ", "omg_requests_failed_total ")))
@@ -1191,6 +1250,6 @@ assert inventory() == before
 report = dict(binaries=binaries, checks=checks, total=len(checks),
               passed=sum(entry["passed"] for entry in checks), host_unchanged=True)
 print(json.dumps(report))
-expected_checks = 264 if consent_oracle is None else 515
+expected_checks = 270 if consent_oracle is None else 521
 if report["passed"] != report["total"] or report["total"] != expected_checks:
     sys.exit(4)

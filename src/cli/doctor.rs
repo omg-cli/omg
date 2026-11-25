@@ -371,16 +371,20 @@ async fn check_fedora_infra() -> usize {
             None
         }
     };
-    let rpm = match crate::core::privilege::system_command("rpm") {
-        Ok(command) => Some(command),
+    match crate::core::privilege::root_controlled_program_path("rpm") {
+        Ok(_) => {
+            #[cfg(feature = "fedora")]
+            {
+                let inventory = crate::package_managers::DnfPackageManager::new()
+                    .has_installed_packages(Duration::from_secs(15))
+                    .await;
+                issues += report_fedora_installed_db(inventory);
+            }
+        }
         Err(error) => {
             println!("  {} RPM backend unavailable: {error}", style::error("✗"));
             issues += 1;
-            None
         }
-    };
-    if let Some(command) = rpm {
-        issues += check_fedora_installed_db(command, Duration::from_secs(15)).await;
     }
     if let Some(command) = dnf {
         issues += check_fedora_package_db(command, Duration::from_secs(15)).await;
@@ -388,48 +392,28 @@ async fn check_fedora_infra() -> usize {
     issues
 }
 
-/// `dnf check` accepts an empty RPM database as consistent. Require RPM to
-/// enumerate at least one installed package as a separate read-only check.
-async fn check_fedora_installed_db(command: std::process::Command, deadline: Duration) -> usize {
-    let mut command = tokio::process::Command::from(command);
-    // RPM loads per-user macros from HOME, which can redirect _dbpath away
-    // from the system database. system_command also removes XDG_CONFIG_HOME.
-    command.env("HOME", "/").arg("-qa").kill_on_drop(true);
-    match tokio::time::timeout(deadline, command.output()).await {
-        Ok(Ok(output))
-            if output.status.success() && !output.stdout.iter().all(u8::is_ascii_whitespace) =>
-        {
+/// An empty RPM database can pass DNF's consistency check.
+#[cfg(feature = "fedora")]
+fn report_fedora_installed_db(inventory: Result<bool>) -> usize {
+    match inventory {
+        Ok(true) => {
             println!(
                 "  {}",
                 style::success("RPM installed package database nonempty")
             );
             0
         }
-        Ok(Ok(output)) if output.status.success() => {
+        Ok(false) => {
             println!(
                 "  {} RPM installed package database is empty",
                 style::error("✗")
             );
             1
         }
-        Ok(Ok(output)) => {
+        Err(error) => {
+            let detail = style::sanitize_terminal_text(&format!("{error:#}"));
             println!(
-                "  {} RPM installed package query failed ({})",
-                style::error("✗"),
-                output.status
-            );
-            1
-        }
-        Ok(Err(error)) => {
-            println!(
-                "  {} RPM installed package query failed: {error}",
-                style::error("✗")
-            );
-            1
-        }
-        Err(_) => {
-            println!(
-                "  {} RPM installed package query timed out",
+                "  {} RPM installed package query failed: {detail}",
                 style::error("✗")
             );
             1
@@ -438,17 +422,15 @@ async fn check_fedora_installed_db(command: std::process::Command, deadline: Dur
 }
 
 async fn check_fedora_package_db(command: std::process::Command, deadline: Duration) -> usize {
-    // Fedora's dnf executable resolves to dnf5; RHEL-family DNF4 uses the
-    // older spelling. Both support --cacheonly and `check`.
-    let disable_repo = if command.get_program().to_string_lossy().ends_with("dnf5") {
-        "--disable-repo=*"
-    } else {
-        "--disablerepo=*"
-    };
+    // DNF5 check reads the installed database directly. A repository
+    // disable glob fails when there are no configured repositories.
+    let dnf5 = command.get_program().to_string_lossy().ends_with("dnf5");
     let mut command = tokio::process::Command::from(command);
-    command
-        .args(["--cacheonly", disable_repo, "check"])
-        .kill_on_drop(true);
+    command.arg("--cacheonly");
+    if !dnf5 {
+        command.arg("--disablerepo=*");
+    }
+    command.arg("check").kill_on_drop(true);
     match tokio::time::timeout(deadline, command.output()).await {
         Ok(Ok(output)) if output.status.success() => {
             println!("  {}", style::success("DNF local package database healthy"));
@@ -2714,13 +2696,17 @@ mod tests {
 
         let fixture = tempfile::TempDir::new().expect("isolated DNF fixture");
         let program = fixture.path().join("dnf5");
-        for (name, repo_flag) in [("dnf5", "--disable-repo=*"), ("dnf", "--disablerepo=*")] {
+        for (name, arguments) in [
+            ("dnf5", "--cacheonly check"),
+            ("dnf", "--cacheonly --disablerepo=* check"),
+        ] {
             let program = fixture.path().join(name);
             let script = fixture.path().join(format!("{name}.sh"));
             std::fs::write(
                 &script,
                 format!(
-                    "#!/bin/sh\n[ \"$1\" = --cacheonly ] && [ \"$2\" = '{repo_flag}' ] && [ \"$3\" = check ] && [ \"$#\" = 3 ]\n"
+                    "#!/bin/sh\n[ \"$*\" = '{arguments}' ] && [ \"$#\" = {} ]\n",
+                    arguments.split_whitespace().count()
                 ),
             )
             .expect("DNF fixture");
@@ -2752,38 +2738,22 @@ mod tests {
         assert!(error.to_string().contains("1 health issue"));
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(feature = "fedora")]
     #[tokio::test]
-    async fn fedora_empty_rpm_inventory_is_a_health_issue() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let fixture = tempfile::TempDir::new().expect("isolated RPM fixture");
-        let program = fixture.path().join("rpm");
-        let caller_home = fixture.path().join("caller-home");
-        std::fs::create_dir(&caller_home).expect("caller home");
-        std::fs::write(caller_home.join(".rpmmacros"), "%_dbpath /alternate-db\n")
-            .expect("user RPM macro fixture");
-        let probe = || {
-            let mut command = std::process::Command::new(&program);
-            command.env("HOME", &caller_home);
-            check_fedora_installed_db(command, Duration::from_secs(2))
-        };
-        for (script, expected) in [
-            (
-                "#!/bin/sh\n[ \"$HOME\" = / ] && [ \"$1\" = -qa ] && printf 'filesystem-1-1\\n'\n",
-                0,
-            ),
-            ("#!/bin/sh\n[ \"$1\" = -qa ]\n", 1),
-            ("#!/bin/sh\nexit 23\n", 1),
+    async fn fedora_empty_or_unreadable_inventory_fails_doctor() {
+        for (inventory, expected) in [
+            (Ok(true), 0),
+            (Ok(false), 1),
+            (Err(anyhow::anyhow!("could not open RPM database")), 1),
         ] {
-            std::fs::write(&program, script).expect("RPM fixture");
-            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700))
-                .expect("executable RPM fixture");
-            assert_eq!(probe().await, expected);
+            let mut issues = 0;
+            add_native_infra_issues(Distro::Fedora, &mut issues, async {
+                report_fedora_installed_db(inventory)
+            })
+            .await;
+            assert_eq!(issues, expected);
+            assert_eq!(finish_doctor(issues, 0).is_ok(), expected == 0);
         }
-        let doctor_issues = probe().await;
-        assert_eq!(doctor_issues, 1);
-        assert!(finish_doctor(doctor_issues, 0).is_err());
     }
 }
 

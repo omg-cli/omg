@@ -1022,18 +1022,58 @@ impl DnfPackageManager {
     /// Returns an error when the installed RPM inventory cannot be read.
     pub fn installed_count(&self) -> Result<usize> {
         let location = RpmDatabase::detect(&self.rpm_db_path)?;
-        let count = Self::open_rpm_sqlite(&location.sqlite).and_then(|connection| {
-            let count: i64 =
-                connection.query_row("SELECT COUNT(*) FROM Packages", [], |row| row.get(0))?;
-            usize::try_from(count).context("RPM package count does not fit in memory")
-        });
-        match count {
+        match Self::count_rpm_sqlite(&location.sqlite) {
             Ok(count) => Ok(count),
             Err(error) => {
                 tracing::debug!("RPM SQLite count unavailable: {error:#}");
                 Ok(self.load_installed_at(&location)?.len())
             }
         }
+    }
+
+    fn count_rpm_sqlite(path: &Path) -> Result<usize> {
+        let connection = Self::open_rpm_sqlite(path)?;
+        let count: i64 =
+            connection.query_row("SELECT COUNT(*) FROM Packages", [], |row| row.get(0))?;
+        usize::try_from(count).context("RPM package count does not fit in memory")
+    }
+
+    pub(crate) async fn has_installed_packages(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<bool> {
+        let runtime = tokio::runtime::Handle::current();
+        let deadline = tokio::time::Instant::now() + timeout;
+        let database = self.rpm_db_path.clone();
+        tokio::task::spawn_blocking(move || {
+            let run = |command: std::process::Command| {
+                runtime.block_on(async {
+                    let mut command = tokio::process::Command::from(command);
+                    command.kill_on_drop(true);
+                    tokio::time::timeout_at(deadline, command.output())
+                        .await
+                        .context("RPM installed package query timed out")?
+                        .context("Cannot execute RPM inventory query")
+                })
+            };
+            let location = RpmDatabase::detect_with_query_runner(&database, &run)?;
+            match Self::count_rpm_sqlite(&location.sqlite) {
+                Ok(count) => Ok(count != 0),
+                Err(error) => {
+                    tracing::debug!("RPM SQLite count unavailable: {error:#}");
+                    let mut command = crate::core::privilege::system_command("rpm")?;
+                    command.arg("--root").arg(&location.root).arg("-qa");
+                    let output = run(command)?;
+                    anyhow::ensure!(
+                        output.status.success(),
+                        "rpm -qa failed ({})",
+                        output.status
+                    );
+                    Ok(!output.stdout.iter().all(u8::is_ascii_whitespace))
+                }
+            }
+        })
+        .await?
     }
 
     /// Load installed packages from RPM `SQLite` database

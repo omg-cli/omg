@@ -1,6 +1,7 @@
 use std::fs;
 use std::io::{self, Read as _};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Output, Stdio};
 
 use anyhow::{Context as _, Result};
 
@@ -25,11 +26,18 @@ pub(super) struct RpmDatabase {
 
 impl RpmDatabase {
     pub(super) fn detect(host_sqlite: &Path) -> Result<Self> {
-        Self::resolve(host_sqlite, false).map(|(database, _)| database)
+        Self::detect_with_query_runner(host_sqlite, &run_query)
+    }
+
+    pub(super) fn detect_with_query_runner(
+        host_sqlite: &Path,
+        run: &impl Fn(Command) -> Result<Output>,
+    ) -> Result<Self> {
+        Self::resolve(host_sqlite, false, run).map(|(database, _)| database)
     }
 
     pub(super) fn detect_with_state_dir(host_sqlite: &Path) -> Result<(Self, PathBuf)> {
-        let (database, config) = Self::resolve(host_sqlite, true)?;
+        let (database, config) = Self::resolve(host_sqlite, true, &run_query)?;
         let directory = config.as_deref().map_or_else(
             || Ok(PathBuf::from(SYSTEM_STATE_DIR)),
             |config| parse_absolute_setting(config, "system_state_dir"),
@@ -39,7 +47,11 @@ impl RpmDatabase {
         Ok((database, path))
     }
 
-    fn resolve(host_sqlite: &Path, include_state_dir: bool) -> Result<(Self, Option<String>)> {
+    fn resolve(
+        host_sqlite: &Path,
+        include_state_dir: bool,
+        run: &impl Fn(Command) -> Result<Output>,
+    ) -> Result<(Self, Option<String>)> {
         #[cfg(test)]
         if host_sqlite != Path::new(HOST_SQLITE) {
             return Ok((
@@ -53,7 +65,7 @@ impl RpmDatabase {
         let config = if uses_default_paths(include_state_dir) {
             None
         } else {
-            Some(read_path_settings()?)
+            Some(read_dnf_settings_with(&["--cacheonly"], run)?)
         };
         let root = config.as_deref().map_or_else(
             || Ok(PathBuf::from("/")),
@@ -62,7 +74,7 @@ impl RpmDatabase {
         let sqlite = if root == Path::new("/") && !has_custom_rpm_configuration() {
             host_sqlite.to_owned()
         } else {
-            let database = rpm_database_directory()?;
+            let database = rpm_database_directory(run)?;
             scoped_database_path(&root, &database)?
         };
         Ok((Self { root, sqlite }, config))
@@ -131,13 +143,24 @@ pub(super) fn read_path_settings() -> Result<String> {
 }
 
 pub(super) fn read_dnf_settings(options: &[&str]) -> Result<String> {
-    let output = system_command("dnf")?
+    read_dnf_settings_with(options, &run_query)
+}
+
+fn run_query(mut command: Command) -> Result<Output> {
+    Ok(command.output()?)
+}
+
+fn read_dnf_settings_with(
+    options: &[&str],
+    run: &impl Fn(Command) -> Result<Output>,
+) -> Result<String> {
+    let mut command = system_command("dnf")?;
+    command
         .env("LC_ALL", "C")
         .arg("--dump-main-config")
         .args(options)
-        .stdin(std::process::Stdio::null())
-        .output()
-        .context("Could not read the effective DNF configuration")?;
+        .stdin(Stdio::null());
+    let output = run(command).context("Could not read the effective DNF configuration")?;
     anyhow::ensure!(
         output.status.success(),
         "Could not read the effective DNF configuration: {}",
@@ -183,12 +206,10 @@ fn has_custom_rpm_configuration() -> bool {
         })
 }
 
-fn rpm_database_directory() -> Result<PathBuf> {
-    let output = system_command("rpm")?
-        .args(["--eval", "%{_dbpath}"])
-        .stdin(std::process::Stdio::null())
-        .output()
-        .context("Could not identify the active RPM database directory")?;
+fn rpm_database_directory(run: &impl Fn(Command) -> Result<Output>) -> Result<PathBuf> {
+    let mut command = system_command("rpm")?;
+    command.args(["--eval", "%{_dbpath}"]).stdin(Stdio::null());
+    let output = run(command).context("Could not identify the active RPM database directory")?;
     anyhow::ensure!(
         output.status.success(),
         "Could not identify the active RPM database directory: {}",
