@@ -44,7 +44,10 @@ EOF
   chmod +x "$work/bin/cargo" "$work/bin/rustc"
   export PATH="$work/bin:$PATH" HOME="$work/home"
   export CARGO_TARGET_DIR="$work/redirected output" CARGO_BUILD_TARGET=foreign-host
-  source <(sed -n '/^build_omg()/,/^}/p' "$repo_root/install.sh")
+  sed '$d' "$repo_root/install.sh" > "$work/installer-functions.sh"
+  set --
+  source "$work/installer-functions.sh"
+  trap - EXIT
   header() { :; }
   info() { :; }
   start_spinner() { :; }
@@ -54,7 +57,6 @@ EOF
   error() { fail "$1"; }
   detect_os() { printf linux; }
   detect_distro() { printf arch; }
-  install_binary() { cp "$1" "$2"; }
   IS_SOURCE_INSTALL=true SCRIPT_DIR="$work/project" INSTALL_DIR="$work/installed"
   build_omg
   grep -qx 'fresh omg' "$INSTALL_DIR/omg" || fail 'source installer copied a stale binary'

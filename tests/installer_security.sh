@@ -21,7 +21,7 @@ bash tests/installer_source_features.sh
 task_dir=$(mktemp -d)
 trap 'rm -rf "$task_dir"' EXIT
 sed '$d' install.sh > "$task_dir/functions.sh"
-for scenario in missing rejected wrong_tag accepted loader_error wrong_version missing_daemon daemon_loader_error hung_probe forked_probe second_install_failure; do
+for scenario in missing rejected wrong_tag accepted accepted_fedora loader_error wrong_version missing_daemon daemon_loader_error hung_probe forked_probe second_install_failure; do
   (
     set --
     source "$task_dir/functions.sh"
@@ -47,7 +47,9 @@ for scenario in missing rejected wrong_tag accepted loader_error wrong_version m
     done
     check_runtime_dependencies() { return 0; }
     detect_os() { echo linux; }
-    detect_distro() { echo arch; }
+    fake_distro=arch
+    [[ "$scenario" != accepted_fedora ]] || fake_distro=fedora
+    detect_distro() { printf '%s\n' "$fake_distro"; }
     detect_arch() { echo x86_64; }
     if [[ "$scenario" == wrong_tag ]]; then
       resolve_version() { printf 'v1.2.2\n'; }
@@ -56,7 +58,7 @@ for scenario in missing rejected wrong_tag accepted loader_error wrong_version m
       local url="${@: -1}"
       if [[ "$url" == *.sha256 ]]; then
         printf '%064d  archive\n' 0
-      elif [[ "$url" == "$RELEASES_BASE_URL/omg-v1.2.3-x86_64-linux-arch.tar.gz" ]]; then
+      elif [[ "$url" == "$RELEASES_BASE_URL/omg-v1.2.3-x86_64-linux-$fake_distro.tar.gz" ]]; then
         printf 'fixture'
       else
         printf 'Unexpected fixture URL: %s\n' "$url" >&2
@@ -92,21 +94,24 @@ for scenario in missing rejected wrong_tag accepted loader_error wrong_version m
         chmod +x "$tmp_dir/omgd"
       fi
     }
-    install_binary() {
-      mkdir -p "$INSTALL_DIR"
-      if [[ "$scenario" == second_install_failure && "$2" == "$INSTALL_DIR/omgd" ]]; then
-        return 1
-      fi
-      cp "$1" "$2"
-    }
+    if [[ "$scenario" == second_install_failure ]]; then
+      eval "$(declare -f rename_install_binary | sed '1s/^rename_install_binary/real_release_rename/')"
+      rename_install_binary() {
+        [[ "$1" != */new-omgd ]] || return 1
+        real_release_rename "$@"
+      }
+    fi
     if install_from_release > "$scenario_dir/output" 2>&1; then status=0; else status=$?; fi
-    if [[ "$scenario" == accepted ]]; then
+    if [[ "$scenario" == accepted || "$scenario" == accepted_fedora ]]; then
       [[ "$status" == 0 && -x "$INSTALL_DIR/omg" && -x "$INSTALL_DIR/omgd" ]]
       [[ $("$INSTALL_DIR/omg" --version) == 'omg 1.2.3' ]]
       [[ $("$INSTALL_DIR/omgd" --version) == 'omgd 1.2.3' ]]
       grep -Fx -- '--source-ref' "$scenario_dir/gh-args"
       grep -Fx 'refs/tags/v1.2.3' "$scenario_dir/gh-args"
       grep -Fx 'omg-cli/omg/.github/workflows/release.yml' "$scenario_dir/gh-args"
+      grep -F '/omg-v1.2.3-x86_64-linux-' "$scenario_dir/gh-args" |
+        grep -Fq "linux-$fake_distro.tar.gz"
+      printf 'PASS: authenticated %s release fixture installed both binaries\n' "$fake_distro"
     elif [[ "$scenario" == loader_error || "$scenario" == wrong_version || "$scenario" == missing_daemon || "$scenario" == daemon_loader_error || "$scenario" == hung_probe || "$scenario" == forked_probe || "$scenario" == second_install_failure ]]; then
       if [[ "$status" == 0 ]]; then
         printf 'Installer accepted unusable pair: %s\n' "$scenario" >&2
@@ -174,7 +179,8 @@ for rename_platform in native darwin; do
       mkdir "$INSTALL_DIR/omg"
       printf 'untouched\n' > "$INSTALL_DIR/omg/omg"
     }
-    if (install_binary "$INSTALL_DIR/source" "$INSTALL_DIR/omg"); then
+    if install_binary_pair "$INSTALL_DIR/source" "$INSTALL_DIR/omg" \
+        "$INSTALL_DIR/source" "$INSTALL_DIR/omgd"; then
       printf 'Installer followed a directory swapped in during staging\n' >&2
       exit 1
     fi
@@ -195,19 +201,149 @@ done
   printf 'new binary\n' > "$task_dir/source"
   printf 'untouched\n' > "$task_dir/outside/omg"
   ln -s "$task_dir/outside" "$INSTALL_DIR/omg"
-  install_binary "$task_dir/source" "$INSTALL_DIR/omg"
+  install_binary_pair "$task_dir/source" "$INSTALL_DIR/omg" \
+    "$task_dir/source" "$INSTALL_DIR/omgd"
   [[ ! -L "$INSTALL_DIR/omg" && -f "$INSTALL_DIR/omg" ]]
   [[ $(cat "$task_dir/outside/omg") == untouched ]]
   printf 'updated binary\n' > "$task_dir/source"
-  install_binary "$task_dir/source" "$INSTALL_DIR/omg"
+  install_binary_pair "$task_dir/source" "$INSTALL_DIR/omg" \
+    "$task_dir/source" "$INSTALL_DIR/omgd"
   cmp "$task_dir/source" "$INSTALL_DIR/omg"
+  rm "$INSTALL_DIR/omgd"
   mkdir "$INSTALL_DIR/omgd"
-  if (install_binary "$task_dir/source" "$INSTALL_DIR/omgd"); then
+  if install_binary_pair "$task_dir/source" "$INSTALL_DIR/omg" \
+      "$task_dir/source" "$INSTALL_DIR/omgd"; then
     printf 'Installer accepted a directory destination\n' >&2
     exit 1
   fi
   [[ ! -e "$INSTALL_DIR/omgd/source" && ! -e "$INSTALL_DIR/omgd/omgd" ]]
 )
+# Exercise the production pair operation through pre-publication, publication
+# and recovery failures. Compare the original file identities as well as data.
+exercise_pair_transaction() {
+  local initial="$1" fault="$2"
+  local pair_root="$task_dir/pair-$initial-$fault"
+  local binary installed original staged_backup status=0
+  set --
+  source "$task_dir/functions.sh"
+  trap - EXIT
+  eval "$(declare -f rename_install_binary | sed '1s/^rename_install_binary/real_pair_rename/')"
+  mkdir -p "$pair_root"/{bin,originals} || return 1
+  INSTALL_DIR="$pair_root/bin"
+  for binary in omg omgd; do
+    printf '#!/bin/sh\nprintf "new %s\n"\n' "$binary" > "$pair_root/$binary" || return 1
+    case "$initial/$binary" in
+      empty/* | cli-only/omgd) continue ;;
+    esac
+    original="$pair_root/originals/$binary"
+    printf 'old %s\n' "$binary" > "$original" || return 1
+    if [[ "$initial" == symlinks ]]; then
+      ln -s "$original" "$INSTALL_DIR/$binary" || return 1
+    else
+      ln "$original" "$INSTALL_DIR/$binary" || return 1
+    fi
+  done
+  cp() {
+    local source="${@: -2:1}"
+    if [[ "$source" == "$pair_root/omg" && "$fault" == copy-cli ]] ||
+       [[ "$source" == "$pair_root/omgd" && "$fault" == copy-daemon ]]; then
+      return 1
+    fi
+    command cp "$@"
+  }
+  chmod() {
+    case "${@: -1}" in
+      */omg|*/new-omg) [[ "$fault" != mode-cli ]] || return 1 ;;
+      */omgd|*/new-omgd) [[ "$fault" != mode-daemon ]] || return 1 ;;
+    esac
+    command chmod "$@"
+  }
+  rename_install_binary() {
+    case "$1" in
+      */new-omg | */omg)
+        printf 'omg\n' >> "$pair_root/publication"
+        [[ "$fault" != publish-cli ]] || return 1
+        ;;
+      */new-omgd | */omgd)
+        printf 'omgd\n' >> "$pair_root/publication"
+        [[ "$fault" != publish-daemon && "$fault" != blocked-restore ]] || return 1
+        ;;
+      */old-omg | */first-backup)
+        [[ "$fault" != blocked-restore ]] || return 1
+        ;;
+    esac
+    real_pair_rename "$@" || return 1
+    case "$fault/${1##*/}" in
+      after-cli/omg | after-cli/new-omg | after-daemon/omgd | after-daemon/new-omgd)
+        return 1 ;;
+      term-after-cli/omg | term-after-cli/new-omg | term-after-daemon/omgd | term-after-daemon/new-omgd)
+        command sh -c 'kill -TERM "$PPID"' ;;
+    esac
+    return 0
+  }
+  install_binary_pair "$pair_root/omg" "$INSTALL_DIR/omg" "$pair_root/omgd" "$INSTALL_DIR/omgd" \
+    > "$pair_root/result" 2>&1 || status=$?
+  if [[ "$fault" == success ]]; then
+    [[ "$status" == 0 ]] || return 1
+    for binary in omg omgd; do
+      installed="$INSTALL_DIR/$binary"
+      [[ ! -L "$installed" && -x "$installed" ]] || return 1
+      [[ $("$installed") == "new $binary" ]] || return 1
+    done
+  elif [[ "$fault" == blocked-restore ]]; then
+    [[ "$status" != 0 && "$INSTALL_DIR/omgd" -ef "$pair_root/originals/omgd" ]] || return 1
+    staged_backup=$(find "$INSTALL_DIR" \( -name old-omg -o -name first-backup \) -type f -print) || return 1
+    [[ -n "$staged_backup" && "$staged_backup" -ef "$pair_root/originals/omg" ]] || return 1
+    grep -Fq -- "${staged_backup%/*}" "$pair_root/result" || return 1
+  else
+    [[ "$status" != 0 ]] || return 1
+    case "$fault" in
+      copy-* | mode-*) [[ ! -e "$pair_root/publication" ]] || return 1 ;;
+      term-*) [[ "$status" == 143 ]] || return 1 ;;
+    esac
+    for binary in omg omgd; do
+      installed="$INSTALL_DIR/$binary"
+      original="$pair_root/originals/$binary"
+      if [[ -e "$original" ]]; then
+        [[ "$installed" -ef "$original" && $(cat "$installed") == "old $binary" ]] || return 1
+        if [[ "$initial" == symlinks ]]; then
+          [[ -L "$installed" && $(readlink "$installed") == "$original" ]] || return 1
+        else
+          [[ ! -L "$installed" ]] || return 1
+        fi
+      else
+        [[ ! -e "$installed" && ! -L "$installed" ]] || return 1
+      fi
+    done
+  fi
+  if [[ "$fault" != blocked-restore ]]; then
+    [[ -z $(find "$INSTALL_DIR" -mindepth 1 -maxdepth 1 -type d -name 'omg-*' -print) ]] || return 1
+  fi
+}
+
+pair_failures=0
+for initial in empty cli-only both symlinks; do
+  for fault in success copy-cli copy-daemon mode-cli mode-daemon publish-cli publish-daemon after-cli after-daemon; do
+    if (exercise_pair_transaction "$initial" "$fault"); then
+      printf 'PASS: installer pair %s %s\n' "$initial" "$fault"
+    else
+      printf 'FAIL: installer pair %s %s\n' "$initial" "$fault" >&2
+      cat "$task_dir/pair-$initial-$fault/result" >&2
+      pair_failures=$((pair_failures + 1))
+    fi
+  done
+done
+for fault in blocked-restore term-after-cli term-after-daemon; do
+  if (exercise_pair_transaction both "$fault"); then
+    printf 'PASS: installer pair both %s\n' "$fault"
+  else
+    printf 'FAIL: installer pair both %s\n' "$fault" >&2
+    cat "$task_dir/pair-both-$fault/result" >&2
+    pair_failures=$((pair_failures + 1))
+  fi
+done
+[[ "$pair_failures" == 0 ]]
+
 # Piped definitions run in an attacker-controlled checkout, even with the old
 # auto-detection bait. They must never qualify as an explicit source install.
 mkdir -p "$task_dir/ambient"

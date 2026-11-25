@@ -6,7 +6,7 @@ cd "$(dirname "$0")/.."
 task_dir=$(mktemp -d "${TMPDIR:-/tmp}/installer-source.XXXXXX")
 trap 'rm -rf "$task_dir"' EXIT
 
-for scenario in ubuntu22-x86 ubuntu22-arm ubuntu24-x86 ubuntu24-arm debian arch arch-missing-libarchive fedora macos ubuntu-retry ubuntu-rename-directory ubuntu-missing-binary ubuntu-rustc-failure ubuntu-configured-success; do
+for scenario in ubuntu22-x86 ubuntu22-arm ubuntu24-x86 ubuntu24-arm debian arch arch-missing-libarchive fedora fedora-missing-daemon macos ubuntu-retry ubuntu-rename-directory ubuntu-missing-binary ubuntu-rustc-failure ubuntu-configured-success; do
   fixture="$task_dir/$scenario"
   mkdir -p "$fixture/source" "$fixture/tools" "$fixture/home"
   distro=ubuntu
@@ -17,7 +17,7 @@ for scenario in ubuntu22-x86 ubuntu22-arm ubuntu24-x86 ubuntu24-arm debian arch 
     ubuntu22-*) version=22.04 ;;
     debian) distro=debian; version=12 ;;
     arch*) distro=arch ;;
-    fedora) distro=fedora ;;
+    fedora*) distro=fedora ;;
     macos) system=Darwin ;;
   esac
   case "$scenario" in *-arm) machine=aarch64 ;; esac
@@ -58,7 +58,10 @@ if [[ "$FIXTURE_RETRY" == 1 && ! -e "$FIXTURE/retried" ]]; then
 fi
 mkdir -p "$CARGO_TARGET_DIR/$FIXTURE_TARGET/release"
 for binary in omg omgd; do
-  if [[ "$FIXTURE_SCENARIO" == ubuntu-missing-binary && "$binary" == omg ]]; then continue; fi
+  if [[ "$FIXTURE_SCENARIO/$binary" == ubuntu-missing-binary/omg ||
+        "$FIXTURE_SCENARIO/$binary" == fedora-missing-daemon/omgd ]]; then
+    continue
+  fi
   printf '#!/bin/sh\nprintf "fixture binary\\n"\n' > "$CARGO_TARGET_DIR/$FIXTURE_TARGET/release/$binary"
   chmod +x "$CARGO_TARGET_DIR/$FIXTURE_TARGET/release/$binary"
 done
@@ -92,7 +95,7 @@ EOF
   fixture_shell=/bin/sh
   skip_shell=1
   case "$scenario" in
-    ubuntu-missing-binary | ubuntu-rustc-failure | ubuntu-configured-success)
+    ubuntu-missing-binary | fedora-missing-daemon | ubuntu-rustc-failure | ubuntu-configured-success)
       fixture_shell=/bin/bash
       skip_shell=0
       printf '# Existing shell configuration\n' > "$fixture/home/.bashrc"
@@ -121,13 +124,13 @@ EOF
   [[ "$retry" == 0 ]] || expected_status=1
   [[ "$missing_libarchive" == 0 ]] || expected_status=1
   [[ "$rename_directory" == 0 ]] || expected_status=1
-  case "$scenario" in ubuntu-missing-binary | ubuntu-rustc-failure) expected_status=1 ;; esac
+  case "$scenario" in ubuntu-missing-binary | fedora-missing-daemon | ubuntu-rustc-failure) expected_status=1 ;; esac
   if [[ "$status" != "$expected_status" ]]; then
     cat "$fixture/output" >&2
     printf '%s: expected exit %s, got %s\n' "$scenario" "$expected_status" "$status" >&2
     exit 1
   fi
-  if [[ "$scenario" == ubuntu-missing-binary || "$scenario" == ubuntu-rustc-failure ]]; then
+  if [[ "$scenario" == ubuntu-missing-binary || "$scenario" == fedora-missing-daemon || "$scenario" == ubuntu-rustc-failure ]]; then
     ! grep -Fq 'Installation Complete!' "$fixture/output"
     [[ ! -e "$fixture/config" && ! -e "$fixture/data" && ! -e "$fixture/bin/omg" ]]
     cmp "$fixture/original-bashrc" "$fixture/home/.bashrc"
@@ -148,7 +151,7 @@ EOF
   expected_features=debian,license,pgp
   case "$scenario" in
     arch) expected_features=arch,license,pgp ;;
-    fedora) expected_features=fedora,license,pgp ;;
+    fedora*) expected_features=fedora,license,pgp ;;
     macos) expected_features=macos,license,pgp ;;
   esac
   expected_builds=$((1 + retry))
@@ -165,6 +168,9 @@ EOF
   fi
   if [[ "$scenario" == ubuntu-missing-binary ]]; then
     [[ -x "$fixture/target/$target/release/omgd" && ! -e "$fixture/bin/omgd" ]]
+  elif [[ "$scenario" == fedora-missing-daemon ]]; then
+    [[ -x "$fixture/target/$target/release/omg" && ! -e "$fixture/bin/omgd" && ! -e "$fixture/bin/omg" ]]
+    grep -Fq 'binary missing from install source' "$fixture/output"
   elif [[ "$rename_directory" == 1 ]]; then
     grep -Fq 'Fixture rename failed:' "$fixture/output"
     [[ -d "$fixture/bin/omg" && ! -e "$fixture/bin/omg/omg" && ! -e "$fixture/bin/omgd" ]]

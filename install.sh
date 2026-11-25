@@ -174,99 +174,91 @@ ask_yes_no() {
 # chmod, then rename over the destination so an interrupted install never
 # leaves a truncated binary.
 #
-# SECURITY (daybreak csf_00c97e45): the staging name must never be
-# predictable (e.g. `${dst}.tmp.$$`). In a shared install dir a local
-# attacker could pre-create that path as a symlink and redirect the copy
-# onto an unrelated file outside the install location. `mktemp -d` creates
-# an unpredictably named, mode-0700 directory no other user can traverse,
-# so the staged copy cannot be redirected before the final rename.
-install_binary() {
-  local src="$1"
-  local dst="$2"
-  local staging_dir tmp_dst
-
-  if [[ ! -f "$src" ]]; then
-    warn "Skipping $(basename "$dst"): binary missing from install source"
-    return 1
-  fi
-
-  if [[ -d "$dst" && ! -L "$dst" ]]; then
-    error "Refusing to install over a directory: $dst"
-  fi
-
-  if ! staging_dir=$(mktemp -d "$(dirname "$dst")/omg-install.XXXXXX"); then
-    error "Failed to create a private staging directory in $(dirname "$dst")"
-  fi
-  tmp_dst="$staging_dir/$(basename "$dst")"
-
-  if ! cp "$src" "$tmp_dst"; then
-    rm -rf "$staging_dir"
-    error "Failed to copy $(basename "$src") to $INSTALL_DIR"
-  fi
-  chmod +x "$tmp_dst"
-  if ! rename_install_binary "$tmp_dst" "$dst"; then
-    rm -rf "$staging_dir"
-    error "Failed to install $dst"
-  fi
-  rmdir "$staging_dir" 2>/dev/null || rm -rf "$staging_dir"
-}
-
-# Commit a release's CLI and daemon as one recoverable pair. The filesystem
-# cannot rename two paths atomically, so preserve the original CLI until the
-# daemon replacement succeeds and restore it on every failure or signal.
+# Stage both executables before publishing either. Rollback keeps the exact
+# original directory entries, including executable metadata and symlinks.
 install_binary_pair() (
-  local first_src="$1" first_dst="$2" second_src="$3" second_dst="$4"
-  local transaction_dir first_backup
-  local had_first=false first_committed=false
+  pair_sources=("$1" "$3")
+  pair_destinations=("$2" "$4")
+  pair_parent="$(dirname "$2")"
+  pair_armed=false
 
-  if [[ ! -f "$first_src" || ! -f "$second_src" ]]; then
-    warn "Refusing to install an incomplete binary pair"
+  if [[ "$2" == "$4" || "$pair_parent" != "$(dirname "$4")" ]]; then
+    warn "Binary pair requires two destinations in the same directory"
     return 1
   fi
-  for destination in "$first_dst" "$second_dst"; do
-    if [[ -d "$destination" && ! -L "$destination" ]]; then
-      warn "Refusing to install over a directory: $destination"
+  for source in "${pair_sources[@]}"; do
+    if [[ ! -f "$source" ]]; then
+      warn "Refusing to install an incomplete pair: binary missing from install source: $source"
       return 1
     fi
   done
-  if ! transaction_dir=$(mktemp -d "$(dirname "$first_dst")/omg-pair.XXXXXX"); then
+
+  if ! mkdir -p "$pair_parent" ||
+     ! pair_work=$(mktemp -d "$pair_parent/omg-pair.XXXXXX"); then
     warn "Failed to create a private binary-pair transaction directory"
     return 1
   fi
-  first_backup="$transaction_dir/first-backup"
 
   rollback_binary_pair() {
-    if [[ "$first_committed" == true ]]; then
-      if [[ "$had_first" == true ]]; then
-        if ! rename_install_binary "$first_backup" "$first_dst"; then
-          warn "CRITICAL: failed to restore $first_dst after daemon installation failed"
+    local slot destination name backup retained=false
+    if [[ "$pair_armed" == true ]]; then
+      for slot in 1 0; do
+        destination="${pair_destinations[slot]}"
+        name="${destination##*/}"
+        backup="$pair_work/old-$name"
+        # A successful rename consumes the staged file, even if the caller
+        # receives a signal or a failure status immediately afterward.
+        [[ ! -e "$pair_work/new-$name" ]] || continue
+        if [[ -e "$backup" || -L "$backup" ]]; then
+          if ! rename_install_binary "$backup" "$destination"; then
+            warn "Failed to restore $destination"
+            retained=true
+          fi
+        elif ! rm -f "$destination"; then
+          warn "Failed to remove newly installed $destination"
+          retained=true
         fi
-      else
-        rm -f "$first_dst"
-      fi
+      done
     fi
-    rm -rf "$transaction_dir"
+    if [[ "$retained" == true ]]; then
+      warn "Rollback needs attention. Recovery directory: $pair_work"
+    else
+      rm -rf "$pair_work"
+    fi
   }
   trap rollback_binary_pair EXIT
   trap 'exit 129' HUP
   trap 'exit 130' INT
   trap 'exit 143' TERM
 
-  if [[ -e "$first_dst" || -L "$first_dst" ]]; then
-    if ! cp -pP "$first_dst" "$first_backup"; then
-      warn "Failed to preserve $first_dst before installing the binary pair"
+  for slot in 0 1; do
+    destination="${pair_destinations[slot]}"
+    name="${destination##*/}"
+    if [[ -e "$destination" || -L "$destination" ]]; then
+      if [[ ! -f "$destination" && ! -L "$destination" ]]; then
+        warn "Refusing to install over a non-regular destination: $destination"
+        return 1
+      fi
+      if ! ln -P "$destination" "$pair_work/old-$name"; then
+        warn "Failed to preserve $destination before installing the binary pair"
+        return 1
+      fi
+    fi
+    if ! cp "${pair_sources[slot]}" "$pair_work/new-$name" ||
+       ! chmod 755 "$pair_work/new-$name"; then
+      warn "Failed to stage $destination"
       return 1
     fi
-    had_first=true
-  fi
+  done
 
-  install_binary "$first_src" "$first_dst" || return 1
-  first_committed=true
-  install_binary "$second_src" "$second_dst" || return 1
-
-  first_committed=false
-  trap - EXIT HUP INT TERM
-  rm -rf "$transaction_dir"
+  pair_armed=true
+  for destination in "${pair_destinations[@]}"; do
+    if ! rename_install_binary "$pair_work/new-${destination##*/}" "$destination"; then
+      warn "Failed to install $destination"
+      return 1
+    fi
+  done
+  pair_armed=false
 )
 
 rename_install_binary() {
@@ -705,7 +697,6 @@ install_from_release() {
   probe_release_binary "$omg_path" omg "$actual_version" || return 1
   probe_release_binary "$omgd_path" omgd "$actual_version" || return 1
 
-  mkdir -p "$INSTALL_DIR"
   install_binary_pair "$omg_path" "$INSTALL_DIR/omg" "$omgd_path" "$INSTALL_DIR/omgd" || return 1
 
   success "Installed prebuilt binaries to $INSTALL_DIR"
@@ -977,11 +968,8 @@ build_omg() {
   fi
 
   # Install
-  mkdir -p "$INSTALL_DIR"
-  install_binary "$target_dir/$host_target/release/omg" "$INSTALL_DIR/omg" || return 1
-  if [[ -f "$target_dir/$host_target/release/omgd" ]]; then
-    install_binary "$target_dir/$host_target/release/omgd" "$INSTALL_DIR/omgd" || return 1
-  fi
+  install_binary_pair "$target_dir/$host_target/release/omg" "$INSTALL_DIR/omg" \
+    "$target_dir/$host_target/release/omgd" "$INSTALL_DIR/omgd" || return 1
 
   success "Installed to $INSTALL_DIR/omg"
 }
