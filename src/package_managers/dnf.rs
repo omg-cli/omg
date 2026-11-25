@@ -26,6 +26,9 @@ use crate::core::{Package, PackageSource, is_root};
 use crate::package_managers::PackageManager;
 use crate::package_managers::types::{UpdateInfo, parse_version_or_zero};
 
+mod rpm_database;
+
+use rpm_database::{HOST_SQLITE, RpmDatabase};
 use rusqlite::{Connection, OpenFlags};
 use zerocopy::{FromBytes, Immutable, KnownLayout, big_endian::U32};
 
@@ -40,6 +43,8 @@ mod rpm_tags {
     pub const RELEASE: u32 = 1002;
     pub const EPOCH: u32 = 1003;
     pub const SUMMARY: u32 = 1004;
+    pub const SIZE: u32 = 1009;
+    pub const LONGSIZE: u32 = 5009;
     pub const ARCH: u32 = 1022;
 }
 
@@ -153,13 +158,15 @@ struct RpmDatabaseObservation {
 }
 
 struct RpmInstalledCatalogObservation {
-    path: PathBuf,
+    host_sqlite: PathBuf,
+    location: RpmDatabase,
     database: RpmDatabaseObservation,
 }
 
 impl super::InstalledCatalogObservation for RpmInstalledCatalogObservation {
     fn is_current(&self) -> Result<bool> {
-        Ok(self.database.is_current(&self.path))
+        Ok(RpmDatabase::detect(&self.host_sqlite)? == self.location
+            && self.database.is_current(&self.location.sqlite))
     }
 }
 
@@ -731,7 +738,7 @@ impl DnfPackageManager {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            rpm_db_path: PathBuf::from("/var/lib/rpm/rpmdb.sqlite"),
+            rpm_db_path: PathBuf::from(HOST_SQLITE),
             repos_dir: PathBuf::from("/etc/yum.repos.d"),
             installed_cache: Arc::new(RwLock::new(None)),
         }
@@ -756,15 +763,16 @@ impl DnfPackageManager {
         *self.cache_write() = None;
     }
 
-    fn cached_installed_packages(&self) -> Option<Vec<InstalledPackage>> {
+    fn cached_installed_packages(&self, path: &Path) -> Option<Vec<InstalledPackage>> {
         self.cache_read()
             .as_ref()
-            .filter(|snapshot| snapshot.observation.is_current(&self.rpm_db_path))
+            .filter(|snapshot| snapshot.observation.is_current(path))
             .map(|snapshot| snapshot.packages.values().flatten().cloned().collect())
     }
 
     fn publish_installed_packages(
         &self,
+        path: &Path,
         packages: &[InstalledPackage],
         observed_identity: Option<RpmDatabaseObservation>,
     ) {
@@ -772,7 +780,7 @@ impl DnfPackageManager {
         // fallback whose actual database was not observed. Empty inventories
         // are valid snapshots too.
         let snapshot = observed_identity
-            .filter(|observation| observation.is_current(&self.rpm_db_path))
+            .filter(|observation| observation.is_current(path))
             .map(|observation| {
                 let mut grouped: HashMap<String, Vec<InstalledPackage>> = HashMap::new();
                 for package in packages {
@@ -823,7 +831,19 @@ impl DnfPackageManager {
     /// # Errors
     /// Returns an error when the installed RPM inventory cannot be read.
     pub fn installed_count(&self) -> Result<usize> {
-        Ok(self.load_installed_packages_blocking()?.len())
+        let location = RpmDatabase::detect(&self.rpm_db_path)?;
+        let count = Self::open_rpm_sqlite(&location.sqlite).and_then(|connection| {
+            let count: i64 =
+                connection.query_row("SELECT COUNT(*) FROM Packages", [], |row| row.get(0))?;
+            usize::try_from(count).context("RPM package count does not fit in memory")
+        });
+        match count {
+            Ok(count) => Ok(count),
+            Err(error) => {
+                tracing::debug!("RPM SQLite count unavailable: {error:#}");
+                Ok(self.load_installed_at(&location)?.len())
+            }
+        }
     }
 
     /// Load installed packages from RPM `SQLite` database
@@ -836,11 +856,16 @@ impl DnfPackageManager {
     }
 
     fn load_installed_packages_blocking(&self) -> Result<Vec<InstalledPackage>> {
-        if let Some(cached) = self.cached_installed_packages() {
+        let location = RpmDatabase::detect(&self.rpm_db_path)?;
+        self.load_installed_at(&location)
+    }
+
+    fn load_installed_at(&self, location: &RpmDatabase) -> Result<Vec<InstalledPackage>> {
+        if let Some(cached) = self.cached_installed_packages(&location.sqlite) {
             return Ok(cached);
         }
-        let (packages, identity) = Self::read_rpm_database(&self.rpm_db_path)?;
-        self.publish_installed_packages(&packages, identity);
+        let (packages, identity) = Self::read_rpm_database(location)?;
+        self.publish_installed_packages(&location.sqlite, &packages, identity);
         Ok(packages)
     }
 
@@ -849,13 +874,14 @@ impl DnfPackageManager {
     }
 
     fn matching_installed_packages(&self, selector: &str) -> Result<Vec<InstalledPackage>> {
-        match Self::read_rpm_name_index(&self.rpm_db_path, selector) {
+        let location = RpmDatabase::detect(&self.rpm_db_path)?;
+        match Self::read_rpm_name_index(&location.sqlite, selector) {
             Ok(packages) if !packages.is_empty() => return Ok(packages),
             Ok(_) => {}
             Err(error) => tracing::debug!("RPM name lookup unavailable: {error:#}"),
         }
         Ok(self
-            .load_installed_packages_blocking()?
+            .load_installed_at(&location)?
             .into_iter()
             .filter(|package| package.matches_selector(selector))
             .collect())
@@ -906,8 +932,9 @@ impl DnfPackageManager {
     /// Read RPM database, trying `SQLite` first then falling back to subprocess
     #[cfg(feature = "fedora")]
     fn read_rpm_database(
-        db_path: &Path,
+        location: &RpmDatabase,
     ) -> Result<(Vec<InstalledPackage>, Option<RpmDatabaseObservation>)> {
+        let db_path = &location.sqlite;
         // Try SQLite first (Fedora 33+, RHEL 9+) - 50-100x faster
         if db_path.exists() {
             let identity = RpmDatabaseObservation::read(db_path);
@@ -932,14 +959,16 @@ impl DnfPackageManager {
         }
 
         // Fallback to subprocess for BDB/NDB systems or when SQLite fails
-        Ok((Self::read_rpm_via_query()?, None))
+        Ok((Self::read_rpm_via_query(&location.root)?, None))
     }
 
     /// Parse installed packages using `rpm -qa` subprocess
     ///
     /// Fallback for systems without `SQLite` RPM database (`BerkeleyDB`, `NDB`).
-    fn read_rpm_via_query() -> Result<Vec<InstalledPackage>> {
+    fn read_rpm_via_query(root: &Path) -> Result<Vec<InstalledPackage>> {
         let output = crate::core::privilege::system_command("rpm")?
+            .arg("--root")
+            .arg(root)
             .args([
                 "-qa",
                 "--queryformat",
@@ -1078,7 +1107,7 @@ impl DnfPackageManager {
         );
 
         let payload = &rest[data_start..data_start + data_size];
-        let mut tags = HashMap::with_capacity(6);
+        let mut tags = HashMap::with_capacity(8);
         for chunk in rest[..data_start].chunks_exact(size_of::<IndexEntry>()) {
             let entry =
                 IndexEntry::ref_from_bytes(chunk).expect("chunk length checked by chunks_exact");
@@ -1095,10 +1124,11 @@ impl DnfPackageManager {
                     "RPM identity tag {tag} must be a single string"
                 );
             }
-            if tag == rpm_tags::EPOCH {
+            if matches!(tag, rpm_tags::EPOCH | rpm_tags::SIZE | rpm_tags::LONGSIZE) {
+                let expected_type = if tag == rpm_tags::LONGSIZE { 5 } else { 4 };
                 anyhow::ensure!(
-                    tag_type == 4 && count == 1,
-                    "RPM EPOCH identity tag must be a single INT32"
+                    tag_type == expected_type && count == 1,
+                    "RPM integer tag {tag} does not contain a single value of the expected type"
                 );
             }
 
@@ -1150,6 +1180,8 @@ impl DnfPackageManager {
                     | rpm_tags::RELEASE
                     | rpm_tags::EPOCH
                     | rpm_tags::SUMMARY
+                    | rpm_tags::SIZE
+                    | rpm_tags::LONGSIZE
                     | rpm_tags::ARCH
             ) {
                 tags.insert(tag, &payload[base..abs_end]);
@@ -1164,8 +1196,10 @@ impl DnfPackageManager {
     /// Extracts name, version, release, and summary from the RPM header blob.
     /// Installation reason is loaded from DNF's system-state query.
     fn parse_package_from_blob(blob: &[u8]) -> Result<InstalledPackage> {
-        let tags = Self::parse_rpm_header(blob)?;
+        Self::parse_package_from_tags(&Self::parse_rpm_header(blob)?)
+    }
 
+    fn parse_package_from_tags(tags: &HashMap<u32, &[u8]>) -> Result<InstalledPackage> {
         // Helper to extract string from tag data
         let get_string = |tag: u32| -> String {
             tags.get(&tag)
@@ -1207,13 +1241,17 @@ impl DnfPackageManager {
     /// Opens `/var/lib/rpm/rpmdb.sqlite` in read-only mode and parses
     /// RPM header blobs from the `Packages` table without a subprocess.
     fn read_rpm_sqlite(db_path: &Path) -> Result<Vec<InstalledPackage>> {
-        let conn = Connection::open_with_flags(
+        Self::read_rpm_sqlite_connection(&Self::open_rpm_sqlite(db_path)?)
+    }
+
+    fn open_rpm_sqlite(db_path: &Path) -> Result<Connection> {
+        let connection = Connection::open_with_flags(
             db_path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
         .context("Failed to open RPM SQLite database")?;
-
-        Self::read_rpm_sqlite_connection(&conn)
+        connection.busy_timeout(std::time::Duration::from_secs(5))?;
+        Ok(connection)
     }
 
     fn read_rpm_sqlite_connection(conn: &Connection) -> Result<Vec<InstalledPackage>> {
@@ -1310,8 +1348,80 @@ impl DnfPackageManager {
     pub(crate) async fn installed_package_sizes(
         query: InstalledSizeQuery<'_>,
     ) -> Result<Vec<(String, i64)>> {
+        if query == InstalledSizeQuery::All
+            && let Some(sizes) = tokio::task::spawn_blocking(|| {
+                let location = RpmDatabase::detect(Path::new(HOST_SQLITE))?;
+                let sizes = Self::read_rpm_installed_sizes(&location.sqlite);
+                match sizes {
+                    Ok(sizes) => Ok::<_, anyhow::Error>(Some(sizes)),
+                    Err(error) => {
+                        tracing::debug!("RPM SQLite sizes unavailable: {error:#}");
+                        Ok(None)
+                    }
+                }
+            })
+            .await??
+        {
+            return Ok(sizes);
+        }
+
         let output = Self::repository_output(RepositoryQuery::InstalledSizes(query)).await?;
         Self::parse_installed_sizes(&output)
+    }
+
+    fn read_rpm_installed_sizes(path: &Path) -> Result<Vec<(String, i64)>> {
+        let conn = Self::open_rpm_sqlite(path)?;
+        let mut statement = conn.prepare("SELECT blob FROM Packages")?;
+        let mut rows = statement.query([])?;
+        let mut sizes = Vec::new();
+        while let Some(row) = rows.next()? {
+            let tags = Self::parse_rpm_header(row.get_ref(0)?.as_blob()?)?;
+            let package = Self::parse_package_from_tags(&tags)?;
+            if package.name == "gpg-pubkey" {
+                continue;
+            }
+            anyhow::ensure!(
+                [
+                    &package.name,
+                    &package.version,
+                    &package.release,
+                    &package.architecture
+                ]
+                .into_iter()
+                .all(|field| !field.is_empty()
+                    && !field
+                        .chars()
+                        .any(|ch| ch.is_whitespace() || ch.is_control())),
+                "RPM header does not identify a complete installed package"
+            );
+            let epoch = if package.version.contains(':') {
+                ""
+            } else {
+                "0:"
+            };
+            let identity = format!(
+                "{}-{epoch}{}-{}.{}",
+                package.name, package.version, package.release, package.architecture
+            );
+            sizes.push((identity, Self::rpm_installed_size(&tags)?));
+        }
+        Ok(sizes)
+    }
+
+    fn rpm_installed_size(tags: &HashMap<u32, &[u8]>) -> Result<i64> {
+        let long = tags
+            .get(&rpm_tags::LONGSIZE)
+            .map(|bytes| -> Result<u64> { Ok(u64::from_be_bytes((*bytes).try_into()?)) })
+            .transpose()?
+            .filter(|value| *value != 0);
+        if let Some(value) = long {
+            return Ok(value.try_into()?);
+        }
+        Ok(tags
+            .get(&rpm_tags::SIZE)
+            .map(|bytes| -> Result<i64> { Ok(u32::from_be_bytes((*bytes).try_into()?).into()) })
+            .transpose()?
+            .unwrap_or_default())
     }
 
     fn parse_installed_sizes(output: &[u8]) -> Result<Vec<(String, i64)>> {
@@ -2425,10 +2535,12 @@ impl PackageManager for DnfPackageManager {
     fn installed_catalog_observation(
         &self,
     ) -> Result<Option<Arc<dyn super::InstalledCatalogObservation>>> {
-        let database = RpmDatabaseObservation::read(&self.rpm_db_path)
+        let location = RpmDatabase::detect(&self.rpm_db_path)?;
+        let database = RpmDatabaseObservation::read(&location.sqlite)
             .context("Cannot observe RPM SQLite inventory for daemon catalog")?;
         Ok(Some(Arc::new(RpmInstalledCatalogObservation {
-            path: self.rpm_db_path.clone(),
+            host_sqlite: self.rpm_db_path.clone(),
+            location,
             database,
         })))
     }
@@ -2442,7 +2554,6 @@ impl PackageManager for DnfPackageManager {
             // packages. Installed inventory needs no repository metadata.
             command.args([
                 "--cacheonly",
-                "--disable-repo=*",
                 "--setopt=disable_excludes=*",
                 "repoquery",
                 "--installed",
@@ -3397,6 +3508,34 @@ mod tests {
             );
         }
         assert!(reject_unsealed_local_rpm_targets(&["package-name.x86_64".to_owned()]).is_ok());
+    }
+
+    #[test]
+    fn rpm_installed_size_uses_unsigned_bytes_and_prefers_nonzero_long_size() -> Result<()> {
+        let short = u32::MAX.to_be_bytes();
+        let long = (u64::from(u32::MAX) + 4096).to_be_bytes();
+        let zero = 0_u64.to_be_bytes();
+        let overflow = u64::MAX.to_be_bytes();
+        let mut tags: HashMap<u32, &[u8]> = HashMap::new();
+        assert_eq!(DnfPackageManager::rpm_installed_size(&tags)?, 0);
+        tags.insert(rpm_tags::SIZE, &short);
+        assert_eq!(
+            DnfPackageManager::rpm_installed_size(&tags)?,
+            i64::from(u32::MAX)
+        );
+        tags.insert(rpm_tags::LONGSIZE, &zero);
+        assert_eq!(
+            DnfPackageManager::rpm_installed_size(&tags)?,
+            i64::from(u32::MAX)
+        );
+        tags.insert(rpm_tags::LONGSIZE, &long);
+        assert_eq!(
+            DnfPackageManager::rpm_installed_size(&tags)?,
+            i64::from(u32::MAX) + 4096
+        );
+        tags.insert(rpm_tags::LONGSIZE, &overflow);
+        assert!(DnfPackageManager::rpm_installed_size(&tags).is_err());
+        Ok(())
     }
 
     #[test]
@@ -4834,7 +4973,9 @@ mod tests {
             database.pragma_update(None, "journal_mode", journal_mode)?;
             assert_eq!(manager.list_installed().await?.len(), 1);
             assert!(
-                manager.cached_installed_packages().is_some(),
+                manager
+                    .cached_installed_packages(&manager.rpm_db_path)
+                    .is_some(),
                 "first inventory read must initialize a cache in {journal_mode} mode"
             );
             database.execute("DELETE FROM Packages", [])?;
@@ -4926,7 +5067,7 @@ mod tests {
         assert!(manager.list_installed().await?.is_empty());
         assert!(
             manager
-                .cached_installed_packages()
+                .cached_installed_packages(&manager.rpm_db_path)
                 .expect("empty snapshot")
                 .is_empty()
         );
@@ -4937,7 +5078,11 @@ mod tests {
         assert!(manager.is_installed("publicsuffix-list-dafsa").await?);
         assert_eq!(manager.list_installed().await?.len(), 1);
         manager.cache_handle().invalidate_installed_cache();
-        assert!(manager.cached_installed_packages().is_none());
+        assert!(
+            manager
+                .cached_installed_packages(&manager.rpm_db_path)
+                .is_none()
+        );
         Ok(())
     }
 
@@ -4956,10 +5101,18 @@ mod tests {
         // and publication, the original observer must reject the old inventory.
         observed.as_mut().expect("database observer").identity =
             RpmDatabaseIdentity::read(&manager.rpm_db_path).expect("database identity");
-        manager.publish_installed_packages(&packages, observed);
-        assert!(manager.cached_installed_packages().is_none());
-        manager.publish_installed_packages(&packages, None);
-        assert!(manager.cached_installed_packages().is_none());
+        manager.publish_installed_packages(&manager.rpm_db_path, &packages, observed);
+        assert!(
+            manager
+                .cached_installed_packages(&manager.rpm_db_path)
+                .is_none()
+        );
+        manager.publish_installed_packages(&manager.rpm_db_path, &packages, None);
+        assert!(
+            manager
+                .cached_installed_packages(&manager.rpm_db_path)
+                .is_none()
+        );
         Ok(())
     }
 
@@ -4971,7 +5124,7 @@ mod tests {
         manager.rpm_db_path = directory.path().join("rpmdb.sqlite");
         assert_eq!(manager.list_installed().await?.len(), 1);
         let cached = manager
-            .cached_installed_packages()
+            .cached_installed_packages(&manager.rpm_db_path)
             .expect("private fixture cache must exist before testing invalidation");
         assert_eq!(
             cached
@@ -4987,10 +5140,18 @@ mod tests {
         );
         let wal = directory.path().join("rpmdb.sqlite-wal");
         std::fs::create_dir(&wal)?;
-        assert!(manager.cached_installed_packages().is_none());
+        assert!(
+            manager
+                .cached_installed_packages(&manager.rpm_db_path)
+                .is_none()
+        );
         std::fs::remove_dir(wal)?;
         std::fs::remove_file(&manager.rpm_db_path)?;
-        assert!(manager.cached_installed_packages().is_none());
+        assert!(
+            manager
+                .cached_installed_packages(&manager.rpm_db_path)
+                .is_none()
+        );
         Ok(())
     }
 
@@ -5012,11 +5173,11 @@ mod tests {
             })
             .collect();
 
-        manager.publish_installed_packages(&packages, identity.clone());
-        manager.publish_installed_packages(&packages, identity);
+        manager.publish_installed_packages(&manager.rpm_db_path, &packages, identity.clone());
+        manager.publish_installed_packages(&manager.rpm_db_path, &packages, identity);
 
         let cached = manager
-            .cached_installed_packages()
+            .cached_installed_packages(&manager.rpm_db_path)
             .expect("populated cache");
         assert_eq!(cached.len(), 2);
         let mut identities: Vec<_> = cached
@@ -5082,6 +5243,7 @@ mod tests {
         manager.rpm_db_path = directory.path().join("rpmdb.sqlite");
         let identity = RpmDatabaseObservation::read(&manager.rpm_db_path);
         manager.publish_installed_packages(
+            &manager.rpm_db_path,
             &[InstalledPackage {
                 name: "glibc".to_string(),
                 version: "2.41".to_string(),
@@ -5093,6 +5255,7 @@ mod tests {
             identity.clone(),
         );
         manager.publish_installed_packages(
+            &manager.rpm_db_path,
             &[InstalledPackage {
                 name: "bash".to_string(),
                 version: "5.2".to_string(),
@@ -5105,7 +5268,7 @@ mod tests {
         );
 
         let cached = manager
-            .cached_installed_packages()
+            .cached_installed_packages(&manager.rpm_db_path)
             .expect("populated cache");
         assert_eq!(cached.len(), 1);
         assert_eq!(cached[0].name, "bash");

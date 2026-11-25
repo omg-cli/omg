@@ -68,6 +68,41 @@ check_reason_delta() {
 }
 # END DNF REASON DELTA ORACLE
 
+verify_configured_installroot() {
+  local root="$base/alternate-root"
+  local report="$base/alternate-report" home
+  local -a omg=(sudo -H -u "$guest_user" -- env OMG_DISABLE_DAEMON=1 "$binary")
+  home=$(getent passwd "$guest_user" | cut -d: -f6)
+  [[ "$home" == /* && "$home" != / ]] || return 1
+  mkdir -p "$root/etc/dnf"
+  install -d -o "$guest_user" -m 0700 "$report" "$root$home/.local/state" "$root$home/.cache"
+  rpm --root "$root" -U --nosignature "$v1"
+  printf '[main]\ninstallroot=%s\nplugins=0\nreposdir=\n' "$root" > "$root/etc/dnf/dnf.conf"
+  config_written=true
+  install -m 0644 "$root/etc/dnf/dnf.conf" "$config"
+  [[ $(rpm --root "$root" -qa --qf '%{NAME}\n') == "$package" ]]
+  ! rpm -q "$package" >/dev/null 2>&1
+  rpm -q rpm >/dev/null
+  "${omg[@]}" --json tc | jq -e '.count == 1' > /dev/null
+  "${omg[@]}" --json status --fast |
+    jq -e '.total_packages == 1 and .explicit_packages == 1 and .orphan_packages == 0 and .updates_available == 0' > /dev/null
+  "${omg[@]}" --json explicit | jq -e --arg name "$package" '.packages == [$name]' > /dev/null
+  "${omg[@]}" --json info "$package" |
+    jq -e --arg name "$package.noarch" '.name == $name and .version == "1-1" and .installed == true' > /dev/null
+  "${omg[@]}" --json search "$package" |
+    jq -e --arg name "$package.noarch" 'map(.name) == [$name]' > /dev/null
+  "${omg[@]}" --json search 'rpm' |
+    jq -e 'length == 0' > /dev/null
+  "${omg[@]}" size --limit 2 > "$base/alternate-size.log"
+  grep -Fq "Number of Packages: 1" "$base/alternate-size.log"
+  grep -Fq "$package-0:1-1.noarch" "$base/alternate-size.log"
+  "${omg[@]}" audit sbom --inventory-only --output "$report/sbom.json"
+  jq -e --arg name "$package" '.components | map(.name) == [$name]' "$report/sbom.json" > /dev/null
+  if [[ "$had_config" == true ]]; then cp -a "$base/original-dnf.conf" "$config"
+  else rm -f -- "$config"; fi
+  config_written=false
+}
+
 verify_installed_commands() {
   local identity hidden
   local -a omg=(sudo -H -u "$guest_user" -- env OMG_DISABLE_DAEMON=1 "$binary")
@@ -140,6 +175,9 @@ SPEC
 }
 v1=$(build_rpm 1); v2=$(build_rpm 2); v3=$(build_rpm 3)
 [[ -f "$v1" && -f "$v2" && -f "$v3" ]] || exit 120
+phase=product
+verify_configured_installroot
+phase=setup
 rpm -Uvh --nosignature "$v1" > "$base/install-v1.log" 2>&1 || { cat "$base/install-v1.log" >&2; exit 120; }
 [[ $(rpm -q --qf '%{VERSION}\n' "$package") == 1 ]] || exit 120
 rpm -qa --qf '%{NAME}|%{EPOCHNUM}|%{VERSION}|%{RELEASE}|%{ARCH}\n' |
