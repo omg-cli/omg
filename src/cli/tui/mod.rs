@@ -211,10 +211,7 @@ async fn run_app(
         #[cfg(unix)]
         while let Ok((connected, status)) = daemon_rx.try_recv() {
             daemon_refresh_in_flight = false;
-            app.daemon_connected = connected;
-            if let Some(status) = status {
-                app.status = Some(status);
-            }
+            app.apply_daemon_status(connected, status);
         }
         while let Ok(remote_status) = team_rx.try_recv() {
             team_refresh_in_flight = false;

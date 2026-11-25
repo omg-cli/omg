@@ -244,6 +244,12 @@ impl App {
         (true, status)
     }
 
+    #[cfg(unix)]
+    pub(crate) fn apply_daemon_status(&mut self, connected: bool, status: Option<StatusResult>) {
+        self.daemon_connected = connected;
+        self.status = status;
+    }
+
     fn load_local_team_status(&mut self) {
         if let Ok(cwd) = std::env::current_dir()
             && let Ok(workspace) = crate::core::env::team::TeamWorkspace::new(&cwd)
