@@ -127,6 +127,19 @@ pub(crate) enum UpdateMode {
     Turbo,
 }
 
+fn select_native_update<T>(
+    mode: UpdateMode,
+    no_sync: bool,
+    cached: impl FnOnce() -> Option<T>,
+    standard: impl FnOnce() -> Option<T>,
+) -> Option<T> {
+    match mode {
+        UpdateMode::Turbo => cached(),
+        UpdateMode::Standard if no_sync => cached().or_else(standard),
+        UpdateMode::Standard | UpdateMode::Fast => standard(),
+    }
+}
+
 #[expect(clippy::fn_params_excessive_bools)] // Maps to --check / --yes / --dry-run / --no-sync
 pub(crate) async fn update_official_only(
     check_only: bool,
@@ -230,14 +243,18 @@ pub(crate) async fn update_official_only(
     let pb =
         crate::cli::modern_ui::modern_spinner("Upgrading", &format!("{count} official packages"));
     let history = crate::core::history::HistoryManager::new()?;
-    let native_operation = match mode {
-        UpdateMode::Turbo => pm.transact_cached_update_with_history(Some(&history)),
-        UpdateMode::Standard | UpdateMode::Fast => pm.transact_with_history(
-            crate::core::history::TransactionType::Update,
-            &[],
-            Some(&history),
-        ),
-    };
+    let native_operation = select_native_update(
+        mode,
+        no_sync,
+        || pm.transact_cached_update_with_history(Some(&history)),
+        || {
+            pm.transact_with_history(
+                crate::core::history::TransactionType::Update,
+                &[],
+                Some(&history),
+            )
+        },
+    );
     if let Some(operation) = native_operation {
         operation.await?;
     } else {
@@ -359,6 +376,38 @@ pub(crate) async fn remove_with_manager(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn standard_no_sync_prefers_a_cached_native_upgrade() {
+        let selected = select_native_update(
+            UpdateMode::Standard,
+            true,
+            || Some("cached plan"),
+            || Some("refreshable plan"),
+        );
+        assert_eq!(selected, Some("cached plan"));
+    }
+
+    #[test]
+    fn standard_no_sync_keeps_the_native_upgrade_when_cached_admission_is_unavailable() {
+        let selected =
+            select_native_update(UpdateMode::Standard, true, || None, || Some("native plan"));
+        assert_eq!(selected, Some("native plan"));
+    }
+
+    #[test]
+    fn synced_updates_keep_the_standard_plan_and_turbo_keeps_cached_metadata() {
+        for (mode, expected) in [
+            (UpdateMode::Standard, Some("native plan")),
+            (UpdateMode::Fast, Some("native plan")),
+            (UpdateMode::Turbo, Some("cached plan")),
+        ] {
+            assert_eq!(
+                select_native_update(mode, false, || Some("cached plan"), || Some("native plan")),
+                expected
+            );
+        }
+    }
 
     /// The Arch update lane calls this after every sync: with no daemon it
     /// must be a quiet no-op, never a failure that aborts the update.
