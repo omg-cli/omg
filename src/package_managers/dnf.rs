@@ -2373,6 +2373,11 @@ impl DnfPackageManager {
         Self::parse_versioned_packages(&output)
     }
 
+    #[doc(hidden)]
+    pub async fn orphan_count() -> Result<usize> {
+        Ok(Self::unneeded_packages().await?.len())
+    }
+
     pub(crate) async fn orphan_packages() -> Result<Vec<String>> {
         Ok(Self::unneeded_packages()
             .await?
@@ -2731,7 +2736,7 @@ impl PackageManager for DnfPackageManager {
                 (0, 0)
             } else {
                 (
-                    Self::unneeded_packages().await?.len(),
+                    Self::orphan_count().await?,
                     self.list_updates().await?.len(),
                 )
             };

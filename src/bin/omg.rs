@@ -366,6 +366,10 @@ fn print_fast_counter(
         FastCounter::Orphan => orphans,
         FastCounter::Updates => updates,
     };
+    print_counter_value(value, json);
+}
+
+fn print_counter_value(value: u32, json: bool) {
     if json {
         println!("{}", serde_json::json!({"count": value}));
     } else {
@@ -375,10 +379,10 @@ fn print_fast_counter(
 
 #[cfg(unix)]
 fn fast_status_from_daemon() -> Result<(u32, u32, u32, u32)> {
-    use omg_lib::core::client::SyncDaemonClient;
+    use omg_lib::core::client::{PROMPT_COUNTER_TIMEOUT, SyncDaemonClient};
     use omg_lib::daemon::protocol::{Request, ResponseResult};
 
-    let mut client = SyncDaemonClient::acquire()?;
+    let mut client = SyncDaemonClient::acquire_with_timeout(PROMPT_COUNTER_TIMEOUT)?;
     let ResponseResult::Status(status) = client.call(&Request::Status { id: 0 })? else {
         anyhow::bail!("Unexpected response from daemon");
     };
@@ -395,14 +399,28 @@ fn try_fast_counter(args: &[String]) -> Result<bool> {
     let Some(counter) = parse_fast_counter_cmd(args) else {
         return Ok(false);
     };
-    try_print_counter(counter, false)
+    try_print_counter(counter, false, true)
 }
 
 async fn run_counter(counter: FastCounter, json: bool) -> Result<()> {
-    if try_print_counter(counter, json)? {
+    if try_print_counter(counter, json, false)? {
         return Ok(());
     }
     let manager = omg_lib::package_managers::get_package_manager()?;
+    #[cfg(feature = "fedora")]
+    if manager.name() == "dnf" {
+        let count = match counter {
+            FastCounter::Orphan => {
+                Some(omg_lib::package_managers::DnfPackageManager::orphan_count().await?)
+            }
+            FastCounter::Updates => Some(manager.list_updates().await?.len()),
+            FastCounter::Explicit | FastCounter::Total => None,
+        };
+        if let Some(count) = count {
+            print_counter_value(count.try_into()?, json);
+            return Ok(());
+        }
+    }
     let (total, explicit, orphans, updates) = manager.get_status(false).await?;
     print_fast_counter(
         counter,
@@ -415,7 +433,7 @@ async fn run_counter(counter: FastCounter, json: bool) -> Result<()> {
     Ok(())
 }
 
-fn try_print_counter(counter: FastCounter, json: bool) -> Result<bool> {
+fn try_print_counter(counter: FastCounter, json: bool, before_dispatch: bool) -> Result<bool> {
     let selected_backend = omg_lib::package_managers::resolve_backend()?;
     if counter == FastCounter::Explicit {
         packages::explicit_sync_with_json(true, json)?;
@@ -456,18 +474,25 @@ fn try_print_counter(counter: FastCounter, json: bool) -> Result<bool> {
         return Ok(true);
     }
 
+    #[cfg(feature = "fedora")]
+    if selected_backend == omg_lib::package_managers::Backend::Fedora {
+        if counter == FastCounter::Total {
+            let total = omg_lib::package_managers::DnfPackageManager::new().installed_count()?;
+            print_counter_value(total.try_into()?, json);
+            return Ok(true);
+        }
+        // The dispatched path owns the single daemon attempt and can run the
+        // individual asynchronous DNF query if the daemon is unavailable.
+        if before_dispatch {
+            return Ok(false);
+        }
+    }
+    #[cfg(not(feature = "fedora"))]
+    let _ = before_dispatch;
+
     #[cfg(unix)]
     if let Ok((total, explicit, orphans, updates)) = fast_status_from_daemon() {
         print_fast_counter(counter, total, explicit, orphans, updates, json);
-        return Ok(true);
-    }
-
-    #[cfg(feature = "fedora")]
-    if selected_backend == omg_lib::package_managers::Backend::Fedora
-        && counter == FastCounter::Total
-    {
-        let total = omg_lib::package_managers::DnfPackageManager::new().installed_count()?;
-        print_fast_counter(counter, total.try_into()?, 0, 0, 0, json);
         return Ok(true);
     }
 
