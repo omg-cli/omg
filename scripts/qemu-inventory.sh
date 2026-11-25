@@ -971,6 +971,30 @@ prepare_native_orphan() {
   check_native_tree_only_delta "$(cat orphan-before.state)" "$marked"
 }
 
+check_fedora_orphan_decline() {
+  local bin=$1 before after native_before native_after history_before history_after rc=0
+  before=$(native_package_snapshot fedora) || return 1
+  native_before=$(sudo -n dnf --cacheonly history list --json 2> orphan-decline-native.stderr.log) || return 1
+  history_before=$(sudo -n bash -c '
+    if [[ -e /var/lib/omg/history.json ]]; then sha256sum /var/lib/omg/history.json; else echo absent; fi
+  ') || return 1
+  printf 'n\n' | timeout --kill-after=5s 25s sudo -n env LC_ALL=C OMG_DISABLE_DAEMON=1 \
+    "$bin" clean --orphans > orphan-decline.stdout.log 2> orphan-decline.stderr.log || rc=$?
+  if [[ "$rc" != 1 ]] || ! grep -Fq 'Operation aborted by the user' orphan-decline.stderr.log; then
+    printf 'assertion failed: Fedora cleanup did not reach and respect the native decline (exit %s)\n' "$rc" >&2
+    return 1
+  fi
+  after=$(native_package_snapshot fedora) || return 1
+  native_after=$(sudo -n dnf --cacheonly history list --json 2>> orphan-decline-native.stderr.log) || return 1
+  history_after=$(sudo -n bash -c '
+    if [[ -e /var/lib/omg/history.json ]]; then sha256sum /var/lib/omg/history.json; else echo absent; fi
+  ') || return 1
+  if [[ "$after" != "$before" || "$native_after" != "$native_before" || "$history_after" != "$history_before" ]]; then
+    printf 'assertion failed: declined Fedora cleanup changed inventory or transaction history\n' >&2
+    return 1
+  fi
+}
+
 check_native_orphan_removed() {
   local distro=$1 output=$2 after expected architecture
   if [[ "$distro" == arch ]]; then
@@ -2304,6 +2328,7 @@ allow_mutations=false
 allow_credentialed=false
 isolate_hermetic=false
 parallel_runtime_installs=false
+verify_fedora_decline=false
 network_scope=unconfined
 network_policy=""
 row_timeout=120
@@ -2326,7 +2351,8 @@ while (($#)); do
     --allow-credentialed) allow_credentialed=true; shift ;;
     --isolate-hermetic) isolate_hermetic=true; shift ;;
     --parallel-runtime-installs) parallel_runtime_installs=true; shift ;;
-    --help) printf 'Usage: qemu-inventory.sh --work DIR --distro D --tiers CSV --tag TAG --binary GUEST_PATH --tsv FILE [--allow-mutations] [--allow-credentialed] [--row-timeout S]\nRuns TSV-selected rows in the guest at 127.0.0.1 and writes evidence.\n'; exit 0 ;;
+    --verify-fedora-decline) verify_fedora_decline=true; shift ;;
+    --help) printf 'Usage: qemu-inventory.sh --work DIR --distro D --tiers CSV --tag TAG --binary GUEST_PATH --tsv FILE [--allow-mutations] [--allow-credentialed] [--verify-fedora-decline] [--row-timeout S]\nRuns TSV-selected rows in the guest at 127.0.0.1 and writes evidence.\n'; exit 0 ;;
     *) printf 'error: unknown argument %s\n' "$1" >&2; exit 2 ;;
   esac
 done
@@ -3055,7 +3081,7 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
     remote+="; $(declare -f check_native_tree_state)"
   fi
   if [[ "$case" == clean-orphans-native ]]; then
-    remote+="; $(declare -f native_package_snapshot); $(declare -f check_native_tree_only_delta); $(declare -f prepare_native_apt_orphan); $(declare -f check_native_apt_orphan_removed); $(declare -f native_arch_orphans); $(declare -f prepare_native_arch_orphan); $(declare -f check_native_arch_orphan_removed); $(declare -f prepare_native_orphan); $(declare -f check_native_orphan_removed)"
+    remote+="; $(declare -f native_package_snapshot); $(declare -f check_native_tree_only_delta); $(declare -f prepare_native_apt_orphan); $(declare -f check_native_apt_orphan_removed); $(declare -f native_arch_orphans); $(declare -f prepare_native_arch_orphan); $(declare -f check_native_arch_orphan_removed); $(declare -f prepare_native_orphan); $(declare -f check_fedora_orphan_decline); $(declare -f check_native_orphan_removed)"
   fi
   if [[ "$case" == release-package-install-tree || "$case" == release-package-remove-tree || "$case" == clean-orphans-native ]]; then
     remote+="; if ! check_native_tree_state '$distro' absent; then printf '\nOMG_QEMU_RECEIPT:dependency:2:1\n'; exit 0; fi"
@@ -3116,6 +3142,9 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   fi
   if [[ "$case" == clean-orphans-native ]]; then
     remote+="; if ! prepare_native_orphan '$distro'; then printf '\nOMG_QEMU_RECEIPT:dependency:2:1\n'; exit 0; fi; export OMG_DISABLE_DAEMON=1"
+    if [[ "$distro" == fedora && "$verify_fedora_decline" == true ]]; then
+      remote+="; if ! check_fedora_orphan_decline $quoted_binary; then cat orphan-decline.stderr.log >&2 2>/dev/null || true; printf '\nOMG_QEMU_RECEIPT:product:1:1\n'; exit 0; fi"
+    fi
   fi
   if [[ "$case" == hooks-install-force ]]; then
     # An identical reinstall cannot prove --force is honored. Replace each

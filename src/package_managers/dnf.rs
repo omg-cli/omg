@@ -406,6 +406,11 @@ struct NativeVersionChanges {
     added: BTreeSet<String>,
 }
 
+enum PreTransactionHistory {
+    RecordFailures,
+    JournalOnly,
+}
+
 #[derive(Debug)]
 enum NativeOutcome {
     NoTransaction,
@@ -749,6 +754,7 @@ impl DnfPackageManager {
         Self::record_native_mutation(
             crate::core::history::TransactionType::Remove,
             Some(history),
+            PreTransactionHistory::RecordFailures,
             |comment| self.replay_stored_transaction(plan.directory, options, comment),
         )
         .await
@@ -2426,8 +2432,9 @@ impl DnfPackageManager {
         kind: crate::core::history::TransactionType,
         args: Vec<String>,
         history: Option<&crate::core::history::HistoryManager>,
+        pre_transaction: PreTransactionHistory,
     ) -> Result<()> {
-        Self::record_native_mutation(kind, history, |comment| {
+        Self::record_native_mutation(kind, history, pre_transaction, |comment| {
             let mut args = args;
             if let Some(comment) = comment {
                 args.insert(0, comment);
@@ -2440,6 +2447,7 @@ impl DnfPackageManager {
     async fn record_native_mutation<F>(
         kind: crate::core::history::TransactionType,
         history: Option<&crate::core::history::HistoryManager>,
+        pre_transaction: PreTransactionHistory,
         operation: impl FnOnce(Option<String>) -> F,
     ) -> Result<()>
     where
@@ -2464,6 +2472,14 @@ impl DnfPackageManager {
         // Observing a non-terminal journal row must not initiate another
         // package mutation. A redo would need its own correlation and native
         // state proof, plus explicit confirmation/elevation/deadline policy.
+        if matches!(pre_transaction, PreTransactionHistory::JournalOnly)
+            && matches!(observed, Ok(NativeOutcome::NoTransaction))
+        {
+            // Native autoremove owns confirmation. Without a correlated DNF
+            // transaction, a decline or pre-transaction error is only an
+            // invocation outcome, not an entry in package history.
+            return operation;
+        }
         Self::record_native_result(kind, history, operation, observed)
     }
 
@@ -2609,6 +2625,7 @@ impl DnfPackageManager {
                     crate::core::history::TransactionType::Remove,
                     arguments,
                     history,
+                    PreTransactionHistory::JournalOnly,
                 )
                 .await
             }
@@ -2784,7 +2801,8 @@ impl PackageManager for DnfPackageManager {
             }
             let mut args = vec![action.to_owned(), "-y".to_owned()];
             args.extend_from_slice(packages);
-            self.recorded_mutation(kind, args, history).await
+            self.recorded_mutation(kind, args, history, PreTransactionHistory::RecordFailures)
+                .await
         }))
     }
 
@@ -2797,6 +2815,7 @@ impl PackageManager for DnfPackageManager {
                 crate::core::history::TransactionType::Update,
                 Self::cached_update_args(),
                 history,
+                PreTransactionHistory::RecordFailures,
             )
             .await
         }))

@@ -1721,6 +1721,9 @@ if [[ -n "$inventory_tiers" && "$rc" == 0 ]]; then
     --native-binary "/opt/omg-qemu/omg-${tag}-${arch}-linux-${distro}/omg" --tsv /work/cases.tsv)
   if [[ "$source_kind" == staged ]]; then
     inv_args+=(--man-page-inventory /work/man_page_inventory.txt)
+    if [[ "$distro" == fedora ]]; then
+      inv_args+=(--verify-fedora-decline)
+    fi
   fi
   [[ "$inventory_mutations" == false ]] || inv_args+=(--allow-mutations)
   [[ "$inventory_isolation" == false ]] || inv_args+=(--isolate-hermetic --network-policy /work/inventory-scopes.json)

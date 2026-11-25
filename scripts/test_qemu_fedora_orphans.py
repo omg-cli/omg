@@ -63,5 +63,50 @@ esac
                     self.assertEqual(result.returncode == 0, accepted, result.stderr)
 
 
+    def test_declined_cleanup_requires_unchanged_inventory_and_both_histories(self):
+        source = (ROOT / 'scripts/qemu-inventory.sh').read_text(encoding='utf-8')
+        start = source.index('check_fedora_orphan_decline() {')
+        end = source.index('\ncheck_native_orphan_removed()', start)
+        function = source[start:end].replace('/var/lib/omg/history.json', './history.json')
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            commands = root / 'commands'
+            commands.mkdir()
+            tools = {
+                'sudo': '[[ $1 == -n ]] || exit 70\nshift\nexec "$@"\n',
+                'dnf': '[[ $* == "--cacheonly history list --json" ]] || exit 70\ncat native-history.json\n',
+                'omg': '''[[ $* == "clean --orphans" ]] || exit 70
+read -r answer
+[[ $answer == n ]] || exit 70
+case "$FAULT" in
+  inventory) printf 'changed' > inventory ;;
+  native) printf '[{}]' > native-history.json ;;
+  history) printf '[{}]' > history.json ;;
+  no-prompt) echo 'Repository unavailable' >&2; exit 1 ;;
+  fake-success) echo 'Operation aborted by the user' >&2; exit 0 ;;
+esac
+echo 'Operation aborted by the user.' >&2
+exit 1
+''',
+            }
+            for name, contents in tools.items():
+                path = commands / name
+                path.write_text('#!/bin/bash\n' + contents, encoding='utf-8', newline='\n')
+                path.chmod(0o755)
+            for fault in ('none', 'inventory', 'native', 'history', 'no-prompt', 'fake-success'):
+                with self.subTest(fault=fault):
+                    (root / 'inventory').write_text('tree present')
+                    (root / 'native-history.json').write_text('[]')
+                    (root / 'history.json').write_text('[]')
+                    result = subprocess.run(
+                        [shutil.which('bash'), '-euo', 'pipefail', '-c', function +
+                         '\nnative_package_snapshot() { cat inventory; }\n'
+                         'check_fedora_orphan_decline omg'],
+                        cwd=root, env=dict(os.environ, FAULT=fault,
+                                           PATH=str(commands) + os.pathsep + os.environ['PATH']),
+                        capture_output=True, text=True, timeout=10)
+                    self.assertEqual(result.returncode == 0, fault == 'none', result.stderr)
+
+
 if __name__ == '__main__':
     unittest.main()
