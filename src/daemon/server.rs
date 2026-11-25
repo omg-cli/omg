@@ -158,15 +158,15 @@ async fn prewarm_caches(state: &Arc<DaemonState>, shutdown: &CancellationToken) 
     // The state owns the backend choice so isolated daemons never
     // fall through to a host package database.
     let explicit_index = state.index_snapshot();
-    match state.explicit_packages().await {
-        Ok(packages) => {
-            state.with_current_index(&explicit_index, || {
-                state.cache.update_explicit(packages);
-            });
-            tracing::debug!("Pre-warmed explicit package cache");
-        }
-        Err(error) => {
-            tracing::warn!("Failed to pre-warm explicit package cache: {error}");
+    if let Some(scope) = state.status_scope().await {
+        match state.explicit_packages().await {
+            Ok(packages) if state.status_scope().await == Some(scope) => {
+                state.with_current_index(&explicit_index, || {
+                    state.cache.update_scoped_explicit(scope, packages);
+                });
+            }
+            Ok(_) => tracing::debug!("RPM database changed while pre-warming the explicit cache"),
+            Err(error) => tracing::warn!("Failed to pre-warm explicit package cache: {error}"),
         }
     }
 
@@ -247,22 +247,29 @@ async fn run_with_status_path(
                     return;
                 }
             };
-            let status = state.status_counts().await;
+            let scope = state.status_scope().await;
             state
                 .runtime_versions
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone_from(&versions);
+            let Some(scope) = scope else {
+                return;
+            };
 
-            let (total, explicit, orphans, updates) = match status {
+            let (total, explicit, orphans, updates) = match state.status_counts().await {
                 Ok(status) => status,
                 Err(error) => {
                     tracing::warn!("Failed to refresh package status: {error}");
                     return;
                 }
             };
+            if state.status_scope().await != Some(scope) {
+                return;
+            }
             let fast_status =
-                crate::core::fast_status::FastStatus::new(total, explicit, orphans, updates);
+                crate::core::fast_status::FastStatus::new(total, explicit, orphans, updates)
+                    .with_scope(scope);
             match write_fast_status_async(
                 fast_status,
                 fast_status_path.to_path_buf(),
@@ -283,7 +290,7 @@ async fn run_with_status_path(
             }
             let previous_vulns = state
                 .cache
-                .get_status()
+                .get_scoped_status(scope)
                 .and_then(|status| status.scanned_vulnerability_summary());
             let scan = tokio::select! {
                 biased;
@@ -314,13 +321,16 @@ async fn run_with_status_path(
             if scan.is_err() {
                 res.invalidate_security_scope();
             }
+            if state.status_scope().await != Some(scope) {
+                return;
+            }
             let res_arc = Arc::new(res);
             // The in-memory cache is authoritative, so persistence is best-effort.
             state.with_current_index(&index, || {
-                if let Err(error) = state.persistent.set_status(&res_arc) {
+                if let Err(error) = state.persistent.set_scoped_status(scope, &res_arc) {
                     tracing::warn!("Failed to persist status cache: {error}");
                 }
-                state.cache.update_status(res_arc);
+                state.cache.update_scoped_status(scope, res_arc);
             });
         }
 

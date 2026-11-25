@@ -11,6 +11,15 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::core::paths;
 
+/// Identifies the installed database that produced a package status snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub(crate) struct StatusScope(pub(crate) [u8; 32]);
+
+impl StatusScope {
+    /// Preserve the existing cache behavior on backends without root scoping.
+    pub(crate) const UNSCOPED: Self = Self([0; 32]);
+}
+
 /// Fast status structure - fixed size for mmap-friendly reads
 ///
 /// Uses zerocopy for safe serialization without unsafe transmute.
@@ -40,10 +49,13 @@ pub struct FastStatus {
     pub updates_available: u32,
     /// Timestamp (unix seconds)
     pub timestamp: u64,
+    scope: [u8; 32],
 }
 
 const MAGIC: u32 = 0x4F4D_4753; // "OMGS"
-const VERSION: u8 = 1;
+const UNSCOPED_VERSION: u8 = 1;
+const SCOPED_VERSION: u8 = 2;
+const UNSCOPED_SIZE: usize = std::mem::offset_of!(FastStatus, scope);
 
 /// Maximum age of the status file before readers reject it as stale.
 ///
@@ -59,8 +71,9 @@ impl FastStatus {
     pub fn new(total: usize, explicit: usize, orphans: usize, updates: usize) -> Self {
         Self {
             magic: MAGIC,
-            version: VERSION,
+            version: UNSCOPED_VERSION,
             pad: [0; 3],
+            scope: StatusScope::UNSCOPED.0,
             total_packages: total.min(u32::MAX as usize) as u32,
             explicit_packages: explicit.min(u32::MAX as usize) as u32,
             orphan_packages: orphans.min(u32::MAX as usize) as u32,
@@ -69,6 +82,14 @@ impl FastStatus {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_secs()),
         }
+    }
+
+    pub(crate) fn with_scope(mut self, scope: StatusScope) -> Self {
+        if scope != StatusScope::UNSCOPED {
+            self.version = SCOPED_VERSION;
+            self.scope = scope.0;
+        }
+        self
     }
 
     /// Write status to file (atomic via temp file + rename)
@@ -82,7 +103,13 @@ impl FastStatus {
         let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
 
         // Safe serialization using zerocopy - no unsafe needed
-        temporary.as_file_mut().write_all(self.as_bytes())?;
+        let bytes = self.as_bytes();
+        let len = if self.version == UNSCOPED_VERSION {
+            UNSCOPED_SIZE
+        } else {
+            bytes.len()
+        };
+        temporary.as_file_mut().write_all(&bytes[..len])?;
         temporary.as_file_mut().sync_all()?;
 
         // Atomic rename; keep the io::ErrorKind so callers matching on
@@ -113,11 +140,18 @@ impl FastStatus {
     pub fn read_from_file(path: &Path) -> Option<Self> {
         let mut file = File::open(path).ok()?;
         let mut bytes = [0u8; std::mem::size_of::<Self>()];
-        file.read_exact(&mut bytes).ok()?;
+        file.read_exact(&mut bytes[..UNSCOPED_SIZE]).ok()?;
+        match bytes[std::mem::offset_of!(Self, version)] {
+            UNSCOPED_VERSION => {}
+            SCOPED_VERSION => file.read_exact(&mut bytes[UNSCOPED_SIZE..]).ok()?,
+            _ => return None,
+        }
+        if file.read(&mut [0]).ok()? != 0 {
+            return None;
+        }
 
-        // Safe deserialization using zerocopy - no unsafe needed
         let status = Self::read_from_bytes(&bytes).ok()?;
-        if status.magic != MAGIC || status.version != VERSION {
+        if status.magic != MAGIC {
             return None;
         }
 
@@ -135,7 +169,19 @@ impl FastStatus {
 
     /// Read the default status file with full validation.
     pub fn read_default() -> Option<Self> {
-        Self::read_validated(&paths::fast_status_path())
+        let status = Self::read_validated(&paths::fast_status_path())?;
+        #[cfg(feature = "fedora")]
+        if crate::package_managers::resolve_backend().ok()?
+            == crate::package_managers::Backend::Fedora
+        {
+            let scope = crate::package_managers::DnfPackageManager::status_scope().ok()?;
+            return status.matches_scope(scope);
+        }
+        status.matches_scope(StatusScope::UNSCOPED)
+    }
+
+    fn matches_scope(self, scope: StatusScope) -> Option<Self> {
+        (self.scope == scope.0).then_some(self)
     }
 
     /// Read a status file only when its parent directory passes the same
@@ -176,7 +222,40 @@ mod tests {
         assert_eq!(read.orphan_packages, 10);
         assert_eq!(read.updates_available, 5);
         assert_eq!(read.magic, MAGIC);
-        assert_eq!(read.version, VERSION);
+        assert_eq!(read.version, UNSCOPED_VERSION);
+    }
+
+    #[test]
+    fn fast_status_preserves_optional_database_scope() -> anyhow::Result<()> {
+        let directory = tempdir()?;
+        let path = directory.path().join("status.bin");
+        let host = StatusScope([1; 32]);
+        let other = StatusScope([2; 32]);
+        let status = FastStatus::new(7, 1, 0, 0).with_scope(host);
+        status.write_to_file(&path)?;
+        let reread = FastStatus::read_from_file(&path).expect("scoped status should be readable");
+        assert_eq!(
+            reread
+                .matches_scope(host)
+                .expect("same database")
+                .total_packages,
+            7
+        );
+        assert!(reread.matches_scope(other).is_none());
+        assert!(reread.matches_scope(StatusScope::UNSCOPED).is_none());
+
+        FastStatus::new(3, 1, 0, 0).write_to_file(&path)?;
+        assert_eq!(std::fs::metadata(&path)?.len(), 32);
+        let unscoped = FastStatus::read_from_file(&path).expect("unscoped file remains usable");
+        assert!(unscoped.matches_scope(host).is_none());
+        assert_eq!(
+            unscoped
+                .matches_scope(StatusScope::UNSCOPED)
+                .unwrap()
+                .total_packages,
+            3
+        );
+        Ok(())
     }
 
     #[test]

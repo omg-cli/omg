@@ -371,3 +371,44 @@ fn explicit_refresh_replaces_status_count_without_changing_status_snapshot() {
         [("rust".to_string(), "1.95".to_string())]
     );
 }
+
+#[test]
+fn status_and_explicit_entries_belong_to_the_publishing_database() {
+    let cache = PackageCache::new(10, 60);
+    let host = StatusScope([1; 32]);
+    let alternate = StatusScope([2; 32]);
+    cache.update_scoped_status(
+        host,
+        Arc::new(StatusResult {
+            total_packages: 2,
+            explicit_packages: 1,
+            orphan_packages: 0,
+            updates_available: 0,
+            security_vulnerabilities: 0,
+            security_unknown_packages: None,
+            vulnerabilities_scanned: false,
+            runtime_versions: Vec::new(),
+        }),
+    );
+    cache.update_scoped_explicit(host, vec!["host-package".to_owned()]);
+    assert!(cache.get_scoped_status(host).is_some());
+    assert_eq!(cache.get_scoped_explicit_count(host), Some(1));
+    assert!(cache.get_scoped_explicit(host).is_some());
+    assert!(cache.get_scoped_status(alternate).is_none());
+    assert!(cache.get_scoped_explicit_count(alternate).is_none());
+    assert!(cache.get_scoped_explicit(alternate).is_none());
+
+    cache.update_scoped_explicit(alternate, vec!["alternate-package".to_owned()]);
+    assert_eq!(
+        cache
+            .get_scoped_explicit(alternate)
+            .expect("alternate list")
+            .as_slice(),
+        ["alternate-package"]
+    );
+    assert!(
+        cache
+            .get_scoped_explicit(host)
+            .is_none_or(|packages| packages.as_slice() == ["host-package"])
+    );
+}

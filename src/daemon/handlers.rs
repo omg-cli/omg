@@ -14,6 +14,7 @@ use super::protocol::{
     DetailedPackageInfo, ExplicitResult, HealthStatus, PackageInfo, Request, RequestId, Response,
     ResponseResult, SearchResult, UpdateEntry, WirePackageSource, error_codes,
 };
+use crate::core::fast_status::StatusScope;
 use crate::core::metrics::GLOBAL_METRICS;
 use crate::core::security::{AuditEventType, AuditSeverity, audit_log_nonblocking};
 use crate::package_managers::{
@@ -509,6 +510,43 @@ impl DaemonState {
                 disk != loaded
             }
         }
+    }
+
+    #[cfg_attr(
+        not(feature = "fedora"),
+        allow(
+            clippy::unused_async,
+            reason = "Fedora resolves native database identity on a blocking worker"
+        )
+    )]
+    pub(super) async fn status_scope(&self) -> Option<StatusScope> {
+        #[cfg(feature = "fedora")]
+        if self.uses_production_backends() && self.package_manager.name() == "dnf" {
+            use crate::package_managers::DnfPackageManager;
+
+            let result = tokio::time::timeout(CATALOG_OBSERVATION_TIMEOUT, async {
+                let permit = Arc::clone(&self.catalog_observation_budget)
+                    .acquire_owned()
+                    .await?;
+                tokio::task::spawn_blocking(move || {
+                    let _permit = permit;
+                    DnfPackageManager::status_scope()
+                })
+                .await
+                .context("RPM status scope task failed")?
+            })
+            .await
+            .context("RPM status scope task exceeded its deadline")
+            .and_then(std::convert::identity);
+            return match result {
+                Ok(scope) => Some(scope),
+                Err(error) => {
+                    tracing::debug!("Skipping package status cache: {error:#}");
+                    None
+                }
+            };
+        }
+        Some(StatusScope::UNSCOPED)
     }
 
     pub(super) async fn status_counts(&self) -> anyhow::Result<(usize, usize, usize, usize)> {
@@ -1305,8 +1343,8 @@ async fn handle_status(state: Arc<DaemonState>, id: RequestId) -> Response {
     // METRICS: Track status requests
     GLOBAL_METRICS.inc_status_requests();
 
-    // 1. Check MEMORY cache first (instant - sub-microsecond, Arc clone is cheap)
-    if let Some(cached) = state.cache.get_status() {
+    let scope = state.status_scope().await;
+    if let Some(cached) = scope.and_then(|scope| state.cache.get_scoped_status(scope)) {
         // METRICS: Cache hit (memory)
         GLOBAL_METRICS.inc_cache_hits();
         return Response::Success {
@@ -1315,33 +1353,35 @@ async fn handle_status(state: Arc<DaemonState>, id: RequestId) -> Response {
         };
     }
 
-    // 2. Check persistent cache (disk - slower)
-    // Runs in blocking thread to avoid stalling async runtime
-    let state_clone = Arc::clone(&state);
-    let cached_result = tokio::task::spawn_blocking(move || {
-        state_clone
-            .persistent
-            .get_status(state_clone.cache.status_ttl())
-    })
-    .await;
+    if let Some(scope) = scope {
+        // 2. Check persistent cache (disk - slower)
+        // Runs in blocking thread to avoid stalling async runtime
+        let state_clone = Arc::clone(&state);
+        let cached_result = tokio::task::spawn_blocking(move || {
+            state_clone
+                .persistent
+                .get_scoped_status(scope, state_clone.cache.status_ttl())
+        })
+        .await;
 
-    match cached_result {
-        Ok(Ok(Some(cached))) => {
-            // METRICS: Cache hit (persistent)
-            GLOBAL_METRICS.inc_cache_hits();
-            // Do not restart its lifetime by promoting an old snapshot into
-            // the memory cache. Only a new backend refresh starts a new TTL.
-            return Response::Success {
-                id,
-                result: ResponseResult::Status(cached),
-            };
-        }
-        Ok(Ok(None)) => {}
-        Ok(Err(error)) => {
-            tracing::warn!("Failed to read persisted status cache: {error}");
-        }
-        Err(error) => {
-            tracing::warn!("Status cache task failed: {error}");
+        match cached_result {
+            Ok(Ok(Some(cached))) => {
+                // METRICS: Cache hit (persistent)
+                GLOBAL_METRICS.inc_cache_hits();
+                // Do not restart its lifetime by promoting an old snapshot into
+                // the memory cache. Only a new backend refresh starts a new TTL.
+                return Response::Success {
+                    id,
+                    result: ResponseResult::Status(cached),
+                };
+            }
+            Ok(Ok(None)) => {}
+            Ok(Err(error)) => {
+                tracing::warn!("Failed to read persisted status cache: {error}");
+            }
+            Err(error) => {
+                tracing::warn!("Status cache task failed: {error}");
+            }
         }
     }
 
@@ -1352,6 +1392,9 @@ async fn handle_status(state: Arc<DaemonState>, id: RequestId) -> Response {
     // status paths; dependency-injected states stay behind the package-manager
     // interface and never access host package databases.
     let status_result = state.status_counts().await;
+    if scope.is_some() && state.status_scope().await != scope {
+        return internal_error(id, "RPM database changed during the status query");
+    }
 
     match status_result {
         Ok((total, explicit, orphans, updates)) => {
@@ -1395,8 +1438,8 @@ async fn handle_security_audit(state: Arc<DaemonState>, id: RequestId) -> Respon
 
 /// Handle list explicit request
 async fn handle_list_explicit(state: Arc<DaemonState>, id: RequestId) -> Response {
-    // Arc clone is cheap - just pointer copy
-    if let Some(cached) = state.cache.get_explicit() {
+    let scope = state.status_scope().await;
+    if let Some(cached) = scope.and_then(|scope| state.cache.get_scoped_explicit(scope)) {
         return Response::Success {
             id,
             result: ResponseResult::Explicit(ExplicitResult {
@@ -1407,13 +1450,20 @@ async fn handle_list_explicit(state: Arc<DaemonState>, id: RequestId) -> Respons
 
     let index = state.index_snapshot();
     let packages_result = state.explicit_packages().await;
+    if scope.is_some() && state.status_scope().await != scope {
+        return internal_error(id, "RPM database changed during the explicit package query");
+    }
 
     match packages_result {
         Ok(packages) => {
             let packages_arc = Arc::new(packages);
-            state.with_current_index(&index, || {
-                state.cache.update_explicit_arc(Arc::clone(&packages_arc));
-            });
+            if let Some(scope) = scope {
+                state.with_current_index(&index, || {
+                    state
+                        .cache
+                        .update_scoped_explicit_arc(scope, Arc::clone(&packages_arc));
+                });
+            }
             Response::Success {
                 id,
                 result: ResponseResult::Explicit(ExplicitResult {
@@ -1427,7 +1477,8 @@ async fn handle_list_explicit(state: Arc<DaemonState>, id: RequestId) -> Respons
 
 /// Handle explicit package count request
 async fn handle_explicit_count(state: Arc<DaemonState>, id: RequestId) -> Response {
-    if let Some(cached) = state.cache.get_explicit_count() {
+    let scope = state.status_scope().await;
+    if let Some(cached) = scope.and_then(|scope| state.cache.get_scoped_explicit_count(scope)) {
         return Response::Success {
             id,
             result: ResponseResult::ExplicitCount(cached),
@@ -1439,12 +1490,17 @@ async fn handle_explicit_count(state: Arc<DaemonState>, id: RequestId) -> Respon
         .explicit_packages()
         .await
         .map(|packages| packages.len());
+    if scope.is_some() && state.status_scope().await != scope {
+        return internal_error(id, "RPM database changed during the explicit package count");
+    }
 
     match count_result {
         Ok(count) => {
-            state.with_current_index(&index, || {
-                state.cache.update_explicit_count(count);
-            });
+            if let Some(scope) = scope {
+                state.with_current_index(&index, || {
+                    state.cache.update_scoped_explicit_count(scope, count);
+                });
+            }
             Response::Success {
                 id,
                 result: ResponseResult::ExplicitCount(count),

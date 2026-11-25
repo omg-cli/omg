@@ -826,6 +826,30 @@ impl DnfPackageManager {
             .collect()
     }
 
+    pub(crate) fn status_scope() -> Result<crate::core::fast_status::StatusScope> {
+        use sha2::{Digest as _, Sha256};
+        use std::os::unix::fs::MetadataExt as _;
+
+        let location = RpmDatabase::detect(Path::new(HOST_SQLITE))?;
+        let identity = std::fs::metadata(&location.sqlite)
+            .context("Cannot identify the RPM database for cached status")?;
+        anyhow::ensure!(
+            identity.is_file(),
+            "RPM status database must be a regular file"
+        );
+        let mut hash = Sha256::new();
+        hash.update(b"OMG Fedora status database v1\0");
+        hash.update(location.root.as_os_str().as_encoded_bytes());
+        hash.update([0]);
+        hash.update(location.sqlite.as_os_str().as_encoded_bytes());
+        hash.update([0]);
+        hash.update(identity.dev().to_le_bytes());
+        hash.update(identity.ino().to_le_bytes());
+        Ok(crate::core::fast_status::StatusScope(
+            hash.finalize().into(),
+        ))
+    }
+
     /// Count installed RPM entries without querying DNF repositories.
     ///
     /// # Errors

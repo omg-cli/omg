@@ -4,8 +4,8 @@
 //! file so it survives daemon restarts. A single-key snapshot does not
 //! justify an embedded transactional database; [`crate::core::safe_ops`]
 //! provides the same crash-safety (no truncated files, owner-only mode).
-//! Version 2 bounds reuse by publication age. Legacy snapshots are validated
-//! but not served; reads never rewrite the stored snapshot.
+//! Snapshots bind counts to an installed database and publication age.
+//! Older snapshots with a timestamp remain readable by unscoped callers.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -13,9 +13,10 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use super::protocol::StatusResult;
+use crate::core::fast_status::StatusScope;
 
 /// Current on-disk status snapshot format.
-const STATUS_FORMAT_VERSION: u32 = 2;
+const STATUS_FORMAT_VERSION: u32 = 3;
 
 #[derive(Deserialize)]
 struct StatusVersion {
@@ -32,6 +33,13 @@ struct PersistedStatus {
     format_version: u32,
     published_at: SystemTime,
     status: StatusResult,
+    scope: StatusScope,
+}
+
+#[derive(Deserialize)]
+struct LegacyStatusV2 {
+    published_at: SystemTime,
+    status: StatusResult,
 }
 
 pub(crate) struct PersistentCache {
@@ -46,16 +54,32 @@ impl PersistentCache {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn get_status(&self, max_age: Duration) -> Result<Option<StatusResult>> {
-        self.get_status_at(max_age, SystemTime::now())
+        self.get_scoped_status(StatusScope::UNSCOPED, max_age)
     }
 
-    fn get_status_at(&self, max_age: Duration, now: SystemTime) -> Result<Option<StatusResult>> {
+    pub(crate) fn get_scoped_status(
+        &self,
+        scope: StatusScope,
+        max_age: Duration,
+    ) -> Result<Option<StatusResult>> {
+        self.get_status_at(scope, max_age, SystemTime::now())
+    }
+
+    fn get_status_at(
+        &self,
+        scope: StatusScope,
+        max_age: Duration,
+        now: SystemTime,
+    ) -> Result<Option<StatusResult>> {
         Ok(self
             .read_snapshot()?
             .filter(|snapshot| {
-                now.duration_since(snapshot.published_at)
-                    .is_ok_and(|age| age < max_age)
+                snapshot.scope == scope
+                    && now
+                        .duration_since(snapshot.published_at)
+                        .is_ok_and(|age| age < max_age)
             })
             .map(|snapshot| snapshot.status))
     }
@@ -84,20 +108,40 @@ impl PersistentCache {
                 );
                 Ok(None)
             }
+            2 => {
+                let legacy: LegacyStatusV2 = serde_json::from_str(&content)
+                    .context("Malformed version-2 daemon status cache")?;
+                Ok(Some(PersistedStatus {
+                    format_version: version.format_version,
+                    published_at: legacy.published_at,
+                    status: legacy.status,
+                    scope: StatusScope::UNSCOPED,
+                }))
+            }
             STATUS_FORMAT_VERSION => serde_json::from_str(&content)
                 .map(Some)
-                .context("Malformed version-2 daemon status cache"),
+                .context("Malformed version-3 daemon status cache"),
             unknown => anyhow::bail!("Unsupported daemon status cache format version {unknown}"),
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn set_status(&self, status: &StatusResult) -> Result<()> {
+        self.set_scoped_status(StatusScope::UNSCOPED, status)
+    }
+
+    pub(crate) fn set_scoped_status(
+        &self,
+        scope: StatusScope,
+        status: &StatusResult,
+    ) -> Result<()> {
         // Never replace unknown or malformed data with a guessed current schema.
         let _ = self.read_snapshot()?;
         let persisted = PersistedStatus {
             format_version: STATUS_FORMAT_VERSION,
             published_at: SystemTime::now(),
             status: status.clone(),
+            scope,
         };
         let content =
             serde_json::to_vec(&persisted).context("Failed to serialize daemon status cache")?;
@@ -130,6 +174,41 @@ impl PersistentCache {
 mod tests {
     use super::*;
 
+    #[test]
+    fn status_cache_matches_the_publishing_database_and_ignores_legacy_status() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let cache = PersistentCache::new(directory.path())?;
+        let host = StatusScope([1; 32]);
+        let alternate = StatusScope([2; 32]);
+        let ttl = Duration::from_mins(5);
+        let unbound = serde_json::json!({
+            "format_version": 2,
+            "published_at": SystemTime::now(),
+            "status": status(),
+        });
+        std::fs::write(&cache.path, unbound.to_string())?;
+        assert!(cache.get_scoped_status(host, ttl)?.is_none());
+        assert_eq!(
+            cache
+                .get_status(ttl)?
+                .context("unscoped version-2 status")?
+                .total_packages,
+            42
+        );
+
+        cache.set_scoped_status(host, &status())?;
+        assert_eq!(
+            cache
+                .get_scoped_status(host, ttl)?
+                .context("same scope status")?
+                .total_packages,
+            42
+        );
+        assert!(cache.get_scoped_status(alternate, ttl)?.is_none());
+        assert!(cache.get_status(ttl)?.is_none());
+        Ok(())
+    }
+
     fn status() -> StatusResult {
         StatusResult {
             total_packages: 42,
@@ -159,7 +238,7 @@ mod tests {
         assert_eq!(std::fs::read(&cache.path)?, bytes);
         cache.set_status(&status())?;
         let current = cache.read_snapshot()?.context("new timestamped snapshot")?;
-        assert_eq!(current.format_version, 2);
+        assert_eq!(current.format_version, 3);
         assert_eq!(current.status.total_packages, 42);
         Ok(())
     }
@@ -169,9 +248,10 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let cache = PersistentCache::new(directory.path())?;
         let snapshot = PersistedStatus {
-            format_version: 2,
+            format_version: STATUS_FORMAT_VERSION,
             published_at: SystemTime::UNIX_EPOCH + Duration::from_secs(100),
             status: status(),
+            scope: StatusScope::UNSCOPED,
         };
         let bytes = serde_json::to_vec(&snapshot)?;
         std::fs::write(&cache.path, &bytes)?;
@@ -184,6 +264,7 @@ mod tests {
             (100, 0, false),
         ] {
             let result = cache.get_status_at(
+                StatusScope::UNSCOPED,
                 Duration::from_secs(ttl),
                 SystemTime::UNIX_EPOCH + Duration::from_secs(now),
             )?;
@@ -198,6 +279,7 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let cache = PersistentCache::new(directory.path())?;
         for bytes in [
+            serde_json::to_vec(&serde_json::json!({"format_version": 4}))?,
             serde_json::to_vec(&serde_json::json!({"format_version": 3}))?,
             serde_json::to_vec(&serde_json::json!({"format_version": 2, "status": status()}))?,
             b"not json".to_vec(),

@@ -9,10 +9,7 @@ use moka::sync::Cache;
 
 use super::protocol::{DetailedPackageInfo, PackageInfo, StatusResult};
 
-/// Static cache keys (avoids String allocation on every cache access)
-const KEY_STATUS: &str = "status";
-const KEY_EXPLICIT: &str = "explicit";
-const KEY_EXPLICIT_COUNT: &str = "explicit_count";
+use crate::core::fast_status::StatusScope;
 
 fn build_cache<K, V>(max_capacity: u64, ttl: Duration) -> Cache<K, V>
 where
@@ -102,12 +99,12 @@ pub struct PackageCache {
     /// Maximum cache size
     max_size: usize,
     status_ttl: Duration,
-    /// System status cache - uses &'static str keys to avoid allocation
-    system_status: Cache<&'static str, Arc<StatusResult>>,
-    /// Explicit package list cache - uses &'static str keys to avoid allocation
-    explicit_packages: Cache<&'static str, Arc<Vec<String>>>,
-    /// Explicit package count cache - uses &'static str keys to avoid allocation
-    explicit_count: Cache<&'static str, usize>,
+    /// System status cache keyed by the installed database
+    system_status: Cache<StatusScope, Arc<StatusResult>>,
+    /// Explicit package list cache keyed by the installed database
+    explicit_packages: Cache<StatusScope, Arc<Vec<String>>>,
+    /// Explicit package count cache keyed by the installed database
+    explicit_count: Cache<StatusScope, usize>,
 }
 
 impl PackageCache {
@@ -147,56 +144,96 @@ impl PackageCache {
         self.status_ttl
     }
 
+    /// Get system status on a backend with one database.
+    #[must_use]
+    pub fn get_status(&self) -> Option<Arc<StatusResult>> {
+        self.get_scoped_status(StatusScope::UNSCOPED)
+    }
+
+    /// Update system status on a backend with one database.
+    pub fn update_status(&self, result: Arc<StatusResult>) {
+        self.update_scoped_status(StatusScope::UNSCOPED, result);
+    }
+
+    /// Get the explicit package list on a backend with one database.
+    #[must_use]
+    pub fn get_explicit(&self) -> Option<Arc<Vec<String>>> {
+        self.get_scoped_explicit(StatusScope::UNSCOPED)
+    }
+
+    /// Get the explicit package count on a backend with one database.
+    #[must_use]
+    pub fn get_explicit_count(&self) -> Option<usize> {
+        self.get_scoped_explicit_count(StatusScope::UNSCOPED)
+    }
+
+    /// Update the explicit package list on a backend with one database.
+    pub fn update_explicit(&self, packages: Vec<String>) {
+        self.update_scoped_explicit(StatusScope::UNSCOPED, packages);
+    }
+
+    /// Update the shared explicit package list on a backend with one database.
+    pub fn update_explicit_arc(&self, packages: Arc<Vec<String>>) {
+        self.update_scoped_explicit_arc(StatusScope::UNSCOPED, packages);
+    }
+
+    /// Update the explicit package count on a backend with one database.
+    pub fn update_explicit_count(&self, count: usize) {
+        self.update_scoped_explicit_count(StatusScope::UNSCOPED, count);
+    }
+
     /// Get cached system status (Arc clone is cheap - just pointer copy)
     /// Inlined for hot-path performance (called on every `omg status`)
     #[inline]
     #[must_use]
-    pub fn get_status(&self) -> Option<Arc<StatusResult>> {
-        self.system_status.get(KEY_STATUS)
+    pub(crate) fn get_scoped_status(&self, scope: StatusScope) -> Option<Arc<StatusResult>> {
+        self.system_status.get(&scope)
     }
 
     /// Update system status cache (accepts Arc to avoid double-wrapping).
     ///
     /// Also refreshes the explicit-count cache: both values belong to the
     /// same status-refresh epoch and are published together by the worker.
-    pub fn update_status(&self, result: Arc<StatusResult>) {
+    pub(crate) fn update_scoped_status(&self, scope: StatusScope, result: Arc<StatusResult>) {
         // A status refresh and an explicit-list refresh are separate backend
         // reads. Invalidate the old list before publishing the new count so
         // callers cannot observe values from different refresh epochs.
-        self.explicit_packages.invalidate(KEY_EXPLICIT);
-        self.explicit_count
-            .insert(KEY_EXPLICIT_COUNT, result.explicit_packages);
-        self.system_status.insert(KEY_STATUS, result);
+        self.explicit_packages.invalidate(&scope);
+        self.explicit_count.insert(scope, result.explicit_packages);
+        self.system_status.insert(scope, result);
     }
 
     /// Get cached explicit packages (Arc clone is cheap - just pointer copy)
     #[inline]
     #[must_use]
-    pub fn get_explicit(&self) -> Option<Arc<Vec<String>>> {
-        self.explicit_packages.get(KEY_EXPLICIT)
+    pub(crate) fn get_scoped_explicit(&self, scope: StatusScope) -> Option<Arc<Vec<String>>> {
+        self.explicit_packages.get(&scope)
     }
 
     /// Get cached explicit package count
     #[inline]
     #[must_use]
-    pub fn get_explicit_count(&self) -> Option<usize> {
-        self.explicit_count.get(KEY_EXPLICIT_COUNT)
+    pub(crate) fn get_scoped_explicit_count(&self, scope: StatusScope) -> Option<usize> {
+        self.explicit_count.get(&scope)
     }
 
     /// Update explicit package cache
-    pub fn update_explicit(&self, packages: Vec<String>) {
-        self.update_explicit_arc(Arc::new(packages));
+    pub(crate) fn update_scoped_explicit(&self, scope: StatusScope, packages: Vec<String>) {
+        self.update_scoped_explicit_arc(scope, Arc::new(packages));
     }
 
-    pub fn update_explicit_arc(&self, packages: Arc<Vec<String>>) {
-        self.explicit_count
-            .insert(KEY_EXPLICIT_COUNT, packages.len());
-        self.explicit_packages.insert(KEY_EXPLICIT, packages);
+    pub(crate) fn update_scoped_explicit_arc(
+        &self,
+        scope: StatusScope,
+        packages: Arc<Vec<String>>,
+    ) {
+        self.explicit_count.insert(scope, packages.len());
+        self.explicit_packages.insert(scope, packages);
     }
 
     /// Update explicit package count cache
-    pub fn update_explicit_count(&self, count: usize) {
-        self.explicit_count.insert(KEY_EXPLICIT_COUNT, count);
+    pub(crate) fn update_scoped_explicit_count(&self, scope: StatusScope, count: usize) {
+        self.explicit_count.insert(scope, count);
     }
 
     /// Get cached results for a query (Arc clone is cheap - just pointer copy)

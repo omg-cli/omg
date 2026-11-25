@@ -1102,6 +1102,8 @@ if [[ "$benchmark" == true ]]; then
 fi
 if [[ "$distro" == fedora ]]; then
   cp "$here/qemu-fedora-advisory-check.sh" "$here/qemu-fedora-advisory-oracle.py" "$work/"
+  cp "$here/../tests/fedora_status_root_switch.py" "$work/"
+  cp -a "$here/../tests/data/fedora" "$work/fedora-status-fixture"
 fi
 if [[ "$distro" == arch ]]; then
   cp "$here/qemu-arch-advisory-check.sh" "$here/qemu-arch-advisory-oracle.py" "$work/"
@@ -1433,6 +1435,9 @@ if [[ "$distro" == arch ]]; then
 fi
 if [[ "$distro" == fedora ]]; then
   bash "$HOME/qemu-fedora-advisory-check.sh" "$bin" "$daemon" "$digest" "$HOME/evidence"
+  timeout --kill-after=5s 120s sudo -n unshare --mount --net --propagation private \
+    python3 -I -B "$HOME/fedora_status_root_switch.py" "$HOME/fedora-status-fixture" "$bin" "$daemon" \
+    > "$HOME/evidence/fedora-status-root-switch.json"
 fi
 echo 'PASS: package lifecycle and native version parity'
 GUEST
@@ -1463,8 +1468,9 @@ if [[ "$distro" == debian || "$distro" == debian-trixie || "$distro" == ubuntu ]
     /work/qemu-osv-check.sh /work/qemu-osv-positive-oracle.py bench@127.0.0.1:
 fi
 if [[ "$distro" == fedora ]]; then
-  timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 \
-    /work/qemu-fedora-advisory-check.sh /work/qemu-fedora-advisory-oracle.py bench@127.0.0.1:
+  timeout 60 docker exec -w /work/guest "$controller" scp -r "${opts[@]}" -P 2222 \
+    /work/qemu-fedora-advisory-check.sh /work/qemu-fedora-advisory-oracle.py \
+    /work/fedora_status_root_switch.py /work/fedora-status-fixture bench@127.0.0.1:
 fi
 if [[ "$distro" == arch ]]; then
   timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 \

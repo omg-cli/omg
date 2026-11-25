@@ -143,8 +143,30 @@ pub fn print_hook(shell: &str) -> Result<()> {
         "{}",
         script.replace("__OMG_STATUS_FILE__", &quoted_status_path)
     );
+    #[cfg(feature = "fedora")]
+    if matches!(shell.to_ascii_lowercase().as_str(), "bash" | "zsh")
+        && crate::package_managers::resolve_backend()
+            .is_ok_and(|backend| backend == crate::package_managers::Backend::Fedora)
+    {
+        print!("{FEDORA_PACKAGE_COUNTS}");
+    }
     Ok(())
 }
+
+#[cfg(feature = "fedora")]
+const FEDORA_PACKAGE_COUNTS: &str = r"
+# Fedora's RPM root can change while this shell is running. Resolve it in OMG.
+unalias omg-ec omg-tc omg-oc omg-uc 2>/dev/null || true
+_omg_refresh_cache() { :; }
+omg-explicit-count() { command omg ec; }
+omg-total-count() { command omg tc; }
+omg-orphan-count() { command omg oc; }
+omg-updates-count() { command omg uc; }
+omg-ec() { omg-explicit-count; }
+omg-tc() { omg-total-count; }
+omg-oc() { omg-orphan-count; }
+omg-uc() { omg-updates-count; }
+";
 
 /// Lines the shell integration owns inside rc files. `remove_hook` deletes
 /// exactly these (plus the `# OMG Package Manager` marker) and nothing else.
