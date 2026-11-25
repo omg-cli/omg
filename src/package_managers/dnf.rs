@@ -1395,7 +1395,7 @@ impl DnfPackageManager {
                 Some(package)
             }
             RepositoryQuery::InstalledReasons(InstalledReasonQuery::RequiredBy(package)) => {
-                crate::core::security::validate_package_name(package)?;
+                Self::validate_query_selector(package)?;
                 args.push(format!("--whatrequires={package}"));
                 None
             }

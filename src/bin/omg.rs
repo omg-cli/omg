@@ -1150,7 +1150,9 @@ fn validate_package_security(command: &Commands) -> Result<()> {
         Commands::Remove { packages, .. } => {
             omg_lib::core::security::validate_package_names(packages)?;
         }
-        Commands::Info { package } => {
+        Commands::Info { package }
+        | Commands::Why { package, .. }
+        | Commands::Blame { package } => {
             #[cfg(feature = "fedora")]
             if omg_lib::package_managers::resolve_backend()?
                 == omg_lib::package_managers::Backend::Fedora
@@ -1160,9 +1162,6 @@ fn validate_package_security(command: &Commands) -> Result<()> {
                 omg_lib::core::security::validate_package_name(package)?;
             }
             #[cfg(not(feature = "fedora"))]
-            omg_lib::core::security::validate_package_name(package)?;
-        }
-        Commands::Why { package, .. } | Commands::Blame { package } => {
             omg_lib::core::security::validate_package_name(package)?;
         }
         _ => {}
