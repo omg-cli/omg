@@ -10,8 +10,9 @@
 //! Native Windows is not supported.
 
 use std::collections::HashMap;
-use std::fs;
 use std::sync::OnceLock;
+#[cfg(any(target_os = "linux", test))]
+use std::{fs, path::Path};
 
 /// Supported operating systems and distributions
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,7 +62,7 @@ pub fn detect_distro() -> Distro {
         // Linux detection via /etc/os-release
         #[cfg(target_os = "linux")]
         {
-            let data = fs::read_to_string("/etc/os-release").ok();
+            let data = read_os_release().ok();
             let map = data.as_deref().map(parse_os_release).unwrap_or_default();
 
             let id = map.get("ID").map(String::as_str).unwrap_or_default();
@@ -89,12 +90,26 @@ pub fn is_omarchy() -> bool {
     #[cfg(target_os = "linux")]
     {
         static OMARCHY: OnceLock<bool> = OnceLock::new();
-        *OMARCHY.get_or_init(|| {
-            fs::read_to_string("/etc/os-release").is_ok_and(|contents| omarchy_release(&contents))
-        })
+        *OMARCHY.get_or_init(|| read_os_release().is_ok_and(|contents| omarchy_release(&contents)))
     }
     #[cfg(not(target_os = "linux"))]
     false
+}
+
+#[cfg(target_os = "linux")]
+fn read_os_release() -> std::io::Result<String> {
+    read_os_release_at(
+        Path::new("/etc/os-release"),
+        Path::new("/usr/lib/os-release"),
+    )
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn read_os_release_at(primary: &Path, vendor: &Path) -> std::io::Result<String> {
+    match fs::read_to_string(primary) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => fs::read_to_string(vendor),
+        result => result,
+    }
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -230,6 +245,24 @@ mod tests {
         assert_eq!(classify("endeavouros", "arch"), Distro::Arch);
         assert_eq!(classify("archarm", "arch"), Distro::Arch);
         assert_eq!(classify("cachyos", "arch"), Distro::Arch);
+    }
+
+    #[test]
+    fn uses_vendor_os_release_only_when_the_primary_is_missing() -> std::io::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let primary = dir.path().join("primary");
+        let vendor = dir.path().join("vendor");
+        fs::write(&vendor, "ID=fedora\n")?;
+
+        assert_eq!(read_os_release_at(&primary, &vendor)?, "ID=fedora\n");
+
+        fs::write(&primary, "ID=arch\n")?;
+        assert_eq!(read_os_release_at(&primary, &vendor)?, "ID=arch\n");
+
+        let directory = dir.path().join("directory");
+        fs::create_dir(&directory)?;
+        assert!(read_os_release_at(&directory, &vendor).is_err());
+        Ok(())
     }
 
     #[test]

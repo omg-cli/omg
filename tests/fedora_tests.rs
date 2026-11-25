@@ -642,18 +642,76 @@ mod dnf_integration {
 
     #[test]
     fn cli_info_resolves_native_full_nevra() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::os::unix::net::UnixListener;
+
         let (selector, name, version) = installed_bash_full_nevra()?;
-        let output = std::process::Command::new(assert_cmd::cargo::cargo_bin!("omg"))
+        let fixture = tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o711))
+            .tempdir_in("/tmp")?;
+        let runtime = fixture.path().join("runtime");
+        std::fs::create_dir(&runtime)?;
+        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700))?;
+        let socket = runtime.join("omg.sock");
+        let listener = UnixListener::bind(&socket)?;
+        listener.set_nonblocking(true)?;
+        let cli = std::path::Path::new(assert_cmd::cargo::cargo_bin!("omg"));
+        let mut command = if omg_lib::core::is_root() {
+            let account = nix::unistd::User::from_name("nobody")?.context("native test user")?;
+            nix::unistd::chown(&socket, Some(account.uid), Some(account.gid))?;
+            nix::unistd::chown(&runtime, Some(account.uid), Some(account.gid))?;
+            let executable = fixture.path().join("omg");
+            std::fs::copy(cli, &executable)?;
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755))?;
+            let mut command = std::process::Command::new("/usr/bin/setpriv");
+            command
+                .arg(format!("--reuid={}", account.uid.as_raw()))
+                .arg(format!("--regid={}", account.gid.as_raw()))
+                .args(["--clear-groups", "--no-new-privs"])
+                .arg(executable);
+            command
+        } else {
+            std::process::Command::new(cli)
+        };
+        command
             .args(["info", &selector])
-            .env("OMG_DISABLE_DAEMON", "1")
+            .env("HOME", &runtime)
+            .env("XDG_CONFIG_HOME", runtime.join("config"))
+            .env("XDG_DATA_HOME", runtime.join("data"))
+            .env("XDG_CACHE_HOME", runtime.join("cache"))
+            .env("XDG_STATE_HOME", runtime.join("state"))
+            .env("OMG_SOCKET_PATH", &socket)
             .env("OMG_TEST_MODE", "0")
+            .env("OMG_DISABLE_TELEMETRY", "1")
+            .env_remove("OMG_DISABLE_DAEMON")
             .env_remove("OMG_TEST_DISTRO")
-            .env_remove("OMG_TEST_BACKEND")
-            .output()?;
+            .env_remove("OMG_TEST_BACKEND");
+        let (output, connections) = std::thread::scope(|scope| -> Result<_> {
+            let invocation = scope.spawn(move || command.output());
+            let mut connections = 0;
+            while !invocation.is_finished() {
+                match listener.accept() {
+                    Ok((connection, _)) => {
+                        drop(connection);
+                        connections += 1;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            let output = invocation.join().expect("info fixture panicked")?;
+            Ok((output, connections))
+        })?;
         assert!(
             output.status.success(),
             "plain CLI selector failed: {}",
             String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            connections, 1,
+            "the RPM fallback should follow one daemon attempt"
         );
         let text = String::from_utf8(output.stdout)?;
         assert!(
@@ -1188,8 +1246,23 @@ mod dnf_integration {
             })
         };
         let history_path = fixture.path().join("history.json");
+        let mut previous = transaction("fixture-old", "2026-01-01T00:00:00Z", true)?;
+        previous.changes.extend([
+            PackageChange {
+                name: fields[0].to_owned(),
+                old_version: None,
+                new_version: Some("fixture-second-build".to_owned()),
+                source: "qa-fixture".to_owned(),
+            },
+            PackageChange {
+                name: "unrelated-package".to_owned(),
+                old_version: None,
+                new_version: Some("fixture-unrelated-build".to_owned()),
+                source: "qa-fixture".to_owned(),
+            },
+        ]);
         HistoryManager::new_in(&history_path)?.save(&[
-            transaction("fixture-old", "2026-01-01T00:00:00Z", true)?,
+            previous,
             transaction("fixture-failed", "2026-01-02T00:00:00Z", false)?,
         ])?;
         let before = std::fs::read(&history_path)?;
@@ -1203,6 +1276,9 @@ mod dnf_integration {
         assert!(output.contains(fields[2]));
         assert!(output.contains("failed to install → fixture-failed"));
         assert!(output.contains("installed → fixture-old"));
+        assert!(output.contains("installed → fixture-second-build"));
+        assert!(!output.contains("fixture-unrelated-build"));
+        assert!(output.contains("OMG Transaction History (2)"));
         assert!(output.find("fixture-failed") < output.find("fixture-old"));
         assert!(output.contains("matched by package name"));
         assert_eq!(before, std::fs::read(&history_path)?);
@@ -1324,6 +1400,21 @@ mod dnf_integration {
         verified?;
         let records = history.load()?;
         anyhow::ensure!(records.len() == 2, "Expected install and remove history");
+        let native_history = std::process::Command::new("dnf")
+            .args(["history", "info", "last", "--json"])
+            .output()?;
+        anyhow::ensure!(
+            native_history.status.success(),
+            "Cannot read native removal history: {}",
+            String::from_utf8_lossy(&native_history.stderr)
+        );
+        let transactions: Vec<serde_json::Value> = serde_json::from_slice(&native_history.stdout)?;
+        anyhow::ensure!(
+            matches!(transactions.as_slice(), [transaction] if transaction["description"]
+                .as_str()
+                .is_some_and(|description| description.split_whitespace().any(|word| word == "replay"))),
+            "Native removal must replay the reviewed plan"
+        );
         let removed = &records[1];
         anyhow::ensure!(
             removed.success && removed.transaction_type == TransactionType::Remove,
@@ -1742,10 +1833,17 @@ mod dnf_operations {
         manager.install(&packages).await?;
         let verified = (|| -> Result<()> {
             let native = std::process::Command::new("rpm")
-                .args(["-q", "tree", "--qf", "%{EPOCHNUM}:%{VERSION}-%{RELEASE}"])
+                .args([
+                    "-q",
+                    "tree",
+                    "--qf",
+                    "%{EPOCHNUM}:%{VERSION}-%{RELEASE}\t%{NAME}-%{EPOCHNUM}:%{VERSION}-%{RELEASE}.%{ARCH}",
+                ])
                 .output()?;
             anyhow::ensure!(native.status.success(), "Cannot read fixture version");
-            let version = String::from_utf8(native.stdout)?;
+            let native = std::str::from_utf8(&native.stdout)?;
+            let (version, full_identity) =
+                native.split_once('\t').context("Native RPM identity")?;
             let mark = std::process::Command::new("sudo")
                 .args(["-n", "dnf", "-y", "mark", "dependency", "tree"])
                 .stdin(std::process::Stdio::null())
@@ -1763,6 +1861,13 @@ mod dnf_operations {
             anyhow::ensure!(
                 preview.status.success() && installed()? && history.load()?.is_empty(),
                 "Preview mutated state or history"
+            );
+            let preview_stdout = String::from_utf8_lossy(&preview.stdout);
+            anyhow::ensure!(
+                preview_stdout
+                    .lines()
+                    .any(|line| line.trim() == full_identity),
+                "Preview omitted the full RPM identity: {preview_stdout}"
             );
             let decline = run(&["clean", "--orphans"], b"n\n")?;
             anyhow::ensure!(
@@ -1790,7 +1895,7 @@ mod dnf_operations {
             anyhow::ensure!(
                 records[1].changes.len() == 1
                     && records[1].changes[0].name == "tree"
-                    && records[1].changes[0].old_version.as_deref() == Some(version.as_str())
+                    && records[1].changes[0].old_version.as_deref() == Some(version)
                     && records[1].changes[0].new_version.is_none(),
                 "Cleanup history differs from native removal"
             );

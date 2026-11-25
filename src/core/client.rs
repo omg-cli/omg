@@ -13,6 +13,9 @@ use crate::core::paths;
 /// Per-operation timeout budget for one daemon request (send *and* receive).
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Prompt counters should fall back to the package database promptly.
+pub const PROMPT_COUNTER_TIMEOUT: Duration = Duration::from_millis(500);
+
 #[cfg(unix)]
 use futures::sink::SinkExt;
 #[cfg(unix)]

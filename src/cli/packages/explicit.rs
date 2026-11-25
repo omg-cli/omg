@@ -50,7 +50,11 @@ pub fn explicit_sync_with_json(count: bool, json: bool) -> Result<()> {
     }
 
     #[cfg(unix)]
-    if let Ok(mut client) = SyncDaemonClient::acquire() {
+    if let Ok(mut client) = if count {
+        SyncDaemonClient::acquire_with_timeout(crate::core::client::PROMPT_COUNTER_TIMEOUT)
+    } else {
+        SyncDaemonClient::acquire()
+    } {
         let request = if count {
             Request::ExplicitCount { id: 0 }
         } else {

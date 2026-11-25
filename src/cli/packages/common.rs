@@ -358,7 +358,13 @@ pub(crate) async fn remove_with_manager(
     use crate::core::packages::PackageService;
 
     let service = PackageService::new(manager)?;
+    report_removal(packages, service.remove(packages)).await
+}
 
+pub(crate) async fn report_removal(
+    packages: &[String],
+    operation: impl Future<Output = Result<()>>,
+) -> Result<()> {
     crate::cli::modern_ui::print_phase_header(
         "🗑️",
         "Remove",
@@ -366,7 +372,7 @@ pub(crate) async fn remove_with_manager(
     );
     println!();
 
-    let result = service.remove(packages).await;
+    let result = operation.await;
 
     crate::core::usage::track_remove_result(result.is_ok());
 

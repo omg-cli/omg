@@ -182,8 +182,14 @@ def validate_structure(directory, archive, fixture):
                 if len(values)!=1 or stderr.strip(): raise ValueError('native daemon counter is missing')
                 counters.append((phase,int(values[0])))
             elif phase=='untrusted-metadata':
-                if 'Failed to query native security advisories' not in stderr or 'signature' not in stderr.lower() or 'No vulnerabilities found' in stdout: raise ValueError('tampered metadata did not fail closed')
-            else: oracle.verify_native_result(SimpleNamespace(returncode=result['exit_code'],stdout=stdout,stderr=stderr),finding)
+                oracle.verify_signature_rejection(
+                    SimpleNamespace(returncode=result['exit_code'], stdout=stdout, stderr=stderr)
+                )
+            else:
+                oracle.verify_native_result(
+                    SimpleNamespace(returncode=result['exit_code'], stdout=stdout, stderr=stderr),
+                    finding, installed=rows,
+                )
         counts=dict(counters)
         if counts['daemon-after']-counts['daemon-before']!=2 or receipt.get('daemon_requests_delta')!=2: raise ValueError('native daemon did not execute two audits')
         return receipt
