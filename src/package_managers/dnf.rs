@@ -784,25 +784,55 @@ impl DnfPackageManager {
     }
 
     pub(crate) fn is_installed_fast(&self, package: &str) -> Result<bool> {
-        let cached = self
-            .cache_read()
-            .as_ref()
-            .filter(|snapshot| snapshot.observation.is_current(&self.rpm_db_path))
-            .map(|snapshot| {
-                snapshot.packages.contains_key(package)
-                    || snapshot
-                        .packages
-                        .values()
-                        .flatten()
-                        .any(|installed| installed.matches_selector(package))
-            });
-        if let Some(installed) = cached {
-            return Ok(installed);
+        Ok(!self.matching_installed_packages(package)?.is_empty())
+    }
+
+    fn matching_installed_packages(&self, selector: &str) -> Result<Vec<InstalledPackage>> {
+        match Self::read_rpm_name_index(&self.rpm_db_path, selector) {
+            Ok(packages) if !packages.is_empty() => return Ok(packages),
+            Ok(_) => {}
+            Err(error) => tracing::debug!("RPM name lookup unavailable: {error:#}"),
         }
         Ok(self
             .load_installed_packages_blocking()?
-            .iter()
-            .any(|installed| installed.matches_selector(package)))
+            .into_iter()
+            .filter(|package| package.matches_selector(selector))
+            .collect())
+    }
+
+    fn read_rpm_name_index(path: &Path, selector: &str) -> Result<Vec<InstalledPackage>> {
+        let connection = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        connection.busy_timeout(std::time::Duration::ZERO)?;
+        // A literal package name can also look like a qualified selector.
+        // Read every plausible name in a single snapshot before matching.
+        let name_arch = selector.rsplit_once('.').map(|(name, _)| name);
+        let nevra_name = super::dnf_advisory::package_identity(selector)
+            .ok()
+            .map(|(name, _)| name);
+        let mut statement = connection.prepare(
+            "SELECT Name.key, Name.hnum, Packages.blob
+             FROM Name LEFT JOIN Packages USING (hnum)
+             WHERE Name.key IN (?1, ?2, ?3)",
+        )?;
+        let mut rows = statement.query(rusqlite::params![selector, name_arch, nevra_name])?;
+        let mut headers = HashSet::new();
+        let mut packages = Vec::new();
+        while let Some(row) = rows.next()? {
+            let name = row.get_ref(0)?.as_str()?;
+            let header: i64 = row.get(1)?;
+            let package = Self::parse_package_from_blob(row.get_ref(2)?.as_blob()?)?;
+            anyhow::ensure!(
+                package.name == name && headers.insert(header),
+                "Inconsistent RPM name index"
+            );
+            if package.matches_selector(selector) {
+                packages.push(package);
+            }
+        }
+        Ok(packages)
     }
 
     async fn apply_current_install_reasons(packages: &mut [InstalledPackage]) -> Result<()> {
@@ -2517,21 +2547,20 @@ impl PackageManager for DnfPackageManager {
         let package = package.to_string();
         Box::pin(async move {
             Self::validate_query_selector(&package)?;
-            let installed = self.load_installed_packages().await?;
-
-            let matches = installed
-                .iter()
-                .filter(|p| p.matches_selector(&package))
-                .collect::<Vec<_>>();
+            let manager = self.cache_handle();
+            let selector = package.clone();
+            let mut matches =
+                tokio::task::spawn_blocking(move || manager.matching_installed_packages(&selector))
+                    .await??;
             anyhow::ensure!(
                 matches.len() <= 1,
                 "Package '{package}' has multiple installed builds; specify the full NEVRA"
             );
-            if let Some(pkg) = matches.first() {
+            if let Some(pkg) = matches.pop() {
                 return Ok(Some(Package {
                     name: pkg.identity(),
                     version: parse_version_or_zero(&format!("{}-{}", pkg.version, pkg.release)),
-                    description: pkg.summary.clone(),
+                    description: pkg.summary,
                     source: PackageSource::Official,
                     installed: true,
                 }));
@@ -4995,6 +5024,76 @@ mod tests {
                 .expect("insert blob");
         }
         dir
+    }
+
+    #[tokio::test]
+    async fn installed_lookup_reads_one_package_when_an_unrelated_header_is_unreadable()
+    -> Result<()> {
+        let header = minimal_named_rpm_header(b"omg-indexed-read-fixture\0");
+        let directory = write_packages_db(&[header.as_slice(), &[0; 32]]);
+        let mut manager = DnfPackageManager::new();
+        manager.rpm_db_path = directory.path().join("rpmdb.sqlite");
+        let database = Connection::open(&manager.rpm_db_path)?;
+        database.execute_batch(
+            "CREATE TABLE Name (key TEXT NOT NULL, hnum INTEGER NOT NULL, idx INTEGER NOT NULL);
+             CREATE INDEX Name_key_idx ON Name(key);
+             INSERT INTO Name VALUES ('omg-indexed-read-fixture', 1, 0), ('unrelated', 2, 0);",
+        )?;
+        drop(database);
+
+        assert!(manager.is_installed("omg-indexed-read-fixture").await?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn indexed_installed_info_preserves_qualified_and_literal_matches() -> Result<()> {
+        let native = include_bytes!("../../tests/data/fedora-publicsuffix.rpmhdr");
+        let literal = minimal_named_rpm_header(b"publicsuffix-list-dafsa.noarch\0");
+        let directory = write_packages_db(&[native.as_slice(), &literal]);
+        let mut manager = DnfPackageManager::new();
+        manager.rpm_db_path = directory.path().join("rpmdb.sqlite");
+        let database = Connection::open(&manager.rpm_db_path)?;
+        database.execute_batch(
+            "CREATE TABLE Name (key TEXT NOT NULL, hnum INTEGER NOT NULL, idx INTEGER NOT NULL);
+             CREATE INDEX Name_key_idx ON Name(key);
+             INSERT INTO Name VALUES
+               ('publicsuffix-list-dafsa', 1, 0), ('publicsuffix-list-dafsa.noarch', 2, 0);",
+        )?;
+        drop(database);
+
+        let exact = DnfPackageManager::parse_package_from_blob(native)?.nevra();
+        let package = manager
+            .info(&exact)
+            .await?
+            .context("missing installed package")?;
+        assert_eq!(package.name, "publicsuffix-list-dafsa.noarch");
+        assert!(package.installed);
+
+        let error = manager
+            .info("publicsuffix-list-dafsa.noarch")
+            .await
+            .expect_err("the literal package name also matches this selector");
+        assert!(error.to_string().contains("multiple installed builds"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn indexed_installed_lookup_falls_back_on_inconsistent_rows() -> Result<()> {
+        let header = minimal_named_rpm_header(b"indexed-fallback-fixture\0");
+        let directory = write_packages_db(&[&header]);
+        let mut manager = DnfPackageManager::new();
+        manager.rpm_db_path = directory.path().join("rpmdb.sqlite");
+        let database = Connection::open(&manager.rpm_db_path)?;
+        database.execute_batch(
+            "CREATE TABLE Name (key TEXT NOT NULL, hnum INTEGER NOT NULL, idx INTEGER NOT NULL);
+             CREATE INDEX Name_key_idx ON Name(key);
+             INSERT INTO Name VALUES ('indexed-fallback-fixture', 2, 0);",
+        )?;
+        drop(database);
+
+        assert!(manager.is_installed("indexed-fallback-fixture").await?);
+        assert!(!manager.is_installed("indexed-fallback-absent").await?);
+        Ok(())
     }
 
     #[test]
