@@ -1139,15 +1139,27 @@ jobs:
           if-no-files-found: error
 
       - name: Coverage summary
-        if: ${{ !cancelled() && (steps.instrumented_tests.outcome == 'success' || steps.instrumented_tests.outcome == 'failure') }}
+        if: ${{ !cancelled() && steps.coverage_sanity.outcome == 'success' }}
         run: |
-          set -o pipefail
+          python3 - <<'PY'
+          import os
+          import runpy
+          from pathlib import Path
 
-          echo "## Coverage Report" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          cargo llvm-cov report \
-            --summary-only \
-            | tee -a $GITHUB_STEP_SUMMARY
+          read_regions = runpy.run_path('scripts/check-line-coverage.py')['_read_region_document']
+          totals = read_regions(Path('coverage-regions.json.gz'))['totals']
+          summary = ['## Coverage Report', '',
+                     '| Metric | Instrumented | Covered | Missed | Coverage |',
+                     '| --- | ---: | ---: | ---: | ---: |']
+          for metric in ('regions', 'functions', 'lines', 'branches'):
+              count, covered = (totals[metric][key] for key in ('count', 'covered'))
+              if type(count) is not int or type(covered) is not int or not 0 <= covered <= count:
+                  raise ValueError(f'Invalid LLVM coverage totals for {metric}')
+              percent = f'{covered / count:.2%}' if count else '—'
+              summary.append(f'| {metric.title()} | {count} | {covered} | {count - covered} | {percent} |')
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as output:
+              output.write('\n'.join(summary) + '\n')
+          PY
 
   coverage-result:
     name: Generate Coverage Report
