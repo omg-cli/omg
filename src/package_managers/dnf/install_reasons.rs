@@ -180,7 +180,7 @@ fn open_regular(path: &Path) -> Result<File> {
     Ok(file)
 }
 
-fn read_table<T: serde::de::DeserializeOwned>(state: &Path, key: &str) -> Result<T> {
+pub(super) fn read_table<T: serde::de::DeserializeOwned>(state: &Path, key: &str) -> Result<T> {
     let path = state.join(format!("{key}.toml"));
     let file = open_regular(&path)?;
     let mut text = String::new();

@@ -798,6 +798,111 @@ exec {shlex.quote(str(native))} "$@"
                     repo_file.write_text(repo_config)
                     restore_test_summary(original)
 
+            def inspect_direct_catalog_cache(original):
+                phase = "direct-catalog-cache"
+                native_cache = work/"direct-catalog-native-cache"
+                catalog = work/"cache/omg/dnf-search-v1.bin"
+                drop = work/"count-available-catalog"
+                drop.touch(mode=0o600)
+                os.chown(drop, account.pw_uid, account.pw_gid)
+                target = Path(dnf).resolve(strict=True)
+                binary = bin_dir/"real-dnf"
+                trace = bin_dir/"track-dnf"
+                shutil.copy2(target, binary)
+                trace.write_text(f"""#!/usr/bin/bash
+repoquery=0
+available=0
+for arg in "$@"; do
+    case "$arg" in
+        repoquery) repoquery=1 ;;
+        --available) available=1 ;;
+    esac
+done
+if [[ "$repoquery" == 1 && "$available" == 1 ]]; then
+    printf 'catalog\\n' >> {shlex.quote(str(drop))}
+fi
+exec {shlex.quote(str(binary))} "$@"
+""")
+                trace.chmod(0o755)
+                identity = f"{package}.noarch"
+                initial = "Catalog-QZ Direct Generation ΩΣ"
+                updated = "Catalog-QZ Revalidated Generation ΩΣ"
+
+                def search(label, query, summary, calls):
+                    before = drop.read_bytes().count(b"\n")
+                    result = command([cli, "--json", "search", "--limit", "1", query], disabled, ordinary)
+                    observed = drop.read_bytes().count(b"\n") - before
+                    value = None
+                    try:
+                        value = json.loads(result.stdout)
+                        if summary is None:
+                            exact = value == []
+                        else:
+                            row, = value
+                            exact = (row["name"], row["version"], row["description"]) == (
+                                identity, "1-1", summary)
+                    except (ValueError, TypeError, KeyError):
+                        exact = False
+                    checks.append(dict(phase=phase, case=label, passed=result.returncode == 0 and exact
+                                       and observed == calls, value={"calls": observed, "rows": value},
+                                       diagnostic=result.stderr[-800:]))
+
+                unsigned = repo_config.replace("repo_gpgcheck=1", "repo_gpgcheck=0") + f"cachedir={native_cache}\n"
+                fixture_config = host_config + "check_config_file_age=0\n"
+                checked(["/usr/bin/mount", "--bind", trace, target])
+                try:
+                    config.write_text(fixture_config)
+                    repo_file.write_text(unsigned)
+                    publish_test_summary(original, initial, "direct-initial")
+                    refresh_fixture()
+                    native_test_summary([], initial)
+                    search("seed", package, initial, 1)
+                    for query in (
+                        package, identity, "OMG-OBSERVER", "observer-fixture", "catalog-qz", "CATALOG-QZ",
+                        "qz direct", "direct generation", "catalog-qz direct generation",
+                        "QZ DIRECT GENERATION", "generation ΩΣ", "GENERATION ως",
+                        "catalog-qz direct generation ΩΣ", "catalog-qz absent",
+                    ):
+                        search(f"warm-{query}", query, None if query == "catalog-qz absent" else initial, 0)
+
+                    encoded = catalog.read_bytes()
+                    catalog.write_bytes(encoded[:-1] + bytes([encoded[-1] ^ 1]))
+                    search("corrupt-cache", identity, initial, 1)
+                    search("rewarmed-after-corruption", identity, initial, 0)
+                    catalog.chmod(0o644)
+                    search("shared-cache", identity, initial, 1)
+                    checks.append(dict(phase=phase, case="private-replacement",
+                                       passed=catalog.stat().st_mode & 0o777 == 0o600))
+                    search("rewarmed-after-permissions", identity, initial, 0)
+
+                    repo_file.write_text(unsigned + f"excludepkgs={package}\n")
+                    search("excluded-native", identity, None, 1)
+                    search("excluded-cached", identity, None, 0)
+                    repo_file.write_text(unsigned)
+                    search("exclusion-removed-native", identity, initial, 1)
+                    search("exclusion-removed-cached", identity, initial, 0)
+
+                    config.write_text(fixture_config + "cacheonly=all\n")
+                    search("cacheonly-policy-native", identity, initial, 1)
+                    config.write_text(fixture_config)
+                    repo_file.write_text(unsigned.replace("repo_gpgcheck=0", "repo_gpgcheck=1"))
+                    refresh_fixture()
+                    search("repository-signature-native", identity, initial, 1)
+                    repo_file.write_text(unsigned)
+                    refresh_fixture()
+                    search("reseed-before-expiration", identity, initial, 1)
+
+                    publish_test_summary(original, updated, "direct-updated")
+                    ordinary_control([dnf, f"--setopt=cachedir={native_cache}", "clean", "expire-cache"])
+                    search("expired-native", identity, updated, 1)
+                    search("refreshed-seed", identity, updated, 1)
+                    search("refreshed-reuse", identity, updated, 0)
+                finally:
+                    checked(["/usr/bin/umount", target])
+                    config.write_text(host_config)
+                    repo_file.write_text(repo_config)
+                    restore_test_summary(original)
+
             refresh_fixture()
             host_explicit = len(set(ordinary_control([dnf, "--cacheonly", "--setopt=disable_excludes=*",
                                                       "repoquery", "--userinstalled", "--qf", r"%{name}\n"]).splitlines()))
@@ -869,6 +974,7 @@ exec {shlex.quote(str(native))} "$@"
                     inspect_aged_catalog("repository-age-zero", original_manifest, 0)
                     for policy in ("never", "all", "metadata"):
                         inspect_cached_age_policy(original_manifest, policy)
+                    inspect_direct_catalog_cache(original_manifest)
 
             fast.unlink(missing_ok=True)
             persisted.unlink(missing_ok=True)
@@ -1085,6 +1191,6 @@ assert inventory() == before
 report = dict(binaries=binaries, checks=checks, total=len(checks),
               passed=sum(entry["passed"] for entry in checks), host_unchanged=True)
 print(json.dumps(report))
-expected_checks = 264 if consent_oracle is None else 485
+expected_checks = 264 if consent_oracle is None else 515
 if report["passed"] != report["total"] or report["total"] != expected_checks:
     sys.exit(4)

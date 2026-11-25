@@ -11,8 +11,8 @@ use sha2::{Digest, Sha256};
 use super::RpmFileIdentity;
 use super::repository_freshness::{RepositoryAge, RepositoryAgePolicy};
 use super::rpm_database::{
-    CONFIG_DROP_INS, PLUGIN_CONFIGS, parse_absolute_setting, read_dnf_settings, reported_setting,
-    rooted_path,
+    CONFIG_DROP_INS, PLUGIN_CONFIGS, RpmDatabase, parse_absolute_setting, read_dnf_settings,
+    reported_setting, rooted_path,
 };
 
 #[derive(Clone, Default, PartialEq, Eq)]
@@ -62,14 +62,210 @@ impl RepositoryObservation {
         let Some(ages) = &self.metadata_ages else {
             return Ok(false);
         };
+        metadata_is_fresh(ages)
+    }
+}
+
+fn metadata_is_fresh(ages: &[RepositoryAge]) -> Result<bool> {
+    let now = i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs())?;
+    for age in ages {
+        if !age.is_fresh(now)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Witness for reusing read-only search rows across CLI processes.
+pub(super) struct DirectCatalogScope {
+    paths: RepositoryPaths,
+    report_digest: [u8; 32],
+    repositories: Vec<(PathBuf, RepositoryAge)>,
+}
+
+impl DirectCatalogScope {
+    pub(super) fn capture(database: &RpmDatabase) -> Result<(Self, [u8; 32])> {
+        anyhow::ensure!(
+            database.root == Path::new("/") && !crate::core::is_root(),
+            "DNF search cache requires the ordinary host installroot"
+        );
+        anyhow::ensure!(
+            std::env::var_os("DNF5_PLUGINS_DIR").is_none(),
+            "Custom DNF plugins require native catalog loading"
+        );
+        let options = ["--dump-repo-config=*", "--dump-variables"];
+        let report = read_dnf_settings(&options)?;
+        let at = report
+            .find("======== Main configuration: ========\n")
+            .context("Missing DNF main configuration")?;
+        let config = &report[at..];
+        let (main, repos) = reported_repositories(config)?;
+        let mut paths = RepositoryPaths::from_report(&database.root, true, config)?;
+        anyhow::ensure!(
+            reported_setting(main, "cacheonly")? == "none"
+                && !repos.is_empty()
+                && repos.iter().all(|(_, settings)| matches!(
+                    reported_setting(settings, "repo_gpgcheck"),
+                    Ok("0")
+                )),
+            "DNF cache-only or signed repository policy requires native catalog loading"
+        );
+        observe_native_catalog_controls(&mut paths, main, database)?;
+        let inputs_before = paths.fingerprint()?;
+        let policies = paths
+            .age_policies
+            .as_ref()
+            .context("Unknown DNF repository age policy")?;
+        anyhow::ensure!(
+            policies.len() == repos.len(),
+            "DNF search cache requires finite repository expiry"
+        );
+        let repositories = policies
+            .iter()
+            .map(|policy| Ok((policy.directory().to_path_buf(), policy.read_for_cache()?)))
+            .collect::<Result<Vec<_>>>()?;
+
+        let report_digest = native_report_digest(&report);
+        let scope = Self {
+            paths,
+            report_digest,
+            repositories,
+        };
+        let key = scope.key()?;
+        // The first native report discovers custom directories. Bind it to
+        // the on-disk generation before taking results from a shared cache.
+        anyhow::ensure!(
+            native_report_digest(&read_dnf_settings(&options)?) == report_digest
+                && scope.paths.fingerprint()? == inputs_before
+                && scope.key()? == key,
+            "DNF inputs changed while observing the search cache"
+        );
+        Ok((scope, key))
+    }
+
+    pub(super) fn key(&self) -> Result<[u8; 32]> {
+        let mut inputs = Vec::new();
         let now = i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs())?;
-        for age in ages {
-            if !age.is_fresh(now)? {
-                return Ok(false);
+        for (repository, age) in &self.repositories {
+            anyhow::ensure!(
+                age.is_fresh(now)? && !repository.join("attrs/expired").try_exists()?,
+                "DNF repository metadata has expired"
+            );
+            for directory in [repository.join("repodata"), repository.join("solv")] {
+                for entry in directory_entries(&directory)?.into_iter().flatten() {
+                    let entry = entry?;
+                    anyhow::ensure!(
+                        entry.file_type()?.is_file(),
+                        "DNF catalog cache requires regular metadata inputs"
+                    );
+                    inputs.push(entry.path());
+                }
             }
         }
-        Ok(true)
+        let mut key = Sha256::new();
+        key.update(b"OMG DNF direct catalog v1\0");
+        key.update(std::env::consts::ARCH.as_bytes());
+        key.update(self.report_digest);
+        key.update(self.paths.fingerprint()?);
+        key.update(fingerprint_files(inputs)?);
+        for name in ["LC_ALL", "LC_MESSAGES", "LANG", "LANGUAGE"] {
+            key.update([0]);
+            if let Some(value) = std::env::var_os(name) {
+                key.update(value.as_encoded_bytes());
+            }
+        }
+        Ok(key.finalize().into())
     }
+}
+
+fn native_report_digest(report: &str) -> [u8; 32] {
+    // DNF can enumerate repository sections in a different order in
+    // successive processes. Preserve each section's full configuration.
+    let mut sections: Vec<_> = report
+        .split("\n======== ")
+        .map(|section| section.trim_end_matches('\n'))
+        .collect();
+    sections.sort_unstable();
+    let mut hash = Sha256::new();
+    for section in sections {
+        hash.update((section.len() as u64).to_le_bytes());
+        hash.update(section.as_bytes());
+    }
+    hash.finalize().into()
+}
+
+fn observe_native_catalog_controls(
+    paths: &mut RepositoryPaths,
+    main: &str,
+    database: &RpmDatabase,
+) -> Result<()> {
+    paths
+        .files
+        .push(crate::core::privilege::root_controlled_program_path("dnf")?);
+    paths.files.push(database.sqlite.clone());
+    let mut wal = database.sqlite.as_os_str().to_os_string();
+    wal.push("-wal");
+    paths.files.push(PathBuf::from(wal));
+
+    let state = parse_absolute_setting(main, "system_state_dir")?;
+    let modules = state.join("modules.toml");
+    if modules.try_exists()? {
+        anyhow::ensure!(
+            super::install_reasons::read_table::<toml::Table>(&state, "modules")?.is_empty(),
+            "DNF module state requires native catalog loading"
+        );
+    }
+    paths.files.push(modules);
+    paths.files.push(PathBuf::from("/etc/dnf/versionlock.toml"));
+    for directory in [
+        PathBuf::from("/etc/dnf/modules.d"),
+        parse_absolute_setting(main, "persistdir")?.join("modulefailsafe"),
+        parse_absolute_setting(main, "pluginpath")?,
+    ] {
+        anyhow::ensure!(
+            directory_entries(&directory)?.is_none_or(|mut files| files.next().is_none()),
+            "DNF module or library plugin state requires native catalog loading"
+        );
+        paths.directories.push((directory, None));
+    }
+
+    // These Fedora command plugins register their own commands. Third-party
+    // plugins can modify DNF context and must take the native path.
+    const FEDORA_COMMAND_PLUGINS: &[&str] = &[
+        "builddep_cmd_plugin.so",
+        "changelog_cmd_plugin.so",
+        "config-manager_cmd_plugin.so",
+        "copr_cmd_plugin.so",
+        "needs_restarting_cmd_plugin.so",
+        "repoclosure_cmd_plugin.so",
+        "repomanage_cmd_plugin.so",
+        "reposync_cmd_plugin.so",
+    ];
+    for path in ["/usr/lib64/dnf5/plugins", "/usr/lib/dnf5/plugins"] {
+        let directory = PathBuf::from(path);
+        for entry in directory_entries(&directory)?.into_iter().flatten() {
+            let path = entry?.path();
+            if path.extension().is_some_and(|value| value == "so") {
+                anyhow::ensure!(
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| FEDORA_COMMAND_PLUGINS.contains(&name)),
+                    "Unknown DNF command plugin requires native catalog loading"
+                );
+            }
+        }
+        paths.directories.push((directory, Some("so")));
+    }
+    for directory in [
+        PathBuf::from("/etc/dnf/dnf5-aliases.d"),
+        PathBuf::from("/usr/share/dnf5/aliases.d"),
+    ]
+    .into_iter()
+    .chain(dirs::config_dir().map(|home| home.join("dnf5/aliases.d")))
+    {
+        paths.directories.push((directory, Some("conf")));
+    }
+    Ok(())
 }
 
 struct ResolvedRepositoryPaths {
@@ -129,7 +325,11 @@ impl RepositoryPaths {
             &["--cacheonly", "--dump-repo-config=*"]
         };
         let report = read_dnf_settings(options)?;
-        let (main, repositories) = reported_repositories(&report)?;
+        Self::from_report(root, for_search, &report)
+    }
+
+    fn from_report(root: &Path, for_search: bool, report: &str) -> Result<Self> {
+        let (main, repositories) = reported_repositories(report)?;
         anyhow::ensure!(
             parse_absolute_setting(main, "installroot")? == root,
             "DNF installroot changed while resolving repository paths"
@@ -434,6 +634,22 @@ fn reported_paths(config: &str, key: &str) -> Result<Vec<PathBuf>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_report_key_preserves_content_but_ignores_repository_order() {
+        let main = "======== Main configuration: ========\ninstallroot = /\n";
+        let first = "======== \"one\" repository configuration: ========\ncachedir = /cache/one\n";
+        let second = "======== \"two\" repository configuration: ========\ncachedir = /cache/two\n";
+        let original = native_report_digest(&format!("{main}{first}{second}"));
+        assert_eq!(
+            original,
+            native_report_digest(&format!("{main}{second}{first}"))
+        );
+        assert_ne!(
+            original,
+            native_report_digest(&format!("{main}{first}{second}excludepkgs = bash\n")),
+        );
+    }
 
     #[test]
     fn repository_observation_tracks_policy_and_metadata_without_solver_churn() -> Result<()> {

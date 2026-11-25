@@ -67,7 +67,19 @@ impl RepositoryAgePolicy {
         }))
     }
 
+    pub(super) fn directory(&self) -> &Path {
+        &self.repository
+    }
+
     pub(super) fn read(&self) -> Result<RepositoryAge> {
+        self.read_primary(false)
+    }
+
+    pub(super) fn read_for_cache(&self) -> Result<RepositoryAge> {
+        self.read_primary(true)
+    }
+
+    fn read_primary(&self, without_modules: bool) -> Result<RepositoryAge> {
         let manifest = self.repository.join("repodata/repomd.xml");
         let file = OpenOptions::new()
             .read(true)
@@ -92,6 +104,17 @@ impl RepositoryAgePolicy {
                 ..Default::default()
             },
         )?;
+        if without_modules {
+            ensure!(
+                !xml.root_element().children().any(|node| {
+                    node.has_tag_name((REPOMD_NAMESPACE, "data"))
+                        && node
+                            .attribute("type")
+                            .is_some_and(|kind| kind.starts_with("modules"))
+                }),
+                "DNF module metadata requires native catalog loading"
+            );
+        }
         let (plain, zchunk) = primary_files(&xml)?;
         let primary = [zchunk.filter(|_| self.prefer_zchunk), plain]
             .into_iter()

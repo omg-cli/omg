@@ -28,13 +28,15 @@ use crate::package_managers::types::{
     SecurityOrigin, SecurityPackage, UpdateInfo, parse_version_or_zero,
 };
 
+mod catalog_cache;
 mod install_reasons;
 mod rpm_database;
 
 mod repository_freshness;
 mod repository_observation;
-use repository_observation::RepositoryObservation;
+use catalog_cache::CatalogCache;
 pub(crate) use repository_observation::StatusRepositories;
+use repository_observation::{DirectCatalogScope, RepositoryObservation};
 use rpm_database::{HOST_SQLITE, RpmDatabase};
 use rusqlite::{Connection, OpenFlags};
 use zerocopy::{FromBytes, Immutable, KnownLayout, big_endian::U32};
@@ -42,6 +44,7 @@ use zerocopy::{FromBytes, Immutable, KnownLayout, big_endian::U32};
 #[cfg(all(test, unix))]
 pub(crate) use tests::search_parity_data;
 
+const MAX_QUERY_BYTES: u64 = 64 * 1024 * 1024;
 const REPOSITORY_RECORD_SEPARATOR: char = '\x1e';
 
 struct AvailablePackageRow<'a> {
@@ -1801,6 +1804,17 @@ impl DnfPackageManager {
         }
     }
 
+    async fn complete_search_catalog() -> Result<Vec<u8>> {
+        let args = Self::repository_query_args(RepositoryQuery::Available(None))?;
+        let mut command =
+            tokio::process::Command::from(crate::core::privilege::system_command("dnf")?);
+        command
+            .arg("--setopt=*.skip_if_unavailable=false")
+            .args(args)
+            .stderr(std::process::Stdio::null());
+        Self::query_output(command).await
+    }
+
     async fn repository_output(query: RepositoryQuery<'_>) -> Result<Vec<u8>> {
         let args = Self::repository_query_args(query)?;
         let mut command =
@@ -1948,7 +1962,6 @@ impl DnfPackageManager {
         mut cancelled: Option<tokio::sync::oneshot::Receiver<()>>,
     ) -> Result<Vec<u8>> {
         use tokio::io::AsyncReadExt;
-        const MAX_OUTPUT_BYTES: u64 = 64 * 1024 * 1024;
         if let Some(cancelled) = cancelled.as_mut() {
             anyhow::ensure!(
                 matches!(
@@ -1961,7 +1974,6 @@ impl DnfPackageManager {
         let mut child = command
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::inherit())
             .kill_on_drop(true)
             .spawn()
             .context("Could not start DNF query")?;
@@ -1970,11 +1982,11 @@ impl DnfPackageManager {
                 let stdout = child.stdout.take().context("DNF stdout was not captured")?;
                 let mut bytes = Vec::new();
                 stdout
-                    .take(MAX_OUTPUT_BYTES + 1)
+                    .take(MAX_QUERY_BYTES + 1)
                     .read_to_end(&mut bytes)
                     .await?;
                 anyhow::ensure!(
-                    bytes.len() as u64 <= MAX_OUTPUT_BYTES,
+                    bytes.len() as u64 <= MAX_QUERY_BYTES,
                     "DNF query output exceeds 64 MiB"
                 );
                 let status = child.wait().await.context("Could not wait for DNF query")?;
@@ -3002,10 +3014,62 @@ impl PackageManager for DnfPackageManager {
     ) -> Pin<Box<dyn Future<Output = Result<Vec<Package>>> + Send + '_>> {
         let query_lower = query.to_lowercase();
         Box::pin(async move {
-            let installed = self.load_installed_packages().await?;
-            let output = Self::repository_output(RepositoryQuery::Available(None)).await?;
+            let manager = self.cache_handle();
+            let (installed, cache, cached) = tokio::task::spawn_blocking(move || {
+                let location = RpmDatabase::detect(&manager.rpm_db_path)?;
+                let installed = manager.load_installed_at(&location)?;
+                let cache = DirectCatalogScope::capture(&location).and_then(CatalogCache::open);
+                let (cache, cached) = match cache {
+                    Ok(cache) => match cache.read() {
+                        Ok(cached) => (Some(cache), cached),
+                        Err(error) => {
+                            tracing::debug!(%error, "DNF search cache read failed");
+                            (Some(cache), None)
+                        }
+                    },
+                    Err(error) => {
+                        tracing::debug!(%error, "DNF search cache unavailable");
+                        (None, None)
+                    }
+                };
+                anyhow::Ok((installed, cache, cached))
+            })
+            .await??;
+
+            if let Some(output) = cached {
+                return tokio::task::spawn_blocking(move || {
+                    Self::search_results(installed, &output, &query_lower)
+                })
+                .await?;
+            }
+
+            // A partial native result can satisfy DNF's configured skip
+            // policy, but it cannot seed the cross-process catalog cache.
+            let (output, cache) = if let Some(cache) = cache {
+                match Self::complete_search_catalog().await {
+                    Ok(output) => (output, Some(cache)),
+                    Err(error) => {
+                        tracing::debug!(%error, "Complete native catalog unavailable");
+                        (
+                            Self::repository_output(RepositoryQuery::Available(None)).await?,
+                            None,
+                        )
+                    }
+                }
+            } else {
+                (
+                    Self::repository_output(RepositoryQuery::Available(None)).await?,
+                    None,
+                )
+            };
             tokio::task::spawn_blocking(move || {
-                Self::search_results(installed, &output, &query_lower)
+                let results = Self::search_results(installed, &output, &query_lower)?;
+                if let Some(cache) = cache
+                    && let Err(error) = cache.publish(&output)
+                {
+                    tracing::debug!(%error, "DNF search cache write failed");
+                }
+                Ok(results)
             })
             .await?
         })
