@@ -302,6 +302,24 @@ impl InstalledPackage {
     }
 }
 
+struct AvailablePackage<'a> {
+    name: &'a str,
+    version: &'a str,
+    summary: &'a str,
+}
+
+impl AvailablePackage<'_> {
+    fn into_package(self) -> Package {
+        Package {
+            name: self.name.to_owned(),
+            version: parse_version_or_zero(self.version),
+            description: self.summary.to_owned(),
+            source: PackageSource::Official,
+            installed: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RepositoryQuery<'a> {
     Available(Option<&'a str>),
@@ -1302,34 +1320,35 @@ impl DnfPackageManager {
         Ok(packages)
     }
 
-    fn parse_available_packages(output: &[u8]) -> Result<Vec<Package>> {
+    fn available_rows(output: &[u8]) -> Result<impl Iterator<Item = Result<AvailablePackage<'_>>>> {
         let text = std::str::from_utf8(output).context("DNF repository output is not UTF-8")?;
-        text.lines()
-            .filter(|line| !line.is_empty())
-            .map(|line| {
-                let mut fields = line.splitn(3, '\t');
-                let name = fields.next().context("DNF repository row has no name")?;
-                let version = fields.next().context("DNF repository row has no version")?;
-                let summary = fields.next().context("DNF repository row has no summary")?;
-                anyhow::ensure!(
-                    !name.is_empty()
-                        && name
-                            .bytes()
-                            .all(|byte| byte.is_ascii_alphanumeric() || b"+._-".contains(&byte)),
-                    "DNF repository row has invalid package name"
-                );
-                anyhow::ensure!(
-                    !version.is_empty() && !version.chars().any(char::is_whitespace),
-                    "DNF repository row has invalid version"
-                );
-                Ok(Package {
-                    name: name.to_owned(),
-                    version: parse_version_or_zero(version),
-                    description: summary.to_owned(),
-                    source: PackageSource::Official,
-                    installed: false,
-                })
+        Ok(text.lines().filter(|line| !line.is_empty()).map(|line| {
+            let mut fields = line.splitn(3, '\t');
+            let name = fields.next().context("DNF repository row has no name")?;
+            let version = fields.next().context("DNF repository row has no version")?;
+            let summary = fields.next().context("DNF repository row has no summary")?;
+            anyhow::ensure!(
+                !name.is_empty()
+                    && name
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || b"+._-".contains(&byte)),
+                "DNF repository row has invalid package name"
+            );
+            anyhow::ensure!(
+                !version.is_empty() && !version.chars().any(char::is_whitespace),
+                "DNF repository row has invalid version"
+            );
+            Ok(AvailablePackage {
+                name,
+                version,
+                summary,
             })
+        }))
+    }
+
+    fn parse_available_packages(output: &[u8]) -> Result<Vec<Package>> {
+        Self::available_rows(output)?
+            .map(|row| row.map(AvailablePackage::into_package))
             .collect()
     }
 
@@ -1366,18 +1385,43 @@ impl DnfPackageManager {
         candidates
     }
 
-    fn search_results(mut candidates: Vec<Package>, query_lower: &str) -> Vec<Package> {
-        let mut matching_identities: HashSet<_> = candidates
+    fn search_results(
+        installed: &[InstalledPackage],
+        output: &[u8],
+        query_lower: &str,
+    ) -> Result<Vec<Package>> {
+        let available = Self::available_rows(output)?.collect::<Result<Vec<_>>>()?;
+        let installed: Vec<_> = installed.iter().map(InstalledPackage::as_package).collect();
+        let matches_query = |name: &str, summary: &str| {
+            name.to_lowercase().contains(query_lower)
+                || summary.to_lowercase().contains(query_lower)
+        };
+        // Any matching summary admits the identity. The installed row, or the
+        // first repository row for an uninstalled identity, supplies its fields.
+        let mut matching_identities: HashSet<_> = installed
             .iter()
-            .filter(|pkg| {
-                pkg.name.to_lowercase().contains(query_lower)
-                    || pkg.description.to_lowercase().contains(query_lower)
-            })
-            .map(|pkg| pkg.name.clone())
+            .filter(|pkg| matches_query(&pkg.name, &pkg.description))
+            .map(|pkg| pkg.name.as_str())
+            .chain(
+                available
+                    .iter()
+                    .filter(|row| matches_query(row.name, row.summary))
+                    .map(|row| row.name),
+            )
             .collect();
-        candidates.retain(|pkg| matching_identities.remove(&pkg.name));
-        candidates.sort_unstable_by(|a, b| a.name.cmp(&b.name));
-        candidates
+        let mut results: Vec<_> = installed
+            .iter()
+            .filter(|pkg| matching_identities.remove(pkg.name.as_str()))
+            .cloned()
+            .collect();
+        results.extend(
+            available
+                .into_iter()
+                .filter(|row| matching_identities.remove(row.name))
+                .map(AvailablePackage::into_package),
+        );
+        results.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+        Ok(results)
     }
 
     pub(crate) async fn installed_package_sizes(
@@ -2767,8 +2811,9 @@ impl PackageManager for DnfPackageManager {
     ) -> Pin<Box<dyn Future<Output = Result<Vec<Package>>> + Send + '_>> {
         let query_lower = query.to_lowercase();
         Box::pin(async move {
-            let candidates = self.package_index().await?;
-            Ok(Self::search_results(candidates, &query_lower))
+            let installed = self.load_installed_packages().await?;
+            let output = Self::repository_output(RepositoryQuery::Available(None)).await?;
+            Self::search_results(&installed, &output, &query_lower)
         })
     }
 
@@ -4035,7 +4080,7 @@ mod tests {
         );
     }
 
-    fn search_catalog_fixture() -> Vec<Package> {
+    fn search_catalog_fixture() -> ([InstalledPackage; 2], &'static [u8]) {
         let installed =
             [("widget.lib", "x86_64"), ("widget.local", "noarch")].map(|(name, architecture)| {
                 InstalledPackage {
@@ -4046,13 +4091,12 @@ mod tests {
                     summary: "Installed summary".to_owned(),
                 }
             });
-        let available = DnfPackageManager::parse_available_packages(
+        (
+            installed,
             b"widget.lib.x86_64\t2-1\tRepository keyword\n\
               widget.lib.x86_64\t3-1\tAnother repository build\n\
               widget.lib.i686\t2-1\tRepository keyword\n",
         )
-        .expect("valid repository rows");
-        DnfPackageManager::search_candidates(&installed, available)
     }
 
     #[test]
@@ -4061,8 +4105,10 @@ mod tests {
             DnfPackageManager::repository_query_format(&RepositoryQuery::Available(None)),
             "%{name}.%{arch}\t%{evr}\t%{summary}\\n"
         );
+        let (installed_packages, output) = search_catalog_fixture();
         let search = |query| {
-            DnfPackageManager::search_results(search_catalog_fixture(), query)
+            DnfPackageManager::search_results(&installed_packages, output, query)
+                .expect("valid repository rows")
                 .into_iter()
                 .map(|pkg| {
                     (
@@ -4104,10 +4150,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn direct_search_preserves_the_first_repository_row_for_a_matching_identity() -> Result<()> {
+        let output = "editor.noarch\t1-1\tPreferred repository\n\
+                      editor.noarch\t1-2\tÉditeur de texte\n";
+        let matches = DnfPackageManager::search_results(&[], output.as_bytes(), "éditeur")?;
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].name, "editor.noarch");
+        assert_eq!(matches[0].version.to_string(), "1-1");
+        assert_eq!(matches[0].description, "Preferred repository");
+        assert!(!matches[0].installed);
+
+        let malformed = "editor.noarch\t1-1\tÉditeur\nmissing-version";
+        assert!(DnfPackageManager::search_results(&[], malformed.as_bytes(), "éditeur").is_err());
+        Ok(())
+    }
+
     #[cfg(unix)]
     pub(crate) fn search_parity_data(query: &str) -> (Vec<Package>, Vec<Package>) {
-        let catalog = search_catalog_fixture();
-        let direct = DnfPackageManager::search_results(catalog.clone(), query);
+        let (installed, output) = search_catalog_fixture();
+        let available = DnfPackageManager::parse_available_packages(output).expect("fixture rows");
+        let catalog = DnfPackageManager::search_candidates(&installed, available);
+        let direct =
+            DnfPackageManager::search_results(&installed, output, query).expect("valid search");
         (catalog, direct)
     }
 
