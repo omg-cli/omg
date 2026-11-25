@@ -5,8 +5,13 @@
 # QEMU, qcow2 images, SLIRP networking, or /dev/kvm.
 set -euo pipefail
 
-DISTRO="${1:?usage: distro-e2e.sh <arch|debian|debian-trixie|ubuntu|fedora> <omg-binary>}"
-OMG_BIN="${2:?usage: distro-e2e.sh <arch|debian|debian-trixie|ubuntu|fedora> <omg-binary>}"
+if [[ $# -lt 2 || $# -gt 3 || ( $# -eq 3 && ${3:-} != --metadata-ready ) ]]; then
+  echo 'usage: distro-e2e.sh <arch|debian|debian-trixie|ubuntu|fedora> <omg-binary> [--metadata-ready]' >&2
+  exit 2
+fi
+DISTRO=$1
+OMG_BIN=$2
+metadata_mode=${3:-}
 
 if [[ ! -x "$OMG_BIN" ]]; then
   echo "ERROR: omg binary is not executable: $OMG_BIN" >&2
@@ -30,17 +35,17 @@ echo "=== [distro-e2e:$DISTRO] Architecture: $(uname -m) ==="
 echo "=== [distro-e2e:$DISTRO] Verifying native package database reads ==="
 case "$DISTRO" in
   arch)
-    pacman -Sy --noconfirm >/dev/null
+    [[ "$metadata_mode" == --metadata-ready ]] || pacman -Sy --noconfirm >/dev/null
     "$OMG_BIN" search pacman --no-aur --limit 5 | grep -qi "pacman"
     "$OMG_BIN" info pacman | grep -q "Name:"
     ;;
   debian|debian-trixie|ubuntu)
-    apt-get update -qq
+    [[ "$metadata_mode" == --metadata-ready ]] || apt-get update -qq
     "$OMG_BIN" search bash --limit 5 | grep -qi "bash"
     "$OMG_BIN" info bash | grep -q "Name:"
     ;;
   fedora)
-    dnf makecache -q
+    [[ "$metadata_mode" == --metadata-ready ]] || dnf makecache -q
     "$OMG_BIN" search bash --limit 5 | grep -qi "bash"
     "$OMG_BIN" info bash | grep -q "Name:"
     ;;

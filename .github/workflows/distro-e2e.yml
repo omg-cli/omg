@@ -103,8 +103,7 @@ jobs:
           set -euo pipefail
           case "$MATRIX_DISTRO" in
             arch)
-              pacman -Syu --noconfirm
-              pacman -S --noconfirm --needed base-devel pkgconf openssl libarchive clang cmake curl python mold
+              pacman -Syu --noconfirm --needed base-devel pkgconf openssl libarchive clang cmake curl python mold
               ;;
             debian|debian-trixie|ubuntu)
               apt-get update -qq
@@ -112,7 +111,7 @@ jobs:
                 build-essential pkg-config libssl-dev libapt-pkg-dev libclang-dev curl ca-certificates python3 mold
               ;;
             fedora)
-              dnf install -y gcc gcc-c++ make pkgconf-pkg-config openssl-devel clang-devel curl ca-certificates python3 mold perl-core
+              dnf --refresh install -y gcc gcc-c++ make pkgconf-pkg-config openssl-devel clang-devel curl ca-certificates python3 mold perl-core
               ;;
             *)
               echo "Unsupported distro: $MATRIX_DISTRO" >&2
@@ -181,7 +180,7 @@ jobs:
         shell: bash
         env:
           MATRIX_DISTRO: ${{ matrix.distro }}
-        run: bash scripts/distro-e2e.sh "$MATRIX_DISTRO" "./target/ci/omg"
+        run: bash scripts/distro-e2e.sh "$MATRIX_DISTRO" "./target/ci/omg" --metadata-ready
 
       - name: Print sccache stats
         if: always() && env.RUSTC_WRAPPER == 'sccache'
