@@ -412,6 +412,14 @@ fn draw_health_cards(f: &mut Frame, area: Rect, app: &App) {
     let updates = app.get_updates_available();
     let orphans = app.get_orphan_packages();
     let vulns = app.get_security_findings_summary();
+    let status_available = app.status.is_some();
+    let count_label = |count: usize| {
+        if status_available {
+            Cow::Owned(count.to_string())
+        } else {
+            Cow::Borrowed("—")
+        }
+    };
 
     // Packages card
     if let Some(c) = cards.first() {
@@ -420,7 +428,7 @@ fn draw_health_cards(f: &mut Frame, area: Rect, app: &App) {
                 "Inventory",
                 "󰏗",
                 colors::ACCENT_BLUE,
-                total_packages.to_string(),
+                count_label(total_packages),
                 colors::FG_PRIMARY,
                 "System Packages",
             ),
@@ -430,23 +438,19 @@ fn draw_health_cards(f: &mut Frame, area: Rect, app: &App) {
 
     // Updates card
     if let Some(c) = cards.get(1) {
-        let color = if updates > 0 {
-            colors::ACCENT_YELLOW
-        } else {
-            colors::ACCENT_GREEN
+        let (icon, color, caption) = match (status_available, updates) {
+            (false, _) => ("󰚰", colors::FG_MUTED, "Updates unknown"),
+            (true, 0) => ("󰄬", colors::ACCENT_GREEN, "System Up-to-date"),
+            (true, _) => ("󰚰", colors::ACCENT_YELLOW, "Updates Available"),
         };
         f.render_widget(
             stat_card(
                 "Maintainability",
-                if updates > 0 { "󰚰" } else { "󰄬" },
+                icon,
                 color,
-                updates.to_string(),
+                count_label(updates),
                 color,
-                if updates > 0 {
-                    "Updates Available"
-                } else {
-                    "System Up-to-date"
-                },
+                caption,
             ),
             *c,
         );
@@ -454,17 +458,17 @@ fn draw_health_cards(f: &mut Frame, area: Rect, app: &App) {
 
     // Orphans card
     if let Some(c) = cards.get(2) {
-        let color = if orphans > 0 {
-            colors::ACCENT_ORANGE
-        } else {
-            colors::ACCENT_GREEN
+        let (icon, color) = match (status_available, orphans) {
+            (false, _) => ("󰃤", colors::FG_MUTED),
+            (true, 0) => ("󰄬", colors::ACCENT_GREEN),
+            (true, _) => ("󰃤", colors::ACCENT_ORANGE),
         };
         f.render_widget(
             stat_card(
                 "Hygiene",
-                if orphans > 0 { "󰃤" } else { "󰄬" },
+                icon,
                 color,
-                orphans.to_string(),
+                count_label(orphans),
                 color,
                 "Orphan Packages",
             ),
@@ -645,7 +649,9 @@ fn draw_quick_actions(f: &mut Frame, area: Rect, app: &App) {
                     .fg(colors::ACCENT_YELLOW),
             ),
             Span::styled(" Update System", Style::default().fg(colors::FG_PRIMARY)),
-            if updates > 0 {
+            if app.status.is_none() {
+                Span::raw("")
+            } else if updates > 0 {
                 Span::styled(
                     format!(" ({updates})"),
                     Style::default()
@@ -682,7 +688,9 @@ fn draw_quick_actions(f: &mut Frame, area: Rect, app: &App) {
                     .fg(colors::ACCENT_ORANGE),
             ),
             Span::styled(" Remove Orphans", Style::default().fg(colors::FG_PRIMARY)),
-            if orphans > 0 {
+            if app.status.is_none() {
+                Span::raw("")
+            } else if orphans > 0 {
                 Span::styled(
                     format!(" ({orphans})"),
                     Style::default().fg(colors::ACCENT_ORANGE),
@@ -752,6 +760,7 @@ fn draw_recent_activity(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_packages(f: &mut Frame, area: Rect, app: &App) {
+    const HEADER_HEIGHT: u16 = 1;
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -807,13 +816,22 @@ fn draw_packages(f: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
-    // Package table with modern styling
-    let rows: Vec<Row> = app
+    let block = styled_block(" Packages");
+    // Each package occupies one line. Build cells only for the rows the table can display.
+    let visible_rows = usize::from(block.inner(*list_area).height.saturating_sub(HEADER_HEIGHT));
+    let selected = app
+        .selected_index
+        .min(app.search_results.len().saturating_sub(1));
+    let start = (selected + 1).saturating_sub(visible_rows);
+    let visible_selection = selected.checked_sub(start);
+    let rows = app
         .search_results
         .iter()
+        .skip(start)
+        .take(visible_rows)
         .enumerate()
         .map(|(i, pkg)| {
-            let is_selected = i == app.selected_index;
+            let is_selected = visible_selection == Some(i);
             let base_style = if is_selected {
                 Style::default().bg(colors::BG_HIGHLIGHT)
             } else {
@@ -848,8 +866,7 @@ fn draw_packages(f: &mut Frame, area: Rect, app: &App) {
                 )),
             ])
             .style(base_style)
-        })
-        .collect();
+        });
 
     let header = Row::new(vec![
         Cell::from(Span::styled(
@@ -877,6 +894,7 @@ fn draw_packages(f: &mut Frame, area: Rect, app: &App) {
                 .add_modifier(Modifier::BOLD),
         )),
     ])
+    .height(HEADER_HEIGHT)
     .style(Style::default().bg(colors::BG_LIGHT));
 
     let table = Table::new(
@@ -889,9 +907,9 @@ fn draw_packages(f: &mut Frame, area: Rect, app: &App) {
         ],
     )
     .header(header)
-    .block(styled_block(" Packages"));
+    .block(block);
 
-    let mut state = TableState::default().with_selected(Some(app.selected_index));
+    let mut state = TableState::default().with_selected(visible_selection);
     f.render_stateful_widget(table, *list_area, &mut state);
 }
 
@@ -1589,6 +1607,65 @@ mod tests {
         assert!(!text.contains("SECURE"));
         assert!(text.contains("Policy not loaded"));
         assert!(!text.contains("COMMUNITY"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dashboard_marks_missing_or_failed_package_status_unavailable() {
+        let mut app = app_on(Tab::Dashboard);
+        let mut terminal = Terminal::new(TestBackend::new(160, 45)).expect("test terminal");
+        let mut render = |app: &App| -> String {
+            terminal
+                .draw(|frame| draw(frame, app))
+                .expect("draw dashboard");
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(ratatui::buffer::Cell::symbol)
+                .collect()
+        };
+
+        let initial = render(&app);
+        assert!(initial.contains("Updates unknown"));
+        assert!(!initial.contains("System Up-to-date") && !initial.contains("✓"));
+
+        let valid = crate::daemon::protocol::StatusResult {
+            total_packages: 12,
+            explicit_packages: 8,
+            orphan_packages: 0,
+            updates_available: 0,
+            security_vulnerabilities: 0,
+            vulnerabilities_scanned: true,
+            security_unknown_packages: Some(0),
+            runtime_versions: vec![],
+        };
+        app.apply_daemon_status(
+            true,
+            Some(crate::daemon::protocol::StatusResult {
+                updates_available: 2,
+                orphan_packages: 3,
+                ..valid.clone()
+            }),
+        );
+        let pending = render(&app);
+        assert!(pending.contains("Update System (2)"));
+        assert!(pending.contains("Remove Orphans (3)"));
+
+        for connected in [true, false] {
+            app.apply_daemon_status(true, Some(valid.clone()));
+            let current = render(&app);
+            assert!(current.contains("System Up-to-date") && current.contains("✓"));
+            assert!(current.contains("No matches"));
+
+            app.apply_daemon_status(connected, None);
+            let unavailable = render(&app);
+            assert!(unavailable.contains("Updates unknown"));
+            assert!(!unavailable.contains("System Up-to-date") && !unavailable.contains("✓"));
+            assert!(!unavailable.contains("No matches"));
+            assert!(unavailable.contains("Unreported"));
+        }
     }
 
     #[cfg(unix)]

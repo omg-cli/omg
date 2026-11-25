@@ -2055,6 +2055,7 @@ async fn drain_interrupted_coordinator(
 async fn drain_completed_coordinator(
     master: &tokio::io::unix::AsyncFd<File>,
     mut transcript: &File,
+    terminal: &mut impl std::io::Write,
 ) -> Result<()> {
     use std::io::Write;
     let drain = async {
@@ -2065,9 +2066,9 @@ async fn drain_completed_coordinator(
                 return Ok::<_, anyhow::Error>(());
             }
             transcript.write_all(&output[..count])?;
-            let _ = std::io::stdout()
+            let _ = terminal
                 .write_all(&output[..count])
-                .and_then(|()| std::io::stdout().flush());
+                .and_then(|()| terminal.flush());
             tokio::task::yield_now().await;
         }
     };
@@ -2170,7 +2171,7 @@ async fn execute_logged(
             tokio::select! {
                 status = child.wait() => {
                     let status = status?;
-                    drain_completed_coordinator(&master, transcript).await?;
+                    drain_completed_coordinator(&master, transcript, &mut std::io::stdout()).await?;
                     return Ok::<_, anyhow::Error>(status);
                 }
                 result = read_pty(&master, &mut output), if output_open => {
@@ -6000,9 +6001,10 @@ omarchy-state set reboot-required
             slave.write_all(b"after").expect("pending terminal tail");
             drop(slave);
         };
+        let mut terminal = Vec::new();
         let (drained, ()) = tokio::time::timeout(Duration::from_secs(2), async {
             tokio::join!(
-                drain_completed_coordinator(&master, &transcript),
+                drain_completed_coordinator(&master, &transcript, &mut terminal),
                 pending_output
             )
         })
@@ -6022,6 +6024,7 @@ omarchy-state set reboot-required
             b"before-after",
             "completion must include output pending before terminal EOF"
         );
+        assert_eq!(terminal, b"before-after");
     }
 
     #[tokio::test]
@@ -6032,6 +6035,7 @@ omarchy-state set reboot-required
         let program =
             crate::core::privilege::root_controlled_program_path("printf").expect("system printf");
         let payload = "x".repeat(257);
+        let mut terminal = Vec::with_capacity(payload.len());
         for attempt in 0..2000 {
             let (master, slave) = open_transport_pty(None).expect("private tail PTY");
             fcntl(&master, FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK))
@@ -6053,13 +6057,19 @@ omarchy-state set reboot-required
             let mut child = command.spawn().expect("private tail writer");
             drop(command);
             assert!(child.wait().expect("tail writer reap").success());
-            drain_completed_coordinator(&master, transcript)
+            terminal.clear();
+            drain_completed_coordinator(&master, transcript, &mut terminal)
                 .await
                 .expect("drain exited coordinator output");
             assert_eq!(
                 std::fs::read(owner.path().join("transcript")).expect("tail transcript"),
                 payload.as_bytes(),
                 "all child bytes must survive reap on attempt {attempt}"
+            );
+            assert_eq!(
+                terminal,
+                payload.as_bytes(),
+                "all child bytes must reach the terminal on attempt {attempt}"
             );
         }
     }
