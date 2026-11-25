@@ -74,7 +74,7 @@ class OptimizationContracts(unittest.TestCase):
         self.assertIn('--image-policy tests/qemu-image-provenance/manifest.json', workflow)
         save = workflow.split('      - name: Save verified native QEMU image cache\n', 1)[1].split('\n      - ', 1)[0]
         self.assertIn("steps.native_fixture_tests.outcome == 'success'", save)
-        self.assertIn('github.event.pull_request.head.repo.full_name == github.repository', save)
+        self.assertIn("github.ref == 'refs/heads/main'", save)
         self.assertIn("steps.native_image_restore.outputs.cache-hit != 'true'", save)
         self.assertNotIn('restore-keys:', workflow)
         self.assertIn('actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9', workflow)
@@ -706,6 +706,42 @@ git() { printf '%040d\\n' 1; }
                     for role in ('portable', 'portable-release'):
                         self.assertEqual(job_block(text, role).count(new_prefix), 1)
                 self.assertNotIn(old_prefix, text)
+
+    def test_distro_e2e_restores_shared_caches_without_saving_per_pr(self):
+        workflow = (WORKFLOWS / 'distro-e2e.yml').read_text(encoding='utf-8')
+        for job in ('container-e2e', 'systemd-daemon-e2e'):
+            with self.subTest(job=job):
+                body = job_block(workflow, job)
+                cache = body.split('      - name: Cache Cargo artifacts\n', 1)[1].split('\n      - ', 1)[0]
+                self.assertIn('uses: Swatinem/rust-cache@', cache)
+                self.assertNotIn('\n        if:', cache)
+                self.assertIn("save-if: ${{ github.ref == 'refs/heads/main' }}", cache)
+
+    def test_publication_and_alpm_unit_suites_have_one_ci_owner(self):
+        workflow = (WORKFLOWS / 'ci.yml').read_text(encoding='utf-8')
+        helpers = job_block(workflow, 'workflow-checks')
+        docs_step = helpers.split('      - name: Test workflow guards on docs-only changes\n', 1)[1]
+        docs_step = docs_step.split('\n      - ', 1)[0]
+        self.assertIn("if: matrix.shard == 0 && github.event_name != 'push' && needs.quick-gate.outputs.checks-required != 'true'", docs_step)
+        for module in ('test_advisory_baseline.py', 'test_alpm_pins.py'):
+            self.assertIn(module, docs_step)
+            self.assertEqual(helpers.count(module), 1)
+            self.assertTrue((ROOT / 'scripts' / module).is_file())
+        self.assertIn('run: python3 scripts/check-alpm-pins.py', helpers)
+
+    def test_ubuntu_can_rerun_without_overwriting_evidence_from_the_failed_attempt(self):
+        workflow = (WORKFLOWS / 'ci.yml').read_text(encoding='utf-8')
+        ubuntu = job_block(workflow, 'ubuntu')
+        artifact_names = re.findall(r'(?m)^          name: (.+)$', ubuntu)
+        for artifact in ('apt-daemon-catalog-ubuntu', 'native-release-ubuntu',
+                         'omg-ubuntu', 'cli-surfaces-ubuntu'):
+            with self.subTest(artifact=artifact):
+                self.assertIn(artifact + '-${{ github.run_attempt }}', artifact_names)
+        self.assertNotIn('overwrite:', ubuntu)
+        self.assertRegex(ubuntu, r'(?m)^    timeout-minutes: (?:[4-5][0-9]|60)$')
+        self.assertIn('cargo clippy --all-targets --no-default-features --features debian,pgp,license', ubuntu)
+        self.assertIn('python3 scripts/run-native-contracts.py --features debian,pgp,license', ubuntu)
+        self.assertIn('--locked --no-fail-fast -- --test-threads=1', ubuntu)
 
     def test_compiler_cache_upload_contains_both_diagnostics_in_one_directory(self):
         cases = [(filename, job, mode)

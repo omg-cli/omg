@@ -103,21 +103,17 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
 
-      - name: Test debt baseline and classification guards on docs-only changes
+      - name: Test workflow guards on docs-only changes
         if: matrix.shard == 0 && github.event_name != 'push' && needs.quick-gate.outputs.checks-required != 'true'
         run: |
           python3 -m unittest discover -s scripts -p 'test_debt*.py'
           python3 -m unittest discover -s scripts -p test_ci_change_scope.py
-
-      - name: Test advisory baseline publication guards
-        if: matrix.shard == 0
-        run: python3 -m unittest discover -s scripts -p test_advisory_baseline.py
+          python3 -m unittest discover -s scripts -p test_advisory_baseline.py
+          python3 scripts/test_alpm_pins.py
 
       - name: Check Rust ALPM snapshot consistency
         if: matrix.shard == 0
-        run: |
-          python3 scripts/check-alpm-pins.py
-          python3 scripts/test_alpm_pins.py
+        run: python3 scripts/check-alpm-pins.py
 
       - name: Debt ratchet (gating)
         if: matrix.shard == 0
@@ -1946,7 +1942,8 @@ jobs:
     needs: quick-gate
     if: needs.quick-gate.outputs.should-build == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group'
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    # A cold build, Clippy and both test runners can exceed 30 minutes.
+    timeout-minutes: 40
     env:
       OMG_CONTRACT_SURFACE_OUT: target/contract-surfaces
       OMG_CONTRACT_SOURCE_SHA: ${{ github.sha }}
@@ -2026,7 +2023,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: apt-daemon-catalog-ubuntu
+          name: apt-daemon-catalog-ubuntu-${{ github.run_attempt }}
           path: |
             ${{ runner.temp }}/apt-daemon-catalog/receipt.json
             ${{ runner.temp }}/apt-daemon-catalog/daemon.log
@@ -2071,7 +2068,7 @@ jobs:
       - name: Upload binary
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: omg-ubuntu
+          name: omg-ubuntu-${{ github.run_attempt }}
           path: target/release/omg
           retention-days: 7
           if-no-files-found: error
@@ -2080,7 +2077,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: cli-surfaces-ubuntu
+          name: cli-surfaces-ubuntu-${{ github.run_attempt }}
           path: target/contract-surfaces/
           retention-days: 14
           if-no-files-found: error

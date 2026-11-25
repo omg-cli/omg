@@ -384,14 +384,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn standard_no_sync_prefers_a_cached_native_upgrade() {
-        let selected = select_native_update(
-            UpdateMode::Standard,
-            true,
-            || Some("cached plan"),
-            || Some("refreshable plan"),
-        );
-        assert_eq!(selected, Some("cached plan"));
+    fn standard_updates_select_cached_or_refreshable_native_upgrade() {
+        for (no_sync, expected) in [(true, "cached plan"), (false, "refreshable plan")] {
+            let selected = select_native_update(
+                UpdateMode::Standard,
+                no_sync,
+                || Some("cached plan"),
+                || Some("refreshable plan"),
+            );
+            assert_eq!(selected, Some(expected));
+        }
     }
 
     #[test]
@@ -402,17 +404,51 @@ mod tests {
     }
 
     #[test]
-    fn synced_updates_keep_the_standard_plan_and_turbo_keeps_cached_metadata() {
+    fn fast_updates_use_the_standard_plan_and_turbo_keeps_cached_metadata() {
         for (mode, expected) in [
-            (UpdateMode::Standard, Some("native plan")),
-            (UpdateMode::Fast, Some("native plan")),
-            (UpdateMode::Turbo, Some("cached plan")),
+            (UpdateMode::Fast, "native plan"),
+            (UpdateMode::Turbo, "cached plan"),
         ] {
             assert_eq!(
                 select_native_update(mode, false, || Some("cached plan"), || Some("native plan")),
-                expected
+                Some(expected)
             );
         }
+    }
+
+    #[test]
+    fn no_sync_official_update_runs_with_a_backend_without_cached_admission() -> Result<()> {
+        use crate::package_managers::{Backend, PackageManager, mock::MockPackageManager};
+        use anyhow::Context;
+
+        const NAME: &str = "cli::packages::common::tests::no_sync_official_update_runs_with_a_backend_without_cached_admission";
+        if crate::core::testing::run_isolated_test(NAME) {
+            return Ok(());
+        }
+        let fixture = tempfile::tempdir()?;
+        let data = fixture.path().to_str().context("Mock package directory")?;
+        temp_env::with_vars(
+            [
+                ("OMG_TEST_MODE", Some("1")),
+                ("OMG_TEST_DISTRO", Some("debian")),
+                ("OMG_DISABLE_DAEMON", Some("1")),
+                ("OMG_NATIVE_TEST_DATA_DIR", Some("1")),
+                ("OMG_DATA_DIR", Some(data)),
+            ],
+            || {
+                assert_eq!(crate::package_managers::resolve_backend()?, Backend::Mock);
+                let manager = MockPackageManager::new_in("debian", fixture.path());
+                manager.set_installed_version("curl", "1.0.0")?;
+                manager.set_available_version("curl", "2.0.0")?;
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?
+                    .block_on(async {
+                        assert_eq!(manager.list_updates().await?.len(), 1);
+                        update_official_only(false, true, false, true, UpdateMode::Standard).await
+                    })
+            },
+        )
     }
 
     /// The Arch update lane calls this after every sync: with no daemon it

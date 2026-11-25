@@ -32,7 +32,8 @@ jobs:
   #
   # release.yml triggers independently of ci.yml, so without this job a tag
   # could be published while CI is red. Publishing is only allowed for a
-  # commit with successful platform, security, coverage and staged guest runs.
+  # commit with successful platform, security and coverage runs. The staged
+  # archive smoke jobs below gate publication after the builds.
   # Non-publishing dry runs
   # bypass this gate; existing-tag sync uses the published release path.
   # ════════════════════════════════════════════════════════════════════════════
@@ -73,7 +74,6 @@ jobs:
           scripts/require-workflow-success.sh codeql.yml "$GITHUB_SHA" CodeQL
           scripts/require-workflow-success.sh coverage.yml "$GITHUB_SHA" Coverage
           scripts/require-workflow-success.sh docker-e2e.yml "$GITHUB_SHA" "Docker E2E"
-          # The successful CI run includes required staged QEMU verification.
 
   # ════════════════════════════════════════════════════════════════════════════
   # BUILD RELEASE ARTIFACTS
