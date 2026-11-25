@@ -157,6 +157,12 @@ fn suspend_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Re
 
 fn resume_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
     enable_raw_mode()?;
+    redraw_alternate_screen(terminal)
+}
+
+fn redraw_alternate_screen(
+    terminal: &mut Terminal<CrosstermBackend<impl io::Write>>,
+) -> Result<()> {
     execute!(
         terminal.backend_mut(),
         EnterAlternateScreen,
@@ -576,6 +582,27 @@ fn force_refresh(app: &mut app::App) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_alternate_screen_write_preserves_the_dashboard_buffer() -> Result<()> {
+        let backend = CrosstermBackend::new(io::Cursor::new(&mut [][..]));
+        let options = ratatui::TerminalOptions {
+            viewport: ratatui::Viewport::Fixed(ratatui::layout::Rect::new(0, 0, 1, 1)),
+        };
+        let mut terminal = Terminal::with_options(backend, options)?;
+        terminal.current_buffer_mut()[(0, 0)].set_symbol("x");
+
+        let error = redraw_alternate_screen(&mut terminal).unwrap_err();
+
+        assert_eq!(
+            error.downcast::<io::Error>()?.kind(),
+            io::ErrorKind::WriteZero
+        );
+        assert_eq!(terminal.current_buffer_mut()[(0, 0)].symbol(), "x");
+        Ok(())
+    }
+
     #[test]
     fn daemon_refresh_runs_in_background_only_when_due() {
         let due = Duration::from_secs(REFRESH_INTERVAL_SECS);
