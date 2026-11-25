@@ -31,6 +31,7 @@ use crate::package_managers::types::{
 mod catalog_cache;
 mod install_reasons;
 mod rpm_database;
+mod rpm_evr;
 
 mod repository_freshness;
 mod repository_observation;
@@ -552,8 +553,7 @@ impl crate::core::security::vulnerability::VulnerabilitySource for PlannedDnfAdv
                     DnfPackageManager::native_advisories().await?,
                 )?;
                 let mut assessments = Vec::with_capacity(packages.len());
-                let mut comparisons = Vec::new();
-                let mut candidates = Vec::new();
+                let mut comparisons = 0;
                 for package in packages {
                     let mut assessment = PackageAssessment::unknown(
                         package.clone(),
@@ -581,21 +581,18 @@ impl crate::core::security::vulnerability::VulnerabilitySource for PlannedDnfAdv
                             let fixed = &native.advisory_nevra[name.len() + 1
                                 ..native.advisory_nevra.len() - architecture.len() - 1];
                             anyhow::ensure!(
-                                comparisons.len() < 10_000,
-                                "Native advisory comparison exceeds its bound"
+                                comparisons < 10_000,
+                                "RPM advisory comparison exceeds its bound"
                             );
-                            comparisons.push((package.version.clone(), fixed.to_owned()));
-                            candidates.push((assessments.len(), finding.clone()));
+                            comparisons += 1;
+                            if rpm_evr::compare(&package.version, fixed)?.is_lt() {
+                                let mut finding = finding.clone();
+                                finding.applicability = FindingApplicability::Possible;
+                                assessment.findings.push(finding);
+                            }
                         }
                     }
                     assessments.push(assessment);
-                }
-                let compared = DnfPackageManager::compare_native_evrs(&comparisons).await?;
-                for ((index, mut finding), comparison) in candidates.into_iter().zip(compared) {
-                    if comparison < 0 {
-                        finding.applicability = FindingApplicability::Possible;
-                        assessments[index].findings.push(finding);
-                    }
                 }
                 for assessment in &mut assessments {
                     assessment.findings.sort_by(|left, right| {
@@ -630,50 +627,6 @@ impl Default for DnfPackageManager {
 }
 
 impl DnfPackageManager {
-    async fn compare_native_evrs(pairs: &[(String, String)]) -> Result<Vec<i32>> {
-        let mut results = Vec::with_capacity(pairs.len());
-        for chunk in pairs.chunks(128) {
-            let mut input = String::new();
-            for (left, right) in chunk {
-                anyhow::ensure!(
-                    [left, right]
-                        .iter()
-                        .all(|value| !value.is_empty() && !value.chars().any(char::is_control)),
-                    "Invalid native comparison input"
-                );
-                input.push_str(left);
-                input.push('\n');
-                input.push_str(right);
-                input.push('\n');
-            }
-            anyhow::ensure!(
-                input.len() <= 64 * 1024,
-                "Native RPM comparison input exceeds limit"
-            );
-            let mut command =
-                tokio::process::Command::from(crate::core::privilege::system_command("rpm")?);
-            command.env("OMG_EVR_PAIRS", input).args(["--eval", r#"%{lua:local left=nil; for value in string.gmatch(os.getenv("OMG_EVR_PAIRS"), "[^\n]+") do if left then print(string.format("%d\n",rpm.vercmp(left,value))); left=nil else left=value end end; if left then error("incomplete comparison") end}"#]);
-            let output = Self::query_output(command).await?;
-            let compared = std::str::from_utf8(&output)?
-                .split_whitespace()
-                .map(|value| match value {
-                    "-1" => Ok(-1),
-                    "0" => Ok(0),
-                    "1" => Ok(1),
-                    _ => Err(anyhow::anyhow!(
-                        "Invalid native RPM version comparison result"
-                    )),
-                })
-                .collect::<Result<Vec<_>>>()?;
-            anyhow::ensure!(
-                compared.len() == chunk.len(),
-                "Incomplete native RPM version comparisons"
-            );
-            results.extend(compared);
-        }
-        Ok(results)
-    }
-
     fn parse_removal_plan(bytes: &[u8]) -> Result<Vec<super::types::RemovalPackage>> {
         let transaction: StoredRemovalTransaction = serde_json::from_slice(bytes)
             .context("DNF5 did not produce a valid stored removal transaction")?;
@@ -2129,7 +2082,7 @@ impl DnfPackageManager {
         Ok(command)
     }
 
-    async fn affected_installed_packages<'a>(
+    fn affected_installed_packages<'a>(
         rows: impl IntoIterator<Item = &'a super::dnf_advisory::ApplicableAdvisory>,
         installed: &[super::types::SecurityPackage],
     ) -> Result<BTreeMap<String, Vec<crate::core::security::scan::InstalledIdentity>>> {
@@ -2147,40 +2100,30 @@ impl DnfPackageManager {
         }
 
         let mut selected = BTreeMap::new();
-        let mut comparisons = Vec::new();
-        let mut candidates = Vec::new();
         for row in rows {
             let Entry::Vacant(entry) = selected.entry(row.nevra.as_str()) else {
                 continue;
             };
             let (name, architecture) = super::dnf_advisory::package_identity(&row.nevra)?;
             let evr = &row.nevra[name.len() + 1..row.nevra.len() - architecture.len() - 1];
+            let mut affected = Vec::new();
             for &package in by_identity.get(&(name, architecture)).into_iter().flatten() {
-                comparisons.push((package.version.clone(), evr.to_owned()));
-                candidates.push((row.nevra.as_str(), package));
+                if rpm_evr::compare(&package.version, evr)?.is_lt() {
+                    affected.push(InstalledIdentity::from(package));
+                }
             }
-            entry.insert((row.name.as_str(), Vec::new()));
+            anyhow::ensure!(
+                !affected.is_empty(),
+                "Advisory {} has no affected installed identity: {}",
+                row.name,
+                row.nevra
+            );
+            entry.insert(affected);
         }
-        let compared = Self::compare_native_evrs(&comparisons).await?;
-        for ((nevra, package), order) in candidates.into_iter().zip(compared) {
-            if order < 0 {
-                selected
-                    .get_mut(nevra)
-                    .context("Missing native advisory selection")?
-                    .1
-                    .push(InstalledIdentity::from(package));
-            }
-        }
-        selected
+        Ok(selected
             .into_iter()
-            .map(|(nevra, (advisory, affected))| {
-                anyhow::ensure!(
-                    !affected.is_empty(),
-                    "Advisory {advisory} has no affected installed identity: {nevra}"
-                );
-                Ok((nevra.to_owned(), affected))
-            })
-            .collect()
+            .map(|(nevra, identities)| (nevra.to_owned(), identities))
+            .collect())
     }
 
     async fn native_advisories() -> Result<
@@ -2961,8 +2904,7 @@ impl PackageManager for DnfPackageManager {
                 let installed = self.security_inventory().await?;
                 let rows = Self::native_advisories().await?;
                 let affected =
-                    Self::affected_installed_packages(rows.iter().map(|(row, _)| row), &installed)
-                        .await?;
+                    Self::affected_installed_packages(rows.iter().map(|(row, _)| row), &installed)?;
                 let mut after = self.security_inventory().await?;
                 let mut before = installed;
                 let identity = |package: &super::types::SecurityPackage| {
@@ -3506,25 +3448,6 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn native_admission_evr_comparisons_preserve_rpm_order_and_batch_association()
-    -> Result<()> {
-        let mut pairs = vec![("1.0-1.fc44".to_owned(), "1.0-1.fc44".to_owned()); 129];
-        pairs[0] = ("2:1.0-1.fc44".into(), "1:9.9-9.fc44".into());
-        pairs[1] = ("1.0~rc1-1.fc44".into(), "1.0-1.fc44".into());
-        pairs[128] = ("1.0^git1-1.fc44".into(), "1.0.1-1.fc44".into());
-        let compared = DnfPackageManager::compare_native_evrs(&pairs).await?;
-        assert_eq!(compared.len(), 129);
-        assert_eq!((compared[0], compared[1], compared[128]), (1, -1, -1));
-        assert!(compared[2..128].iter().all(|value| *value == 0));
-        assert!(
-            DnfPackageManager::compare_native_evrs(&[("1.0\n2.0".into(), "3.0".into())])
-                .await
-                .is_err()
-        );
-        Ok(())
-    }
-
     #[test]
     fn proposed_admission_inventory_preserves_solver_dependencies_epochs_and_multilib() -> Result<()>
     {
@@ -3802,8 +3725,8 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn native_advisory_identity_excludes_patched_versions_and_other_architectures() {
+    #[test]
+    fn native_advisory_identity_excludes_patched_versions_and_other_architectures() {
         use crate::core::security::scan::InstalledIdentity;
 
         let package = |version: &str, architecture: &str| super::super::types::SecurityPackage {
@@ -3837,7 +3760,6 @@ mod tests {
             [&row, &other_architecture, &row],
             &installed,
         )
-        .await
         .unwrap();
         assert_eq!(
             affected,
@@ -3857,7 +3779,6 @@ mod tests {
                 [&other_architecture, &row],
                 &installed[1..]
             )
-            .await
             .is_err()
         );
     }

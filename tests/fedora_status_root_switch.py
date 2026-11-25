@@ -449,22 +449,25 @@ with tempfile.TemporaryDirectory(prefix="omg-fedora-cache-scope-", dir="/tmp") a
                                    value=(after[0] - before[0], after[1] - before[1])))
 
     @contextmanager
-    def reject_native_selection(option):
-        target = Path(dnf).resolve(strict=True)
-        with tempfile.TemporaryDirectory(prefix="dnf-selection-", dir=root) as directory:
+    def reject_native_selection(option, *, executable=dnf, prefix=False):
+        target = Path(executable).resolve(strict=True)
+        pattern = shlex.quote(option) + ("*" if prefix else "")
+        diagnostic = ("Unexpected DNF selection subprocess" if executable == dnf
+                      else "Unexpected RPM version comparison subprocess")
+        with tempfile.TemporaryDirectory(prefix="native-selection-", dir=root) as directory:
             gate = Path(directory)
             gate.chmod(0o755)
-            native_dnf = gate / target.name
-            shutil.copy2(target, native_dnf)
+            native_executable = gate / target.name
+            shutil.copy2(target, native_executable)
             wrapper = gate / "check-native-query"
             wrapper.write_text(f"""#!/usr/bin/bash
 for argument in "$@"; do
-    if [[ "$argument" == {shlex.quote(option)} ]]; then
-        printf '%s\\n' 'Unexpected DNF selection subprocess' >&2
+    if [[ "$argument" == {pattern} ]]; then
+        printf '%s\\n' {shlex.quote(diagnostic)} >&2
         exit 197
     fi
 done
-exec {shlex.quote(str(native_dnf))} "$@"
+exec {shlex.quote(str(native_executable))} "$@"
 """)
             wrapper.chmod(0o755)
             checked(["/usr/bin/mount", "--bind", wrapper, target])
@@ -1172,9 +1175,14 @@ exec {shlex.quote(str(binary))} "$@"
             native_advisories([advisory_id])
             ordinary_control([dnf, *advisory_options, "clean", "metadata"])
             assert not cached_manifests(advisory_cache)
-            with running_daemon(log):
+            with reject_native_selection("%{lua:", executable=rpm, prefix=True), running_daemon(log):
                 snapshot = json.loads(persisted.read_text())["status"]
-                assert snapshot["security_vulnerabilities"] == 1 and snapshot["updates_available"] == 1
+                findings = snapshot["security_vulnerabilities"]
+                updates = snapshot["updates_available"]
+                checks.append(dict(phase="status-repository-initial", case="advisory-without-rpm-version-process",
+                                   passed=findings == 1 and updates == 1, findings=findings, updates=updates,
+                                   diagnostic=(root / "daemon.log").read_text(errors="replace")[-1200:]
+                                   if findings != 1 or updates != 1 else None))
                 inspect_update_status("status-repository-initial", 1, True)
                 normal_manifests = cached_manifests(normal_cache)
                 advisory_manifests = cached_manifests(advisory_cache)
@@ -1317,6 +1325,6 @@ assert inventory() == before
 report = dict(binaries=binaries, checks=checks, total=len(checks),
               passed=sum(entry["passed"] for entry in checks), host_unchanged=True)
 print(json.dumps(report))
-expected_checks = 300 if consent_oracle is None else 551
+expected_checks = 301 if consent_oracle is None else 552
 if report["passed"] != report["total"] or report["total"] != expected_checks:
     sys.exit(4)
