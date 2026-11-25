@@ -126,7 +126,7 @@ async fn write_fast_status_async(
     let published = tokio::task::spawn_blocking(move || {
         let mut result = Ok(());
         let published = state.with_current_index(&index, || {
-            result = status.write_to_file(&path);
+            result = status.write_to_file(state.remember_fast_status_path(path));
         });
         result.map(|()| published)
     })
@@ -199,6 +199,7 @@ async fn run_with_status_path(
     socket_path: PathBuf,
     fast_status_path: PathBuf,
 ) -> Result<()> {
+    state.remember_fast_status_path(fast_status_path.clone());
     let shutdown_token = CancellationToken::new();
     let _cancel_on_drop = shutdown_token.clone().drop_guard();
     let mut workers = tokio::task::JoinSet::new();
@@ -1656,7 +1657,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn fast_status_writes_run_through_the_blocking_adapter() {
+    async fn fast_status_writes_follow_the_published_catalog() {
         let directory = tempfile::tempdir().expect("tempdir");
         let path = directory.path().join("status.bin");
         let status = crate::core::fast_status::FastStatus::new(10, 4, 1, 2);
@@ -1673,7 +1674,7 @@ mod tests {
             .expect("isolated fast-status state"),
         );
         let index = state.index_snapshot();
-        write_fast_status_async(status, path.clone(), state, index)
+        write_fast_status_async(status, path.clone(), Arc::clone(&state), Arc::clone(&index))
             .await
             .expect("write fast status");
 
@@ -1681,6 +1682,44 @@ mod tests {
             crate::core::fast_status::FastStatus::read_from_file(&path).expect("read fast status");
         assert_eq!(persisted.total_packages, 10);
         assert_eq!(persisted.updates_available, 2);
+
+        let refresh = || {
+            state.replace_index(
+                super::super::index::PackageIndex::empty(),
+                #[cfg(feature = "arch")]
+                crate::package_managers::pacman_db::AlpmCatalogEpoch::UNIX_EPOCH,
+            );
+        };
+        refresh();
+        assert!(
+            !path.exists(),
+            "replaced catalog left its fast status visible"
+        );
+        refresh();
+        assert!(
+            !write_fast_status_async(status, path.clone(), Arc::clone(&state), index)
+                .await
+                .expect("check stale writer")
+        );
+        assert!(!path.exists(), "stale writer recreated the fast status");
+        let fresh = crate::core::fast_status::FastStatus::new(11, 4, 1, 3);
+        let index = state.index_snapshot();
+        assert!(
+            write_fast_status_async(fresh, path.clone(), Arc::clone(&state), index)
+                .await
+                .expect("publish new catalog counts")
+        );
+        let persisted =
+            crate::core::fast_status::FastStatus::read_from_file(&path).expect("read fresh status");
+        assert_eq!(persisted.total_packages, 11);
+
+        std::fs::remove_file(&path).expect("clear fixture file");
+        std::fs::create_dir(&path).expect("substitute directory");
+        refresh();
+        assert!(
+            path.is_dir(),
+            "cache invalidation must preserve directories"
+        );
     }
 
     #[test]

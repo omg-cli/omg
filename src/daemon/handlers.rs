@@ -1,7 +1,7 @@
 //! Request handlers for the daemon
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use anyhow::Context;
 use governor::clock::DefaultClock;
@@ -210,6 +210,7 @@ pub struct DaemonState {
     security_scan_lock: tokio::sync::Mutex<()>,
     pub(super) background_security_scans: bool,
     index: RwLock<PublishedIndex>,
+    fast_status_path: OnceLock<PathBuf>,
     /// Locked because RefreshIndex must swap in a fresh AlpmWorker: libalpm
     /// caches loaded syncdbs in memory and never revalidates them on disk, so
     /// a worker that predates `omg sync` serves a frozen update list forever.
@@ -257,6 +258,10 @@ impl DaemonState {
         true
     }
 
+    pub(super) fn remember_fast_status_path(&self, path: PathBuf) -> &Path {
+        self.fast_status_path.get_or_init(|| path).as_path()
+    }
+
     /// Atomically publish a rebuilt index and invalidate derived caches.
     #[cfg(test)]
     pub(super) fn replace_index(
@@ -292,6 +297,15 @@ impl DaemonState {
         self.index_generation.fetch_add(1, Ordering::Release);
         self.cache.clear();
         self.persistent.invalidate_status();
+        if let Some(path) = self.fast_status_path.get()
+            && let Err(error) = std::fs::remove_file(path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(
+                "Failed to invalidate fast status at {}: {error}",
+                path.display()
+            );
+        }
         package_count
     }
 
@@ -685,6 +699,7 @@ impl DaemonState {
                 #[cfg(feature = "arch")]
                 epoch: index_epoch,
             }),
+            fast_status_path: OnceLock::new(),
             vulnerability_scanner: Arc::new(
                 crate::core::security::vulnerability::VulnerabilityScanner::new(),
             ),
