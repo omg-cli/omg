@@ -473,14 +473,12 @@ mod tests {
         std::fs::create_dir_all(db.join("local"))?;
         std::fs::create_dir(db.join("sync"))?;
         std::fs::write(db.join("local/ALPM_DB_VERSION"), "9\n")?;
-        std::fs::write(
-            &conf,
-            format!(
-                "[options]\nRootDir = {}\nDBPath = {}\n",
-                root.display(),
-                db.display()
-            ),
-        )?;
+        let config = format!(
+            "[options]\nRootDir = {}\nDBPath = {}\n",
+            root.display(),
+            db.display()
+        );
+        std::fs::write(&conf, config)?;
         temp_env::with_vars(
             [
                 ("OMG_PACMAN_CONF", Some(conf.as_os_str())),

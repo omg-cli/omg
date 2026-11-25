@@ -442,7 +442,9 @@ jobs:
                 local case_id=${test_name//::/_}
                 local log="$fixture_evidence/$case_id.log"
                 local runner=()
-                if [[ "$test_name" == runtimes::npm::admission_tests::banned_transitive_dependency_stops_npm_before_materialization ||
+                if [[ "$test_name" == package_managers::alpm_ops::tests::native_install_and_preview_resolve_locally_with_daemon_available ||
+                      "$test_name" == cli::packages::info::tests::native_text_info_looks_up_one_character_aur_names ||
+                      "$test_name" == runtimes::npm::admission_tests::banned_transitive_dependency_stops_npm_before_materialization ||
                       "$test_name" == runtimes::npm::admission_tests::retained_npm_admission_refuses_policy_changes_before_publication ]]; then
                   runner=(env OMG_ISOLATED_FIXTURE_TEST="$test_name")
                 fi

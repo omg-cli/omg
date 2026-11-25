@@ -437,6 +437,16 @@ git() { printf '%040d\\n' 1; }
         set -eu
         test "$1" = --exact
         test "$3" = --include-ignored
+        case "$2" in
+          probe::case) ;;
+          *)
+            test "${OMG_ISOLATED_FIXTURE_TEST:-}" = "$2"
+            if [ "$FIXTURE_BEHAVIOR" != missing-uid-proof ]; then
+              printf '[omg-unprivileged-fixture] test=%s parent_uid=0 executable_sha256=fixture\\n' "$2"
+              printf '[omg-unprivileged-fixture-child] test=%s uid=65534 executable_sha256=fixture\\n' "$2"
+            fi
+            ;;
+        esac
         profile=${LLVM_PROFILE_FILE//%p/123}
         profile=${profile//%m/1}
         profile=${profile//%c/}
@@ -456,26 +466,34 @@ git() { printf '%040d\\n' 1; }
           printf 'test result: ok. 1 passed; 0 failed; 0 ignored;\\n'
         fi
         """
-        for behavior in ('pass', 'fail', 'skipped', 'profile-error', 'empty-selection',
-                         'missing-profile', 'empty-profile', 'missing-registry'):
-            with self.subTest(behavior=behavior), tempfile.TemporaryDirectory() as directory:
+        cases = [('probe::case', behavior) for behavior in (
+            'pass', 'fail', 'skipped', 'profile-error', 'empty-selection',
+            'missing-profile', 'empty-profile', 'missing-registry',
+        )]
+        for name in (
+            'package_managers::alpm_ops::tests::native_install_and_preview_resolve_locally_with_daemon_available',
+            'cli::packages::info::tests::native_text_info_looks_up_one_character_aur_names',
+        ):
+            cases.extend(((name, 'pass'), (name, 'missing-uid-proof')))
+        for name, behavior in cases:
+            with self.subTest(name=name, behavior=behavior), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 binary = root / 'fixture'
                 binary.write_bytes(textwrap.dedent(fixture).encode())
                 binary.chmod(0o755)
                 profiles, evidence = root / 'profiles', root / 'evidence'
                 profiles.mkdir(); evidence.mkdir()
-                (evidence / 'registry.txt').write_bytes(b'' if behavior == 'missing-registry' else b'probe::case: test\n')
+                (evidence / 'registry.txt').write_bytes(b'' if behavior == 'missing-registry' else f'{name}: test\n'.encode())
                 body = '\n'.join((function,
                     'fixture_binary=$TEST_BINARY', 'fixture_profiles=$TEST_PROFILES',
-                    'fixture_evidence=$TEST_EVIDENCE', 'run_case probe::case'))
+                    'fixture_evidence=$TEST_EVIDENCE', 'run_case "$TEST_NAME"'))
                 result = subprocess.run([BASH, '-euo', 'pipefail', '-c', body],
                     env=dict(os.environ, TEST_BINARY=binary.as_posix(), TEST_PROFILES=profiles.as_posix(),
-                             TEST_EVIDENCE=evidence.as_posix(), FIXTURE_BEHAVIOR=behavior),
+                             TEST_EVIDENCE=evidence.as_posix(), TEST_NAME=name, FIXTURE_BEHAVIOR=behavior),
                     capture_output=True, text=True)
                 if behavior == 'pass':
                     self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                    self.assertEqual((evidence / 'passed.tsv').read_text(), 'probe::case\t1\n')
+                    self.assertEqual((evidence / 'passed.tsv').read_text(), f'{name}\t1\n')
                 else:
                     self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
                     self.assertFalse((evidence / 'passed.tsv').exists())

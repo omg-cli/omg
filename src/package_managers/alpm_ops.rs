@@ -3453,20 +3453,16 @@ mod tests {
         let directory = fixture.directory.path();
         let root = directory.join("root");
         let conf = directory.join("pacman.conf");
-        std::fs::write(
-            &conf,
-            format!(
-                "[options]\nRootDir = {}\nDBPath = {}\nSigLevel = Required DatabaseOptional\n\
+        let config = format!(
+            "[options]\nRootDir = {}\nDBPath = {}\nSigLevel = Required DatabaseOptional\n\
              [fixture]\nUsage = Install\nServer = file://{}\n",
-                root.display(),
-                fixture.database().display(),
-                directory.display()
-            ),
-        )?;
-        std::fs::write(
-            directory.join("policy.toml"),
-            "banned_packages = ['install-routing-demo']\n",
-        )?;
+            root.display(),
+            fixture.database().display(),
+            directory.display()
+        );
+        std::fs::write(&conf, config)?;
+        let policy = "banned_packages = ['install-routing-demo']\n";
+        std::fs::write(directory.join("policy.toml"), policy)?;
         let socket = directory.join("run/omg.sock");
         crate::core::paths::prepare_socket_parent(&socket)?;
         let listener = UnixListener::bind(&socket)?;
