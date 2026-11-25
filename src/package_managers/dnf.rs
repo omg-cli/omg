@@ -29,6 +29,8 @@ use crate::package_managers::types::{UpdateInfo, parse_version_or_zero};
 use rusqlite::{Connection, OpenFlags};
 use zerocopy::{FromBytes, Immutable, KnownLayout, big_endian::U32};
 
+const DNF_HISTORY_DATABASE: &str = "transaction_history.sqlite";
+
 #[cfg(all(test, unix))]
 pub(crate) use tests::search_parity_data;
 
@@ -364,6 +366,16 @@ impl PreparedDnfRemoval {
     pub(crate) fn packages(&self) -> &[super::types::RemovalPackage] {
         &self.packages
     }
+}
+
+enum DnfAdmission<'a> {
+    InstallOrUpgrade,
+    Remove {
+        packages: &'a [String],
+        comment: Option<&'a str>,
+        yes: bool,
+        dry_run: bool,
+    },
 }
 
 #[derive(serde::Deserialize)]
@@ -705,6 +717,19 @@ impl DnfPackageManager {
         plan: PreparedDnfRemoval,
         history: &crate::core::history::HistoryManager,
     ) -> Result<()> {
+        Self::record_native_mutation(
+            crate::core::history::TransactionType::Remove,
+            Some(history),
+            |comment| self.replay_removal_plan(plan, comment),
+        )
+        .await
+    }
+
+    async fn replay_removal_plan(
+        &self,
+        plan: PreparedDnfRemoval,
+        comment: Option<String>,
+    ) -> Result<()> {
         // Replay normally loads available repositories. Removal uses only
         // installed packages, and DNF rejects a disable glob with no matches.
         let mut command =
@@ -718,10 +743,36 @@ impl DnfPackageManager {
         } else {
             &["--disable-repo=*"]
         };
+        self.replay_stored_transaction(plan.directory, options, comment)
+            .await
+    }
+
+    pub(crate) async fn remove_with_elevation(
+        packages: &[String],
+        yes: bool,
+        dry_run: bool,
+    ) -> Result<()> {
+        let mode = if dry_run {
+            "--dry-run"
+        } else if yes {
+            "-y"
+        } else {
+            "--confirm"
+        };
+        let operation = |comment: Option<String>| async move {
+            let mut args: Vec<_> = comment.into_iter().collect();
+            args.extend(["remove".to_owned(), mode.to_owned()]);
+            args.extend_from_slice(packages);
+            crate::core::privilege::run_privileged_dnf(&args).await
+        };
+        if dry_run {
+            return operation(None).await;
+        }
+        let history = crate::core::history::HistoryManager::new()?;
         Self::record_native_mutation(
             crate::core::history::TransactionType::Remove,
-            Some(history),
-            |comment| self.replay_stored_transaction(plan.directory, options, comment),
+            Some(&history),
+            operation,
         )
         .await
     }
@@ -1788,10 +1839,36 @@ impl DnfPackageManager {
 
     async fn native_history(since: Option<u64>) -> Result<Vec<NativeTransaction>> {
         let range = since.map_or_else(|| "last".to_owned(), |id| format!("{}..last", id.max(1)));
+        // DNF can initialize its journal as root; an ordinary caller cannot.
+        // Avoid an error message on a fresh default installation, but still ask
+        // DNF for its effective path before deciding that there is no journal.
+        let unprivileged = !is_root();
+        let check_before_query = unprivileged
+            && !Path::new("/usr/lib/sysimage/libdnf5")
+                .join(DNF_HISTORY_DATABASE)
+                .exists();
+        if check_before_query
+            && Self::native_history_is_missing()
+                .await
+                .is_ok_and(|missing| missing)
+        {
+            return Ok(Vec::new());
+        }
         let mut command =
             tokio::process::Command::from(crate::core::privilege::system_command("dnf")?);
         command.args(["history", "info", "--json", &range]);
-        let output = Self::query_output(command).await?;
+        let output = match Self::query_output(command).await {
+            Err(_)
+                if unprivileged
+                    && !check_before_query
+                    && Self::native_history_is_missing()
+                        .await
+                        .is_ok_and(|missing| missing) =>
+            {
+                return Ok(Vec::new());
+            }
+            result => result?,
+        };
         let transactions: Vec<NativeTransaction> =
             serde_json::from_slice(&output).context("Invalid native DNF history")?;
         anyhow::ensure!(
@@ -1799,6 +1876,39 @@ impl DnfPackageManager {
             "Invalid native transaction ID"
         );
         Ok(transactions)
+    }
+
+    async fn native_history_is_missing() -> Result<bool> {
+        let mut command =
+            tokio::process::Command::from(crate::core::privilege::system_command("dnf")?);
+        command.arg("--dump-main-config");
+        let config = Self::query_output(command).await?;
+        Self::history_is_missing(std::str::from_utf8(&config)?)
+    }
+
+    fn history_is_missing(config: &str) -> Result<bool> {
+        let effective = |key: &str| -> Result<&str> {
+            let mut values = config.lines().filter_map(|line| {
+                let (name, value) = line.split_once('=')?;
+                (name.trim() == key).then(|| value.trim())
+            });
+            let value = values
+                .next()
+                .with_context(|| format!("Missing DNF {key}"))?;
+            anyhow::ensure!(values.next().is_none(), "Ambiguous DNF {key}");
+            Ok(value)
+        };
+        anyhow::ensure!(
+            effective("installroot")? == "/",
+            "Unexpected DNF install root"
+        );
+        let directory = Path::new(effective("transaction_history_dir")?);
+        anyhow::ensure!(directory.is_absolute(), "Relative DNF history directory");
+        match directory.join(DNF_HISTORY_DATABASE).symlink_metadata() {
+            Ok(_) => Ok(false),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+            Err(error) => Err(error).context("Cannot verify DNF history path"),
+        }
     }
 
     fn native_outcome(transactions: &[NativeTransaction], comment: &str) -> Result<NativeOutcome> {
@@ -1948,14 +2058,19 @@ impl DnfPackageManager {
         operation
     }
 
-    /// Only fixed install/upgrade inputs cross the same-binary elevation boundary.
+    /// Only fixed transaction modes and validated package selectors cross elevation.
     #[doc(hidden)]
     pub fn validate_admission_args(args: &[String]) -> Result<()> {
+        Self::admission_request(args).map(|_| ())
+    }
+
+    fn admission_request(args: &[String]) -> Result<DnfAdmission<'_>> {
         anyhow::ensure!(
             args.len() <= 10_004,
             "DNF transaction has too many arguments"
         );
         let mut remaining = args;
+        let mut correlation = None;
         if let Some(comment) = remaining
             .first()
             .and_then(|value| value.strip_prefix("--comment=omg-"))
@@ -1965,6 +2080,7 @@ impl DnfPackageManager {
                 id.to_string() == comment,
                 "Noncanonical DNF transaction comment"
             );
+            correlation = remaining.first().map(String::as_str);
             remaining = &remaining[1..];
         }
         let cached = remaining
@@ -1973,16 +2089,32 @@ impl DnfPackageManager {
         if cached {
             remaining = &remaining[1..];
         }
-        let [action, yes, packages @ ..] = remaining else {
+        let [action, mode, packages @ ..] = remaining else {
             anyhow::bail!("Incomplete DNF admission request");
         };
         anyhow::ensure!(
-            matches!(action.as_str(), "install" | "upgrade") && yes == "-y",
-            "Unsupported DNF admission request"
-        );
-        anyhow::ensure!(
             !cached || action == "upgrade",
             "Cached metadata mode is only supported for upgrades"
+        );
+        if action == "remove" {
+            anyhow::ensure!(!packages.is_empty(), "Remove requires package operands");
+            let (yes, dry_run) = match mode.as_str() {
+                "-y" => (true, false),
+                "--confirm" => (false, false),
+                "--dry-run" if correlation.is_none() => (false, true),
+                _ => anyhow::bail!("Unsupported DNF removal mode"),
+            };
+            Self::validate_package_selectors(packages)?;
+            return Ok(DnfAdmission::Remove {
+                packages,
+                comment: correlation,
+                yes,
+                dry_run,
+            });
+        }
+        anyhow::ensure!(
+            matches!(action.as_str(), "install" | "upgrade") && mode == "-y",
+            "Unsupported DNF admission request"
         );
         anyhow::ensure!(
             action != "upgrade" || packages.is_empty(),
@@ -1992,7 +2124,8 @@ impl DnfPackageManager {
             action != "install" || !packages.is_empty(),
             "Install requires package operands"
         );
-        Self::validate_install_selectors(packages)
+        Self::validate_install_selectors(packages)?;
+        Ok(DnfAdmission::InstallOrUpgrade)
     }
 
     #[doc(hidden)]
@@ -2002,12 +2135,37 @@ impl DnfPackageManager {
             super::resolve_backend()? == super::Backend::Fedora,
             "Native DNF admission requires the Fedora backend"
         );
-        Self::validate_admission_args(args)?;
-        Self::new().execute_reviewed_transaction(args).await
+        let manager = Self::new();
+        match Self::admission_request(args)? {
+            DnfAdmission::InstallOrUpgrade => manager.execute_reviewed_transaction(args).await,
+            DnfAdmission::Remove {
+                packages,
+                comment,
+                yes,
+                dry_run,
+            } => {
+                let Some(plan) =
+                    crate::cli::packages::review_fedora_removal(packages, yes, dry_run).await?
+                else {
+                    return Ok(());
+                };
+                crate::cli::packages::common::report_removal(
+                    packages,
+                    manager.replay_removal_plan(plan, comment.map(str::to_owned)),
+                )
+                .await
+            }
+        }
     }
 
     async fn execute_reviewed_transaction(&self, args: &[String]) -> Result<()> {
-        Self::validate_admission_args(args)?;
+        anyhow::ensure!(
+            matches!(
+                Self::admission_request(args)?,
+                DnfAdmission::InstallOrUpgrade
+            ),
+            "DNF install/upgrade admission requires an install or upgrade"
+        );
         crate::core::security::policy::require_native_plan_support("DNF")?;
         anyhow::ensure!(
             is_root(),
@@ -2909,6 +3067,15 @@ mod tests {
         for values in [
             vec!["install", "-y", "example"],
             vec!["install", "-y", "example-2:1.0~rc1-1.fc44.x86_64"],
+            vec!["remove", "--dry-run", "example"],
+            vec!["remove", "--confirm", "example"],
+            vec!["remove", "-y", "example"],
+            vec![
+                "--comment=omg-550e8400-e29b-41d4-a716-446655440000",
+                "remove",
+                "-y",
+                "example",
+            ],
             vec!["--setopt=cacheonly=metadata", "upgrade", "-y"],
             vec![
                 "--comment=omg-550e8400-e29b-41d4-a716-446655440000",
@@ -2928,6 +3095,16 @@ mod tests {
             vec!["install", "-y"],
             vec!["install", "-y", "/tmp/local.rpm"],
             vec!["install", "-y", "example-2:1.0-1.fc44.rpm"],
+            vec!["remove", "-y"],
+            vec!["remove", "--confirm", "/tmp/caller-plan"],
+            vec!["remove", "--dry-run", "--installroot=/tmp/root"],
+            vec!["--setopt=cacheonly=metadata", "remove", "-y", "example"],
+            vec![
+                "--comment=omg-550e8400-e29b-41d4-a716-446655440000",
+                "remove",
+                "--dry-run",
+                "example",
+            ],
         ] {
             assert!(
                 DnfPackageManager::validate_admission_args(&args(&values)).is_err(),
@@ -4111,6 +4288,29 @@ mod tests {
             DnfPackageManager::cached_update_args(),
             ["--setopt=cacheonly=metadata", "upgrade", "-y"]
         );
+    }
+
+    #[test]
+    fn fresh_dnf_history_requires_absence_at_the_effective_location() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let config = format!(
+            "[main]\ninstallroot = /\ntransaction_history_dir = {}\n",
+            directory.path().display()
+        );
+        assert!(DnfPackageManager::history_is_missing(&config)?);
+        std::fs::write(
+            directory.path().join(DNF_HISTORY_DATABASE),
+            b"unreadable journal format",
+        )?;
+        assert!(!DnfPackageManager::history_is_missing(&config)?);
+        for invalid in [
+            format!("{config}transaction_history_dir = /other"),
+            config.replace("installroot = /", "installroot = /other"),
+            "installroot = /\ntransaction_history_dir = relative".into(),
+        ] {
+            assert!(DnfPackageManager::history_is_missing(&invalid).is_err());
+        }
+        Ok(())
     }
 
     #[test]
