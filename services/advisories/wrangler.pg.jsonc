@@ -30,6 +30,7 @@
     "limits": { "cpu_ms": 30000 },
     "placement": { "mode": "smart" },
     "triggers": { "crons": ["*/5 * * * *"] },
+    "tail_consumers": [{ "service": "omg-cve" }],
     "observability": {
         "enabled": true,
         "traces": { "enabled": true, "head_sampling_rate": 0.1 },
