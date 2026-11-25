@@ -818,10 +818,11 @@ git() { printf '%040d\\n' 1; }
         workflow = (WORKFLOWS / 'ci.yml').read_text(encoding='utf-8')
         ubuntu = job_block(workflow, 'ubuntu')
         artifact_names = re.findall(r'(?m)^          name: (.+)$', ubuntu)
-        for artifact in ('apt-daemon-catalog-ubuntu', 'native-release-ubuntu',
-                         'omg-ubuntu', 'cli-surfaces-ubuntu'):
+        for artifact in ('apt-daemon-catalog-ubuntu', 'native-release-ubuntu', 'cli-surfaces-ubuntu'):
             with self.subTest(artifact=artifact):
                 self.assertIn(artifact + '-${{ github.run_attempt }}', artifact_names)
+        self.assertNotIn('omg-ubuntu-${{ github.run_attempt }}', artifact_names)
+        self.assertIn('./target/release/omg --version', ubuntu)
         self.assertNotIn('overwrite:', ubuntu)
         self.assertRegex(ubuntu, r'(?m)^    timeout-minutes: (?:[4-5][0-9]|60)$')
         self.assertIn('cargo clippy --all-targets --no-default-features --features debian,pgp,license', ubuntu)

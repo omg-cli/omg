@@ -93,7 +93,7 @@ class NativePhaseMatrixTests(unittest.TestCase):
             "Upload Debian benchmark artifact": validation + " && matrix.platform == 'debian'",
             "Publish Debian benchmark summary": validation + " && matrix.platform == 'debian'",
             "Verify binary": validation,
-            "Upload binary": validation,
+            "Upload binary": validation + " && matrix.platform == 'ubuntu-2604'",
             "Preserve compiled parser surfaces": "always() && " + validation,
             "Platform clippy": "${{ !cancelled() }}",
         }
