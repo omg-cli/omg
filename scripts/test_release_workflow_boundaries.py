@@ -418,6 +418,25 @@ class ReleaseWorkflowBoundaryTests(unittest.TestCase):
         self.assertEqual(set(dependencies.group(1).split(', ')), {'benchmark', 'workflow-helpers'})
         self.assertNotRegex(history, r'\balways\(')
 
+    def test_main_benchmark_uses_helper_coverage_required_by_release_ci(self):
+        benchmark = (WORKFLOWS / 'benchmark.yml').read_text(encoding='utf-8')
+        helpers = job_block(benchmark, 'workflow-helpers')
+        self.assertIn("    if: github.event_name != 'push' && inputs.rust-comparison != true\n", helpers)
+        self.assertIn('Admit exact successful CI helper owners', helpers)
+        self.assertIn('Execute independent complete helper owner', helpers)
+        self.assertIn('Performance Regression Gate', job_block(benchmark, 'benchmark'))
+
+        ci = (WORKFLOWS / 'ci.yml').read_text(encoding='utf-8')
+        ci_gate = job_block(ci, 'ci-success')
+        self.assertIn('needs: [quick-gate, workflow-checks,', ci_gate)
+        self.assertIn("github.event_name == 'push' || needs.quick-gate.outputs.checks-required == 'true'", ci_gate)
+        self.assertIn('scripts/workflow-helpers.py admit --current-run', ci_gate)
+        for filename in ('authorize-release.yml', 'release.yml'):
+            with self.subTest(workflow=filename):
+                gate = (WORKFLOWS / filename).read_text(encoding='utf-8')
+                for workflow in ('ci.yml', 'benchmark.yml'):
+                    self.assertIn(f'scripts/require-workflow-success.sh {workflow} "$GITHUB_SHA"', gate)
+
     def test_benchmark_uses_the_job_release_pair_without_rebuilding(self):
         workflow = (WORKFLOWS / 'benchmark.yml').read_text(encoding='utf-8')
         launcher = step_script(job_block(workflow, 'benchmark'), 'Run Benchmarks (Hyperfine)')

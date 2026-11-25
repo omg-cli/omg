@@ -99,7 +99,8 @@ jobs:
 
   workflow-helpers:
     name: Admit workflow helpers on Linux host
-    if: inputs.rust-comparison != true
+    # Release already requires the same commit's CI helper proof.
+    if: github.event_name != 'push' && inputs.rust-comparison != true
     runs-on: ubuntu-24.04
     timeout-minutes: 35
     permissions:
