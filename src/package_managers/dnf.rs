@@ -1547,11 +1547,15 @@ impl DnfPackageManager {
     }
 
     async fn repository_output(query: RepositoryQuery<'_>) -> Result<Vec<u8>> {
+        Self::query_output(Self::repository_command(query)?).await
+    }
+
+    fn repository_command(query: RepositoryQuery<'_>) -> Result<tokio::process::Command> {
         let args = Self::repository_query_args(query)?;
         let mut command =
             tokio::process::Command::from(crate::core::privilege::system_command("dnf")?);
         command.args(args);
-        Self::query_output(command).await
+        Ok(command)
     }
 
     fn repository_query_args(query: RepositoryQuery<'_>) -> Result<Vec<String>> {
@@ -1699,6 +1703,7 @@ impl DnfPackageManager {
     ) -> Result<Vec<u8>> {
         use tokio::io::AsyncReadExt;
         const MAX_OUTPUT_BYTES: u64 = 64 * 1024 * 1024;
+        const MAX_DIAGNOSTIC_BYTES: u64 = 64 * 1024;
         if let Some(cancelled) = cancelled.as_mut() {
             anyhow::ensure!(
                 matches!(
@@ -1711,24 +1716,50 @@ impl DnfPackageManager {
         let mut child = command
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::inherit())
             .kill_on_drop(true)
             .spawn()
             .context("Could not start DNF query")?;
         let result = {
             let operation = async {
                 let stdout = child.stdout.take().context("DNF stdout was not captured")?;
-                let mut bytes = Vec::new();
-                stdout
-                    .take(MAX_OUTPUT_BYTES + 1)
-                    .read_to_end(&mut bytes)
-                    .await?;
-                anyhow::ensure!(
-                    bytes.len() as u64 <= MAX_OUTPUT_BYTES,
-                    "DNF query output exceeds 64 MiB"
-                );
+                let stderr = child.stderr.take();
+                let output = async {
+                    let mut bytes = Vec::new();
+                    stdout
+                        .take(MAX_OUTPUT_BYTES + 1)
+                        .read_to_end(&mut bytes)
+                        .await?;
+                    anyhow::ensure!(
+                        bytes.len() as u64 <= MAX_OUTPUT_BYTES,
+                        "DNF query output exceeds 64 MiB"
+                    );
+                    Ok(bytes)
+                };
+                let diagnostics = async {
+                    let mut bytes = Vec::new();
+                    if let Some(mut stderr) = stderr {
+                        (&mut stderr)
+                            .take(MAX_DIAGNOSTIC_BYTES)
+                            .read_to_end(&mut bytes)
+                            .await?;
+                        tokio::io::copy(&mut stderr, &mut tokio::io::sink()).await?;
+                    }
+                    Ok(bytes)
+                };
+                let (bytes, diagnostics) = tokio::try_join!(output, diagnostics)?;
                 let status = child.wait().await.context("Could not wait for DNF query")?;
-                anyhow::ensure!(status.success(), "DNF query failed: {status}");
+                if !status.success() {
+                    let diagnostics = String::from_utf8_lossy(&diagnostics);
+                    if let Some(detail) = diagnostics
+                        .lines()
+                        .map(str::trim)
+                        .rfind(|line| !line.is_empty())
+                    {
+                        let detail = crate::cli::style::sanitize_terminal_text(detail);
+                        anyhow::bail!("DNF query failed: {status}: {detail}");
+                    }
+                    anyhow::bail!("DNF query failed: {status}");
+                }
                 Ok(bytes)
             };
             let cancellation = async {
@@ -1754,6 +1785,23 @@ impl DnfPackageManager {
             child.wait().await.context("Could not reap DNF query")?;
         }
         result
+    }
+
+    fn search_with_progress(
+        &self,
+        query: &str,
+        progress: bool,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<Package>>> + Send + '_>> {
+        let query_lower = query.to_lowercase();
+        Box::pin(async move {
+            let installed = self.load_installed_packages().await?;
+            let mut command = Self::repository_command(RepositoryQuery::Available(None))?;
+            if !progress {
+                command.stderr(std::process::Stdio::piped());
+            }
+            let output = Self::query_output(command).await?;
+            Self::search_results(&installed, &output, &query_lower)
+        })
     }
 
     async fn owned_stored_transaction(
@@ -2809,12 +2857,14 @@ impl PackageManager for DnfPackageManager {
         &self,
         query: &str,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<Package>>> + Send + '_>> {
-        let query_lower = query.to_lowercase();
-        Box::pin(async move {
-            let installed = self.load_installed_packages().await?;
-            let output = Self::repository_output(RepositoryQuery::Available(None)).await?;
-            Self::search_results(&installed, &output, &query_lower)
-        })
+        self.search_with_progress(query, true)
+    }
+
+    fn search_quietly(
+        &self,
+        query: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<Package>>> + Send + '_>> {
+        self.search_with_progress(query, false)
     }
 
     fn package_index(&self) -> Pin<Box<dyn Future<Output = Result<Vec<Package>>> + Send + '_>> {
@@ -4719,6 +4769,28 @@ mod tests {
                 .to_string()
                 .contains("DNF query failed")
         );
+    }
+
+    #[tokio::test]
+    async fn captured_query_drains_diagnostics_and_preserves_failure_reason() -> Result<()> {
+        let mut verbose = tokio::process::Command::new("/bin/sh");
+        verbose
+            .stderr(std::process::Stdio::piped())
+            .args(["-c", "head -c 131072 /dev/zero >&2 && printf '[]'"]);
+        let deadline = std::time::Duration::from_secs(5);
+        assert_eq!(
+            DnfPackageManager::query_output_with_deadline(verbose, deadline).await?,
+            b"[]"
+        );
+
+        let mut failed = tokio::process::Command::new("/bin/sh");
+        failed.stderr(std::process::Stdio::piped()).args([
+            "-c",
+            "printf 'Loading repositories\nRepository is unavailable\n' >&2; exit 7",
+        ]);
+        let error = DnfPackageManager::query_output(failed).await.unwrap_err();
+        assert!(error.to_string().ends_with("Repository is unavailable"));
+        Ok(())
     }
 
     #[tokio::test]

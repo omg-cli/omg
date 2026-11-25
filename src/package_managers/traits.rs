@@ -77,6 +77,14 @@ pub trait PackageManager: Send + Sync {
         query: &str,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<Package>>> + Send + '_>>;
 
+    /// Search while another renderer owns the terminal.
+    fn search_quietly(
+        &self,
+        query: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<Package>>> + Send + '_>> {
+        self.search(query)
+    }
+
     /// List every package available to a persistent search index.
     ///
     /// Backends whose normal empty-query search is complete can use this

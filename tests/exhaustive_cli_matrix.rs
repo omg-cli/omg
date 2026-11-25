@@ -610,6 +610,17 @@ mod boundary_matrix {
     #[cfg(all(target_os = "linux", debug_assertions))]
     #[test]
     fn dashboard_remains_responsive_during_history_write() -> anyhow::Result<()> {
+        dashboard_pty("history")
+    }
+
+    #[cfg(all(target_os = "linux", debug_assertions))]
+    #[test]
+    fn dashboard_restores_search_input_after_package_action() -> anyhow::Result<()> {
+        dashboard_pty("action")
+    }
+
+    #[cfg(all(target_os = "linux", debug_assertions))]
+    fn dashboard_pty(mode: &str) -> anyhow::Result<()> {
         let home = tempfile::tempdir_in("/var/tmp")?;
         let data = home.path().join("data");
         std::fs::create_dir(&data)?;
@@ -620,13 +631,15 @@ mod boundary_matrix {
                 "-c",
                 include_str!("fixtures/dashboard_history_pty.py"),
                 env!("CARGO_BIN_EXE_omg"),
+                mode,
             ])
             .env_clear()
             .env("HOME", home.path())
             .env("XDG_CONFIG_HOME", home.path().join("config"))
             .env("XDG_CACHE_HOME", home.path().join("cache"))
-            .env("OMG_NATIVE_TEST_DATA_DIR", "1")
             .env("OMG_DATA_DIR", &data)
+            .env("OMG_TEST_MODE", "1")
+            .env("OMG_TEST_DISTRO", "debian")
             .env("OMG_SOCKET_PATH", home.path().join("omg.sock"))
             .env("OMG_DISABLE_DAEMON", "1")
             .env("OMG_DISABLE_TELEMETRY", "1")
@@ -642,7 +655,7 @@ mod boundary_matrix {
         let output = command.output()?;
         assert!(
             output.status.success(),
-            "dashboard history PTY failed:\n{}",
+            "dashboard {mode} PTY failed:\n{}",
             String::from_utf8_lossy(&output.stderr)
         );
         Ok(())

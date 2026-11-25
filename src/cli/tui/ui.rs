@@ -13,7 +13,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{
         Block, BorderType, Borders, Cell, Clear, Gauge, List, ListItem, ListState, Paragraph, Row,
-        Table, TableState, Tabs,
+        Table, TableState, Tabs, Wrap,
     },
 };
 use std::borrow::Cow;
@@ -814,6 +814,7 @@ fn draw_packages(f: &mut Frame, area: Rect, app: &App) {
             format!(" Search failed: {error}"),
             Style::default().fg(colors::ACCENT_RED),
         )))
+        .wrap(Wrap { trim: true })
         .block(styled_block(" Packages"))
         .style(Style::default().bg(colors::BG_MEDIUM));
         f.render_widget(error_panel, *list_area);

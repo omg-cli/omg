@@ -455,7 +455,7 @@ impl App {
     ) -> Result<Vec<crate::package_managers::SyncPackage>> {
         let backend = crate::package_managers::get_package_manager()?;
         Ok(backend
-            .search(query)
+            .search_quietly(query)
             .await
             .context("Failed to search official packages")?
             .into_iter()
