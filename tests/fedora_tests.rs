@@ -642,18 +642,50 @@ mod dnf_integration {
 
     #[test]
     fn cli_info_resolves_native_full_nevra() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::os::unix::net::UnixListener;
+
         let (selector, name, version) = installed_bash_full_nevra()?;
-        let output = std::process::Command::new(assert_cmd::cargo::cargo_bin!("omg"))
-            .args(["info", &selector])
-            .env("OMG_DISABLE_DAEMON", "1")
-            .env("OMG_TEST_MODE", "0")
-            .env_remove("OMG_TEST_DISTRO")
-            .env_remove("OMG_TEST_BACKEND")
-            .output()?;
+        let runtime = tempfile::tempdir()?;
+        std::fs::set_permissions(runtime.path(), std::fs::Permissions::from_mode(0o700))?;
+        let socket = runtime.path().join("omg.sock");
+        let listener = UnixListener::bind(&socket)?;
+        listener.set_nonblocking(true)?;
+        let (output, connections) = std::thread::scope(|scope| -> Result<_> {
+            let invocation = scope.spawn(|| {
+                std::process::Command::new(assert_cmd::cargo::cargo_bin!("omg"))
+                    .args(["info", &selector])
+                    .env("OMG_SOCKET_PATH", &socket)
+                    .env("OMG_TEST_MODE", "0")
+                    .env_remove("OMG_DISABLE_DAEMON")
+                    .env_remove("OMG_TEST_DISTRO")
+                    .env_remove("OMG_TEST_BACKEND")
+                    .output()
+            });
+            let mut connections = 0;
+            while !invocation.is_finished() {
+                match listener.accept() {
+                    Ok((connection, _)) => {
+                        drop(connection);
+                        connections += 1;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            let output = invocation.join().expect("info fixture panicked")?;
+            Ok((output, connections))
+        })?;
         assert!(
             output.status.success(),
             "plain CLI selector failed: {}",
             String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            connections, 1,
+            "the RPM fallback should follow one daemon attempt"
         );
         let text = String::from_utf8(output.stdout)?;
         assert!(

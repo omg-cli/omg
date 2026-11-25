@@ -24,6 +24,8 @@ mod update;
 // Re-export all public functions
 pub use clean::clean;
 pub use explicit::{explicit, explicit_sync, explicit_sync_with_json};
+#[doc(hidden)]
+pub use info::info_after_fast_miss;
 pub use info::{info, info_sync, info_with_json};
 pub use install::install;
 pub use remove::remove;

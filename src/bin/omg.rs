@@ -600,15 +600,12 @@ fn try_fast_search(args: &[String]) -> bool {
 }
 
 /// Ultra-fast path for simple info
-fn try_fast_info(args: &[String]) -> bool {
+fn try_fast_info(args: &[String]) -> Option<bool> {
     if has_help_flag(args) || has_json_flag(args) {
-        return false;
+        return None;
     }
 
-    let Some(package) = info_package_from_fast_args(args) else {
-        return false;
-    };
-    matches!(packages::info_sync(package), Ok(true))
+    packages::info_sync(info_package_from_fast_args(args)?).ok()
 }
 
 /// `omg info fd` plus global quiet/verbose flags in any order.
@@ -783,7 +780,6 @@ fn try_fast_paths(args: &[String]) -> Result<bool> {
     if try_fast_counter(args)?
         || try_fast_explicit_count(args)
         || try_fast_search(args)
-        || try_fast_info(args)
         || try_fast_which(args)
         || try_fast_list(args)?
         || try_fast_status(args)
@@ -946,11 +942,16 @@ fn main() {
         Err(error) => finish(Err(error)),
     }
 
+    let info_fast_result = try_fast_info(&args);
+    if info_fast_result == Some(true) {
+        finish(Ok(()));
+    }
+
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build();
     let result = match runtime {
-        Ok(runtime) => runtime.block_on(async_main(args)),
+        Ok(runtime) => runtime.block_on(async_main(args, info_fast_result == Some(false))),
         Err(error) => Err(anyhow::Error::new(error).context("Failed to initialize async runtime")),
     };
 
@@ -996,7 +997,7 @@ fn complete_audit(operation: Result<()>, audit: Result<()>) -> Result<()> {
     }
 }
 
-async fn async_main(args: Vec<String>) -> Result<()> {
+async fn async_main(args: Vec<String>, info_fast_missed: bool) -> Result<()> {
     // Record startup time for telemetry
     omg_lib::core::telemetry::record_startup_time();
 
@@ -1073,7 +1074,7 @@ async fn async_main(args: Vec<String>) -> Result<()> {
 
     let ctx = omg_lib::cli::CliContext { json: cli.json };
 
-    let result = dispatch_command(&cli.command, &ctx).await;
+    let result = dispatch_command(&cli.command, &ctx, info_fast_missed).await;
     finish_command_telemetry(cmd_start, command_name(&cli.command), result.is_ok()).await;
     if let Some(task) = telemetry_ping {
         match task.await {
@@ -1592,7 +1593,11 @@ const fn command_supports_json(command: &Commands) -> bool {
 
 /// Main command dispatcher - routes commands to appropriate handlers
 #[expect(clippy::too_many_lines)]
-async fn dispatch_command(command: &Commands, ctx: &omg_lib::cli::CliContext) -> Result<()> {
+async fn dispatch_command(
+    command: &Commands,
+    ctx: &omg_lib::cli::CliContext,
+    info_fast_missed: bool,
+) -> Result<()> {
     // Global --json contract: reject unsupported combinations explicitly instead
     // of silently emitting human-readable output.
     if ctx.json && !command_supports_json(command) {
@@ -1671,6 +1676,9 @@ async fn dispatch_command(command: &Commands, ctx: &omg_lib::cli::CliContext) ->
             }
             handle_update_command(*check, *yes, *dry_run, *no_sync, *aur_only, *fast, *turbo)
                 .await?;
+        }
+        Commands::Info { package } if info_fast_missed => {
+            packages::info_after_fast_miss(package).await?;
         }
         Commands::Info { package } => packages::info_with_json(package, ctx.json).await?,
         Commands::Clean {

@@ -203,8 +203,19 @@ pub async fn info_with_json(package: &str, json: bool) -> Result<()> {
         return info_json(package).await;
     }
 
+    info_text(package, false).await
+}
+
+#[doc(hidden)]
+pub async fn info_after_fast_miss(package: &str) -> Result<()> {
+    validate_info_selector(package).context("Invalid package name")?;
+    info_text(package, true).await
+}
+
+async fn info_text(package: &str, sync_missed: bool) -> Result<()> {
     info_fallback(
         package,
+        sync_missed,
         #[cfg(feature = "arch")]
         AUR_RPC_URL,
     )
@@ -319,7 +330,11 @@ async fn info_json(package: &str) -> Result<()> {
     anyhow::bail!("Package '{package}' not found")
 }
 
-async fn info_fallback(package: &str, #[cfg(feature = "arch")] aur_rpc: &str) -> Result<()> {
+async fn info_fallback(
+    package: &str,
+    sync_missed: bool,
+    #[cfg(feature = "arch")] aur_rpc: &str,
+) -> Result<()> {
     if crate::package_managers::resolve_backend()? == crate::package_managers::Backend::Mock {
         let pm = get_package_manager()?;
         let info = manager_info(pm.as_ref(), package)
@@ -329,8 +344,7 @@ async fn info_fallback(package: &str, #[cfg(feature = "arch")] aur_rpc: &str) ->
         return Ok(());
     }
 
-    // Try sync path first
-    if info_sync(package)? {
+    if !sync_missed && info_sync(package)? {
         return Ok(());
     }
 
@@ -530,7 +544,7 @@ mod tests {
                         }
                         anyhow::Ok(())
                     });
-                    let result = super::info_fallback("x", &endpoint).await;
+                    let result = super::info_fallback("x", false, &endpoint).await;
                     tokio::time::timeout(std::time::Duration::from_secs(2), reply).await???;
                     if let Some(error) = error {
                         assert!(result.expect_err("AUR lookup should fail").to_string().contains(error));
