@@ -37,6 +37,24 @@ test("streamed delta drains oversized events across bounded checkpoint batches",
     expect(three.batch.length).toBe(2);
     expect(three.caughtUp).toBe(true);
 });
+
+test("production batch drains 128 changes before resuming from its last committed offset", async () => {
+    const raw = JSON.stringify([
+        event(Array.from({ length: 129 }, (_, i) => `CVE-2026-${1234 + i}`)),
+    ]);
+    const first = await deltaBatch(new Response(raw).body, null, 128);
+
+    expect(first.batch).toHaveLength(128);
+    expect(first.batch.at(-1)?.item.id).toBe("CVE-2026-1361");
+    expect(first.caughtUp).toBe(false);
+
+    const remaining = await deltaBatch(new Response(raw).body, { event: time, offset: 128 }, 128);
+
+    expect(remaining.batch.map(({ item }) => item.id)).toEqual(["CVE-2026-1362"]);
+    expect(remaining.caughtUp).toBe(true);
+    await expect(deltaBatch(new Response(raw).body, null, 129)).rejects.toThrow("invalid delta batch limit");
+});
+
 test("malformed streams and missing replay history fail closed", async () => {
     await expect(
         deltaBatch(

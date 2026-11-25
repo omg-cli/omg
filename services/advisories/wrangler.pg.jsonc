@@ -26,7 +26,7 @@
         },
     ],
     "r2_buckets": [{ "binding": "RAW", "bucket_name": "omg-advisories-raw" }],
-    "vars": { "CVE_BATCH_SIZE": "32", "DB_BACKEND": "postgres" },
+    "vars": { "CVE_BATCH_SIZE": "128", "DB_BACKEND": "postgres" },
     "limits": { "cpu_ms": 30000 },
     "placement": { "mode": "smart" },
     "triggers": { "crons": ["*/5 * * * *"] },
