@@ -304,9 +304,8 @@ class AdvisoryReleaseBoundaryTests(unittest.TestCase):
         self.assertNotIn("advisory-baseline.py status", release)
 
     def test_pending_advisory_baseline_does_not_block_verified_tag_creation(self):
-        workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
-        script = step_script(job_block(workflow, "release-tag"),
-                             "Tag Cargo.toml version when all platform builds succeeded")
+        workflow = (ROOT / ".github/workflows/authorize-release.yml").read_text(encoding="utf-8")
+        script = step_script(job_block(workflow, "tag"), "Verify and authorize the release candidate")
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "Cargo.toml").write_text('version = "0.1.225"\n', encoding="utf-8", newline="\n")
@@ -330,9 +329,7 @@ class AdvisoryReleaseBoundaryTests(unittest.TestCase):
                                GITHUB_SHA="a" * 40, GITHUB_REF="refs/heads/main",
                                GITHUB_EVENT_NAME="workflow_dispatch", GITHUB_RUN_ATTEMPT="1",
                                RELEASE_CANDIDATE="v0.1.225@" + "a" * 40,
-                               GITHUB_STEP_SUMMARY=str(root / "summary"),
-                               LINUX_MATRIX="success", SANDBOX_CANCELLATION="success",
-                               FEATURE_INTERSECTIONS="success", MACOS="success", UBUNTU="success")
+                               GITHUB_STEP_SUMMARY=str(root / "summary"), PUBLISH_RELEASE="true")
             result = subprocess.run([BASH, "-e", "-o", "pipefail", "-c", script], cwd=root,
                                     env=environment, capture_output=True, text=True, timeout=10)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
