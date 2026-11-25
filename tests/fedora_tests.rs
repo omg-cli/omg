@@ -921,22 +921,24 @@ mod dnf_integration {
         let root = String::from_utf8(root.stdout)?;
         let expected: std::collections::BTreeSet<_> =
             providers.lines().chain(root.lines()).collect();
-        let tree = std::process::Command::new(binary)
-            .env("NO_COLOR", "1")
-            .env("LC_ALL", "C")
-            .args(["size", "--tree", &selector, "--limit", "10000"])
-            .output()?;
-        assert!(
-            tree.status.success(),
-            "{}",
-            String::from_utf8_lossy(&tree.stderr)
-        );
-        let tree = String::from_utf8(tree.stdout)?;
-        for name in &expected {
-            assert!(tree.contains(name), "missing provider {name}");
+        for target in [&selector, root.trim_end()] {
+            let tree = std::process::Command::new(binary)
+                .env("NO_COLOR", "1")
+                .env("LC_ALL", "C")
+                .args(["size", "--tree", target, "--limit", "10000"])
+                .output()?;
+            assert!(
+                tree.status.success(),
+                "{target}: {}",
+                String::from_utf8_lossy(&tree.stderr)
+            );
+            let tree = String::from_utf8(tree.stdout)?;
+            for name in &expected {
+                assert!(tree.contains(name), "missing provider {name}");
+            }
+            assert!(tree.contains(&format!("Number of Packages: {}", expected.len())));
+            assert!(tree.contains("not a minimal dependency closure"));
         }
-        assert!(tree.contains(&format!("Number of Packages: {}", expected.len())));
-        assert!(tree.contains("not a minimal dependency closure"));
         let missing = std::process::Command::new(binary)
             .args(["size", "--tree", "omg-no-such-package"])
             .output()?;
@@ -1045,18 +1047,20 @@ mod dnf_integration {
             .split_once('\t')
             .expect("native installation reason");
         let binary = assert_cmd::cargo::cargo_bin!("omg");
-        let output = std::process::Command::new(binary)
-            .env("NO_COLOR", "1")
-            .args(["why", &selector])
-            .output()?;
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let output = String::from_utf8(output.stdout)?;
-        assert!(output.contains(identity));
-        assert!(output.contains(&format!("Reason: {reason}")));
+        for target in [&selector, identity] {
+            let output = std::process::Command::new(binary)
+                .env("NO_COLOR", "1")
+                .args(["why", target])
+                .output()?;
+            assert!(
+                output.status.success(),
+                "{target}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let output = String::from_utf8(output.stdout)?;
+            assert!(output.contains(identity));
+            assert!(output.contains(&format!("Reason: {reason}")));
+        }
         let native = std::process::Command::new("dnf")
             .args([
                 "--setopt=disable_excludes=*",
@@ -1064,7 +1068,7 @@ mod dnf_integration {
                 "--installed",
                 "--qf",
                 format,
-                &format!("--whatrequires={selector}"),
+                &format!("--whatrequires={identity}"),
             ])
             .output()?;
         assert!(native.status.success());
@@ -1074,28 +1078,30 @@ mod dnf_integration {
             .map(|line| line.split_once('\t').expect("native dependent"))
             .filter(|(name, _)| *name != identity)
             .collect();
-        let output = std::process::Command::new(binary)
-            .env("NO_COLOR", "1")
-            .args(["why", "--reverse", &selector])
-            .output()?;
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let output = String::from_utf8(output.stdout)?;
-        for (identity, reason) in &expected {
+        for target in [&selector, identity] {
+            let output = std::process::Command::new(binary)
+                .env("NO_COLOR", "1")
+                .args(["why", "--reverse", target])
+                .output()?;
             assert!(
-                output.contains(&format!("{identity}: {reason}")),
-                "missing {identity}"
+                output.status.success(),
+                "{target}: {}",
+                String::from_utf8_lossy(&output.stderr)
             );
+            let output = String::from_utf8(output.stdout)?;
+            for (identity, reason) in &expected {
+                assert!(
+                    output.contains(&format!("{identity}: {reason}")),
+                    "missing {identity}"
+                );
+            }
+            assert!(output.contains(&format!("Dependents ({})", expected.len())));
+            assert!(!output.contains("Safe to remove:"));
         }
         assert!(
             !expected.is_empty(),
             "glibc fixture must have native requiring packages"
         );
-        assert!(output.contains(&format!("Dependents ({})", expected.len())));
-        assert!(!output.contains("Safe to remove:"));
         for arguments in [
             vec!["why", "omg-no-such-package"],
             vec!["why", "--reverse", "omg-no-such-package"],
@@ -1116,15 +1122,15 @@ mod dnf_integration {
             .prefix("omg-fedora-blame-")
             .tempdir_in("/tmp")?;
         let selector = format!("glibc.{}", std::env::consts::ARCH);
-        let invoke = || {
+        let invoke = |target: &str| {
             std::process::Command::new(assert_cmd::cargo::cargo_bin!("omg"))
                 .env("OMG_NATIVE_TEST_DATA_DIR", "1")
                 .env("OMG_DATA_DIR", fixture.path())
                 .env("NO_COLOR", "1")
-                .args(["blame", &selector])
+                .args(["blame", target])
                 .output()
         };
-        let empty = invoke()?;
+        let empty = invoke(&selector)?;
         assert!(
             empty.status.success(),
             "{}",
@@ -1156,7 +1162,7 @@ mod dnf_integration {
                 "--installed",
                 "--qf",
                 "%{full_nevra}\n",
-                &format!("--whatrequires={selector}"),
+                &format!("--whatrequires={}", fields[2]),
             ])
             .output()?;
         assert!(requiring.status.success());
@@ -1187,20 +1193,21 @@ mod dnf_integration {
             transaction("fixture-failed", "2026-01-02T00:00:00Z", false)?,
         ])?;
         let before = std::fs::read(&history_path)?;
-        let output = invoke()?;
+        let output = invoke(fields[2])?;
         assert!(
             output.status.success(),
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
         let output = String::from_utf8(output.stdout)?;
+        assert!(output.contains(fields[2]));
         assert!(output.contains("failed to install → fixture-failed"));
         assert!(output.contains("installed → fixture-old"));
         assert!(output.find("fixture-failed") < output.find("fixture-old"));
         assert!(output.contains("matched by package name"));
         assert_eq!(before, std::fs::read(&history_path)?);
         std::fs::write(&history_path, b"invalid history")?;
-        let corrupt = invoke()?;
+        let corrupt = invoke(&selector)?;
         assert!(!corrupt.status.success());
         assert!(!String::from_utf8(corrupt.stdout)?.contains("No OMG transaction history"));
         assert_eq!(std::fs::read(&history_path)?, b"invalid history");

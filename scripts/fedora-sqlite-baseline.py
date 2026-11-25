@@ -283,6 +283,13 @@ def restore(destination, policy, arch, revision, installed, diagnostics):
         except OSError:
             destination.mkdir(exist_ok=True)
             raise
+    # Keep refused downloads for diagnostics. The admitted bundle now holds
+    # the verified bytes, so the upload needs only that copy.
+    for duplicate in (archive, proof):
+        try:
+            duplicate.unlink()
+        except OSError as error:
+            print(f'Kept duplicate diagnostic {duplicate.name}: {type(error).__name__}')
     return True
 
 

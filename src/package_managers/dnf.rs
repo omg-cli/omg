@@ -1395,7 +1395,7 @@ impl DnfPackageManager {
                 Some(package)
             }
             RepositoryQuery::InstalledReasons(InstalledReasonQuery::RequiredBy(package)) => {
-                crate::core::security::validate_package_name(package)?;
+                Self::validate_query_selector(package)?;
                 args.push(format!("--whatrequires={package}"));
                 None
             }
@@ -2357,14 +2357,7 @@ impl PackageManager for DnfPackageManager {
                     "Installed packages changed during native security audit"
                 );
                 let mut result = super::dnf_advisory::audit_result(rows)?;
-                result.coverage = crate::core::security::scan::AuditCoverage::Reported {
-                    assessed: before
-                        .iter()
-                        .map(crate::core::security::scan::InstalledIdentity::from)
-                        .collect(),
-                    unassessed: Vec::new(),
-                    sources: vec![crate::core::security::scan::AdvisoryProvenance::NativeDnf],
-                };
+                result.coverage = super::dnf_advisory::installed_coverage(&before, &affected);
                 for (_, findings) in &mut result.vulnerabilities {
                     for finding in findings {
                         let native = finding

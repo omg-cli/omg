@@ -37,13 +37,12 @@ pub async fn run(package: &str, reverse: bool) -> Result<()> {
         backend != crate::package_managers::Backend::Mock,
         "Package dependency analysis is not implemented for the mock backend"
     );
-    crate::core::security::validate_package_name(package)?;
-
     #[cfg(feature = "fedora")]
     if backend == crate::package_managers::Backend::Fedora {
         crate::cli::tea::run_report(show_reason_fedora(package, reverse).await?)?;
         return Ok(());
     }
+    crate::core::security::validate_package_name(package)?;
 
     #[cfg(any(feature = "debian", feature = "debian-pure"))]
     if crate::core::env::distro::is_debian_like() {
@@ -111,9 +110,10 @@ async fn show_reason_fedora(package: &str, reverse: bool) -> Result<Cmd<()>> {
             )),
         ]));
     }
-    let mut dependents =
-        DnfPackageManager::installed_package_reasons(InstalledReasonQuery::RequiredBy(package))
-            .await?;
+    let mut dependents = DnfPackageManager::installed_package_reasons(
+        InstalledReasonQuery::RequiredBy(&root.identity),
+    )
+    .await?;
     dependents.retain(|entry| entry.identity != root.identity);
     dependents.sort_by(|left, right| left.identity.cmp(&right.identity));
     let count = dependents.len();

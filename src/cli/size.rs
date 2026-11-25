@@ -32,14 +32,13 @@ pub async fn run(tree: Option<&str>, limit: usize) -> Result<()> {
         backend != crate::package_managers::Backend::Mock,
         "Package size analysis is not implemented for the mock backend"
     );
-    if let Some(package) = tree {
-        crate::core::security::validate_package_name(package)?;
-    }
-
     #[cfg(feature = "fedora")]
     if backend == crate::package_managers::Backend::Fedora {
         crate::cli::tea::run_report(show_sizes_fedora(tree, limit).await?)?;
         return Ok(());
+    }
+    if let Some(package) = tree {
+        crate::core::security::validate_package_name(package)?;
     }
 
     #[cfg(any(feature = "debian", feature = "debian-pure"))]
@@ -87,7 +86,7 @@ async fn show_sizes_fedora(tree: Option<&str>, limit: usize) -> Result<Cmd<()>> 
         );
         let root = selected.remove(0);
         let mut providers = DnfPackageManager::installed_package_sizes(
-            InstalledSizeQuery::RequirementProviders(package),
+            InstalledSizeQuery::RequirementProviders(&root.0),
         )
         .await?;
         providers.retain(|(identity, _)| identity != &root.0);
