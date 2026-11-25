@@ -1251,6 +1251,26 @@ jobs:
         if: contains(matrix.features, 'debian')
         run: timeout -k 5s 180s python3 scripts/prepare-node-test-fixture.py --destination "$RUNNER_TEMP/node-test-fixture"
 
+      - name: Prepare pinned Rust ALPM source for Fedora
+        if: matrix.platform == 'fedora'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Nextest resolves all optional dependencies for metadata even in a Fedora build.
+          source="$RUNNER_TEMP/omg-alpm-source"
+          python3 scripts/check-alpm-pins.py --prepare-cargo-source "$source"
+          cargo_home="${CARGO_HOME:-$HOME/.cargo}"
+          mkdir -p "$cargo_home"
+          config="$cargo_home/config.toml"
+          if [[ -f "$cargo_home/config" ]]; then
+            config="$cargo_home/config"
+          fi
+          {
+            printf '\n'
+            cat "$source/cargo-config.toml"
+          } >> "$config"
+          sha256sum "$source/cargo-config.toml"
+
       - name: Run unit tests
         if: matrix.phase == 'validation'
         run: python3 scripts/run-native-contracts.py --features ${{ matrix.features }}

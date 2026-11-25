@@ -115,6 +115,15 @@ class NativePhaseMatrixTests(unittest.TestCase):
         self.assertIn("name: native-release-${{ matrix.platform }}-${{ github.run_attempt }}", self.steps["Upload native release pair"])
         self.assertIn("name: cli-surfaces-${{ matrix.platform }}", self.steps["Preserve compiled parser surfaces"])
 
+    def test_fedora_installs_the_verified_alpm_source_before_cargo_metadata(self) -> None:
+        name = "Prepare pinned Rust ALPM source for Fedora"
+        self.assertLess(self.job.index(f"- name: {name}"), self.job.index("- name: Run unit tests"))
+        prepare = self.steps[name]
+        self.assertIn("if: matrix.platform == 'fedora'", prepare)
+        self.assertIn('python3 scripts/check-alpm-pins.py --prepare-cargo-source "$source"', prepare)
+        self.assertIn('cat "$source/cargo-config.toml"', prepare)
+        self.assertIn('} >> "$config"', prepare)
+
     def test_cache_keeps_compatibility_hash_without_run_specific_diagnostics_or_extra_writers(self) -> None:
         cache = self.steps["Cache Rust dependencies"]
         self.assertIn("          RUSTUP_DIAGNOSTICS_DIR: \"\"\n", cache)
