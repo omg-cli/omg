@@ -230,7 +230,12 @@ impl PackageIndex {
         depends: &[String],
         licenses: &[String],
     ) {
-        let name_lower = name.to_ascii_lowercase();
+        let lowercase = |value: &str| match self.name_kind {
+            SearchNameKind::RpmIdentity => value.to_lowercase(),
+            SearchNameKind::Literal => value.to_ascii_lowercase(),
+        };
+        let name_lower = lowercase(name);
+        let description_lower = lowercase(description);
         let idx = self.items.len();
         self.items.push(CompactPackageInfo {
             rpm_eligible: true,
@@ -238,7 +243,7 @@ impl PackageIndex {
             name_lower_offset: self.pool.intern(&name_lower),
             version_offset: self.pool.intern(version),
             description_offset: self.pool.intern(description),
-            description_lower_offset: self.pool.intern(&description.to_ascii_lowercase()),
+            description_lower_offset: self.pool.intern(&description_lower),
             url_offset: self.pool.intern(url),
             size,
             download_size,
@@ -266,17 +271,21 @@ impl PackageIndex {
     /// reading the host package database.
     #[cfg(test)]
     pub(crate) fn from_records(records: &[(&str, &str, &str)]) -> Self {
-        let mut index = Self::with_capacity(records.len());
-        for &(name, version, description) in records {
-            index.push(name, version, description, "", 0, 0, "extra", &[], &[]);
-        }
-        index
+        Self::from_records_for_kind(records, SearchNameKind::Literal)
     }
 
     #[cfg(test)]
     pub(crate) fn from_rpm_records(records: &[(&str, &str, &str)]) -> Self {
-        let mut index = Self::from_records(records);
-        index.name_kind = SearchNameKind::RpmIdentity;
+        Self::from_records_for_kind(records, SearchNameKind::RpmIdentity)
+    }
+
+    #[cfg(test)]
+    fn from_records_for_kind(records: &[(&str, &str, &str)], kind: SearchNameKind) -> Self {
+        let mut index = Self::with_capacity(records.len());
+        index.name_kind = kind;
+        for &(name, version, description) in records {
+            index.push(name, version, description, "", 0, 0, "extra", &[], &[]);
+        }
         index
     }
 
@@ -543,22 +552,21 @@ impl PackageIndex {
         use crate::core::packages::search::{SearchRanker, SearchScore};
 
         let query_lower = query.to_lowercase();
+        let finder = memchr::memmem::Finder::new(&query_lower);
         let mut ranker = SearchRanker::new(query);
         let mut scored: Vec<(SearchScore, usize)> = Vec::new();
         // DNF admits name OR description substrings across the complete catalog.
         // Score every eligible row before the bounded cache prefix is selected.
         for (idx, item) in self.items.iter().enumerate() {
-            let name_lower = self.pool.get(item.name_offset).to_lowercase();
-            if !name_lower.contains(&query_lower)
-                && !self
-                    .pool
-                    .get(item.description_offset)
-                    .to_lowercase()
-                    .contains(&query_lower)
+            let name_lower = self.pool.get(item.name_lower_offset);
+            if finder.find(name_lower.as_bytes()).is_none()
+                && finder
+                    .find(self.pool.get(item.description_lower_offset).as_bytes())
+                    .is_none()
                 && !self.rpm_summary_aliases.get(&idx).is_some_and(|aliases| {
                     aliases
                         .iter()
-                        .any(|&offset| self.pool.get(offset).contains(&query_lower))
+                        .any(|&offset| finder.find(self.pool.get(offset).as_bytes()).is_some())
                 })
             {
                 continue;
@@ -568,7 +576,7 @@ impl PackageIndex {
             } else {
                 SearchNameKind::Literal
             };
-            scored.push((ranker.score(&name_lower, kind), idx));
+            scored.push((ranker.score(name_lower, kind), idx));
         }
         let compare = |a: &(SearchScore, usize), b: &(SearchScore, usize)| {
             a.0.cmp(&b.0)

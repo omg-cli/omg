@@ -583,6 +583,77 @@ exec {shlex.quote(str(native))} "$@"
             def refresh_fixture():
                 for args in ([], advisory_options):
                     ordinary_control([dnf, *args, "--refresh", "-y", "makecache"])
+
+            def inspect_multiline_summary(original):
+                from compression import zstd
+
+                primary_ns = "{http://linux.duke.edu/metadata/common}"
+                primary = zstd.decompress((repo/"repodata/primary.xml.zst").read_bytes()).decode()
+                original_summary = ET.fromstring(primary).findtext(f"{primary_ns}package/{primary_ns}summary")
+                assert original_summary
+                previous = f"<summary>{original_summary}</summary>"
+                assert primary.count(previous) == 1
+                summary = "Fixture-QZ First Line\nFixture-QZ\tÄquator Catalogue ΩΣ"
+                primary = primary.replace(previous, f"<summary>{summary}</summary>").encode()
+                modified = ET.fromstring(original)
+                modified.remove(next(row for row in modified.findall(f"{repo_ns}data")
+                                     if row.attrib["type"] == "primary"))
+                append_metadata(modified, "primary", "repodata/primary-multiline.xml.gz", primary)
+                manifest.write_bytes(ET.tostring(modified))
+                try:
+                    sign_manifest()
+                    ordinary_control([dnf, "clean", "metadata"])
+                    refresh_fixture()
+                    identity = f"{package}.noarch"
+                    native = ordinary_control([dnf, "--cacheonly", "repoquery", "--available", "--latest-limit=1",
+                                               "--queryformat", "%{name}.%{arch}\t%{evr}\t%{summary}\x1e", package])
+                    assert native == f"{identity}\t1-1\t{summary}\x1e", repr(native)
+
+                    queries = (
+                        package, identity, "OMG-OBSERVER", "observer-fixture", "Fixture-QZ", "FIXTURE-QZ",
+                        "fixture-qz first line", "QZ FIRST", "QZ FIRST LINE",
+                        "ÄQUATOR", "äquator catalogue", "catalogue ΩΣ", "CATALOGUE ως", "fixture-qz absent",
+                    )
+                    for role, mode in (("direct", disabled), ("daemon", env)):
+                        requests_before = request_counters()
+                        for query in queries:
+                            result = command([cli, "--json", "search", "--limit", "1", query], mode, ordinary)
+                            value = None
+                            try:
+                                value = json.loads(result.stdout)
+                                row, = value
+                                matched = (row["name"], row["version"], row["description"]) == (
+                                    identity, "1-1", summary)
+                            except (ValueError, KeyError, TypeError):
+                                matched = False
+                            if query == "fixture-qz absent":
+                                matched = value == []
+                            checks.append(dict(phase="repository-multiline", case=f"{role}-{query}",
+                                               passed=result.returncode == 0 and matched,
+                                               value=value, diagnostic=result.stderr[-650:]))
+                        result = command([cli, "--json", "info", package], mode, ordinary)
+                        try:
+                            value = json.loads(result.stdout)
+                            matched = value["name"] == identity and value["version"] == "1-1" \
+                                and value["description"] == summary and value["installed"] is False
+                        except (ValueError, KeyError, TypeError):
+                            value, matched = result.stdout[-650:], False
+                        checks.append(dict(phase="repository-multiline", case=f"{role}-info",
+                                           passed=result.returncode == 0 and matched,
+                                           value=value, diagnostic=result.stderr[-650:]))
+                        total, failed = request_counters()
+                        calls = total - requests_before[0] - 1
+                        failures = failed - requests_before[1]
+                        expected_calls = len(queries) + 1 if role == "daemon" else 0
+                        checks.append(dict(phase="repository-multiline", case=f"{role}-ipc",
+                                           passed=calls == expected_calls and failures == 0,
+                                           value={"calls": calls, "failures": failures}))
+                finally:
+                    manifest.write_bytes(original)
+                    sign_manifest()
+                    ordinary_control([dnf, "clean", "metadata"])
+                    refresh_fixture()
+
             refresh_fixture()
             host_explicit = len(set(ordinary_control([dnf, "--cacheonly", "--setopt=disable_excludes=*",
                                                       "repoquery", "--userinstalled", "--qf", r"%{name}\n"]).splitlines()))
@@ -638,6 +709,8 @@ exec {shlex.quote(str(native))} "$@"
                 ordinary_control([dnf, "clean", "metadata"])
                 refresh_fixture()
                 inspect_repository("repository-metadata-restored", True)
+                if consent_oracle is not None:
+                    inspect_multiline_summary(original_manifest)
 
             fast.unlink(missing_ok=True)
             persisted.unlink(missing_ok=True)
@@ -854,6 +927,6 @@ assert inventory() == before
 report = dict(binaries=binaries, checks=checks, total=len(checks),
               passed=sum(entry["passed"] for entry in checks), host_unchanged=True)
 print(json.dumps(report))
-expected_checks = 264 if consent_oracle is None else 297
+expected_checks = 264 if consent_oracle is None else 329
 if report["passed"] != report["total"] or report["total"] != expected_checks:
     sys.exit(4)

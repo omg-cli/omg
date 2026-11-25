@@ -41,6 +41,49 @@ use zerocopy::{FromBytes, Immutable, KnownLayout, big_endian::U32};
 #[cfg(all(test, unix))]
 pub(crate) use tests::search_parity_data;
 
+const REPOSITORY_RECORD_SEPARATOR: char = '\x1e';
+
+struct AvailablePackageRow<'a> {
+    name: &'a str,
+    version: &'a str,
+    summary: &'a str,
+}
+
+impl<'a> AvailablePackageRow<'a> {
+    fn parse(row: &'a str) -> Result<Self> {
+        let mut fields = row.splitn(3, '\t');
+        let name = fields.next().context("DNF repository row has no name")?;
+        let version = fields.next().context("DNF repository row has no version")?;
+        let summary = fields.next().context("DNF repository row has no summary")?;
+        anyhow::ensure!(
+            !name.is_empty()
+                && name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"+._-".contains(&byte)),
+            "DNF repository row has invalid package name"
+        );
+        anyhow::ensure!(
+            !version.is_empty() && !version.chars().any(char::is_whitespace),
+            "DNF repository row has invalid version"
+        );
+        Ok(Self {
+            name,
+            version,
+            summary,
+        })
+    }
+
+    fn into_package(self) -> Package {
+        Package {
+            name: self.name.to_owned(),
+            version: parse_version_or_zero(self.version),
+            description: self.summary.to_owned(),
+            source: PackageSource::Official,
+            installed: false,
+        }
+    }
+}
+
 /// RPM tag constants for parsing header entries
 #[cfg(feature = "fedora")]
 mod rpm_tags {
@@ -1418,34 +1461,22 @@ impl DnfPackageManager {
         Ok(packages)
     }
 
-    fn parse_available_packages(output: &[u8]) -> Result<Vec<Package>> {
+    fn available_package_rows(
+        output: &[u8],
+    ) -> Result<impl Iterator<Item = Result<AvailablePackageRow<'_>>>> {
         let text = std::str::from_utf8(output).context("DNF repository output is not UTF-8")?;
-        text.lines()
-            .filter(|line| !line.is_empty())
-            .map(|line| {
-                let mut fields = line.splitn(3, '\t');
-                let name = fields.next().context("DNF repository row has no name")?;
-                let version = fields.next().context("DNF repository row has no version")?;
-                let summary = fields.next().context("DNF repository row has no summary")?;
-                anyhow::ensure!(
-                    !name.is_empty()
-                        && name
-                            .bytes()
-                            .all(|byte| byte.is_ascii_alphanumeric() || b"+._-".contains(&byte)),
-                    "DNF repository row has invalid package name"
-                );
-                anyhow::ensure!(
-                    !version.is_empty() && !version.chars().any(char::is_whitespace),
-                    "DNF repository row has invalid version"
-                );
-                Ok(Package {
-                    name: name.to_owned(),
-                    version: parse_version_or_zero(version),
-                    description: summary.to_owned(),
-                    source: PackageSource::Official,
-                    installed: false,
-                })
-            })
+        anyhow::ensure!(
+            text.is_empty() || text.ends_with(REPOSITORY_RECORD_SEPARATOR),
+            "DNF repository row has no record terminator"
+        );
+        Ok(text
+            .split_terminator(REPOSITORY_RECORD_SEPARATOR)
+            .map(AvailablePackageRow::parse))
+    }
+
+    fn parse_available_packages(output: &[u8]) -> Result<Vec<Package>> {
+        Self::available_package_rows(output)?
+            .map(|row| row.map(AvailablePackageRow::into_package))
             .collect()
     }
 
@@ -1472,18 +1503,47 @@ impl DnfPackageManager {
         candidates
     }
 
-    fn search_results(mut candidates: Vec<Package>, query_lower: &str) -> Vec<Package> {
-        let mut matching_identities: HashSet<_> = candidates
-            .iter()
-            .filter(|pkg| {
-                pkg.name.to_lowercase().contains(query_lower)
-                    || pkg.description.to_lowercase().contains(query_lower)
-            })
-            .map(|pkg| pkg.name.clone())
-            .collect();
-        candidates.retain(|pkg| matching_identities.remove(&pkg.name));
+    fn search_results(
+        installed: Vec<InstalledPackage>,
+        repository: &[u8],
+        query_lower: &str,
+    ) -> Result<Vec<Package>> {
+        let rows = Self::available_package_rows(repository)?.collect::<Result<Vec<_>>>()?;
+        let finder = memchr::memmem::Finder::new(query_lower);
+        let mut lowercase = Vec::new();
+        let mut contains = |text: &str| {
+            if text.is_ascii() {
+                lowercase.clear();
+                lowercase.extend_from_slice(text.as_bytes());
+                lowercase.make_ascii_lowercase();
+                finder.find(&lowercase).is_some()
+            } else {
+                finder.find(text.to_lowercase().as_bytes()).is_some()
+            }
+        };
+        let mut candidates = Self::search_candidates(installed, Vec::new());
+        let mut matching_identities = HashSet::new();
+        for package in &candidates {
+            if contains(&package.name) || contains(&package.description) {
+                matching_identities.insert(package.name.clone());
+            }
+        }
+        for row in &rows {
+            if contains(row.name) || contains(row.summary) {
+                matching_identities.insert(row.name.to_owned());
+            }
+        }
+
+        // Match any summary for an identity, then display the first row, with
+        // installed packages first. Only materialize matching repository rows.
+        candidates.retain(|package| matching_identities.remove(&package.name));
+        candidates.extend(
+            rows.into_iter()
+                .filter(|row| matching_identities.remove(row.name))
+                .map(AvailablePackageRow::into_package),
+        );
         candidates.sort_unstable_by(|a, b| a.name.cmp(&b.name));
-        candidates
+        Ok(candidates)
     }
 
     fn sqlite_security_inventory(&self) -> Result<Vec<SecurityPackage>> {
@@ -1715,15 +1775,13 @@ impl DnfPackageManager {
 
     /// Query-format strings for `dnf repoquery --queryformat`.
     ///
-    /// dnf5 contract (verified against dnf5 on Fedora 44): field separators
-    /// must be real TAB characters (passed through verbatim), but the row
-    /// terminator must be the two-character escape `\n`. A real newline
-    /// inside the format is silently dropped, concatenating every row into
-    /// one mega-row that fails parsing; a literal `\t` escape is passed
-    /// through as text instead of a tab, which also fails parsing.
+    /// DNF5 passes literal tabs and record separators through. Available
+    /// package summaries can contain newlines, so those records end at U+001E,
+    /// which cannot appear in the repository's XML. The other queries use
+    /// DNF's backslash-n escape, since DNF drops literal newlines.
     fn repository_query_format(query: &RepositoryQuery<'_>) -> &'static str {
         match query {
-            RepositoryQuery::Available(_) => "%{name}.%{arch}\t%{evr}\t%{summary}\\n",
+            RepositoryQuery::Available(_) => "%{name}.%{arch}\t%{evr}\t%{summary}\x1e",
             RepositoryQuery::InstalledSizes(_) => "%{full_nevra}\t%{installsize}\\n",
             RepositoryQuery::InstalledReasons(_) => "%{full_nevra}\t%{reason}\\n",
             RepositoryQuery::InstalledDetails(_) => "%{name}\t%{evr}\t%{full_nevra}\t%{reason}\\n",
@@ -2934,8 +2992,12 @@ impl PackageManager for DnfPackageManager {
     ) -> Pin<Box<dyn Future<Output = Result<Vec<Package>>> + Send + '_>> {
         let query_lower = query.to_lowercase();
         Box::pin(async move {
-            let candidates = self.package_index().await?;
-            Ok(Self::search_results(candidates, &query_lower))
+            let installed = self.load_installed_packages().await?;
+            let output = Self::repository_output(RepositoryQuery::Available(None)).await?;
+            tokio::task::spawn_blocking(move || {
+                Self::search_results(installed, &output, &query_lower)
+            })
+            .await?
         })
     }
 
@@ -4188,7 +4250,7 @@ mod tests {
     #[test]
     fn available_repository_rows_preserve_epoch_and_uninstalled_state() {
         let packages = DnfPackageManager::parse_available_packages(
-            b"tree\t2:2.2.1-4.fc44\tDirectory listing\n",
+            b"tree\t2:2.2.1-4.fc44\tDirectory listing\x1e",
         )
         .expect("valid repository row");
         assert_eq!(packages.len(), 1);
@@ -4201,7 +4263,7 @@ mod tests {
     #[test]
     fn available_repository_rows_preserve_official_source_and_complete_payload() {
         let packages = DnfPackageManager::parse_available_packages(
-            b"tree.x86_64\t2:2.2.1-4.fc44\tDirectory listing\n",
+            b"tree.x86_64\t2:2.2.1-4.fc44\tDirectory listing\x1e",
         )
         .expect("valid official repository row");
         assert_eq!(packages.len(), 1);
@@ -4223,35 +4285,36 @@ mod tests {
         );
     }
 
-    fn search_catalog_fixture() -> Vec<Package> {
-        let installed =
-            [("widget.lib", "x86_64"), ("widget.local", "noarch")].map(|(name, architecture)| {
-                InstalledPackage {
-                    name: name.to_owned(),
-                    architecture: architecture.to_owned(),
-                    version: "1".to_owned(),
-                    release: "1".to_owned(),
-                    summary: "Installed summary".to_owned(),
-                    reason: InstallReason::Dependency,
-                }
-            });
-        let available = DnfPackageManager::parse_available_packages(
-            b"widget.lib.x86_64\t2-1\tRepository keyword\n\
-              widget.lib.x86_64\t3-1\tAnother repository build\n\
-              widget.lib.i686\t2-1\tRepository keyword\n",
-        )
-        .expect("valid repository rows");
-        DnfPackageManager::search_candidates(Vec::from(installed), available)
+    fn installed_search_fixture() -> Vec<InstalledPackage> {
+        [("widget.lib", "x86_64"), ("widget.local", "noarch")]
+            .map(|(name, architecture)| InstalledPackage {
+                name: name.to_owned(),
+                architecture: architecture.to_owned(),
+                version: "1".to_owned(),
+                release: "1".to_owned(),
+                summary: "Installed summary".to_owned(),
+                reason: InstallReason::Dependency,
+            })
+            .to_vec()
+    }
+
+    const SEARCH_REPOSITORY_ROWS: &[u8] = b"widget.lib.x86_64\t2-1\tRepository keyword\x1e\
+        widget.lib.x86_64\t3-1\tAnother repository build\x1e\
+        widget.lib.i686\t2-1\tRepository keyword\x1e";
+
+    fn search_fixture(query: &str) -> Vec<Package> {
+        DnfPackageManager::search_results(installed_search_fixture(), SEARCH_REPOSITORY_ROWS, query)
+            .expect("valid repository rows")
     }
 
     #[test]
     fn search_matches_qualified_identities_and_prefers_installed_rows() {
         assert_eq!(
             DnfPackageManager::repository_query_format(&RepositoryQuery::Available(None)),
-            "%{name}.%{arch}\t%{evr}\t%{summary}\\n"
+            "%{name}.%{arch}\t%{evr}\t%{summary}\x1e"
         );
         let search = |query| {
-            DnfPackageManager::search_results(search_catalog_fixture(), query)
+            search_fixture(query)
                 .into_iter()
                 .map(|pkg| {
                     (
@@ -4295,20 +4358,23 @@ mod tests {
 
     #[cfg(unix)]
     pub(crate) fn search_parity_data(query: &str) -> (Vec<Package>, Vec<Package>) {
-        let catalog = search_catalog_fixture();
-        let direct = DnfPackageManager::search_results(catalog.clone(), query);
-        (catalog, direct)
+        let available = DnfPackageManager::parse_available_packages(SEARCH_REPOSITORY_ROWS)
+            .expect("valid repository rows");
+        let catalog = DnfPackageManager::search_candidates(installed_search_fixture(), available);
+        (catalog, search_fixture(query))
     }
 
     #[test]
     fn malformed_repository_rows_do_not_become_empty_searches() {
         for row in [
-            b"tree".as_slice(),
-            b"tree\t\tmissing version",
-            b"bad/name\t1-1\tx",
-            b"tree\t1-1\t\xff",
+            b"tree\x1e".as_slice(),
+            b"tree\t1-1\tmissing separator",
+            b"tree\t\tmissing version\x1e",
+            b"bad/name\t1-1\tx\x1e",
+            b"tree\t1-1\t\xff\x1e",
         ] {
             assert!(DnfPackageManager::parse_available_packages(row).is_err());
+            assert!(DnfPackageManager::search_results(Vec::new(), row, "other").is_err());
         }
         assert!(
             DnfPackageManager::parse_available_packages(b"")
@@ -4319,10 +4385,6 @@ mod tests {
 
     #[test]
     fn repository_query_formats_match_dnf5_row_terminator_contract() {
-        // dnf5 passes real TABs through but silently drops a real newline
-        // inside --queryformat/--qf, concatenating every row into one.
-        // The row terminator must therefore be the two-character `\n`
-        // escape; a literal `\t` escape is passed through as text.
         let queries = [
             RepositoryQuery::Available(None),
             RepositoryQuery::Available(Some("tree")),
@@ -4346,8 +4408,11 @@ mod tests {
                 "dnf5 drops real newlines and concatenates rows: {format:?}"
             );
             assert!(
-                format.ends_with("\\n"),
-                "dnf5 needs the literal backslash-n row terminator: {format:?}"
+                match query {
+                    RepositoryQuery::Available(_) => format.ends_with(REPOSITORY_RECORD_SEPARATOR),
+                    _ => format.ends_with("\\n"),
+                },
+                "dnf5 row terminator does not match its parser: {format:?}"
             );
             assert!(
                 !format.contains("\\t"),
