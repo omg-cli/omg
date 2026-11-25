@@ -733,7 +733,7 @@ async function java(identity: RuntimeIdentity, sources: Sources, result: Assessm
     });
     if (!loaded) return;
     const payload = object(JSON.parse(loaded.raw));
-    if (payload.bomFormat !== "CycloneDX" || !["1.5", "1.6", "1.7"].includes(string(payload.specVersion)) || object(object(payload.metadata).component).name !== "Eclipse Temurin")
+    if (payload.bomFormat !== "CycloneDX" || !["1.4", "1.5", "1.6", "1.7"].includes(string(payload.specVersion)) || object(object(payload.metadata).component).name !== "Eclipse Temurin")
         throw new Error("invalid Temurin vulnerability disclosure report");
     for (const value of array(payload.vulnerabilities)) {
         const row = object(value);

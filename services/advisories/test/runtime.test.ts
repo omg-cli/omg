@@ -384,13 +384,13 @@ test(".NET includes ASP.NET-only security releases and compares the installed AS
         expect((await report(store, "dotnet", "9.0.100", "microsoft", fetcher)).findings).toMatchObject([{ id: "CVE-2026-12345", applicability: "applicable" }]);
     } finally { db.close(); }
 });
-test("Temurin verifies official asset digest and preserves partial exact-build evidence", async () => {
+test("Temurin accepts the official CycloneDX 1.4 report with partial exact-build evidence", async () => {
     const { store, db } = setup();
     try {
-        const raw = JSON.stringify({ bomFormat: "CycloneDX", specVersion: "1.6", metadata: { component: { name: "Eclipse Temurin" } }, vulnerabilities: [{ id: "CVE-2026-12345", description: "Temurin fixture", affects: [{ ref: "pkg:github/openjdk/jdk", versions: [{ range: "vers:generic/21.0.1" }] }] }] });
+        const raw = JSON.stringify({ bomFormat: "CycloneDX", specVersion: "1.4", metadata: { component: { name: "Eclipse Temurin" } }, vulnerabilities: [{ id: "CVE-2026-12345", description: "Temurin fixture", affects: [{ ref: "pkg:github/openjdk/jdk", versions: [{ range: "vers:generic/21.0.1|8u392" }] }] }] });
         const digest = await sha256(raw);
         const fetcher = async (url: string) => url.endsWith("/latest") ? Response.json({ tag_name: "vdr-fixture", assets: [{ name: "temurin-vdr-fixture.json", digest: `sha256:${digest}`, size: new TextEncoder().encode(raw).length, browser_download_url: "https://github.com/adoptium/temurin-vdr-generator/releases/download/fixture/temurin-vdr-fixture.json" }] }) : new Response(raw);
-        expect((await report(store, "java", "21.0.1+12", "temurin", fetcher)).findings).toMatchObject([{ applicability: "applicable" }]);
+        expect(await report(store, "java", "21.0.1+12", "temurin", fetcher)).toMatchObject({ coverage: "partial", findings: [{ applicability: "applicable" }] });
         expect((await report(store, "java", "21.0.2+13", "temurin", fetcher)).findings).toEqual([]);
         expect((await report(store, "java", "21", "temurin", fetcher)).coverage).toBe("unknown");
     } finally { db.close(); }
