@@ -22,6 +22,77 @@ INSTALLED = [{'name': 'gcc', 'evr': '0:16-1.fc44', 'arch': 'x86_64',
               'immutable_header_sha256': 'c'*64, 'signature_sha256': 'd'*64, 'signers': 'Key ID 6d9f90a6'}]
 
 
+class RuntimeAbiInventoryTests(unittest.TestCase):
+    link = '/usr/lib/gcc/x86_64-redhat-linux/16/32/libgomp.so'
+    declared = '../../../../libgomp.so.1.0.0'
+    target = '/usr/lib/libgomp.so.1.0.0'
+    required = '/usr/lib64/libsqlite3.so.0'
+
+    def setUp(self):
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        self.root = Path(scratch.name).resolve()
+        self.path('/etc/yum.repos.d').mkdir(parents=True)
+        self.path('/etc/dnf').mkdir()
+        self.path('/etc/dnf/dnf.conf').write_bytes(b'dnf settings')
+        self.path('/etc/yum.repos.d/fedora.repo').write_bytes(b'Fedora repository')
+        self.path(self.required).parent.mkdir(parents=True)
+        self.path(self.required).write_bytes(b'installed library')
+        self.path(self.link).parent.mkdir(parents=True)
+        self.path(self.link).symlink_to(self.declared)
+
+    def path(self, name):
+        return self.root / name.lstrip('/')
+
+    def inventory(self, files):
+        def rpm_output(argv, limit):
+            if '%{HEADERIMMUTABLE}' in argv[-1]:
+                return b'signed package header fixture'
+            if '%{FILELINKTOS}' not in argv[-1]:
+                return '\n'.join(files).encode()
+            return '\n'.join(f'{name}\t{link}' for name, link in files.items()).encode()
+
+        with mock.patch.object(cache, 'Path', side_effect=self.path), \
+                mock.patch.object(cache, 'bounded_output', side_effect=rpm_output), \
+                mock.patch.object(cache, 'package_inventory', return_value=INSTALLED):
+            return cache.inventory()['abi']
+
+    def test_records_absent_optional_multilib_target_in_cache_identity(self):
+        files = {self.link: self.declared, self.required: ''}
+        absent = self.inventory(files)
+        self.assertEqual(absent[self.link], {'absent_optional_target': self.target})
+        self.assertEqual(absent[self.required], cache.sha(b'installed library'))
+
+        self.path(self.target).write_bytes(b'optional multilib library')
+        present = self.inventory(dict(files, **{self.target: ''}))
+        self.assertEqual(present[self.link], cache.sha(b'optional multilib library'))
+        self.assertNotEqual(cache.sha(cache.canonical(absent)), cache.sha(cache.canonical(present)))
+
+    def test_missing_required_abi_cannot_use_the_optional_link_exception(self):
+        for files in (
+            {self.link: self.declared, self.required: '', self.target: ''},
+            {self.link: 'different-link-target', self.required: ''},
+            {self.required: '', '/usr/lib64/libmissing.so.1': ''},
+        ):
+            with self.subTest(files=files), self.assertRaisesRegex(ValueError, 'installed runtime ABI file is missing'):
+                self.inventory(files)
+
+    def test_hashes_rpm_owned_gcc_linker_plugin_under_libexec(self):
+        link = '/usr/lib64/bfd-plugins/liblto_plugin.so'
+        declared = '../../libexec/gcc/x86_64-redhat-linux/16/liblto_plugin.so'
+        target = '/usr/libexec/gcc/x86_64-redhat-linux/16/liblto_plugin.so'
+        self.path(link).parent.mkdir()
+        self.path(link).symlink_to(declared)
+        self.path(target).parent.mkdir(parents=True)
+        self.path(target).write_bytes(b'GCC linker plugin')
+        files = {self.required: '', link: declared, target: ''}
+        self.assertEqual(self.inventory(files)[link], cache.sha(b'GCC linker plugin'))
+        with self.assertRaisesRegex(ValueError, 'foreign runtime ABI target'):
+            self.inventory({self.required: '', link: declared})
+        with self.assertRaisesRegex(ValueError, 'foreign runtime ABI target'):
+            self.inventory(dict(files, **{link: 'different-link-target'}))
+
+
 class BaselineTests(unittest.TestCase):
     save = fixtures.FedoraSQLiteTests.save
 

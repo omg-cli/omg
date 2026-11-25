@@ -1,0 +1,110 @@
+name: Authorize Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release-candidate:
+        description: "Current main release candidate: vVERSION@FULL_COMMIT_SHA"
+        type: string
+        required: true
+      publish:
+        description: "Create the version tag and dispatch Release"
+        type: boolean
+        default: false
+  workflow_call:
+    inputs:
+      release-candidate:
+        type: string
+        required: true
+      publish:
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  tag:
+    name: Authorize release candidate
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && github.run_attempt == '1'
+    concurrency:
+      group: release-authorization-${{ github.ref }}
+      cancel-in-progress: false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 100
+    permissions:
+      contents: write
+      actions: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: ${{ inputs.publish }}
+
+      - name: Verify and authorize the release candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_CANDIDATE: ${{ inputs['release-candidate'] }}
+          PUBLISH_RELEASE: ${{ inputs.publish }}
+        run: |
+          case "$PUBLISH_RELEASE" in
+            true|false) ;;
+            *) echo "::error::Release publish input must be true or false"; exit 1 ;;
+          esac
+
+          VERSION=$(awk -F'"' '/^version =/ {print $2; exit}' Cargo.toml)
+          test -n "$VERSION"
+          TAG="v${VERSION}"
+
+          if [[ "$GITHUB_EVENT_NAME" != workflow_dispatch || "$GITHUB_REF" != refs/heads/main \
+             || "$GITHUB_RUN_ATTEMPT" != 1 \
+             || "$RELEASE_CANDIDATE" != "$TAG@$GITHUB_SHA" ]]; then
+            echo "::error::Release authorization requires a fresh main dispatch and must match its Cargo.toml version and full commit SHA"
+            exit 1
+          fi
+
+          if git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null; then
+            echo "Tag $TAG already exists; bump Cargo.toml to cut a new alpha"
+            exit 0
+          fi
+
+          scripts/require-workflow-success.sh ci.yml "$GITHUB_SHA" CI
+          scripts/require-workflow-success.sh benchmark.yml "$GITHUB_SHA" Benchmark
+          # Version tags are immutable. Validate the other workflows BEFORE
+          # creating a tag, so a failed candidate cannot consume a version.
+          scripts/require-workflow-success.sh audit.yml "$GITHUB_SHA" "Security Audit"
+          scripts/require-workflow-success.sh secrets.yml "$GITHUB_SHA" "Secret Scanning"
+          scripts/require-workflow-success.sh codeql.yml "$GITHUB_SHA" CodeQL
+          scripts/require-workflow-success.sh coverage.yml "$GITHUB_SHA" Coverage
+          scripts/require-workflow-success.sh docker-e2e.yml "$GITHUB_SHA" "Docker E2E"
+
+          require_current_main() {
+            local live_main
+            if ! live_main=$(git ls-remote --exit-code --refs origin refs/heads/main); then
+              echo "::error::Cannot read live refs/heads/main; refusing release"
+              return 1
+            fi
+            if [[ "$live_main" != "$GITHUB_SHA"$'\trefs/heads/main' ]]; then
+              echo "::error::Live refs/heads/main does not match the authorized release commit"
+              return 1
+            fi
+          }
+
+          require_current_main
+          if [[ "$PUBLISH_RELEASE" == false ]]; then
+            echo "Validated $TAG at $GITHUB_SHA" | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          git tag "$TAG" "$GITHUB_SHA"
+          git push origin "refs/tags/${TAG}"
+          if ! git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null; then
+            echo "::error::Pushed $TAG but origin does not have refs/tags/${TAG}"
+            exit 1
+          fi
+          echo "Tagged $TAG at $GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
+          echo "Tagged $TAG at $GITHUB_SHA"
+
+          # GITHUB_TOKEN tag pushes do not start other workflows. Dispatch
+          # Release explicitly so GitHub Latest is not left on a 7-month-old tag.
+          require_current_main
+          gh workflow run release.yml --ref "$TAG" -f dry_run=false
+          echo "Dispatched Release for $TAG"

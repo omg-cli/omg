@@ -67,18 +67,28 @@ class ReleaseWorkflowBoundaryTests(unittest.TestCase):
 
     def test_immutable_tag_requires_explicit_dispatch_and_push_evidence(self):
         ci = (WORKFLOWS / 'ci.yml').read_text()
-        block = job_block(ci, 'release-tag')
+        legacy = job_block(ci, 'release-tag')
+        authorization = (WORKFLOWS / 'authorize-release.yml').read_text()
+        block = job_block(authorization, 'tag')
         tag = block.index('git tag "$TAG" "$GITHUB_SHA"')
         self.assertIn("if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' "
-                      "&& github.run_attempt == '1' && inputs['release-candidate'] != ''", block)
+                      "&& github.run_attempt == '1'", block)
         self.assertIn("RELEASE_CANDIDATE: ${{ inputs['release-candidate'] }}", block)
+        self.assertIn('  workflow_dispatch:', authorization)
+        self.assertIn('  workflow_call:', authorization)
+        self.assertRegex(authorization, r'(?m)^      publish:\n        description: [^\n]+\n'
+                                        r'        type: boolean\n        default: false$')
+        self.assertNotIn('needs:', block)
+        self.assertIn('uses: ./.github/workflows/authorize-release.yml', legacy)
+        self.assertIn('ci-success]', legacy)
+        for platform in ('linux-matrix', 'sandbox-cancellation', 'feature-intersections', 'macos', 'ubuntu'):
+            self.assertIn(f"needs.{platform}.result == 'success'", legacy)
         self.assertRegex(ci, r'(?m)^      release-candidate:\n        description: [^\n]+\n'
                              r'        type: string\n        default: ""$')
         self.assertIn("--event push", (ROOT / 'scripts/require-workflow-success.sh').read_text())
         for workflow in ('ci.yml', 'benchmark.yml', 'audit.yml', 'secrets.yml', 'codeql.yml',
                          'coverage.yml', 'docker-e2e.yml'):
             self.assertLess(block.index(f'scripts/require-workflow-success.sh {workflow}'), tag)
-        self.assertIn('ci-success]', block)
 
     def test_release_concurrency_cannot_collide_with_pr_branch_name(self):
         ci = (WORKFLOWS / 'ci.yml').read_text()
@@ -94,9 +104,8 @@ class ReleaseWorkflowBoundaryTests(unittest.TestCase):
                 self.assertNotEqual(release_group.casefold(), pr_format.format(branch).casefold())
 
     def test_release_dispatch_cannot_tag_without_exact_authorization_and_push_ci(self):
-        ci = (WORKFLOWS / 'ci.yml').read_text()
-        script = step_script(job_block(ci, 'release-tag'),
-                             'Tag Cargo.toml version when all platform builds succeeded')
+        workflow = (WORKFLOWS / 'authorize-release.yml').read_text()
+        script = step_script(job_block(workflow, 'tag'), 'Verify and authorize the release candidate')
         sha = 'a' * 40
         approved = f'v0.1.225@{sha}'
         main = 'refs/heads/main'
@@ -114,11 +123,17 @@ class ReleaseWorkflowBoundaryTests(unittest.TestCase):
             ('metacharacters', {'RELEASE_CANDIDATE': '$(touch injected)'}, [], False, False),
             ('replay', {'GITHUB_RUN_ATTEMPT': '2'}, [], False, False),
             ('missing attempt', {'GITHUB_RUN_ATTEMPT': ''}, [], False, False),
+            ('invalid publish input', {'PUBLISH_RELEASE': ''}, [], False, False),
             ('failed push CI', {'PUSH_CI': 'failure'}, ['ci.yml'], False, False),
+            ('validation with failed CI', {'PUSH_CI': 'failure', 'PUBLISH_RELEASE': 'false'},
+             ['ci.yml'], False, False),
             ('drift before tag', {'BEFORE_TAG': 'drifted'}, all_lookups, False, False),
+            ('validation with drift', {'BEFORE_TAG': 'drifted', 'PUBLISH_RELEASE': 'false'},
+             all_lookups, False, False),
             ('unreadable before tag', {'BEFORE_TAG': 'unreadable'}, all_lookups, False, False),
             ('drift after tag', {'AFTER_TAG': 'drifted'}, all_lookups, True, False),
             ('unreadable after tag', {'AFTER_TAG': 'unreadable'}, all_lookups, True, False),
+            ('validate without publishing', {'PUBLISH_RELEASE': 'false'}, all_lookups, False, False),
             ('exact fresh authorization', {}, all_lookups, True, True),
         ):
             with self.subTest(label=label), \
@@ -157,15 +172,17 @@ class ReleaseWorkflowBoundaryTests(unittest.TestCase):
                            GITHUB_EVENT_NAME='workflow_dispatch', GITHUB_REF=main, GITHUB_SHA=sha,
                            GITHUB_RUN_ATTEMPT='1', GITHUB_STEP_SUMMARY=str(root / 'summary'),
                            RELEASE_CANDIDATE=approved, BEFORE_TAG='current', AFTER_TAG='current',
-                           PUSH_CI='success', LINUX_MATRIX='success', SANDBOX_CANCELLATION='success',
-                           FEATURE_INTERSECTIONS='success', MACOS='success', UBUNTU='success')
+                           PUSH_CI='success', PUBLISH_RELEASE='true')
                 env.update(overrides)
                 result = subprocess.run([BASH, '-e', '-o', 'pipefail', '-c', script], cwd=root,
                                         env=env, capture_output=True, text=True, timeout=10)
                 lookups = root / 'lookups'
                 self.assertEqual(lookups.read_text().splitlines() if lookups.exists() else [],
                                  [f'{name} {sha}' for name in expected_lookups])
-                self.assertEqual(result.returncode == 0, dispatched, result.stdout + result.stderr)
+                validated = label == 'validate without publishing'
+                self.assertEqual(result.returncode == 0, dispatched or validated, result.stdout + result.stderr)
+                if validated:
+                    self.assertIn(f'v0.1.225 at {sha}', (root / 'summary').read_text())
                 self.assertFalse((root / 'advisory-status-called').exists())
                 reads = root / 'main-reads'
                 expected_reads = [env['BEFORE_TAG']] if expected_lookups == all_lookups else []

@@ -17,12 +17,16 @@ How releases are built, published, verified, and rolled back.
 Main pushes run CI but do not tag or publish. When a release is approved,
 confirm the candidate is the current `main` commit and that its push-triggered
 CI, Benchmark, Security Audit, Secret Scanning, CodeQL, Coverage, and Docker E2E
-have passed. Then a maintainer with repository
-write access can run the **CI** workflow on `main` and fill in
+have passed. A maintainer with repository write access can run
+**Authorize Release** on `main` and fill in
 `release-candidate` with `vVERSION@FULL_COMMIT_SHA` (the Cargo.toml version,
-prefixed with `v`, and the full SHA of that exact commit). Leave the input
-blank for a nonpublishing CI dispatch. Select `run-qemu` to include staged
-guest verification in the dispatch.
+prefixed with `v`, and the full SHA of that exact commit). The default
+validates the seven existing push results. Select `publish` to create the tag
+and dispatch **Release**.
+
+For a fresh CI run before tagging, dispatch **CI** on `main` with the same
+`release-candidate` and select `run-qemu` if staged guest verification is
+requested. Leave the candidate blank to dispatch CI without authorizing a release.
 
 The tag job runs only on the dispatch's first attempt. It refuses a mismatched
 candidate and requires successful push checks for that exact SHA. It checks
@@ -33,12 +37,11 @@ the tag stays immutable and Release is not dispatched.
 Advisory import and freshness are verified separately by the advisory service.
 OMG enforces its advisory policy during package and runtime operations.
 
-Keep `main` frozen from dispatch until **Tag Release** finishes: each live-ref
-check and the following write are separate operations, so a check cannot lock
-`main`. Keep pre-interlock push runs out of the retry queue. For a failed
-release dispatch, obtain fresh approval and start a new dispatch rather than
-rerunning it. If it already pushed a tag, stop; do not move the tag or retry
-publication without a separate recovery decision.
+For a publishing dispatch, keep `main` frozen until **Authorize release candidate**
+finishes. The live-ref checks and writes are separate operations. Keep pre-interlock
+push runs out of the retry queue. A failed dispatch requires fresh approval and a
+new dispatch. If it already pushed a tag, leave the tag in place and make a
+separate recovery decision before retrying publication.
 
 ## Pipeline overview
 

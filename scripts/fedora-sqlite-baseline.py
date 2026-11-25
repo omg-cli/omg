@@ -107,16 +107,37 @@ def inventory(diagnostics=None):
     rows = package_inventory(raw)
     repositories = [Path('/etc/dnf/dnf.conf'), *sorted(Path('/etc/yum.repos.d').glob('*.repo'))]
     require(len(repositories) > 1, 'authenticated repository configuration is missing')
-    paths = bounded_output(['rpm', '-qa', '--qf', '[%{FILENAMES}\n]'], LIMIT).decode().splitlines()
+    files = bounded_output(['rpm', '-qa', '--qf', '[%{FILENAMES}\t%{FILELINKTOS}\n]'], LIMIT).decode()
+    paths = {}
+    for row in files.splitlines():
+        name, link = row.split('\t')
+        paths.setdefault(name, set()).add(link)
+    root = Path('/')
+    library_roots = ('/usr/lib/', '/usr/lib64/')
     abi = {}
-    for name in sorted(set(paths)):
-        path = Path(name)
-        if '.so' not in path.name or not name.startswith(('/usr/lib/', '/usr/lib64/')):
+    for name, declared_links in sorted(paths.items()):
+        path = root / name.removeprefix('/')
+        if '.so' not in path.name or not name.startswith(library_roots):
             continue
-        require(path.exists(), 'installed runtime ABI file is missing')
         target = path.resolve()
-        require(str(target).startswith(('/usr/lib/', '/usr/lib64/')), 'foreign runtime ABI target')
-        if target.is_file():
+        require(target.is_relative_to(root), 'foreign runtime ABI target')
+        target_name = '/' + target.relative_to(root).as_posix()
+        if not target_name.startswith(library_roots):
+            # GCC's packaged binutils plugin lives under libexec.
+            require(name == '/usr/lib64/bfd-plugins/liblto_plugin.so'
+                    and re.fullmatch(r'/usr/libexec/gcc/(?:x86_64|aarch64)-redhat-linux/[0-9]+/liblto_plugin\.so', target_name)
+                    and path.is_symlink() and declared_links == {os.readlink(path)}
+                    and target_name in paths and target.is_file(), 'foreign runtime ABI target')
+        if not path.exists():
+            # These GCC links are shipped on x86_64 even without the optional i686 RPMs.
+            optional_multilib = re.fullmatch(
+                r'/usr/lib/gcc/x86_64-redhat-linux/[0-9]+/32/(?:libgomp|libstdc\+\+)\.so', name)
+            require(optional_multilib and path.is_symlink() and declared_links == {os.readlink(path)}
+                    and target_name not in paths
+                    and re.fullmatch(r'/usr/lib/' + re.escape(path.name) + r'(?:\.[0-9]+)+', target_name),
+                    f'installed runtime ABI file is missing: {name}')
+            abi[name] = {'absent_optional_target': target_name}
+        elif target.is_file():
             abi[name] = SQLITE['digest'](target)
     require(abi, 'runtime ABI inventory is empty')
     result = dict(schema_version=1, packages=rows,
