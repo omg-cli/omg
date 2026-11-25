@@ -335,33 +335,25 @@ detect_os() {
 
 detect_distro() {
   local os_release_file="${1:-/etc/os-release}"
-  local distro="unknown"
-  local id_like=""
   local ID=""
   local ID_LIKE=""
 
+  if [[ "$#" == 0 && ! -e "$os_release_file" ]]; then
+    os_release_file=/usr/lib/os-release
+  fi
   if [[ -f "$os_release_file" ]]; then
     # shellcheck disable=SC1090
     . "$os_release_file"
-    distro="${ID:-unknown}"
-    id_like=" ${ID_LIKE:-} "
-
-    case "$distro" in
-    ubuntu | debian | arch | fedora) ;;
-    rhel | centos) distro="fedora" ;;
-    *)
-      case "$id_like" in
-      *" arch "*) distro="arch" ;;
-      *" ubuntu "*) distro="ubuntu" ;;
-      *" debian "*) distro="debian" ;;
-      *" fedora "* | *" rhel "* | *" centos "*) distro="fedora" ;;
-      *) distro="unknown" ;;
-      esac
-      ;;
-    esac
   fi
 
-  echo "$distro"
+  case " ${ID:-} ${ID_LIKE:-} " in
+    *" arch "*) printf '%s\n' arch ;;
+    *" fedora "* | *" rhel "* | *" centos "* | *" rocky "* | *" almalinux "*)
+      printf '%s\n' fedora ;;
+    *" ubuntu "*) printf '%s\n' ubuntu ;;
+    *" debian "*) printf '%s\n' debian ;;
+    *) printf '%s\n' unknown ;;
+  esac
 }
 
 detect_arch() {
@@ -917,6 +909,29 @@ check_dependencies() {
   fi
 }
 
+# Share backend selection between source installation and Make's Cargo targets.
+native_cargo() {
+  local verb="${1:-}" features
+  case "$verb" in
+    build | check | clippy | test) shift ;;
+    *) warn "Unknown native Cargo action: $verb"; return 1 ;;
+  esac
+
+  case "$(detect_os)" in
+    linux)
+      case "$(detect_distro)" in
+        arch) features=arch,license,pgp ;;
+        debian | ubuntu) features=debian,license,pgp ;;
+        *) features=fedora,license,pgp ;;
+      esac
+      ;;
+    darwin) features=macos,license,pgp ;;
+    *) warn "Native Cargo targets require Linux or macOS"; return 1 ;;
+  esac
+
+  cargo "$verb" --locked --no-default-features --features "$features" "$@"
+}
+
 # 🏗️ Build & Install
 build_omg() {
   header "Building OMG"
@@ -927,43 +942,16 @@ build_omg() {
 
   local work_dir="$SCRIPT_DIR"
   info "Installing from source directory"
-  cd "$work_dir"
-
-  # Select features based on platform. WSL reports Linux and uses its distro backend.
-  local cargo_features=""
-  local detected_os
-  detected_os=$(detect_os)
-  local detected_distro
-  detected_distro=$(detect_distro)
-
-  case "$detected_os" in
-  linux)
-    case "$detected_distro" in
-    arch) cargo_features="--features arch,license,pgp" ;;
-    debian | ubuntu) cargo_features="--no-default-features --features debian,license,pgp" ;;
-    fedora) cargo_features="--no-default-features --features fedora,license,pgp" ;;
-    *) cargo_features="--no-default-features --features fedora,license,pgp" ;;
-    esac
-    ;;
-  darwin)
-    cargo_features="--no-default-features --features macos,license,pgp"
-    ;;
-  *)
-    # Runtimes only — no system package manager
-    cargo_features="--no-default-features --features license"
-    ;;
-  esac
+  cd "$work_dir" || return 1
 
   local host_target target_dir
   host_target=$(rustc --print host-tuple) || return 1
   target_dir="${CARGO_TARGET_DIR:-target}"
-  info "Build features: ${cargo_features}"
   if [[ "$SOURCE_BINARIES_ONLY" == false && -z "${RUSTFLAGS+x}" && -z "${CARGO_ENCODED_RUSTFLAGS+x}" ]]; then
     export RUSTFLAGS="-C target-cpu=native"
   fi
   info "Compiling binary (release)"
-  # shellcheck disable=SC2086
-  if ! cargo build --locked --release --target "$host_target" --target-dir "$target_dir" ${cargo_features}; then
+  if ! native_cargo build --release --target "$host_target" --target-dir "$target_dir"; then
     warn "Build failed"
     return 1
   fi
@@ -1248,6 +1236,18 @@ finish() {
   printf "  3. Try ${CYAN}omg search firefox${RESET} to test\n"
   printf "\n"
 }
+
+# Internal entry used by Make. It only runs from the installer checkout.
+if [[ "${1:-}" == "--native-cargo" ]]; then
+  if [[ -z "$SCRIPT_DIR" || ! -f "$SCRIPT_DIR/Cargo.toml" ]] ||
+     ! grep -q 'name = "omg"' "$SCRIPT_DIR/Cargo.toml"; then
+    error "Native Cargo requires an OMG source checkout"
+  fi
+  cd "$SCRIPT_DIR" || exit 1
+  shift
+  native_cargo "$@"
+  exit $?
+fi
 
 # Run
 if [[ "${1:-}" == "--uninstall" || "${OMG_UNINSTALL:-0}" == "1" ]]; then

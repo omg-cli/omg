@@ -295,7 +295,10 @@ with tempfile.TemporaryDirectory(prefix="omg-fedora-cache-scope-", dir="/tmp") a
     (empty / "etc/dnf/dnf.conf").write_text(empty_config)
     (empty / "etc/dnf/omg-fixture-repos").mkdir()
     (empty / "etc/dnf/omg-fixture-repos/fixture.repo").write_text(repo_config)
-    checked([rpm, "--root", empty, "--initdb"])
+    # Build the empty database through the same native transaction path as the
+    # populated root. The hosted guest disallows the standalone initdb lock.
+    checked([rpm, "--root", empty, "-U", "--nosignature", fixture/"observer-fixture.rpm"])
+    checked([rpm, "--root", empty, "-e", package])
     config.write_text(empty_config)
     inspect_doctor("doctor-empty-installroot", empty, 0)
     (empty / "etc/dnf/omg-fixture-repos/fixture.repo").unlink()

@@ -32,6 +32,8 @@ Select the backend for your host. Cargo features are additive, so use
 | Fedora | `cargo build --locked --no-default-features --features fedora,pgp,license` |
 | Apple silicon macOS | `cargo build --locked --no-default-features --features macos,pgp,license` |
 
+The Make build, release, check, test, and Clippy targets select the local platform's backend.
+
 The release workflow uses these same backend feature sets. Debian 13 and Ubuntu
 26.04 need the APT 7 release archive; Debian 12 and Ubuntu 24.04 use APT 6.
 `debian-pure` is for indexing and fixtures, not live package mutations.

@@ -61,13 +61,15 @@ all: build
 # Building
 # ═══════════════════════════════════════════════════════════════════════════════
 
+NATIVE_CARGO = bash ./install.sh --native-cargo
+
 # Development build
 build:
-	cargo build --features arch
+	$(NATIVE_CARGO) build
 
 # Release build with optimizations
 release:
-	cargo build --release --features arch
+	$(NATIVE_CARGO) build --release
 
 # Install to ~/.local/bin
 install:
@@ -79,11 +81,11 @@ install:
 
 # Run all tests
 test:
-	cargo test --features arch
+	$(NATIVE_CARGO) test
 
 # Run library tests only (fast)
 test-lib:
-	cargo test --lib --features arch
+	$(NATIVE_CARGO) test --lib
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Advanced Testing
@@ -92,7 +94,7 @@ test-lib:
 # Run property-based tests
 test-property:
 	@echo "Running property-based tests..."
-	cargo test --test property_tests_v2 --features arch
+	$(NATIVE_CARGO) test --test property_tests_v2
 	@echo "✓ Property tests passed!"
 
 # Run fuzzing tests (5 minutes per target)
@@ -127,7 +129,7 @@ test-security:
 	@echo "2. IPC message validation fuzzing..."
 	cargo +nightly fuzz run ipc_messages -- -max_total_time=180 -seed=43
 	@echo "3. Security validation tests..."
-	cargo test --test security_audit_tests --features arch
+	$(NATIVE_CARGO) test --test security_audit_tests
 	artifacts=$$(if [ -d fuzz/artifacts ]; then find fuzz/artifacts -type f -print; fi) || exit 1; if [ -n "$$artifacts" ]; then echo "⚠️  Security issues found! Check fuzz/artifacts/"; exit 1; else echo "✓ Security tests passed!"; fi
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -136,7 +138,7 @@ test-security:
 
 # Check without building (fast)
 check:
-	cargo check --features arch
+	$(NATIVE_CARGO) check
 
 # Format code
 fmt:
@@ -148,11 +150,11 @@ fmt-check:
 
 # Run clippy with warnings as errors
 clippy:
-	cargo clippy --features arch -- -D warnings
+	$(NATIVE_CARGO) clippy -- -D warnings
 
 # Run clippy with all targets (pedantic+nursery configured in Cargo.toml [lints])
 clippy-strict:
-	cargo clippy --features arch --all-targets -- -D warnings
+	$(NATIVE_CARGO) clippy --all-targets -- -D warnings
 
 # Security audit dependencies
 audit:
