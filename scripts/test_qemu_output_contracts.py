@@ -2344,6 +2344,9 @@ esac
             release = root / 'os-release'
             output = root / 'doctor.out'
             trace = root / 'doctor.exec.log'
+            database_read = '122 openat(AT_FDCWD, "/usr/lib/sysimage/rpm/rpmdb.sqlite", O_RDONLY|O_NOFOLLOW|O_CLOEXEC) = 7\n'
+            dnf_check = ('123 execve("/usr/bin/dnf5", ["/usr/bin/dnf5", '
+                         '"--cacheonly", "check"], 0x7ffd /* 1 var */) = 0\n')
             (root / 'bin').mkdir()
             pacman = root / 'bin/pacman'
             pacman.write_text('#!/usr/bin/env bash\ncase "$1" in -Dk) exit 0 ;; -Qq) printf "one\\ntwo\\n" ;; *) exit 17 ;; esac\n', encoding='utf-8')
@@ -2363,11 +2366,7 @@ esac
                     if health:
                         healthy += f'  {health}\n'
                     output.write_text(healthy, encoding='utf-8')
-                    trace.write_text(
-                        '122 execve("/usr/bin/rpm", ["/usr/bin/rpm", "-qa"], 0x7ffd) = 0\n'
-                        '123 execve("/usr/bin/dnf5", ["/usr/bin/dnf5", "--cacheonly", '
-                        '"--disable-repo=*", "check"], 0x7ffd /* 1 var */) = 0\n',
-                        encoding='utf-8')
+                    trace.write_text(database_read + dnf_check, encoding='utf-8')
                     command = oracle + '\ncheck_doctor_native_backend "$1" "$2" "$3" "$4"\n'
                     def probe():
                         return subprocess.run(
@@ -2399,25 +2398,25 @@ esac
                                          'APT Doctor must verify the native command')
                         output.write_text(healthy, encoding='utf-8')
                     if distro == 'fedora':
-                        self.assertIn('Fedora doctor RPM execution receipt: 122 execve(', passed.stderr)
+                        self.assertIn('Fedora doctor RPM SQLite read receipt: 122 openat(', passed.stderr)
                         self.assertIn('Fedora doctor DNF execution receipt: 123 execve(', passed.stderr)
                         output.write_text(f'  {identity}\n', encoding='utf-8')
                         self.assertEqual(probe().returncode, 1, 'Fedora identity alone is not native health proof')
                         output.write_text(healthy, encoding='utf-8')
-                        trace.write_text(
-                            '123 execve("/usr/bin/dnf5", ["/usr/bin/dnf5", "--cacheonly", '
-                            '"--disable-repo=*", "check"], 0x7ffd /* 1 var */) = 0\n',
-                            encoding='utf-8')
-                        self.assertEqual(probe().returncode, 1, 'Fedora health text without an RPM query is not proof')
-                        trace.write_text('122 execve("/usr/bin/rpm", ["/usr/bin/rpm", "-qa"], 0x7ffd) = 0\n', encoding='utf-8')
-                        self.assertEqual(probe().returncode, 1, 'Fedora health text without an offline DNF check is not proof')
-                        trace.write_text('123 execve("/usr/bin/dnf5", ["/usr/bin/dnf5", "check"], 0x7ffd) = 0\n', encoding='utf-8')
-                        self.assertEqual(probe().returncode, 1, 'Fedora health text without an offline DNF exec is not proof')
-                        trace.write_text(
-                            '122 execve("/usr/bin/rpm", ["/usr/bin/rpm", "-qa"], 0x7ffd) = 0\n'
-                            '123 execve("/usr/bin/dnf5", ["/usr/bin/dnf5", "--cacheonly", '
-                            '"--disable-repo=*", "check"], 0x7ffd /* 1 var */) = 0\n',
-                            encoding='utf-8')
+                        bad_traces = {
+                            'missing SQLite read': dnf_check,
+                            'failed SQLite read': database_read.replace('= 7', '= -1 EACCES') + dnf_check,
+                            'DNF read instead of OMG read': dnf_check + database_read.replace('122 ', '123 '),
+                            'unrelated SQLite read': database_read.replace('rpmdb.sqlite', 'other.sqlite') + dnf_check,
+                            'missing DNF check': database_read,
+                            'DNF without offline flag': database_read + dnf_check.replace('"--cacheonly", ', ''),
+                            'obsolete repository glob': database_read + dnf_check.replace('"check"', '"--disable-repo=*", "check"'),
+                        }
+                        for label, bad_trace in bad_traces.items():
+                            with self.subTest(trace=label):
+                                trace.write_text(bad_trace, encoding='utf-8')
+                                self.assertEqual(probe().returncode, 1)
+                        trace.write_text(database_read + dnf_check, encoding='utf-8')
                     output.write_text('  Arch Linux detected\n' if distro != 'arch'
                                       else '  Fedora/RHEL detected (dnf backend)\n', encoding='utf-8')
                     self.assertEqual(probe().returncode, 1)

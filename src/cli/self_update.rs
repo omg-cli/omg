@@ -122,6 +122,7 @@ pub async fn run(force: bool, version: Option<String>) -> Result<()> {
     }
 
     let artifact = release_artifact(&target_version)?;
+    let installed = InstalledPair::running()?;
 
     println!(
         "  {} Downloading {}...",
@@ -153,12 +154,11 @@ pub async fn run(force: bool, version: Option<String>) -> Result<()> {
         let temp_dir = tempfile::tempdir().context("Failed to create temp directory for update")?;
         let (new_binary, new_daemon) = extract_update_pair(&bytes, temp_dir.path(), &archive_name)?;
 
-        let current_exe = env::current_exe().context("Failed to find current executable path")?;
         tokio::runtime::Handle::current()
             .block_on(install_checked_update_pair(
                 &new_binary,
                 &new_daemon,
-                &current_exe,
+                &installed,
                 &probe_version,
                 std::time::Duration::from_secs(10),
             ))
@@ -243,24 +243,116 @@ fn install_binary_atomically(
     persist_update_binary(stage_update_binary(new_binary, destination)?, destination)
 }
 
+struct InstalledPair {
+    cli: std::path::PathBuf,
+    cli_revision: fs::Metadata,
+    daemon_revision: Option<fs::Metadata>,
+}
+
+impl InstalledPair {
+    fn running() -> Result<Self> {
+        let path = env::current_exe().context("Failed to find current executable path")?;
+        let installed = Self::capture(&path)?;
+        #[cfg(target_os = "linux")]
+        {
+            let running = fs::metadata("/proc/self/exe")
+                .context("Cannot identify the running OMG executable")?;
+            anyhow::ensure!(
+                install_revision_matches(&running, &installed.cli_revision),
+                "The running OMG executable was replaced. Retry from the installed binary."
+            );
+        }
+        Ok(installed)
+    }
+
+    fn capture(cli: &std::path::Path) -> Result<Self> {
+        let cli_revision =
+            read_install_revision(cli)?.context("Installed OMG executable is missing")?;
+        let daemon_revision = read_install_revision(&cli.with_file_name("omgd"))?;
+        Ok(Self {
+            cli: cli.to_owned(),
+            cli_revision,
+            daemon_revision,
+        })
+    }
+
+    fn verify_current(&self) -> Result<()> {
+        const CHANGED: &str = "Installed OMG pair changed while preparing the update. Retry from the installed binary.";
+        let observed = Self::capture(&self.cli).context(CHANGED)?;
+        let same_daemon = match (&self.daemon_revision, &observed.daemon_revision) {
+            (Some(expected), Some(actual)) => install_revision_matches(expected, actual),
+            (None, None) => true,
+            _ => false,
+        };
+        anyhow::ensure!(
+            install_revision_matches(&self.cli_revision, &observed.cli_revision) && same_daemon,
+            CHANGED
+        );
+        Ok(())
+    }
+}
+
+fn read_install_revision(path: &std::path::Path) -> Result<Option<fs::Metadata>> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            anyhow::ensure!(
+                metadata.is_file(),
+                "Refusing non-regular update destination {}",
+                path.display()
+            );
+            Ok(Some(metadata))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("Cannot inspect {}", path.display())),
+    }
+}
+
+#[cfg(unix)]
+fn install_revision_matches(expected: &fs::Metadata, actual: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    (
+        expected.dev(),
+        expected.ino(),
+        expected.len(),
+        expected.mode(),
+    ) == (actual.dev(), actual.ino(), actual.len(), actual.mode())
+        && (
+            expected.mtime(),
+            expected.mtime_nsec(),
+            expected.ctime(),
+            expected.ctime_nsec(),
+        ) == (
+            actual.mtime(),
+            actual.mtime_nsec(),
+            actual.ctime(),
+            actual.ctime_nsec(),
+        )
+}
+
+#[cfg(not(unix))]
+fn install_revision_matches(expected: &fs::Metadata, actual: &fs::Metadata) -> bool {
+    expected.len() == actual.len() && expected.modified().ok() == actual.modified().ok()
+}
+
 fn install_update_pair(
     cli: &std::path::Path,
     daemon: &std::path::Path,
-    destination: &std::path::Path,
+    installed: &InstalledPair,
 ) -> Result<()> {
-    install_update_pair_with(cli, daemon, destination, persist_update_binary)
+    install_update_pair_with(cli, daemon, installed, persist_update_binary)
 }
 
 async fn install_checked_update_pair(
     cli: &std::path::Path,
     daemon: &std::path::Path,
-    destination: &std::path::Path,
+    installed: &InstalledPair,
     version: &Version,
     probe_timeout: std::time::Duration,
 ) -> Result<()> {
     probe_update_binary(cli, "omg", version, probe_timeout).await?;
     probe_update_binary(daemon, "omgd", version, probe_timeout).await?;
-    install_update_pair(cli, daemon, destination)
+    install_update_pair(cli, daemon, installed)
 }
 
 async fn probe_update_binary(
@@ -531,9 +623,10 @@ fn extract_update_pair(
 fn install_update_pair_with(
     cli: &std::path::Path,
     daemon: &std::path::Path,
-    destination: &std::path::Path,
+    installed: &InstalledPair,
     mut replace: impl FnMut(tempfile::NamedTempFile, &std::path::Path) -> Result<()>,
 ) -> Result<()> {
+    let destination = installed.cli.as_path();
     let parent = destination.parent().context("Executable has no parent")?;
     let mut options = fs::OpenOptions::new();
     options.read(true).write(true).create(true).truncate(false);
@@ -554,6 +647,7 @@ fn install_update_pair_with(
     }
     lock.try_lock()
         .context("Another self-update is in progress; retry when it finishes")?;
+    installed.verify_current()?;
     // Keep the lock file: unlinking it would let another updater lock a new inode.
     let destinations = [
         destination.with_file_name("omgd"),
@@ -1339,7 +1433,7 @@ mod tests {
             let error = install_checked_update_pair(
                 &cli,
                 &daemon,
-                &installed.join("omg"),
+                &InstalledPair::capture(&installed.join("omg")).expect("original installation"),
                 &Version::new(1, 2, 3),
                 std::time::Duration::from_secs(2),
             )
@@ -1374,7 +1468,7 @@ mod tests {
             tokio::runtime::Handle::current().block_on(install_checked_update_pair(
                 &candidate_cli,
                 &candidate_daemon,
-                &destination,
+                &InstalledPair::capture(&destination).expect("original installation"),
                 &Version::new(1, 2, 3),
                 std::time::Duration::from_secs(2),
             ))
@@ -1445,7 +1539,7 @@ mod tests {
                 tokio::runtime::Handle::current().block_on(install_checked_update_pair(
                     &candidate_cli,
                     &candidate_daemon,
-                    &destination,
+                    &InstalledPair::capture(&destination).expect("original installation"),
                     &Version::new(1, 2, 3),
                     std::time::Duration::from_secs(2),
                 ))
@@ -1515,7 +1609,7 @@ mod tests {
             let error = install_checked_update_pair(
                 &cli,
                 &daemon,
-                &installed,
+                &InstalledPair::capture(&installed).expect("original installation"),
                 &Version::new(1, 2, 3),
                 std::time::Duration::from_secs(2),
             )
@@ -1549,7 +1643,7 @@ mod tests {
         let error = install_checked_update_pair(
             &cli,
             &daemon,
-            &installed,
+            &InstalledPair::capture(&installed).expect("original installation"),
             &Version::new(1, 2, 3),
             std::time::Duration::from_secs(1),
         )
@@ -1601,7 +1695,7 @@ mod tests {
         let error = install_checked_update_pair(
             &cli,
             &daemon,
-            &installed,
+            &InstalledPair::capture(&installed).expect("original installation"),
             &Version::new(1, 2, 3),
             std::time::Duration::from_secs(2),
         )
@@ -2136,7 +2230,9 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         for old_daemon in [true, false] {
             let (_tmp, cli, daemon, destination) = pair_fixture(old_daemon);
-            install_update_pair(&cli, &daemon, &destination).expect("update pair");
+            InstalledPair::capture(&destination)
+                .and_then(|installed| install_update_pair(&cli, &daemon, &installed))
+                .expect("update pair");
             assert_eq!(fs::read(&destination).expect("installed cli"), b"new cli");
             let daemon = destination.with_file_name("omgd");
             assert_eq!(fs::read(&daemon).expect("installed daemon"), b"new daemon");
@@ -2154,7 +2250,11 @@ mod tests {
     fn update_pair_staging_failure_preserves_both_installed_files() {
         let (_tmp, cli, daemon, destination) = pair_fixture(true);
         fs::remove_file(&cli).expect("missing CLI payload");
-        assert!(install_update_pair(&cli, &daemon, &destination).is_err());
+        assert!(
+            InstalledPair::capture(&destination)
+                .and_then(|installed| install_update_pair(&cli, &daemon, &installed))
+                .is_err()
+        );
         assert_eq!(fs::read(&destination).expect("cli"), b"old cli");
         assert_eq!(
             fs::read(destination.with_file_name("omgd")).expect("daemon"),
@@ -2186,8 +2286,11 @@ mod tests {
                         Some((metadata.dev(), metadata.ino(), metadata.mode()))
                     });
                     let mut count = 0;
-                    let result =
-                        install_update_pair_with(&cli, &daemon, &destination, |staged, path| {
+                    let result = install_update_pair_with(
+                        &cli,
+                        &daemon,
+                        &InstalledPair::capture(&destination).expect("original installation"),
+                        |staged, path| {
                             count += 1;
                             if count == fail_at {
                                 if fail_after_rename {
@@ -2196,7 +2299,8 @@ mod tests {
                                 anyhow::bail!("injected replacement/sync failure");
                             }
                             persist_update_binary(staged, path)
-                        });
+                        },
+                    );
                     assert!(
                         format!("{:#}", result.expect_err("must fail"))
                             .contains("previous OMG binaries restored")
@@ -2245,14 +2349,19 @@ mod tests {
         let (_tmp, cli, daemon, destination) = pair_fixture(true);
         let old_cli = fs::metadata(&destination).expect("old cli metadata");
         let parent = destination.parent().expect("bin directory");
-        let error = install_update_pair_with(&cli, &daemon, &destination, |staged, path| {
-            if path == destination {
-                fs::remove_file(path)?;
-                fs::create_dir(path)?;
-                anyhow::bail!("injected replacement failure with an obstructed destination");
-            }
-            persist_update_binary(staged, path)
-        })
+        let error = install_update_pair_with(
+            &cli,
+            &daemon,
+            &InstalledPair::capture(&destination).expect("original installation"),
+            |staged, path| {
+                if path == destination {
+                    fs::remove_file(path)?;
+                    fs::create_dir(path)?;
+                    anyhow::bail!("injected replacement failure with an obstructed destination");
+                }
+                persist_update_binary(staged, path)
+            },
+        )
         .expect_err("rollback must report blocked restoration");
         let message = format!("{error:#}");
         assert!(message.contains("rollback needs attention"), "{message}");
@@ -2287,7 +2396,9 @@ mod tests {
         assert!(
             format!(
                 "{:#}",
-                install_update_pair(&cli, &daemon, &destination).expect_err("locked")
+                InstalledPair::capture(&destination)
+                    .and_then(|installed| install_update_pair(&cli, &daemon, &installed))
+                    .expect_err("locked")
             )
             .contains("Another self-update")
         );
@@ -2296,9 +2407,102 @@ mod tests {
         fs::write(&target, b"untouched").expect("target");
         fs::remove_file(destination.with_file_name("omgd")).expect("remove daemon");
         std::os::unix::fs::symlink(&target, destination.with_file_name("omgd")).expect("symlink");
-        assert!(install_update_pair(&cli, &daemon, &destination).is_err());
+        assert!(
+            InstalledPair::capture(&destination)
+                .and_then(|installed| install_update_pair(&cli, &daemon, &installed))
+                .is_err()
+        );
         assert_eq!(fs::read(&target).expect("target"), b"untouched");
         assert_eq!(fs::read(&destination).expect("cli"), b"old cli");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn update_refuses_if_installed_pair_changes_during_probe() {
+        use std::time::Duration;
+
+        for old_daemon in [true, false] {
+            for change in ["replace-cli", "edit-cli", "change-daemon", "remove-daemon"] {
+                if change == "remove-daemon" && !old_daemon {
+                    continue;
+                }
+                let (tmp, cli, daemon, destination) = pair_fixture(old_daemon);
+                let started = tmp.path().join("probe-started");
+                let proceed = tmp.path().join("probe-proceed");
+                write_version_probe(
+                    &cli,
+                    &format!(
+                        "touch '{}'; while [ ! -e '{}' ]; do sleep 0.01; done; echo 'omg 1.2.3'",
+                        started.display(),
+                        proceed.display()
+                    ),
+                );
+                write_version_probe(&daemon, "echo 'omgd 1.2.3'");
+                let current_destination = destination.clone();
+                let update = tokio::spawn(async move {
+                    install_checked_update_pair(
+                        &cli,
+                        &daemon,
+                        &InstalledPair::capture(&current_destination)
+                            .expect("original installation"),
+                        &Version::new(1, 2, 3),
+                        Duration::from_secs(3),
+                    )
+                    .await
+                });
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while !started.is_file() {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .expect("the real candidate probe began");
+                let daemon_path = destination.with_file_name("omgd");
+                match change {
+                    "replace-cli" => {
+                        let replacement = tmp.path().join("later-cli");
+                        fs::write(&replacement, b"installed by a later update").unwrap();
+                        fs::rename(replacement, &destination).unwrap();
+                    }
+                    "edit-cli" => {
+                        let modified = fs::metadata(&destination).unwrap().modified().unwrap();
+                        fs::write(&destination, b"edited!").unwrap();
+                        fs::File::open(&destination)
+                            .unwrap()
+                            .set_times(fs::FileTimes::new().set_modified(modified))
+                            .unwrap();
+                    }
+                    "change-daemon" => {
+                        let replacement = tmp.path().join("later-daemon");
+                        fs::write(&replacement, b"a newer daemon").unwrap();
+                        fs::rename(replacement, &daemon_path).unwrap();
+                    }
+                    "remove-daemon" => fs::remove_file(&daemon_path).unwrap(),
+                    _ => unreachable!(),
+                }
+                let cli_bytes = fs::read(&destination).unwrap();
+                let daemon_bytes = fs::read(&daemon_path).ok();
+                fs::write(proceed, b"ready").expect("finish the candidate probe");
+
+                let error = update.await.unwrap().expect_err(change);
+                assert!(
+                    format!("{error:#}")
+                        .contains("Installed OMG pair changed while preparing the update"),
+                    "{change}: {error:#}"
+                );
+                assert_eq!(fs::read(&destination).unwrap(), cli_bytes);
+                assert_eq!(fs::read(&daemon_path).ok(), daemon_bytes);
+                assert!(
+                    fs::read_dir(destination.parent().unwrap())
+                        .unwrap()
+                        .all(|entry| !entry
+                            .unwrap()
+                            .file_name()
+                            .to_string_lossy()
+                            .starts_with(".omg-self-update-backup-"))
+                );
+            }
+        }
     }
 
     #[test]

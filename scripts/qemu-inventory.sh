@@ -445,17 +445,23 @@ check_doctor_native_backend() {
           printf 'native doctor DNF execution receipt is missing\n' >&2
           return 2
         fi
-        local dnf_exec_line
-        if ! dnf_exec_line=$(grep -Em 1 'execve\("(/usr/bin|/usr/sbin)/dnf5", \["[^"]+", "--cacheonly", "--disable-repo=\*", "check"\], .*\) = 0$' "$exec_receipt"); then
+        local dnf_exec_line rpm_read_line
+        if ! dnf_exec_line=$(grep -Em 1 'execve\("(/usr/bin|/usr/sbin)/dnf5", \["[^"]+", "--cacheonly", "check"\], .*\) = 0$' "$exec_receipt"); then
           printf 'assertion failed: doctor did not execute the trusted offline DNF5 package database check\n' >&2
           return 1
         fi
-        local rpm_exec_line
-        if ! rpm_exec_line=$(grep -Em 1 'execve\("(/usr/bin|/usr/sbin)/rpm", \["[^"]+", "-qa"\], .*\) = 0$' "$exec_receipt"); then
-          printf 'assertion failed: doctor did not execute the trusted RPM installed package query\n' >&2
+        # DNF also opens the database. Count only a read before DNF starts.
+        if ! rpm_read_line=$(awk -v stop="$dnf_exec_line" '
+          $0 == stop { exit }
+          /openat\(AT_FDCWD, "\/(var\/lib|usr\/lib\/sysimage)\/rpm\/rpmdb\.sqlite", O_RDONLY[^)]*\) = [0-9]+$/ {
+            print; found=1; exit
+          }
+          END { if (!found) exit 1 }
+        ' "$exec_receipt"); then
+          printf 'assertion failed: doctor did not read the installed RPM SQLite database before running DNF5\n' >&2
           return 1
         fi
-        printf 'Fedora doctor RPM execution receipt: %s\n' "$rpm_exec_line" >&2
+        printf 'Fedora doctor RPM SQLite read receipt: %s\n' "$rpm_read_line" >&2
         printf 'Fedora doctor DNF execution receipt: %s\n' "$dnf_exec_line" >&2
       fi ;;
   esac
@@ -3272,8 +3278,8 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
     remote+="; if ! python3 qemu-doctor-turbo-oracle.py prepare --source $quoted_binary --root \"\$rowdir\"; then printf '\nOMG_QEMU_RECEIPT:dependency:2:1\n'; exit 0; fi"
     remote+="; run_omg '$command_timeout' \"\$rowdir/doctor-turbo-private/omg\" $arg_string </dev/null > command.stdout.log 2> command.stderr.log; assertion=0"
   elif [[ "$distro" == fedora && "$case" == doctor ]]; then
-    remote+="; if ! command -v strace >/dev/null || ! strace --seccomp-bpf -f -qq -e trace=execve -o doctor.preflight.log true; then printf '\nOMG_QEMU_RECEIPT:dependency:2:1\n'; exit 0; fi"
-    remote+="; run_omg '$command_timeout' strace --seccomp-bpf -f -qq -e trace=execve -o doctor.exec.log $quoted_binary $arg_string > command.stdout.log 2> command.stderr.log; assertion=0"
+    remote+="; if ! command -v strace >/dev/null || ! strace --seccomp-bpf -f -qq -e trace=execve,openat -o doctor.preflight.log true; then printf '\nOMG_QEMU_RECEIPT:dependency:2:1\n'; exit 0; fi"
+    remote+="; run_omg '$command_timeout' strace --seccomp-bpf -f -qq -e trace=execve,openat -o doctor.exec.log $quoted_binary $arg_string > command.stdout.log 2> command.stderr.log; assertion=0"
   else
     remote+="; run_native_omg '$command_timeout' $quoted_binary $arg_string </dev/null > command.stdout.log 2> command.stderr.log; assertion=0"
   fi
@@ -3380,7 +3386,7 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
       remote+="; if [ \"\$assertion\" = 0 ] && env PATH=\"\$doctor_path\" /bin/bash -c 'command -v makepkg >/dev/null'; then printf 'assertion failed: controlled doctor PATH still exposes makepkg\\n' >&2; execution_phase=dependency; rc=2; assertion=1; fi"
     fi
     if [[ "$distro" == fedora ]]; then
-      remote+="; if [ \"\$assertion\" = 0 ]; then run_omg '$command_timeout' strace --seccomp-bpf -f -qq -e trace=execve -o doctor.minimal.exec.log env PATH=\"\$doctor_path\" $quoted_binary doctor > doctor.minimal.stdout.log 2> doctor.minimal.stderr.log; fi"
+      remote+="; if [ \"\$assertion\" = 0 ]; then run_omg '$command_timeout' strace --seccomp-bpf -f -qq -e trace=execve,openat -o doctor.minimal.exec.log env PATH=\"\$doctor_path\" $quoted_binary doctor > doctor.minimal.stdout.log 2> doctor.minimal.stderr.log; fi"
     else
       remote+="; if [ \"\$assertion\" = 0 ]; then run_omg '$command_timeout' env PATH=\"\$doctor_path\" $quoted_binary doctor > doctor.minimal.stdout.log 2> doctor.minimal.stderr.log; fi"
     fi
