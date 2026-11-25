@@ -24,9 +24,11 @@ The batch passed 633 native Arch WSL unit and fixture tests plus 105 unprivilege
 
 ```sh
 cargo clippy --locked --no-default-features --features arch,pgp,license \
-  --lib --test e2e_runtime_management --test install_update_comprehensive --test docker_e2e -- -D warnings
+  --all-targets -- -D warnings
 ```
 
 ## Working branch
 
 The Rust CLI and package manager batch is in PR #1098. The Windows checkout holds separate advisory service edits. Local logs and timing samples are under `.git/nov24-cli-audit/`, including `pr1098-native-info-receipt.json` and `pr1098-native-https.log`. [PR #1098](https://github.com/omg-cli/omg/pull/1098)
+
+Additional AUR build, search-ranking, cache cleanup, and Arch inventory optimizations are preserved on `codex/arch-runtime-performance`. Restoring explicit elevation passed all six tests in `coverage_19`, including the caller's failed-transaction history contract. The benchmark uses the restored public ALPM count helper. [Performance branch](https://github.com/omg-cli/omg/tree/codex/arch-runtime-performance)

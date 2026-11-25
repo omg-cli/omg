@@ -205,7 +205,8 @@ mod tests {
         second.architecture = Some("aarch64".into());
         let advisory = serde_json::from_str(
             r#"{"name":"AVG-fixture","packages":["fixture","fixture"],"status":"Vulnerable","severity":"High","affected":"1-1","fixed":"2-1","issues":["CVE-fixture"]}"#,
-        )?;
+        )
+        .expect("complete duplicate-name advisory fixture");
         let source = AdvisoryProvenance::ArchSnapshot {
             payload_sha256: "01".repeat(32),
             fetched_at: jiff::Timestamp::UNIX_EPOCH,

@@ -358,7 +358,6 @@ pub(crate) struct AuthorizedBuild {
 #[derive(Debug)]
 pub(crate) struct BuiltPackages {
     archives: Vec<ArchiveSnapshot>,
-    inspections: Vec<artifact_inspector::ArtifactInspection>,
     profile: AurSecurityProfile,
     requested_outputs: BTreeSet<String>,
 }
@@ -2886,7 +2885,6 @@ impl AurClient {
         }
     }
 
-    #[cfg(test)]
     fn authorize_archives(
         paths: &[PathBuf],
         source: &ReviewedSource,
@@ -2894,17 +2892,6 @@ impl AurClient {
         outputs: &[String],
         fresh: bool,
     ) -> Result<Vec<ArchiveSnapshot>> {
-        Self::authorize_archives_with_inspections(paths, source, base, outputs, fresh)
-            .map(|pairs| pairs.into_iter().map(|(snapshot, _)| snapshot).collect())
-    }
-
-    fn authorize_archives_with_inspections(
-        paths: &[PathBuf],
-        source: &ReviewedSource,
-        base: &str,
-        outputs: &[String],
-        fresh: bool,
-    ) -> Result<Vec<(ArchiveSnapshot, artifact_inspector::ArtifactInspection)>> {
         let srcinfo = source.text(Path::new(".SRCINFO"))?;
         let expected_version =
             srcinfo_version(srcinfo).context("Missing reviewed package version")?;
@@ -2967,7 +2954,7 @@ impl AurClient {
                     ],
                     "succeeded",
                 )?;
-                Ok((snapshot, admission.into_inspection()))
+                Ok(snapshot)
             })
             .collect()
     }
@@ -3068,10 +3055,14 @@ impl AurClient {
                 .all(|output| outputs.contains(output)),
             "Requested AUR outputs must belong to the authorized build output set"
         );
-        let (primary, primary_inspections): (Vec<_>, Vec<_>) =
-            Self::authorize_archives_with_inspections(paths, source, base, outputs, fresh)?
-                .into_iter()
-                .unzip();
+        let primary = Self::authorize_archives(paths, source, base, outputs, fresh)?;
+        let primary_inspections = primary
+            .iter()
+            .map(|archive| {
+                artifact_inspector::inspect_archive(&archive.path())
+                    .map(artifact_inspector::ArchiveAdmission::into_inspection)
+            })
+            .collect::<Result<Vec<_>>>()?;
         let profile = self.settings.aur.security_profile;
         self.settings.aur.validate_security_profile()?;
         for inspection in &primary_inspections {
@@ -3083,7 +3074,6 @@ impl AurClient {
         {
             return Ok(BuiltPackages {
                 archives: primary,
-                inspections: primary_inspections,
                 profile,
                 requested_outputs: requested_outputs.iter().cloned().collect(),
             });
@@ -3106,7 +3096,6 @@ impl AurClient {
             )?;
             return Ok(BuiltPackages {
                 archives: primary,
-                inspections: primary_inspections,
                 profile,
                 requested_outputs: requested_outputs.iter().cloned().collect(),
             });
@@ -3129,16 +3118,14 @@ impl AurClient {
         let secondary_paths = Self::find_built_packages(pkg_dir, &secondary_env.pkgdest, outputs)
             .await
             .map_err(|_| AurError::PackageArchiveNotFound(base.to_owned()))?;
-        let (_secondary, secondary_inspections): (Vec<_>, Vec<_>) =
-            Self::authorize_archives_with_inspections(
-                &secondary_paths,
-                source,
-                base,
-                outputs,
-                fresh,
-            )?
-            .into_iter()
-            .unzip();
+        let secondary = Self::authorize_archives(&secondary_paths, source, base, outputs, fresh)?;
+        let secondary_inspections = secondary
+            .iter()
+            .map(|archive| {
+                artifact_inspector::inspect_archive(&archive.path())
+                    .map(artifact_inspector::ArchiveAdmission::into_inspection)
+            })
+            .collect::<Result<Vec<_>>>()?;
 
         // Reproducible Builds recommends rebuilding independently and comparing
         // the outputs; accepting only identical archive hashes makes the check
@@ -3161,7 +3148,6 @@ impl AurClient {
         )?;
         Ok(BuiltPackages {
             archives: primary,
-            inspections: primary_inspections,
             profile,
             requested_outputs: requested_outputs.iter().cloned().collect(),
         })
@@ -4579,14 +4565,9 @@ impl AurClient {
         let mut items = Vec::new();
         for batch in batches {
             batch.require_profile(profile)?;
-            let cached_inspections = (batch.inspections.len() == batch.archives.len())
-                .then_some(batch.inspections.as_slice());
-            for (idx, snapshot) in batch.archives.iter().enumerate() {
-                let inspection = if let Some(cached) = cached_inspections {
-                    cached[idx].clone()
-                } else {
-                    artifact_inspector::inspect_archive(&snapshot.path())?.into_inspection()
-                };
+            for snapshot in &batch.archives {
+                let inspection =
+                    artifact_inspector::inspect_archive(&snapshot.path())?.into_inspection();
                 snapshot.verify_sha256(&inspection.archive_sha256)?;
                 inspection.enforce_profile(profile)?;
                 items.push(InstallItem {
@@ -4713,45 +4694,55 @@ pub async fn search_detailed(query: &str) -> Result<Vec<AurPackageDetail>> {
     let response: AurDetailedResponse = decode_aur_rpc_response(response).await?;
 
     // SECURITY: Validate all names in response
-    let results = response.results.into_iter().filter(|p| {
-        if let Err(e) = crate::core::security::validate_package_name(&p.name) {
-            tracing::warn!(
-                "Rejecting invalid package name from AUR search_detailed: {} ({})",
-                p.name,
-                e
-            );
-            false
-        } else {
-            true
-        }
-    });
+    let mut results = response
+        .results
+        .into_iter()
+        .filter(|p| {
+            if let Err(e) = crate::core::security::validate_package_name(&p.name) {
+                tracing::warn!(
+                    "Rejecting invalid package name from AUR search_detailed: {} ({})",
+                    p.name,
+                    e
+                );
+                false
+            } else {
+                true
+            }
+        })
+        .collect::<Vec<_>>();
 
     // Rank exact, prefix, and word-boundary matches before popularity.
-    // Precompute ranking keys once in O(N) instead of allocating lowercase strings in O(N log N).
     let query_lower = query.to_ascii_lowercase();
-    let mut ranked: Vec<_> = results
-        .map(|pkg| {
-            let name_lower = pkg.name.to_ascii_lowercase();
-            let tier = if name_lower == query_lower {
-                0_u8
-            } else if name_lower.starts_with(&query_lower) {
-                1_u8
-            } else if has_word_boundary_match(&name_lower, &query_lower) {
-                2_u8
-            } else {
-                3_u8
-            };
-            (tier, pkg)
-        })
-        .collect();
-    ranked.sort_by(|(a_tier, a), (b_tier, b)| {
-        a_tier.cmp(b_tier).then_with(|| {
-            b.popularity
-                .partial_cmp(&a.popularity)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
+    results.sort_by(|a, b| {
+        let a_name_lower = a.name.to_ascii_lowercase();
+        let b_name_lower = b.name.to_ascii_lowercase();
+
+        // Exact match check
+        let a_exact = a_name_lower == query_lower;
+        let b_exact = b_name_lower == query_lower;
+        if a_exact != b_exact {
+            return b_exact.cmp(&a_exact);
+        }
+
+        // Prefix match check
+        let a_prefix = a_name_lower.starts_with(&query_lower);
+        let b_prefix = b_name_lower.starts_with(&query_lower);
+        if a_prefix != b_prefix {
+            return b_prefix.cmp(&a_prefix);
+        }
+
+        // Word boundary match check (uses module-level helper)
+        let a_word = has_word_boundary_match(&a_name_lower, &query_lower);
+        let b_word = has_word_boundary_match(&b_name_lower, &query_lower);
+        if a_word != b_word {
+            return b_word.cmp(&a_word);
+        }
+
+        // Final tiebreaker: popularity (more popular first)
+        b.popularity
+            .partial_cmp(&a.popularity)
+            .unwrap_or(std::cmp::Ordering::Equal)
     });
-    let results: Vec<_> = ranked.into_iter().map(|(_, pkg)| pkg).collect();
 
     Ok(results)
 }
@@ -10932,7 +10923,6 @@ finally:
                 let wave = [
                     BuiltPackages {
                         archives: vec![ArchiveSnapshot::capture(&archive)?],
-                        inspections: Vec::new(),
                         profile: AurSecurityProfile::Hardened,
                         requested_outputs: BTreeSet::from(["demo".to_owned()]),
                     },
@@ -11137,7 +11127,6 @@ finally:
         );
         let standard = BuiltPackages {
             archives: vec![ArchiveSnapshot::capture(&archive)?],
-            inspections: Vec::new(),
             profile: AurSecurityProfile::Standard,
             requested_outputs: BTreeSet::from(["demo".to_owned()]),
         };
@@ -11372,7 +11361,6 @@ finally:
         }
         let mut batch = BuiltPackages {
             archives,
-            inspections: Vec::new(),
             profile: AurSecurityProfile::Hardened,
             requested_outputs: BTreeSet::from(["omg-fixture-app".to_owned()]),
         };
@@ -11441,7 +11429,6 @@ finally:
                 .block_on(AurClient::install_built_packages(
                     &[BuiltPackages {
                         archives: vec![snapshot],
-                        inspections: Vec::new(),
                         profile: AurSecurityProfile::Hardened,
                         requested_outputs: BTreeSet::from(["demo".to_owned()]),
                     }],

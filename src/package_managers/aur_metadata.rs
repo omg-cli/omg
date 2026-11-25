@@ -414,36 +414,7 @@ fn publish_generation(root: &Path, bytes: &[u8], validators: AurMetaCache) -> Re
         validators,
     };
     commit_manifest(root, &manifest).context("Failed to publish AUR metadata generation")?;
-    prune_superseded_generations(root, &manifest.generation);
     Ok(())
-}
-
-fn prune_superseded_generations(root: &Path, active_generation: &str) {
-    let Ok(entries) = std::fs::read_dir(root) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let file_name = entry.file_name();
-        let Some(name) = file_name.to_str() else {
-            continue;
-        };
-        if !name.starts_with("gen-") || name == active_generation {
-            continue;
-        }
-        let path = entry.path();
-        let Ok(meta) = std::fs::symlink_metadata(&path) else {
-            continue;
-        };
-        if meta.file_type().is_dir()
-            && let Err(error) = std::fs::remove_dir_all(&path)
-        {
-            tracing::debug!(
-                path = %path.display(),
-                %error,
-                "Failed to prune superseded AUR metadata generation"
-            );
-        }
-    }
 }
 
 #[cfg(test)]

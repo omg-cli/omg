@@ -95,6 +95,26 @@ where
     })
 }
 
+/// Get a mutable cached ALPM handle.
+pub fn with_handle_mut<F, R>(f: F) -> Result<R>
+where
+    F: FnOnce(&mut Alpm) -> Result<R>,
+{
+    ALPM_HANDLE.with(|cell| {
+        let current_epoch = CACHE_EPOCH.load(Ordering::Acquire);
+        let mut maybe_handle = cell
+            .try_borrow_mut()
+            .context("Nested ALPM handle access is not supported")?;
+        refresh_cached_handle(&mut maybe_handle, current_epoch)?;
+
+        let handle = &mut maybe_handle
+            .as_mut()
+            .context("ALPM handle initialization failed")?
+            .handle;
+        f(handle)
+    })
+}
+
 /// Invalidate ALPM handles across all threads.
 ///
 /// Increments the global cache epoch, causing all threads to create fresh
@@ -306,14 +326,11 @@ pub fn list_installed_with_licenses() -> Result<Vec<(String, String, String)>> {
             let license_str = if licenses.is_empty() {
                 "Unknown".to_string()
             } else {
-                let mut joined = String::new();
-                for (idx, license) in licenses.iter().enumerate() {
-                    if idx > 0 {
-                        joined.push_str(", ");
-                    }
-                    joined.push_str(license);
-                }
-                joined
+                licenses
+                    .iter()
+                    .map(std::string::ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
             };
             (
                 pkg.name().to_string(),
@@ -360,6 +377,20 @@ pub fn get_counts() -> Result<(usize, usize, usize)> {
         });
 
         Ok((total, explicit, orphans))
+    })
+}
+
+/// Get explicit count only - INSTANT (<500µs, optimized for count-only queries)
+/// This is faster than `list_explicit_fast` when you only need the count
+#[inline]
+pub fn get_explicit_count_fast() -> Result<usize> {
+    with_handle(|handle| {
+        Ok(handle
+            .localdb()
+            .pkgs()
+            .iter()
+            .filter(|p| p.reason() == PackageReason::Explicit)
+            .count())
     })
 }
 
