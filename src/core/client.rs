@@ -292,19 +292,19 @@ impl DaemonClient {
     }
 }
 
-/// Rebuild a running daemon's ALPM snapshot after this process wrote catalogs.
+/// Reload the daemon's package catalog after writing repository metadata.
 ///
-/// Mutations stay in the privileged omg child. This only asks omgd to drop a
-/// frozen libalpm handle. A missing daemon is normal for users who disabled it.
+/// The daemon refreshes its backend and package index when present. CLI
+/// callers also support running without a daemon.
 pub async fn refresh_daemon_after_catalog_write() -> Result<()> {
     match DaemonClient::connect().await {
         Ok(mut client) => {
             client.refresh_index().await.context(
-                "ALPM databases changed, but the daemon could not reload them from disk",
+                "Package databases changed, but the daemon could not reload them from disk",
             )?;
         }
         Err(error) => {
-            tracing::debug!("Daemon unavailable after ALPM catalog write: {error}");
+            tracing::debug!("Daemon unavailable after package catalog write: {error}");
         }
     }
     Ok(())

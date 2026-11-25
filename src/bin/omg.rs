@@ -1102,7 +1102,9 @@ fn command_requires_root(command: &Commands) -> bool {
             omg_lib::core::env::distro::Distro::Fedora,
         );
     match command {
-        Commands::Sync => true,
+        // DNF refreshes the caller's cache before requesting elevation for
+        // the system cache. Re-executing the whole command skips that refresh.
+        Commands::Sync => !native_fedora,
         // DNF5 --store resolves the complete plan without executing it, but
         // requires root even for a preview. Keep invalid recursion on its
         // existing unprivileged refusal path before any native plan is made.
@@ -2753,7 +2755,7 @@ mod tests {
     }
 
     #[test]
-    fn clean_elevation_uses_native_fedora_or_root_dispatch() {
+    fn cleanup_and_sync_elevation_use_the_selected_backend() {
         let aur_only = Commands::Clean {
             orphans: false,
             cache: false,
@@ -2777,6 +2779,6 @@ mod tests {
                 omg_lib::core::env::distro::Distro::Fedora,
             );
         assert_eq!(command_requires_root(&cache), !native_fedora);
-        assert!(command_requires_root(&Commands::Sync));
+        assert_eq!(command_requires_root(&Commands::Sync), !native_fedora);
     }
 }

@@ -443,6 +443,42 @@ fi
                                         capture_output=True, text=True, timeout=10)
                 self.assertEqual(result.returncode == 0, expected, result.stderr)
 
+    def test_staged_fedora_sync_requires_complete_guest_evidence(self):
+        if not shutil.which('jq'):
+            self.skipTest('jq required')
+        source = (ROOT / 'scripts/benchmark-qemu.sh').read_text(encoding='utf-8')
+        gate = source.split('# BEGIN FEDORA SYNC RECEIPT', 1)[1].split('# END FEDORA SYNC RECEIPT', 1)[0]
+        checked = ['denied-caller-refreshed', 'approved-ipc', 'root-only-system-refreshed']
+        checks = [dict(case=name, passed=True) for name in (
+            [f'case-{index}' for index in range(29)] + checked
+        )]
+        good = dict(schema_version=1, total=32, passed=32, host_unchanged=True,
+                    binaries=dict(omg='a' * 64, omgd='b' * 64), checks=checks)
+        bad = (
+            None,
+            json.dumps(good) + '\n' + json.dumps(good),
+            json.dumps(dict(good, host_unchanged='true')),
+            json.dumps(dict(good, checks=checks[:-1])),
+            json.dumps(dict(good, checks=checks[:-1] + [checks[0]])),
+            json.dumps(dict(good, checks=checks[:-1] + [dict(case='unrelated', passed=True)])),
+            json.dumps(dict(good, checks=checks[:-1] + [dict(case='failed', passed=False)])),
+            json.dumps(dict(good, binaries=dict(omg='missing', omgd='b' * 64))),
+        )
+        cases = [(value, 'staged', False) for value in bad]
+        cases.extend([(json.dumps(good), 'staged', True), (None, 'published', True)])
+        for receipt, source_kind, expected in cases:
+            with self.subTest(receipt=receipt, source_kind=source_kind), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                evidence = root / 'guest/evidence'
+                evidence.mkdir(parents=True)
+                if receipt is not None:
+                    (evidence / 'fedora-sync-cache.json').write_text(receipt)
+                result = subprocess.run(
+                    [BASH, '-euc', gate],
+                    env=dict(os.environ, work=root.as_posix(), distro='fedora', source_kind=source_kind, rc='0'),
+                    capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode == 0, expected, result.stderr)
+
     def test_doctor_connectivity_receipt_rejects_missing_and_false_claims(self):
         if not shutil.which('jq'):
             self.skipTest('jq required')

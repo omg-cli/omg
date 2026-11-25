@@ -1104,6 +1104,9 @@ if [[ "$distro" == fedora ]]; then
   cp "$here/qemu-fedora-advisory-check.sh" "$here/qemu-fedora-advisory-oracle.py" "$work/"
   cp "$here/../tests/fedora_status_root_switch.py" "$work/"
   cp -a "$here/../tests/data/fedora" "$work/fedora-status-fixture"
+  if [[ "$source_kind" == staged ]]; then
+    cp "$here/../tests/fedora_sync_cache.py" "$work/"
+  fi
 fi
 if [[ "$distro" == arch ]]; then
   cp "$here/qemu-arch-advisory-check.sh" "$here/qemu-arch-advisory-oracle.py" "$work/"
@@ -1438,6 +1441,12 @@ if [[ "$distro" == fedora ]]; then
   timeout --kill-after=5s 120s sudo -n unshare --mount --net --propagation private \
     python3 -I -B "$HOME/fedora_status_root_switch.py" "$HOME/fedora-status-fixture" "$bin" "$daemon" \
     > "$HOME/evidence/fedora-status-root-switch.json"
+  if [[ -f "$HOME/fedora_sync_cache.py" ]]; then
+    sudo -n install -d -m 0700 /var/lib/omg
+    sudo -n setsid --wait timeout --kill-after=5s 120s unshare --mount --net --propagation private \
+      python3 -I -B "$HOME/fedora_sync_cache.py" "$HOME/fedora-status-fixture" "$bin" "$daemon" \
+      > "$HOME/evidence/fedora-sync-cache.json"
+  fi
 fi
 echo 'PASS: package lifecycle and native version parity'
 GUEST
@@ -1471,6 +1480,10 @@ if [[ "$distro" == fedora ]]; then
   timeout 60 docker exec -w /work/guest "$controller" scp -r "${opts[@]}" -P 2222 \
     /work/qemu-fedora-advisory-check.sh /work/qemu-fedora-advisory-oracle.py \
     /work/fedora_status_root_switch.py /work/fedora-status-fixture bench@127.0.0.1:
+  if [[ "$source_kind" == staged ]]; then
+    timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 \
+      /work/fedora_sync_cache.py bench@127.0.0.1:
+  fi
 fi
 if [[ "$distro" == arch ]]; then
   timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 \
@@ -1557,6 +1570,26 @@ if [[ "$rc" == 0 ]]; then
     fi
   fi
 fi
+# BEGIN FEDORA SYNC RECEIPT
+if [[ "$rc" == 0 && "$distro" == fedora && "$source_kind" == staged ]]; then
+  sync_receipt="$work/guest/evidence/fedora-sync-cache.json"
+  if ! [[ -f "$sync_receipt" && ! -L "$sync_receipt" && $(wc -c < "$sync_receipt") -le 65536 ]] \
+    || ! jq -e -s '
+      length == 1 and (.[0] | .schema_version == 1 and
+        .total == 32 and .passed == 32 and .host_unchanged == true and
+        (.binaries.omg | test("^[0-9a-f]{64}$")) and
+        (.binaries.omgd | test("^[0-9a-f]{64}$")) and
+        (.checks | type == "array" and length == 32 and
+          all(.[]; .passed == true and (.case | type == "string" and length > 0)) and
+          (map(.case) | unique |
+            length == 32 and index("denied-caller-refreshed") != null and
+            index("approved-ipc") != null and index("root-only-system-refreshed") != null)))
+    ' "$sync_receipt" >/dev/null; then
+    printf 'Missing or incomplete Fedora sync cache evidence\n' >&2
+    exit 1
+  fi
+fi
+# END FEDORA SYNC RECEIPT
 if [[ "$rc" == 0 && "$distro" == debian-trixie ]]; then
   if ! python3 "$here/qemu-apt-abi-evidence.py" --evidence-dir "$work/guest/evidence/apt-abi" \
     --archive "$work/release/$archive" --probe "$here/qemu-apt-abi.py"; then
