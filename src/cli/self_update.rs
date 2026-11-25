@@ -105,18 +105,19 @@ pub async fn run(force: bool, version: Option<String>) -> Result<()> {
     // versions both stop here so a compromised/misconfigured release feed
     // cannot roll a user back to a vulnerable version.
     if !force {
-        if target_version == current_version {
-            println!(
-                "  {} You are already on the latest version.",
-                style::maybe_color("✓", |t| t.green().to_string())
-            );
-            return Ok(());
-        }
-        if target_version < current_version {
-            anyhow::bail!(
-                "Refusing to downgrade from {current_version} to {target_version} \
+        match target_version.cmp_precedence(&current_version) {
+            std::cmp::Ordering::Equal => {
+                println!(
+                    "  {} You are already on the latest version.",
+                    style::maybe_color("✓", |t| t.green().to_string())
+                );
+                return Ok(());
+            }
+            std::cmp::Ordering::Less => anyhow::bail!(
+                "Refusing to downgrade from {current_version} to {target_version} \\
                  (use --force to override)"
-            );
+            ),
+            std::cmp::Ordering::Greater => {}
         }
     }
 
@@ -492,6 +493,10 @@ fn install_update_pair_with(
         destinations[0] != destinations[1],
         "CLI and daemon destinations overlap"
     );
+    let recovery_dir = tempfile::Builder::new()
+        .prefix(".omg-self-update-backup-")
+        .tempdir_in(parent)
+        .context("Could not create a private self-update recovery directory")?;
     let mut backups = Vec::new();
     for (index, path) in destinations.iter().enumerate() {
         match fs::symlink_metadata(path) {
@@ -501,9 +506,23 @@ fn install_update_pair_with(
                     "Refusing non-regular update destination {}",
                     path.display()
                 );
-                let backup = stage_update_binary(path, path)?;
-                backup.as_file().set_permissions(metadata.permissions())?;
-                backup.as_file().sync_all()?;
+                let name = path
+                    .file_name()
+                    .context("Update destination has no file name")?;
+                let backup = recovery_dir.path().join(name);
+                // Keep the original inode, including its owner and extended attributes.
+                fs::hard_link(path, &backup)
+                    .with_context(|| format!("Cannot retain original file {}", path.display()))?;
+                let linked = fs::symlink_metadata(&backup)?;
+                anyhow::ensure!(linked.is_file(), "Update destination changed during backup");
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt;
+                    anyhow::ensure!(
+                        (metadata.dev(), metadata.ino()) == (linked.dev(), linked.ino()),
+                        "Update destination changed during backup"
+                    );
+                }
                 backups.push(Some(backup));
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound && index == 0 => {
@@ -514,6 +533,10 @@ fn install_update_pair_with(
             }
         }
     }
+    fs::File::open(recovery_dir.path())?
+        .sync_all()
+        .context("Failed to sync update recovery directory")?;
+    crate::core::safe_ops::sync_parent_directory_sync(recovery_dir.path())?;
     let staged = [
         stage_update_binary(daemon, &destinations[0])?,
         stage_update_binary(cli, &destinations[1])?,
@@ -523,14 +546,9 @@ fn install_update_pair_with(
             let mut recovery_errors = Vec::new();
             for (path, backup) in destinations.iter().zip(backups) {
                 let restored = match backup {
-                    Some(backup) => match backup.persist(path) {
-                        Ok(_) => crate::core::safe_ops::sync_parent_directory_sync(path),
-                        Err(failed) => {
-                            let reason = failed.error.to_string();
-                            let retained = failed.file.keep().map(|(_, path)| path);
-                            Err(anyhow::anyhow!("{reason}; recovery copy: {retained:?}"))
-                        }
-                    },
+                    Some(backup) => fs::rename(backup, path)
+                        .map_err(anyhow::Error::from)
+                        .and_then(|()| crate::core::safe_ops::sync_parent_directory_sync(path)),
                     None => match fs::remove_file(path) {
                         Ok(()) => crate::core::safe_ops::sync_parent_directory_sync(path),
                         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -544,9 +562,11 @@ fn install_update_pair_with(
             if recovery_errors.is_empty() {
                 return Err(error).context("Update failed; previous OMG binaries restored");
             }
+            let retained = recovery_dir.keep();
             anyhow::bail!(
-                "Update failed: {error:#}; rollback needs attention: {}",
-                recovery_errors.join("; ")
+                "Update failed: {error:#}; rollback needs attention: {}; recovery directory: {}",
+                recovery_errors.join("; "),
+                retained.display()
             );
         }
     }
@@ -576,8 +596,6 @@ fn extract_update_binary(
     extract_dir: &std::path::Path,
     archive_name: &str,
 ) -> Result<Option<std::path::PathBuf>> {
-    use std::io::Read as _;
-
     let wrapper: Option<std::path::PathBuf> = archive_name
         .strip_suffix(".tar.gz")
         .map(|stem| std::path::PathBuf::from(stem).join("omg"));
@@ -637,26 +655,26 @@ fn extract_update_binary(
             fs::create_dir_all(parent)
                 .with_context(|| format!("Failed to create {}", parent.display()))?;
         }
-        let mut content = Vec::new();
+        let size = entry.size();
         anyhow::ensure!(
-            entry.size() <= MAX_UPDATE_BINARY_BYTES,
+            size <= MAX_UPDATE_BINARY_BYTES,
             "Update binary exceeds the size bound"
         );
-        entry
-            .read_to_end(&mut content)
-            .context("Failed to read update binary from archive")?;
-        anyhow::ensure!(
-            u64::try_from(content.len()).is_ok_and(|len| len <= MAX_UPDATE_BINARY_BYTES),
-            "Update binary exceeds the size bound"
-        );
-        fs::write(&dest_path, &content)
+        let mut binary = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&dest_path)
             .with_context(|| format!("Failed to stage update binary {}", dest_path.display()))?;
+        let copied = std::io::copy(&mut entry, &mut binary)
+            .context("Failed to copy update binary from archive")?;
+        anyhow::ensure!(copied == size, "Update binary is incomplete");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             // Preflight executes these private candidates before installation.
             // Normalize executable permissions without trusting archive modes.
-            fs::set_permissions(&dest_path, fs::Permissions::from_mode(0o755))
+            binary
+                .set_permissions(fs::Permissions::from_mode(0o755))
                 .context("Failed to make staged update binary executable")?;
         }
         if wanted_cli {
@@ -2058,35 +2076,117 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn update_pair_restores_both_after_second_replace_or_sync_failure() {
+    fn update_pair_restores_original_files_after_replace_or_sync_failure() {
+        use std::os::unix::fs::MetadataExt;
+
         for old_daemon in [true, false] {
-            for fail_after_rename in [true, false] {
-                let (_tmp, cli, daemon, destination) = pair_fixture(old_daemon);
-                let mut count = 0;
-                let result =
-                    install_update_pair_with(&cli, &daemon, &destination, |staged, path| {
-                        count += 1;
-                        if count == 2 {
-                            if fail_after_rename {
-                                persist_update_binary(staged, path)?;
-                            }
-                            anyhow::bail!("injected replacement/sync failure");
-                        }
-                        persist_update_binary(staged, path)
+            for fail_at in [1, 2] {
+                for fail_after_rename in [true, false] {
+                    let (_tmp, cli, daemon, destination) = pair_fixture(old_daemon);
+                    let daemon_path = destination.with_file_name("omgd");
+                    let installed = [&destination, &daemon_path];
+                    let originals = installed.map(|path| {
+                        let metadata = fs::symlink_metadata(path).ok()?;
+                        #[cfg(target_os = "linux")]
+                        rustix::fs::setxattr(
+                            path,
+                            "user.omg.rollback-test",
+                            b"original",
+                            rustix::fs::XattrFlags::empty(),
+                        )
+                        .expect("mark the installed file");
+                        Some((metadata.dev(), metadata.ino(), metadata.mode()))
                     });
-                assert!(
-                    format!("{:#}", result.expect_err("must fail"))
-                        .contains("previous OMG binaries restored")
-                );
-                assert_eq!(fs::read(&destination).expect("cli restored"), b"old cli");
-                let path = destination.with_file_name("omgd");
-                if old_daemon {
-                    assert_eq!(fs::read(path).expect("daemon restored"), b"old daemon");
-                } else {
-                    assert!(!path.exists());
+                    let mut count = 0;
+                    let result =
+                        install_update_pair_with(&cli, &daemon, &destination, |staged, path| {
+                            count += 1;
+                            if count == fail_at {
+                                if fail_after_rename {
+                                    persist_update_binary(staged, path)?;
+                                }
+                                anyhow::bail!("injected replacement/sync failure");
+                            }
+                            persist_update_binary(staged, path)
+                        });
+                    assert!(
+                        format!("{:#}", result.expect_err("must fail"))
+                            .contains("previous OMG binaries restored")
+                    );
+                    assert_eq!(fs::read(&destination).expect("cli restored"), b"old cli");
+                    if old_daemon {
+                        assert_eq!(
+                            fs::read(&daemon_path).expect("daemon restored"),
+                            b"old daemon"
+                        );
+                    }
+                    for (path, original) in installed.into_iter().zip(originals) {
+                        if let Some(identity) = original {
+                            let restored = fs::symlink_metadata(path).expect("installed file");
+                            assert_eq!(
+                                (restored.dev(), restored.ino(), restored.mode()),
+                                identity,
+                                "rollback must preserve the original file at {}",
+                                path.display()
+                            );
+                            #[cfg(target_os = "linux")]
+                            {
+                                let mut attribute = [0_u8; 8];
+                                let bytes = rustix::fs::getxattr(
+                                    path,
+                                    "user.omg.rollback-test",
+                                    &mut attribute[..],
+                                )
+                                .expect("preserved attribute");
+                                assert_eq!(&attribute[..bytes], b"original");
+                            }
+                        } else {
+                            assert!(!path.exists(), "rollback must restore an absent daemon");
+                        }
+                    }
                 }
             }
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn update_pair_retains_original_when_rollback_cannot_replace_destination() {
+        use std::os::unix::fs::MetadataExt;
+
+        let (_tmp, cli, daemon, destination) = pair_fixture(true);
+        let old_cli = fs::metadata(&destination).expect("old cli metadata");
+        let parent = destination.parent().expect("bin directory");
+        let error = install_update_pair_with(&cli, &daemon, &destination, |staged, path| {
+            if path == destination {
+                fs::remove_file(path)?;
+                fs::create_dir(path)?;
+                anyhow::bail!("injected replacement failure with an obstructed destination");
+            }
+            persist_update_binary(staged, path)
+        })
+        .expect_err("rollback must report blocked restoration");
+        let message = format!("{error:#}");
+        assert!(message.contains("rollback needs attention"), "{message}");
+        let recovery_dir = message
+            .split_once("recovery directory: ")
+            .map(|(_, path)| std::path::Path::new(path))
+            .expect("named recovery directory");
+        assert_eq!(recovery_dir.parent(), Some(parent));
+        let recovered = recovery_dir.join("omg");
+        let metadata = fs::metadata(&recovered).expect("retained original");
+        assert_eq!(
+            (metadata.dev(), metadata.ino()),
+            (old_cli.dev(), old_cli.ino())
+        );
+        assert_eq!(
+            fs::read(recovered).expect("retained CLI contents"),
+            b"old cli"
+        );
+        assert_eq!(
+            fs::read(destination.with_file_name("omgd")).expect("restored daemon"),
+            b"old daemon"
+        );
     }
 
     #[test]

@@ -179,6 +179,70 @@ with tempfile.TemporaryDirectory(prefix="omg-fedora-cache-scope-", dir="/tmp") a
     def ordinary_control(command_line):
         return checked(command_line, native_env, ordinary)
 
+    def inspect_self_update():
+        old_pair = {path: (path.stat().st_ino, hashlib.sha256(path.read_bytes()).digest())
+                    for path in (cli, server)}
+        version = checked([cli, "--version"], disabled, ordinary).strip().removeprefix("omg ")
+        current = version.split("+", 1)[0]
+        major, minor, patch = map(int, current.split("-", 1)[0].split("."))
+        newer = f"{major}.{minor}.{patch + 1}"
+        newest_major = f"{major + 1}.0.0"
+        already = "You are already on the latest version."
+        refused = "Refusing to downgrade"
+        invalid = "is not valid semver"
+        download_failed = "Failed to fetch"
+        phases = [
+            ("current", ["self-update", "--version", version], 0, already),
+            ("current-alias", ["up", "--version", version], 0, already),
+            ("current-prefixed", ["self-update", "--version", f"v{current}"], 0, already),
+            ("current-whitespace", ["up", "--version", f"  {current}  "], 0, already),
+            ("current-build", ["self-update", "--version", f"{current}+other"], 0, already),
+            ("current-build-prefixed", ["up", "--version", f"v{current}+build.42"], 0, already),
+            ("older", ["self-update", "--version", "0.0.0"], 1, refused),
+            ("older-alias", ["up", "--version", "0.0.0"], 1, refused),
+            ("older-prefixed", ["self-update", "--version", "v0.0.0"], 1, refused),
+            ("older-prerelease", ["up", "--version", "0.0.0-rc.10"], 1, refused),
+            ("older-build", ["self-update", "--version", "0.0.0+build.42"], 1, refused),
+            ("older-whitespace", ["up", "--version", "  v0.0.0  "], 1, refused),
+            ("invalid-empty", ["self-update", "--version", ""], 1, invalid),
+            ("invalid-prefix-only", ["up", "--version", "v"], 1, invalid),
+            ("invalid-short", ["self-update", "--version", "1.2"], 1, invalid),
+            ("invalid-extra-component", ["up", "--version", "1.2.3.4"], 1, invalid),
+            ("invalid-leading-zero", ["self-update", "--version", "1.02.3"], 1, invalid),
+            ("invalid-empty-build", ["up", "--version", "1.2.3+"], 1, invalid),
+            ("newer-patch", ["self-update", "--version", newer], 1, download_failed),
+            ("newer-major", ["up", "--version", newest_major], 1, download_failed),
+            ("newer-prerelease", ["self-update", "--version", f"{newer}-rc.10"], 1, download_failed),
+            ("newer-build", ["up", "--version", f"{newer}+build.42"], 1, download_failed),
+            ("newer-prefixed", ["self-update", "--version", f"v{newer}"], 1, download_failed),
+            ("newer-whitespace", ["up", "--version", f"  {newer}  "], 1, download_failed),
+            ("force-current", ["self-update", "--force", "--version", version], 1, download_failed),
+            ("force-current-build", ["up", "--force", "--version", f"{current}+build.42"], 1, download_failed),
+            ("force-older", ["self-update", "--force", "--version", "0.0.0"], 1, download_failed),
+            ("force-older-prefixed", ["up", "--force", "--version", "v0.0.0"], 1, download_failed),
+            ("help", ["self-update", "--help"], 0, "Update OMG to the latest version"),
+            ("alias-help", ["up", "--help"], 0, "Update OMG to the latest version"),
+        ]
+        for phase, args, status, expected in phases:
+            result = command([cli, *args], disabled, ordinary)
+            output = result.stdout + result.stderr
+            if expected == download_failed:
+                selected = args[-1].strip().removeprefix("v")
+                artifact = f"omg-v{selected}-x86_64-linux-fedora.tar.gz"
+                expected_stage = f"Downloading {artifact}" in result.stdout and f"{artifact}.sha256" in result.stderr
+            else:
+                expected_stage = "Downloading " not in result.stdout
+            checked_unchanged = all(path.stat().st_ino == inode for path, (inode, _) in old_pair.items())
+            checks.append(dict(phase=f"self-update-{phase}", case="native Fedora self-update exit",
+                               passed=result.returncode == status and expected in output
+                               and expected_stage and checked_unchanged,
+                               status=result.returncode, diagnostic=output[-900:]))
+        assert all(hashlib.sha256(path.read_bytes()).digest() == digest
+                   for path, (_, digest) in old_pair.items())
+        assert not (bin_dir / ".omg-self-update.lock").exists()
+
+    inspect_self_update()
+
     def inspect_doctor(phase, installroot, expected_packages):
         rpm_installed = checked(
             [rpm, "--root", installroot, "-qa", "--qf", "%{NAME}\n"],
@@ -1250,6 +1314,6 @@ assert inventory() == before
 report = dict(binaries=binaries, checks=checks, total=len(checks),
               passed=sum(entry["passed"] for entry in checks), host_unchanged=True)
 print(json.dumps(report))
-expected_checks = 270 if consent_oracle is None else 521
+expected_checks = 300 if consent_oracle is None else 551
 if report["passed"] != report["total"] or report["total"] != expected_checks:
     sys.exit(4)
