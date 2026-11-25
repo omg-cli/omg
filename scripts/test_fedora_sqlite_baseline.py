@@ -146,6 +146,12 @@ class BaselineTests(unittest.TestCase):
         admission = json.loads((destination/'admission.json').read_bytes())
         self.assertEqual((admission['build_source_sha'], admission['consumer_sha']),
                          (fixtures.REVISION, 'e'*40))
+        cache_diagnostics = self.work/'diagnostics'/'cache'
+        self.assertTrue((cache_diagnostics/'pointer.json').is_file())
+        self.assertFalse((cache_diagnostics/'sqlite-baseline.tar').exists())
+        self.assertFalse((cache_diagnostics/'proof.json').exists())
+        self.assertEqual(fixtures.sqlite.digest(destination/'baseline.tar'), admission['archive_sha256'])
+        self.assertEqual(fixtures.sqlite.digest(destination/'baseline.sigstore.json'), admission['proof_sha256'])
         self.assertTrue(all(key.startswith(cache.prefix('x86_64', 'b'*64, self.metadata['inventory_sha256'])) for key in keys))
         context = dict(run_id='91', run_attempt=2,
                        admission_sha256=fixtures.sqlite.digest(destination/'admission.json'))
@@ -184,6 +190,16 @@ class BaselineTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     self.restore(metadata, tamper=mode == 'tampered')
                 self.assertEqual(list((self.work/'supply').iterdir()), [])
+                cache_diagnostics = self.work/'diagnostics'/'cache'
+                self.assertTrue((cache_diagnostics/'sqlite-baseline.tar').is_file())
+                self.assertTrue((cache_diagnostics/'proof.json').is_file())
+
+    def test_duplicate_cleanup_failure_preserves_a_successful_admission(self):
+        with mock.patch.object(Path, 'unlink', side_effect=PermissionError):
+            destination, _ = self.restore()
+        admission = json.loads((destination/'admission.json').read_bytes())
+        self.assertEqual(fixtures.sqlite.digest(destination/'baseline.tar'), admission['archive_sha256'])
+        self.assertTrue((self.work/'diagnostics'/'cache'/'sqlite-baseline.tar').is_file())
 
     def test_same_run_partial_rerun_revalidates_owner_bytes_age_and_recipe(self):
         import zipfile
