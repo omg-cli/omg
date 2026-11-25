@@ -921,22 +921,24 @@ mod dnf_integration {
         let root = String::from_utf8(root.stdout)?;
         let expected: std::collections::BTreeSet<_> =
             providers.lines().chain(root.lines()).collect();
-        let tree = std::process::Command::new(binary)
-            .env("NO_COLOR", "1")
-            .env("LC_ALL", "C")
-            .args(["size", "--tree", &selector, "--limit", "10000"])
-            .output()?;
-        assert!(
-            tree.status.success(),
-            "{}",
-            String::from_utf8_lossy(&tree.stderr)
-        );
-        let tree = String::from_utf8(tree.stdout)?;
-        for name in &expected {
-            assert!(tree.contains(name), "missing provider {name}");
+        for target in [&selector, root.trim_end()] {
+            let tree = std::process::Command::new(binary)
+                .env("NO_COLOR", "1")
+                .env("LC_ALL", "C")
+                .args(["size", "--tree", target, "--limit", "10000"])
+                .output()?;
+            assert!(
+                tree.status.success(),
+                "{target}: {}",
+                String::from_utf8_lossy(&tree.stderr)
+            );
+            let tree = String::from_utf8(tree.stdout)?;
+            for name in &expected {
+                assert!(tree.contains(name), "missing provider {name}");
+            }
+            assert!(tree.contains(&format!("Number of Packages: {}", expected.len())));
+            assert!(tree.contains("not a minimal dependency closure"));
         }
-        assert!(tree.contains(&format!("Number of Packages: {}", expected.len())));
-        assert!(tree.contains("not a minimal dependency closure"));
         let missing = std::process::Command::new(binary)
             .args(["size", "--tree", "omg-no-such-package"])
             .output()?;
@@ -960,25 +962,24 @@ mod dnf_integration {
     }
 
     #[test]
-    fn installed_metadata_does_not_hide_excluded_packages() -> Result<()> {
+    fn installed_metadata_uses_trusted_dnf_despite_path_override() -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
         let cache = dirs::cache_dir().expect("user cache directory");
         std::fs::create_dir_all(&cache)?;
         let fixture = tempfile::tempdir_in(cache)?;
         let dnf = fixture.path().join("dnf");
+        let marker = fixture.path().join("untrusted-dnf-invoked");
         std::fs::write(
             &dnf,
-            "#!/bin/sh\nexec /usr/bin/dnf --setopt=excludepkgs=glibc \"$@\"\n",
+            "#!/bin/sh\nprintf 'invoked\\n' > \"$OMG_UNTRUSTED_DNF_MARKER\"; exit 88\n",
         )?;
         std::fs::set_permissions(&dnf, std::fs::Permissions::from_mode(0o700))?;
-        let hidden = std::process::Command::new(&dnf)
-            .args(["repoquery", "--installed", "--qf", "%{name}\n", "glibc"])
-            .output()?;
-        assert!(hidden.status.success());
-        assert!(
-            hidden.stdout.is_empty(),
-            "exclusion fixture must hide glibc from ordinary queries"
-        );
+        let control = std::process::Command::new(&dnf)
+            .env("OMG_UNTRUSTED_DNF_MARKER", &marker)
+            .status()?;
+        assert_eq!(control.code(), Some(88));
+        assert!(marker.is_file(), "the wrapper must record an invocation");
+        std::fs::remove_file(&marker)?;
         let selector = format!("glibc.{}", std::env::consts::ARCH);
         let inherited = std::env::var_os("PATH").expect("native command PATH");
         let path = std::env::join_paths(
@@ -1002,6 +1003,7 @@ mod dnf_integration {
             );
             let output = std::process::Command::new(assert_cmd::cargo::cargo_bin!("omg"))
                 .env("PATH", &path)
+                .env("OMG_UNTRUSTED_DNF_MARKER", &marker)
                 .env("NO_COLOR", "1")
                 .args(&arguments)
                 .output()?;
@@ -1012,8 +1014,9 @@ mod dnf_integration {
             );
             assert_eq!(
                 baseline.stdout, output.stdout,
-                "exclusions changed {arguments:?}"
+                "PATH override changed {arguments:?}"
             );
+            assert!(!marker.exists(), "ran untrusted DNF for {arguments:?}");
         }
         fixture.close()?;
         Ok(())
@@ -1045,18 +1048,20 @@ mod dnf_integration {
             .split_once('\t')
             .expect("native installation reason");
         let binary = assert_cmd::cargo::cargo_bin!("omg");
-        let output = std::process::Command::new(binary)
-            .env("NO_COLOR", "1")
-            .args(["why", &selector])
-            .output()?;
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let output = String::from_utf8(output.stdout)?;
-        assert!(output.contains(identity));
-        assert!(output.contains(&format!("Reason: {reason}")));
+        for target in [&selector, identity] {
+            let output = std::process::Command::new(binary)
+                .env("NO_COLOR", "1")
+                .args(["why", target])
+                .output()?;
+            assert!(
+                output.status.success(),
+                "{target}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let output = String::from_utf8(output.stdout)?;
+            assert!(output.contains(identity));
+            assert!(output.contains(&format!("Reason: {reason}")));
+        }
         let native = std::process::Command::new("dnf")
             .args([
                 "--setopt=disable_excludes=*",
@@ -1064,7 +1069,7 @@ mod dnf_integration {
                 "--installed",
                 "--qf",
                 format,
-                &format!("--whatrequires={selector}"),
+                &format!("--whatrequires={identity}"),
             ])
             .output()?;
         assert!(native.status.success());
@@ -1074,28 +1079,30 @@ mod dnf_integration {
             .map(|line| line.split_once('\t').expect("native dependent"))
             .filter(|(name, _)| *name != identity)
             .collect();
-        let output = std::process::Command::new(binary)
-            .env("NO_COLOR", "1")
-            .args(["why", "--reverse", &selector])
-            .output()?;
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let output = String::from_utf8(output.stdout)?;
-        for (identity, reason) in &expected {
+        for target in [&selector, identity] {
+            let output = std::process::Command::new(binary)
+                .env("NO_COLOR", "1")
+                .args(["why", "--reverse", target])
+                .output()?;
             assert!(
-                output.contains(&format!("{identity}: {reason}")),
-                "missing {identity}"
+                output.status.success(),
+                "{target}: {}",
+                String::from_utf8_lossy(&output.stderr)
             );
+            let output = String::from_utf8(output.stdout)?;
+            for (identity, reason) in &expected {
+                assert!(
+                    output.contains(&format!("{identity}: {reason}")),
+                    "missing {identity}"
+                );
+            }
+            assert!(output.contains(&format!("Dependents ({})", expected.len())));
+            assert!(!output.contains("Safe to remove:"));
         }
         assert!(
             !expected.is_empty(),
             "glibc fixture must have native requiring packages"
         );
-        assert!(output.contains(&format!("Dependents ({})", expected.len())));
-        assert!(!output.contains("Safe to remove:"));
         for arguments in [
             vec!["why", "omg-no-such-package"],
             vec!["why", "--reverse", "omg-no-such-package"],
@@ -1116,15 +1123,15 @@ mod dnf_integration {
             .prefix("omg-fedora-blame-")
             .tempdir_in("/tmp")?;
         let selector = format!("glibc.{}", std::env::consts::ARCH);
-        let invoke = || {
+        let invoke = |target: &str| {
             std::process::Command::new(assert_cmd::cargo::cargo_bin!("omg"))
                 .env("OMG_NATIVE_TEST_DATA_DIR", "1")
                 .env("OMG_DATA_DIR", fixture.path())
                 .env("NO_COLOR", "1")
-                .args(["blame", &selector])
+                .args(["blame", target])
                 .output()
         };
-        let empty = invoke()?;
+        let empty = invoke(&selector)?;
         assert!(
             empty.status.success(),
             "{}",
@@ -1156,7 +1163,7 @@ mod dnf_integration {
                 "--installed",
                 "--qf",
                 "%{full_nevra}\n",
-                &format!("--whatrequires={selector}"),
+                &format!("--whatrequires={}", fields[2]),
             ])
             .output()?;
         assert!(requiring.status.success());
@@ -1187,20 +1194,21 @@ mod dnf_integration {
             transaction("fixture-failed", "2026-01-02T00:00:00Z", false)?,
         ])?;
         let before = std::fs::read(&history_path)?;
-        let output = invoke()?;
+        let output = invoke(fields[2])?;
         assert!(
             output.status.success(),
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
         let output = String::from_utf8(output.stdout)?;
+        assert!(output.contains(fields[2]));
         assert!(output.contains("failed to install → fixture-failed"));
         assert!(output.contains("installed → fixture-old"));
         assert!(output.find("fixture-failed") < output.find("fixture-old"));
         assert!(output.contains("matched by package name"));
         assert_eq!(before, std::fs::read(&history_path)?);
         std::fs::write(&history_path, b"invalid history")?;
-        let corrupt = invoke()?;
+        let corrupt = invoke(&selector)?;
         assert!(!corrupt.status.success());
         assert!(!String::from_utf8(corrupt.stdout)?.contains("No OMG transaction history"));
         assert_eq!(std::fs::read(&history_path)?, b"invalid history");
@@ -1317,6 +1325,21 @@ mod dnf_integration {
         verified?;
         let records = history.load()?;
         anyhow::ensure!(records.len() == 2, "Expected install and remove history");
+        let native_history = std::process::Command::new("dnf")
+            .args(["history", "info", "last", "--json"])
+            .output()?;
+        anyhow::ensure!(
+            native_history.status.success(),
+            "Cannot read native removal history: {}",
+            String::from_utf8_lossy(&native_history.stderr)
+        );
+        let transactions: Vec<serde_json::Value> = serde_json::from_slice(&native_history.stdout)?;
+        anyhow::ensure!(
+            matches!(transactions.as_slice(), [transaction] if transaction["description"]
+                .as_str()
+                .is_some_and(|description| description.split_whitespace().any(|word| word == "replay"))),
+            "Native removal must replay the reviewed plan"
+        );
         let removed = &records[1];
         anyhow::ensure!(
             removed.success && removed.transaction_type == TransactionType::Remove,

@@ -51,18 +51,21 @@ pub async fn install(packages: &[String]) -> Result<()> {
         pm.install(packages).await?;
     }
 
-    modern_ui::print_success_with_packages(
-        &format!(
-            "Installed {} {}",
-            packages.len(),
-            if packages.len() == 1 {
-                "package"
-            } else {
-                "packages"
-            }
-        ),
-        packages,
-    );
+    // DNF prints the actual transaction, including an empty result.
+    if pm.name() != "dnf" {
+        modern_ui::print_success_with_packages(
+            &format!(
+                "Installed {} {}",
+                packages.len(),
+                if packages.len() == 1 {
+                    "package"
+                } else {
+                    "packages"
+                }
+            ),
+            packages,
+        );
+    }
     crate::core::usage::track_install_result(packages, true);
     Ok(())
 }

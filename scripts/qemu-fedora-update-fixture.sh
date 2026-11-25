@@ -68,6 +68,46 @@ check_reason_delta() {
 }
 # END DNF REASON DELTA ORACLE
 
+verify_installed_commands() {
+  local identity hidden
+  local -a omg=(sudo -H -u "$guest_user" -- env OMG_DISABLE_DAEMON=1 "$binary")
+  config_written=true
+  printf '[main]\nreposdir=%s/repos\nexcludepkgs=%s\n' "$base" "$package" > "$config"
+  chmod 644 "$config"
+  dnf -q --cacheonly repo list --all --json | jq -e 'type == "array" and length == 0' > /dev/null
+  hidden=$(dnf -q --cacheonly repoquery --installed --qf '%{name}\n' "$package")
+  [[ -z "$hidden" ]] || { echo 'Configured exclusion did not hide the native control'; return 1; }
+  identity=$(rpm -q --qf '%{NAME}-%{EPOCHNUM}:%{VERSION}-%{RELEASE}.%{ARCH}\n' "$package")
+  [[ -n "$identity" ]] || return 1
+  "${omg[@]}" --json explicit | jq -e --arg fixture "$package" '.packages | index($fixture) != null' > /dev/null
+  "${omg[@]}" --json explicit --count | jq -e '.count >= 1' > /dev/null
+  for cmd in size why why-reverse blame; do
+    case "$cmd" in
+      size) "${omg[@]}" size --tree "$identity" ;;
+      why) "${omg[@]}" why "$identity" ;;
+      why-reverse) "${omg[@]}" why --reverse "$identity" ;;
+      blame) "${omg[@]}" blame "$identity" ;;
+    esac > "$base/$cmd.log"
+    grep -Fq -- "$identity" "$base/$cmd.log" || { cat "$base/$cmd.log"; return 1; }
+  done
+  printf '[main]\nreposdir=%s/repos\n' "$base" > "$config"
+  dnf -q history list --json > "$base/native-noop-before.json"
+  "${omg[@]}" --json history > "$base/omg-noop-before.json"
+  "${omg[@]}" remove --dry-run "$package-absent" > "$base/remove-noop.log"
+  grep -Fq 'No packages to remove' "$base/remove-noop.log"
+  "${omg[@]}" install --yes "$identity" > "$base/install-noop.log"
+  grep -Fq 'No package changes needed' "$base/install-noop.log"
+  if grep -Fq 'Installed 1 package' "$base/install-noop.log"; then
+    cat "$base/install-noop.log"
+    return 1
+  fi
+  "${omg[@]}" --json history > "$base/omg-noop-after.json"
+  dnf -q history list --json > "$base/native-noop-after.json"
+  cmp "$base/omg-noop-before.json" "$base/omg-noop-after.json"
+  cmp "$base/native-noop-before.json" "$base/native-noop-after.json"
+  [[ $(rpm -q --qf '%{VERSION}\n' "$package") == 1 ]]
+}
+
 if [[ -e "$config" ]]; then cp -a "$config" "$base/original-dnf.conf"; had_config=true; fi
 mkdir -p "$base/repo" "$base/repos"
 chmod 755 "$base/repo" "$base/repos"
@@ -106,6 +146,9 @@ rpm -qa --qf '%{NAME}|%{EPOCHNUM}|%{VERSION}|%{RELEASE}|%{ARCH}\n' |
   grep -v "^$package|" | LC_ALL=C sort > "$base/system-before.tsv"
 snapshot_install_reasons "$base/reasons-before.tsv" ||
   { echo 'native DNF install reasons unavailable before update' >&2; exit 120; }
+phase=product
+verify_installed_commands
+phase=setup
 cat > "$base/repos/$repo_id.repo" <<REPO
 [$repo_id]
 name=OMG QEMU bounded update

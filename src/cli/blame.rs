@@ -26,13 +26,12 @@ pub async fn run(package: &str) -> Result<()> {
         backend != crate::package_managers::Backend::Mock,
         "Package installation history is not implemented for the mock backend"
     );
-    crate::core::security::validate_package_name(package)?;
-
     #[cfg(feature = "fedora")]
     if backend == crate::package_managers::Backend::Fedora {
         crate::cli::tea::run_report(build_blame_fedora(package).await?)?;
         return Ok(());
     }
+    crate::core::security::validate_package_name(package)?;
 
     let cmd = build_blame_output(package)?;
     // Fails (non-zero exit) when the command tree contains Cmd::Error.
@@ -53,9 +52,10 @@ async fn build_blame_fedora(package: &str) -> Result<Cmd<()>> {
         "Package '{package}' matches multiple installed builds; specify a version and architecture"
     );
     let root = selected.remove(0);
-    let mut dependents =
-        DnfPackageManager::installed_package_reasons(InstalledReasonQuery::RequiredBy(package))
-            .await?;
+    let mut dependents = DnfPackageManager::installed_package_reasons(
+        InstalledReasonQuery::RequiredBy(&root.identity),
+    )
+    .await?;
     dependents.retain(|entry| entry.identity != root.identity);
     dependents.sort_by(|left, right| left.identity.cmp(&right.identity));
     let mut commands = vec![

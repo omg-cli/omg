@@ -1,8 +1,40 @@
 //! DNF owns RPM version applicability; detailed collections are not installed inventory.
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
+
+use crate::core::security::scan::{
+    AdvisoryProvenance, AuditCoverage, InstalledIdentity, UnassessedPackage,
+};
+use crate::core::security::vulnerability::UnknownCoverage;
+use crate::package_managers::types::SecurityPackage;
+
+pub(super) fn installed_coverage(
+    installed: &[SecurityPackage],
+    affected: &BTreeMap<String, Vec<InstalledIdentity>>,
+) -> AuditCoverage {
+    // An enabled repository can omit updateinfo entirely. DNF's applicable
+    // rows prove positive matches, but do not report per-package coverage.
+    let matched: BTreeSet<_> = affected.values().flatten().collect();
+    let mut assessed = Vec::new();
+    let mut unassessed = Vec::new();
+    for package in installed.iter().map(InstalledIdentity::from) {
+        if matched.contains(&package) {
+            assessed.push(package);
+        } else {
+            unassessed.push(UnassessedPackage {
+                package,
+                reason: UnknownCoverage::EvidenceUnavailable,
+            });
+        }
+    }
+    AuditCoverage::Reported {
+        assessed,
+        unassessed,
+        sources: vec![AdvisoryProvenance::NativeDnf],
+    }
+}
 
 /// Audit queries must not silently omit an unreachable enabled repository.
 pub(super) fn query_args(details: bool) -> Vec<&'static str> {
@@ -211,6 +243,39 @@ pub(super) fn join_advisories(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn enabled_feed_reports_coverage_only_for_exact_affected_identities() {
+        let installed: Vec<_> = [("1-1", "x86_64"), ("2-1", "x86_64"), ("1-1", "i686")]
+            .into_iter()
+            .map(|(version, architecture)| SecurityPackage {
+                origin: crate::package_managers::types::SecurityOrigin::DistributionPackage,
+                name: "fixture".into(),
+                version: version.into(),
+                architecture: Some(architecture.into()),
+                advisory_source: None,
+                description: String::new(),
+                licenses: Vec::new(),
+            })
+            .collect();
+        let affected = InstalledIdentity::from(&installed[0]);
+        let evidence =
+            BTreeMap::from([("fixture-0:2-1.x86_64".to_owned(), vec![affected.clone()])]);
+        assert_eq!(
+            installed_coverage(&installed, &evidence),
+            AuditCoverage::Reported {
+                assessed: vec![affected],
+                unassessed: installed[1..]
+                    .iter()
+                    .map(|package| UnassessedPackage {
+                        package: InstalledIdentity::from(package),
+                        reason: UnknownCoverage::EvidenceUnavailable,
+                    })
+                    .collect(),
+                sources: vec![AdvisoryProvenance::NativeDnf],
+            }
+        );
+    }
 
     #[test]
     #[ignore = "requires Fedora DNF5 and a metadata-only advisory fixture configuration"]

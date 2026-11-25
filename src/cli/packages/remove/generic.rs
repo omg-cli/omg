@@ -40,6 +40,15 @@ pub(super) async fn preview(packages: &[String], dry_run: bool) -> Result<usize>
             .collect::<Result<Vec<_>>>()?
     };
 
+    report_preview(&selected, native, dry_run);
+    Ok(selected.len())
+}
+
+pub(super) fn report_preview(
+    selected: &[crate::package_managers::types::RemovalPackage],
+    native: bool,
+    dry_run: bool,
+) {
     crate::cli::modern_ui::print_phase_header(
         "🗑️",
         if native {
@@ -60,7 +69,7 @@ pub(super) async fn preview(packages: &[String], dry_run: bool) -> Result<usize>
         }
     );
 
-    for package in &selected {
+    for package in selected {
         println!(
             "    {} {} {}",
             style::error("✗"),
@@ -79,5 +88,4 @@ pub(super) async fn preview(packages: &[String], dry_run: bool) -> Result<usize>
     if dry_run {
         ui::print_dry_run_footer();
     }
-    Ok(selected.len())
 }

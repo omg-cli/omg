@@ -462,6 +462,15 @@ fn try_print_counter(counter: FastCounter, json: bool) -> Result<bool> {
         return Ok(true);
     }
 
+    #[cfg(feature = "fedora")]
+    if selected_backend == omg_lib::package_managers::Backend::Fedora
+        && counter == FastCounter::Total
+    {
+        let total = omg_lib::package_managers::DnfPackageManager::new().installed_count()?;
+        print_fast_counter(counter, total.try_into()?, 0, 0, 0, json);
+        return Ok(true);
+    }
+
     #[cfg(feature = "arch")]
     if selected_backend == omg_lib::package_managers::Backend::Arch
         && let Ok((total, explicit, orphans)) =
@@ -485,7 +494,7 @@ fn try_print_counter(counter: FastCounter, json: bool) -> Result<bool> {
         return Ok(true);
     }
 
-    #[cfg(not(any(feature = "arch", target_os = "macos")))]
+    #[cfg(not(any(feature = "arch", feature = "fedora", target_os = "macos")))]
     let _ = selected_backend;
 
     // A cache/daemon miss must reach the selected backend through the normal
@@ -1150,7 +1159,9 @@ fn validate_package_security(command: &Commands) -> Result<()> {
         Commands::Remove { packages, .. } => {
             omg_lib::core::security::validate_package_names(packages)?;
         }
-        Commands::Info { package } => {
+        Commands::Info { package }
+        | Commands::Why { package, .. }
+        | Commands::Blame { package } => {
             #[cfg(feature = "fedora")]
             if omg_lib::package_managers::resolve_backend()?
                 == omg_lib::package_managers::Backend::Fedora
@@ -1160,9 +1171,6 @@ fn validate_package_security(command: &Commands) -> Result<()> {
                 omg_lib::core::security::validate_package_name(package)?;
             }
             #[cfg(not(feature = "fedora"))]
-            omg_lib::core::security::validate_package_name(package)?;
-        }
-        Commands::Why { package, .. } | Commands::Blame { package } => {
             omg_lib::core::security::validate_package_name(package)?;
         }
         _ => {}
