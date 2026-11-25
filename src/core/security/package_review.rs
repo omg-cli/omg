@@ -102,6 +102,7 @@ async fn assess(
     Ok(reports)
 }
 
+/// Review the proposed inventory and revalidate the evidence after consent.
 pub(crate) async fn review_async(
     inventory: &[SecurityPackage],
     context: &str,

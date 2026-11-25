@@ -2009,11 +2009,8 @@ impl DnfPackageManager {
         let context = serde_json::to_string(&("omg-native-dnf-stored-v1", args, &digest))?;
         let gaps = vec!["DNF5's native advisory CLI filters by currently installed package names; it cannot establish complete coverage for newly selected dependencies. Vendor fixed versions do not establish introduced ranges or branch applicability. Matching native advisories below remain possible; CVE/disclosed-zero-day coverage remains unknown. https://dnf5.readthedocs.io/en/stable/commands/advisory.8.html".into()];
         let source = PlannedDnfAdvisories;
-        let review = crate::core::security::package_review::review_async(
-            &inventory, &context, &gaps, &source,
-        )
-        .await?;
-        review.verify_async(&source).await?;
+        crate::core::security::package_review::review_async(&inventory, &context, &gaps, &source)
+            .await?;
         let (directory, checked) = tokio::task::spawn_blocking(move || -> Result<_> {
             let digest = Self::stored_tree_digest(directory.path())?;
             Ok((directory, digest))
