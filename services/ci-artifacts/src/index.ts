@@ -206,6 +206,9 @@ async function credentials(request: Request, env: Env): Promise<Response> {
   { headers: { 'Cache-Control': 'no-store' } });
 }
 const immutableCacheControl = 'public, max-age=31536000, immutable';
+
+// Large downloads keep a single R2 stream to bound the Worker's resource use.
+const maxEdgeCacheBytes = 16 * 1024 * 1024;
 function cacheBranches(body: ReadableStream<Uint8Array>) {
   const reader = body.getReader();
   const queue: Uint8Array[] = [];
@@ -272,6 +275,15 @@ function admissibleCached(response: Response, limit: number, contentType: string
     && response.headers.get('cache-control') === immutableCacheControl
     && !response.headers.has('set-cookie') && !response.headers.has('vary');
 }
+
+function fixedLengthBody(body: ReadableStream<Uint8Array>, size: number, ctx?: Pick<ExecutionContext, 'waitUntil'>) {
+  const stream = new FixedLengthStream(size);
+  const transfer = body.pipeTo(stream.writable).catch(() => undefined);
+  ctx?.waitUntil(transfer);
+
+  return stream.readable;
+}
+
 async function cacheImmutable(cache: Cache, key: Request, response: Response, limit: number): Promise<void> {
   if (!response.body) return;
   const abort = new AbortController();
@@ -279,16 +291,8 @@ async function cacheImmutable(cache: Cache, key: Request, response: Response, li
   const deadline = new Promise<void>(resolve => {
     timer = setTimeout(() => { abort.abort(); resolve(); }, 25000);
   });
-  let bytes = 0;
   try {
-    const body = response.body.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({
-      transform(chunk, controller) {
-        bytes += chunk.byteLength;
-        if (bytes > limit) throw new Error('cache body limit');
-        controller.enqueue(chunk);
-      },
-      flush() { if (bytes !== limit) throw new Error('cache body length mismatch'); },
-    }), { signal: abort.signal });
+    const body = response.body.pipeThrough(new FixedLengthStream(limit), { signal: abort.signal });
     await Promise.race([cache.put(key, new Response(body, response)), deadline]);
   }
   catch { abort.abort(); }
@@ -302,6 +306,7 @@ async function dependency(request: Request, env: Env, path: string, ctx?: Pick<E
   const latest = match[4] === 'latest.json';
   const archive = match[5] === 'tar';
   const limit = latest ? 65536 : archive ? 160 * 1024 * 1024 : 1024 * 1024;
+  const edgeLimit = Math.min(limit, maxEdgeCacheBytes);
   const contentType = archive ? 'application/x-tar' : 'application/json';
   const cacheKey = new Request(request.url, { method: 'GET' });
   let edge: Cache | undefined;
@@ -309,8 +314,10 @@ async function dependency(request: Request, env: Env, path: string, ctx?: Pick<E
     try {
       edge = caches.default;
       const cached = await edge.match(cacheKey);
-      if (cached && admissibleCached(cached, limit, contentType)) {
-        const hit = new Response(cached.body, cached);
+
+      if (cached?.body && admissibleCached(cached, edgeLimit, contentType)) {
+        const size = Number(cached.headers.get('content-length'));
+        const hit = new Response(fixedLengthBody(cached.body, size, ctx), cached);
         hit.headers.set('X-OMG-Artifact-Cache', 'HIT');
         return hit;
       }
@@ -325,14 +332,18 @@ async function dependency(request: Request, env: Env, path: string, ctx?: Pick<E
     throw new Refusal(502);
   }
   if (request.method === 'GET' && !body) throw new Refusal(502);
-  const branches = edge && ctx && body ? cacheBranches(body) : undefined;
-  const response = new Response(branches?.client ?? body, { headers: {
+
+  const branches = edge && ctx && body && object.size <= edgeLimit ? cacheBranches(body) : undefined;
+  const clientBody = branches?.client ?? body;
+
+  const response = new Response(clientBody ? fixedLengthBody(clientBody, object.size, ctx) : null, { headers: {
     'Content-Type': contentType, 'Content-Length': String(object.size),
     'ETag': object.httpEtag, 'X-Content-Type-Options': 'nosniff',
     'Cache-Control': latest ? 'no-store' : immutableCacheControl,
   } });
   if (edge && ctx && branches) ctx.waitUntil(cacheImmutable(edge, cacheKey, new Response(branches.cache, response), object.size));
-  if (!latest && request.method === 'GET') response.headers.set('X-OMG-Artifact-Cache', edge ? 'MISS' : 'BYPASS');
+
+  if (!latest && request.method === 'GET') response.headers.set('X-OMG-Artifact-Cache', branches ? 'MISS' : 'BYPASS');
   return response;
 }
 export default {

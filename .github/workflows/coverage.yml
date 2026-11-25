@@ -624,7 +624,7 @@ jobs:
           PY
 
       - name: Save verified native QEMU image cache
-        if: ${{ success() && steps.native_fixture_tests.outcome == 'success' && steps.native_image_restore.outputs.cache-hit != 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+        if: ${{ success() && github.ref == 'refs/heads/main' && steps.native_fixture_tests.outcome == 'success' && steps.native_image_restore.outputs.cache-hit != 'true' }}
         continue-on-error: true
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
