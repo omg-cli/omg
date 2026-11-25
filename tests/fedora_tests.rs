@@ -1188,8 +1188,23 @@ mod dnf_integration {
             })
         };
         let history_path = fixture.path().join("history.json");
+        let mut previous = transaction("fixture-old", "2026-01-01T00:00:00Z", true)?;
+        previous.changes.extend([
+            PackageChange {
+                name: fields[0].to_owned(),
+                old_version: None,
+                new_version: Some("fixture-second-build".to_owned()),
+                source: "qa-fixture".to_owned(),
+            },
+            PackageChange {
+                name: "unrelated-package".to_owned(),
+                old_version: None,
+                new_version: Some("fixture-unrelated-build".to_owned()),
+                source: "qa-fixture".to_owned(),
+            },
+        ]);
         HistoryManager::new_in(&history_path)?.save(&[
-            transaction("fixture-old", "2026-01-01T00:00:00Z", true)?,
+            previous,
             transaction("fixture-failed", "2026-01-02T00:00:00Z", false)?,
         ])?;
         let before = std::fs::read(&history_path)?;
@@ -1203,6 +1218,9 @@ mod dnf_integration {
         assert!(output.contains(fields[2]));
         assert!(output.contains("failed to install → fixture-failed"));
         assert!(output.contains("installed → fixture-old"));
+        assert!(output.contains("installed → fixture-second-build"));
+        assert!(!output.contains("fixture-unrelated-build"));
+        assert!(output.contains("OMG Transaction History (2)"));
         assert!(output.find("fixture-failed") < output.find("fixture-old"));
         assert!(output.contains("matched by package name"));
         assert_eq!(before, std::fs::read(&history_path)?);
