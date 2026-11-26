@@ -1133,6 +1133,49 @@ impl DnfPackageManager {
         Ok(command)
     }
 
+    const RPM_SBOM_QUERY_FORMAT: &str = concat!(
+        "%{NAME:shescape} %|ARCH?{%{ARCH:shescape}}:{''}| %{EPOCHNUM} ",
+        "%{VERSION:shescape} %{RELEASE:shescape} ",
+        "%|VENDOR?{%{VENDOR:shescape}}:{''}| %|LICENSE?{%{LICENSE:shescape}}:{''}|\\n",
+    );
+
+    fn parse_rpm_sbom_inventory(output: &[u8]) -> Result<Vec<super::types::SbomPackage>> {
+        use super::types::{SbomPackage, SecurityOrigin, SecurityPackage};
+
+        let output = std::str::from_utf8(output).context("RPM SBOM inventory is not UTF-8")?;
+        let fields = shell_words::split(output).context("Invalid quoted RPM SBOM inventory")?;
+        let (records, remainder) = fields.as_chunks::<7>();
+        anyhow::ensure!(remainder.is_empty(), "Truncated RPM SBOM record");
+        let mut inventory = Vec::with_capacity(records.len());
+        for [name, architecture, epoch, version, release, vendor, license] in records {
+            // Imported RPM keys are trust records rather than installed software.
+            if name == "gpg-pubkey" && architecture.is_empty() {
+                continue;
+            }
+            Self::validate_versioned_fields(&[name, architecture, epoch, version, release])?;
+            anyhow::ensure!(
+                epoch.bytes().all(|byte| byte.is_ascii_digit()),
+                "Invalid RPM epoch"
+            );
+            inventory.push(SbomPackage {
+                package: SecurityPackage {
+                    origin: SecurityOrigin::DistributionPackage,
+                    name: name.clone(),
+                    version: format!("{epoch}:{version}-{release}"),
+                    advisory_source: None,
+                    architecture: Some(architecture.clone()),
+                    description: String::new(),
+                    licenses: (!license.trim().is_empty())
+                        .then(|| license.clone())
+                        .into_iter()
+                        .collect(),
+                },
+                rpm_vendor: (!vendor.trim().is_empty()).then(|| vendor.clone()),
+            });
+        }
+        Ok(inventory)
+    }
+
     fn rpm_query<const N: usize>(
         arguments: [&str; N],
         deadline: std::time::Duration,
@@ -3499,6 +3542,23 @@ impl PackageManager for DnfPackageManager {
         })
     }
 
+    fn sbom_inventory(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<super::types::SbomPackage>>> + Send + '_>> {
+        Box::pin(async {
+            let mut command = Self::rpm_query_command()?;
+            command.args(["-qa", "--qf", Self::RPM_SBOM_QUERY_FORMAT]);
+            let output = Self::controlled_query_output(
+                "RPM",
+                command,
+                std::time::Duration::from_mins(1),
+                None,
+            )
+            .await?;
+            Self::parse_rpm_sbom_inventory(&output)
+        })
+    }
+
     fn security_audit(
         &self,
     ) -> Option<
@@ -4415,18 +4475,17 @@ mod tests {
             .filter(|line| !line.starts_with("gpg-pubkey\t(none)\t"))
             .map(str::to_owned)
             .collect();
-        let packages = DnfPackageManager::new().security_inventory().await.unwrap();
-        let mut actual: Vec<_> = packages
-            .into_iter()
-            .map(|package| {
-                format!(
-                    "{}\t{}\t{}",
-                    package.name,
-                    package.architecture.unwrap(),
-                    package.version
-                )
-            })
-            .collect();
+        let manager = DnfPackageManager::new();
+        let packages = manager.security_inventory().await.unwrap();
+        let identity = |package: &super::super::types::SecurityPackage| {
+            format!(
+                "{}\t{}\t{}",
+                package.name,
+                package.architecture.as_deref().unwrap(),
+                package.version
+            )
+        };
+        let mut actual: Vec<_> = packages.iter().map(identity).collect();
         expected.sort();
         actual.sort();
         assert!(
@@ -4437,6 +4496,46 @@ mod tests {
             actual, expected,
             "security inventory lost or changed native identities"
         );
+
+        let records = manager.sbom_inventory().await.unwrap();
+        let mut sbom_identities: Vec<_> = records
+            .iter()
+            .map(|record| identity(&record.package))
+            .collect();
+        sbom_identities.sort();
+        assert_eq!(
+            sbom_identities, expected,
+            "SBOM inventory lost native identities"
+        );
+        assert!(
+            records
+                .iter()
+                .any(|record| !record.package.licenses.is_empty())
+        );
+    }
+
+    #[test]
+    fn rpm_sbom_inventory_preserves_quoted_vendor_and_licenses() {
+        let inventory = DnfPackageManager::parse_rpm_sbom_inventory(
+            b"'gpg-pubkey' '' 0 'public-key' '1' '' 'pubkey'\n\
+              'sample' 'x86_64' 2 '1' '4' 'Example'\\''s Vendor' 'MIT OR Apache-2.0'\n\
+              'sample' 'i686' 0 '1' '4' '' ''\n",
+        )
+        .unwrap();
+        assert_eq!(inventory.len(), 2);
+        assert_eq!(inventory[0].package.version, "2:1-4");
+        assert_eq!(inventory[0].rpm_vendor.as_deref(), Some("Example's Vendor"));
+        assert_eq!(inventory[0].package.licenses, ["MIT OR Apache-2.0"]);
+        assert_eq!(inventory[1].package.architecture.as_deref(), Some("i686"));
+        assert!(inventory[1].rpm_vendor.is_none());
+        assert!(inventory[1].package.licenses.is_empty());
+        for malformed in [
+            b"'sample' 'x86_64' 2 '1' '4' 'Vendor'".as_slice(),
+            b"'sample' 'x86_64' -2 '1' '4' 'Vendor' 'MIT'",
+            b"'sample' 'x86_64' 2 '1' '4' 'Vendor 'MIT'",
+        ] {
+            assert!(DnfPackageManager::parse_rpm_sbom_inventory(malformed).is_err());
+        }
     }
 
     #[tokio::test]

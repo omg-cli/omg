@@ -5,14 +5,15 @@ use super::sbom::{
 };
 use super::scan::{AdvisorySeverity, AuditCoverage, SecurityAuditResult};
 use crate::core::env::distro::Distro;
-use crate::package_managers::types::SecurityPackage;
+use crate::package_managers::types::SbomPackage;
 use anyhow::Context;
+use std::borrow::Cow;
 
 pub(super) async fn generate(include_vulns: bool) -> Result<Sbom, SbomError> {
     let result = async {
         let manager = crate::package_managers::get_package_manager()?;
         let mut installed = manager
-            .security_inventory()
+            .sbom_inventory()
             .await
             .context("Failed to list packages")?;
         let audit = if include_vulns {
@@ -27,16 +28,10 @@ pub(super) async fn generate(include_vulns: bool) -> Result<Sbom, SbomError> {
             None
         };
         let mut after = manager
-            .security_inventory()
+            .sbom_inventory()
             .await
             .context("Failed to list packages")?;
-        let key = |p: &SecurityPackage| (p.name.clone(), p.version.clone(), p.architecture.clone());
-        installed.sort_by_key(key);
-        after.sort_by_key(key);
-        anyhow::ensure!(
-            installed == after,
-            "Installed inventory changed during SBOM generation"
-        );
+        verify_inventory(&mut installed, &mut after)?;
         compose(
             &installed,
             audit.as_ref(),
@@ -49,12 +44,44 @@ pub(super) async fn generate(include_vulns: bool) -> Result<Sbom, SbomError> {
     })
 }
 
-fn purl(package: &SecurityPackage, distro: Distro) -> anyhow::Result<String> {
+fn verify_inventory(
+    installed: &mut [SbomPackage],
+    after: &mut [SbomPackage],
+) -> anyhow::Result<()> {
+    let compare = |left: &SbomPackage, right: &SbomPackage| {
+        let (left, right) = (&left.package, &right.package);
+        (&left.name, &left.version, &left.architecture).cmp(&(
+            &right.name,
+            &right.version,
+            &right.architecture,
+        ))
+    };
+    installed.sort_unstable_by(compare);
+    after.sort_unstable_by(compare);
+    anyhow::ensure!(
+        installed == after,
+        "Installed inventory changed during SBOM generation"
+    );
+    Ok(())
+}
+
+fn purl(record: &SbomPackage, distro: Distro) -> anyhow::Result<Option<String>> {
+    let package = &record.package;
     let (kind, namespace) = match distro {
-        Distro::Arch => ("alpm", "arch"),
-        Distro::Debian => ("deb", "debian"),
-        Distro::Ubuntu => ("deb", "ubuntu"),
-        Distro::Fedora => ("rpm", "fedora"),
+        Distro::Arch => ("alpm", Some(Cow::Borrowed("arch"))),
+        Distro::Debian => ("deb", Some(Cow::Borrowed("debian"))),
+        Distro::Ubuntu => ("deb", Some(Cow::Borrowed("ubuntu"))),
+        Distro::Fedora => (
+            "rpm",
+            record.rpm_vendor.as_deref().map(|vendor| {
+                let vendor = vendor.trim();
+                if vendor.eq_ignore_ascii_case("Fedora Project") {
+                    Cow::Borrowed("fedora")
+                } else {
+                    Cow::Owned(vendor.to_lowercase())
+                }
+            }),
+        ),
         _ => anyhow::bail!("Unsupported SBOM distribution"),
     };
     anyhow::ensure!(
@@ -82,20 +109,23 @@ fn purl(package: &SecurityPackage, distro: Distro) -> anyhow::Result<String> {
     } else {
         &package.version
     };
-    let mut value = format!(
-        "pkg:{kind}/{namespace}/{}@{}",
-        urlencoding::encode(&package.name),
-        urlencoding::encode(version)
-    );
-    if !qualifiers.is_empty() {
-        value.push('?');
-        value.push_str(&qualifiers.join("&"));
-    }
-    Ok(value)
+    Ok(namespace.map(|namespace| {
+        let mut value = format!(
+            "pkg:{kind}/{}/{}@{}",
+            urlencoding::encode(&namespace),
+            urlencoding::encode(&package.name),
+            urlencoding::encode(version)
+        );
+        if !qualifiers.is_empty() {
+            value.push('?');
+            value.push_str(&qualifiers.join("&"));
+        }
+        value
+    }))
 }
 
-pub(super) fn compose(
-    installed: &[SecurityPackage],
+fn compose(
+    installed: &[SbomPackage],
     audit: Option<&SecurityAuditResult>,
     distro: Distro,
 ) -> anyhow::Result<Sbom> {
@@ -171,8 +201,17 @@ pub(super) fn compose(
             );
         }
     }
-    for package in installed {
-        let reference = purl(package, distro)?;
+    for record in installed {
+        let package = &record.package;
+        let package_url = purl(record, distro)?;
+        let reference = package_url.clone().unwrap_or_else(|| {
+            format!(
+                "urn:omg:rpm:{}:{}:{}",
+                urlencoding::encode(&package.name),
+                urlencoding::encode(&package.version),
+                urlencoding::encode(package.architecture.as_deref().unwrap_or_default()),
+            )
+        });
         let key = (
             package.name.clone(),
             package.version.clone(),
@@ -203,6 +242,12 @@ pub(super) fn compose(
             name: "omg:package-origin".into(),
             value: serde_json::to_string(&package.origin)?,
         });
+        if let Some(vendor) = &record.rpm_vendor {
+            properties.push(SbomProperty {
+                name: "omg:rpm-vendor".into(),
+                value: vendor.clone(),
+            });
+        }
         if let Some((name, version)) = &package.advisory_source {
             properties.extend([
                 SbomProperty {
@@ -222,7 +267,7 @@ pub(super) fn compose(
             name: package.name.clone(),
             version: package.version.clone(),
             description: Some(package.description.clone()),
-            purl: Some(reference),
+            purl: package_url,
             licenses: package
                 .licenses
                 .iter()
@@ -442,6 +487,95 @@ pub(super) fn compose(
 mod tests {
     use super::*;
     use crate::core::security::scan::{InstalledIdentity, Vulnerability};
+    use crate::package_managers::types::SecurityPackage;
+
+    fn compose_fixture(
+        installed: &[SecurityPackage],
+        audit: Option<&SecurityAuditResult>,
+        distro: Distro,
+    ) -> anyhow::Result<Sbom> {
+        let records: Vec<_> = installed
+            .iter()
+            .map(|package| SbomPackage {
+                package: package.clone(),
+                rpm_vendor: (distro == Distro::Fedora).then(|| "Fedora Project".into()),
+            })
+            .collect();
+        super::compose(&records, audit, distro)
+    }
+
+    #[test]
+    fn inventory_reconciliation_accepts_reordering_and_refuses_rpm_metadata_changes()
+    -> anyhow::Result<()> {
+        let record = |arch: &str| SbomPackage {
+            package: SecurityPackage {
+                origin: crate::package_managers::types::SecurityOrigin::DistributionPackage,
+                name: "example".into(),
+                version: "2:1-4".into(),
+                advisory_source: None,
+                architecture: Some(arch.into()),
+                description: String::new(),
+                licenses: vec!["MIT".into()],
+            },
+            rpm_vendor: Some("Example Vendor".into()),
+        };
+        let mut installed = [record("x86_64"), record("i686")];
+        let mut after = [record("i686"), record("x86_64")];
+
+        verify_inventory(&mut installed, &mut after)?;
+        assert_eq!(installed[0].package.architecture.as_deref(), Some("i686"));
+
+        after[0].rpm_vendor = None;
+        assert!(verify_inventory(&mut installed, &mut after).is_err());
+
+        after[0] = record("i686");
+        after[0].package.licenses = vec!["Apache-2.0".into()];
+        assert!(verify_inventory(&mut installed, &mut after).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn rpm_purls_use_declared_vendor_and_omit_unknown_vendor() {
+        let package = SecurityPackage {
+            origin: crate::package_managers::types::SecurityOrigin::DistributionPackage,
+            name: "sample".into(),
+            version: "2:1-4".into(),
+            advisory_source: None,
+            architecture: Some("x86_64".into()),
+            description: String::new(),
+            licenses: vec!["MIT OR Apache-2.0".into()],
+        };
+        let mut unlabelled = SbomPackage::from(package.clone());
+        unlabelled.package.architecture = Some("i686".into());
+        let records = [
+            SbomPackage {
+                package,
+                rpm_vendor: Some("Example Vendor, LLC".into()),
+            },
+            unlabelled,
+        ];
+        let report = super::compose(&records, None, Distro::Fedora).unwrap();
+        let labelled = &report.components[0];
+        assert_eq!(
+            labelled.purl.as_deref(),
+            Some("pkg:rpm/example%20vendor%2C%20llc/sample@1-4?arch=x86_64&epoch=2")
+        );
+        assert!(
+            labelled
+                .properties
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|property| property.name == "omg:rpm-vendor"
+                    && property.value == "Example Vendor, LLC")
+        );
+        let unlabelled = &report.components[1];
+        assert!(unlabelled.purl.is_none());
+        assert_eq!(
+            unlabelled.bom_ref.as_deref(),
+            Some("urn:omg:rpm:sample:2%3A1-4:i686")
+        );
+    }
 
     #[test]
     fn sbom_refuses_false_clean_finding_totals_before_export() {
@@ -451,7 +585,7 @@ mod tests {
             high_severity: 0,
             vulnerabilities: Vec::new(),
         };
-        compose(&[], Some(&audit), Distro::Arch)
+        compose_fixture(&[], Some(&audit), Distro::Arch)
             .expect_err("contradictory totals must not enter an SBOM");
     }
 
@@ -514,7 +648,7 @@ mod tests {
             },
         ];
         let audit = SecurityAuditResult::from_assessments(assessments);
-        let sbom = compose(&[official, archive], Some(&audit), Distro::Arch)
+        let sbom = compose_fixture(&[official, archive], Some(&audit), Distro::Arch)
             .expect("complete Arch inventory join");
         let roundtrip: Sbom =
             serde_json::from_str(&serde_json::to_string(&sbom).expect("serialize Arch SBOM"))
@@ -583,7 +717,7 @@ mod tests {
         let mut invalid = audit;
         invalid.high_severity = 0;
         assert!(
-            compose(&[], Some(&invalid), Distro::Arch).is_err(),
+            compose_fixture(&[], Some(&invalid), Distro::Arch).is_err(),
             "counter refusal precedes any SBOM export"
         );
     }
@@ -605,7 +739,7 @@ mod tests {
             (Distro::Ubuntu, "Ubuntu", "pkg:deb/ubuntu/"),
             (Distro::Fedora, "Fedora", "pkg:rpm/fedora/"),
         ] {
-            let report = compose(std::slice::from_ref(&package), None, distro).unwrap();
+            let report = compose_fixture(std::slice::from_ref(&package), None, distro).unwrap();
             assert_eq!(report.metadata.component.as_ref().unwrap().name, name);
             assert_eq!(report.components[0].version, "2:1.0-3");
             assert!(
@@ -643,11 +777,11 @@ mod tests {
         }
         let mut sourced = package.clone();
         sourced.advisory_source = Some(("different-source".into(), "1.0".into()));
-        let report = compose(&[sourced], None, Distro::Debian).unwrap();
+        let report = compose_fixture(&[sourced], None, Distro::Debian).unwrap();
         assert_eq!(report.components[0].name, "fixture+tools");
         assert_eq!(report.components[0].version, "2:1.0-3");
-        assert!(compose(&[], None, Distro::Unknown).is_err());
-        assert!(compose(&[package.clone(), package], None, Distro::Debian).is_err());
+        assert!(compose_fixture(&[], None, Distro::Unknown).is_err());
+        assert!(compose_fixture(&[package.clone(), package], None, Distro::Debian).is_err());
     }
 
     #[test]
@@ -683,7 +817,7 @@ mod tests {
                 }],
             )],
         };
-        let sbom = compose(&installed, Some(&audit), Distro::Fedora).unwrap();
+        let sbom = compose_fixture(&installed, Some(&audit), Distro::Fedora).unwrap();
         assert_eq!(sbom.components.len(), 3);
         assert_eq!(sbom.vulnerabilities[0].affects.len(), 1);
         assert_eq!(
@@ -707,7 +841,7 @@ mod tests {
                 url: "https://example.test/advisory".into(),
             }],
         });
-        let native = compose(&installed, Some(&native_audit), Distro::Fedora).unwrap();
+        let native = compose_fixture(&installed, Some(&native_audit), Distro::Fedora).unwrap();
         let evidence = &native.vulnerabilities[0];
         assert_eq!(evidence.ratings[0].score, None);
         assert_eq!(evidence.ratings[0].severity.as_deref(), Some("high"));
@@ -722,9 +856,12 @@ mod tests {
         assert!(evidence.properties.iter().any(|property| property.name
             == "omg:advisory:published-severity"
             && property.value == "Important"));
-        assert!(compose(&[patched], Some(&audit), Distro::Fedora).is_err());
+        assert!(compose_fixture(&[patched], Some(&audit), Distro::Fedora).is_err());
+        let ubuntu = compose_fixture(&[old], None, Distro::Ubuntu).unwrap();
         assert!(
-            purl(&old, Distro::Ubuntu)
+            ubuntu.components[0]
+                .purl
+                .as_deref()
                 .unwrap()
                 .starts_with("pkg:deb/ubuntu/fixture@1%3A1.0-1")
         );
@@ -771,7 +908,8 @@ mod tests {
                 }],
             )],
         };
-        let report = compose(std::slice::from_ref(&package), Some(&audit), Distro::Debian).unwrap();
+        let report =
+            compose_fixture(std::slice::from_ref(&package), Some(&audit), Distro::Debian).unwrap();
         let properties = report.components[0].properties.as_ref().unwrap();
         assert!(properties.iter().any(
             |property| property.name == "omg:advisory-coverage" && property.value == "unknown"
@@ -800,7 +938,7 @@ mod tests {
             sources: Vec::new(),
         };
         assert!(
-            compose(&[package], Some(&missing), Distro::Debian).is_err(),
+            compose_fixture(&[package], Some(&missing), Distro::Debian).is_err(),
             "reported coverage may not omit an installed identity"
         );
     }

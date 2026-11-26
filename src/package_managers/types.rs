@@ -119,6 +119,23 @@ impl SecurityPackage {
     }
 }
 
+/// Installed software metadata used by the system SBOM.
+#[derive(Debug, PartialEq, Eq)]
+pub struct SbomPackage {
+    pub package: SecurityPackage,
+    /// Vendor declared in the installed RPM header.
+    pub rpm_vendor: Option<String>,
+}
+
+impl From<SecurityPackage> for SbomPackage {
+    fn from(package: SecurityPackage) -> Self {
+        Self {
+            package,
+            rpm_vendor: None,
+        }
+    }
+}
+
 /// Canonical orphan rule for pacman-based systems (`pacman -Qdt` semantics).
 ///
 /// A package is an orphan when it was **not** installed explicitly and no

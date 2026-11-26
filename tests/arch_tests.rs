@@ -531,6 +531,9 @@ mod security {
             .mock_install("omg-sbom-fixture", "1.2.3")
             .expect("seed the installed package inventory");
         project
+            .mock_install("omg-sbom-counterpart", "4.5.6")
+            .expect("seed a second installed package for inventory comparison");
+        project
             .run(&["audit", "sbom", "--inventory-only", "--output", "sbom.json"])
             .assert_success();
         let content = project
@@ -539,13 +542,18 @@ mod security {
         let sbom: serde_json::Value = serde_json::from_str(&content).expect("valid CycloneDX JSON");
         assert_eq!(sbom["bomFormat"], "CycloneDX");
         assert_eq!(sbom["specVersion"], "1.5");
-        assert!(
-            sbom["components"]
-                .as_array()
-                .is_some_and(|components| components.iter().any(|component| {
-                    component["name"] == "omg-sbom-fixture" && component["version"] == "1.2.3"
-                })),
-            "SBOM must contain the seeded package and version"
+        let packages: Vec<_> = sbom["components"]
+            .as_array()
+            .expect("SBOM components")
+            .iter()
+            .map(|component| (component["name"].as_str(), component["version"].as_str()))
+            .collect();
+        assert_eq!(
+            packages,
+            [
+                (Some("omg-sbom-counterpart"), Some("4.5.6")),
+                (Some("omg-sbom-fixture"), Some("1.2.3")),
+            ]
         );
         assert!(
             sbom["metadata"]["component"]["properties"]
