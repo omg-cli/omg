@@ -21,6 +21,8 @@ use crate::{cli::style, core::http::download_client};
 
 const ZIG_INDEX_URL: &str = "https://ziglang.org/download/index.json";
 
+type ZigIndex = serde_json::Map<String, serde_json::Value>;
+
 /// Zig release version info (tarball URL and checksum come from the index).
 #[derive(Debug, Clone)]
 pub(crate) struct ZigVersion {
@@ -42,66 +44,67 @@ impl ZigManager {
         }
     }
 
-    /// Fetch the raw release index.
-    async fn fetch_index(&self) -> Result<serde_json::Value> {
-        self.client
+    async fn fetch_index(&self) -> Result<ZigIndex> {
+        let response = self
+            .client
             .get(ZIG_INDEX_URL)
             .timeout(std::time::Duration::from_secs(30))
             .send()
             .await
             .context("Failed to fetch Zig release index. Check your internet connection.")?
             .error_for_status()
-            .context("Zig release-index request failed")?
+            .context("Zig release-index request failed")?;
+        anyhow::ensure!(
+            response.status() == reqwest::StatusCode::OK,
+            "Zig release index returned HTTP {}",
+            response.status()
+        );
+        response
             .bounded_json()
             .await
             .context("Failed to parse Zig release index from ziglang.org")
     }
 
-    /// List available Zig versions (newest first, `master` excluded).
+    /// List stable releases with a tarball entry for this host, newest first.
     pub async fn list_available(&self) -> Result<Vec<ZigVersion>> {
-        Ok(parse_zig_versions(&self.fetch_index().await?))
-    }
-
-    /// Resolve `latest` and partial requests against the index. Exact
-    /// versions pass through so the installed fast path is preserved.
-    pub async fn resolve_alias(&self, alias: &str) -> Result<String> {
-        let alias = normalize_version(alias);
-        if alias == "latest" {
-            let versions = self.list_available().await?;
-            versions
-                .first()
-                .map(|version| version.version.clone())
-                .context("No Zig versions found upstream")
-        } else {
-            Ok(alias)
-        }
-    }
-
-    /// Resolve a partial version request (`0`, `0.15`) to the newest matching
-    /// index release before any tarball URL is built.
-    async fn resolve_requested_version(&self, version: &str) -> Result<String> {
-        if !super::common::is_partial_version(version) {
-            return Ok(version.to_owned());
-        }
-        let available = self.list_available().await?;
-        let names: Vec<String> = available
-            .iter()
-            .map(|version| version.version.clone())
-            .collect();
-        Ok(super::resolve_version_request(&names, version))
+        let target = zig_target()?;
+        Ok(parse_zig_versions(&self.fetch_index().await?, target))
     }
 
     /// Install Zig - PURE RUST, NO SUBPROCESS
     pub async fn install(&self, version: &str) -> Result<()> {
-        let version = self.resolve_alias(version).await?;
-        let version = self.resolve_requested_version(&version).await?;
-        crate::core::security::validate_runtime_version(&version)?;
+        let requested = normalize_version(version);
+        crate::core::security::validate_runtime_version(&requested)?;
+        let (version, index) =
+            if requested == "latest" || super::common::is_partial_version(&requested) {
+                let target = zig_target()?;
+                let index = self.fetch_index().await?;
+                let versions = parse_zig_versions(&index, target);
+                let version = if requested == "latest" {
+                    versions
+                        .into_iter()
+                        .next()
+                        .map(|release| release.version)
+                        .with_context(|| format!("No Zig versions found upstream for {target}"))?
+                } else {
+                    let names: Vec<_> = versions
+                        .into_iter()
+                        .map(|release| release.version)
+                        .collect();
+                    super::resolve_version_request(&names, &requested)
+                };
+                (version, Some(index))
+            } else {
+                (requested, None)
+            };
+        let _install_lease = super::common::try_lock_runtime_install(&self.versions_dir, &version)?;
         let version_dir = self.versions_dir.join(&version);
 
         if super::common::is_valid_version_dir(&version_dir) {
             print_already_installed("Zig", &version);
             return self.use_version(&version);
         }
+        super::common::require_unoccupied_install_destination(&version_dir)?;
 
         println!(
             "{} Installing Zig {}...\n",
@@ -109,27 +112,30 @@ impl ZigManager {
             style::caution(&version)
         );
 
-        let index = self.fetch_index().await?;
-        let (url, checksum) = index_artifact(&index, &version, zig_target()?)?;
+        let target = zig_target()?;
+        let index = if let Some(index) = index {
+            index
+        } else {
+            self.fetch_index().await?
+        };
+        let (url, checksum) = index_artifact(&index, &version, target)?;
 
         let filename = url
-            .rsplit('/')
-            .next()
+            .path_segments()
+            .and_then(|mut segments| segments.next_back())
             .filter(|name| !name.is_empty())
             .with_context(|| format!("Zig tarball URL has no filename: {url}"))?;
         super::common::validate_download_filename(filename)?;
-
-        fs::create_dir_all(&self.versions_dir)?;
 
         println!("{} Downloading {filename}...", style::informative("→"));
         let downloads = tempfile::Builder::new()
             .prefix(".download-")
             .tempdir_in(&self.versions_dir)?;
         let download_path = downloads.path().join(filename);
-        download_with_progress(self.client, &url, &download_path, &checksum).await?;
+        download_with_progress(self.client, url.as_str(), &download_path, &checksum).await?;
 
         println!("{} Extracting (pure Rust)...", style::informative("→"));
-        self.publish_download(&download_path, &url, &version)
+        self.publish_download(&download_path, url.as_str(), &version)
             .await?;
 
         remove_file_best_effort(&download_path, "runtime archive");
@@ -191,23 +197,17 @@ fn zig_target() -> Result<&'static str> {
     }
 }
 
-/// Parse the release index into newest-first versions, skipping `master`.
-fn parse_zig_versions(index: &serde_json::Value) -> Vec<ZigVersion> {
-    let Some(table) = index.as_object() else {
-        return Vec::new();
-    };
-    let mut versions: Vec<ZigVersion> = table
+/// The publisher's stable version keys identify the downloadable releases.
+fn parse_zig_versions(index: &ZigIndex, target: &str) -> Vec<ZigVersion> {
+    let mut versions: Vec<ZigVersion> = index
         .iter()
-        .filter(|(key, _)| *key != "master")
-        .filter_map(|(key, entry)| {
-            let version = entry
-                .get("version")
-                .and_then(serde_json::Value::as_str)
-                .filter(|version| !version.is_empty())
-                .unwrap_or(key);
-            (!version.is_empty()).then(|| ZigVersion {
-                version: version.to_owned(),
-            })
+        .filter(|(key, entry)| {
+            entry.get(target).is_some()
+                && semver::Version::parse(key)
+                    .is_ok_and(|version| version.pre.is_empty() && version.build.is_empty())
+        })
+        .map(|(key, _)| ZigVersion {
+            version: key.clone(),
         })
         .collect();
     versions.sort_by(|a, b| super::common::version_cmp(&b.version, &a.version));
@@ -215,22 +215,33 @@ fn parse_zig_versions(index: &serde_json::Value) -> Vec<ZigVersion> {
 }
 
 /// Resolve the tarball URL and validated SHA-256 for one index version.
-fn index_artifact(
-    index: &serde_json::Value,
-    version: &str,
-    target: &str,
-) -> Result<(String, String)> {
+fn index_artifact(index: &ZigIndex, version: &str, target: &str) -> Result<(reqwest::Url, String)> {
     let entry = index.get(version).with_context(|| {
         format!("Zig version {version} not found in the release index. Check available versions with: omg list zig --available")
     })?;
+    if let Some(declared) = entry.get("version").filter(|_| version != "master") {
+        anyhow::ensure!(
+            declared.as_str() == Some(version),
+            "Index entry version {declared} does not match Zig release {version}"
+        );
+    }
     let artifact = entry
         .get(target)
         .with_context(|| format!("Zig {version} has no {target} tarball in the release index"))?;
     let url = artifact
         .get("tarball")
         .and_then(serde_json::Value::as_str)
-        .with_context(|| format!("Zig {version} {target} entry has no tarball URL"))?
-        .to_owned();
+        .with_context(|| format!("Zig {version} {target} entry has no tarball URL"))?;
+    let url = reqwest::Url::parse(url).context("Invalid Zig publisher URL")?;
+    anyhow::ensure!(
+        url.scheme() == "https"
+            && url.host_str() == Some("ziglang.org")
+            && url.port_or_known_default() == Some(443)
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.fragment().is_none(),
+        "Zig publisher URL must use the official ziglang.org HTTPS origin"
+    );
     let digest = artifact
         .get("shasum")
         .and_then(serde_json::Value::as_str)
@@ -255,6 +266,7 @@ async fn stage_zig_tree(download_path: &Path, staging: &Path) -> Result<()> {
         }
     }
     let binary = staging.join("zig");
+    super::common::require_regular_file(&binary)?;
     make_staged_executable(&binary)?;
     let bin_dir = staging.join("bin");
     fs::create_dir_all(&bin_dir)?;
@@ -320,9 +332,9 @@ mod tests {
             client: download_client(),
         };
         manager
-            .install(version)
+            .install("0.15")
             .await
-            .expect("complete authenticated public installation");
+            .expect("complete authenticated public installation from one catalog");
         let installed = fixture.versions.join(version);
         assert_eq!(
             fs::read(fixture.versions.join("current").join("bin/zig")).unwrap(),
@@ -349,17 +361,17 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn fixture_index() -> serde_json::Value {
-        json!({
+    fn fixture_index() -> ZigIndex {
+        serde_json::from_value(json!({
             "master": {"version": "0.18.0-dev.1+abc", "x86_64-linux": {"tarball": "https://ziglang.org/builds/zig-x86_64-linux-master.tar.xz", "shasum": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}},
             "0.16.0": {"version": "0.16.0", "x86_64-linux": {"tarball": "https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz", "shasum": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}},
             "0.15.2": {"version": "0.15.2", "x86_64-linux": {"tarball": "https://ziglang.org/download/0.15.2/zig-x86_64-linux-0.15.2.tar.xz", "shasum": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}},
-        })
+        })).expect("fixture index is an object")
     }
 
     #[test]
     fn index_parsing_skips_master_and_sorts_newest_first() {
-        let versions = parse_zig_versions(&fixture_index());
+        let versions = parse_zig_versions(&fixture_index(), "x86_64-linux");
         let names: Vec<&str> = versions
             .iter()
             .map(|version| version.version.as_str())
@@ -367,11 +379,64 @@ mod tests {
         assert_eq!(names, vec!["0.16.0", "0.15.2"]);
     }
 
+    #[tokio::test]
+    async fn release_index_rejects_partial_success_and_non_object_responses() -> Result<()> {
+        let path = "/download/index.json";
+        let fixture = super::super::test_https::HttpsFixture::new_with_statuses(
+            "ziglang.org",
+            vec![
+                (path.to_owned(), 206, serde_json::to_vec(&fixture_index())?),
+                (path.to_owned(), 200, b"[]".to_vec()),
+            ],
+        )
+        .await?;
+        let manager = ZigManager {
+            client: Box::leak(Box::new(fixture.client(true)?)),
+            ..ZigManager::new()
+        };
+        let partial = manager.list_available().await;
+        let array = manager.list_available().await;
+        assert_eq!(
+            fixture.finish().await?,
+            vec![format!("GET {path} HTTP/1.1"); 2]
+        );
+        for (result, expected) in [(partial, "HTTP 206"), (array, "Zig release index")] {
+            let error = result.expect_err("invalid release index must fail");
+            assert!(format!("{error:#}").contains(expected), "{error:#}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn index_artifact_requires_the_published_release_and_origin() {
+        let mut index = fixture_index();
+        index.get_mut("0.16.0").unwrap()["version"] = json!("0.16.1");
+        let error = index_artifact(&index, "0.16.0", "x86_64-linux")
+            .expect_err("conflicting release identity");
+        assert!(
+            format!("{error:#}").contains("does not match Zig release 0.16.0"),
+            "{error:#}"
+        );
+
+        let mut index = fixture_index();
+        index.get_mut("0.16.0").unwrap()["x86_64-linux"]["tarball"] =
+            json!("https://example.com/download/zig.tar.xz");
+        let error = index_artifact(&index, "0.16.0", "x86_64-linux")
+            .expect_err("archive origin must be Zig's publisher");
+        assert!(
+            format!("{error:#}").contains("Zig publisher URL"),
+            "{error:#}"
+        );
+    }
+
     #[test]
     fn index_artifact_resolves_url_and_validates_shasum() {
         let (url, checksum) =
             index_artifact(&fixture_index(), "0.16.0", "x86_64-linux").expect("fixture artifact");
-        assert!(url.ends_with("zig-x86_64-linux-0.16.0.tar.xz"), "{url}");
+        assert!(
+            url.path().ends_with("zig-x86_64-linux-0.16.0.tar.xz"),
+            "{url}"
+        );
         assert_eq!(
             checksum,
             "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
