@@ -7,6 +7,15 @@ use super::enforce_install_policy;
 
 pub async fn install(packages: &[String]) -> Result<()> {
     let pm = get_package_manager()?;
+    let summary = "Installed";
+    #[cfg(feature = "fedora")]
+    let summary = if crate::package_managers::resolve_backend()?
+        == crate::package_managers::Backend::Fedora
+    {
+        "Install request complete for"
+    } else {
+        summary
+    };
     let policy =
         crate::core::security::SecurityPolicy::load_default().map_err(anyhow::Error::from)?;
     let vulnerability_scanner = crate::core::security::vulnerability::VulnerabilityScanner::new();
@@ -53,7 +62,7 @@ pub async fn install(packages: &[String]) -> Result<()> {
 
     modern_ui::print_success_with_packages(
         &format!(
-            "Install request complete for {} {}",
+            "{summary} {} {}",
             packages.len(),
             if packages.len() == 1 {
                 "package"
