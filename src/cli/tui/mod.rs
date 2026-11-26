@@ -1,10 +1,12 @@
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+    terminal::{
+        Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
+        enable_raw_mode,
+    },
 };
-use futures::FutureExt;
 use ratatui::{Terminal, backend::CrosstermBackend};
 use std::future::Future;
 use std::io;
@@ -98,73 +100,71 @@ async fn run_tui_with_app(mut app: app::App) -> Result<()> {
         "Interactive dashboard requires an interactive terminal"
     );
 
-    // Setup terminal. Every fallible step must restore previously-acquired
-    // terminal state on failure, or the user's shell is left in raw mode.
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    if let Err(err) = execute!(stdout, EnterAlternateScreen) {
-        disable_raw_mode()?;
-        return Err(err.into());
+    let mut session = TerminalSession::new().context("Failed to enter dashboard terminal")?;
+    let result = run_app(&mut session, &mut app).await;
+    let restoration = session
+        .restore()
+        .context("Failed to restore dashboard terminal");
+    result.and(restoration)
+}
+
+struct TerminalSession {
+    terminal: Terminal<CrosstermBackend<io::Stdout>>,
+    active: bool,
+}
+
+impl TerminalSession {
+    fn new() -> io::Result<Self> {
+        let mut session = Self {
+            terminal: Terminal::new(CrosstermBackend::new(io::stdout()))?,
+            active: false,
+        };
+        session.enter()?;
+        Ok(session)
     }
 
-    let terminal = match Terminal::new(CrosstermBackend::new(stdout))
-        .and_then(|mut terminal| terminal.hide_cursor().map(|()| terminal))
-    {
-        Ok(terminal) => terminal,
-        Err(err) => {
-            disable_raw_mode()?;
-            execute!(io::stdout(), LeaveAlternateScreen)?;
-            return Err(err.into());
+    fn enter(&mut self) -> io::Result<()> {
+        enable_raw_mode()?;
+        self.active = true;
+        execute!(
+            self.terminal.backend_mut(),
+            EnterAlternateScreen,
+            Clear(ClearType::All)
+        )?;
+        self.terminal.hide_cursor()
+    }
+
+    fn restore(&mut self) -> io::Result<()> {
+        if !self.active {
+            return Ok(());
         }
-    };
-    let mut terminal = terminal;
 
-    // Catch panics from the event loop so raw mode and the alternate screen
-    // are restored before the panic resumes.
-    let app_result = std::panic::AssertUnwindSafe(run_app(&mut terminal, &mut app))
-        .catch_unwind()
-        .await;
-    let cleanup_result = cleanup_terminal(&mut terminal);
+        // Try each restoration even if one fails. Output to the primary
+        // screen is limited to restoring the cursor.
+        let raw = disable_raw_mode();
+        let screen = execute!(self.terminal.backend_mut(), LeaveAlternateScreen);
+        let cursor = self.terminal.show_cursor();
+        let result = raw.and(screen).and(cursor);
+        self.active = result.is_err();
+        result
+    }
 
-    match app_result {
-        Ok(result) => result.and(cleanup_result),
-        Err(payload) => {
-            if let Err(error) = cleanup_result {
-                tracing::error!("Failed to restore terminal after TUI panic: {error}");
-            }
-            std::panic::resume_unwind(payload)
+    fn resume(&mut self) -> io::Result<()> {
+        // The resumed alternate screen needs fresh drawing buffers.
+        self.terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+        self.enter()
+    }
+}
+
+impl Drop for TerminalSession {
+    fn drop(&mut self) {
+        if let Err(error) = self.restore() {
+            tracing::error!("Failed to restore dashboard terminal: {error}");
         }
     }
 }
 
-/// Cleanup terminal state - extracted to ensure consistent cleanup
-fn cleanup_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
-    terminal.clear()?;
-    Ok(())
-}
-
-fn suspend_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
-    Ok(())
-}
-
-fn resume_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
-    enable_raw_mode()?;
-    execute!(terminal.backend_mut(), EnterAlternateScreen)?;
-    terminal.hide_cursor()?;
-    terminal.clear()?;
-    Ok(())
-}
-
-async fn run_app(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    app: &mut app::App,
-) -> Result<()> {
+async fn run_app(session: &mut TerminalSession, app: &mut app::App) -> Result<()> {
     let mut last_search = String::new();
     let mut next_search_id = 0;
     let mut search_request = None;
@@ -227,7 +227,7 @@ async fn run_app(
         }
 
         // Draw UI
-        terminal.draw(|f| ui::draw(f, app))?;
+        session.terminal.draw(|f| ui::draw(f, app))?;
 
         // Handle events with timeout for animations
         let was_search_mode = app.search_mode;
@@ -288,7 +288,7 @@ async fn run_app(
                     ));
                 }
                 if let Some(action) = terminal_action {
-                    run_terminal_action(terminal, app, action).await?;
+                    run_terminal_action(session, app, action).await?;
                 }
             }
         }
@@ -466,14 +466,14 @@ fn handle_special_key_actions(
 }
 
 async fn run_terminal_action(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    session: &mut TerminalSession,
     app: &mut app::App,
     action: app::ConfirmationAction,
 ) -> Result<()> {
     app.action_in_flight = true;
-    if let Err(error) = suspend_terminal(terminal) {
+    if let Err(error) = session.restore() {
         app.action_in_flight = false;
-        return Err(error);
+        return Err(error).context("Failed to suspend dashboard terminal");
     }
 
     let (label, result) = match action {
@@ -497,7 +497,9 @@ async fn run_terminal_action(
         ),
     };
 
-    let resume_result = resume_terminal(terminal);
+    let resume_result = session
+        .resume()
+        .context("Failed to resume dashboard terminal");
     app.action_in_flight = false;
     report_action_result(app, result, label);
     force_refresh(app);

@@ -7735,6 +7735,106 @@ env.OMG_FIXTURE_TASK = "changed"
                     checks.append(dict(phase=phase, case=f"{role}-{option[2:]}-ipc",
                                        passed=calls == (0, 0), value=calls))
 
+    def inspect_dashboard_terminal():
+        import pty
+        import select
+        import termios
+
+        enter = b"\x1b[?1049h"
+        leave = b"\x1b[?1049l"
+        hide = b"\x1b[?25l"
+        show = b"\x1b[?25h"
+        report = b"\x1b[6n"
+        cases = (
+            ("quit", (b"q",), 1, b""),
+            ("interrupt", (b"\x03",), 1, b""),
+            ("cancel-search", (b"2", b"/", b"q", b"\x1b", b"q"), 1, b""),
+            ("interrupt-search", (b"2", b"/", b"\x03"), 1, b""),
+            ("cancel-update", (b"u", b"\x1b", b"q"), 1, b"Install all available package updates"),
+            ("cancel-clean", (b"c", b"\x1b", b"q"), 1, b"Clean Package Caches"),
+            ("cancel-orphans", (b"o", b"\x1b", b"q"), 1, b"Remove every orphaned package"),
+            ("resume-after-error", (b"c", b"\r", b"q"), 2, b"clean cache failed"),
+        )
+        for label, keys, sessions, evidence in cases:
+            master, slave = pty.openpty()
+            code = None
+            output = bytearray()
+            replies = 0
+            attributes = None
+            before = termios.tcgetattr(slave)
+
+            def attach_tty():
+                fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+
+            def read_terminal(deadline, finished):
+                nonlocal replies
+                while time.monotonic() < deadline and not finished():
+                    if not select.select([master], [], [], 0.03)[0]:
+                        continue
+                    chunk = os.read(master, 8192)
+                    if not chunk:
+                        break
+                    output.extend(chunk)
+                    assert len(output) <= 524288
+                    for _ in range(output.count(report) - replies):
+                        os.write(master, b"\x1b[1;1R")
+                        replies += 1
+
+            try:
+                termios.tcsetwinsize(slave, (28, 112))
+                os.chown(os.ttyname(slave), account.pw_uid, account.pw_gid)
+                mode = dict(disabled, TERM="xterm-256color", OMG_NO_UPDATE_CHECK="1")
+                if label == "resume-after-error":
+                    mode.update(OMG_TEST_MODE="1", OMG_TEST_DISTRO="fedora")
+                with subprocess.Popen([str(cli), "dash"], cwd=work, env=mode, stdin=slave,
+                                      stdout=slave, stderr=slave, start_new_session=True,
+                                      preexec_fn=attach_tty, **ordinary) as process:
+                    try:
+                        read_terminal(time.monotonic() + 8,
+                                      lambda: hide in output or process.poll() is not None)
+                        for index, key in enumerate(keys):
+                            if process.poll() is not None:
+                                break
+                            os.write(master, key)
+                            if index + 1 < len(keys):
+                                read_terminal(time.monotonic() + 0.24,
+                                              lambda: process.poll() is not None)
+                            if label.startswith("cancel-") and evidence and index == 0:
+                                read_terminal(time.monotonic() + 5,
+                                              lambda: evidence in output or process.poll() is not None)
+                            if label == "resume-after-error" and key == b"\r":
+                                read_terminal(time.monotonic() + 5,
+                                              lambda: evidence in output or process.poll() is not None)
+                        read_terminal(time.monotonic() + 8, lambda: process.poll() is not None)
+                        code = process.poll()
+                        read_terminal(time.monotonic() + 0.15, lambda: False)
+                        attributes = termios.tcgetattr(slave)
+                    finally:
+                        if process.poll() is None:
+                            process.kill()
+                            process.wait(3)
+            finally:
+                os.close(master)
+                os.close(slave)
+
+            last_exit = output.rfind(leave)
+            restored = output[last_exit + len(leave):] if last_exit >= 0 else b""
+            checks.extend((
+                dict(phase="dashboard-terminal", case=f"{label}-process",
+                     passed=code == 0 and evidence in output, status=code,
+                     diagnostic=output[-500:].decode(errors="replace")),
+                dict(phase="dashboard-terminal", case=f"{label}-termios",
+                     passed=attributes == before),
+                dict(phase="dashboard-terminal", case=f"{label}-screen",
+                     passed=output.count(enter) == output.count(leave) == sessions
+                     and not re.search(rb"\x1b\[[23]J", restored) and report not in output,
+                     value={"enters":output.count(enter), "leaves":output.count(leave),
+                            "cursor_queries":output.count(report),
+                            "after_exit":restored[-140:].decode(errors="replace")}),
+                dict(phase="dashboard-terminal", case=f"{label}-cursor",
+                     passed=last_exit >= 0 and restored.rfind(show) > restored.rfind(hide)),
+            ))
+
     def inspect_info_json_writes():
         cases = (
             ("name", package, "No space left on device"),
@@ -8678,6 +8778,7 @@ exec {shlex.quote(str(binary))} "$@"
                 if consent_oracle is not None:
                     inspect_info_attempts()
                     inspect_info_json_writes()
+                    inspect_dashboard_terminal()
                     inspect_migration()
                     inspect_snapshots()
                     inspect_snapshot_recovery()
@@ -9007,6 +9108,6 @@ mark_progress("completed with host inventory unchanged")
 report = dict(binaries=binaries, checks=checks, total=len(checks),
               passed=sum(entry["passed"] for entry in checks), host_unchanged=True)
 print(json.dumps(report))
-expected_checks = 303 if consent_oracle is None else 2835
+expected_checks = 303 if consent_oracle is None else 2867
 if report["passed"] != report["total"] or report["total"] != expected_checks:
     sys.exit(4)
