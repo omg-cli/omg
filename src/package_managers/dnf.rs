@@ -3160,17 +3160,18 @@ impl DnfPackageManager {
         let targets = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
         crate::core::security::audit::record_operation("dnf", &targets, "attempt")?;
         cmd.args(args);
-        let status = Self::run_native_command(cmd)?;
+        let status = Self::run_native_command(cmd, args == ["clean", "packages"]);
         crate::core::security::audit::record_operation(
             "dnf",
             &targets,
-            if status.success() {
+            if status.as_ref().is_ok_and(std::process::ExitStatus::success) {
                 "succeeded"
             } else {
                 "failed"
             },
         )?;
 
+        let status = status?;
         if status.success() {
             self.invalidate_installed_cache();
             Ok(())
@@ -3179,17 +3180,23 @@ impl DnfPackageManager {
         }
     }
 
-    /// Run a foreground DNF transaction on its blocking owner. Leave the
-    /// native input and output streams connected for prompts and progress.
+    /// Run DNF on its blocking owner. Foreground transactions retain stdout
+    /// for prompts and progress. Cache cleanup also inspects native stdout.
     pub(crate) fn run_native_command(
-        command: std::process::Command,
+        mut command: std::process::Command,
+        cache_cleanup: bool,
     ) -> std::io::Result<std::process::ExitStatus> {
+        if cache_cleanup {
+            command
+                .env("LC_ALL", "C")
+                .stdout(std::process::Stdio::piped());
+        }
         std::thread::Builder::new()
             .spawn(move || {
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()?;
-                runtime.block_on(Self::native_command_status(command.into()))
+                runtime.block_on(Self::native_command_status(command.into(), cache_cleanup))
             })?
             .join()
             .map_err(|_| std::io::Error::other("DNF command owner panicked"))?
@@ -3197,8 +3204,10 @@ impl DnfPackageManager {
 
     async fn native_command_status(
         mut command: tokio::process::Command,
+        cache_cleanup: bool,
     ) -> std::io::Result<std::process::ExitStatus> {
         let mut child = command.stderr(std::process::Stdio::piped()).spawn()?;
+        let stdout = child.stdout.take();
         let stderr = child.stderr.take().expect("DNF stderr is piped");
         #[cfg(unix)]
         let forward = {
@@ -3211,39 +3220,70 @@ impl DnfPackageManager {
         };
         #[cfg(not(unix))]
         let forward = true;
-        let diagnostics = Self::forward_native_diagnostics(stderr, forward);
-        tokio::pin!(diagnostics);
-        let (status, diagnostic_result) = tokio::select! {
-            result = &mut diagnostics => (child.wait().await?, result),
-            status = child.wait() => {
-                // A descendant can inherit stderr after DNF itself has exited.
-                let result = tokio::time::timeout(
-                    std::time::Duration::from_secs(1),
-                    &mut diagnostics,
-                ).await.unwrap_or(Ok(()));
-                (status?, result)
+        let mut removal_failed = false;
+        let mut repository_failed = false;
+        let (status, diagnostic_result) = {
+            let diagnostics = async {
+                let stdout = async {
+                    if let Some(stdout) = stdout {
+                        Self::forward_native_lines(stdout, std::io::stdout(), forward, |line| {
+                            removal_failed |= Self::cache_cleanup_report_has_errors(line);
+                        })
+                        .await?;
+                    }
+                    Ok(())
+                };
+                let stderr =
+                    Self::forward_native_lines(stderr, std::io::stderr(), forward, |line| {
+                        repository_failed |= cache_cleanup
+                            && line.starts_with("Failed to cleanup repository cache in path ");
+                    });
+                let (stdout, stderr) = tokio::join!(stdout, stderr);
+                stdout.and(stderr)
+            };
+            tokio::pin!(diagnostics);
+            tokio::select! {
+                result = &mut diagnostics => (child.wait().await?, result),
+                status = child.wait() => {
+                    // Descendants can retain pipes after DNF itself has exited.
+                    let result = tokio::time::timeout(
+                        std::time::Duration::from_secs(1),
+                        &mut diagnostics,
+                    ).await.unwrap_or(Ok(()));
+                    (status?, result)
+                }
             }
         };
         if let Err(error) = diagnostic_result {
             tracing::debug!(%error, "Could not forward DNF diagnostics");
         }
+        if cache_cleanup && status.success() && (removal_failed || repository_failed) {
+            return Err(std::io::Error::other(
+                "DNF reported package cache cleanup errors",
+            ));
+        }
         Ok(status)
     }
 
-    async fn forward_native_diagnostics(
-        mut stderr: tokio::process::ChildStderr,
-        forward: bool,
+    fn cache_cleanup_report_has_errors(line: &str) -> bool {
+        // DNF5 can exit zero even after reporting failed cache deletions.
+        line.strip_prefix("Removed ")
+            .and_then(|line| line.rsplit_once("). "))
+            .and_then(|(_, report)| report.strip_suffix(" errors occurred."))
+            .and_then(|count| count.parse::<u64>().ok())
+            .is_some_and(|count| count != 0)
+    }
+
+    async fn forward_native_lines(
+        input: impl tokio::io::AsyncRead + Unpin,
+        mut terminal: impl std::io::Write,
+        mut forward: bool,
+        mut inspect_line: impl FnMut(&str),
     ) -> std::io::Result<()> {
-        use std::io::Write as _;
         use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 
-        if !forward {
-            tokio::io::copy(&mut stderr, &mut tokio::io::sink()).await?;
-            return Ok(());
-        }
         const MAX_LINE_BYTES: u64 = 64 * 1024;
-        let mut reader = BufReader::new(stderr);
-        let mut terminal = std::io::stderr();
+        let mut reader = BufReader::new(input);
         let mut line = Vec::new();
         let mut discarding_line = false;
         loop {
@@ -3260,15 +3300,19 @@ impl DnfPackageManager {
                 continue;
             }
             let raw = String::from_utf8_lossy(&line);
-            let mut safe = Self::safe_query_diagnostic(raw.trim_end_matches(['\r', '\n']));
-            safe.push('\n');
-            if terminal.write_all(safe.as_bytes()).is_err() {
-                // A closed log sink cannot interrupt a running transaction.
-                tokio::io::copy(&mut reader, &mut tokio::io::sink()).await?;
-                return Ok(());
+            let raw = raw.trim_end_matches(['\r', '\n']);
+            inspect_line(raw);
+            if forward {
+                let mut safe = Self::safe_query_diagnostic(raw);
+                safe.push('\n');
+                // Continue inspecting after a log reader closes its pipe.
+                forward = terminal.write_all(safe.as_bytes()).is_ok();
             }
         }
-        terminal.flush()
+        if forward {
+            terminal.flush()?;
+        }
+        Ok(())
     }
 }
 
@@ -5570,7 +5614,9 @@ mod tests {
             .arg(&pid_file);
         let status = tokio::time::timeout(
             std::time::Duration::from_secs(4),
-            tokio::task::spawn_blocking(move || DnfPackageManager::run_native_command(command)),
+            tokio::task::spawn_blocking(move || {
+                DnfPackageManager::run_native_command(command, false)
+            }),
         )
         .await;
         let child_pid: i32 = std::fs::read_to_string(pid_file)?.trim().parse()?;
@@ -5584,6 +5630,34 @@ mod tests {
                 .code(),
             Some(7)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn native_cache_cleanup_reports_partial_dnf_failures() -> Result<()> {
+        let run = |script: &str, cache_cleanup| {
+            let mut command = std::process::Command::new("/bin/sh");
+            command.args(["-c", script]);
+            DnfPackageManager::run_native_command(command, cache_cleanup)
+        };
+        let summary =
+            "printf '%s\\n' 'Removed 1 files, 1 directories (total of 8 B). 2 errors occurred.'";
+        let repository = "printf '%s\\n' 'Failed to cleanup repository cache in path fixture' >&2";
+        for script in [summary, repository] {
+            assert_eq!(
+                run(script, true).unwrap_err().to_string(),
+                "DNF reported package cache cleanup errors"
+            );
+        }
+        assert!(run(summary, false)?.success());
+        assert!(
+            run(
+                "printf '%s\\n' 'Removed 1 files, 1 directories (total of 8 B). 0 errors occurred.'",
+                true,
+            )?
+            .success()
+        );
+        assert_eq!(run(&format!("{repository}; exit 7"), true)?.code(), Some(7));
         Ok(())
     }
 
