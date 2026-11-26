@@ -368,7 +368,8 @@ fn advisory_link(id: &str) -> Option<String> {
     None
 }
 
-fn safe_reference(value: &str) -> Option<String> {
+/// Validate a provider's advisory URL before display or export.
+pub(super) fn safe_reference(value: &str) -> Option<String> {
     if value != crate::cli::style::sanitize_terminal_text(value) {
         return None;
     }

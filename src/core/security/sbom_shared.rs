@@ -400,9 +400,16 @@ fn compose(
                             native
                                 .references
                                 .iter()
-                                .map(|reference| SbomVulnAdvisory {
-                                    title: Some(format!("{}: {}", reference.kind, reference.id)),
-                                    url: reference.url.clone(),
+                                .filter_map(|reference| {
+                                    let url =
+                                        super::advisory_review::safe_reference(&reference.url)?;
+                                    Some(SbomVulnAdvisory {
+                                        title: Some(format!(
+                                            "{}: {}",
+                                            reference.kind, reference.id
+                                        )),
+                                        url,
+                                    })
                                 })
                                 .collect()
                         })
@@ -830,16 +837,28 @@ mod tests {
         native_audit.high_severity = 1;
         let finding = &mut native_audit.vulnerabilities[0].1[0];
         finding.advisory_severity = Some(AdvisorySeverity::Important);
+        let public_reference = "https://bugs.example.test/show_bug.cgi?id=1234#details";
         finding.native_advisory = Some(crate::core::security::scan::NativeAdvisory {
             source: "dnf5".into(),
             advisory_nevra: "fixture-1:1.0-2.x86_64".into(),
             published_severity: "Important".into(),
             description: "Upstream details".into(),
-            references: vec![crate::core::security::scan::AdvisoryReference {
-                id: "BZ-fixture".into(),
+            references: [
+                ("insecure", "http://example.test/advisory"),
+                (
+                    "credentials",
+                    "https://account:example@example.test/advisory",
+                ),
+                ("control", "https://example.test/\nforged"),
+                ("BZ-fixture", public_reference),
+            ]
+            .into_iter()
+            .map(|(id, url)| crate::core::security::scan::AdvisoryReference {
+                id: id.into(),
                 kind: "bugzilla".into(),
-                url: "https://example.test/advisory".into(),
-            }],
+                url: url.into(),
+            })
+            .collect(),
         });
         let native = compose_fixture(&installed, Some(&native_audit), Distro::Fedora).unwrap();
         let evidence = &native.vulnerabilities[0];
@@ -851,7 +870,12 @@ mod tests {
                 |property| property.name == "omg:advisory:title" && property.value == "fixture"
             )
         );
-        assert_eq!(evidence.advisories[0].url, "https://example.test/advisory");
+        assert_eq!(evidence.advisories.len(), 1, "emit only safe advisory URLs");
+        assert_eq!(evidence.advisories[0].url, public_reference);
+        assert_eq!(
+            evidence.advisories[0].title.as_deref(),
+            Some("bugzilla: BZ-fixture")
+        );
         assert!(evidence.references.is_empty());
         assert!(evidence.properties.iter().any(|property| property.name
             == "omg:advisory:published-severity"
