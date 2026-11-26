@@ -1029,7 +1029,7 @@ pub fn history(
                 let matches = entry
                     .changes
                     .iter()
-                    .any(|c| c.name.to_lowercase().contains(query_lower));
+                    .any(|change| change.display_name().to_lowercase().contains(query_lower));
                 if !matches {
                     return false;
                 }
@@ -1103,14 +1103,15 @@ pub fn history(
 
         // If searching, highlight matching packages.
         for change in &entry.changes {
+            let name = crate::cli::style::sanitize_terminal_text(&change.display_name());
             let pkg_display = if let Some(ref query_lower) = search_lower {
-                if change.name.to_lowercase().contains(query_lower) {
-                    style::success(&change.name)
+                if name.to_lowercase().contains(query_lower) {
+                    style::success(&name)
                 } else {
-                    style::package(&change.name)
+                    style::package(&name)
                 }
             } else {
-                style::package(&change.name)
+                style::package(&name)
             };
 
             println!(
@@ -1435,6 +1436,7 @@ async fn rollback_with_aur_rebuild(
                     let changes = packages
                         .iter()
                         .map(|(name, version)| crate::core::history::PackageChange {
+                            architecture: None,
                             name: name.clone(),
                             old_version: None,
                             new_version: Some(version.clone()),
@@ -1478,6 +1480,7 @@ async fn rollback_with_aur_rebuild(
                 let changes = packages
                     .iter()
                     .map(|(name, version)| crate::core::history::PackageChange {
+                        architecture: None,
                         name: name.clone(),
                         old_version: None,
                         new_version: Some(version.clone()),
@@ -1528,6 +1531,7 @@ async fn rollback_with_aur_rebuild(
                     let changes = restored
                         .iter()
                         .map(|(name, version)| crate::core::history::PackageChange {
+                            architecture: None,
                             name: name.clone(),
                             old_version: None,
                             new_version: Some(version.clone()),
@@ -2047,6 +2051,7 @@ mod tests {
             timestamp: jiff::Timestamp::now(),
             transaction_type,
             changes: vec![crate::core::history::PackageChange {
+                architecture: None,
                 name: "example".to_string(),
                 old_version: old_version.map(str::to_string),
                 new_version: Some("2.0-1".to_string()),
@@ -2084,6 +2089,7 @@ mod tests {
         let mut target = transaction(TransactionType::Update, "aur", Some("1.0-1"), true);
         target.id = "a1b2".to_owned();
         target.changes.push(PackageChange {
+            architecture: None,
             name: "unavailable".to_owned(),
             old_version: Some("1.0-1".to_owned()),
             new_version: Some("2.0-1".to_owned()),
@@ -2162,6 +2168,7 @@ mod tests {
             true,
         );
         mixed.changes.push(crate::core::history::PackageChange {
+            architecture: None,
             name: "paru".to_string(),
             old_version: Some("1.9.0".to_string()),
             new_version: Some("2.0.0".to_string()),

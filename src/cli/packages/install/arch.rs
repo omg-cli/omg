@@ -178,6 +178,7 @@ fn parent_install_changes(
         .iter()
         .filter(|package| !aur_packages.contains(*package))
         .map(|package| PackageChange {
+            architecture: None,
             name: history_package_name(package),
             old_version: None,
             new_version: None,
@@ -573,6 +574,7 @@ fn record_aur_history(
 ) -> Result<()> {
     use crate::core::history::{HistoryManager, PackageChange, TransactionType};
     let change = PackageChange {
+        architecture: None,
         name: name.to_string(),
         old_version: None,
         new_version: installed_version,
@@ -1309,6 +1311,7 @@ mod tests {
         let aur = vec!["aur-only".to_string()];
         let expected =
             ["official-a", "official-b"].map(|name| crate::core::history::PackageChange {
+                architecture: None,
                 name: name.to_string(),
                 old_version: None,
                 new_version: None,

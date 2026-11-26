@@ -2679,27 +2679,32 @@ impl DnfPackageManager {
             }
         }
         let mut result = Vec::new();
-        for ((name, _architecture), changes) in grouped {
+        for ((name, architecture), changes) in grouped {
+            let change = |old_version, new_version| PackageChange {
+                name: name.to_owned(),
+                architecture: Some(architecture.to_owned()),
+                old_version,
+                new_version,
+                source: "dnf".to_owned(),
+            };
             if changes.removed.len() == 1 && changes.added.len() == 1 {
-                result.push(PackageChange {
-                    name: name.to_owned(),
-                    old_version: changes.removed.into_iter().next(),
-                    new_version: changes.added.into_iter().next(),
-                    source: "dnf".to_owned(),
-                });
+                result.push(change(
+                    changes.removed.into_iter().next(),
+                    changes.added.into_iter().next(),
+                ));
             } else {
-                result.extend(changes.removed.into_iter().map(|version| PackageChange {
-                    name: name.to_owned(),
-                    old_version: Some(version),
-                    new_version: None,
-                    source: "dnf".to_owned(),
-                }));
-                result.extend(changes.added.into_iter().map(|version| PackageChange {
-                    name: name.to_owned(),
-                    old_version: None,
-                    new_version: Some(version),
-                    source: "dnf".to_owned(),
-                }));
+                result.extend(
+                    changes
+                        .removed
+                        .into_iter()
+                        .map(|version| change(Some(version), None)),
+                );
+                result.extend(
+                    changes
+                        .added
+                        .into_iter()
+                        .map(|version| change(None, Some(version))),
+                );
             }
         }
         Ok(result)
@@ -5776,9 +5781,16 @@ mod tests {
             .find(|change| change.old_version.is_some())
             .unwrap();
         assert_eq!(upgrade.name, "a-b");
+        assert_eq!(upgrade.architecture.as_deref(), Some("x86_64"));
         assert_eq!(upgrade.old_version.as_deref(), Some("2:1-1"));
         assert_eq!(upgrade.new_version.as_deref(), Some("2:2-1"));
         assert_eq!(upgrade.source, "dnf");
+        let install = changes
+            .iter()
+            .find(|change| change.old_version.is_none())
+            .unwrap();
+        assert_eq!(install.display_name(), "a-b.i686");
+        assert_eq!(install.new_version.as_deref(), Some("2:3-1"));
         for package in [
             NativeTransactionPackage {
                 nevra: "broken".to_owned(),
@@ -5853,6 +5865,7 @@ mod tests {
             timestamp: "2026-01-01T00:00:00Z".parse()?,
             transaction_type: TransactionType::Install,
             changes: vec![PackageChange {
+                architecture: None,
                 name: "tree".to_owned(),
                 old_version: None,
                 new_version: Some("2.2.1-4.fc44".to_owned()),
@@ -5955,6 +5968,7 @@ mod tests {
         let history = HistoryManager::new_in(directory.path().join("history.json")).unwrap();
         let result = DnfPackageManager::record_native_result;
         let committed_changes = vec![PackageChange {
+            architecture: None,
             name: "tree".into(),
             old_version: Some("0:2.2.1-4.fc44".into()),
             new_version: None,

@@ -75,6 +75,7 @@ fn execute_recorded_system_update(
     let changes: Vec<PackageChange> = updates
         .into_iter()
         .map(|update| PackageChange {
+            architecture: None,
             name: update.name,
             old_version: Some(update.old_version),
             new_version: Some(update.new_version),

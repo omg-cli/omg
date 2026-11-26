@@ -1420,6 +1420,7 @@ async fn apply_security_updates(
                     format!("{package} no longer has an available update; rescan before fixing")
                 })?;
             Ok(PackageChange {
+                architecture: None,
                 name: update.name.clone(),
                 old_version: Some(update.old_version.clone()),
                 new_version: Some(update.new_version.clone()),

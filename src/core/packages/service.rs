@@ -146,6 +146,7 @@ impl PackageService {
                 if let Some(local) = local_metadata.get(pkg) {
                     official.push(pkg.clone());
                     changes.push(PackageChange {
+                        architecture: None,
                         name: local.name.clone(),
                         old_version: None,
                         new_version: Some(local.version.version_string()),
@@ -173,6 +174,7 @@ impl PackageService {
 
                     official.push(pkg.clone());
                     changes.push(PackageChange {
+                        architecture: None,
                         name: info.name,
                         old_version: None,
                         new_version: Some(info.version.version_string()),
@@ -195,6 +197,7 @@ impl PackageService {
 
                     aur_pkgs.push(pkg.clone());
                     changes.push(PackageChange {
+                        architecture: None,
                         name: info.name,
                         old_version: None,
                         new_version: Some(info.version.version_string()),
@@ -224,6 +227,7 @@ impl PackageService {
             #[cfg(feature = "arch")]
             if let Some(local) = local_metadata.get(pkg) {
                 changes.push(PackageChange {
+                    architecture: None,
                     name: local.name.clone(),
                     old_version: None,
                     new_version: Some(local.version.version_string()),
@@ -256,6 +260,7 @@ impl PackageService {
             .await?;
 
             changes.push(PackageChange {
+                architecture: None,
                 name: info.name,
                 old_version: None,
                 new_version: Some(info.version.version_string()),
@@ -300,6 +305,7 @@ impl PackageService {
         let changes = packages
             .iter()
             .map(|name| PackageChange {
+                architecture: None,
                 name: name.clone(),
                 // Preserve every request even if its installed version is unknown.
                 old_version: installed.get(name).cloned(),
@@ -339,6 +345,7 @@ impl PackageService {
             .await?;
 
             changes.push(PackageChange {
+                architecture: None,
                 name: up.name.clone(),
                 old_version: Some(up.old_version.clone()),
                 new_version: Some(up.new_version.clone()),

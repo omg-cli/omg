@@ -6,7 +6,7 @@ use serde::Serialize;
 use crate::cli::tea::{Cmd, UpdateType};
 use crate::core::packages::PackageService;
 use crate::package_managers::get_package_manager;
-use crate::package_managers::types::update_package_name;
+use crate::package_managers::types::qualified_package_name;
 
 #[derive(Debug, Serialize)]
 pub struct OutdatedPackage {
@@ -21,7 +21,7 @@ pub struct OutdatedPackage {
 
 impl OutdatedPackage {
     fn package_label(&self) -> std::borrow::Cow<'_, str> {
-        update_package_name(&self.name, self.architecture.as_deref())
+        qualified_package_name(&self.name, self.architecture.as_deref())
     }
 }
 

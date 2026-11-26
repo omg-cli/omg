@@ -37,12 +37,23 @@ impl std::fmt::Display for TransactionType {
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct PackageChange {
     pub name: String,
+    /// Architecture of the affected build when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub architecture: Option<String>,
     pub old_version: Option<String>,
     pub new_version: Option<String>,
     pub source: String,
 }
 
 impl PackageChange {
+    #[must_use]
+    pub fn display_name(&self) -> std::borrow::Cow<'_, str> {
+        crate::package_managers::types::qualified_package_name(
+            &self.name,
+            self.architecture.as_deref(),
+        )
+    }
+
     /// Whether the system package manager can restore this change.
     /// Official repository names vary (`core`, `extra`, `apt`, `pacman`), so
     /// only sources that require a separate installation path are excluded.
@@ -952,6 +963,7 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let manager = HistoryManager::new_in(directory.path().join("history.json"))?;
         let package_change = |index| PackageChange {
+            architecture: None,
             name: format!("pkg-{index}"),
             old_version: None,
             new_version: Some("1.0".to_string()),
@@ -1002,6 +1014,7 @@ mod tests {
         manager.add_transaction(
             TransactionType::Update,
             vec![PackageChange {
+                architecture: None,
                 name: "archived-package".into(),
                 old_version: Some("1".into()),
                 new_version: Some("2".into()),
@@ -1083,6 +1096,7 @@ mod tests {
     fn official_repository_names_are_restorable() {
         for source in ["official", "core", "extra", "apt", "pacman"] {
             let change = PackageChange {
+                architecture: None,
                 name: "example".to_string(),
                 old_version: Some("1.0".to_string()),
                 new_version: Some("2.0".to_string()),
@@ -1092,6 +1106,7 @@ mod tests {
         }
         for source in ["aur", "AUR", "local"] {
             let change = PackageChange {
+                architecture: None,
                 name: "example".to_string(),
                 old_version: Some("1.0".to_string()),
                 new_version: Some("2.0".to_string()),
@@ -1111,6 +1126,7 @@ mod tests {
             .finish_operation(
                 TransactionType::Install,
                 vec![PackageChange {
+                    architecture: None,
                     name: "example".to_string(),
                     old_version: None,
                     new_version: Some("1.0".to_string()),
@@ -1146,6 +1162,7 @@ mod tests {
         manager.finish_operation(
             TransactionType::Remove,
             vec![PackageChange {
+                architecture: None,
                 name: "example".to_string(),
                 old_version: Some("1.0".to_string()),
                 new_version: None,
@@ -1195,6 +1212,7 @@ mod tests {
             .finish_operation(
                 TransactionType::Install,
                 vec![PackageChange {
+                    architecture: None,
                     name: "example".to_string(),
                     old_version: None,
                     new_version: Some("1.0".to_string()),
@@ -1243,6 +1261,7 @@ mod tests {
             let result = manager.add_transaction(
                 TransactionType::Install,
                 vec![PackageChange {
+                    architecture: None,
                     name: "example".to_string(),
                     old_version: None,
                     new_version: Some("1.0".to_string()),
@@ -1314,6 +1333,7 @@ mod tests {
                 manager.add_transaction(
                     TransactionType::Install,
                     vec![PackageChange {
+                        architecture: None,
                         name: format!("package-{index}"),
                         old_version: None,
                         new_version: Some("1.0.0".to_string()),
@@ -1342,6 +1362,7 @@ mod tests {
             timestamp: Timestamp::now(),
             transaction_type: TransactionType::Install,
             changes: vec![PackageChange {
+                architecture: None,
                 name: "example".to_string(),
                 old_version: None,
                 new_version: Some("1.0.0".to_string()),
