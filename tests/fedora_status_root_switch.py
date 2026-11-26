@@ -2482,6 +2482,193 @@ run = 'fixture-environment "$@"'
                 expected={path_key: opaque_path})
 
 
+    def inspect_task_package_metadata():
+        import ctypes
+        import struct
+        import time
+
+        phase = "task-package-metadata"
+        helper = Path(__file__).with_name("runtime_advisory_fixture.py")
+        if not helper.is_file():
+            helper = fixture.parents[1] / "runtime_advisory_fixture.py"
+        versions = {"node": ("24.22.3", "24.23.5"), "bun": ("1.2.20", "1.2.21")}
+        with tempfile.TemporaryDirectory(prefix="task-package-metadata-", dir=work) as directory:
+            home = Path(directory)
+            os.chown(home, account.pw_uid, account.pw_gid)
+            seed = """
+import importlib.util, json, sys
+from pathlib import Path
+helper, home, definitions = sys.argv[1:]
+spec = importlib.util.spec_from_file_location("runtime_advisory_fixture", helper)
+fixture = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(fixture)
+home = Path(home)
+config = Path(fixture.fixture_cli_environment(home)["OMG_CONFIG_DIR"])
+for name, versions in json.loads(definitions).items():
+    for version in versions:
+        root = home / "data" / "versions" / name / version
+        executable = root / ("bin/node" if name == "node" else "bun")
+        executable.parent.mkdir(parents=True)
+        reported = "v" + version if name == "node" else version
+        executable.write_text(f'''#!/bin/sh
+if [ "$1" = --version ]; then
+    printf '%s\\n' '{reported}'
+    exit
+fi
+printf 'fixture package {name} {reported}'
+for arg in "$@"; do printf '|<%s>' "$arg"; done
+printf '\\n'
+''')
+        executable.chmod(0o755)
+        fixture.seed_runtime_advisory_fixture(root, name, version, config)
+bin_dir = home / "bin"
+bin_dir.mkdir()
+for manager in ("npm", "pnpm", "yarn"):
+    executable = bin_dir / manager
+    executable.write_text(f'''#!/bin/sh
+version=$(node --version) || exit
+printf 'fixture package {manager} %s' "$version"
+for arg in "$@"; do printf '|<%s>' "$arg"; done
+printf '\\n'
+''')
+    executable.chmod(0o755)
+"""
+            checked([sys.executable, "-I", "-B", "-c", seed, helper, home, json.dumps(versions)],
+                    dict(disabled, HOME=str(home)), ordinary)
+            env = dict(disabled, HOME=str(home), OMG_DATA_DIR=str(home/"data"),
+                       OMG_CONFIG_DIR=str(home/"config"/"omg"), OMG_NATIVE_TEST_DATA_DIR="1",
+                       XDG_CONFIG_HOME=str(home/"config"), XDG_DATA_HOME=str(home/"xdg-data"),
+                       XDG_CACHE_HOME=str(home/"cache"), XDG_STATE_HOME=str(home/"state"),
+                       PATH=f"{home/'bin'}:{base_env['PATH']}")
+            libc = ctypes.CDLL(None, use_errno=True)
+            libc.inotify_init1.argtypes = [ctypes.c_int]
+            libc.inotify_add_watch.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_uint32]
+            in_open, in_close_nowrite = 0x20, 0x10
+            notice = struct.Struct("iIII")
+            node, next_node = versions["node"]
+            bun, next_bun = versions["bun"]
+            script = {"fixture-js": "echo fixture"}
+            task = """[tasks.fixture]
+run = 'node "$@"'
+"""
+            provided = object()
+
+            def encoded(manifest):
+                return json.dumps(manifest) if isinstance(manifest, dict) else manifest
+
+            def run(label, *, metadata=provided, parent=None, pins=(), markers=(), mise=None,
+                    replacement=None, manager="npm", version=node, error=None, opens=2):
+                outer = home / label
+                outer.mkdir()
+                project = outer / "project"
+                project.mkdir()
+                os.chown(project, account.pw_uid, account.pw_gid)
+                manifest = project / "package.json"
+                if metadata is provided:
+                    metadata = {"engines": {"node": node, "bun": bun}, "scripts": script}
+                if isinstance(metadata, dict):
+                    metadata = {"scripts": script, **metadata}
+                if metadata is not None:
+                    manifest.write_text(encoded(metadata))
+                if parent is not None:
+                    (outer / "package.json").write_text(encoded(parent))
+                for filename, value in pins:
+                    (project / filename).write_text(value)
+                for filename in markers:
+                    (project / filename).touch()
+                if mise is not None:
+                    (project / "mise.toml").write_text(mise)
+                if replacement is not None:
+                    os.chown(manifest, account.pw_uid, account.pw_gid)
+                    (project / "replacement.json").write_text(encoded(replacement))
+                fd = libc.inotify_init1(os.O_CLOEXEC | os.O_NONBLOCK)
+                assert fd >= 0, ctypes.get_errno()
+                try:
+                    if metadata is not None:
+                        watch_id = libc.inotify_add_watch(fd, os.fsencode(manifest), in_open | in_close_nowrite)
+                        assert watch_id >= 0, (manifest, ctypes.get_errno())
+                    args = [cli, "run", "fixture" if mise is not None else "fixture-js", "--", "two words", "--literal"]
+                    started = time.monotonic_ns()
+                    result = subprocess.run(args, cwd=project, env=env, stdin=subprocess.DEVNULL,
+                                            capture_output=True, text=True, timeout=10, **ordinary)
+                    elapsed_ns = time.monotonic_ns() - started
+                    try:
+                        events = os.read(fd, 65536)
+                    except BlockingIOError:
+                        events = b""
+                    reads = offset = 0
+                    while offset < len(events):
+                        _, kind, _, length = notice.unpack_from(events, offset)
+                        reads += bool(kind & in_open)
+                        offset += notice.size + length
+                    lines = [line for line in result.stdout.splitlines() if line.startswith("fixture package ")]
+                    values = ["two words", "--literal"]
+                    if mise is None:
+                        values[:0] = ["run", "fixture-js"] + (["--"] if manager in ("npm", "pnpm", "yarn") else [])
+                    reported = version if manager == "bun" else f"v{version}"
+                    expected = f"fixture package {manager} {reported}" + "".join(f"|<{arg}>" for arg in values)
+                    passed = (result.returncode != 0 and not lines and error in result.stderr) if error else (
+                        result.returncode == 0 and lines == [expected] and (opens is None or reads == opens))
+                    checks.append(dict(phase=phase, case=label, status=result.returncode, passed=passed,
+                                       reported_reads=reads, expected_reads=opens, expected_output=expected,
+                                       elapsed_ns=elapsed_ns, diagnostic=(result.stdout + result.stderr)[-1200:]))
+                except subprocess.TimeoutExpired:
+                    checks.append(dict(phase=phase, case=label, status=None, passed=False,
+                                       diagnostic="package task did not finish"))
+                finally:
+                    os.close(fd)
+
+            run("default-npm")
+            run("engines-node-over-volta", metadata={"engines": {"node": node}, "volta": {"node": next_node}})
+            run("volta-node", metadata={"volta": {"node": next_node}}, version=next_node)
+            run("engines-bun-over-volta", metadata={"packageManager": "bun", "engines": {"bun": bun},
+                                                   "volta": {"bun": next_bun}}, manager="bun", version=bun)
+            run("volta-bun", metadata={"packageManager": "bun", "volta": {"bun": next_bun}},
+                manager="bun", version=next_bun)
+            run("independent-volta-fallback", metadata={"engines": {"bun": bun}, "volta": {"node": next_node}},
+                version=next_node)
+            run("trimmed-runtime-pin", metadata={"engines": {"node": f" {next_node} "}}, version=next_node)
+            run("node-version-precedence", pins=((".node-version", next_node),), version=next_node)
+            run("nvmrc-precedence", pins=((".nvmrc", next_node),), version=next_node)
+            run("tool-versions-precedence", pins=((".tool-versions", f"nodejs {next_node}\n"),), version=next_node)
+            run("bun-version-precedence", pins=((".bun-version", next_bun),),
+                markers=("bun.lockb",), manager="bun", version=next_bun)
+            run("manifest-precedes-same-directory-mise", mise=f"[tools]\nnode = '{next_node}'\n" + task,
+                manager="node")
+            run("child-package-over-parent", parent={"engines": {"node": next_node}})
+            run("parent-pin-ignores-unrelated-fields", metadata={"packageManager": None},
+                parent={"packageManager": False, "scripts": [], "engines": {"node": next_node}}, version=next_node)
+            run("native-mise-without-manifest", metadata=None, mise=task, pins=((".node-version", node),),
+                manager="node", opens=0)
+            run("explicit-npm-before-bun", metadata={"packageManager": "npm@11.2.0", "engines": {"node": node}},
+                markers=("bun.lockb",))
+            run("explicit-pnpm", metadata={"packageManager": "pnpm@10.1.0", "engines": {"node": node}},
+                manager="pnpm")
+            run("explicit-yarn", metadata={"packageManager": "yarn@4.6.0", "engines": {"node": node}},
+                markers=("pnpm-lock.yaml",), manager="yarn")
+            run("explicit-bun", metadata={"packageManager": "bun@1.2.20", "engines": {"bun": bun}},
+                markers=("yarn.lock",), manager="bun", version=bun)
+            run("pnpm-lock", markers=("pnpm-lock.yaml",), manager="pnpm")
+            run("yarn-lock", markers=("yarn.lock",), manager="yarn")
+            run("pnpm-lock-over-yarn", markers=("pnpm-lock.yaml", "yarn.lock"), manager="pnpm")
+            run("legacy-bun-lock-over-pnpm", markers=("bun.lockb", "pnpm-lock.yaml"), manager="bun", version=bun)
+            run("text-bun-lock", markers=("bun.lock",), manager="bun", version=bun)
+            run("text-bun-lock-over-pnpm", markers=("bun.lock", "pnpm-lock.yaml"), manager="bun", version=bun)
+            run("explicit-npm-before-text-bun", metadata={"packageManager": "npm", "engines": {"node": node}},
+                markers=("bun.lock",))
+            run("malformed-syntax", metadata="{", error="Failed to parse", opens=None)
+            run("malformed-engines", metadata={"engines": False}, error="Failed to parse", opens=None)
+            run("malformed-volta", metadata={"volta": []}, error="Failed to parse", opens=None)
+            run("malformed-scripts", metadata={"scripts": {"fixture-js": 1}}, error="Failed to parse", opens=None)
+            run("malformed-manager", metadata={"packageManager": False}, error="Failed to parse", opens=None)
+            run("native-mise-refreshes-after-dependency", manager="node", version=next_node, opens=None,
+                mise=task + """depends = ["prepare"]
+[tasks.prepare]
+run = "cp replacement.json package.json"
+""", metadata={"engines": {"node": node}},
+                replacement={"engines": {"node": next_node}, "scripts": script})
+
+
     def inspect_environment_lockfiles():
         phase = "environment-lockfiles"
         with tempfile.TemporaryDirectory(prefix="environment-locks-", dir=work) as directory:
@@ -4188,6 +4375,7 @@ exec {shlex.quote(str(binary))} "$@"
                     inspect_task_watch()
                     inspect_task_runtime_admissions()
                     inspect_task_environment_bytes()
+                    inspect_task_package_metadata()
                 config.write_text(alternate_config)
                 refresh_fixture()
                 expected = ordinary_control([dnf, "--cacheonly", "repoquery",
@@ -4505,6 +4693,6 @@ assert inventory() == before
 report = dict(binaries=binaries, checks=checks, total=len(checks),
               passed=sum(entry["passed"] for entry in checks), host_unchanged=True)
 print(json.dumps(report))
-expected_checks = 303 if consent_oracle is None else 1419
+expected_checks = 303 if consent_oracle is None else 1451
 if report["passed"] != report["total"] or report["total"] != expected_checks:
     sys.exit(4)

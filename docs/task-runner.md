@@ -75,7 +75,7 @@ build = "node"
 
 ## Choose a JavaScript package manager
 
-For `package.json`, OMG checks the `packageManager` field first. It then checks `bun.lockb`, `pnpm-lock.yaml`, `yarn.lock`, and `package-lock.json` or `npm-shrinkwrap.json`, in that order. With no marker, it uses npm. The current detector does not use `bun.lock` as a marker.
+For `package.json`, OMG uses the `packageManager` field when set. Otherwise, it checks for `bun.lock` or `bun.lockb` first, followed by `pnpm-lock.yaml` and `yarn.lock`. If none are present, it uses npm.
 
 ```json
 {

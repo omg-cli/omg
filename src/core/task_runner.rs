@@ -199,7 +199,8 @@ impl TaskDetector {
         let Some(package) = read_js_manifest(&self.current_dir)? else {
             return Ok(None);
         };
-        let package_manager = js_package_manager_for(&self.current_dir, &package)?;
+        let package_manager =
+            js_package_manager_for(&self.current_dir, package.package_manager.as_deref())?;
         let ecosystem = Ecosystem::for_js_manager(&package_manager);
 
         let scripts = package.scripts.unwrap_or_default();
@@ -849,12 +850,13 @@ fn read_js_manifest(current_dir: &Path) -> Result<Option<PackageJson>> {
         .map(Some)
 }
 
-fn js_package_manager_for(current_dir: &Path, package: &PackageJson) -> Result<String> {
-    if let Some(package_manager) = &package.package_manager {
+fn js_package_manager_for(current_dir: &Path, declared: Option<&str>) -> Result<String> {
+    if let Some(package_manager) = declared {
         return parse_package_manager_name(package_manager);
     }
 
     for (marker, manager) in [
+        ("bun.lock", "bun"),
         ("bun.lockb", "bun"),
         ("pnpm-lock.yaml", "pnpm"),
         ("yarn.lock", "yarn"),
@@ -867,23 +869,16 @@ fn js_package_manager_for(current_dir: &Path, package: &PackageJson) -> Result<S
     Ok("npm".to_string())
 }
 
-fn detect_js_package_manager(current_dir: &Path) -> Result<Option<String>> {
-    read_js_manifest(current_dir)?
-        .map(|package| js_package_manager_for(current_dir, &package))
-        .transpose()
-}
-
-fn detect_js_runtime(current_dir: &std::path::Path) -> Result<Option<(String, String)>> {
-    let Some(package_manager) = detect_js_package_manager(current_dir)? else {
-        return Ok(None);
-    };
-    let runtime = if package_manager == "bun" {
-        "bun"
+fn js_runtime_for(
+    current_dir: &Path,
+    package: &hooks::ProjectPackageMetadata,
+) -> Result<(&'static str, &'static str)> {
+    let manager = js_package_manager_for(current_dir, package.package_manager.as_deref())?;
+    Ok(if manager == "bun" {
+        ("bun", "latest")
     } else {
-        "node"
-    };
-    let default_version = if runtime == "bun" { "latest" } else { "lts" };
-    Ok(Some((runtime.to_string(), default_version.to_string())))
+        ("node", "lts")
+    })
 }
 
 #[derive(Deserialize)]
@@ -1028,9 +1023,12 @@ fn execute_process_in(
         // Runtime selection below still requires reviewed managed bytes when
         // rustup owns PATH; do not silently install a competing toolchain here.
     }
-    let mut versions = hooks::detect_versions(current_dir)?;
-    if let Some((runtime, default_version)) = detect_js_runtime(current_dir)? {
-        versions.entry(runtime).or_insert(default_version);
+    let (mut versions, package) = hooks::detect_task_versions(current_dir)?;
+    if let Some(package) = package {
+        let (runtime, default_version) = js_runtime_for(current_dir, &package)?;
+        versions
+            .entry(runtime.to_owned())
+            .or_insert_with(|| default_version.to_owned());
     }
     ensure_js_package_manager(cmd)?;
     // Resolve all required runtimes. Sequential processing is required because
@@ -2928,7 +2926,8 @@ pathlib.Path({}).write_text(sys.prefix + '|' + omg_local_venv_probe.VALUE)
             r#"{"packageManager":"./repo-script","scripts":{}}"#,
         )
         .unwrap();
-        let error = detect_js_package_manager(project.path())
+        let (_, package) = hooks::detect_task_versions(project.path()).unwrap();
+        let error = js_runtime_for(project.path(), &package.unwrap())
             .expect_err("repo-controlled executable path must fail");
         assert!(error.to_string().contains("Unsupported packageManager"));
     }
@@ -2938,15 +2937,15 @@ pathlib.Path({}).write_text(sys.prefix + '|' + omg_local_venv_probe.VALUE)
         let project = TempDir::new().unwrap();
         fs::write(project.path().join("package.json"), r#"{"scripts":{}}"#).unwrap();
 
+        let (_, package) = hooks::detect_task_versions(project.path()).unwrap();
+        let package = package.unwrap();
         assert_eq!(
-            detect_js_package_manager(project.path())
-                .unwrap()
-                .as_deref(),
-            Some("npm")
+            js_package_manager_for(project.path(), package.package_manager.as_deref()).unwrap(),
+            "npm"
         );
         assert_eq!(
-            detect_js_runtime(project.path()).unwrap(),
-            Some(("node".to_string(), "lts".to_string()))
+            js_runtime_for(project.path(), &package).unwrap(),
+            ("node", "lts")
         );
     }
 

@@ -51,25 +51,32 @@ const VERSION_FILES: &[(&str, &str)] = &[
     ("rust-toolchain.toml", "rust"),
     // Universal
     (".tool-versions", "multi"),
-    ("package.json", "multi"),
 ];
 
 #[derive(Deserialize)]
 struct PackageJsonVersions {
-    engines: Option<PackageEngines>,
-    volta: Option<VoltaToolchain>,
+    engines: Option<PackageRuntimeFields>,
+    volta: Option<PackageRuntimeFields>,
 }
 
-#[derive(Deserialize)]
-struct PackageEngines {
+#[derive(Default, Deserialize)]
+struct PackageRuntimeFields {
     node: Option<String>,
     bun: Option<String>,
 }
 
 #[derive(Deserialize)]
-struct VoltaToolchain {
-    node: Option<String>,
-    bun: Option<String>,
+struct TaskPackageJson {
+    engines: Option<PackageRuntimeFields>,
+    volta: Option<PackageRuntimeFields>,
+    #[serde(rename = "packageManager")]
+    package_manager: Option<String>,
+    #[serde(rename = "scripts")]
+    _scripts: Option<HashMap<String, String>>,
+}
+
+pub(crate) struct ProjectPackageMetadata {
+    pub(crate) package_manager: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -88,36 +95,41 @@ fn read_pin_file(path: &Path) -> Result<Option<String>> {
         .with_context(|| format!("Failed to read version pin file {}", path.display()))
 }
 
-fn read_package_json_versions(dir: &Path) -> Result<Option<HashMap<String, String>>> {
-    let path = dir.join("package.json");
-    let Some(content) = read_pin_file(&path)? else {
+fn read_package_json_pins(
+    path: &Path,
+    versions: &mut HashMap<String, String>,
+    read_task_metadata: bool,
+) -> Result<Option<ProjectPackageMetadata>> {
+    let Some(content) = read_pin_file(path)? else {
         return Ok(None);
     };
-    let pkg: PackageJsonVersions = serde_json::from_str(&content)
-        .with_context(|| format!("Failed to parse {}", path.display()))?;
-    let mut versions = HashMap::new();
+    let parse_context = || format!("Failed to parse {}", path.display());
+    let (engines, volta, metadata) = if read_task_metadata {
+        let package: TaskPackageJson =
+            serde_json::from_str(&content).with_context(parse_context)?;
+        let metadata = ProjectPackageMetadata {
+            package_manager: package.package_manager,
+        };
+        (package.engines, package.volta, Some(metadata))
+    } else {
+        let package: PackageJsonVersions =
+            serde_json::from_str(&content).with_context(parse_context)?;
+        (package.engines, package.volta, None)
+    };
 
-    // Process volta first (lower priority)
-    if let Some(volta) = pkg.volta {
-        if let Some(node) = volta.node {
-            versions.insert("node".to_string(), node);
-        }
-        if let Some(bun) = volta.bun {
-            versions.insert("bun".to_string(), bun);
+    let engines = engines.unwrap_or_default();
+    let volta = volta.unwrap_or_default();
+    for (runtime, pin) in [
+        ("node", engines.node.or(volta.node)),
+        ("bun", engines.bun.or(volta.bun)),
+    ] {
+        if let Some(pin) = pin {
+            versions
+                .entry(runtime.to_owned())
+                .or_insert_with(|| pin.trim().to_owned());
         }
     }
-
-    // Process engines second (higher priority - overwrites volta)
-    if let Some(engines) = pkg.engines {
-        if let Some(node) = engines.node {
-            versions.insert("node".to_string(), node);
-        }
-        if let Some(bun) = engines.bun {
-            versions.insert("bun".to_string(), bun);
-        }
-    }
-
-    Ok((!versions.is_empty()).then_some(versions))
+    Ok(metadata)
 }
 
 /// Print the shell hook script to be added to shell rc file
@@ -309,7 +321,9 @@ fn hook_env_output(shell: &str, cwd: &Path) -> Result<String> {
 
 /// Continue applying valid pins when a shell prompt encounters a bad pin.
 fn detect_versions_for_hook(cwd: &Path) -> HashMap<String, String> {
-    detect_version_pins(cwd, &mise_environment(), PinPolicy::ShellHook).unwrap_or_default()
+    detect_version_pins(cwd, &mise_environment(), PinPolicy::ShellHook)
+        .map(|pins| pins.versions)
+        .unwrap_or_default()
 }
 
 fn parse_tool_versions_file(
@@ -411,22 +425,12 @@ fn try_parse_version_file(
     filename: &str,
     file_path: &Path,
     runtime: &str,
-    dir: &Path,
     versions: &mut HashMap<String, String>,
 ) -> Result<()> {
     match filename {
         ".tool-versions" => parse_tool_versions_file(file_path, versions)?,
         "global.json" => parse_global_json_file(file_path, versions)?,
         "rust-toolchain.toml" => parse_rust_toolchain_file(file_path, runtime, versions)?,
-        "package.json" => {
-            if let Some(extra) = read_package_json_versions(dir)? {
-                for (runtime, version) in extra {
-                    versions
-                        .entry(runtime)
-                        .or_insert_with(|| version.trim().to_string());
-                }
-            }
-        }
         "go.mod" => parse_go_mod_file(file_path, runtime, versions)?,
         "pyproject.toml" => parse_pyproject_requires_python(file_path, versions)?,
         _ => parse_simple_version_file(file_path, runtime, versions)?,
@@ -451,27 +455,41 @@ fn detect_versions_with_env(
     start: &Path,
     selection: &HashMap<String, String>,
 ) -> Result<HashMap<String, String>> {
-    detect_version_pins(start, selection, PinPolicy::Explicit)
+    detect_version_pins(start, selection, PinPolicy::Explicit).map(|pins| pins.versions)
+}
+
+pub(crate) fn detect_task_versions(
+    start: &Path,
+) -> Result<(HashMap<String, String>, Option<ProjectPackageMetadata>)> {
+    let pins = detect_version_pins(start, &mise_environment(), PinPolicy::Task)?;
+    Ok((pins.versions, pins.project_package))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PinPolicy {
     Explicit,
     ShellHook,
+    Task,
+}
+
+struct VersionPins {
+    versions: HashMap<String, String>,
+    project_package: Option<ProjectPackageMetadata>,
 }
 
 fn detect_version_pins(
     start: &Path,
     selection: &HashMap<String, String>,
     policy: PinPolicy,
-) -> Result<HashMap<String, String>> {
+) -> Result<VersionPins> {
     let mut mise_documents_read = 0;
     let mut versions = HashMap::new();
+    let mut project_package = None;
     let mut current = Some(start.to_path_buf());
     let mut is_start_directory = true;
 
     while let Some(dir) = current {
-        let reject_bad_pin = is_start_directory && policy == PinPolicy::Explicit;
+        let reject_bad_pin = is_start_directory && policy != PinPolicy::ShellHook;
         for (filename, runtime) in VERSION_FILES {
             if versions.contains_key(*runtime) {
                 continue;
@@ -481,7 +499,7 @@ fn detect_version_pins(
             if file_path.exists() {
                 let previous_versions = versions.clone();
                 if let Err(error) =
-                    try_parse_version_file(filename, &file_path, runtime, &dir, &mut versions)
+                    try_parse_version_file(filename, &file_path, runtime, &mut versions)
                 {
                     versions = previous_versions;
                     if reject_bad_pin {
@@ -495,6 +513,20 @@ fn detect_version_pins(
             }
         }
 
+        let package_path = dir.join("package.json");
+        let read_task_metadata = is_start_directory && policy == PinPolicy::Task;
+        if read_task_metadata || package_path.exists() {
+            match read_package_json_pins(&package_path, &mut versions, read_task_metadata) {
+                Ok(metadata) if read_task_metadata => project_package = metadata,
+                Ok(_) => {}
+                Err(error) if reject_bad_pin => return Err(error),
+                Err(error) => tracing::warn!(
+                    "Ignoring invalid runtime pin {}: {error:#}",
+                    package_path.display()
+                ),
+            }
+        }
+
         // Each directory's dedicated pins win over its mise layers. Processing
         // directories nearest-first also preserves child mise pins over parent
         // dedicated files, while aliases are merged inside the layer resolver.
@@ -502,7 +534,7 @@ fn detect_version_pins(
             Ok(documents) => {
                 mise_documents_read += documents.len();
                 if mise_documents_read > crate::config::mise_config::MAX_CONFIG_FILES {
-                    if policy == PinPolicy::Explicit {
+                    if policy != PinPolicy::ShellHook {
                         anyhow::bail!("Too many mise configuration files");
                     }
                     tracing::warn!(
@@ -524,7 +556,10 @@ fn detect_version_pins(
         is_start_directory = false;
     }
 
-    Ok(versions)
+    Ok(VersionPins {
+        versions,
+        project_package,
+    })
 }
 
 /// Build PATH additions for detected versions
