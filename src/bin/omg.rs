@@ -1095,7 +1095,6 @@ async fn async_main(args: Vec<String>, info_sync_missed: bool) -> Result<()> {
     init_logging(cli.verbose, cli.quiet || cli.json);
 
     omg_lib::core::telemetry::track_session_start();
-    let telemetry_ping = spawn_telemetry_ping();
 
     if matches!(
         &cli.command,
@@ -1118,6 +1117,7 @@ async fn async_main(args: Vec<String>, info_sync_missed: bool) -> Result<()> {
     let ctx = omg_lib::cli::CliContext { json: cli.json };
 
     let result = dispatch_command(&cli.command, &ctx, info_sync_missed).await;
+    let telemetry_ping = spawn_telemetry_ping();
     finish_command_telemetry(cmd_start, command_name(&cli.command), result.is_ok()).await;
     if let Some(task) = telemetry_ping {
         match task.await {
@@ -1252,9 +1252,9 @@ fn init_logging(verbose: u8, quiet: bool) {
         .init();
 }
 
-/// Spawn telemetry ping on first run
+/// Spawn first-run telemetry after the command has applied any settings changes.
 fn spawn_telemetry_ping() -> Option<tokio::task::JoinHandle<Result<()>>> {
-    (omg_lib::core::telemetry::is_first_run() && !omg_lib::core::telemetry::is_telemetry_opt_out())
+    (!omg_lib::core::telemetry::is_telemetry_opt_out() && omg_lib::core::telemetry::is_first_run())
         .then(|| tokio::spawn(omg_lib::core::telemetry::ping_install()))
 }
 

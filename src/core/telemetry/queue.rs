@@ -1,13 +1,14 @@
 use std::collections::{HashSet, VecDeque};
-use std::fs::{File, OpenOptions, TryLockError};
-use std::path::{Path, PathBuf};
+use std::fs::{File, TryLockError};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    ConsentEpoch, MAX_QUEUE_BYTES, MAX_QUEUE_SIZE, QUEUE_FORMAT_VERSION, read_saved_telemetry,
+    ConsentEpoch, MAX_QUEUE_BYTES, MAX_QUEUE_SIZE, QUEUE_FORMAT_VERSION, open_telemetry_lock,
+    read_saved_telemetry,
 };
 use crate::core::telemetry_client::TelemetryEvent;
 
@@ -84,7 +85,7 @@ impl QueueStore {
 
     /// Keep one sender active across processes while producers still append.
     pub(super) fn try_dispatch_lock(&self) -> Result<Option<File>> {
-        let lock = open_lock(&self.path.with_extension("dispatch.lock"))?;
+        let lock = open_telemetry_lock(&self.path.with_extension("dispatch.lock"))?;
         match lock.try_lock() {
             Ok(()) => Ok(Some(lock)),
             Err(TryLockError::WouldBlock) => Ok(None),
@@ -121,7 +122,7 @@ impl QueueStore {
     }
 
     fn mutation_lock(&self) -> Result<File> {
-        let lock = open_lock(&self.path.with_extension("lock"))?;
+        let lock = open_telemetry_lock(&self.path.with_extension("lock"))?;
         lock.lock().context("Failed to lock telemetry queue")?;
         Ok(lock)
     }
@@ -188,27 +189,6 @@ impl QueueStore {
         crate::core::safe_ops::atomic_write_file_sync_private(&self.path, content)
             .with_context(|| format!("Failed to save telemetry queue: {}", self.path.display()))
     }
-}
-
-fn open_lock(path: &Path) -> Result<File> {
-    let mut options = OpenOptions::new();
-    options.create(true).read(true).write(true).truncate(false);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options
-            .mode(0o600)
-            .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK);
-    }
-    let lock = options
-        .open(path)
-        .with_context(|| format!("Failed to open telemetry lock: {}", path.display()))?;
-    anyhow::ensure!(
-        lock.metadata()?.is_file(),
-        "Telemetry lock must be a regular file: {}",
-        path.display()
-    );
-    Ok(lock)
 }
 
 #[cfg(test)]

@@ -24,6 +24,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 import tomllib
 from urllib.parse import parse_qs
 import xml.etree.ElementTree as ET
@@ -5139,6 +5140,83 @@ fresh:
                     child.wait()
 
 
+    def inspect_install_telemetry_admission():
+        phase = "fedora-install-telemetry"
+        operations = (
+            ("privacy", "status"),
+            ("config", "get", "telemetry.enabled"),
+            ("run", "probe"),
+            ("config", "list"),
+            ("privacy", "status"),
+        )
+
+        for scenario in ("first-use", "settings-held", "install-held", "default-off",
+                         "environment-off", "explicit-opt-out"):
+            with tempfile.TemporaryDirectory(prefix="install-telemetry-", dir=work) as directory:
+                home = Path(directory)
+                data, config = home/"data", home/"config"
+                for path in (home, data, config):
+                    path.mkdir(exist_ok=True)
+                    path.chmod(0o700)
+                    os.chown(path, account.pw_uid, account.pw_gid)
+
+                def write(path, value):
+                    path.write_text(value)
+                    path.chmod(0o600)
+                    os.chown(path, account.pw_uid, account.pw_gid)
+
+                write(home/"Makefile", "probe:\n\t@printf 'install telemetry probe finished\\n'\n")
+                marker = data/".installed"
+                flag = "false" if scenario=="default-off" else "true"
+                write(config/"config.toml", f"telemetry_enabled = {flag}\n")
+                held_path = data/".installed.lock" if scenario=="install-held" else config/"config.lock"
+                write(held_path, "")
+                chosen = {name:value for name,value in disabled.items() if name != "OMG_DISABLE_TELEMETRY"}
+                chosen.update(HOME=str(home), OMG_DATA_DIR=str(data), OMG_CONFIG_DIR=str(config),
+                              XDG_CONFIG_HOME=str(home/"xdg-config"), XDG_DATA_HOME=str(home/"xdg-data"),
+                              XDG_STATE_HOME=str(home/"state"), XDG_CACHE_HOME=str(home/"cache"),
+                              CI="1", OMG_NO_UPDATE_CHECK="1", RUST_LOG="omg_lib::core::telemetry=debug")
+                if scenario=="environment-off":
+                    chosen["OMG_DISABLE_TELEMETRY"] = "1"
+
+                pending = ("settings-held", "install-held")
+                expect_creation = 2 if scenario in pending else 0 if scenario=="first-use" else None
+                original = None
+                with held_path.open("r+b") as lock:
+                    if scenario in pending:
+                        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    for index, args in enumerate(operations):
+                        if scenario in pending and index==2:
+                            fcntl.flock(lock, fcntl.LOCK_UN)
+                        if scenario=="explicit-opt-out" and index==0:
+                            args = ("privacy", "opt-out")
+                        result = command([cli, *args], chosen, ordinary, timeout=12)
+                        ran = ("Telemetry disabled locally" in result.stdout if args==("privacy", "opt-out")
+                               else result.stdout.strip() == ("false" if scenario in ("default-off", "explicit-opt-out") else "true")
+                               if args[0:2]==("config", "get")
+                               else "install telemetry probe finished" in result.stdout if args[0]=="run"
+                               else bool(result.stdout))
+                        contents = marker.read_bytes() if marker.is_file() else None
+                        dispatches = result.stderr.count("Install telemetry ping ")
+                        if index==expect_creation and contents:
+                            original = contents
+                            document = json.loads(contents)
+                            valid = (uuid.UUID(document["install_id"]).version==4
+                                     and bool(document["timestamp"]) and bool(document["version"]))
+                        else:
+                            valid = True
+                        expected = expect_creation is not None and index>=expect_creation
+                        gate = (valid and contents is not None and contents==original
+                                if expected else contents is None)
+                        actual_flag = tomllib.loads((config/"config.toml").read_text())["telemetry_enabled"]
+                        checks.append(dict(phase=phase, case=f"{scenario}-{index+1}",
+                            passed=bool(result.returncode==0 and ran and gate and
+                                         dispatches==int(index==expect_creation) and
+                                         actual_flag is (scenario not in ("default-off", "explicit-opt-out"))),
+                            status=result.returncode, diagnostic=(result.stdout[-420:],result.stderr[-550:],
+                                                                 contents is not None,dispatches,actual_flag)))
+
+
     def inspect_task_environment_bytes():
         phase = "task-environment-bytes"
         raw = b"test-\xff-value"
@@ -7877,6 +7955,7 @@ exec {shlex.quote(str(binary))} "$@"
                     inspect_telemetry_storage()
                     inspect_telemetry_queue_overlap()
                     inspect_telemetry_consent_transitions()
+                    inspect_install_telemetry_admission()
                 config.write_text(host_config)
                 inspect("returned-host", host_count, host_explicit, host=True)
                 mark_progress("root switch and return")
@@ -8188,6 +8267,6 @@ mark_progress("completed with host inventory unchanged")
 report = dict(binaries=binaries, checks=checks, total=len(checks),
               passed=sum(entry["passed"] for entry in checks), host_unchanged=True)
 print(json.dumps(report))
-expected_checks = 303 if consent_oracle is None else 2562
+expected_checks = 303 if consent_oracle is None else 2592
 if report["passed"] != report["total"] or report["total"] != expected_checks:
     sys.exit(4)

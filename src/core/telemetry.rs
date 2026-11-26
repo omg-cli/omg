@@ -23,6 +23,7 @@
 //! batches remain queued for a later invocation.
 
 use std::collections::{HashSet, VecDeque};
+use std::fs::{File, OpenOptions, TryLockError};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -275,29 +276,6 @@ pub fn is_first_run() -> bool {
     !marker_path.exists()
 }
 
-/// Generate or load install ID
-///
-/// A corrupt or unreadable marker falls back to a fresh ID rather than
-/// failing: install telemetry must never break a user command, and the next
-/// successful `create_marker` repairs the file.
-fn generate_or_load_id() -> String {
-    let marker_path = super::paths::installed_marker_path();
-
-    if marker_path.exists() {
-        match std::fs::read_to_string(&marker_path)
-            .map_err(anyhow::Error::from)
-            .and_then(|content| Ok(serde_json::from_str::<InstallMarker>(&content)?.install_id))
-        {
-            Ok(install_id) => return install_id,
-            Err(error) => tracing::debug!(
-                "Install marker unreadable ({}), regenerating install ID: {error}",
-                marker_path.display()
-            ),
-        }
-    }
-    uuid::Uuid::new_v4().to_string()
-}
-
 /// Get platform string (e.g., "linux-x86_64")
 fn get_platform() -> String {
     format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
@@ -345,13 +323,29 @@ pub fn get_backend() -> String {
     }
 }
 
+fn open_telemetry_lock(path: &Path) -> Result<File> {
+    let mut options = OpenOptions::new();
+    options.create(true).read(true).write(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options
+            .mode(0o600)
+            .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK);
+    }
+    let lock = options
+        .open(path)
+        .with_context(|| format!("Failed to open telemetry lock: {}", path.display()))?;
+    anyhow::ensure!(
+        lock.metadata()?.is_file(),
+        "Telemetry lock must be a regular file: {}",
+        path.display()
+    );
+    Ok(lock)
+}
+
 /// Create install marker file
-fn create_marker(install_id: &str) -> Result<()> {
-    let marker_path = super::paths::installed_marker_path();
-
-    // Installation telemetry can race other first-start writers.
-    super::paths::ensure_data_dir()?;
-
+fn create_marker(path: &Path, install_id: &str) -> Result<()> {
     let marker = InstallMarker {
         install_id: install_id.to_string(),
         timestamp: jiff::Timestamp::now().to_string(),
@@ -360,16 +354,40 @@ fn create_marker(install_id: &str) -> Result<()> {
 
     let content =
         serde_json::to_vec_pretty(&marker).context("Failed to serialize install marker")?;
-    crate::core::safe_ops::atomic_write_file_sync(&marker_path, content)
-        .with_context(|| format!("Failed to save install marker: {}", marker_path.display()))
+    crate::core::safe_ops::atomic_write_file_sync_private(path, content)
+        .with_context(|| format!("Failed to save install marker: {}", path.display()))
 }
 
 /// Ping install telemetry endpoint
 pub async fn ping_install() -> Result<()> {
-    // Generate or load install ID
-    let install_id = generate_or_load_id();
+    let Some(_consent) = capture_consent().and_then(CaptureConsent::try_lease) else {
+        return Ok(());
+    };
+    let marker = super::paths::installed_marker_path();
+    if marker
+        .try_exists()
+        .context("Failed to check the install marker")?
+    {
+        return Ok(());
+    }
 
-    // Create payload
+    super::paths::ensure_data_dir()?;
+    let install_lock = open_telemetry_lock(&marker.with_extension("lock"))?;
+    match install_lock.try_lock() {
+        Ok(()) => {}
+        Err(TryLockError::WouldBlock) => return Ok(()),
+        Err(TryLockError::Error(error)) => {
+            return Err(error).context("Failed to lock installation telemetry");
+        }
+    }
+    if marker
+        .try_exists()
+        .context("Failed to check the install marker")?
+    {
+        return Ok(());
+    }
+
+    let install_id = uuid::Uuid::new_v4().to_string();
     let payload = InstallPayload {
         install_id: install_id.clone(),
         timestamp: jiff::Timestamp::now().to_string(),
@@ -404,7 +422,7 @@ pub async fn ping_install() -> Result<()> {
 
     // This is deliberately one-shot best-effort telemetry; do not retry on a
     // later user command when the endpoint is unavailable.
-    create_marker(&install_id)
+    create_marker(&marker, &install_id)
 }
 
 // =============================================================================
