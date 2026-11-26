@@ -691,6 +691,7 @@ jobs:
           retention-days: 14
 
       - name: Generate LCOV report
+        id: lcov_report
         if: ${{ !cancelled() && (steps.instrumented_tests.outcome == 'success' || steps.instrumented_tests.outcome == 'failure') }}
         run: |
           cargo llvm-cov report \
@@ -710,8 +711,10 @@ jobs:
 
       - name: Generate HTML report
         if: ${{ !cancelled() && (steps.instrumented_tests.outcome == 'success' || steps.instrumented_tests.outcome == 'failure') && (failure() || github.event_name == 'workflow_dispatch') }}
+        env:
+          COVERAGE_REUSE_MERGED_PROFILE: ${{ steps.lcov_report.outcome == 'success' }}
         run: |
-          cargo llvm-cov report --html
+          bash scripts/run-coverage-report.sh --html
 
       - name: Upload HTML coverage report
         if: ${{ !cancelled() && (steps.instrumented_tests.outcome == 'success' || steps.instrumented_tests.outcome == 'failure') && (failure() || github.event_name == 'workflow_dispatch') }}
@@ -732,8 +735,10 @@ jobs:
 
       - name: Generate region evidence
         if: ${{ !cancelled() && (steps.instrumented_tests.outcome == 'success' || steps.instrumented_tests.outcome == 'failure') }}
+        env:
+          COVERAGE_REUSE_MERGED_PROFILE: ${{ steps.lcov_report.outcome == 'success' }}
         run: |
-          if cargo llvm-cov report --json --output-path coverage-regions.json --verbose 2> coverage-region-export.log; then
+          if bash scripts/run-coverage-report.sh --json --output-path coverage-regions.json --verbose 2> coverage-region-export.log; then
             :
           else
             status=$?
@@ -1127,9 +1132,11 @@ jobs:
 
       - name: Generate function coverage evidence
         if: ${{ !cancelled() && (steps.instrumented_tests.outcome == 'success' || steps.instrumented_tests.outcome == 'failure') }}
+        env:
+          COVERAGE_REUSE_MERGED_PROFILE: ${{ steps.lcov_report.outcome == 'success' }}
         run: |
           LLVM_COV_FLAGS='-show-functions -sources src/core/security/audit.rs' \
-            cargo llvm-cov report > coverage-functions.txt
+            bash scripts/run-coverage-report.sh > coverage-functions.txt
           test -s coverage-functions.txt
 
       - name: Preserve function coverage evidence
