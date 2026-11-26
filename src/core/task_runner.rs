@@ -4,10 +4,12 @@ use dialoguer::{Confirm, Select, theme::ColorfulTheme};
 use semver::{Version, VersionReq};
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::ffi::{OsStr, OsString};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::config::mise_env::{Environment, ResolvedEnv, prepend_paths};
 use crate::core::runtime_resolver::find_in_path;
 use crate::hooks;
 use crate::runtimes::rust::RustManager;
@@ -916,63 +918,25 @@ struct Poetry {
     scripts: Option<HashMap<String, String>>,
 }
 
-fn command_environment(command: &Command) -> Result<HashMap<String, String>> {
-    let mut effective: HashMap<String, String> = std::env::vars().collect();
+fn command_environment(command: &Command) -> Environment {
+    let mut effective: Environment = std::env::vars_os().collect();
     for (key, value) in command.get_envs() {
-        let key = key.to_str().context("Environment name is not UTF-8")?;
         if let Some(value) = value {
-            effective.insert(
-                key.to_string(),
-                value
-                    .to_str()
-                    .context("Environment value is not UTF-8")?
-                    .to_string(),
-            );
+            effective.insert(key.to_owned(), value.to_owned());
         } else {
             effective.remove(key);
         }
     }
-    Ok(effective)
+    effective
 }
 
-fn apply_resolved_environment(
-    command: &mut Command,
-    resolved: &crate::config::mise_env::ResolvedEnv,
-) -> Result<()> {
-    let mut effective = command_environment(command)?;
-    if !resolved.path_additions.is_empty() {
-        effective =
-            crate::config::mise_env::with_path_overlay(&effective, &resolved.path_additions);
-        if let Some(path) = effective.get("PATH") {
-            command.env("PATH", path);
-        }
-    }
+fn apply_resolved_environment(command: &mut Command, resolved: &ResolvedEnv) {
     for (key, value) in &resolved.set {
         command.env(key, value);
-        effective.insert(key.clone(), value.clone());
     }
     for key in &resolved.unset {
         command.env_remove(key);
-        effective.remove(key);
     }
-    #[cfg(unix)]
-    for script in &resolved.sources {
-        let sourced = crate::config::mise_env::eval_sourced_file(script, &effective)?;
-        for (key, value) in sourced.set {
-            command.env(&key, &value);
-            effective.insert(key, value);
-        }
-        for key in sourced.unset {
-            command.env_remove(&key);
-            effective.remove(&key);
-        }
-    }
-    #[cfg(not(unix))]
-    anyhow::ensure!(
-        resolved.sources.is_empty(),
-        "_.source scripts require a Unix shell"
-    );
-    Ok(())
 }
 
 fn execute_native_mise_task(directory: &Path, name: &str, extra_args: &[String]) -> Result<()> {
@@ -1100,7 +1064,7 @@ fn execute_process_in(
     let mut path_additions = Vec::with_capacity(selected_paths.len());
     for (runtime, bin_path) in &selected_paths {
         admit_task_runtime(&mut runtime_admissions, runtime, bin_path)?;
-        path_additions.push(bin_path.display().to_string());
+        path_additions.push(bin_path.clone());
     }
 
     // Auto-activate python virtual environment if present
@@ -1138,10 +1102,10 @@ fn execute_process_in(
                 selected_paths.push(("python".to_owned(), base));
             }
             // Prepend venv/bin to path additions (higher priority)
-            path_additions.insert(0, bin_path.display().to_string());
+            path_additions.insert(0, bin_path);
 
             // Set VIRTUAL_ENV
-            command.env("VIRTUAL_ENV", venv.display().to_string());
+            command.env("VIRTUAL_ENV", venv);
             // Unset PYTHONHOME if set, to ensure venv is used correctly
             command.env_remove("PYTHONHOME");
         }
@@ -1151,27 +1115,24 @@ fn execute_process_in(
     // unmet `required` entries). Resolved against the tool-augmented PATH so
     // `tools = true` entries see their final value; `_.path` dirs slot after
     // the tool bin dirs above.
-    let base_env = command_environment(&command)?;
-    let overlaid = crate::config::mise_env::with_path_overlay(&base_env, &path_additions);
+    let mut environment = command_environment(&command);
+    if !path_additions.is_empty() {
+        let current_path = environment.get(OsStr::new("PATH")).map(OsString::as_os_str);
+        let path = prepend_paths(path_additions.iter().map(PathBuf::as_path), current_path)?;
+        command.env("PATH", &path);
+        environment.insert("PATH".into(), path);
+    }
     let mise_env = crate::config::mise_env::load_mise_env_chain(
         current_dir,
-        &overlaid,
+        &environment,
         crate::config::mise_env::Strictness::Strict,
     )?;
-
-    if !path_additions.is_empty()
-        && let Ok(current_path) = std::env::var("PATH")
-    {
-        let new_path = format!("{}:{}", path_additions.join(":"), current_path);
-        command.env("PATH", new_path);
-    }
-
-    apply_resolved_environment(&mut command, &mise_env)?;
+    apply_resolved_environment(&mut command, &mise_env);
 
     if let Some(parsed) = task_env {
-        let effective = command_environment(&command)?;
-        let resolved = crate::config::mise_env::resolve_task_env(parsed, &effective, task_root)?;
-        apply_resolved_environment(&mut command, &resolved)?;
+        mise_env.apply_to(&mut environment);
+        let resolved = crate::config::mise_env::resolve_task_env(parsed, &environment, task_root)?;
+        apply_resolved_environment(&mut command, &resolved);
     }
 
     if let Some(venv) = venv_path.as_ref().filter(|path| path.join("bin").is_dir()) {
@@ -1276,14 +1237,19 @@ fn resolve_task_runtime(
         "go" | "ruby" | "bun" | "pi" | "deno" | "zig" | "dotnet" | "php" => name,
         _ => return Ok(None),
     };
-    let environment = command_environment(command)?;
+    let path = command
+        .get_envs()
+        .find(|(key, _)| *key == "PATH")
+        .map_or_else(
+            || std::env::var_os("PATH"),
+            |(_, value)| value.map(OsStr::to_owned),
+        );
     let directory = command
         .get_current_dir()
         .context("Task runtime executable has no working directory")?;
-    let resolved =
-        which::which_in(name, environment.get("PATH"), directory).with_context(|| {
-            format!("Task runtime executable {name} is missing from its final PATH")
-        })?;
+    let resolved = which::which_in(name, path, directory).with_context(|| {
+        format!("Task runtime executable {name} is missing from its final PATH")
+    })?;
     let mut executable = resolved.canonicalize()?;
     let selected = selected_paths
         .iter()
@@ -3597,11 +3563,11 @@ var_colon ::= value
         ]);
         let resolved = crate::config::mise_env::resolve_task_env(
             &parsed,
-            &command_environment(&command).unwrap(),
+            &command_environment(&command),
             dir.path(),
         )
         .unwrap();
-        apply_resolved_environment(&mut command, &resolved).unwrap();
+        apply_resolved_environment(&mut command, &resolved);
         let output = command.output().unwrap();
         assert!(output.status.success());
         assert_eq!(
@@ -3630,14 +3596,16 @@ var_colon ::= value
         let mut command = Command::new("sh");
         let resolved = crate::config::mise_env::load_mise_env_chain(
             &child,
-            &command_environment(&command).unwrap(),
+            &command_environment(&command),
             crate::config::mise_env::Strictness::Strict,
         )
         .unwrap();
-        apply_resolved_environment(&mut command, &resolved).unwrap();
-        let environment = command_environment(&command).unwrap();
+        apply_resolved_environment(&mut command, &resolved);
+        let environment = command_environment(&command);
         assert!(
-            environment["SOURCE_PATH"]
+            environment[OsStr::new("SOURCE_PATH")]
+                .to_str()
+                .unwrap()
                 .split(':')
                 .any(|path| path == dir.path().join("parent-bin").to_string_lossy()),
             "child source did not see the parent's configured executable path"
@@ -3664,20 +3632,24 @@ var_colon ::= value
         let mut command = Command::new("sh");
         let resolved = crate::config::mise_env::load_mise_env_chain(
             &child,
-            &command_environment(&command).unwrap(),
+            &command_environment(&command),
             crate::config::mise_env::Strictness::Strict,
         )
         .unwrap();
-        apply_resolved_environment(&mut command, &resolved).unwrap();
-        let environment = command_environment(&command).unwrap();
+        apply_resolved_environment(&mut command, &resolved);
+        let environment = command_environment(&command);
         assert!(
-            environment["PATH"]
+            environment[OsStr::new("PATH")]
+                .to_str()
+                .unwrap()
                 .split(':')
                 .any(|path| path == child.join("child-bin").to_string_lossy()),
             "parent source assignment erased the child's later path directive"
         );
         assert_eq!(
-            environment["PATH"]
+            environment[OsStr::new("PATH")]
+                .to_str()
+                .unwrap()
                 .split(':')
                 .filter(|path| *path == "/source-extra")
                 .count(),

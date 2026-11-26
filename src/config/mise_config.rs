@@ -288,7 +288,7 @@ mod compatibility {
         let env = load_mise_env_chain(root.path(), &HashMap::new(), Strictness::Strict).unwrap();
         assert!(
             env.set
-                .contains(&("ROOT".into(), root.path().display().to_string()))
+                .contains(&("ROOT".into(), root.path().as_os_str().to_owned()))
         );
     }
 
@@ -303,7 +303,7 @@ mod compatibility {
                 load_mise_env_chain(root.path(), &HashMap::new(), Strictness::Strict).unwrap();
             assert!(
                 env.set
-                    .contains(&("ROOT".into(), directory.display().to_string()))
+                    .contains(&("ROOT".into(), directory.as_os_str().to_owned()))
             );
         }
     }

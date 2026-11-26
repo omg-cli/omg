@@ -2224,7 +2224,7 @@ standalone.chmod(0o755)
             notice = struct.Struct("iIII")
 
             def run(label, executable, chosen, expected, *, pins=(), path=(), venv=None,
-                    ancestor=False, mise=False):
+                    ancestor=False, mise=False, raw_path=False, no_path=False):
                 folder = here / label
                 folder.mkdir()
                 project = folder / "project" if ancestor else folder
@@ -2248,6 +2248,12 @@ run = 'node "$@"'
 
                 path_values = [str(bins[name]) for name in path] + [str(here/"bin"), base_env["PATH"]]
                 env = dict(environment, PATH=":".join(path_values))
+                if raw_path:
+                    opaque = folder / os.fsdecode(b"opaque-\xff")
+                    opaque.mkdir()
+                    env["PATH"] = os.fsencode(opaque) + b":" + os.fsencode(env["PATH"])
+                if no_path:
+                    env.pop("PATH")
                 fd = libc.inotify_init1(os.O_CLOEXEC | os.O_NONBLOCK)
                 assert fd >= 0, ctypes.get_errno()
                 log = ""
@@ -2307,6 +2313,173 @@ run = 'node "$@"'
             run("bun-with-node", "bun", "bun", {"node": 3, "bun": 3}, pins=("node", "bun"))
             run("node-pin-from-parent", "node", "node", {"node": 3}, pins=("node",), ancestor=True)
             run("runtime-in-mise-task", "fixture", "node", {"node": 3}, pins=("node",), mise=True)
+            run("managed-runtime-opaque-path", "node", "node", {"node": 3}, pins=("node",), raw_path=True)
+            run("managed-runtime-initially-unset-path", "node", "node", {"node": 3}, pins=("node",), no_path=True)
+
+
+    def inspect_task_environment_bytes():
+        phase = "task-environment-bytes"
+        raw = b"test-\xff-value"
+        opaque_key = b"OMG_FIXTURE_KEY_\xfe"
+        system_path = os.fsencode(base_env["PATH"])
+        with tempfile.TemporaryDirectory(prefix="task-environment-bytes-", dir=work) as directory:
+            here = Path(directory)
+            here.chmod(0o755)
+            bin_dir = here / "bin"
+            bin_dir.mkdir()
+            tool = bin_dir / "fixture-environment"
+            tool.write_text("""#!/usr/bin/python3
+import json, os, sys
+keys = (b"OMG_FIXTURE_RAW", b"OMG_FIXTURE_OUT", b"OMG_FIXTURE_KEY_\\xfe", b"PATH")
+values = {key.hex(): value.hex() for key in keys if (value := os.environb.get(key)) is not None}
+print("fixture environment " + json.dumps({"values": values, "args": sys.argv[1:]}))
+""")
+            tool.chmod(0o755)
+            opaque_bin = here / os.fsdecode(b"bin-\xff")
+            opaque_bin.mkdir()
+            os.link(tool, opaque_bin / tool.name)
+            default_path = os.fsencode(bin_dir) + b":" + system_path
+            opaque_path = os.fsencode(opaque_bin) + b":" + system_path
+            raw_key = b"OMG_FIXTURE_RAW"
+            result_key = b"OMG_FIXTURE_OUT"
+            path_key = b"PATH"
+            template_file = "[env._]\nfile = { path = 'fixture.env', expand = true }\n"
+            source_config = "[env._]\nsource = 'source.sh'\n"
+            path_config = "[env._]\npath = ['tooling']\n"
+            task = """[tasks.fixture]
+run = 'fixture-environment "$@"'
+"""
+            task_env = "[tasks.fixture.env]\n"
+            task_source = "[tasks.fixture.env._]\nsource = 'source.sh'\n"
+
+            def run(label, *, env=None, conf=None, files=(), parent_conf=None, parent_files=(),
+                    expected=None, error=None, opaque_root=False, native_task=False, local_tool=False):
+                parent = here / label
+                parent.mkdir()
+                os.chown(parent, account.pw_uid, account.pw_gid)
+                name = os.fsdecode(b"project-\xff") if opaque_root else "project"
+                project = parent / name
+                project.mkdir()
+                if conf is not None:
+                    (project / "mise.toml").write_text(conf)
+                if parent_conf is not None:
+                    (parent / "mise.toml").write_text(parent_conf)
+                for root, inputs in ((project, files), (parent, parent_files)):
+                    for filename, value in inputs:
+                        (root / filename).write_text(value)
+                if local_tool:
+                    (project / "tooling").mkdir()
+                    os.link(tool, project / "tooling" / tool.name)
+                launch = {os.fsencode(key): os.fsencode(value) for key, value in disabled.items()}
+                launch.update({
+                    b"HOME": os.fsencode(parent), b"PATH": default_path,
+                    b"XDG_CONFIG_HOME": os.fsencode(parent/"config"), b"XDG_DATA_HOME": os.fsencode(parent/"data"),
+                    b"XDG_CACHE_HOME": os.fsencode(parent/"cache"), b"XDG_STATE_HOME": os.fsencode(parent/"state"),
+                })
+                for key, value in (env or {}).items():
+                    if value is None:
+                        launch.pop(key, None)
+                    else:
+                        launch[key] = value
+                try:
+                    result = subprocess.run([cli, "run", "fixture" if native_task else tool.name,
+                                             "--", "one value", "--flag"], cwd=project, env=launch,
+                                            stdin=subprocess.DEVNULL, capture_output=True, timeout=8,
+                                            **ordinary)
+                    output = result.stdout.decode(errors="replace")
+                    diagnostic = result.stderr.decode(errors="replace")
+                    marker = "fixture environment "
+                    results = [line[len(marker):] for line in output.splitlines() if line.startswith(marker)]
+                    if error:
+                        passed = result.returncode != 0 and not results and error in diagnostic and "panicked" not in diagnostic
+                    else:
+                        wanted = expected(project) if callable(expected) else (expected or {})
+                        payload = json.loads(results[0]) if len(results) == 1 else {}
+                        values = payload.get("values", {})
+                        passed = (result.returncode == 0 and payload.get("args") == ["one value", "--flag"]
+                                  and all(values.get(key.hex()) == (value.hex() if value is not None else None)
+                                          for key, value in wanted.items()))
+                    checks.append(dict(phase=phase, case=label, passed=passed, status=result.returncode,
+                                       diagnostic=(output + diagnostic)[-1300:]))
+                except subprocess.TimeoutExpired:
+                    checks.append(dict(phase=phase, case=label, passed=False, status=None,
+                                       diagnostic="task exceeded deadline"))
+
+            run("inherited-text", env={raw_key: b"ordinary"}, expected={raw_key: b"ordinary"})
+            run("inherited-opaque-value", env={raw_key: raw}, expected={raw_key: raw})
+            run("inherited-opaque-key", env={opaque_key: b"extra"}, expected={opaque_key: b"extra"})
+            run("inherited-opaque-path", env={path_key: opaque_path}, expected={path_key: opaque_path})
+            run("toml-overrides-opaque-value", env={raw_key: raw}, conf="[env]\nOMG_FIXTURE_RAW = 'configured'\n",
+                expected={raw_key: b"configured"})
+            run("toml-removes-opaque-value", env={raw_key: raw}, conf="[env]\nOMG_FIXTURE_RAW = false\n",
+                expected={raw_key: None})
+            run("default-keeps-opaque-nonempty", env={raw_key: raw},
+                conf="[env]\nOMG_FIXTURE_RAW = { default = 'fallback' }\n", expected={raw_key: raw})
+            run("required-accepts-opaque-nonempty", env={raw_key: raw},
+                conf="[env]\nOMG_FIXTURE_RAW = { required = true }\n", expected={raw_key: raw})
+            run("template-refuses-opaque-reference", env={raw_key: raw},
+                conf="[env]\nOMG_FIXTURE_OUT = '{{env.OMG_FIXTURE_RAW}}'\n",
+                error="Environment variable OMG_FIXTURE_RAW is not UTF-8")
+            run("template-reads-text-reference", env={raw_key: b"text"},
+                conf="[env]\nOMG_FIXTURE_OUT = '{{env.OMG_FIXTURE_RAW}}'\n", expected={result_key: b"text"})
+            run("dotenv-refuses-opaque-reference", env={raw_key: raw}, conf=template_file,
+                files=(("fixture.env", "OMG_FIXTURE_OUT=$OMG_FIXTURE_RAW\n"),),
+                error="Environment variable OMG_FIXTURE_RAW is not UTF-8")
+            run("dotenv-missing-expands-empty", conf=template_file,
+                files=(("fixture.env", "OMG_FIXTURE_OUT=base$OMG_FIXTURE_RAW\n"),),
+                expected={result_key: b"base"})
+            run("dotenv-plain-opaque-inheritance", env={raw_key: raw}, conf="[env._]\nfile = 'fixture.env'\n",
+                files=(("fixture.env", "OMG_FIXTURE_OUT=plain\n"),),
+                expected={result_key: b"plain", raw_key: raw})
+            run("source-copies-opaque-value", env={raw_key: raw}, conf=source_config,
+                files=(("source.sh", 'export OMG_FIXTURE_OUT="$OMG_FIXTURE_RAW"\n'),),
+                expected={result_key: raw, raw_key: raw})
+            run("source-exports-opaque-value", env={result_key: b"before"}, conf=source_config,
+                files=(("source.sh", "export OMG_FIXTURE_OUT=$(printf '\\377')\n"),),
+                expected={result_key: b"\xff"})
+            run("source-unsets-opaque-value", env={raw_key: raw}, conf=source_config,
+                files=(("source.sh", "unset OMG_FIXTURE_RAW\n"),), expected={raw_key: None})
+            run("source-keeps-opaque-inherited-key", env={opaque_key: b"extra"}, conf=source_config,
+                files=(("source.sh", "export OMG_FIXTURE_OUT=ready\n"),),
+                expected={opaque_key: b"extra", result_key: b"ready"})
+            run("mise-path-preserves-opaque-component", env={path_key: opaque_path}, conf=path_config,
+                expected=lambda cwd: {path_key: os.fsencode(cwd/"tooling") + b":" + opaque_path})
+            run("source-path-preserves-opaque-component", env={path_key: opaque_path}, conf=source_config,
+                files=(("source.sh", 'export PATH="$PATH:/source-fixture"\n'),),
+                expected={path_key: opaque_path + b":/source-fixture"})
+            run("mise-path-from-opaque-project-root", env={path_key: system_path}, conf=path_config,
+                opaque_root=True, local_tool=True,
+                expected=lambda cwd: {path_key: os.fsencode(cwd/"tooling") + b":" + system_path})
+            run("template-refuses-opaque-project-root", opaque_root=True,
+                conf="[env]\nOMG_FIXTURE_OUT = '{{config_root}}'\n", error="Mise config root is not UTF-8")
+            run("path-entry-with-colon-refused", conf="[env._]\npath = ['dir:with-colon']\n",
+                error="Cannot prepend directories to PATH")
+            run("empty-path-overlay", env={path_key: b""}, conf=path_config, local_tool=True,
+                expected=lambda cwd: {path_key: os.fsencode(cwd/"tooling")})
+            run("unset-path-overlay", env={path_key: None}, conf=path_config, local_tool=True,
+                expected=lambda cwd: {path_key: os.fsencode(cwd/"tooling")})
+            run("nonempty-path-retains-explicit-empty-segments", env={path_key: b":" + opaque_path + b":"},
+                conf=path_config,
+                expected=lambda cwd: {path_key: os.fsencode(cwd/"tooling") + b"::" + opaque_path + b":"})
+            run("opaque-mise-selection-refused", env={b"MISE_ENV": b"test-\xff"},
+                error="Environment variable MISE_ENV is not UTF-8")
+            run("selected-mise-layer-works-with-opaque-inheritance", env={b"MISE_ENV": b"test", raw_key: raw},
+                files=(("mise.test.toml", "[env]\nOMG_FIXTURE_OUT = 'selected'\n"),),
+                expected={result_key: b"selected", raw_key: raw})
+            run("layered-parent-source-final-child-override", env={raw_key: raw}, parent_conf=source_config,
+                parent_files=(("source.sh", 'export OMG_FIXTURE_OUT="$OMG_FIXTURE_RAW"\n'),),
+                conf="[env]\nOMG_FIXTURE_OUT = 'child'\n", expected={result_key: b"child", raw_key: raw})
+            run("layered-path-order-with-opaque-component", env={path_key: opaque_path},
+                parent_conf="[env._]\npath = ['parent-bin']\n", conf=path_config,
+                expected=lambda cwd: {path_key: b":".join(
+                    (os.fsencode(cwd/"tooling"), os.fsencode(cwd.parent/"parent-bin"), opaque_path))})
+            run("native-task-overrides-opaque-value", native_task=True, env={raw_key: raw},
+                conf=task + task_env + "OMG_FIXTURE_RAW = 'task'\n", expected={raw_key: b"task"})
+            run("native-task-source-reads-opaque-value", native_task=True, env={raw_key: raw},
+                conf=task + task_source, files=(("source.sh", 'export OMG_FIXTURE_OUT="$OMG_FIXTURE_RAW"\n'),),
+                expected={result_key: raw, raw_key: raw})
+            run("native-task-finds-opaque-path", native_task=True, env={path_key: opaque_path}, conf=task,
+                expected={path_key: opaque_path})
 
 
     def inspect_environment_lockfiles():
@@ -4014,6 +4187,7 @@ exec {shlex.quote(str(binary))} "$@"
                     inspect_task_selection()
                     inspect_task_watch()
                     inspect_task_runtime_admissions()
+                    inspect_task_environment_bytes()
                 config.write_text(alternate_config)
                 refresh_fixture()
                 expected = ordinary_control([dnf, "--cacheonly", "repoquery",
@@ -4331,6 +4505,6 @@ assert inventory() == before
 report = dict(binaries=binaries, checks=checks, total=len(checks),
               passed=sum(entry["passed"] for entry in checks), host_unchanged=True)
 print(json.dumps(report))
-expected_checks = 303 if consent_oracle is None else 1385
+expected_checks = 303 if consent_oracle is None else 1419
 if report["passed"] != report["total"] or report["total"] != expected_checks:
     sys.exit(4)

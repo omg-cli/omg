@@ -34,6 +34,7 @@
 //! env directives remain out of scope.
 
 use std::collections::{HashMap, HashSet};
+use std::ffi::{OsStr, OsString};
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
@@ -96,22 +97,31 @@ pub(crate) struct MiseEnv {
     pub redactions: Vec<String>,
 }
 
-/// Fully resolved environment: ordered assignments plus removals.
+pub(crate) type Environment = HashMap<OsString, OsString>;
+
+/// Fully resolved environment: ordered native assignments plus removals.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct ResolvedEnv {
     /// `(name, value)` assignments in application order; later wins.
-    pub set: Vec<(String, String)>,
+    pub set: Vec<(String, OsString)>,
     /// Variables to remove.
     pub unset: Vec<String>,
-    /// Directories to prepend to `PATH` (after tool bin dirs), in order.
-    pub path_additions: Vec<String>,
-    /// `_.source` scripts to evaluate (config-root-resolved).
-    pub sources: Vec<PathBuf>,
     /// Names whose values must be masked in echoed output.
     pub redacted: HashSet<String>,
 }
 
 impl ResolvedEnv {
+    pub(crate) fn apply_to(&self, environment: &mut Environment) {
+        environment.extend(
+            self.set
+                .iter()
+                .map(|(name, value)| (OsString::from(name), value.clone())),
+        );
+        for name in &self.unset {
+            environment.remove(OsStr::new(name));
+        }
+    }
+
     /// Whether `name` matches a redaction flag or glob pattern.
     fn is_redacted(name: &str, entry_redact: bool, patterns: &[String]) -> bool {
         if entry_redact {
@@ -173,24 +183,17 @@ pub(crate) fn validate_env_name(name: &str) -> Result<()> {
     }
 }
 
-/// Overlay `PATH` for `tools = true` resolution: tool bin dirs are already
-/// known while the rest of the environment is not yet resolved, so lazy
-/// entries referencing `{{env.PATH}}` see the final tool-augmented value.
-pub(crate) fn with_path_overlay(
-    base: &HashMap<String, String>,
-    tool_bins: &[String],
-) -> HashMap<String, String> {
-    let mut overlaid = base.clone();
-    if !tool_bins.is_empty() {
-        let current = base.get("PATH").cloned().unwrap_or_default();
-        let joined = if current.is_empty() {
-            tool_bins.join(":")
-        } else {
-            format!("{}:{current}", tool_bins.join(":"))
-        };
-        overlaid.insert("PATH".to_string(), joined);
-    }
-    overlaid
+/// Prepend complete entries while preserving the bytes and order of the existing PATH.
+pub(crate) fn prepend_paths<'a>(
+    paths: impl IntoIterator<Item = &'a Path>,
+    current: Option<&OsStr>,
+) -> Result<OsString> {
+    let inherited = current
+        .filter(|path| !path.is_empty())
+        .into_iter()
+        .flat_map(std::env::split_paths);
+    std::env::join_paths(paths.into_iter().map(Path::to_path_buf).chain(inherited))
+        .context("Cannot prepend directories to PATH")
 }
 
 /// Expand `{{env.NAME}}` and `{{config_root}}` templates in a TOML value.
@@ -198,9 +201,9 @@ pub(crate) fn with_path_overlay(
 /// `lookup` sees already-resolved variables first, then the base environment.
 /// Any other `{{…}}` is a hard error: silently leaving Tera syntax literal
 /// would set a wrong value that looks right.
-pub(crate) fn expand_templates(
+fn expand_templates<'a>(
     value: &str,
-    lookup: &dyn Fn(&str) -> Option<String>,
+    lookup: &dyn Fn(&str) -> Result<Option<&'a str>>,
 ) -> Result<String> {
     let mut output = String::with_capacity(value.len());
     let mut rest = value;
@@ -213,13 +216,13 @@ pub(crate) fn expand_templates(
         let expression = after[..end].trim();
         if let Some(var) = expression.strip_prefix("env.") {
             let var = var.trim();
-            match lookup(var) {
-                Some(resolved) => output.push_str(&resolved),
+            match lookup(var)? {
+                Some(resolved) => output.push_str(resolved),
                 None => anyhow::bail!("Unknown template variable {{{{{var}}}}} in env value"),
             }
         } else if expression == "config_root" {
-            match lookup("\0config_root") {
-                Some(root) => output.push_str(&root),
+            match lookup("\0config_root")? {
+                Some(root) => output.push_str(root),
                 None => anyhow::bail!("{{config_root}} is unavailable in this context"),
             }
         } else {
@@ -233,7 +236,10 @@ pub(crate) fn expand_templates(
 
 /// Expand `$NAME` / `${NAME}` against `lookup`; unknown names expand empty
 /// (dotenv semantics). Used for dotenv files and `expand = true` files.
-fn expand_dollar(value: &str, lookup: &dyn Fn(&str) -> Option<String>) -> String {
+fn expand_dollar<'a>(
+    value: &str,
+    lookup: &dyn Fn(&str) -> Result<Option<&'a str>>,
+) -> Result<String> {
     let mut output = String::with_capacity(value.len());
     let mut chars = value.chars().peekable();
     while let Some(char) = chars.next() {
@@ -251,8 +257,8 @@ fn expand_dollar(value: &str, lookup: &dyn Fn(&str) -> Option<String>) -> String
                 if chars.next().is_none() {
                     output.push_str("${");
                     output.push_str(&name);
-                } else if let Some(resolved) = lookup(&name) {
-                    output.push_str(&resolved);
+                } else if let Some(resolved) = lookup(&name)? {
+                    output.push_str(resolved);
                 }
             }
             Some(c) if c.is_ascii_alphabetic() || *c == '_' => {
@@ -260,14 +266,14 @@ fn expand_dollar(value: &str, lookup: &dyn Fn(&str) -> Option<String>) -> String
                 while let Some(c) = chars.next_if(|c| c.is_ascii_alphanumeric() || *c == '_') {
                     name.push(c);
                 }
-                if let Some(resolved) = lookup(&name) {
-                    output.push_str(&resolved);
+                if let Some(resolved) = lookup(&name)? {
+                    output.push_str(resolved);
                 }
             }
             _ => output.push('$'),
         }
     }
-    output
+    Ok(output)
 }
 
 /// Parse one `[env]` variable spec into an [`EnvEntry`].
@@ -699,11 +705,11 @@ pub(crate) enum Strictness {
 /// Accumulator for one resolution pass.
 struct Resolver<'a> {
     /// Base environment (process snapshot): never mutated, only read.
-    base: &'a HashMap<String, String>,
+    base: &'a Environment,
     /// config_root for `{{config_root}}` templates.
-    config_root: String,
+    config_root: &'a Path,
     /// Ordered assignments; later entries override earlier ones.
-    assigned: Vec<(String, String)>,
+    assigned: Vec<(String, OsString)>,
     /// Index into `assigned` for override-in-place.
     index: HashMap<String, usize>,
     unset: Vec<String>,
@@ -714,18 +720,32 @@ struct Resolver<'a> {
 }
 
 impl Resolver<'_> {
-    fn lookup(&self, name: &str) -> Option<String> {
-        if name == "\0config_root" {
-            return Some(self.config_root.clone());
-        }
+    fn lookup(&self, name: &str) -> Option<&OsStr> {
         if self.unset.iter().any(|removed| removed == name) {
             return None;
         }
         self.index
             .get(name)
             .and_then(|position| self.assigned.get(*position))
-            .map(|(_, value)| value.clone())
-            .or_else(|| self.base.get(name).cloned())
+            .map(|(_, value)| value.as_os_str())
+            .or_else(|| self.base.get(OsStr::new(name)).map(OsString::as_os_str))
+    }
+
+    fn lookup_text(&self, name: &str) -> Result<Option<&str>> {
+        if name == "\0config_root" {
+            return self
+                .config_root
+                .to_str()
+                .map(Some)
+                .context("Mise config root is not UTF-8");
+        }
+        self.lookup(name)
+            .map(|value| {
+                value
+                    .to_str()
+                    .with_context(|| format!("Environment variable {name} is not UTF-8"))
+            })
+            .transpose()
     }
 
     fn warn(&mut self, message: &str) {
@@ -735,7 +755,7 @@ impl Resolver<'_> {
         }
     }
 
-    fn assign(&mut self, name: &str, value: String, redact: bool) {
+    fn assign(&mut self, name: &str, value: OsString, redact: bool) {
         if ResolvedEnv::is_redacted(name, redact, self.patterns) {
             self.redacted.insert(name.to_string());
         }
@@ -769,21 +789,21 @@ impl Resolver<'_> {
         }
         match &entry.action {
             EnvAction::Set(raw) => {
-                let value = expand_templates(raw, &|name| self.lookup(name))?;
-                self.assign(&entry.name, value, entry.redact);
+                let value = expand_templates(raw, &|name| self.lookup_text(name))?;
+                self.assign(&entry.name, value.into(), entry.redact);
             }
             EnvAction::Default(raw) => {
                 let current = self.lookup(&entry.name);
-                if current.as_deref().is_none_or(str::is_empty) {
-                    let value = expand_templates(raw, &|name| self.lookup(name))?;
-                    self.assign(&entry.name, value, entry.redact);
+                if current.is_none_or(OsStr::is_empty) {
+                    let value = expand_templates(raw, &|name| self.lookup_text(name))?;
+                    self.assign(&entry.name, value.into(), entry.redact);
                 } else if let Some(value) = current {
-                    self.assign(&entry.name, value, entry.redact);
+                    self.assign(&entry.name, value.to_owned(), entry.redact);
                 }
             }
             EnvAction::Required { .. } => {
                 let current = self.lookup(&entry.name);
-                if current.as_deref().is_none_or(str::is_empty) {
+                if current.is_none_or(OsStr::is_empty) {
                     let message = format!(
                         "Required environment variable {} is not set; define it in the shell or mise.local.toml",
                         entry.name
@@ -793,7 +813,7 @@ impl Resolver<'_> {
                     }
                     self.warn(&message);
                 } else if let Some(value) = current {
-                    self.assign(&entry.name, value, entry.redact);
+                    self.assign(&entry.name, value.to_owned(), entry.redact);
                 }
             }
             EnvAction::Unset => self.remove(&entry.name),
@@ -805,20 +825,21 @@ impl Resolver<'_> {
     fn apply_file(
         &mut self,
         directive: &EnvFileDirective,
-        pairs: Vec<(String, String)>,
+        pairs: &[(String, String)],
         tools_phase: bool,
-    ) {
+    ) -> Result<()> {
         if directive.tools_phase != tools_phase {
-            return;
+            return Ok(());
         }
         for (key, raw) in pairs {
             let value = if directive.expand {
-                expand_dollar(&raw, &|name| self.lookup(name))
+                expand_dollar(raw, &|name| self.lookup_text(name))?
             } else {
-                raw
+                raw.clone()
             };
-            self.assign(&key, value, directive.redact);
+            self.assign(key, value.into(), directive.redact);
         }
+        Ok(())
     }
 }
 
@@ -828,14 +849,14 @@ impl Resolver<'_> {
 fn resolve_one(
     parsed: &MiseEnv,
     file_pairs: &[(EnvFileDirective, Vec<(String, String)>)],
-    base: &HashMap<String, String>,
+    base: &Environment,
     config_root: &Path,
     patterns: &[String],
     strict: Strictness,
 ) -> Result<ResolvedEnv> {
     let mut resolver = Resolver {
         base,
-        config_root: config_root.display().to_string(),
+        config_root,
         assigned: Vec::new(),
         index: HashMap::new(),
         unset: Vec::new(),
@@ -846,27 +867,20 @@ fn resolve_one(
     };
     for tools_phase in [false, true] {
         for (directive, pairs) in file_pairs {
-            resolver.apply_file(directive, pairs.clone(), tools_phase);
+            resolver.apply_file(directive, pairs, tools_phase)?;
         }
         for entry in &parsed.entries {
             resolver.apply_entry(entry, tools_phase)?;
         }
-        let paths: Vec<String> = parsed
+        let mut paths = parsed
             .paths
             .iter()
             .filter(|(_, phase)| *phase == tools_phase)
-            .map(|(path, _)| path.display().to_string())
-            .collect();
-        if !paths.is_empty() {
-            let current = resolver.lookup("PATH").unwrap_or_default();
-            let path = if current.is_empty() {
-                paths.join(":")
-            } else {
-                format!("{}:{current}", paths.join(":"))
-            };
-            // PATH is an ordered layer effect like any other assignment.
-            // Deferring it would hide parent paths from later source scripts
-            // and let a parent source overwrite a child's later directive.
+            .map(|(path, _)| path.as_path())
+            .peekable();
+        if paths.peek().is_some() {
+            let path = prepend_paths(paths, resolver.lookup("PATH"))?;
+            // PATH is an ordered layer effect and must be visible to later sources.
             resolver.assign("PATH", path, false);
         }
         for (script, phase) in &parsed.sources {
@@ -879,9 +893,14 @@ fn resolve_one(
                 // documents see them and can override them. Do not replay
                 // these scripts after the chain has already been merged.
                 let mut effective = resolver.base.clone();
-                effective.extend(resolver.assigned.iter().cloned());
+                effective.extend(
+                    resolver
+                        .assigned
+                        .iter()
+                        .map(|(key, value)| (OsString::from(key), value.clone())),
+                );
                 for name in &resolver.unset {
-                    effective.remove(name);
+                    effective.remove(OsStr::new(name));
                 }
                 let sourced = eval_sourced_file(script, &effective)?;
                 for (key, value) in sourced.set {
@@ -901,15 +920,13 @@ fn resolve_one(
     Ok(ResolvedEnv {
         set: resolver.assigned,
         unset: resolver.unset,
-        path_additions: Vec::new(),
-        sources: Vec::new(),
         redacted: resolver.redacted,
     })
 }
 
 pub(crate) fn resolve_task_env(
     parsed: &MiseEnv,
-    base: &HashMap<String, String>,
+    base: &Environment,
     config_root: &Path,
 ) -> Result<ResolvedEnv> {
     let file_pairs = parsed
@@ -934,7 +951,7 @@ pub(crate) fn resolve_task_env(
 
 /// Merge one [`ResolvedEnv`] into an accumulated chain result: later files
 /// override earlier assignments, removals win over prior assignments, and
-/// path additions, sources, and redactions accumulate in order.
+/// redactions accumulate in order.
 fn merge_chain(accumulated: &mut ResolvedEnv, next: ResolvedEnv) {
     let mut index: HashMap<String, usize> = HashMap::new();
     for (slot, (key, _)) in accumulated.set.iter().enumerate() {
@@ -955,12 +972,6 @@ fn merge_chain(accumulated: &mut ResolvedEnv, next: ResolvedEnv) {
             accumulated.unset.push(removed);
         }
     }
-    accumulated.path_additions.extend(next.path_additions);
-    for script in next.sources {
-        if !accumulated.sources.contains(&script) {
-            accumulated.sources.push(script);
-        }
-    }
     accumulated.redacted.extend(next.redacted);
 }
 
@@ -970,13 +981,24 @@ fn merge_chain(accumulated: &mut ResolvedEnv, next: ResolvedEnv) {
 /// [`Strictness::Strict`] and fail closed on missing required inputs.
 pub(crate) fn load_mise_env_chain(
     start: &Path,
-    base: &HashMap<String, String>,
+    base: &Environment,
     strict: Strictness,
 ) -> Result<ResolvedEnv> {
+    let mut selection = HashMap::new();
+    if let Some(value) = base.get(OsStr::new("MISE_ENV")) {
+        let value = value
+            .to_str()
+            .context("Environment variable MISE_ENV is not UTF-8")?;
+        selection.insert("MISE_ENV".to_owned(), value.to_owned());
+    }
+    let documents = super::mise_config::load(start, &selection)?;
     let mut merged = ResolvedEnv::default();
+    if documents.is_empty() {
+        return Ok(merged);
+    }
     let mut effective = base.clone();
     let mut patterns: Vec<String> = Vec::new();
-    for document in super::mise_config::load(start, base)? {
+    for document in documents {
         let parsed = parse_mise_env(&document.value, &document.root)
             .with_context(|| format!("Invalid mise environment in {}", document.path.display()))?;
         patterns.extend(parsed.redactions.iter().cloned());
@@ -1007,10 +1029,7 @@ pub(crate) fn load_mise_env_chain(
             &patterns,
             strict,
         )?;
-        effective.extend(resolved.set.iter().cloned());
-        for name in &resolved.unset {
-            effective.remove(name);
-        }
+        resolved.apply_to(&mut effective);
         merge_chain(&mut merged, resolved);
     }
     Ok(merged)
@@ -1023,15 +1042,12 @@ pub(crate) fn load_mise_env_chain(
 /// difference. A non-zero script exit is a hard error: a half-sourced
 /// environment must never silently apply.
 #[cfg(unix)]
-pub(crate) fn eval_sourced_file(
-    script: &Path,
-    base: &HashMap<String, String>,
-) -> Result<ResolvedEnv> {
+pub(crate) fn eval_sourced_file(script: &Path, base: &Environment) -> Result<ResolvedEnv> {
     fn snapshot(
         shell: &str,
         script: Option<&Path>,
-        base: &HashMap<String, String>,
-    ) -> Result<HashMap<String, String>> {
+        base: &Environment,
+    ) -> Result<HashMap<String, OsString>> {
         let mut command = std::process::Command::new(shell);
         command.env_clear().envs(base);
         command.arg("-c");
@@ -1086,17 +1102,18 @@ fn which_shell(name: &str) -> bool {
 
 /// Parse NUL-separated `KEY=value` records from `env -0` output. Records
 /// without `=` cannot come from `env` and are ignored defensively.
-fn parse_nul_env(output: &[u8]) -> HashMap<String, String> {
+#[cfg(unix)]
+fn parse_nul_env(output: &[u8]) -> HashMap<String, OsString> {
+    use std::os::unix::ffi::OsStringExt as _;
+
     let mut vars = HashMap::new();
     for record in output.split(|byte| *byte == 0) {
-        let Ok(text) = std::str::from_utf8(record) else {
-            continue;
-        };
-        if let Some((key, value)) = text.split_once('=')
-            && !key.is_empty()
+        let mut parts = record.splitn(2, |byte| *byte == b'=');
+        if let (Some(key), Some(value)) = (parts.next(), parts.next())
+            && let Ok(key) = std::str::from_utf8(key)
             && validate_env_name(key).is_ok()
         {
-            vars.insert(key.to_string(), value.to_string());
+            vars.insert(key.to_owned(), OsString::from_vec(value.to_vec()));
         }
     }
     vars
@@ -1179,10 +1196,10 @@ mod tests {
         );
     }
 
-    fn base(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+    fn base(pairs: &[(&str, &str)]) -> Environment {
         pairs
             .iter()
-            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .map(|(key, value)| (OsString::from(key), OsString::from(value)))
             .collect()
     }
 
@@ -1191,11 +1208,7 @@ mod tests {
         parse_mise_env(&document, root).expect("test [env] parses")
     }
 
-    fn resolve_text(
-        toml_text: &str,
-        base_map: &HashMap<String, String>,
-        strict: Strictness,
-    ) -> ResolvedEnv {
+    fn resolve_text(toml_text: &str, base_map: &Environment, strict: Strictness) -> ResolvedEnv {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let parsed = parse_env(toml_text, dir.path());
         resolve_one(
@@ -1214,7 +1227,7 @@ mod tests {
             .set
             .iter()
             .find(|(key, _)| key == name)
-            .map(|(_, value)| value.clone())
+            .and_then(|(_, value)| value.to_str().map(str::to_owned))
     }
 
     #[test]
@@ -1377,15 +1390,19 @@ mod tests {
     #[test]
     fn expand_dollar_references_earlier_values() {
         assert_eq!(
-            expand_dollar("$A/${B}/lit", &|name| match name {
-                "A" => Some("x".to_string()),
-                "B" => Some("y".to_string()),
+            expand_dollar("$A/${B}/lit", &|name| Ok(match name {
+                "A" => Some("x"),
+                "B" => Some("y"),
                 _ => None,
-            }),
+            }))
+            .unwrap(),
             "x/y/lit"
         );
-        assert_eq!(expand_dollar("$-$${", &|_| None), "$-$${");
-        assert_eq!(expand_dollar("${UNFINISHED", &|_| None), "${UNFINISHED");
+        assert_eq!(expand_dollar("$-$${", &|_| Ok(None)).unwrap(), "$-$${");
+        assert_eq!(
+            expand_dollar("${UNFINISHED", &|_| Ok(None)).unwrap(),
+            "${UNFINISHED"
+        );
     }
 
     #[test]
@@ -1425,7 +1442,11 @@ mod tests {
             Strictness::Strict,
         );
         assert_eq!(
-            resolved.set.into_iter().collect::<HashMap<_, _>>(),
+            resolved
+                .set
+                .into_iter()
+                .map(|(key, value)| (OsString::from(key), value))
+                .collect::<Environment>(),
             base(&[
                 ("API_TOKEN", "first"),
                 ("API_TOKEN_OLD_TOKEN", "repeated"),
@@ -1492,18 +1513,20 @@ mod tests {
         .expect("parent config");
         std::fs::write(
             dir.path().join("parent.sh"),
-            "export FROM_SOURCE=parent\nexport MODE=parent\n",
+            "printf x >> \"$0.calls\"\nexport FROM_SOURCE=parent\nexport MODE=parent\n",
         )
         .expect("parent source");
         let child = dir.path().join("child");
         std::fs::create_dir(&child).expect("child directory");
         std::fs::write(child.join("mise.toml"), "[env]\nMODE = \"child\"\nCOPY = \"{{env.FROM_SOURCE}}\"\nFROM_SOURCE = { required = true }\n").expect("child config");
-        let resolved = load_mise_env_chain(&child, &std::env::vars().collect(), Strictness::Strict)
-            .expect("source precedes child resolution");
+        let resolved =
+            load_mise_env_chain(&child, &std::env::vars_os().collect(), Strictness::Strict)
+                .expect("source precedes child resolution");
         assert_eq!(get(&resolved, "COPY").as_deref(), Some("parent"));
         assert_eq!(get(&resolved, "MODE").as_deref(), Some("child"));
-        assert!(
-            resolved.sources.is_empty(),
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("parent.sh.calls")).expect("source ran"),
+            "x",
             "sources must be evaluated exactly once in their layer"
         );
     }
@@ -1517,7 +1540,7 @@ mod tests {
         merge_chain(
             &mut accumulated,
             ResolvedEnv {
-                set: vec![("A".to_string(), "child".to_string())],
+                set: vec![("A".to_string(), "child".into())],
                 ..ResolvedEnv::default()
             },
         );
@@ -1530,7 +1553,7 @@ mod tests {
     fn sourced_script_errors_fail_closed() {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let script = dir.path().join("env.sh");
-        let env = std::env::vars().collect();
+        let env = std::env::vars_os().collect();
         assert!(eval_sourced_file(&script, &env).is_err());
         std::fs::write(&script, "export PARTIAL=yes\nreturn 1\n").expect("script");
         assert!(eval_sourced_file(&script, &env).is_err());
@@ -1557,7 +1580,7 @@ mod tests {
         let script = dir.path().join("env.sh");
         std::fs::write(&script, "export RESULT=\"$CONFIGURED/bin\"\nunset SECRET\n")
             .expect("script");
-        let mut env: HashMap<String, String> = std::env::vars().collect();
+        let mut env: Environment = std::env::vars_os().collect();
         env.insert("CONFIGURED".into(), "/resolved".into());
         env.insert("SECRET".into(), "removed".into());
         let resolved = eval_sourced_file(&script, &env).expect("source");
@@ -1565,12 +1588,13 @@ mod tests {
         assert!(resolved.unset.iter().any(|key| key == "SECRET"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn nul_env_parsing_skips_junk() {
         let vars = parse_nul_env(b"GOOD=1\x00NOEQUALS\x00BAD-NAME=2\x00EMPTY=\x00");
-        assert_eq!(vars.get("GOOD").map(String::as_str), Some("1"));
+        assert_eq!(vars.get("GOOD").and_then(|value| value.to_str()), Some("1"));
         assert!(!vars.contains_key("BAD-NAME"));
-        assert_eq!(vars.get("EMPTY").map(String::as_str), Some(""));
+        assert_eq!(vars.get("EMPTY").and_then(|value| value.to_str()), Some(""));
     }
 
     #[test]
@@ -1588,7 +1612,8 @@ mod tests {
         .expect("script");
         // `$RANDOM` differs per shell invocation, so only the fixed variable
         // can be asserted deterministically.
-        let vars = eval_sourced_file(&script, &std::env::vars().collect()).expect("eval succeeds");
+        let vars =
+            eval_sourced_file(&script, &std::env::vars_os().collect()).expect("eval succeeds");
         assert_eq!(get(&vars, "OMG_FIXED_PROBE").as_deref(), Some("yes"));
     }
 }
