@@ -1232,7 +1232,7 @@ jobs:
           # Diagnostic output paths contain run IDs, not compiler settings.
           RUSTUP_DIAGNOSTICS_DIR: ""
         with:
-          prefix-key: v2-platform-dependencies
+          prefix-key: ${{ matrix.platform == 'debian' && 'v2-platform-dependencies' || 'v3-platform-dependencies' }}
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' && matrix.phase == 'validation' }}
           # Never restore across distro ABI or feature contracts. The action
@@ -1274,7 +1274,8 @@ jobs:
 
       - name: Run unit tests
         if: matrix.phase == 'validation'
-        run: python3 scripts/run-native-contracts.py --features ${{ matrix.features }}
+        # Debian's benchmark uses the default profile and shares its dependencies here.
+        run: python3 scripts/run-native-contracts.py --features ${{ matrix.features }} --cargo-profile ${{ matrix.platform == 'debian' && 'test' || 'ci' }}
 
       - name: Build release
         if: matrix.phase == 'validation' && matrix.platform != 'ubuntu-2604'
@@ -1328,7 +1329,7 @@ jobs:
       - name: Test emitted shell hooks
         if: matrix.phase == 'validation' && matrix.platform == 'fedora'
         env:
-          OMG_HOOK_TEST_BINARY: ${{ github.workspace }}/target/debug/omg
+          OMG_HOOK_TEST_BINARY: ${{ github.workspace }}/target/ci/omg
           OMG_HOOK_TEST_REQUIRE_SHELLS: bash,zsh,fish
         run: |
           test -x "$OMG_HOOK_TEST_BINARY"
@@ -1343,10 +1344,11 @@ jobs:
           set -euo pipefail
           if [[ '${{ matrix.platform }}' == fedora ]]; then
             cargo test --lib --bins --no-default-features --features ${{ matrix.features }} \
-              --locked --no-fail-fast --message-format=json -- --test-threads=1 \
+              --profile ci --locked --no-fail-fast --message-format=json -- --test-threads=1 \
               | tee target/fedora-serial-libtest.jsonl
           else
-            cargo test --lib --bins --no-default-features --features ${{ matrix.features }} --locked --no-fail-fast -- --test-threads=1
+            cargo test --lib --bins --no-default-features --features ${{ matrix.features }} \
+              --profile ${{ matrix.platform == 'debian' && 'test' || 'ci' }} --locked --no-fail-fast -- --test-threads=1
           fi
 
       - name: Native Fedora ignored integration fixtures
@@ -1395,7 +1397,7 @@ jobs:
         run: |
           set -euo pipefail
           binary=$(cargo test --lib --no-run --no-default-features --features arch,pgp,license \
-            --locked --message-format=json | jq -r \
+            --profile ci --locked --message-format=json | jq -r \
             'select(.reason == "compiler-artifact" and .target.name == "omg_lib" and .profile.test) | .executable // empty')
           test -n "$binary"
           install -Dm755 "$binary" target/sandbox-test/omg-lib-tests
@@ -1465,7 +1467,7 @@ jobs:
             cargo_source=(--config "$RUNNER_TEMP/omg-alpm-source/cargo-config.toml")
           fi
           cargo clippy --all-targets --no-default-features --features ${{ matrix.features }} \
-            "${cargo_source[@]}" --locked -- -D warnings
+            "${cargo_source[@]}" --profile ${{ matrix.platform == 'debian' && 'dev' || 'ci' }} --locked -- -D warnings
 
       - name: Record native Clippy execution
         if: always()
@@ -1782,9 +1784,8 @@ jobs:
         env:
           ZSTD_CLEVEL: "6"
         with:
-          # v1 repeatedly missed restoration but could not reserve its key.
-          # Keep dependency compatibility hashes; recover in a fresh namespace.
-          prefix-key: "v2-macos-dependencies"
+          # Regenerate dependencies for the Cargo CI profile.
+          prefix-key: "v3-macos"
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-bin: false
@@ -1845,7 +1846,7 @@ jobs:
           printf 'OMG_MACOS_PYTHON_FIXTURE_ARCHIVE=%s\n' "$archive" >> "$GITHUB_ENV"
 
       - name: Run unit tests
-        run: python3 scripts/run-native-contracts.py --features macos,pgp,license
+        run: python3 scripts/run-native-contracts.py --features macos,pgp,license --cargo-profile ci
 
       - name: Install Homebrew test packages
         run: |
@@ -1853,7 +1854,7 @@ jobs:
 
       - name: Run macOS platform integration tests
         run: |
-          cargo test --test macos_tests --no-default-features --features macos,pgp,license --locked -- --test-threads=1
+          cargo test --test macos_tests --no-default-features --features macos,pgp,license --profile ci --locked -- --test-threads=1
 
       - name: Verify native Homebrew doctor
         run: python3 scripts/verify-macos-doctor.py target/release/omg
@@ -2007,7 +2008,7 @@ jobs:
         env:
           ZSTD_CLEVEL: "6"
         with:
-          prefix-key: "v1-ubuntu-debian"
+          prefix-key: "v2-ubuntu-debian"
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
@@ -2067,7 +2068,7 @@ jobs:
       - name: Platform clippy
         run: |
           cargo clippy --all-targets --no-default-features --features debian,pgp,license \
-            --locked -- -D warnings
+            --profile ci --locked -- -D warnings
 
       - name: Install nextest
         uses: taiki-e/install-action@e67fa11c4b9316fa714ddf0abed07a0c3143b95b # v2.87.4
@@ -2080,10 +2081,10 @@ jobs:
         run: timeout -k 5s 180s python3 scripts/prepare-node-test-fixture.py --destination "$RUNNER_TEMP/node-test-fixture"
 
       - name: Run unit tests
-        run: python3 scripts/run-native-contracts.py --features debian,pgp,license
+        run: python3 scripts/run-native-contracts.py --features debian,pgp,license --cargo-profile ci
 
       - name: Run serial library and binary contracts
-        run: cargo test --lib --bins --no-default-features --features debian,pgp,license --locked --no-fail-fast -- --test-threads=1
+        run: cargo test --lib --bins --no-default-features --features debian,pgp,license --profile ci --locked --no-fail-fast -- --test-threads=1
 
       - name: Verify binary
         run: |
