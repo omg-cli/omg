@@ -195,7 +195,7 @@ omg audit verify
 
 Screen output defaults to 20 entries. Export defaults to all entries unless `--limit` is supplied. Redirecting the screen display does not produce JSON. A `.csv` extension selects CSV; other extensions select JSON.
 
-`omg audit verify` checks internal hash-chain consistency and refuses a collection marked incomplete. A log owner can rewrite entries and recompute hashes, truncate history, or remove an incompleteness marker. Successful verification proves neither authenticity nor completeness. Retain independent logs if you need evidence against the machine's administrator.
+`omg audit verify` checks internal hash-chain consistency in the active log and each retained rotated file, and refuses a collection marked incomplete. A log owner can rewrite entries and recompute hashes, truncate history, or remove an incompleteness marker. Successful verification proves neither authenticity nor completeness. Retain independent logs if you need evidence against the machine's administrator.
 
 Unprivileged storage defaults to `~/.local/share/omg/audit/audit.jsonl`. Privileged Linux storage is `/var/lib/omg/audit/audit.jsonl`. A trusted legacy `/var/log/omg` collection is migrated atomically on first use. Migration refuses conflicting locations, untrusted permissions, or a cross-filesystem move. Preserve the old data and reconcile it while OMG is stopped; do not delete audit history to clear an error.
 

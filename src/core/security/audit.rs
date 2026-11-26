@@ -566,14 +566,61 @@ impl AuditLogger {
         Ok(())
     }
 
-    /// Verify the integrity of the entire audit log.
+    /// Verify the integrity of this audit log file.
     pub fn verify_integrity(&self) -> Result<AuditIntegrityReport, AuditError> {
-        with_audit_read_lock(&self.log_path, || self.verify_integrity_unlocked())
+        with_audit_read_lock(&self.log_path, || Self::verify_segment(&self.log_path))
     }
 
-    fn verify_integrity_unlocked(&self) -> Result<AuditIntegrityReport, AuditError> {
-        let path_str = self.log_path.display().to_string();
-        let file = open_read_file(&self.log_path)?;
+    /// Verify retained files under the same lock used by rotation. Each file
+    /// starts its own chain, including logs produced by older writers.
+    pub(crate) fn verify_retained_integrity(
+        &self,
+    ) -> Result<Option<AuditIntegrityReport>, AuditError> {
+        with_audit_read_lock(&self.log_path, || {
+            let mut combined = AuditIntegrityReport {
+                total_entries: 0,
+                valid_entries: 0,
+                chain_valid: true,
+                first_invalid_entry: None,
+                log_path: self.log_path.clone(),
+            };
+            let mut found_segment = false;
+            let paths = (1..=self.max_archives)
+                .rev()
+                .map(|index| rotated_path(&self.log_path, index))
+                .chain(std::iter::once(self.log_path.clone()));
+            for path in paths {
+                let report = match Self::verify_segment(&path) {
+                    Ok(report) => report,
+                    Err(AuditError::Open { source, .. })
+                        if source.kind() == io::ErrorKind::NotFound =>
+                    {
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
+                found_segment = true;
+                combined.total_entries += report.total_entries;
+                combined.valid_entries += report.valid_entries;
+                combined.chain_valid &= report.chain_valid;
+                if combined.first_invalid_entry.is_none()
+                    && let Some(entry) = report.first_invalid_entry
+                {
+                    combined.first_invalid_entry = Some(if path == self.log_path {
+                        entry
+                    } else {
+                        let name = path.file_name().unwrap_or(path.as_os_str());
+                        format!("{}: {entry}", name.to_string_lossy())
+                    });
+                }
+            }
+            Ok(found_segment.then_some(combined))
+        })
+    }
+
+    fn verify_segment(path: &Path) -> Result<AuditIntegrityReport, AuditError> {
+        let path_str = path.display().to_string();
+        let file = open_read_file(path)?;
         let reader = BufReader::new(file);
 
         let mut total_entries = 0;
@@ -629,7 +676,7 @@ impl AuditLogger {
             valid_entries,
             chain_valid,
             first_invalid_entry: first_invalid,
-            log_path: self.log_path.clone(),
+            log_path: path.to_path_buf(),
         })
     }
 
@@ -691,7 +738,9 @@ fn bounded_audit_field(value: &str) -> String {
 }
 
 fn rotated_path(path: &Path, index: usize) -> PathBuf {
-    PathBuf::from(format!("{}.{index}", path.display()))
+    let mut name = path.as_os_str().to_os_string();
+    name.push(format!(".{index}"));
+    PathBuf::from(name)
 }
 
 fn open_read_file(path: &Path) -> Result<File, AuditError> {
@@ -2197,6 +2246,12 @@ mod tests {
                 .is_valid()
         );
         assert!(logger.verify_integrity().expect("verify active").is_valid());
+        let retained = logger
+            .verify_retained_integrity()
+            .expect("verify retained audit log")
+            .expect("active log and archive are present");
+        assert_eq!(retained.total_entries, 2);
+        assert!(retained.is_valid());
         assert_eq!(
             std::fs::metadata(&log_path)
                 .expect("active mode")

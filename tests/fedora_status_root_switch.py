@@ -610,6 +610,96 @@ exec {shlex.quote(str(native_executable))} "$@"
 
 
 
+
+    def inspect_audit_segments():
+        phase = "audit-segment-verification"
+
+        def segment(tag, count, *, legacy=False, broken_link=False):
+            previous = "genesis"
+            rows = []
+            for sequence in range(count):
+                row = dict(id=f"{tag}-{sequence}", timestamp=f"2026-01-01T12:00:0{sequence}Z",
+                           event_type="policy_violation", severity="info", user="fixture",
+                           resource="test-package", description="Known inventory event", prev_hash=previous)
+                if broken_link and sequence == 1:
+                    row["prev_hash"] = "unlinked"
+                parts = [row["id"], row["timestamp"], "PolicyViolation", "Info",
+                         row["user"], row["resource"], row["description"]]
+                if legacy:
+                    preimage = "".join([*parts, row["prev_hash"]]).encode()
+                else:
+                    row["hash_version"] = 1
+                    fields = [value.encode() for value in (*parts, "", row["prev_hash"])]
+                    preimage = bytes((255, 1)) + b"".join(len(value).to_bytes(8, "big") + value for value in fields)
+                row["hash"] = hashlib.sha256(preimage).hexdigest()
+                previous = row["hash"]
+                rows.append(row)
+            return rows
+
+        def write_segment(path, rows):
+            path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+            path.chmod(0o600)
+            os.chown(path, account.pw_uid, account.pw_gid)
+
+        cases = [(index, kind) for index in range(1, 6) for kind in
+                 ("valid", "archive-only", "invalid-digest", "invalid-link", "invalid-json", "invalid-file", "incomplete")]
+        cases.extend(((1, "empty"), (2, "non-utf8"), (3, "multiple-segments")))
+        for index, kind in cases:
+            root_data = Path(tempfile.mkdtemp(prefix=f"{phase}-{index}-{kind}-", dir=work))
+            os.chown(root_data, account.pw_uid, account.pw_gid)
+            data = root_data / os.fsdecode(b"audited-\xff") if kind == "non-utf8" else root_data
+            directory = data / "audit"
+            directory.mkdir(parents=True)
+            for path in (data, directory):
+                os.chown(path, account.pw_uid, account.pw_gid)
+                path.chmod(0o700)
+            active = directory / "audit.jsonl"
+            archive = directory / f"audit.jsonl.{index}"
+            if kind not in ("empty", "archive-only"):
+                write_segment(active, segment("active", 1))
+            if kind == "invalid-file":
+                archive.mkdir()
+            elif kind != "empty":
+                rows = segment(f"archive-{index}", 2, legacy=index % 2 == 1, broken_link=kind == "invalid-link")
+                if kind == "invalid-digest":
+                    rows[1]["description"] = "Unexpected inventory event"
+                write_segment(archive, rows)
+                if kind == "invalid-json":
+                    with archive.open("ab") as file:
+                        file.write(b"{incomplete record\n")
+            if kind == "multiple-segments":
+                write_segment(directory / "audit.jsonl.1", segment("second-segment", 1))
+            if kind == "incomplete":
+                (directory / "incomplete").touch()
+            before = {path.name: path.read_bytes() for path in directory.iterdir() if path.is_file()}
+            result = command([cli, "audit", "verify"], dict(disabled, OMG_DATA_DIR=str(data)), ordinary)
+            lines = result.stdout.splitlines()
+            verified = "Local audit chain consistency verified" in result.stdout
+            if kind == "incomplete":
+                correct = (result.returncode == 1 and not verified
+                           and "Audit collection is incomplete" in result.stderr)
+            elif kind == "empty":
+                correct = result.returncode == 0 and not verified and "No audit log exists yet." in result.stdout
+            elif kind == "invalid-file":
+                correct = (result.returncode == 1 and not verified
+                           and archive.name in result.stderr and "regular file" in result.stderr)
+            else:
+                total = {"archive-only": 2, "multiple-segments": 4, "invalid-json": 4}.get(kind, 3)
+                invalid = kind.startswith("invalid-")
+                valid = total - int(kind in ("invalid-json", "invalid-digest"))
+                counts = f"Total: {total} entries" in result.stdout and f"Valid: {valid} entries" in result.stdout
+                if invalid:
+                    first_invalid = "line_3" if kind == "invalid-json" else f"archive-{index}-1"
+                    correct = (result.returncode == 1 and not verified and counts
+                               and any("First Invalid:" in line and archive.name in line and first_invalid in line for line in lines))
+                else:
+                    correct = result.returncode == 0 and verified and counts
+            after = {path.name: path.read_bytes() for path in directory.iterdir()
+                     if path.is_file() and path.name != "audit.lock"}
+            assert before == after, (index, kind)
+            checks.append(dict(phase=phase, case=f"{index}-{kind}", passed=correct, status=result.returncode,
+                               diagnostic=(result.stdout + result.stderr)[-1200:]))
+
     def inspect_history_locks():
         phase = "history-lock"
         def transaction(label, day, kind, name, success=True):
@@ -1542,6 +1632,7 @@ exec {shlex.quote(str(binary))} "$@"
                 inspect("initial-host", host_count, host_explicit, host=True)
                 if consent_oracle is not None:
                     inspect_history_locks()
+                    inspect_audit_segments()
                 config.write_text(alternate_config)
                 refresh_fixture()
                 expected = ordinary_control([dnf, "--cacheonly", "repoquery",
@@ -1859,6 +1950,6 @@ assert inventory() == before
 report = dict(binaries=binaries, checks=checks, total=len(checks),
               passed=sum(entry["passed"] for entry in checks), host_unchanged=True)
 print(json.dumps(report))
-expected_checks = 303 if consent_oracle is None else 724
+expected_checks = 303 if consent_oracle is None else 762
 if report["passed"] != report["total"] or report["total"] != expected_checks:
     sys.exit(4)

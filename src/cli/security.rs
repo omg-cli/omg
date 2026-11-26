@@ -479,18 +479,15 @@ pub fn verify_audit_log(_ctx: &CliContext) -> Result<()> {
         &crate::core::paths::data_dir().join("audit/incomplete"),
     )?;
     let logger = AuditLogger::new().context("Failed to open audit log")?;
-    let report = match logger.verify_integrity() {
-        Ok(report) => report,
-        Err(error) if error.is_not_found() => {
-            println!(
-                "  {} No audit log exists yet.",
-                style::maybe_color("ℹ", |t| t.blue().to_string())
-            );
-            return Ok(());
-        }
-        Err(error) => {
-            return Err(error).context("Failed to verify audit log integrity");
-        }
+    let Some(report) = logger
+        .verify_retained_integrity()
+        .context("Failed to verify audit log integrity")?
+    else {
+        println!(
+            "  {} No audit log exists yet.",
+            style::maybe_color("ℹ", |t| t.blue().to_string())
+        );
+        return Ok(());
     };
 
     if report.is_valid() {
