@@ -253,6 +253,24 @@ pub(crate) async fn update_official_only(
     let pb =
         crate::cli::modern_ui::modern_spinner("Upgrading", &format!("{count} official packages"));
     let history = crate::core::history::HistoryManager::new()?;
+    #[cfg(feature = "fedora")]
+    if crate::package_managers::resolve_backend()? == crate::package_managers::Backend::Fedora {
+        let cached =
+            matches!(mode, UpdateMode::Turbo) || matches!(mode, UpdateMode::Standard) && no_sync;
+        let changes = crate::package_managers::DnfPackageManager::new()
+            .update_with_history(cached, Some(&history))
+            .await;
+        pb.finish_and_clear();
+        if let Some(changes) = changes?.filter(|&count| count != 0) {
+            let label = if changes == 1 { "change" } else { "changes" };
+            crate::cli::modern_ui::print_success(&format!(
+                "System updated successfully · {changes} package {label}"
+            ));
+            crate::core::usage::track_update_result(changes, true);
+        }
+        return Ok(());
+    }
+
     let native_operation = select_native_update(
         mode,
         no_sync,

@@ -180,12 +180,20 @@ fn unreadable_archive_reaches_arch_metadata_validation_without_mutation() -> Res
 }
 
 #[test]
-fn fedora_mock_keeps_generic_install_dispatch() {
+fn fedora_mock_keeps_generic_install_dispatch() -> Result<()> {
     let project = TestProject::for_distro("fedora");
     let result = run(&project, &["install", "--yes", "git"]);
     result.assert_success();
     assert!(result.stdout.contains("Installed 1 package"));
-    assert!(project.data_dir.path().join("mock_state_dnf.json").exists());
+    let result = run(&project, &["install", "--yes", "vim-enhanced", "firefox"]);
+    result.assert_success();
+    assert!(result.stdout.contains("Installed 2 packages"));
+    let state: serde_json::Value = serde_json::from_slice(&std::fs::read(
+        project.data_dir.path().join("mock_state_dnf.json"),
+    )?)?;
+    assert_eq!(state["installed"]["git"], "2.43.0");
+    assert_eq!(state["installed"]["vim-enhanced"], "9.0.2103");
+    assert_eq!(state["installed"]["firefox"], "122.0");
     assert!(
         !project
             .data_dir
@@ -194,4 +202,5 @@ fn fedora_mock_keeps_generic_install_dispatch() {
             .exists()
     );
     project.close_checked();
+    Ok(())
 }
