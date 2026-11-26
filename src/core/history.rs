@@ -562,6 +562,13 @@ mod tests {
                     .contains("Failed to inspect package history")
             );
             assert_eq!(fs::read(&store)?, b"invalid store");
+            fs::remove_file(&store)?;
+
+            let manager = HistoryManager::new_in(store.join("history.json"))?;
+            manager.save(&[])?;
+            let before = fs::read(&manager.log_path)?;
+            assert!(HistoryManager::load_existing()?.is_empty());
+            assert_eq!(fs::read(&manager.log_path)?, before);
             Ok(())
         })
     }

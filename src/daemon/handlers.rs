@@ -2126,14 +2126,16 @@ pub(super) mod tests {
             .update_explicit(vec!["former-explicit".into(), "other".into()]);
 
         let response = handle_request(Arc::clone(&state), Request::Explicit { id: 1 }).await;
-        let Response::Success {
-            result: ResponseResult::Explicit(result),
-            ..
-        } = response
-        else {
-            anyhow::bail!("Explicit inventory should be available: {response:?}");
-        };
-        assert_eq!(result.packages.as_slice(), std::slice::from_ref(&package));
+        assert!(
+            matches!(
+                &response,
+                Response::Success {
+                    result: ResponseResult::Explicit(result),
+                    ..
+                } if result.packages.as_slice() == std::slice::from_ref(&package)
+            ),
+            "{response:?}"
+        );
 
         let response = handle_request(Arc::clone(&state), Request::ExplicitCount { id: 2 }).await;
         assert!(matches!(

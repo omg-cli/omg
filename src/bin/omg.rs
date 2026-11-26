@@ -529,10 +529,11 @@ fn try_fast_explicit_count(args: &[String]) -> bool {
         return false;
     }
 
-    if args.len() == 3 && args[1] == "explicit" && matches!(args[2].as_str(), "--count" | "-c") {
-        let Ok(backend) = omg_lib::package_managers::resolve_backend() else {
-            return false;
-        };
+    if args.len() == 3
+        && args[1] == "explicit"
+        && matches!(args[2].as_str(), "--count" | "-c")
+        && let Ok(backend) = omg_lib::package_managers::resolve_backend()
+    {
         #[cfg(feature = "fedora")]
         if backend == omg_lib::package_managers::Backend::Fedora {
             return false;
