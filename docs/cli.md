@@ -909,7 +909,9 @@ discard queued events on opt-out and before enabling telemetry from a disabled s
 Environment overrides can keep collection disabled after opt-in. A telemetry
 batch holds a shared settings lease while it sends. If opt-out reports a busy
 configuration lock, retry after the batch finishes. Saved queue and session files
-are limited to 8 MiB and 64 KiB respectively.
+are limited to 8 MiB and 64 KiB respectively. Overlapping processes merge their
+events into the local queue. One process drains the saved queue at a time.
+Events added during a send stay queued for the next batch.
 
 ---
 

@@ -33,6 +33,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::core::telemetry_client::{CommandEvent, PerformanceEvent, SessionEvent, TelemetryEvent};
 
+mod queue;
+use queue::{PendingEvent, QueueStore};
+
 /// Maximum queue size before dropping old events
 const MAX_QUEUE_SIZE: usize = 5000;
 const MAX_QUEUE_BYTES: u64 = 8 * 1024 * 1024;
@@ -344,18 +347,10 @@ static SESSION_STATE: OnceLock<Mutex<TelemetrySession>> = OnceLock::new();
 /// Global CLI start time for startup metrics
 static CLI_START_TIME: OnceLock<Instant> = OnceLock::new();
 
-/// Strict persisted queue envelope.
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PersistedEventQueue {
-    format_version: u32,
-    events: Vec<TelemetryEvent>,
-}
-
 /// Event queue for batching telemetry events
 #[derive(Debug)]
 struct EventQueue {
-    events: VecDeque<Arc<TelemetryEvent>>,
+    events: VecDeque<PendingEvent>,
     events_since_persist: AtomicU32,
     last_persist: AtomicI64,
     persistence_enabled: bool,
@@ -385,7 +380,7 @@ impl EventQueue {
             );
         }
 
-        self.events.push_back(Arc::new(event));
+        self.events.push_back(PendingEvent::new(event));
         self.events_since_persist.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -398,7 +393,10 @@ impl EventQueue {
     }
 
     fn snapshot(&self) -> Vec<Arc<TelemetryEvent>> {
-        self.events.iter().cloned().collect()
+        self.events
+            .iter()
+            .map(|row| Arc::clone(&row.event))
+            .collect()
     }
 
     fn confirm_sent(&mut self, sent: &[Arc<TelemetryEvent>]) {
@@ -406,7 +404,7 @@ impl EventQueue {
         // identical payload therefore cannot be acknowledged by an older batch.
         let identities: HashSet<_> = sent.iter().map(Arc::as_ptr).collect();
         self.events
-            .retain(|event| !identities.contains(&Arc::as_ptr(event)));
+            .retain(|row| !identities.contains(&Arc::as_ptr(&row.event)));
     }
 
     fn path() -> Result<PathBuf> {
@@ -417,7 +415,7 @@ impl EventQueue {
     fn load() -> Self {
         let result = Self::path().and_then(|path| Self::load_from(&path));
         match result {
-            Ok(queue) => queue,
+            Ok(()) => Self::default(),
             Err(error) => {
                 tracing::warn!(
                     "Telemetry queue persistence disabled because its state is invalid: {error:#}"
@@ -430,55 +428,21 @@ impl EventQueue {
         }
     }
 
-    fn load_from(path: &std::path::Path) -> Result<Self> {
-        let Some(content) = read_saved_telemetry(path, "Telemetry queue", MAX_QUEUE_BYTES)? else {
-            return Ok(Self::default());
-        };
-        let persisted = serde_json::from_str::<PersistedEventQueue>(&content)
-            .with_context(|| format!("Malformed telemetry queue: {}", path.display()))?;
-        anyhow::ensure!(
-            persisted.format_version == QUEUE_FORMAT_VERSION,
-            "Unsupported telemetry queue format version {} (expected {})",
-            persisted.format_version,
-            QUEUE_FORMAT_VERSION
-        );
-        let now = jiff::Timestamp::now().as_second();
-        let excess = persisted.events.len().saturating_sub(MAX_QUEUE_SIZE);
-        Ok(Self {
-            events: persisted
-                .events
-                .into_iter()
-                .skip(excess)
-                .map(Arc::new)
-                .collect(),
-            events_since_persist: AtomicU32::new(0),
-            last_persist: AtomicI64::new(now),
-            persistence_enabled: true,
-        })
+    fn load_from(path: &Path) -> Result<()> {
+        QueueStore::new(path.to_path_buf()).validate()
     }
 
-    fn save(&self) -> Result<()> {
+    fn save(&mut self) -> Result<()> {
         anyhow::ensure!(
             self.persistence_enabled,
             "telemetry queue persistence is disabled after a load failure"
         );
-        let path = Self::path()?;
-        let persisted = PersistedEventQueue {
-            format_version: QUEUE_FORMAT_VERSION,
-            events: self
-                .events
-                .iter()
-                .map(|event| event.as_ref().clone())
-                .collect(),
-        };
-        let content =
-            serde_json::to_vec(&persisted).context("Failed to serialize telemetry queue")?;
-        anyhow::ensure!(
-            content.len() as u64 <= MAX_QUEUE_BYTES,
-            "Telemetry queue exceeds the {MAX_QUEUE_BYTES} byte limit"
-        );
-        crate::core::safe_ops::atomic_write_file_sync_private(&path, content)
-            .with_context(|| format!("Failed to save telemetry queue: {}", path.display()))?;
+        if self.events.is_empty() {
+            return Ok(());
+        }
+
+        QueueStore::new(Self::path()?).append(&self.events)?;
+        self.events.clear();
 
         // Reset persist tracking
         self.events_since_persist.store(0, Ordering::Relaxed);
@@ -859,6 +823,53 @@ where
     SendBatch: FnOnce(Vec<TelemetryEvent>) -> Sending,
     Sending: std::future::Future<Output = Result<()>>,
 {
+    let use_persistence = match queue.lock() {
+        Ok(mut local) if local.persistence_enabled => {
+            if let Err(error) = local.save() {
+                tracing::warn!("Failed to merge local telemetry: {error:#}");
+                return;
+            }
+            true
+        }
+        Ok(_) => false,
+        Err(error) => {
+            tracing::warn!("Failed to lock telemetry queue: {error}");
+            return;
+        }
+    };
+    if use_persistence {
+        if let Err(error) = flush_persisted_queue(send_batch).await {
+            tracing::debug!("Deferred telemetry dispatch: {error:#}");
+        }
+    } else {
+        flush_unsaved_queue(queue, send_batch).await;
+    }
+}
+
+async fn flush_persisted_queue<SendBatch, Sending>(send_batch: SendBatch) -> Result<()>
+where
+    SendBatch: FnOnce(Vec<TelemetryEvent>) -> Sending,
+    Sending: std::future::Future<Output = Result<()>>,
+{
+    let store = QueueStore::new(EventQueue::path()?);
+    let Some(_dispatch) = store.try_dispatch_lock()? else {
+        return Ok(());
+    };
+    let batch = store.prepare_batch()?;
+    if batch.is_empty() {
+        return Ok(());
+    }
+
+    let payloads = batch.iter().map(|row| row.event.clone()).collect();
+    send_batch(payloads).await?;
+    store.acknowledge(&batch)
+}
+
+async fn flush_unsaved_queue<SendBatch, Sending>(queue: &Mutex<EventQueue>, send_batch: SendBatch)
+where
+    SendBatch: FnOnce(Vec<TelemetryEvent>) -> Sending,
+    Sending: std::future::Future<Output = Result<()>>,
+{
     let events = match queue.lock() {
         Ok(queue) => queue.snapshot(),
         Err(error) => {
@@ -870,27 +881,14 @@ where
         return;
     }
 
-    tracing::debug!("Flushing {} telemetry events", events.len());
     let payloads = events.iter().map(|event| event.as_ref().clone()).collect();
     match send_batch(payloads).await {
         Ok(()) => {
             if let Ok(mut queue) = queue.lock() {
                 queue.confirm_sent(&events);
-                if let Err(error) = queue.save() {
-                    tracing::warn!("Failed to persist telemetry queue after flush: {error}");
-                }
             }
         }
-        Err(error) => {
-            tracing::debug!("Failed to flush telemetry events: {error}");
-            if let Ok(queue) = queue.lock()
-                && let Err(persist_error) = queue.save()
-            {
-                tracing::warn!(
-                    "Failed to preserve telemetry queue after send failure: {persist_error}"
-                );
-            }
-        }
+        Err(error) => tracing::debug!("Failed to flush in-memory telemetry: {error}"),
     }
 }
 

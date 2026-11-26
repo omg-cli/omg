@@ -4928,6 +4928,105 @@ for version in versions:
             invoke("status-enabled-after-release", ["status"], chosen, 0, enabled)
 
 
+    def inspect_telemetry_queue_overlap():
+        phase = "fedora-telemetry-queue-overlap"
+
+        def write(path, data, mode=0o600):
+            path.write_bytes(data)
+            path.chmod(mode)
+            os.chown(path, account.pw_uid, account.pw_gid)
+
+        for initial in (0, 1, 2):
+            for first in ("left", "right"):
+                for existing_ids in (False, True):
+                    with tempfile.TemporaryDirectory(prefix="queue-overlap-", dir=work) as directory:
+                        home = Path(directory)
+                        data, config = home/"data", home/"config"
+                        for path in (home, data, config):
+                            path.mkdir(exist_ok=True)
+                            path.chmod(0o700)
+                            os.chown(path, account.pw_uid, account.pw_gid)
+                        write(config/"config.toml", b"telemetry_enabled = true\n")
+                        write(data/".installed", b"{}")
+                        seed = [{"type":"performance","metric_type":"existing-fixture","duration_ms":7}
+                                for _ in range(initial)]
+                        if existing_ids:
+                            for index, row in enumerate(seed):
+                                row["queue_id"] = f"01234567-89ab-4cde-8f01-{index:012d}"
+                        queue = data/"telemetry_queue.json"
+                        write(queue, json.dumps({"format_version":1,"events":seed}).encode())
+                        write(data/"telemetry_session.json", json.dumps({
+                            "format_version":1,"session_id":"shared-fixture-session",
+                            "started_at":"2026-10-01T01:02:03Z","commands_run":0,
+                            "last_activity":int(time.time())}).encode())
+                        write(home/"Makefile", b"""left right:
+	@touch ready-$@
+	@i=0; while [ ! -f release-$@ ] && [ $$i -lt 300 ]; do i=$$((i+1)); sleep 0.02; done
+	@test -f release-$@
+	@printf '%s finished\\n' $@
+""")
+                        chosen = {name:value for name,value in disabled.items() if name != "OMG_DISABLE_TELEMETRY"}
+                        chosen.update(HOME=str(home), OMG_DATA_DIR=str(data), OMG_CONFIG_DIR=str(config),
+                                      XDG_CONFIG_HOME=str(home/"xdg-config"), XDG_DATA_HOME=str(home/"xdg-data"),
+                                      XDG_STATE_HOME=str(home/"state"), XDG_CACHE_HOME=str(home/"cache"),
+                                      CI="1", OMG_NO_UPDATE_CHECK="1")
+                        children = {}
+                        try:
+                            for key in ("left","right"):
+                                children[key] = subprocess.Popen([str(cli),"run",key], cwd=home, env=chosen,
+                                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    text=True, **ordinary)
+
+                            deadline = time.monotonic() + 12
+                            while not all((home/f"ready-{key}").is_file() for key in children):
+                                assert all(child.poll() is None for child in children.values()), {
+                                    key: child.communicate() if child.poll() is not None else None
+                                    for key, child in children.items()}
+                                assert time.monotonic() < deadline, "both telemetry commands must reach the task barrier"
+                                time.sleep(0.02)
+                            second = "right" if first == "left" else "left"
+                            for consumed, key in enumerate((first,second), 1):
+                                (home/f"release-{key}").touch()
+                                status_text, warnings = children[key].communicate(timeout=12)
+                                value = json.loads(queue.read_bytes())
+                                events = value["events"]
+                                commands = [event for event in events if event["type"] == "command"]
+                                retained = [event for event in events if event.get("metric_type")=="existing-fixture"]
+                                identity = [event.get("queue_id") for event in events]
+                                native = (len(commands) == consumed and all(event["command"] == "run" for event in commands)
+                                          and len(retained)==initial and all(row["duration_ms"] == 7 for row in retained))
+                                stable = (all(isinstance(value, str) and len(value)==36 for value in identity)
+                                          and len(set(identity))==len(identity)
+                                          and (not existing_ids or {row["queue_id"] for row in seed} <= set(identity)))
+                                checks.append(dict(phase=phase,
+                                    case=f"seed-{initial}-{first}-ids-{existing_ids}-{consumed}",
+                                    passed=children[key].returncode==0 and f"{key} finished" in status_text
+                                    and value["format_version"]==1 and native and stable,
+                                    status=children[key].returncode, diagnostic=(status_text[-430:], warnings[-500:],
+                                        len(commands),len(retained),len(events),sum(value is not None for value in identity))))
+                        finally:
+                            for child in children.values():
+                                if child.poll() is None:
+                                    child.kill()
+                                child.wait()
+
+        for initial in range(6):
+            with tempfile.TemporaryDirectory(prefix="queue-control-", dir=work) as directory:
+                home = Path(directory)
+                os.chown(home, account.pw_uid, account.pw_gid)
+                queue = home/"telemetry_queue.json"
+                rows = [{"type":"performance","metric_type":"disabled-control","duration_ms":index}
+                        for index in range(initial)]
+                original = json.dumps({"format_version":1,"events":rows}).encode()
+                write(queue, original)
+                chosen = dict(disabled, HOME=str(home), OMG_DATA_DIR=str(home), OMG_CONFIG_DIR=str(home/"config"))
+                result = command([cli,"privacy","status"], chosen, ordinary, timeout=12)
+                checks.append(dict(phase=phase, case=f"disabled-{initial}",
+                    passed=result.returncode==0 and "Telemetry: Disabled" in result.stdout
+                    and queue.read_bytes()==original, status=result.returncode,
+                    diagnostic=(result.stdout[-430:], result.stderr[-500:])))
+
+
     def inspect_task_environment_bytes():
         phase = "task-environment-bytes"
         raw = b"test-\xff-value"
@@ -7664,6 +7763,7 @@ exec {shlex.quote(str(binary))} "$@"
                     inspect_snapshot_recovery()
                     inspect_privacy_commands()
                     inspect_telemetry_storage()
+                    inspect_telemetry_queue_overlap()
                 config.write_text(host_config)
                 inspect("returned-host", host_count, host_explicit, host=True)
                 mark_progress("root switch and return")
@@ -7975,6 +8075,6 @@ mark_progress("completed with host inventory unchanged")
 report = dict(binaries=binaries, checks=checks, total=len(checks),
               passed=sum(entry["passed"] for entry in checks), host_unchanged=True)
 print(json.dumps(report))
-expected_checks = 303 if consent_oracle is None else 2502
+expected_checks = 303 if consent_oracle is None else 2532
 if report["passed"] != report["total"] or report["total"] != expected_checks:
     sys.exit(4)

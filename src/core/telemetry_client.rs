@@ -263,9 +263,13 @@ fn record_failure() {
 
 /// Send batched telemetry events with circuit breaker support
 pub async fn send_batch(events: Vec<TelemetryEvent>) -> Result<()> {
-    if !crate::core::telemetry::is_enhanced_telemetry_enabled() || events.is_empty() {
+    if events.is_empty() {
         return Ok(());
     }
+    anyhow::ensure!(
+        crate::core::telemetry::is_enhanced_telemetry_enabled(),
+        "Telemetry consent changed before dispatch"
+    );
 
     // Check circuit breaker state; hold any won probe-slot guard across the
     // batch request so cancellation cannot leak the latch.
