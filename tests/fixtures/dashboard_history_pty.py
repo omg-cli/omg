@@ -17,7 +17,9 @@ binary = sys.argv[1]
 mode = sys.argv[2] if len(sys.argv) > 2 else "history"
 data = Path(os.environ["OMG_DATA_DIR"])
 package = "omg-history-lock-fixture"
-if mode == "history":
+
+
+def write_history():
     (data / "history.json").write_text(json.dumps([{
         "id": "history-lock-fixture",
         "timestamp": "2026-01-01T00:00:00Z",
@@ -29,7 +31,13 @@ if mode == "history":
         ],
     }]), encoding="utf-8")
 
-with (data / "history.lock").open("wb") as lock:
+
+if mode == "history":
+    write_history()
+
+history_lock = data / "history.lock"
+lock_context = contextlib.nullcontext() if mode == "visibility" else history_lock.open("wb")
+with lock_context as lock:
     if mode == "history":
         fcntl.flock(lock, fcntl.LOCK_EX)
     pid, terminal = pty.fork()
@@ -78,6 +86,24 @@ with (data / "history.lock").open("wb") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             os.write(terminal, b"r")
             time.sleep(0.25)
+        elif mode == "visibility":
+            read_until(b"\x1b[?1049h")
+            os.write(terminal, b"5")
+            read_until(b"No activity recorded yet")
+            assert not history_lock.exists()
+            tab_started = len(transcript)
+            os.write(terminal, b"3")
+            read_until(b"Runtimes", tab_started)
+            write_history()
+            os.write(terminal, b"r")
+            quiet_until = time.monotonic() + 1
+            while time.monotonic() < quiet_until:
+                read_output(0.05)
+                assert not history_lock.exists(), "Runtimes refresh opened package history"
+            tab_started = len(transcript)
+            os.write(terminal, b"5")
+            read_until(f"{package}.i686, {package}.x86_64".encode(), tab_started)
+            assert history_lock.exists(), "entering Activity did not load the new history"
         else:
             assert mode == "action"
             read_until(b"Updates unknown")

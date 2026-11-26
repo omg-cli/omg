@@ -72,6 +72,10 @@ fn should_refresh_team(tab: app::Tab, in_flight: bool, elapsed: Duration) -> boo
         && elapsed >= Duration::from_secs(TEAM_REFRESH_INTERVAL_SECS)
 }
 
+fn shows_package_history(tab: app::Tab) -> bool {
+    matches!(tab, app::Tab::Dashboard | app::Tab::Activity)
+}
+
 fn search_session_started(was_search_mode: bool, search_mode: bool) -> bool {
     !was_search_mode && search_mode
 }
@@ -265,7 +269,10 @@ async fn run_app(
             app.history = history;
             app.history_loaded = true;
         }
-        if history_refresh_requested && history_refresh.is_none() {
+        if history_refresh_requested
+            && history_refresh.is_none()
+            && shows_package_history(app.current_tab)
+        {
             history_refresh_requested = false;
             // Dropping this thread's handle lets the terminal exit even if a
             // package transaction still holds the history lock.
@@ -280,6 +287,7 @@ async fn run_app(
 
         // Handle events with timeout for animations
         let was_search_mode = app.search_mode;
+        let previous_tab = app.current_tab;
         poll_input.send(())?;
         let event = event_rx
             .recv()
@@ -368,7 +376,9 @@ async fn run_app(
         // Update app state
         let last_refresh = app.last_tick;
         app.tick()?;
-        history_refresh_requested |= app.external_refresh_enabled && app.last_tick != last_refresh;
+        history_refresh_requested |= app.external_refresh_enabled
+            && shows_package_history(app.current_tab)
+            && (app.last_tick != last_refresh || !shows_package_history(previous_tab));
 
         #[cfg(unix)]
         if should_refresh_daemon(daemon_refresh_in_flight, last_daemon_refresh.elapsed()) {

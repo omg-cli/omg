@@ -615,6 +615,12 @@ mod boundary_matrix {
 
     #[cfg(all(target_os = "linux", debug_assertions))]
     #[test]
+    fn dashboard_refreshes_package_history_only_for_visible_tabs() -> anyhow::Result<()> {
+        dashboard_pty("visibility")
+    }
+
+    #[cfg(all(target_os = "linux", debug_assertions))]
+    #[test]
     fn dashboard_restores_search_input_after_package_action() -> anyhow::Result<()> {
         dashboard_pty("action")
     }
