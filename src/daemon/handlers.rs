@@ -585,6 +585,11 @@ impl DaemonState {
         self.package_manager.list_explicit().await
     }
 
+    pub(super) fn caches_explicit_packages(&self) -> bool {
+        // DNF can change install reasons without changing the RPM database.
+        !self.uses_rpm_catalog()
+    }
+
     pub fn new() -> anyhow::Result<Self> {
         let selected_backend = crate::package_managers::resolve_backend()?;
         let data_dir = crate::core::paths::daemon_data_dir();
@@ -1367,15 +1372,6 @@ async fn handle_info(state: Arc<DaemonState>, id: RequestId, package: String) ->
 }
 
 async fn cached_status(state: &Arc<DaemonState>) -> Option<StatusResult> {
-    #[cfg(feature = "fedora")]
-    if state.uses_rpm_catalog() {
-        // Persisted status carries no live RPM observation after a restart.
-        let (cached, observation) = state.cache.observed_status()?;
-        return state
-            .status_rpm_catalog_is_current(observation)
-            .await
-            .then(|| Arc::unwrap_or_clone(cached));
-    }
     if let Some(cached) = state.cache.get_status() {
         return Some(Arc::unwrap_or_clone(cached));
     }
@@ -1405,7 +1401,8 @@ async fn cached_status(state: &Arc<DaemonState>) -> Option<StatusResult> {
 #[tracing::instrument(skip(state))]
 async fn handle_status(state: Arc<DaemonState>, id: RequestId) -> Response {
     GLOBAL_METRICS.inc_status_requests();
-    if let Some(cached) = cached_status(&state).await {
+    let rpm_catalog = state.uses_rpm_catalog();
+    if !rpm_catalog && let Some(cached) = cached_status(&state).await {
         GLOBAL_METRICS.inc_cache_hits();
         return Response::Success {
             id,
@@ -1416,9 +1413,14 @@ async fn handle_status(state: Arc<DaemonState>, id: RequestId) -> Response {
     // METRICS: Cache miss - need to query system
     GLOBAL_METRICS.inc_cache_misses();
 
-    // 3. Query the selected backend. Production uses the optimized native
-    // status paths; dependency-injected states stay behind the package-manager
-    // interface and never access host package databases.
+    // DNF install reasons and repository metadata can change independently of
+    // RPM inventory. Its observation can only carry forward advisory coverage.
+    #[cfg(feature = "fedora")]
+    let observed_status = if rpm_catalog {
+        state.cache.observed_status()
+    } else {
+        None
+    };
     let status_result = state.status_counts().await;
 
     match status_result {
@@ -1435,10 +1437,26 @@ async fn handle_status(state: Arc<DaemonState>, id: RequestId) -> Response {
                     .clone(),
                 None,
             );
-            debug_assert!(
-                !cacheable,
-                "package-count snapshots without a vulnerability scan must not be cached"
-            );
+            debug_assert!(!cacheable);
+
+            #[cfg(feature = "fedora")]
+            let res = if let Some((cached, observation)) = observed_status
+                && total == cached.total_packages
+                && state.status_rpm_catalog_is_current(observation).await
+                && state
+                    .cache
+                    .get_status()
+                    .is_some_and(|entry| Arc::ptr_eq(&entry, &cached))
+            {
+                StatusResult {
+                    security_vulnerabilities: cached.security_vulnerabilities,
+                    security_unknown_packages: cached.security_unknown_packages,
+                    vulnerabilities_scanned: cached.vulnerabilities_scanned,
+                    ..res
+                }
+            } else {
+                res
+            };
 
             Response::Success {
                 id,
@@ -1463,8 +1481,8 @@ async fn handle_security_audit(state: Arc<DaemonState>, id: RequestId) -> Respon
 
 /// Handle list explicit request
 async fn handle_list_explicit(state: Arc<DaemonState>, id: RequestId) -> Response {
-    // Arc clone is cheap - just pointer copy
-    if let Some(cached) = state.cache.get_explicit() {
+    let use_cache = state.caches_explicit_packages();
+    if use_cache && let Some(cached) = state.cache.get_explicit() {
         return Response::Success {
             id,
             result: ResponseResult::Explicit(ExplicitResult {
@@ -1473,20 +1491,23 @@ async fn handle_list_explicit(state: Arc<DaemonState>, id: RequestId) -> Respons
         };
     }
 
-    let index = state.index_snapshot();
+    let index = use_cache.then(|| state.index_snapshot());
     let packages_result = state.explicit_packages().await;
 
     match packages_result {
         Ok(packages) => {
-            let packages_arc = Arc::new(packages);
-            state.with_current_index(&index, || {
-                state.cache.update_explicit_arc(Arc::clone(&packages_arc));
-            });
+            let packages = if let Some(index) = index {
+                let shared = Arc::new(packages);
+                state.with_current_index(&index, || {
+                    state.cache.update_explicit_arc(Arc::clone(&shared));
+                });
+                Arc::unwrap_or_clone(shared)
+            } else {
+                packages
+            };
             Response::Success {
                 id,
-                result: ResponseResult::Explicit(ExplicitResult {
-                    packages: Arc::unwrap_or_clone(packages_arc),
-                }),
+                result: ResponseResult::Explicit(ExplicitResult { packages }),
             }
         }
         Err(error) => internal_error(id, format!("Failed to list explicit packages: {error}")),
@@ -1495,14 +1516,15 @@ async fn handle_list_explicit(state: Arc<DaemonState>, id: RequestId) -> Respons
 
 /// Handle explicit package count request
 async fn handle_explicit_count(state: Arc<DaemonState>, id: RequestId) -> Response {
-    if let Some(cached) = state.cache.get_explicit_count() {
+    let use_cache = state.caches_explicit_packages();
+    if use_cache && let Some(cached) = state.cache.get_explicit_count() {
         return Response::Success {
             id,
             result: ResponseResult::ExplicitCount(cached),
         };
     }
 
-    let index = state.index_snapshot();
+    let index = use_cache.then(|| state.index_snapshot());
     let count_result = state
         .explicit_packages()
         .await
@@ -1510,9 +1532,11 @@ async fn handle_explicit_count(state: Arc<DaemonState>, id: RequestId) -> Respon
 
     match count_result {
         Ok(count) => {
-            state.with_current_index(&index, || {
-                state.cache.update_explicit_count(count);
-            });
+            if let Some(index) = index {
+                state.with_current_index(&index, || {
+                    state.cache.update_explicit_count(count);
+                });
+            }
             Response::Success {
                 id,
                 result: ResponseResult::ExplicitCount(count),
@@ -2092,6 +2116,56 @@ pub(super) mod tests {
 
     #[cfg(feature = "fedora")]
     #[tokio::test]
+    async fn fedora_explicit_list_and_count_read_current_dnf_reasons() -> anyhow::Result<()> {
+        let (_directory, state, _, revision, _, _) = mutable_fedora_catalog(true, None)?;
+        let package = "retired-tool.x86_64".to_owned();
+        state
+            .package_manager
+            .install(std::slice::from_ref(&package))
+            .await?;
+        state
+            .cache
+            .update_explicit(vec!["former-explicit".into(), "other".into()]);
+
+        let response = handle_request(Arc::clone(&state), Request::Explicit { id: 1 }).await;
+        let Response::Success {
+            result: ResponseResult::Explicit(result),
+            ..
+        } = response
+        else {
+            anyhow::bail!("Explicit inventory should be available: {response:?}");
+        };
+        assert_eq!(result.packages.as_slice(), std::slice::from_ref(&package));
+
+        let response = handle_request(Arc::clone(&state), Request::ExplicitCount { id: 2 }).await;
+        assert!(matches!(
+            response,
+            Response::Success {
+                result: ResponseResult::ExplicitCount(1),
+                ..
+            }
+        ));
+
+        state.cache.clear();
+        let _ = handle_request(Arc::clone(&state), Request::Explicit { id: 3 }).await;
+        let _ = handle_request(Arc::clone(&state), Request::ExplicitCount { id: 4 }).await;
+        assert!(state.cache.get_explicit().is_none());
+        assert!(state.cache.get_explicit_count().is_none());
+        state.package_manager.remove(&[package]).await?;
+        assert_eq!(revision.load(Ordering::Acquire), 0);
+        let response = handle_request(state, Request::ExplicitCount { id: 5 }).await;
+        assert!(matches!(
+            response,
+            Response::Success {
+                result: ResponseResult::ExplicitCount(0),
+                ..
+            }
+        ));
+        Ok(())
+    }
+
+    #[cfg(feature = "fedora")]
+    #[tokio::test]
     async fn fedora_status_refuses_unbound_cached_security_scope() -> anyhow::Result<()> {
         let (_directory, state, _, revision, _, _) = mutable_fedora_catalog(true, None)?;
         let status =
@@ -2125,24 +2199,42 @@ pub(super) mod tests {
     #[tokio::test]
     async fn fedora_status_drops_scope_when_inventory_changes() -> anyhow::Result<()> {
         let (_directory, state, _, revision, _, _) = mutable_fedora_catalog(true, None)?;
+        state
+            .package_manager
+            .install(&["retired-tool.x86_64".to_owned()])
+            .await?;
+        let (total, explicit, orphans, updates) = state.status_counts().await?;
         let observation = state.observe_status_rpm_catalog().await?;
         let index = state.index_snapshot();
         let status = Arc::new(
-            super::super::status_policy::status_snapshot(42, 20, 1, 2, vec![], Some((5, 2))).0,
+            super::super::status_policy::status_snapshot(
+                total,
+                0,
+                orphans + 1,
+                updates + 1,
+                vec![],
+                Some((5, 2)),
+            )
+            .0,
         );
         state
             .publish_observed_status(&index, Arc::clone(&status), Arc::clone(&observation))
             .await;
-        assert_eq!(
-            cached_status(&state)
-                .await
-                .context("valid RPM scope should be reusable")?
-                .scanned_vulnerability_summary(),
-            Some((5, 2))
-        );
+        let response = handle_request(Arc::clone(&state), Request::Status { id: 1 }).await;
+        let Response::Success {
+            result: ResponseResult::Status(current),
+            ..
+        } = response
+        else {
+            anyhow::bail!("live status should use counts from the package manager");
+        };
+        assert_eq!(current.explicit_packages, explicit);
+        assert_eq!(current.orphan_packages, orphans);
+        assert_eq!(current.updates_available, updates);
+        assert_eq!(current.scanned_vulnerability_summary(), Some((5, 2)));
 
         revision.fetch_add(1, Ordering::AcqRel);
-        let response = handle_request(Arc::clone(&state), Request::Status { id: 1 }).await;
+        let response = handle_request(Arc::clone(&state), Request::Status { id: 2 }).await;
         let Response::Success {
             result: ResponseResult::Status(current),
             ..
@@ -2150,7 +2242,7 @@ pub(super) mod tests {
         else {
             anyhow::bail!("stale observed status should fall back to live package counts");
         };
-        assert_ne!(current.total_packages, 42);
+        assert_eq!(current.total_packages, total);
         assert_eq!(current.scanned_vulnerability_summary(), None);
 
         state.cache.clear();

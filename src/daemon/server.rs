@@ -157,16 +157,18 @@ async fn prewarm_caches(state: &Arc<DaemonState>, shutdown: &CancellationToken) 
     // Pre-compute explicit package list for instant first query.
     // The state owns the backend choice so isolated daemons never
     // fall through to a host package database.
-    let explicit_index = state.index_snapshot();
-    match state.explicit_packages().await {
-        Ok(packages) => {
-            state.with_current_index(&explicit_index, || {
-                state.cache.update_explicit(packages);
-            });
-            tracing::debug!("Pre-warmed explicit package cache");
-        }
-        Err(error) => {
-            tracing::warn!("Failed to pre-warm explicit package cache: {error}");
+    if state.caches_explicit_packages() {
+        let explicit_index = state.index_snapshot();
+        match state.explicit_packages().await {
+            Ok(packages) => {
+                state.with_current_index(&explicit_index, || {
+                    state.cache.update_explicit(packages);
+                });
+                tracing::debug!("Pre-warmed explicit package cache");
+            }
+            Err(error) => {
+                tracing::warn!("Failed to pre-warm explicit package cache: {error}");
+            }
         }
     }
 
