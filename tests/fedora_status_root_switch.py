@@ -3942,6 +3942,125 @@ exec {shlex.quote(str(native))} "$@"
                            and not stderr and marker_state == "absent", marker_state)
 
 
+    def inspect_man_pages():
+        phase = "fedora-man-pages"
+        commands = (
+            ("config",), ("config", "get"), ("config", "set"), ("config", "validate"), ("config", "reset"),
+            ("privacy",), ("privacy", "opt-in"), ("privacy", "export"),
+            ("tool",), ("tool", "search"), ("tool", "remove"), ("tool", "registry"),
+            ("install",), ("remove",), ("update",), ("info",), ("search",),
+            ("env",), ("env", "export"), ("env", "plan"),
+            ("team",), ("team", "golden-path"), ("team", "golden-path", "create"),
+            ("workspace", "diff"), ("snapshot", "restore"), ("audit", "log"),
+            ("migrate", "import"), ("generate-man",), ("clean",), ("run",), ("use",),
+        )
+        common_options = {"--verbose", "--quiet", "--json", "--help"}
+        global_options = common_options | {"--all-commands", "--version"}
+
+        with tempfile.TemporaryDirectory(prefix="man-pages-", dir=work) as directory:
+            here = Path(directory)
+            os.chown(here, account.pw_uid, account.pw_gid)
+
+            def environment(label, native_home=False):
+                parent = here / label
+                home = parent / (os.fsdecode(b"home-\xff") if native_home else "home")
+                home.mkdir(parents=True)
+                os.chown(home, account.pw_uid, account.pw_gid)
+                return home, dict(disabled, HOME=str(home), OMG_DATA_DIR=str(home/"data"),
+                                  OMG_CONFIG_DIR=str(home/"config"), XDG_CONFIG_HOME=str(home/"config"),
+                                  XDG_DATA_HOME=str(home/"xdg-data"), XDG_CACHE_HOME=str(home/"cache"),
+                                  XDG_STATE_HOME=str(home/"state"), OMG_NO_UPDATE_CHECK="1")
+
+            def generate(label, env, output, args, check_existing=None):
+                result = command([cli, "generate-man", *args], env, ordinary, timeout=12)
+                pages = list(output.glob("omg*.1")) if output.is_dir() else []
+                count = re.search(r"Generated (\d+) man pages", result.stdout)
+                correct = (result.returncode == 0 and count is not None
+                           and int(count.group(1)) == len(pages) == 140
+                           and all(page.is_file() and not page.is_symlink() and page.stat().st_size > 0 for page in pages)
+                           and not (Path(env["HOME"]) / "~").exists()
+                           and (check_existing is None or check_existing()))
+                checks.append(dict(phase=phase, case=label, status=result.returncode, passed=correct,
+                                   pages=len(pages), diagnostic=(result.stdout + result.stderr)[-1100:]))
+                return result
+
+            home, env = environment("content")
+            archive = home / "manual files"
+            generate("explicit-output", env, archive, ["--output", archive])
+
+            def unroff(text):
+                return re.sub(r"\\f[BRI]", "", text).replace(r"\-", "-")
+
+            for argv in commands:
+                invocation = "omg " + " ".join(argv)
+                name = "omg-" + "-".join(argv)
+                result = command([cli, *argv, "--help"], env, ordinary, timeout=8)
+                page = archive / f"{name}.1"
+                man = unroff(page.read_text()) if page.is_file() else ""
+                title = re.search(r"(?m)^\.TH\s+(\S+) 1(?:\s|$)", man)
+                names = re.search(r"(?m)^\.SH NAME\n([^\n]+)", man)
+                synopsis = re.search(r"(?m)^\.SH SYNOPSIS\n([^\n]+)", man)
+                help_path = re.search(r"(?m)^Usage: (.+)$", result.stdout)
+                options = set(re.findall(r"(?<![\w-])--[a-z][a-z0-9-]*", man))
+                help_options = set(re.findall(r"(?<![\w-])--[a-z][a-z0-9-]*", result.stdout))
+                references = re.findall(r"(?m)^(omg-[\w-]+)\(1\)$", man)
+                full_path = (title is not None and title[1] == name
+                             and names is not None and (names[1] == name or names[1].startswith(name + " - "))
+                             and synopsis is not None and synopsis[1].startswith(invocation + " "))
+                correct = (result.returncode == 0 and help_path is not None
+                           and help_path[1].startswith(invocation)
+                           and full_path and common_options <= help_options
+                           and options & global_options == help_options & global_options
+                           and all((archive / f"{reference}.1").is_file() for reference in references))
+                checks.append(dict(phase=phase, case=f"help-{name}", status=result.returncode,
+                                   passed=correct, title=title[1] if title else None,
+                                   synopsis=synopsis[1] if synopsis else None,
+                                   missing_globals=sorted((help_options & global_options) - options),
+                                   unexpected_globals=sorted((options & global_options) - help_options),
+                                   diagnostic=(result.stdout + result.stderr)[-1100:]))
+
+            home, env = environment("default-xdg")
+            generate("default-xdg", env, home/"xdg-data/man/man1", [])
+            home, env = environment("default-home")
+            env.pop("XDG_DATA_HOME")
+            generate("default-home", env, home/".local/share/man/man1", [])
+
+            for label, argument, relative, native_home in (
+                ("relative-output", "custom pages", "custom pages", False),
+                ("tilde-output", "~/man", "man", False),
+                ("tilde-redundant-separator", "~//man", "man", False),
+                ("tilde-home", "~", "", False),
+                ("tilde-native-home", "~/manuals", "manuals", True),
+            ):
+                home, env = environment(label, native_home=native_home)
+                generate(label, env, home/relative, ["--output", argument])
+
+            home, env = environment("replace")
+            output = home / "existing"
+            output.mkdir()
+            page = output / "omg.1"
+            page.write_bytes(b"previous generated page\n")
+            page.chmod(0o640)
+            unrelated = output / "notes.txt"
+            unrelated.write_bytes(b"preserve local notes\n")
+            for path in (output, page, unrelated):
+                os.chown(path, account.pw_uid, account.pw_gid)
+            generate("replace-preserves-local-files", env, output, ["--output", output],
+                     lambda: (page.read_bytes() != b"previous generated page\n"
+                              and stat.S_IMODE(page.stat().st_mode) == 0o640
+                              and unrelated.read_bytes() == b"preserve local notes\n"))
+
+            home, env = environment("obstructed")
+            output = home / "not-a-directory"
+            output.write_bytes(b"unchanged\n")
+            os.chown(output, account.pw_uid, account.pw_gid)
+            result = command([cli, "generate-man", "--output", output], env, ordinary, timeout=8)
+            checks.append(dict(phase=phase, case="obstructed-output", status=result.returncode, pages=0,
+                               passed=(result.returncode != 0 and "Failed to create directory" in result.stderr
+                                       and "Generated" not in result.stdout and output.read_bytes() == b"unchanged\n"),
+                               diagnostic=(result.stdout + result.stderr)[-1100:]))
+
+
     def inspect_task_environment_bytes():
         phase = "task-environment-bytes"
         raw = b"test-\xff-value"
@@ -6658,6 +6777,7 @@ exec {shlex.quote(str(binary))} "$@"
                     inspect_named_tool_updates()
                     inspect_config_files()
                     inspect_fedora_output_admission()
+                    inspect_man_pages()
                     mark_progress("runtime selection and Python environments")
                     inspect_task_environment_bytes()
                     inspect_task_package_metadata()
@@ -6983,6 +7103,6 @@ mark_progress("completed with host inventory unchanged")
 report = dict(binaries=binaries, checks=checks, total=len(checks),
               passed=sum(entry["passed"] for entry in checks), host_unchanged=True)
 print(json.dumps(report))
-expected_checks = 303 if consent_oracle is None else 2280
+expected_checks = 303 if consent_oracle is None else 2321
 if report["passed"] != report["total"] or report["total"] != expected_checks:
     sys.exit(4)

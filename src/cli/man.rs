@@ -14,16 +14,21 @@ use super::style;
 /// Generate man pages for all OMG commands
 pub fn generate(output_dir: Option<String>) -> Result<()> {
     let output_path = if let Some(dir) = output_dir {
-        PathBuf::from(shellexpand(&dir))
+        let path = PathBuf::from(dir);
+        if let Ok(relative) = path.strip_prefix("~") {
+            dirs::home_dir()
+                .context("Cannot determine the home directory for man page output")?
+                .join(relative)
+        } else {
+            path
+        }
     } else {
-        // Default to ~/.local/share/man/man1
         dirs::data_dir()
-            .unwrap_or_else(|| PathBuf::from("~/.local/share"))
+            .context("Cannot determine the data directory for man page output")?
             .join("man")
             .join("man1")
     };
 
-    // Create output directory if it doesn't exist
     fs::create_dir_all(&output_path)
         .with_context(|| format!("Failed to create directory: {}", output_path.display()))?;
 
@@ -33,20 +38,11 @@ pub fn generate(output_dir: Option<String>) -> Result<()> {
         output_path.display()
     );
 
-    let cmd = Cli::command();
-    let mut generated = 0;
-
-    // Generate main omg man page
-    let man = Man::new(cmd.clone());
-    let man_path = output_path.join("omg.1");
-    let mut buffer = Vec::new();
-    man.render(&mut buffer)?;
-    fs::write(&man_path, buffer)
-        .with_context(|| format!("Failed to write {}", man_path.display()))?;
-    println!("  {} omg.1", style::success("✓"));
-    generated += 1;
-
-    generated += render_subcommand_pages(&cmd, &output_path, "omg")?;
+    // Build the whole tree once so pages inherit global flags, versions, and
+    // command names. The generated help commands have no standalone pages.
+    let mut command = Cli::command().disable_help_subcommand(true);
+    command.build();
+    let generated = render_pages(&command, &output_path, &mut Vec::new())?;
 
     println!();
     println!("{} Generated {} man pages", style::success("✓"), generated);
@@ -60,26 +56,22 @@ pub fn generate(output_dir: Option<String>) -> Result<()> {
     Ok(())
 }
 
-fn render_subcommand_pages(command: &clap::Command, output: &Path, prefix: &str) -> Result<usize> {
-    let mut generated = 0;
+fn render_pages(command: &clap::Command, output: &Path, buffer: &mut Vec<u8>) -> Result<usize> {
+    let name = command
+        .get_display_name()
+        .unwrap_or_else(|| command.get_name());
+    let path = output.join(format!("{name}.1"));
+    buffer.clear();
+    Man::new(command.clone())
+        .render(buffer)
+        .with_context(|| format!("Failed to render {}", path.display()))?;
+    fs::write(&path, buffer.as_slice())
+        .with_context(|| format!("Failed to write {}", path.display()))?;
+    println!("  {} {name}.1", style::success("✓"));
+
+    let mut generated = 1;
     for subcommand in command.get_subcommands().filter(|cmd| !cmd.is_hide_set()) {
-        let name = format!("{prefix}-{}", subcommand.get_name());
-        let path = output.join(format!("{name}.1"));
-        let mut buffer = Vec::new();
-        Man::new(subcommand.clone()).render(&mut buffer)?;
-        fs::write(&path, buffer).with_context(|| format!("Failed to write {}", path.display()))?;
-        println!("  {} {name}.1", style::success("✓"));
-        generated += 1 + render_subcommand_pages(subcommand, output, &name)?;
+        generated += render_pages(subcommand, output, buffer)?;
     }
     Ok(generated)
-}
-
-/// Simple shell expansion for ~ paths
-fn shellexpand(path: &str) -> String {
-    if path.starts_with("~/")
-        && let Ok(home) = std::env::var("HOME")
-    {
-        return path.replacen('~', &home, 1);
-    }
-    path.to_string()
 }
