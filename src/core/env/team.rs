@@ -669,46 +669,80 @@ fi
         Ok(())
     }
 
-    /// Commit omg.lock to git
+    /// Commit only omg.lock using Git's partial-commit index.
     fn git_commit_lock(root: &Path, message: &str) -> Result<()> {
-        use std::process::Command;
-
-        let lock_path = root.join("omg.lock");
-        if !lock_path.exists() {
+        if !root.join("omg.lock").exists() {
             return Ok(());
         }
 
-        let add = Command::new("git")
-            .args(["add", "--", "omg.lock"])
-            .current_dir(root)
-            .output()
-            .context("Failed to run git add for omg.lock")?;
-        if !add.status.success() {
-            anyhow::bail!(
+        let status = Self::git_command(
+            root,
+            &[
+                "--no-optional-locks",
+                "status",
+                "--porcelain=v2",
+                "--branch",
+                "-z",
+                "--no-renames",
+                "--untracked-files=all",
+                "--ignored=matching",
+                "--",
+                "omg.lock",
+            ],
+        )
+        .output()
+        .context("Failed to inspect Git status for omg.lock")?;
+        anyhow::ensure!(
+            status.status.success(),
+            "git status failed: {}",
+            String::from_utf8_lossy(&status.stderr).trim()
+        );
+
+        let records = status.stdout.split(|byte| *byte == 0);
+        let unborn = records
+            .clone()
+            .any(|record| record == b"# branch.oid (initial)");
+        let tracked = records.clone().any(|record| record.starts_with(b"1 "));
+        let untracked = records.clone().any(|record| record == b"? omg.lock");
+        anyhow::ensure!(
+            !records.clone().any(|record| record == b"! omg.lock"),
+            "omg.lock is ignored by Git"
+        );
+        anyhow::ensure!(
+            !records.clone().any(|record| record.starts_with(b"u ")),
+            "omg.lock has unresolved Git index conflicts"
+        );
+
+        if !tracked && !untracked {
+            return Ok(());
+        }
+        if tracked
+            && !unborn
+            && Self::git_lock_matches_head(
+                root,
+                records.clone().any(|record| record.starts_with(b"1 D.")),
+            )?
+        {
+            return Ok(());
+        }
+
+        if !tracked {
+            // Git needs a path to be known for a partial commit. Use an intent
+            // entry for a new file so a rejected hook does not stage its contents.
+            let add = Self::git_command(root, &["add", "--intent-to-add", "--", "omg.lock"])
+                .output()
+                .context("Failed to register omg.lock with Git")?;
+            anyhow::ensure!(
+                add.status.success(),
                 "git add failed: {}",
                 String::from_utf8_lossy(&add.stderr).trim()
             );
         }
 
-        let changed = Command::new("git")
-            .args(["diff", "--cached", "--quiet", "--", "omg.lock"])
-            .current_dir(root)
-            .output()
-            .context("Failed to inspect staged omg.lock")?;
-        match changed.status.code() {
-            Some(0) => return Ok(()),
-            Some(1) => {}
-            _ => anyhow::bail!(
-                "git diff failed: {}",
-                String::from_utf8_lossy(&changed.stderr).trim()
-            ),
-        }
-
-        let commit = Command::new("git")
-            .args(["commit", "--only", "-m", message, "--", "omg.lock"])
-            .current_dir(root)
-            .output()
-            .context("Failed to run git commit for omg.lock")?;
+        let commit =
+            Self::git_command(root, &["commit", "--only", "-m", message, "--", "omg.lock"])
+                .output()
+                .context("Failed to run git commit for omg.lock")?;
         if !commit.status.success() {
             let output = format!(
                 "{}{}",
@@ -719,6 +753,45 @@ fi
         }
 
         Ok(())
+    }
+
+    fn git_command(root: &Path, args: &[&str]) -> std::process::Command {
+        let mut git = std::process::Command::new("git");
+        git.args(args).current_dir(root);
+        git
+    }
+
+    fn git_lock_matches_head(root: &Path, staged_deletion: bool) -> Result<bool> {
+        let mut diff = Self::git_command(root, &["diff", "--quiet", "HEAD", "--", "omg.lock"]);
+
+        // A staged deletion hides the file from diff, even though a partial
+        // commit will read its working-tree copy. Compare via an index from HEAD.
+        let comparison = staged_deletion.then(tempfile::tempdir).transpose()?;
+        if let Some(directory) = comparison.as_ref() {
+            let index = directory.path().join("index");
+            let read = Self::git_command(root, &["read-tree", "HEAD"])
+                .env("GIT_INDEX_FILE", &index)
+                .output()
+                .context("Failed to prepare Git comparison for omg.lock")?;
+            anyhow::ensure!(
+                read.status.success(),
+                "git read-tree failed: {}",
+                String::from_utf8_lossy(&read.stderr).trim()
+            );
+            diff.env("GIT_INDEX_FILE", index);
+        }
+
+        let changed = diff
+            .output()
+            .context("Failed to compare omg.lock with Git HEAD")?;
+        match changed.status.code() {
+            Some(0) => Ok(true),
+            Some(1) => Ok(false),
+            _ => anyhow::bail!(
+                "git diff failed: {}",
+                String::from_utf8_lossy(&changed.stderr).trim()
+            ),
+        }
     }
 }
 

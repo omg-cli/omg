@@ -1315,7 +1315,10 @@ case "$distro" in
   arch|fedora) guest_tools+=(libcap systemd) ;;
   debian|debian-trixie|ubuntu) guest_tools+=(libcap2-bin systemd-coredump) ;;
 esac
-[[ "$distro" != fedora ]] || guest_tools+=(createrepo_c gnupg2)
+if [[ "$distro" == fedora ]]; then
+  guest_tools+=(createrepo_c gnupg2)
+  [[ "$source_kind" != staged ]] || guest_tools+=(git)
+fi
 if [[ "$distro" == arch ]]; then guest_tools+=(python); else guest_tools+=(python3); fi
 [[ "$benchmark" != true ]] || guest_tools+=(hyperfine)
 case "$distro" in

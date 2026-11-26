@@ -1197,6 +1197,187 @@ exec {shlex.quote(str(native_executable))} "$@"
             run("pull-after-repeated-push", ("team", "pull"), ("Environment is in sync",))
 
 
+    def inspect_git_workflow():
+        phase = "git-workflow"
+        executable = shutil.which("git", path=base_env["PATH"])
+        assert executable is not None, "Git is required for the staged workflow checks"
+        with tempfile.TemporaryDirectory(prefix="git-workflow-", dir=work) as directory:
+            here = Path(directory)
+            os.chown(here, account.pw_uid, account.pw_gid)
+            isolated = dict(disabled, HOME=str(here), GIT_CONFIG_NOSYSTEM="1",
+                            XDG_DATA_HOME=str(here/"data"), XDG_CONFIG_HOME=str(here/"config"),
+                            XDG_CACHE_HOME=str(here/"cache"), XDG_STATE_HOME=str(here/"state"))
+
+            def child(program, args, cwd):
+                return subprocess.run([str(program), *args], cwd=cwd, env=isolated, text=True,
+                                      stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                      stderr=subprocess.PIPE, timeout=10, **ordinary)
+
+            def git(*args, cwd=here):
+                result = child(executable, args, cwd)
+                assert result.returncode == 0, (args, result.stderr)
+                return result.stdout
+
+            def run(label, args, markers=(), *, cwd=here, fails=False, inspect=None):
+                try:
+                    result = child(cli, args, cwd)
+                except subprocess.TimeoutExpired:
+                    checks.append(dict(phase=phase, case=label, passed=False, status=None,
+                                       diagnostic="command exceeded local deadline"))
+                    return
+                output = result.stdout + result.stderr
+                okay = ((result.returncode != 0) == fails
+                        and all(marker in output for marker in markers)
+                        and (inspect is None or inspect()))
+                checks.append(dict(phase=phase, case=label, passed=okay, status=result.returncode,
+                                   diagnostic=output[-1100:]))
+
+            def owned_dir(path):
+                path.mkdir()
+                os.chown(path, account.pw_uid, account.pw_gid)
+
+            def init_repo(path):
+                git("init", "--quiet", cwd=path)
+                git("config", "user.name", "Fedora audit", cwd=path)
+                git("config", "user.email", "fixture@example.invalid", cwd=path)
+                git("config", "commit.gpgsign", "false", cwd=path)
+
+            def set_hook(path, body):
+                path.write_text(body)
+                path.chmod(0o755)
+
+            def auto_push(path):
+                config = path / ".omg/team.toml"
+                old = config.read_text()
+                assert "auto_push = false" in old
+                config.write_text(old.replace("auto_push = false", "auto_push = true"))
+
+            run("status-outside-repo", ("hooks", "status"), ("Not a git repository",))
+            run("install-outside-repo", ("hooks", "install"), ("Not a git repository",), fails=True)
+            init_repo(here)
+            git("commit", "--allow-empty", "--quiet", "-m", "Fixture base")
+            git("config", "core.hooksPath", "fixture hooks")
+            hooks = here / "fixture hooks"
+            pre = hooks / "pre-commit"
+            nested = here / "nested"
+            owned_dir(nested)
+            all_names = ("pre-commit", "post-checkout", "post-merge")
+            run("status-no-hooks", ("hooks", "status"), ("pre-commit - not installed",))
+            run("install-from-nested", ("hooks", "install"), ("Installed 3 hook(s)",), cwd=nested,
+                inspect=lambda: all((hooks/name).stat().st_mode & 0o100 for name in all_names))
+            generated = pre.read_bytes()
+            run("status-generated", ("hooks", "status"), ("pre-commit - installed (OMG)",), cwd=nested)
+            run("manual-generated", ("hooks", "run", "pre-commit"), ("Hook completed successfully",))
+            run("install-idempotent", ("hooks", "install"), ("already installed",),
+                inspect=lambda: pre.read_bytes() == generated)
+            pre.chmod(0o644)
+            run("status-disabled-generated", ("hooks", "status"), ("pre-commit - installed (OMG, not executable)",))
+            run("install-restores-executable", ("hooks", "install"), ("pre-commit",),
+                inspect=lambda: pre.read_bytes() == generated and bool(pre.stat().st_mode & 0o100))
+            pre.chmod(0o755)
+            set_hook(pre, "#!/bin/sh\n[ -f hook-cwd-marker ] || exit 17\nprintf 'fixture hook saw repository root\\n'\n")
+            (here/"hook-cwd-marker").touch()
+            custom = pre.read_bytes()
+            run("status-custom", ("hooks", "status"), ("unrecognized or modified",))
+            run("install-preserves-custom", ("hooks", "install"), ("exists, use --force",),
+                inspect=lambda: pre.read_bytes() == custom)
+            run("manual-custom-from-root", ("hooks", "run", "pre-commit"), ("fixture hook saw repository root",))
+            run("manual-custom-from-nested", ("hooks", "run", "pre-commit"),
+                ("fixture hook saw repository root",), cwd=nested)
+            run("force-replaces-custom", ("hooks", "install", "--force"), ("Installed 3 hook(s)",),
+                inspect=lambda: pre.read_bytes() == generated)
+            post = hooks / "post-merge"
+            set_hook(post, "#!/bin/sh\nprintf 'custom post merge\\n'\n")
+            run("uninstall-keeps-custom", ("hooks", "uninstall"), ("Removed 2 hook(s)",),
+                inspect=lambda: not pre.exists() and post.is_file())
+            run("status-after-uninstall", ("hooks", "status"), ("pre-commit - not installed", "unrecognized or modified"))
+            run("manual-missing-managed", ("hooks", "run", "pre-commit"), ("is not installed",), fails=True)
+            run("manual-unknown", ("hooks", "run", "fixture-extra"), ("Unknown hook",), fails=True)
+            set_hook(pre, "#!/bin/sh\nprintf 'deliberate hook rejection\\n' >&2\nexit 18\n")
+            run("manual-returns-hook-failure", ("hooks", "run", "pre-commit"),
+                ("deliberate hook rejection", "failed"), fails=True)
+
+            run("team-init", ("team", "init", "fixture/auto-git"), ("initialized",))
+            auto_push(here)
+            lock = here / "omg.lock"
+            unrelated = here / "unrelated"
+            unrelated.write_text("staged fixture\n")
+            git("add", "--", unrelated.name)
+            unrelated.write_text("unstaged fixture\n")
+            unrelated_stage = git("ls-files", "--stage", "--", unrelated.name)
+            initial_head = git("rev-parse", "HEAD")
+
+            def unrelated_preserved():
+                return (git("ls-files", "--stage", "--", unrelated.name) == unrelated_stage
+                        and unrelated.read_text() == "unstaged fixture\n")
+
+            push = ("team", "push")
+            run("auto-first-rejected", push, ("deliberate hook rejection",), fails=True,
+                inspect=lambda: (git("rev-parse", "HEAD") == initial_head and unrelated_preserved()
+                                 and not git("diff", "--cached", "--ita-invisible-in-index", "--name-only", "--", lock.name)))
+            set_hook(pre, "#!/bin/sh\nexit 0\n")
+            run("auto-first-retry", push, ("Team lock updated",),
+                inspect=lambda: (git("show", "--format=", "--name-only", "HEAD") == "omg.lock\n"
+                                 and git("show", "HEAD:omg.lock").encode() == lock.read_bytes()
+                                 and unrelated_preserved()))
+
+            (here/".gitattributes").write_text("omg.lock filter=auditlock\n")
+            git("config", "filter.auditlock.clean", "sed -E 's/^timestamp = [0-9]+$/timestamp = 1700000000/'")
+            git("add", "--", lock.name)
+            git("commit", "--only", "--quiet", "-m", "Deterministic lock dates", "--", lock.name)
+            stable_head = git("rev-parse", "HEAD")
+            lock.write_text("manually staged lock contents\n")
+            git("add", "--", lock.name)
+            candidate_staged = git("show", ":omg.lock")
+            set_hook(pre, "#!/bin/sh\nprintf 'deliberate hook rejection\\n' >&2\nexit 18\n")
+            run("auto-unchanged-preserves-staged", push, ("Team lock updated",),
+                inspect=lambda: (git("rev-parse", "HEAD") == stable_head and unrelated_preserved()
+                                 and git("show", ":omg.lock") == candidate_staged))
+
+            git("rm", "-qf", "--cached", "--", lock.name)
+            run("auto-unchanged-preserves-staged-deletion", push, ("Team lock updated",),
+                inspect=lambda: (git("rev-parse", "HEAD") == stable_head and unrelated_preserved()
+                                 and git("ls-files", "--stage", "--", lock.name) == ""))
+            git("add", "--", lock.name)
+
+            lock.write_text("different historical lock\n")
+            set_hook(pre, "#!/bin/sh\nexit 0\n")
+            git("commit", "--only", "--quiet", "-m", "Different historical lock", "--", lock.name)
+            stable_head = git("rev-parse", "HEAD")
+            lock.write_text(candidate_staged)
+            git("add", "--", lock.name)
+            set_hook(pre, "#!/bin/sh\nprintf 'deliberate hook rejection\\n' >&2\nexit 18\n")
+            run("auto-tracked-rejection-preserves-staging", push, ("deliberate hook rejection",), fails=True,
+                inspect=lambda: (git("rev-parse", "HEAD") == stable_head and unrelated_preserved()
+                                 and git("show", ":omg.lock") == candidate_staged))
+            git("rm", "-qf", "--cached", "--", lock.name)
+            run("auto-rejection-preserves-staged-deletion", push, ("deliberate hook rejection",), fails=True,
+                inspect=lambda: (git("rev-parse", "HEAD") == stable_head and unrelated_preserved()
+                                 and git("ls-files", "--stage", "--", lock.name) == ""))
+
+            set_hook(pre, "#!/bin/sh\nexit 0\n")
+            run("auto-tracked-retry", push, ("Team lock updated",),
+                inspect=lambda: (git("rev-parse", "HEAD") != stable_head and unrelated_preserved()
+                                 and git("show", "--format=", "--name-only", "HEAD") == "omg.lock\n"))
+
+            unborn = here / "unborn"
+            owned_dir(unborn)
+            init_repo(unborn)
+            run("unborn-team-init", ("team", "init", "fixture/unborn"), ("initialized",), cwd=unborn)
+            auto_push(unborn)
+            run("unborn-commits-lock", push, ("Team lock updated",), cwd=unborn,
+                inspect=lambda: git("show", "--format=", "--name-only", "HEAD", cwd=unborn) == "omg.lock\n")
+
+            ignored = here / "ignored"
+            owned_dir(ignored)
+            init_repo(ignored)
+            (ignored/".gitignore").write_text("omg.lock\n")
+            run("ignored-team-init", ("team", "init", "fixture/ignored"), ("initialized",), cwd=ignored)
+            auto_push(ignored)
+            run("auto-respects-ignored-lock", push, ("ignored",), cwd=ignored, fails=True,
+                inspect=lambda: git("ls-files", "--stage", "--", "omg.lock", cwd=ignored) == "")
+
+
     def inspect_environment_lockfiles():
         phase = "environment-lockfiles"
         with tempfile.TemporaryDirectory(prefix="environment-locks-", dir=work) as directory:
@@ -2895,6 +3076,7 @@ exec {shlex.quote(str(binary))} "$@"
                     inspect_team_storage()
                     inspect_team_commands()
                     inspect_team_push_publication()
+                    inspect_git_workflow()
                 config.write_text(alternate_config)
                 refresh_fixture()
                 expected = ordinary_control([dnf, "--cacheonly", "repoquery",
@@ -3212,6 +3394,6 @@ assert inventory() == before
 report = dict(binaries=binaries, checks=checks, total=len(checks),
               passed=sum(entry["passed"] for entry in checks), host_unchanged=True)
 print(json.dumps(report))
-expected_checks = 303 if consent_oracle is None else 1153
+expected_checks = 303 if consent_oracle is None else 1184
 if report["passed"] != report["total"] or report["total"] != expected_checks:
     sys.exit(4)

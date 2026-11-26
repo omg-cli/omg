@@ -103,7 +103,36 @@ fn get_hooks_dir() -> Result<PathBuf> {
     get_hooks_dir_at(&std::env::current_dir().context("Failed to read current directory")?)
 }
 
-fn read_hook_file(path: &Path) -> Result<Option<String>> {
+struct HookFile {
+    content: String,
+    #[cfg(unix)]
+    file: fs::File,
+}
+
+impl HookFile {
+    fn is_executable(&self) -> Result<bool> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            Ok(self.file.metadata()?.permissions().mode() & 0o100 != 0)
+        }
+        #[cfg(not(unix))]
+        Ok(true)
+    }
+
+    fn restore_execute_permission(&self) -> Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = self.file.metadata()?.permissions().mode() & 0o777;
+            self.file
+                .set_permissions(fs::Permissions::from_mode(mode | 0o100))?;
+        }
+        Ok(())
+    }
+}
+
+fn read_hook_file(path: &Path) -> Result<Option<HookFile>> {
     const MAX_HOOK_BYTES: u64 = 64 * 1024;
     let mut options = fs::OpenOptions::new();
     options.read(true);
@@ -132,13 +161,19 @@ fn read_hook_file(path: &Path) -> Result<Option<String>> {
         path.display()
     );
     let mut content = String::new();
-    file.take(MAX_HOOK_BYTES + 1).read_to_string(&mut content)?;
+    (&file)
+        .take(MAX_HOOK_BYTES + 1)
+        .read_to_string(&mut content)?;
     anyhow::ensure!(
         content.len() as u64 <= MAX_HOOK_BYTES,
         "Git hook exceeds inspection limit: {}",
         path.display()
     );
-    Ok(Some(content))
+    Ok(Some(HookFile {
+        content,
+        #[cfg(unix)]
+        file,
+    }))
 }
 
 fn is_generated_hook(name: &str, content: &str) -> bool {
@@ -172,8 +207,19 @@ pub fn install(force: bool) -> Result<()> {
         // Check if hook already exists
         if !force {
             match read_hook_file(&hook_path)? {
-                Some(existing) if existing == content => {
-                    println!("  {} {} (already installed)", style::dim("•"), name);
+                Some(existing) if existing.content == content => {
+                    if existing.is_executable()? {
+                        println!("  {} {} (already installed)", style::dim("•"), name);
+                    } else {
+                        existing.restore_execute_permission().with_context(|| {
+                            format!("Failed to restore execute permission for {name} hook")
+                        })?;
+                        println!(
+                            "  {} {} (restored execute permission)",
+                            style::success("✓"),
+                            name
+                        );
+                    }
                     continue;
                 }
                 Some(_) => {
@@ -267,7 +313,7 @@ fn uninstall_from(hooks_dir: &Path) -> Result<()> {
                 println!("  {} {} (not installed)", style::dim("•"), name);
                 continue;
             }
-            Some(content) if !is_generated_hook(name, &content) => {
+            Some(hook) if !is_generated_hook(name, &hook.content) => {
                 println!(
                     "  {} {} (not an unmodified current OMG hook, skipping)",
                     style::warning("⚠"),
@@ -312,8 +358,16 @@ pub fn status() -> Result<()> {
             None => {
                 println!("  {} {} - not installed", style::dim("○"), name);
             }
-            Some(content) if is_generated_hook(name, &content) => {
-                println!("  {} {} - installed (OMG)", style::success("●"), name);
+            Some(hook) if is_generated_hook(name, &hook.content) => {
+                if hook.is_executable()? {
+                    println!("  {} {} - installed (OMG)", style::success("●"), name);
+                } else {
+                    println!(
+                        "  {} {} - installed (OMG, not executable)",
+                        style::warning("●"),
+                        name
+                    );
+                }
             }
             Some(_) => {
                 println!(
@@ -358,7 +412,8 @@ pub fn run_hook(hook_name: &str) -> Result<()> {
 
     println!("{} Running {hook_name} hook...\n", style::header("OMG"));
 
-    let status = std::process::Command::new(&hook_path)
+    let status = std::process::Command::new("git")
+        .args(["hook", "run", hook_name])
         .status()
         .with_context(|| format!("Failed to execute {hook_name} hook"))?;
 
@@ -518,7 +573,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("pre-commit");
         fs::write(&path, "# OMG\n").unwrap();
-        assert_eq!(read_hook_file(&path).unwrap().as_deref(), Some("# OMG\n"));
+        assert_eq!(read_hook_file(&path).unwrap().unwrap().content, "# OMG\n");
     }
 
     #[cfg(unix)]
@@ -547,7 +602,9 @@ mod tests {
         );
         let result = read_hook_file(&path);
         fs::set_permissions(&path, original).expect("restore fixture permissions");
-        let error = result.expect_err("unreadable hook file must fail closed");
+        let Err(error) = result else {
+            panic!("unreadable hook file must fail closed");
+        };
         assert!(
             error.chain().any(|cause| cause
                 .downcast_ref::<std::io::Error>()
