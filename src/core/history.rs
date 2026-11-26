@@ -458,11 +458,21 @@ impl HistoryManager {
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt as _;
-            options.mode(0o600).custom_flags(nix::libc::O_NOFOLLOW);
+            options
+                .mode(0o600)
+                .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK);
         }
         let lock = options
             .open(&lock_path)
             .with_context(|| format!("Failed to open history lock: {}", lock_path.display()))?;
+        let metadata = lock
+            .metadata()
+            .with_context(|| format!("Failed to inspect history lock: {}", lock_path.display()))?;
+        anyhow::ensure!(
+            metadata.is_file(),
+            "Package history lock must be a regular file: {}",
+            lock_path.display()
+        );
         lock.lock()
             .with_context(|| format!("Failed to lock package history: {}", lock_path.display()))?;
 

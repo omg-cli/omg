@@ -609,6 +609,74 @@ exec {shlex.quote(str(native_executable))} "$@"
                                    status=result.returncode, diagnostic=(result.stderr or result.stdout)[-900:]))
 
 
+
+    def inspect_history_locks():
+        phase = "history-lock"
+        def transaction(label, day, kind, name, success=True):
+            changes = [] if name is None else [
+                dict(name=name, old_version="1-1" if kind != "Install" else None,
+                     new_version="2-1" if kind != "Remove" else None, source="fedora")
+            ]
+            return dict(id=label, timestamp=f"2026-01-{day:02}T12:00:00Z",
+                        transaction_type=kind, changes=changes, success=success)
+
+        installed = transaction("archived-install", 1, "Install", "alpha")
+        removed = transaction("archived-remove", 3, "Remove", "Beta")
+        updated = transaction("live-update", 5, "Update", "alpha")
+        synced = transaction("live-sync", 7, "Sync", None)
+        failed = transaction("live-remove", 9, "Remove", "alpha-agent", False)
+        live = [updated, synced, failed]
+        archived = [installed, removed, updated]
+        cases = (
+            ("all", [], [failed, synced, updated, removed, installed]),
+            ("limit", ["--limit", "2"], [failed, synced]),
+            ("empty-limit", ["--limit", "0"], []),
+            ("search", ["--search", "ALPHA"], [failed, updated, installed]),
+            ("type", ["--type", "remove"], [failed, removed]),
+            ("date", ["--from", "2026-01-03", "--to", "2026-01-07"], [synced, updated, removed]),
+            ("combined", ["--search", "BETA", "--type", "remove", "--limit", "1"], [removed]),
+            ("outside-dates", ["--from", "2026-01-10"], []),
+        )
+        for kind in ("regular", "absent", "fifo", "symlink", "directory"):
+            for label, args, expected in cases:
+                sandbox = Path(tempfile.mkdtemp(prefix=f"{phase}-{kind}-{label}-", dir=work))
+                os.chown(sandbox, account.pw_uid, account.pw_gid)
+                live_file = sandbox / "history.json"
+                archive = sandbox / "history.json.archive.jsonl"
+                lock = sandbox / "history.lock"
+                target = sandbox / "untouched"
+                live_file.write_text(json.dumps(live))
+                archive.write_text("".join(json.dumps(row) + "\n" for row in archived))
+                if kind == "regular":
+                    lock.touch(mode=0o600)
+                    os.chown(lock, account.pw_uid, account.pw_gid)
+                elif kind == "fifo":
+                    os.mkfifo(lock, 0o600)
+                    os.chown(lock, account.pw_uid, account.pw_gid)
+                elif kind == "symlink":
+                    target.write_text("keep")
+                    lock.symlink_to(target.name)
+                elif kind == "directory":
+                    lock.mkdir()
+                fingerprints = (live_file.read_bytes(), archive.read_bytes())
+                mode = dict(disabled, OMG_DATA_DIR=str(sandbox), TZ="UTC")
+                result = command([cli, "--json", "history", *args], mode, ordinary)
+                if kind in ("regular", "absent"):
+                    try:
+                        correct = (result.returncode == 0 and json.loads(result.stdout) == expected
+                                   and stat.S_ISREG(lock.lstat().st_mode)
+                                   and stat.S_IMODE(lock.lstat().st_mode) == 0o600)
+                    except (ValueError, OSError):
+                        correct = False
+                else:
+                    diagnostic = "Package history lock must be a regular file" if kind == "fifo" else "Failed to open history lock"
+                    correct = result.returncode == 1 and not result.stdout.strip() and diagnostic in result.stderr
+                assert fingerprints == (live_file.read_bytes(), archive.read_bytes())
+                if kind == "symlink":
+                    assert lock.is_symlink() and target.read_text() == "keep"
+                checks.append(dict(phase=phase, case=f"{kind}-{label}", passed=correct,
+                                   status=result.returncode, diagnostic=(result.stderr or result.stdout)[-800:]))
+
     def inspect_read_only_updates(phase, update_count):
         cases = (
             ("outdated-json", ["--json", "outdated"]),
@@ -1472,6 +1540,8 @@ exec {shlex.quote(str(binary))} "$@"
                 assert json.loads(persisted.read_text())["status"]["total_packages"] == host_count
                 initial_status = persisted.read_bytes()
                 inspect("initial-host", host_count, host_explicit, host=True)
+                if consent_oracle is not None:
+                    inspect_history_locks()
                 config.write_text(alternate_config)
                 refresh_fixture()
                 expected = ordinary_control([dnf, "--cacheonly", "repoquery",
@@ -1789,6 +1859,6 @@ assert inventory() == before
 report = dict(binaries=binaries, checks=checks, total=len(checks),
               passed=sum(entry["passed"] for entry in checks), host_unchanged=True)
 print(json.dumps(report))
-expected_checks = 303 if consent_oracle is None else 684
+expected_checks = 303 if consent_oracle is None else 724
 if report["passed"] != report["total"] or report["total"] != expected_checks:
     sys.exit(4)
