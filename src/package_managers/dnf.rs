@@ -336,11 +336,15 @@ impl InstalledPackage {
     fn as_package(&self) -> Package {
         Package {
             name: self.identity(),
-            version: parse_version_or_zero(&format!("{}-{}", self.version, self.release)),
+            version: parse_version_or_zero(&self.evr()),
             description: self.summary.clone(),
             source: PackageSource::Official,
             installed: true,
         }
+    }
+
+    fn evr(&self) -> String {
+        format!("{}-{}", self.version, self.release)
     }
 }
 
@@ -379,6 +383,13 @@ const UPGRADE_QUERY_ARGS: [&str; 6] = [
     "--setopt=*.skip_if_unavailable=false",
     "list",
     "--upgrades",
+];
+
+const REPOSITORY_REFRESH_ARGS: [&str; 4] = [
+    "--refresh",
+    "--setopt=*.skip_if_unavailable=false",
+    "makecache",
+    "-y",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1474,19 +1485,79 @@ impl DnfPackageManager {
         Ok(candidates.pop())
     }
 
-    fn search_candidates(installed: &[InstalledPackage], available: Vec<Package>) -> Vec<Package> {
-        let mut candidates: Vec<_> = installed.iter().map(InstalledPackage::as_package).collect();
+    // Put the native newest build first for each installed identity. Keep
+    // older descriptions searchable in both direct and daemon paths.
+    async fn order_installed_search_builds(
+        installed: &[InstalledPackage],
+    ) -> Result<Vec<&InstalledPackage>> {
+        let mut first = HashMap::with_capacity(installed.len());
+        let mut contenders = BTreeMap::<usize, Vec<usize>>::new();
+        for (index, package) in installed.iter().enumerate() {
+            let identity = (package.name.as_str(), package.architecture.as_str());
+            let first = *first.entry(identity).or_insert(index);
+            if first != index {
+                contenders
+                    .entry(first)
+                    .or_insert_with(|| vec![first])
+                    .push(index);
+            }
+        }
+
+        // RPM compares only parallel builds. Batch a round across all
+        // identities, carrying an unpaired build into the next round.
+        while contenders.values().any(|builds| builds.len() > 1) {
+            let pairs: Vec<_> = contenders
+                .values()
+                .flat_map(|builds| builds.chunks_exact(2))
+                .map(|pair| (installed[pair[0]].evr(), installed[pair[1]].evr()))
+                .collect();
+            let mut order = Self::compare_native_evrs(&pairs).await?.into_iter();
+            for builds in contenders.values_mut() {
+                let pairs = builds.chunks_exact(2);
+                let mut winners = pairs
+                    .clone()
+                    .map(|pair| {
+                        if order.next().expect("validated RPM comparison count") < 0 {
+                            pair[1]
+                        } else {
+                            pair[0]
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                winners.extend_from_slice(pairs.remainder());
+                *builds = winners;
+            }
+        }
+
+        let mut ordered: Vec<_> = installed.iter().collect();
+        for (first, builds) in contenders {
+            ordered.swap(first, builds[0]);
+        }
+        Ok(ordered)
+    }
+
+    fn search_candidates<'a>(
+        installed: impl IntoIterator<Item = &'a InstalledPackage>,
+        available: Vec<Package>,
+    ) -> Vec<Package> {
+        let mut candidates: Vec<_> = installed
+            .into_iter()
+            .map(InstalledPackage::as_package)
+            .collect();
         candidates.extend(available);
         candidates
     }
 
-    fn search_results(
-        installed: &[InstalledPackage],
+    fn search_results<'a>(
+        installed: impl IntoIterator<Item = &'a InstalledPackage>,
         output: &[u8],
         query_lower: &str,
     ) -> Result<Vec<Package>> {
         let available = Self::available_rows(output)?.collect::<Result<Vec<_>>>()?;
-        let installed: Vec<_> = installed.iter().map(InstalledPackage::as_package).collect();
+        let installed: Vec<_> = installed
+            .into_iter()
+            .map(InstalledPackage::as_package)
+            .collect();
         let matches_query = |name: &str, summary: &str| {
             name.to_lowercase().contains(query_lower)
                 || summary.to_lowercase().contains(query_lower)
@@ -1922,8 +1993,11 @@ impl DnfPackageManager {
             if !progress {
                 command.stderr(std::process::Stdio::piped());
             }
-            let output = Self::query_output(command).await?;
-            Self::search_results(&installed, &output, &query_lower)
+            let (installed, output) = tokio::try_join!(
+                Self::order_installed_search_builds(&installed),
+                Self::query_output(command)
+            )?;
+            Self::search_results(installed, &output, &query_lower)
         })
     }
 
@@ -3224,8 +3298,11 @@ impl PackageManager for DnfPackageManager {
     fn package_index(&self) -> Pin<Box<dyn Future<Output = Result<Vec<Package>>> + Send + '_>> {
         Box::pin(async move {
             let installed = self.load_installed_packages().await?;
-            let available = Self::available_packages(None).await?;
-            Ok(Self::search_candidates(&installed, available))
+            let (installed, available) = tokio::try_join!(
+                Self::order_installed_search_builds(&installed),
+                Self::available_packages(None)
+            )?;
+            Ok(Self::search_candidates(installed, available))
         })
     }
 
@@ -3274,16 +3351,13 @@ impl PackageManager for DnfPackageManager {
 
             tokio::task::spawn_blocking({
                 let manager = self.cache_handle();
-                move || manager.run_dnf(&["--refresh", "makecache", "-y"])
+                move || manager.run_dnf(&REPOSITORY_REFRESH_ARGS)
             })
             .await??;
 
             if !is_root() {
-                crate::core::privilege::run_privileged_program(
-                    "dnf",
-                    &["--refresh", "makecache", "-y"],
-                )
-                .await?;
+                crate::core::privilege::run_privileged_program("dnf", &REPOSITORY_REFRESH_ARGS)
+                    .await?;
             }
             Ok(())
         })
@@ -4688,6 +4762,50 @@ mod tests {
 
         let malformed = "editor.noarch\t1-1\tÉditeur\nmissing-version";
         assert!(DnfPackageManager::search_results(&[], malformed.as_bytes(), "éditeur").is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn search_prefers_the_latest_installed_build_without_losing_older_descriptions()
+    -> Result<()> {
+        let installed: Vec<_> = [
+            ("x86_64", "1", "2", "Older kernel"),
+            ("i686", "2:1", "1", "Higher epoch kernel"),
+            ("x86_64", "1", "10", "Latest native kernel"),
+            ("x86_64", "1", "3", "Intermediate kernel"),
+            ("i686", "1:100", "1", "Old multilib kernel"),
+        ]
+        .into_iter()
+        .map(
+            |(architecture, version, release, summary)| InstalledPackage {
+                name: "kernel-test".into(),
+                version: version.into(),
+                release: release.into(),
+                architecture: architecture.into(),
+                summary: summary.into(),
+            },
+        )
+        .collect();
+        let ordered = DnfPackageManager::order_installed_search_builds(&installed).await?;
+        let results = DnfPackageManager::search_results(ordered.iter().copied(), b"", "kernel")?;
+        let versions = results
+            .iter()
+            .map(|package| (package.name.as_str(), package.version.to_string()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            versions,
+            [
+                ("kernel-test.i686", "2:1-1".into()),
+                ("kernel-test.x86_64", "1-10".into())
+            ]
+        );
+        let results =
+            DnfPackageManager::search_results(ordered.iter().copied(), b"", "older kernel")?;
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].version.to_string(), "1-10");
+        let candidates = DnfPackageManager::search_candidates(ordered, Vec::new());
+        assert_eq!(candidates.len(), installed.len());
+        assert_eq!(candidates[0].version.to_string(), "1-10");
         Ok(())
     }
 
