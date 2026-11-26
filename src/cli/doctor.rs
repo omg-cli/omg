@@ -394,9 +394,9 @@ async fn check_fedora_installed_db(command: std::process::Command, deadline: Dur
     let mut command = tokio::process::Command::from(command);
     // RPM loads per-user macros from HOME, which can redirect _dbpath away
     // from the system database. system_command also removes XDG_CONFIG_HOME.
-    command.env("HOME", "/").arg("-qa").kill_on_drop(true);
-    match tokio::time::timeout(deadline, command.output()).await {
-        Ok(Ok(output))
+    command.env("HOME", "/").arg("-qa");
+    match fedora_package_probe(command, deadline, "RPM installed package query").await {
+        Ok(output)
             if output.status.success() && !output.stdout.iter().all(u8::is_ascii_whitespace) =>
         {
             println!(
@@ -405,14 +405,14 @@ async fn check_fedora_installed_db(command: std::process::Command, deadline: Dur
             );
             0
         }
-        Ok(Ok(output)) if output.status.success() => {
+        Ok(output) if output.status.success() => {
             println!(
                 "  {} RPM installed package database is empty",
                 style::error("✗")
             );
             1
         }
-        Ok(Ok(output)) => {
+        Ok(output) => {
             println!(
                 "  {} RPM installed package query failed ({})",
                 style::error("✗"),
@@ -420,18 +420,8 @@ async fn check_fedora_installed_db(command: std::process::Command, deadline: Dur
             );
             1
         }
-        Ok(Err(error)) => {
-            println!(
-                "  {} RPM installed package query failed: {error}",
-                style::error("✗")
-            );
-            1
-        }
-        Err(_) => {
-            println!(
-                "  {} RPM installed package query timed out",
-                style::error("✗")
-            );
+        Err(error) => {
+            println!("  {} {error:#}", style::error("✗"));
             1
         }
     }
@@ -490,11 +480,75 @@ async fn fedora_package_db_output(
     if !dnf5 {
         command.arg("--disablerepo=*");
     }
-    command.arg("check").kill_on_drop(true);
-    tokio::time::timeout(deadline, command.output())
-        .await
-        .context("DNF local package database check timed out")?
-        .context("DNF local package database check failed")
+    command.arg("check");
+    fedora_package_probe(command, deadline, "DNF local package database check").await
+}
+
+async fn fedora_package_probe(
+    mut command: tokio::process::Command,
+    deadline: Duration,
+    probe: &str,
+) -> Result<std::process::Output> {
+    use std::process::{Output, Stdio};
+    use tokio::io::{AsyncRead, AsyncReadExt as _};
+
+    const OUTPUT_LIMIT: u64 = 8 * 1024 * 1024;
+    async fn read_output(pipe: impl AsyncRead + Unpin, probe: &str) -> Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        pipe.take(OUTPUT_LIMIT + 1)
+            .read_to_end(&mut bytes)
+            .await
+            .with_context(|| format!("{probe} failed"))?;
+        anyhow::ensure!(
+            bytes.len() as u64 <= OUTPUT_LIMIT,
+            "{probe} output exceeds {OUTPUT_LIMIT} bytes"
+        );
+        Ok(bytes)
+    }
+
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .with_context(|| format!("{probe} failed"))?;
+    let result = tokio::time::timeout(deadline, async {
+        let stdout = child
+            .stdout
+            .take()
+            .context("Package probe stdout missing")?;
+        let stderr = child
+            .stderr
+            .take()
+            .context("Package probe stderr missing")?;
+        let (status, stdout, stderr) = tokio::try_join!(
+            async {
+                child
+                    .wait()
+                    .await
+                    .with_context(|| format!("{probe} failed"))
+            },
+            read_output(stdout, probe),
+            read_output(stderr, probe),
+        )?;
+        Ok(Output {
+            status,
+            stdout,
+            stderr,
+        })
+    })
+    .await
+    .with_context(|| format!("{probe} timed out"))
+    .and_then(std::convert::identity);
+    if result.is_err() {
+        let _ = child.start_kill();
+        child
+            .wait()
+            .await
+            .with_context(|| format!("Could not reap {probe}"))?;
+    }
+    result
 }
 
 fn dnf_check_details(stdout: &[u8], stderr: &[u8]) -> Vec<String> {
@@ -2841,6 +2895,35 @@ mod tests {
                 "fixture-0:1-1.noarch",
                 "conflict in https://mirror.invalid/meta",
             ]
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn fedora_dnf_health_check_rejects_oversized_output_on_either_pipe() {
+        for invocation in [
+            "exec head -c 8388609 /dev/zero",
+            "exec head -c 8388609 /dev/zero >&2",
+        ] {
+            let mut command = std::process::Command::new("/bin/sh");
+            command.args(["-c", invocation]);
+            let failure = fedora_package_db_output(command, Duration::from_secs(5))
+                .await
+                .map(|output| output.stdout.len() + output.stderr.len())
+                .expect_err("DNF health output must be bounded");
+            assert!(failure.to_string().contains("output exceeds 8388608 bytes"));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn fedora_rpm_health_check_refuses_oversized_inventory() {
+        let mut command = std::process::Command::new("/bin/sh");
+        command.args(["-c", "yes filesystem-1-1 | head -c 8388609"]);
+        assert_eq!(
+            check_fedora_installed_db(command, Duration::from_secs(5)).await,
+            1,
+            "an oversized inventory must not count as a healthy package database"
         );
     }
 
