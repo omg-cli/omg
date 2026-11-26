@@ -335,16 +335,26 @@ with tempfile.TemporaryDirectory(prefix="omg-fedora-cache-scope-", dir="/tmp") a
             ("explicit-after-search", ["--json", "explicit"], lambda value: len(value["packages"]) == expected_explicit),
             ("status-after-search", ["--json", "status"], lambda value: value["total_packages"] == expected_total),
         ]
+        daemon_log = root / "daemon.log"
         for label, args, verify in cases:
             counters_before = request_counters() if label == "status-json" else None
+            log_offset = daemon_log.stat().st_size if counters_before is not None else 0
             result = command([cli, *args], env, ordinary)
             if counters_before is not None:
                 requests, failures = request_counters()
                 # The second metrics call contributes one request alongside Status.
                 requests -= counters_before[0] + 1
                 failures -= counters_before[1]
+                value = dict(requests=requests, failures=failures)
+                if failures:
+                    with daemon_log.open("rb") as stream:
+                        stream.seek(max(log_offset, daemon_log.stat().st_size - 8192))
+                        recent = stream.read(8192)
+                    value["reply_write_failed"] = any(signal in recent for signal in
+                                                       (b"Client error: Broken pipe",
+                                                        b"Client error: Connection reset by peer"))
                 checks.append(dict(phase=phase, case="status-ipc", passed=requests == 1 and failures == 0,
-                                   value=dict(requests=requests, failures=failures)))
+                                   value=value))
             try:
                 value = json.loads(result.stdout)
                 matched = result.returncode == 0 and verify(value)
@@ -746,7 +756,7 @@ exec {shlex.quote(str(native_executable))} "$@"
         finally:
             config.write_bytes(main_before)
 
-    def status_during(change):
+    def status_during(change, *, args=("daemon-status",), mode=env):
         # Pause the real counts query before libdnf5 takes any database locks.
         # The wrapper and native executable are confined to this mount namespace.
         target = Path(dnf).resolve(strict=True)
@@ -762,6 +772,10 @@ exec {shlex.quote(str(native_executable))} "$@"
             wrapper = gate / "hold-dnf"
             wrapper.write_text(f"""#!/usr/bin/bash
 for argument in "$@"; do
+    if [[ "$argument" == --upgrades ]]; then
+        : > {shlex.quote(str(handoff / "upgrades"))}
+        break
+    fi
     if [[ "$argument" == --unneeded ]]; then
         : > {shlex.quote(str(arrived))}
         for ((attempt=0; attempt<240; attempt++)); do
@@ -777,12 +791,12 @@ exec {shlex.quote(str(native))} "$@"
             wrapper.chmod(0o755)
             checked(["/usr/bin/mount", "--bind", wrapper, target])
             try:
-                with subprocess.Popen([str(cli), "daemon-status"], cwd=work, env=env,
+                with subprocess.Popen([str(cli), *args], cwd=work, env=mode,
                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                       stdin=subprocess.DEVNULL, text=True, **ordinary) as status:
                     try:
                         wait_for(arrived.exists, status)
-                        change()
+                        change(handoff)
                         resume.touch()
                         stdout, stderr = status.communicate(timeout=25)
                         return status.returncode, stdout, stderr
@@ -792,6 +806,45 @@ exec {shlex.quote(str(native))} "$@"
                             status.wait(4)
             finally:
                 checked(["/usr/bin/umount", target])
+
+    def inspect_overlapping_status(phase, expected_updates):
+        native_orphans = ordinary_control([dnf, "--cacheonly", "repoquery", "--unneeded",
+                                           "--qf", r"%{name}\n"]).splitlines()
+        expected = {
+            "total_packages": 1,
+            "explicit_packages": 1,
+            "orphan_packages": len(native_orphans),
+            "updates_available": expected_updates,
+        }
+        labels = {
+            "Total packages:": "total_packages", "Explicit packages:": "explicit_packages",
+            "Orphan packages:": "orphan_packages", "Updates available:": "updates_available",
+        }
+        for label, args, mode in (
+            ("parallel-direct-status", ("--json", "status"), disabled),
+            ("parallel-daemon-status", ("daemon-status",), env),
+        ):
+            started_upgrades = False
+
+            def inspect_while_orphans_wait(handoff):
+                nonlocal started_upgrades
+                deadline = time.monotonic() + 1.5
+                started_upgrades = (handoff / "upgrades").exists()
+                while not started_upgrades and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                    started_upgrades = (handoff / "upgrades").exists()
+
+            status, stdout, stderr = status_during(inspect_while_orphans_wait, args=args, mode=mode)
+            if mode is disabled:
+                value = json.loads(stdout) if status == 0 else {}
+                counts = {key: value.get(key) for key in expected}
+            else:
+                counts = {labels[name]: int(count) for name, count in
+                          re.findall(r"(?m)^\s*(Total packages:|Explicit packages:|Orphan packages:|Updates available:)\s*([0-9]+)\s*$", stdout)}
+            checks.append(dict(phase=phase, case=label,
+                               passed=status == 0 and started_upgrades and counts == expected,
+                               status=status, started_upgrades=started_upgrades, counts=counts,
+                               diagnostic=stderr[-900:]))
 
     @contextmanager
     def running_daemon(log):
@@ -1326,7 +1379,7 @@ exec {shlex.quote(str(binary))} "$@"
                 inspect_update_status("status-advisory-only", 1, False)
                 advisory_manifests = cached_manifests(advisory_cache)
 
-                def refresh_advisory_while_counting():
+                def refresh_advisory_while_counting(_handoff):
                     distinct = ET.fromstring(original_manifest)
                     distinct.find(f"{repo_ns}revision").text = str(time.time_ns())
                     manifest.write_bytes(ET.tostring(distinct))
@@ -1345,7 +1398,7 @@ exec {shlex.quote(str(binary))} "$@"
                                    status=exit_code, value=(stdout + stderr)[-1200:]))
                 advisory_manifests = cached_manifests(advisory_cache)
 
-                def refresh_packages_while_counting():
+                def refresh_packages_while_counting(_handoff):
                     manifest.write_bytes(ET.tostring(new_manifest))
                     sign_manifest()
                     ordinary_control([dnf, "clean", "metadata"])
@@ -1362,6 +1415,7 @@ exec {shlex.quote(str(binary))} "$@"
                 if consent_oracle is not None:
                     inspect_update_query_refusal("update-empty-native-installed", "--installed", True)
                     inspect_update_query_refusal("update-empty-native-upgrades", "--upgrades", False)
+                    inspect_overlapping_status("status-metadata-only", 0)
 
                 manifest.write_bytes(original_manifest)
                 sign_manifest()
@@ -1370,9 +1424,10 @@ exec {shlex.quote(str(binary))} "$@"
                 inspect_update_status("status-metadata-restored", 1, False)
                 if consent_oracle is not None:
                     inspect_update_query_refusal("update-present-native-installed", "--installed", False)
+                    inspect_overlapping_status("status-metadata-restored", 1)
                 normal_manifests = cached_manifests(normal_cache)
 
-                def disable_repository_while_counting():
+                def disable_repository_while_counting(_handoff):
                     alternate_repo.write_text(repo_config.replace("enabled=1", "enabled=0"))
                     assert cached_manifests(normal_cache) == normal_manifests
                     assert cached_manifests(advisory_cache) == advisory_manifests
@@ -1457,6 +1512,6 @@ assert inventory() == before
 report = dict(binaries=binaries, checks=checks, total=len(checks),
               passed=sum(entry["passed"] for entry in checks), host_unchanged=True)
 print(json.dumps(report))
-expected_checks = 303 if consent_oracle is None else 572
+expected_checks = 303 if consent_oracle is None else 576
 if report["passed"] != report["total"] or report["total"] != expected_checks:
     sys.exit(4)

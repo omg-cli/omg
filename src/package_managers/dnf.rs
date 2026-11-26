@@ -2830,9 +2830,14 @@ impl DnfPackageManager {
         }
     }
 
-    pub(crate) async fn orphan_packages() -> Result<Vec<String>> {
+    async fn unneeded_packages() -> Result<Vec<VersionedPackage>> {
         let output = Self::repository_output(RepositoryQuery::Unneeded).await?;
-        Ok(Self::parse_versioned_packages(&output)?
+        Self::parse_versioned_packages(&output)
+    }
+
+    pub(crate) async fn orphan_packages() -> Result<Vec<String>> {
+        Ok(Self::unneeded_packages()
+            .await?
             .into_iter()
             .map(|package| format!("{}.{}", package.name, package.architecture))
             .collect())
@@ -3257,11 +3262,9 @@ impl PackageManager for DnfPackageManager {
             let (orphans, updates) = if fast {
                 (0, 0)
             } else {
-                let unneeded = Self::repository_output(RepositoryQuery::Unneeded).await?;
-                (
-                    Self::parse_versioned_packages(&unneeded)?.len(),
-                    self.list_updates().await?.len(),
-                )
+                let (unneeded, upgrades) =
+                    tokio::try_join!(Self::unneeded_packages(), self.list_updates())?;
+                (unneeded.len(), upgrades.len())
             };
 
             Ok((total, explicit, orphans, updates))
