@@ -322,7 +322,7 @@ fn push_keeps_the_existing_lock_when_team_status_is_malformed() {
     let previous = EnvironmentState {
         schema_version: EnvironmentState::SCHEMA_VERSION,
         packages: vec!["previous-package".to_string()],
-        runtimes: Default::default(),
+        runtimes: std::collections::BTreeMap::new(),
         timestamp: 1,
         hash: String::new(),
     };
