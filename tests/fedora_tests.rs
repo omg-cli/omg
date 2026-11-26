@@ -1029,45 +1029,54 @@ mod dnf_integration {
     }
 
     #[tokio::test]
-    async fn explicit_cli_matches_native_backend_without_a_daemon() -> Result<()> {
+    async fn explicit_cli_reads_native_reasons_without_waiting_for_daemon() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+
         let mut expected = DnfPackageManager::new().list_explicit().await?;
         expected.sort();
         expected.dedup();
-        let binary = assert_cmd::cargo::cargo_bin!("omg");
-        let mut listing = tokio::process::Command::new(binary);
-        listing
-            .args(["--json", "explicit"])
-            .env("OMG_DISABLE_DAEMON", "1")
-            .env("OMG_DISABLE_TELEMETRY", "1")
-            .env("OMG_TEST_MODE", "0")
-            .env_remove("OMG_TEST_DISTRO")
-            .env_remove("OMG_NATIVE_TEST_DATA_DIR");
-        let mut child = spawn_bounded_child(&mut listing)?;
-        let listing = bounded_child_output(&mut child, std::time::Duration::from_mins(1)).await?;
-        assert!(
-            listing.status.success(),
-            "{}",
-            String::from_utf8_lossy(&listing.stderr)
-        );
-        let listing: serde_json::Value = serde_json::from_slice(&listing.stdout)?;
-        assert_eq!(listing["packages"], serde_json::json!(expected));
-        let mut count = tokio::process::Command::new(binary);
-        count
-            .args(["--json", "explicit", "--count"])
-            .env("OMG_DISABLE_DAEMON", "1")
-            .env("OMG_DISABLE_TELEMETRY", "1")
-            .env("OMG_TEST_MODE", "0")
-            .env_remove("OMG_TEST_DISTRO")
-            .env_remove("OMG_NATIVE_TEST_DATA_DIR");
-        let mut child = spawn_bounded_child(&mut count)?;
-        let count = bounded_child_output(&mut child, std::time::Duration::from_mins(1)).await?;
-        assert!(
-            count.status.success(),
-            "{}",
-            String::from_utf8_lossy(&count.stderr)
-        );
-        let count: serde_json::Value = serde_json::from_slice(&count.stdout)?;
-        assert_eq!(count["count"], serde_json::json!(expected.len()));
+        let runtime = tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()?;
+        let listener = tokio::net::UnixListener::bind(runtime.path().join("omg.sock"))?;
+        let count = serde_json::json!({ "count": expected.len() });
+        for (arguments, wanted) in [
+            (
+                &["--json", "explicit"][..],
+                serde_json::json!({ "count": expected.len(), "packages": expected }),
+            ),
+            (&["--json", "explicit", "--count"][..], count.clone()),
+            (&["--json", "ec"][..], count),
+            (&["ec"][..], serde_json::json!(expected.len())),
+        ] {
+            let mut command = tokio::process::Command::new(assert_cmd::cargo::cargo_bin!("omg"));
+            command
+                .args(arguments)
+                .env("XDG_RUNTIME_DIR", runtime.path())
+                .env_remove("OMG_SOCKET_PATH")
+                .env_remove("OMG_DISABLE_DAEMON")
+                .env("OMG_DISABLE_TELEMETRY", "1")
+                .env("OMG_TEST_MODE", "0")
+                .env_remove("OMG_TEST_DISTRO")
+                .env_remove("OMG_NATIVE_TEST_DATA_DIR");
+            let mut child = spawn_bounded_child(&mut command)?;
+            let output = tokio::select! {
+                biased;
+                connected = listener.accept() => {
+                    let (_connection, _) = connected?;
+                    child.kill().await?;
+                    anyhow::bail!("{arguments:?} contacted the daemon for native DNF reasons");
+                }
+                output = bounded_child_output(&mut child, std::time::Duration::from_mins(1)) => output?,
+            };
+            assert!(
+                output.status.success(),
+                "{arguments:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+            assert_eq!(value, wanted, "{arguments:?}");
+        }
         Ok(())
     }
 
