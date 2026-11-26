@@ -7,32 +7,39 @@ use super::enforce_install_policy;
 
 pub async fn install(packages: &[String]) -> Result<()> {
     let pm = get_package_manager()?;
+    #[cfg(not(feature = "fedora"))]
+    let native_dnf = false;
+    #[cfg(feature = "fedora")]
+    let native_dnf =
+        crate::package_managers::resolve_backend()? == crate::package_managers::Backend::Fedora;
     let summary = "Installed";
     #[cfg(feature = "fedora")]
-    let summary = if crate::package_managers::resolve_backend()?
-        == crate::package_managers::Backend::Fedora
-    {
+    let summary = if native_dnf {
         "Install request complete for"
     } else {
         summary
     };
-    let policy =
-        crate::core::security::SecurityPolicy::load_default().map_err(anyhow::Error::from)?;
-    let vulnerability_scanner = crate::core::security::vulnerability::VulnerabilityScanner::new();
-    for package in packages {
-        let info = pm
-            .info(package)
-            .await?
-            .with_context(|| format!("Package not found: {package}"))?;
-        enforce_install_policy(
-            &policy,
-            &vulnerability_scanner,
-            &info.name,
-            &info.version,
-            crate::package_managers::types::SecurityOrigin::Unknown,
-            None,
-        )
-        .await?;
+    // DNF reviews the complete stored transaction, including capability providers.
+    if !native_dnf {
+        let policy =
+            crate::core::security::SecurityPolicy::load_default().map_err(anyhow::Error::from)?;
+        let vulnerability_scanner =
+            crate::core::security::vulnerability::VulnerabilityScanner::new();
+        for package in packages {
+            let info = pm
+                .info(package)
+                .await?
+                .with_context(|| format!("Package not found: {package}"))?;
+            enforce_install_policy(
+                &policy,
+                &vulnerability_scanner,
+                &info.name,
+                &info.version,
+                crate::package_managers::types::SecurityOrigin::Unknown,
+                None,
+            )
+            .await?;
+        }
     }
 
     modern_ui::print_phase_header(
