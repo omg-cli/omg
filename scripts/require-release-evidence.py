@@ -113,7 +113,7 @@ def require_release_evidence(repository, sha, snapshot=github_snapshot):
             for file, label in REQUIRED.items():
                 run = latest[file]
                 print(f'{label} passed for {sha} in run {run.id} attempt {run.attempt}', flush=True)
-            return
+            return latest['ci.yml']
         if pending != last_pending:
             print(f'Waiting for {", ".join(pending)} on {sha}', flush=True)
             last_pending = pending
@@ -128,7 +128,10 @@ if __name__ == '__main__':
     parser.add_argument('commit')
     arguments = parser.parse_args()
     try:
-        require_release_evidence(os.environ['GITHUB_REPOSITORY'], arguments.commit)
+        ci_run = require_release_evidence(os.environ['GITHUB_REPOSITORY'], arguments.commit)
+        if output := os.environ.get('GITHUB_OUTPUT'):
+            with open(output, 'a', encoding='utf-8') as stream:
+                stream.write(f'ci-run={ci_run.id}\nci-attempt={ci_run.attempt}\n')
     except (KeyError, OSError, TypeError, ValueError, AttributeError, subprocess.SubprocessError) as error:
         print(f'::error::Release evidence rejected: {error}', file=sys.stderr)
         sys.exit(1)

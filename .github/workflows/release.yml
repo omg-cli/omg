@@ -14,6 +14,10 @@ on:
         description: "Sync an existing published tag to R2 instead of building"
         required: false
         default: ""
+      smoke_ci_sha:
+        description: "Dry-run Linux smoke using a successful main CI source SHA"
+        required: false
+        default: ""
 
 concurrency:
   group: release
@@ -34,24 +38,29 @@ jobs:
   # could be published while CI is red. Publishing is only allowed for a
   # commit with successful platform, security and coverage runs. The staged
   # archive smoke jobs below gate publication after the builds.
-  # Non-publishing dry runs
-  # bypass this gate; existing-tag sync uses the published release path.
+  # Branch dry runs can still build locally. A CI archive smoke dispatch
+  # checks the selected main commit without publishing or signing.
   # ════════════════════════════════════════════════════════════════════════════
   gate-on-ci:
     name: "Gate on CI"
-    if: github.event_name != 'workflow_dispatch' || inputs.sync_existing_tag == ''
+    if: github.event_name != 'workflow_dispatch' || inputs.sync_existing_tag == '' || inputs.smoke_ci_sha != ''
     runs-on: ubuntu-24.04
     # Long enough to watch an in-progress 90-minute QEMU run to completion;
     # a tag pushed seconds after `main` lands must not miss the run.
     timeout-minutes: 100
     permissions:
+      contents: read
       actions: read
+    outputs:
+      linux-version: ${{ steps.stage.outputs.version }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - name: Require successful CI and benchmark runs for this commit
+        id: evidence
+        if: inputs.smoke_ci_sha == ''
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           DRY_RUN: ${{ inputs.dry_run }}
@@ -69,6 +78,89 @@ jobs:
 
           python3 scripts/require-release-evidence.py "$GITHUB_SHA"
 
+      - name: Require evidence for CI archive smoke
+        id: smoke-evidence
+        if: inputs.smoke_ci_sha != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          SMOKE_CI_SHA: ${{ inputs.smoke_ci_sha }}
+          SYNC_EXISTING_TAG: ${{ inputs.sync_existing_tag }}
+        run: |
+          if [[ "$GITHUB_EVENT_NAME" != workflow_dispatch || "$DRY_RUN" != true \
+             || -n "$SYNC_EXISTING_TAG" || ! "$SMOKE_CI_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::CI archive smoke requires a dry run and a full main commit SHA"
+            exit 1
+          fi
+          python3 scripts/require-release-evidence.py "$SMOKE_CI_SHA"
+          if ! git cat-file -e "$SMOKE_CI_SHA^{commit}"; then
+            git fetch --no-tags --depth=1 origin "$SMOKE_CI_SHA"
+          fi
+
+      - name: Stage verified Linux archives
+        id: stage
+        if: >-
+          inputs.smoke_ci_sha != '' ||
+          (vars.OMG_RELEASE_REUSE_CI_LINUX == 'true' && steps.evidence.outputs.ci-run != '')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ inputs.smoke_ci_sha || github.sha }}
+          CI_RUN: ${{ steps.smoke-evidence.outputs.ci-run || steps.evidence.outputs.ci-run }}
+          CI_ATTEMPT: ${{ steps.smoke-evidence.outputs.ci-attempt || steps.evidence.outputs.ci-attempt }}
+        run: |
+          python3 scripts/native-build-artifact.py stage-release --destination verified-linux \
+            --commit "$SOURCE_SHA" --ci-run "$CI_RUN" --ci-attempt "$CI_ATTEMPT"
+          version=$(jq -er '.archives.fedora.version' verified-linux/native-release-provenance.json)
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: steps.stage.outputs.version != ''
+        with:
+          name: arch-build
+          path: verified-linux/arch-build/
+          compression-level: 0
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: steps.stage.outputs.version != ''
+        with:
+          name: debian-build
+          path: verified-linux/debian-build/
+          compression-level: 0
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: steps.stage.outputs.version != ''
+        with:
+          name: debian-trixie-build
+          path: verified-linux/debian-trixie-build/
+          compression-level: 0
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: steps.stage.outputs.version != ''
+        with:
+          name: ubuntu-build
+          path: verified-linux/ubuntu-build/
+          compression-level: 0
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: steps.stage.outputs.version != ''
+        with:
+          name: fedora-build
+          path: verified-linux/fedora-build/
+          compression-level: 0
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: steps.stage.outputs.version != ''
+        with:
+          name: native-release-provenance
+          path: verified-linux/native-release-provenance.json
+          if-no-files-found: error
+
   # ════════════════════════════════════════════════════════════════════════════
   # BUILD RELEASE ARTIFACTS
   # ════════════════════════════════════════════════════════════════════════════
@@ -76,6 +168,7 @@ jobs:
   build-arch:
     name: "Build Arch"
     needs: gate-on-ci
+    if: needs.gate-on-ci.outputs.linux-version == ''
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     container: archlinux:latest@sha256:f3691b4dde62ba4c4b6f0ae2c1fbf28e8c0c8c4b9a35c7e06dc1f70e21aa29f6
@@ -123,6 +216,7 @@ jobs:
   build-debian:
     name: "Build Debian"
     needs: gate-on-ci
+    if: needs.gate-on-ci.outputs.linux-version == ''
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     container: debian:bookworm@sha256:813017f3d62be4b5891a7acca6a01bdcd4b8513daa81b1ab99d3a50385b26931
@@ -188,6 +282,7 @@ jobs:
   build-debian-trixie:
     name: "Build Debian Trixie"
     needs: gate-on-ci
+    if: needs.gate-on-ci.outputs.linux-version == ''
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     container: debian:trixie@sha256:34cd9e9fd437c0a095ec39cb2e73422c9f30821b0d0848ed74fd0d43bae4d958
@@ -253,6 +348,7 @@ jobs:
   build-ubuntu:
     name: "Build Ubuntu"
     needs: gate-on-ci
+    if: needs.gate-on-ci.outputs.linux-version == ''
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -297,6 +393,7 @@ jobs:
   build-fedora:
     name: "Build Fedora"
     needs: gate-on-ci
+    if: needs.gate-on-ci.outputs.linux-version == ''
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     container:
@@ -349,6 +446,7 @@ jobs:
   build-macos:
     name: "Build macOS (ARM64)"
     needs: gate-on-ci
+    if: inputs.smoke_ci_sha == ''
     runs-on: macos-15
     timeout-minutes: 30
     outputs:
@@ -391,7 +489,12 @@ jobs:
 
   smoke-apt-debian:
     name: "Staged Debian APT smoke (ABI 6)"
-    needs: build-debian
+    needs: [gate-on-ci, build-debian]
+    if: >-
+      ${{ !cancelled() && needs.gate-on-ci.result == 'success' &&
+          (needs.gate-on-ci.outputs.linux-version != '' || needs.build-debian.result == 'success') }}
+    env:
+      STAGED_VERSION: ${{ needs.gate-on-ci.outputs.linux-version }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -408,7 +511,7 @@ jobs:
           APT_ABI: '6'
         run: |
           set -euo pipefail
-          VERSION=$(awk -F'"' '/^version =/ {print $2; exit}' Cargo.toml)
+          VERSION="${STAGED_VERSION:-$(awk -F'"' '/^version =/ {print $2; exit}' Cargo.toml)}"
           test -n "$VERSION"
           ./scripts/release-smoke.sh --release "v$VERSION" --staged-dir staged-release \
             --distro "$DISTRO" --apt-abi "$APT_ABI" --evidence-dir apt-smoke-evidence
@@ -423,7 +526,12 @@ jobs:
 
   smoke-apt-ubuntu:
     name: "Staged Ubuntu APT smoke (ABI 6)"
-    needs: build-ubuntu
+    needs: [gate-on-ci, build-ubuntu]
+    if: >-
+      ${{ !cancelled() && needs.gate-on-ci.result == 'success' &&
+          (needs.gate-on-ci.outputs.linux-version != '' || needs.build-ubuntu.result == 'success') }}
+    env:
+      STAGED_VERSION: ${{ needs.gate-on-ci.outputs.linux-version }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -440,7 +548,7 @@ jobs:
           APT_ABI: '6'
         run: |
           set -euo pipefail
-          VERSION=$(awk -F'"' '/^version =/ {print $2; exit}' Cargo.toml)
+          VERSION="${STAGED_VERSION:-$(awk -F'"' '/^version =/ {print $2; exit}' Cargo.toml)}"
           test -n "$VERSION"
           ./scripts/release-smoke.sh --release "v$VERSION" --staged-dir staged-release \
             --distro "$DISTRO" --apt-abi "$APT_ABI" --evidence-dir apt-smoke-evidence
@@ -455,7 +563,12 @@ jobs:
 
   smoke-apt-trixie:
     name: "Staged ${{ matrix.distro }} APT smoke (ABI 7)"
-    needs: build-debian-trixie
+    needs: [gate-on-ci, build-debian-trixie]
+    if: >-
+      ${{ !cancelled() && needs.gate-on-ci.result == 'success' &&
+          (needs.gate-on-ci.outputs.linux-version != '' || needs.build-debian-trixie.result == 'success') }}
+    env:
+      STAGED_VERSION: ${{ needs.gate-on-ci.outputs.linux-version }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     strategy:
@@ -476,7 +589,7 @@ jobs:
           APT_ABI: '7'
         run: |
           set -euo pipefail
-          VERSION=$(awk -F'"' '/^version =/ {print $2; exit}' Cargo.toml)
+          VERSION="${STAGED_VERSION:-$(awk -F'"' '/^version =/ {print $2; exit}' Cargo.toml)}"
           test -n "$VERSION"
           ./scripts/release-smoke.sh --release "v$VERSION" --staged-dir staged-release \
             --distro "$DISTRO" --apt-abi "$APT_ABI" --evidence-dir apt-smoke-evidence
@@ -491,7 +604,12 @@ jobs:
 
   smoke-arch:
     name: "Staged Arch release smoke"
-    needs: build-arch
+    needs: [gate-on-ci, build-arch]
+    if: >-
+      ${{ !cancelled() && needs.gate-on-ci.result == 'success' &&
+          (needs.gate-on-ci.outputs.linux-version != '' || needs.build-arch.result == 'success') }}
+    env:
+      STAGED_VERSION: ${{ needs.gate-on-ci.outputs.linux-version }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -505,7 +623,7 @@ jobs:
       - name: Exercise staged Arch release
         run: |
           set -euo pipefail
-          VERSION=$(awk -F'"' '/^version =/ {print $2; exit}' Cargo.toml)
+          VERSION="${STAGED_VERSION:-$(awk -F'"' '/^version =/ {print $2; exit}' Cargo.toml)}"
           test -n "$VERSION"
           ./scripts/release-smoke.sh --release "v$VERSION" --staged-dir staged-release \
             --distro arch --evidence-dir staged-arch-smoke-evidence
@@ -520,7 +638,12 @@ jobs:
 
   smoke-fedora:
     name: "Staged Fedora release smoke"
-    needs: build-fedora
+    needs: [gate-on-ci, build-fedora]
+    if: >-
+      ${{ !cancelled() && needs.gate-on-ci.result == 'success' &&
+          (needs.gate-on-ci.outputs.linux-version != '' || needs.build-fedora.result == 'success') }}
+    env:
+      STAGED_VERSION: ${{ needs.gate-on-ci.outputs.linux-version }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -534,7 +657,7 @@ jobs:
       - name: Exercise staged Fedora release
         run: |
           set -euo pipefail
-          VERSION=$(awk -F'"' '/^version =/ {print $2; exit}' Cargo.toml)
+          VERSION="${STAGED_VERSION:-$(awk -F'"' '/^version =/ {print $2; exit}' Cargo.toml)}"
           test -n "$VERSION"
           ./scripts/release-smoke.sh --release "v$VERSION" --staged-dir staged-release \
             --distro fedora --evidence-dir staged-fedora-smoke-evidence
@@ -599,7 +722,11 @@ jobs:
     name: "Create Release"
     runs-on: ubuntu-24.04
     timeout-minutes: 15
-    needs: [build-arch, build-debian, build-debian-trixie, build-ubuntu, build-fedora, build-macos, smoke-apt-debian, smoke-apt-ubuntu, smoke-apt-trixie, smoke-arch, smoke-fedora, smoke-macos]
+    needs: [gate-on-ci, build-macos, smoke-apt-debian, smoke-apt-ubuntu, smoke-apt-trixie, smoke-arch, smoke-fedora, smoke-macos]
+    if: >-
+      ${{ !cancelled() && inputs.smoke_ci_sha == '' &&
+          !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') &&
+          !contains(needs.*.result, 'skipped') }}
     permissions:
       contents: write
       id-token: write
@@ -658,6 +785,23 @@ jobs:
           fi
           test -n "$VERSION"
           ./scripts/collect-release-artifacts.sh "$VERSION" artifacts release
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: needs.gate-on-ci.outputs.linux-version != ''
+        with:
+          name: native-release-provenance
+          path: native-release-evidence
+
+      - name: Match release bytes to verified CI archives
+        if: needs.gate-on-ci.outputs.linux-version != ''
+        run: |
+          set -euo pipefail
+          jq -er --arg sha "$GITHUB_SHA" '
+            select(.source_sha == $sha and (.archives | keys) ==
+              ["arch", "debian", "debian-trixie", "fedora", "ubuntu"]) |
+            .archives[] | "\(.archive_sha256)  \(.archive)"
+          ' native-release-evidence/native-release-provenance.json > "$RUNNER_TEMP/native-release-digests"
+          (cd release && sha256sum --strict --check "$RUNNER_TEMP/native-release-digests")
 
       - name: Attest release archives and SBOM
         id: attest
@@ -741,6 +885,7 @@ jobs:
     if: >-
       ${{
         always() &&
+        inputs.smoke_ci_sha == '' &&
         (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.dry_run == 'false')) &&
         (inputs.sync_existing_tag != '' || needs.release.result == 'success')
       }}
