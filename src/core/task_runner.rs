@@ -10,7 +10,10 @@ use std::process::Command;
 
 use crate::config::mise_env::{Environment, ResolvedEnv, prepend_paths};
 use crate::core::runtime_resolver::{RuntimeVersionReq, find_in_path};
-use crate::hooks;
+use crate::hooks::{self, NodeAliasErrors, NodeSelection};
+
+#[cfg(test)]
+use crate::core::runtime_resolver::resolve_nvm_alias;
 use crate::runtimes::rust::RustManager;
 use crate::runtimes::security::{ReviewMode, RuntimeAdmission, admit_selected_path};
 use crate::runtimes::{BunManager, NodeManager};
@@ -1032,10 +1035,12 @@ fn execute_process_in(
             .or_insert_with(|| default_version.to_owned());
     }
     ensure_js_package_manager(cmd)?;
-    // Resolve all required runtimes. Sequential processing is required because
-    // individual resolvers may ask the user to confirm an installation.
+    // Resolve required runtimes in order so setup prompts remain sequential.
+    let selected_node = versions
+        .remove("node")
+        .map(|request| ensure_node_runtime(&request))
+        .transpose()?;
     let runtime_resolvers: &[(&str, fn(&str) -> Result<String>)] = &[
-        ("node", ensure_node_runtime),
         ("bun", ensure_bun_runtime),
         ("python", ensure_python_runtime),
         ("go", ensure_go_runtime),
@@ -1050,6 +1055,9 @@ fn execute_process_in(
         }
     }
     let mut selected_paths = hooks::selected_runtime_paths(&versions)?;
+    if let Some(path) = selected_node {
+        selected_paths.insert(0, ("node".to_owned(), path));
+    }
     for runtime in versions.keys() {
         anyhow::ensure!(
             !crate::runtimes::SUPPORTED_RUNTIMES.contains(&runtime.as_str())
@@ -1393,31 +1401,25 @@ fn find_rust_toolchain_file(start: &Path) -> Option<PathBuf> {
     None
 }
 
-fn ensure_node_runtime(version: &str) -> Result<String> {
-    let normalized = version.trim_start_matches('v');
-    let node_manager = NodeManager::new();
-    let installed = node_manager
-        .list_installed()
-        .context("Failed to list installed Node.js versions")?;
-    // Task PATH selection prefers a matching managed installation. Consult
-    // the ambient runtime only when that inventory cannot satisfy the pin.
-    if installed_runtime_satisfies(&installed, normalized)
-        || system_runtime_satisfies("node", normalized)
-    {
-        return Ok(normalized.to_string());
-    }
+fn ensure_node_runtime(request: &str) -> Result<PathBuf> {
+    let data_dir = crate::core::paths::data_dir();
+    let request = match hooks::select_node_runtime(&data_dir, request, NodeAliasErrors::Report)? {
+        NodeSelection::Installed(path) => return Ok(path),
+        NodeSelection::Missing(request) => request,
+    };
 
-    if let Some(nvm_version) = nvm_resolve_version(normalized)? {
-        return Ok(nvm_version);
-    }
-
-    let prompt = format!("Node.js '{normalized}' is missing. Install now?");
-    if confirm_interactively(&prompt)? {
-        let resolved = run_async(node_manager.resolve_alias(normalized))?;
-        run_async(node_manager.install(&resolved))?;
-        Ok(resolved)
-    } else {
+    let prompt = format!("Node.js '{request}' is missing. Install now?");
+    if !confirm_interactively(&prompt)? {
         anyhow::bail!("Node.js setup cancelled");
+    }
+    let manager = NodeManager::new();
+    let resolved = run_async(manager.resolve_alias(&request))?;
+    run_async(manager.install(&resolved))?;
+    match hooks::select_node_runtime(&data_dir, &resolved, NodeAliasErrors::Report)? {
+        NodeSelection::Installed(path) => Ok(path),
+        NodeSelection::Missing(_) => {
+            anyhow::bail!("Node.js setup did not select an installation for {resolved:?}")
+        }
     }
 }
 
@@ -1487,34 +1489,6 @@ fn installed_runtime_satisfies(installed: &[String], requested: &str) -> bool {
                 .as_ref()
                 .is_some_and(|requirement| requirement.matches_str(version))
     })
-}
-
-fn nvm_resolve_version(version: &str) -> Result<Option<String>> {
-    let nvm_dir = std::env::var_os("NVM_DIR")
-        .map(PathBuf::from)
-        .or_else(|| home::home_dir().map(|dir| dir.join(".nvm")));
-    let Some(nvm_dir) = nvm_dir else {
-        return Ok(None);
-    };
-
-    let resolved = match resolve_nvm_alias(&nvm_dir, version)? {
-        Some(alias) => alias,
-        None => version.to_string(),
-    };
-    let normalized = resolved.trim_start_matches('v');
-    let bin_path = nvm_dir
-        .join("versions/node")
-        .join(format!("v{normalized}"))
-        .join("bin");
-    // An empty or partially installed bin directory cannot satisfy a runtime
-    // requirement. Check this exact executable without falling back to PATH.
-    Ok(which::which(bin_path.join("node"))
-        .is_ok()
-        .then(|| normalized.to_string()))
-}
-
-fn resolve_nvm_alias(nvm_dir: &std::path::Path, alias: &str) -> Result<Option<String>> {
-    crate::core::runtime_resolver::resolve_nvm_alias(nvm_dir, alias)
 }
 
 fn parse_package_manager_name(value: &str) -> Result<String> {
@@ -2471,7 +2445,7 @@ pathlib.Path({}).write_text(sys.prefix + '|' + omg_local_venv_probe.VALUE)
                 );
                 assert!(system_runtime_satisfies("node", "24.22.3"));
                 assert!(system_runtime_satisfies("node", "latest"));
-                assert_eq!(ensure_node_runtime("v24.22.3").unwrap(), "24.22.3");
+                assert_eq!(ensure_node_runtime("v24.22.3").unwrap(), bin);
                 assert_eq!(std::fs::read(&marker).unwrap(), b"reviewed");
                 assert!(!system_runtime_satisfies("node", "24.22.4"));
                 assert!(!system_runtime_satisfies("node", "24.22.2"));

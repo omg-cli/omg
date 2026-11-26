@@ -2454,6 +2454,108 @@ printf 'fixture runtime {runtime} {version}|<%s>\\n' "$@"
                                        passed=passed, expected_version=version, diagnostic=log[-1100:]))
 
 
+    def inspect_node_alias_selection():
+        managed = ("24.15.3", "24.15.9", "24.16.2")
+        external = ("v26.0.5", "v26.1.0")
+        seed = r"""
+import importlib.util, json, sys
+from pathlib import Path
+helper, home, managed, external = sys.argv[1:]
+spec = importlib.util.spec_from_file_location("runtime_advisory_fixture", helper)
+fixture = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(fixture)
+home = Path(home)
+config = Path(fixture.fixture_cli_environment(home)["OMG_CONFIG_DIR"])
+for directory, versions in (("data", managed), ("nvm", external)):
+    for version in json.loads(versions):
+        root = home / directory / "versions/node" / version
+        program = root / "bin/node"
+        program.parent.mkdir(parents=True)
+        program.write_text(f'''#!/bin/sh
+if [ "$1" = --version ]; then
+    printf '%s\\n' 'v{version.removeprefix("v")}'
+    exit
+fi
+printf 'fixture node {directory} {version}|<%s>\\n' "$@"
+''')
+        program.chmod(0o755)
+        fixture.seed_runtime_advisory_fixture(root, "node", version, config)
+"""
+        with tempfile.TemporaryDirectory(prefix="task-node-aliases-", dir=work) as directory:
+            here = Path(directory)
+            os.chown(here, account.pw_uid, account.pw_gid)
+            checked([sys.executable, "-I", "-B", "-c", seed, runtime_advisory_fixture, here,
+                     json.dumps(managed), json.dumps(external)], dict(disabled, HOME=str(here)), ordinary)
+            nvm = here / "nvm"
+            aliases = nvm / "alias"
+            (aliases / "lts").mkdir(parents=True)
+            for name, value in (
+                ("default", "# Managed team default\n  v24.15.3 # exact\n"),
+                ("team", "default"),
+                ("project-minor", "24.15"),
+                ("project-major", "v24"),
+                ("newest", "node"),
+                ("lts/*", "lts/krypton"),
+                ("lts/krypton", "v24.15.9"),
+                ("unavailable", "v28.0.0"),
+                ("external", "v26.0.5"),
+                ("review-cycle-one", "review-cycle-two"),
+                ("review-cycle-two", "review-cycle-one"),
+            ):
+                (aliases / name).write_text(value + "\n")
+            for depth in (64, 65):
+                for index in range(depth):
+                    target = f"chain-{depth}-{index+1}" if index + 1 < depth else "v24.15.3"
+                    (aliases / f"chain-{depth}-{index}").write_text(target + "\n")
+            env = dict(disabled, HOME=str(here), NVM_DIR=str(nvm), OMG_DATA_DIR=str(here/"data"),
+                       OMG_CONFIG_DIR=str(here/"config"/"omg"), OMG_NATIVE_TEST_DATA_DIR="1",
+                       XDG_CONFIG_HOME=str(here/"config"), XDG_DATA_HOME=str(here/"xdg-data"),
+                       XDG_CACHE_HOME=str(here/"cache"), XDG_STATE_HOME=str(here/"state"))
+            cases = (
+                ("managed-exact", "24.15.3", ("data", "24.15.3")),
+                ("named-exact", "default", ("data", "24.15.3")),
+                ("named-chain", "team", ("data", "24.15.3")),
+                ("named-minor", "project-minor", ("data", "24.15.9")),
+                ("named-major", "project-major", ("data", "24.16.2")),
+                ("builtin-node", "node", ("data", "24.16.2")),
+                ("named-builtin", "newest", ("data", "24.16.2")),
+                ("default-lts", "lts", ("data", "24.15.9")),
+                ("wildcard-lts", "lts/*", ("data", "24.15.9")),
+                ("named-lts", "lts/krypton", ("data", "24.15.9")),
+                ("maximum-chain", "chain-64-0", ("data", "24.15.3")),
+                ("excess-chain", "chain-65-0", "Nvm alias chain exceeds 64 resolutions"),
+                ("undefined-alias", "unlisted", "Interactive confirmation required:"),
+                ("alias-target-unavailable", "unavailable", "Node.js '28.0.0' is missing"),
+                ("nvm-exact", "v26.0.5", ("nvm", "v26.0.5")),
+                ("nvm-major", "26", ("nvm", "v26.1.0")),
+                ("nvm-alias", "external", ("nvm", "v26.0.5")),
+                ("nvm-cycle", "review-cycle-one", "Nvm alias cycle"),
+            )
+            bins = [str(here / directory / "versions/node" / version / "bin")
+                    for directory, versions in (("data", managed), ("nvm", external)) for version in versions]
+            for label, request, want in cases:
+                project = here / label
+                project.mkdir()
+                (project / ".nvmrc").write_text(request + "\n")
+                for mode, args in (
+                    ("hook", ("hook-env", "--shell", "bash")),
+                    ("task", ("run", "node", "--", "two words")),
+                ):
+                    result = subprocess.run([cli, *args], cwd=project, env=env, stdin=subprocess.DEVNULL,
+                                            capture_output=True, text=True, timeout=8, **ordinary)
+                    output = [line for line in result.stdout.splitlines() if line.startswith("fixture node ")]
+                    if mode == "hook":
+                        matching = str(here / want[0] / "versions/node" / want[1] / "bin") if isinstance(want, tuple) else None
+                        emitted = [path for path in bins if f"'{path}'" in result.stdout]
+                        passed = result.returncode == 0 and emitted == ([matching] if matching else []) and not output
+                    elif isinstance(want, tuple):
+                        passed = result.returncode == 0 and output == [f"fixture node {want[0]} {want[1]}|<two words>"]
+                    else:
+                        passed = result.returncode != 0 and not output and want in result.stderr
+                    checks.append(dict(phase="task-node-aliases", case=f"{label}-{mode}", status=result.returncode,
+                                       passed=passed, expected=want, diagnostic=(result.stdout + result.stderr)[-1100:]))
+
+
     def inspect_task_environment_bytes():
         phase = "task-environment-bytes"
         raw = b"test-\xff-value"
@@ -5154,6 +5256,7 @@ exec {shlex.quote(str(binary))} "$@"
                     runtime_advisory_fixture = stage_runtime_fixture(root)
                     inspect_task_runtime_admissions()
                     inspect_task_version_requirements()
+                    inspect_node_alias_selection()
                     inspect_task_environment_bytes()
                     inspect_task_package_metadata()
                     inspect_mise_task_execution()
@@ -5474,6 +5577,6 @@ assert inventory() == before
 report = dict(binaries=binaries, checks=checks, total=len(checks),
               passed=sum(entry["passed"] for entry in checks), host_unchanged=True)
 print(json.dumps(report))
-expected_checks = 303 if consent_oracle is None else 1752
+expected_checks = 303 if consent_oracle is None else 1788
 if report["passed"] != report["total"] or report["total"] != expected_checks:
     sys.exit(4)

@@ -115,8 +115,8 @@ pub(crate) fn resolve_nvm_alias(nvm_dir: &Path, alias: &str) -> Result<Option<St
 
     let mut current = alias.to_owned();
     let mut seen = HashSet::new();
-    let mut resolved_alias = false;
-    for _ in 0..64 {
+    let mut hops = 0;
+    loop {
         validate(&current)?;
         if !seen.insert(current.clone()) {
             return Err(NvmAliasRejection::Cycle(current).into());
@@ -127,9 +127,10 @@ pub(crate) fn resolve_nvm_alias(nvm_dir: &Path, alias: &str) -> Result<Option<St
             candidate.push("*");
         }
         match std::fs::symlink_metadata(&candidate) {
+            Ok(_) if hops == 64 => return Err(NvmAliasRejection::TooDeep.into()),
             Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(resolved_alias.then_some(current));
+                return Ok((hops != 0).then_some(current));
             }
             Err(error) => {
                 return Err(error).with_context(|| {
@@ -156,9 +157,8 @@ pub(crate) fn resolve_nvm_alias(nvm_dir: &Path, alias: &str) -> Result<Option<St
             return Ok(None);
         };
         next.clone_into(&mut current);
-        resolved_alias = true;
+        hops += 1;
     }
-    Err(NvmAliasRejection::TooDeep.into())
 }
 
 /// Find an executable in the system `PATH`.

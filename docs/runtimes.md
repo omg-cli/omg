@@ -96,7 +96,7 @@ rust stable
 
 Keep one line per runtime. If the same runtime appears twice, OMG uses the first line. A version requirement or major version is not an exact release pin. See the [editable example](../examples/.tool-versions).
 
-For task and shell selection, a bare minor such as `22.11` selects within that minor series. A full version pins the specified patch and any prerelease or build suffix. Node and Bun `latest` select the newest installed stable release when one is available. Node LTS requests rely on an LTS alias or provider metadata.
+For task and shell selection, a bare minor such as `22.11` selects within that minor series. A full version pins the specified patch and any prerelease or build suffix. Node and Bun `latest` select the newest installed stable release when one is available. Node accepts local NVM aliases that name an exact version, a major or minor series, or the built-in latest selection. Node LTS requests rely on an LTS alias or provider metadata. OMG checks its managed installations before the NVM installation tree and applies advisory review to the selected runtime.
 
 OMG puts a selected installation's binary directory on `PATH`. Companion commands shipped by a runtime, such as `npm` or `cargo`, come from that installation. OMG does not reimplement their package managers. Global packages installed into one runtime version may be absent after switching versions; install project dependencies locally or manage globals per version.
 

@@ -662,20 +662,88 @@ pub(crate) fn selected_runtime_paths<S: std::hash::BuildHasher>(
     Ok(paths)
 }
 
-fn resolve_node_bin_path(data_dir: &Path, version: &str) -> Result<Option<PathBuf>> {
-    let normalized = version.trim_start_matches('v');
-    let versions_dir = data_dir.join("versions/node");
-    if let Some(path) = node_version_bin_path(&versions_dir, normalized) {
-        return Ok(Some(path));
+#[derive(Clone, Copy)]
+pub(crate) enum NodeAliasErrors {
+    IgnoreRejected,
+    Report,
+}
+
+pub(crate) enum NodeSelection {
+    Installed(PathBuf),
+    Missing(String),
+}
+
+pub(crate) fn select_node_runtime(
+    data_dir: &Path,
+    request: &str,
+    errors: NodeAliasErrors,
+) -> Result<NodeSelection> {
+    fn normalized(request: &str) -> &str {
+        match request {
+            "node" => "latest",
+            request => request.strip_prefix('v').unwrap_or(request),
+        }
     }
 
-    if let Some(resolved) = resolve_installed_version_req(&versions_dir, normalized)?
-        && let Some(path) = node_version_bin_path(&versions_dir, &resolved)
+    let managed = data_dir.join("versions/node");
+    let original = normalized(request);
+    if let Some(path) = select_node_bin(&managed, original, original)? {
+        return Ok(NodeSelection::Installed(path));
+    }
+
+    let mut resolved_alias = None;
+    if let Some(nvm_dir) = std::env::var_os("NVM_DIR")
+        .filter(|directory| !directory.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| home::home_dir().map(|dir| dir.join(".nvm")))
     {
-        return Ok(Some(path));
+        resolved_alias = match errors {
+            NodeAliasErrors::IgnoreRejected => resolve_nvm_alias(&nvm_dir, request)?,
+            NodeAliasErrors::Report => {
+                crate::core::runtime_resolver::resolve_nvm_alias(&nvm_dir, request)?
+            }
+        };
+        let target = resolved_alias.as_deref().map_or(original, normalized);
+        if target != original
+            && let Some(path) = select_node_bin(&managed, target, target)?
+        {
+            return Ok(NodeSelection::Installed(path));
+        }
+        if RuntimeVersionReq::parse(target).is_some()
+            && let Some(path) = select_nvm_node_bin(&nvm_dir.join("versions/node"), target)?
+        {
+            return Ok(NodeSelection::Installed(path));
+        }
     }
 
-    nvm_node_bin(normalized)
+    let target = resolved_alias.as_deref().map_or(original, normalized);
+    let install_request = if target == "lts/*" { "lts" } else { target };
+    Ok(NodeSelection::Missing(install_request.to_owned()))
+}
+
+fn select_node_bin(versions: &Path, request: &str, exact: &str) -> Result<Option<PathBuf>> {
+    if let Some(path) = node_version_bin_path(versions, exact) {
+        return Ok(Some(path));
+    }
+    Ok(resolve_installed_version_req(versions, request)?
+        .and_then(|version| node_version_bin_path(versions, &version)))
+}
+
+fn select_nvm_node_bin(versions: &Path, request: &str) -> Result<Option<PathBuf>> {
+    let Some(path) = select_node_bin(versions, request, &format!("v{request}"))? else {
+        return Ok(None);
+    };
+    let (Ok(base), Ok(canonical)) = (versions.canonicalize(), path.canonicalize()) else {
+        return Ok(None);
+    };
+    Ok((canonical.starts_with(base) && which::which(path.join("node")).is_ok()).then_some(path))
+}
+
+fn resolve_node_bin_path(data_dir: &Path, version: &str) -> Result<Option<PathBuf>> {
+    match select_node_runtime(data_dir, version, NodeAliasErrors::IgnoreRejected)? {
+        NodeSelection::Installed(path) => Ok(Some(path)),
+        NodeSelection::Missing(_) => Ok(None),
+    }
 }
 
 fn resolve_bun_bin_path(data_dir: &Path, version: &str) -> Result<Option<PathBuf>> {
@@ -867,49 +935,6 @@ fn resolve_installed_version_req(versions_dir: &Path, req: &str) -> Result<Optio
     }
 
     Ok(best.map(|(_, name)| name))
-}
-
-fn nvm_node_bin(version: &str) -> Result<Option<PathBuf>> {
-    let Some(nvm_dir) = std::env::var_os("NVM_DIR")
-        .map(PathBuf::from)
-        .or_else(|| home::home_dir().map(|dir| dir.join(".nvm")))
-    else {
-        return Ok(None);
-    };
-
-    let resolved = match resolve_nvm_alias(&nvm_dir, version)? {
-        Some(alias) => alias,
-        None => version.to_string(),
-    };
-    let normalized = resolved.trim_start_matches('v');
-
-    // SECURITY (audit sec14 F1): `version` originates from repo-supplied pin
-    // files. Without validation a hostile pin like `../../evil/bin` escapes
-    // the nvm versions tree and puts an attacker-controlled directory on the
-    // spawned command's PATH. Same contract as validated_runtime_bin_dir.
-    if crate::core::security::validate_runtime_version(normalized).is_err() {
-        return Ok(None); // hostile pin: never place it on PATH
-    }
-
-    let bin_path = nvm_dir
-        .join("versions/node")
-        .join(format!("v{normalized}"))
-        .join("bin");
-
-    // Canonicalize and require the result to stay inside the nvm versions
-    // tree even if symlinks redirect it.
-    let canonical_base = nvm_dir
-        .join("versions/node")
-        .canonicalize()
-        .unwrap_or_else(|_| nvm_dir.join("versions/node"));
-    let Ok(canonical) = bin_path.canonicalize() else {
-        return Ok(None);
-    };
-    if !canonical.starts_with(&canonical_base) {
-        return Ok(None);
-    }
-
-    Ok(crate::runtimes::common::is_trusted_runtime_bin_dir(&bin_path).then_some(bin_path))
 }
 
 fn resolve_nvm_alias(nvm_dir: &Path, alias: &str) -> Result<Option<String>> {
@@ -2567,7 +2592,9 @@ path = "hostile"
                 "v8.0.0/../../../evil",
                 "..",
             ] {
-                let result = nvm_node_bin(hostile).expect("nvm probe must not error");
+                let data = tempdir().unwrap();
+                let result =
+                    resolve_node_bin_path(data.path(), hostile).expect("nvm probe must not error");
                 assert!(result.is_none(), "hostile pin {hostile:?} must be refused");
             }
         }
