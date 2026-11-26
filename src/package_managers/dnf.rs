@@ -30,6 +30,8 @@ use crate::package_managers::types::{PackageStatus, UpdateInfo, parse_version_or
 use rusqlite::{Connection, OpenFlags};
 use zerocopy::{FromBytes, Immutable, KnownLayout, big_endian::U32};
 
+mod catalog;
+
 const DNF_HISTORY_DATABASE: &str = "transaction_history.sqlite";
 
 #[cfg(all(test, unix))]
@@ -108,7 +110,7 @@ struct InstalledSnapshot {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct RpmFileIdentity {
+struct FileIdentity {
     device: u64,
     inode: u64,
     size: u64,
@@ -116,10 +118,8 @@ struct RpmFileIdentity {
     changed: (i64, i64),
 }
 
-impl RpmFileIdentity {
+impl FileIdentity {
     fn read(path: &Path) -> std::io::Result<Option<Self>> {
-        use std::os::unix::fs::MetadataExt;
-
         let metadata = match std::fs::metadata(path) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -130,29 +130,35 @@ impl RpmFileIdentity {
                 "RPM cache input is not a regular file",
             ));
         }
-        Ok(Some(Self {
+        Ok(Some(Self::from_metadata(&metadata)))
+    }
+
+    fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt as _;
+
+        Self {
             device: metadata.dev(),
             inode: metadata.ino(),
             size: metadata.len(),
             modified: (metadata.mtime(), metadata.mtime_nsec()),
             changed: (metadata.ctime(), metadata.ctime_nsec()),
-        }))
+        }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RpmDatabaseIdentity {
-    database: RpmFileIdentity,
-    wal: Option<RpmFileIdentity>,
+    database: FileIdentity,
+    wal: Option<FileIdentity>,
 }
 
 impl RpmDatabaseIdentity {
     fn read(path: &Path) -> Option<Self> {
-        let database = RpmFileIdentity::read(path).ok()??;
+        let database = FileIdentity::read(path).ok()??;
         let mut wal_path = path.as_os_str().to_os_string();
         wal_path.push("-wal");
         // An absent WAL is valid; an unreadable one must not validate a hit.
-        let wal = RpmFileIdentity::read(Path::new(&wal_path)).ok()?;
+        let wal = FileIdentity::read(Path::new(&wal_path)).ok()?;
         Some(Self { database, wal })
     }
 
@@ -3132,6 +3138,33 @@ impl PackageManager for DnfPackageManager {
             database,
         })))
     }
+
+    fn package_index_observation(
+        &self,
+    ) -> Result<Option<Arc<dyn super::InstalledCatalogObservation>>> {
+        let rpm = self
+            .installed_catalog_observation()?
+            .context("Cannot observe the installed RPM search catalog")?;
+        let mut paths = catalog::RepositoryPaths::default();
+        let before = paths.snapshot()?;
+        let mut command =
+            tokio::process::Command::from(crate::core::privilege::system_command("dnf")?);
+        command.env("LC_ALL", "C").arg("--dump-main-config");
+        let config = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(Self::query_output_with_deadline(
+                command,
+                std::time::Duration::from_secs(3),
+            ))?;
+        paths.add_effective_paths(std::str::from_utf8(&config)?)?;
+        let observation = catalog::PackageCatalog::new(rpm, paths)?;
+        anyhow::ensure!(
+            before == catalog::RepositoryPaths::default().snapshot()?,
+            "DNF configuration changed while resolving repository inputs"
+        );
+        Ok(Some(Arc::new(observation)))
+    }
     fn security_inventory(
         &self,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<super::types::SecurityPackage>>> + Send + '_>> {
@@ -3871,10 +3904,10 @@ mod tests {
             .expect("SQLite observation");
         assert!(observed.is_current()?);
         let wal = directory.path().join("rpmdb.sqlite-wal");
-        let before = RpmFileIdentity::read(&wal)?.expect("observed WAL");
+        let before = FileIdentity::read(&wal)?.expect("observed WAL");
         std::thread::sleep(std::time::Duration::from_millis(2));
         std::fs::set_permissions(&wal, std::fs::metadata(&wal)?.permissions())?;
-        let after = RpmFileIdentity::read(&wal)?.expect("WAL retained");
+        let after = FileIdentity::read(&wal)?.expect("WAL retained");
         assert_eq!(
             (after.device, after.inode, after.size, after.modified),
             (before.device, before.inode, before.size, before.modified)

@@ -8,9 +8,7 @@ use anyhow::Result;
 use super::types::PackageStatus;
 use crate::core::Package;
 
-/// A retained observation of the installed inventory used by a package index.
-///
-/// Repository metadata is outside this observation and needs explicit refresh.
+/// A retained observation of package inventory inputs.
 /// Observation checks can perform native I/O; callers must use a blocking task.
 pub trait InstalledCatalogObservation: Send + Sync {
     fn is_current(&self) -> Result<bool>;
@@ -31,6 +29,15 @@ pub trait PackageManager: Send + Sync {
         &self,
     ) -> Result<Option<std::sync::Arc<dyn InstalledCatalogObservation>>> {
         Ok(None)
+    }
+
+    /// Observe the inputs used by the search index before building it.
+    /// Backends may include repository metadata. Installed status remains
+    /// scoped to the installed observation. Call on a blocking task.
+    fn package_index_observation(
+        &self,
+    ) -> Result<Option<std::sync::Arc<dyn InstalledCatalogObservation>>> {
+        self.installed_catalog_observation()
     }
 
     /// Preserve installed package identities for security exports. Backends
