@@ -1372,15 +1372,6 @@ async fn handle_info(state: Arc<DaemonState>, id: RequestId, package: String) ->
 }
 
 async fn cached_status(state: &Arc<DaemonState>) -> Option<StatusResult> {
-    #[cfg(feature = "fedora")]
-    if state.uses_rpm_catalog() {
-        // Persisted status carries no live RPM observation after a restart.
-        let (cached, observation) = state.cache.observed_status()?;
-        return state
-            .status_rpm_catalog_is_current(observation)
-            .await
-            .then(|| Arc::unwrap_or_clone(cached));
-    }
     if let Some(cached) = state.cache.get_status() {
         return Some(Arc::unwrap_or_clone(cached));
     }
@@ -1410,7 +1401,8 @@ async fn cached_status(state: &Arc<DaemonState>) -> Option<StatusResult> {
 #[tracing::instrument(skip(state))]
 async fn handle_status(state: Arc<DaemonState>, id: RequestId) -> Response {
     GLOBAL_METRICS.inc_status_requests();
-    if let Some(cached) = cached_status(&state).await {
+    let rpm_catalog = state.uses_rpm_catalog();
+    if !rpm_catalog && let Some(cached) = cached_status(&state).await {
         GLOBAL_METRICS.inc_cache_hits();
         return Response::Success {
             id,
@@ -1421,9 +1413,14 @@ async fn handle_status(state: Arc<DaemonState>, id: RequestId) -> Response {
     // METRICS: Cache miss - need to query system
     GLOBAL_METRICS.inc_cache_misses();
 
-    // 3. Query the selected backend. Production uses the optimized native
-    // status paths; dependency-injected states stay behind the package-manager
-    // interface and never access host package databases.
+    // DNF install reasons and repository metadata can change independently of
+    // RPM inventory. Its observation can only carry forward advisory coverage.
+    #[cfg(feature = "fedora")]
+    let observed_status = if rpm_catalog {
+        state.cache.observed_status()
+    } else {
+        None
+    };
     let status_result = state.status_counts().await;
 
     match status_result {
@@ -1440,10 +1437,26 @@ async fn handle_status(state: Arc<DaemonState>, id: RequestId) -> Response {
                     .clone(),
                 None,
             );
-            debug_assert!(
-                !cacheable,
-                "package-count snapshots without a vulnerability scan must not be cached"
-            );
+            debug_assert!(!cacheable);
+
+            #[cfg(feature = "fedora")]
+            let res = if let Some((cached, observation)) = observed_status
+                && total == cached.total_packages
+                && state.status_rpm_catalog_is_current(observation).await
+                && state
+                    .cache
+                    .get_status()
+                    .is_some_and(|entry| Arc::ptr_eq(&entry, &cached))
+            {
+                StatusResult {
+                    security_vulnerabilities: cached.security_vulnerabilities,
+                    security_unknown_packages: cached.security_unknown_packages,
+                    vulnerabilities_scanned: cached.vulnerabilities_scanned,
+                    ..res
+                }
+            } else {
+                res
+            };
 
             Response::Success {
                 id,
@@ -2185,24 +2198,42 @@ pub(super) mod tests {
     #[tokio::test]
     async fn fedora_status_drops_scope_when_inventory_changes() -> anyhow::Result<()> {
         let (_directory, state, _, revision, _, _) = mutable_fedora_catalog(true, None)?;
+        state
+            .package_manager
+            .install(&["retired-tool.x86_64".to_owned()])
+            .await?;
+        let (total, explicit, orphans, updates) = state.status_counts().await?;
         let observation = state.observe_status_rpm_catalog().await?;
         let index = state.index_snapshot();
         let status = Arc::new(
-            super::super::status_policy::status_snapshot(42, 20, 1, 2, vec![], Some((5, 2))).0,
+            super::super::status_policy::status_snapshot(
+                total,
+                0,
+                orphans + 1,
+                updates + 1,
+                vec![],
+                Some((5, 2)),
+            )
+            .0,
         );
         state
             .publish_observed_status(&index, Arc::clone(&status), Arc::clone(&observation))
             .await;
-        assert_eq!(
-            cached_status(&state)
-                .await
-                .context("valid RPM scope should be reusable")?
-                .scanned_vulnerability_summary(),
-            Some((5, 2))
-        );
+        let response = handle_request(Arc::clone(&state), Request::Status { id: 1 }).await;
+        let Response::Success {
+            result: ResponseResult::Status(current),
+            ..
+        } = response
+        else {
+            anyhow::bail!("live status should use counts from the package manager");
+        };
+        assert_eq!(current.explicit_packages, explicit);
+        assert_eq!(current.orphan_packages, orphans);
+        assert_eq!(current.updates_available, updates);
+        assert_eq!(current.scanned_vulnerability_summary(), Some((5, 2)));
 
         revision.fetch_add(1, Ordering::AcqRel);
-        let response = handle_request(Arc::clone(&state), Request::Status { id: 1 }).await;
+        let response = handle_request(Arc::clone(&state), Request::Status { id: 2 }).await;
         let Response::Success {
             result: ResponseResult::Status(current),
             ..
@@ -2210,7 +2241,7 @@ pub(super) mod tests {
         else {
             anyhow::bail!("stale observed status should fall back to live package counts");
         };
-        assert_ne!(current.total_packages, 42);
+        assert_eq!(current.total_packages, total);
         assert_eq!(current.scanned_vulnerability_summary(), None);
 
         state.cache.clear();

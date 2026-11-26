@@ -49,7 +49,7 @@ async fn status_json(fast: bool) -> Result<()> {
     let start = std::time::Instant::now();
 
     #[cfg(unix)]
-    let daemon_counts = query_daemon_status().await.map(|status| {
+    let daemon_counts = query_daemon_status(fast).await.map(|status| {
         PackageStatus::from((
             status.total_packages,
             status.explicit_packages,
@@ -84,7 +84,18 @@ async fn status_json(fast: bool) -> Result<()> {
 }
 
 #[cfg(unix)]
-async fn query_daemon_status() -> Option<StatusResult> {
+async fn query_daemon_status(fast: bool) -> Option<StatusResult> {
+    #[cfg(not(feature = "fedora"))]
+    let _ = fast;
+    #[cfg(feature = "fedora")]
+    if fast
+        && matches!(
+            crate::package_managers::resolve_backend(),
+            Ok(crate::package_managers::Backend::Fedora)
+        )
+    {
+        return None;
+    }
     tokio::time::timeout(std::time::Duration::from_millis(500), async {
         let mut client = DaemonClient::connect().await.ok()?;
         match client.call(Request::Status { id: 0 }).await.ok()? {
@@ -105,7 +116,7 @@ async fn status_fallback(fast: bool) -> Result<()> {
     let start = std::time::Instant::now();
 
     #[cfg(unix)]
-    if let Some(status) = query_daemon_status().await {
+    if let Some(status) = query_daemon_status(fast).await {
         display_status_report(
             status.total_packages,
             status.explicit_packages,
