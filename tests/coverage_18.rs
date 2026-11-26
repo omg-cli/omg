@@ -616,6 +616,15 @@ async fn status_reports_backend_corruption_without_cached_success_and_recovers_o
         }
         other => panic!("corrupt backend status returned {other:?}"),
     }
+    let metadata_request = Request::StatusMetadata { id: 743 };
+    assert_eq!(metadata_request.variant_name(), "status_metadata");
+    match request_on_wire(&fixture, metadata_request).await? {
+        Response::Success {
+            id: 743,
+            result: ResponseResult::StatusMetadata(metadata),
+        } => assert!(metadata.rpm_advisories.is_none()),
+        other => panic!("status metadata should be independent of package counts, got {other:?}"),
+    }
     assert_eq!(std::fs::read(&state_path)?, broken);
 
     std::fs::write(&state_path, &original)?;

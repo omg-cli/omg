@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::io::{ErrorKind, Write as _};
 use std::path::{Path, PathBuf};
 
+use super::files::{self, Symlinks};
 use super::fingerprint::EnvironmentState;
 
 /// Check whether a team remote URL is an HTTPS gist.github.com URL.
@@ -102,19 +103,6 @@ fn current_member_id() -> String {
     whoami::username().unwrap_or_else(|_| "unknown".to_string())
 }
 
-/// Read a durable team file after rejecting symlinks and non-regular paths.
-fn read_regular_file(path: &Path, what: &str) -> Result<String> {
-    let metadata = std::fs::symlink_metadata(path)
-        .with_context(|| format!("Failed to inspect {what}: {}", path.display()))?;
-    anyhow::ensure!(
-        !metadata.file_type().is_symlink() && metadata.is_file(),
-        "{what} must be a regular file: {}",
-        path.display()
-    );
-    std::fs::read_to_string(path)
-        .with_context(|| format!("Failed to read {what}: {}", path.display()))
-}
-
 impl TeamStatus {
     /// Current team-status file format version.
     pub const STATUS_FORMAT_VERSION: u32 = 1;
@@ -132,6 +120,12 @@ pub struct TeamWorkspace {
     root: PathBuf,
     /// Team configuration
     config: Option<TeamConfig>,
+}
+
+#[derive(Clone, Copy)]
+enum LockUpdate {
+    Keep,
+    Replace,
 }
 
 impl TeamWorkspace {
@@ -222,7 +216,7 @@ impl TeamWorkspace {
     fn load_config(root: &Path) -> Result<TeamConfig> {
         Self::validate_config_dir(root)?;
         let path = root.join(".omg/team.toml");
-        let content = read_regular_file(&path, "Team config")?;
+        let content = files::read_utf8(&path, "Team config", Symlinks::Refuse)?;
         toml::from_str(&content).context("Failed to parse team config")
     }
 
@@ -270,6 +264,9 @@ impl TeamWorkspace {
         let status_json = serde_json::to_vec_pretty(&status)?;
         let content = toml::to_string_pretty(&config)?;
         let status_path = self.status_path();
+        let config_path = self.config_path();
+        files::ensure_size(status_json.len() as u64, "Team status", &status_path)?;
+        files::ensure_size(content.len() as u64, "Team config", &config_path)?;
         if !Self::publish_init_file(&status_path, &status_json)? {
             let blocked = || {
                 format!(
@@ -277,11 +274,12 @@ impl TeamWorkspace {
                     status_path.display()
                 )
             };
-            let previous: TeamStatus = read_regular_file(&status_path, "Team status")
-                .and_then(|content| {
-                    serde_json::from_str(&content).context("Failed to parse team status")
-                })
-                .with_context(blocked)?;
+            let previous: TeamStatus =
+                files::read_utf8(&status_path, "Team status", Symlinks::Refuse)
+                    .and_then(|content| {
+                        serde_json::from_str(&content).context("Failed to parse team status")
+                    })
+                    .with_context(blocked)?;
             anyhow::ensure!(
                 previous.format_version == TeamStatus::STATUS_FORMAT_VERSION
                     && previous.config == config
@@ -299,7 +297,6 @@ impl TeamWorkspace {
 
         // Publish the config last. Its presence is the initialization marker,
         // so a retry can reuse staged status if this publication fails.
-        let config_path = self.config_path();
         anyhow::ensure!(
             Self::publish_init_file(&config_path, content.as_bytes())?,
             "{} already exists; refusing to re-initialize",
@@ -350,7 +347,9 @@ impl TeamWorkspace {
         self.ensure_config_dir()?;
         config.remote_url = Some(remote_url.to_string());
         let content = toml::to_string_pretty(&config)?;
-        crate::core::safe_ops::atomic_write_file_sync(self.config_path(), content)?;
+        let path = self.config_path();
+        files::ensure_size(content.len() as u64, "Team config", &path)?;
+        crate::core::safe_ops::atomic_write_file_sync(path, content)?;
         self.config = Some(config);
 
         Ok(())
@@ -358,42 +357,19 @@ impl TeamWorkspace {
 
     /// Update local member status
     pub async fn update_status(&self) -> Result<TeamStatus> {
-        let config = Self::load_config(&self.root)?;
-
-        // Capture current environment
         let current_env = EnvironmentState::capture().await?;
+        self.persist_status(&current_env, LockUpdate::Keep)
+    }
 
-        // Load team lock if exists
-        let lock_path = self.root.join("omg.lock");
-        let lock_hash = if lock_path.exists() {
-            let lock = EnvironmentState::load(&lock_path)?;
-            lock.hash
-        } else {
-            String::new()
-        };
-
-        let in_sync = lock_hash.is_empty() || current_env.hash == lock_hash;
-
-        let member = TeamMember {
-            id: config.member_id.clone(),
-            name: local_member_name(),
-            env_hash: current_env.hash,
-            last_sync: jiff::Timestamp::now().as_second(),
-            in_sync,
-            drift_summary: if in_sync {
-                None
-            } else {
-                Some("Environment differs from team lock".to_string())
-            },
-        };
-
-        // Existing team state is durable data. Reject missing or malformed
-        // status instead of replacing it with an empty member set. Hold a
-        // cross-process flock across load-modify-save so two concurrent omg
-        // invocations cannot drop each other's member updates. Uses the std
-        // advisory file-lock API (stable since Rust 1.89):
-        // https://doc.rust-lang.org/std/fs/struct.File.html#method.lock
-        let lock_path = self.status_path().with_extension("lock");
+    fn persist_status(
+        &self,
+        current_env: &EnvironmentState,
+        lock_update: LockUpdate,
+    ) -> Result<TeamStatus> {
+        // Serialize local lockfile publication and member updates. Read the
+        // existing status before publishing either file.
+        let status_path = self.status_path();
+        let status_lock_path = status_path.with_extension("lock");
         let mut options = std::fs::OpenOptions::new();
         options.create(true).read(true).write(true).truncate(false);
         #[cfg(unix)]
@@ -401,14 +377,30 @@ impl TeamWorkspace {
             use std::os::unix::fs::OpenOptionsExt as _;
             options.mode(0o600).custom_flags(nix::libc::O_NOFOLLOW);
         }
-        let lock = options
-            .open(&lock_path)
-            .with_context(|| format!("Failed to open team status lock {}", lock_path.display()))?;
+        let lock = options.open(&status_lock_path).with_context(|| {
+            format!(
+                "Failed to open team status lock {}",
+                status_lock_path.display()
+            )
+        })?;
         lock.lock().context("Failed to acquire team status lock")?;
 
         let mut status = self.load_status()?;
+        let lock_path = self.root.join("omg.lock");
+        let lock_hash = match lock_update {
+            LockUpdate::Replace => current_env.hash.clone(),
+            LockUpdate::Keep => current_lock_hash(&lock_path)?,
+        };
 
-        // Update or add member
+        let in_sync = lock_hash.is_empty() || current_env.hash == lock_hash;
+        let member = TeamMember {
+            id: status.config.member_id.clone(),
+            name: local_member_name(),
+            env_hash: current_env.hash.clone(),
+            last_sync: jiff::Timestamp::now().as_second(),
+            in_sync,
+            drift_summary: (!in_sync).then(|| "Environment differs from team lock".to_string()),
+        };
         if let Some(existing) = status.members.iter_mut().find(|m| m.id == member.id) {
             *existing = member;
         } else {
@@ -418,11 +410,13 @@ impl TeamWorkspace {
         status.lock_hash = lock_hash;
         status.updated_at = jiff::Timestamp::now().as_second();
 
-        // Save status through an atomic replacement so an interruption cannot
-        // truncate durable team state.
         self.ensure_config_dir()?;
         let status_json = serde_json::to_vec_pretty(&status)?;
-        crate::core::safe_ops::atomic_write_file_sync(self.status_path(), status_json)?;
+        files::ensure_size(status_json.len() as u64, "Team status", &status_path)?;
+        if matches!(lock_update, LockUpdate::Replace) {
+            current_env.save(&lock_path)?;
+        }
+        crate::core::safe_ops::atomic_write_file_sync(status_path, status_json)?;
 
         Ok(status)
     }
@@ -432,7 +426,7 @@ impl TeamWorkspace {
     pub fn load_status(&self) -> Result<TeamStatus> {
         Self::validate_config_dir(&self.root)?;
         let path = self.status_path();
-        let content = read_regular_file(&path, "Team status")?;
+        let content = files::read_utf8(&path, "Team status", Symlinks::Refuse)?;
         let mut status: TeamStatus =
             serde_json::from_str(&content).context("Failed to parse team status")?;
         if status.format_version > TeamStatus::STATUS_FORMAT_VERSION {
@@ -453,17 +447,11 @@ impl TeamWorkspace {
 
     /// Push local environment to team lock
     pub async fn push(&self) -> Result<()> {
-        let config = self.config.as_ref().context("Not a team workspace")?;
-
-        // Capture and save
+        self.config.as_ref().context("Not a team workspace")?;
         let state = EnvironmentState::capture().await?;
-        let lock_path = self.root.join("omg.lock");
-        state.save(&lock_path)?;
+        let status = self.persist_status(&state, LockUpdate::Replace)?;
 
-        // Update status
-        self.update_status().await?;
-
-        if config.auto_push && self.is_git_repo() {
+        if status.config.auto_push && self.is_git_repo() {
             self.git_commit_lock("Update omg.lock via team push")?;
         }
 
@@ -657,6 +645,15 @@ fi
         }
 
         Ok(())
+    }
+}
+
+fn current_lock_hash(path: &Path) -> Result<String> {
+    match path.symlink_metadata() {
+        Ok(_) => Ok(EnvironmentState::load(path)?.hash),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(String::new()),
+        Err(error) => Err(error)
+            .with_context(|| format!("Failed to inspect team lockfile {}", path.display())),
     }
 }
 
@@ -1058,6 +1055,56 @@ mod tests {
         std::fs::write(workspace.config_path(), toml::to_string(&config)?)?;
         assert!(workspace.load_status().is_err());
         assert_eq!(std::fs::read(workspace.status_path())?, persisted);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn team_lock_lookup_distinguishes_missing_and_invalid_parent() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let parent = directory.path().join("not-a-directory");
+        std::fs::write(&parent, "regular file")?;
+        assert_eq!(current_lock_hash(&directory.path().join("omg.lock"))?, "");
+        let rejected = current_lock_hash(&parent.join("omg.lock"))
+            .expect_err("an invalid parent is not a missing team lockfile");
+        assert!(
+            rejected
+                .to_string()
+                .contains("Failed to inspect team lockfile")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn team_status_refuses_a_directory_at_its_lock_path() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut workspace = TeamWorkspace::new(directory.path())?;
+        workspace.init("fixture-team", "Fixture")?;
+        let mut state = EnvironmentState {
+            schema_version: EnvironmentState::SCHEMA_VERSION,
+            runtimes: std::collections::BTreeMap::new(),
+            packages: Vec::new(),
+            timestamp: 0,
+            hash: String::new(),
+        };
+        state.hash = state.calculate_hash();
+        state.save(directory.path().join("omg.lock"))?;
+        let status = workspace.persist_status(&state, LockUpdate::Keep)?;
+        assert_eq!(status.lock_hash, state.hash);
+        let before = std::fs::read(workspace.status_path())?;
+        let lock = workspace.status_path().with_extension("lock");
+        std::fs::remove_file(&lock)?;
+        std::fs::create_dir(&lock)?;
+        let rejected = workspace
+            .persist_status(&state, LockUpdate::Keep)
+            .expect_err("directory cannot be opened as the status lock");
+        assert!(
+            rejected
+                .to_string()
+                .contains("Failed to open team status lock")
+        );
+        assert!(lock.is_dir());
+        assert_eq!(std::fs::read(workspace.status_path())?, before);
         Ok(())
     }
 

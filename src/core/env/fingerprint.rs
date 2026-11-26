@@ -214,50 +214,13 @@ fn fingerprint_requires_backend() -> Result<Vec<String>> {
 }
 
 pub(crate) fn read_lockfile(path: &Path) -> Result<String> {
-    use std::io::Read as _;
-
-    const MAX_LOCKFILE_BYTES: u64 = 16 * 1024 * 1024;
-
-    let metadata = fs::symlink_metadata(path)
-        .with_context(|| format!("Failed to inspect lockfile {}", path.display()))?;
-    anyhow::ensure!(
-        metadata.file_type().is_file(),
-        "Refusing to read lockfile that is not a regular file: {}",
-        path.display()
-    );
-
-    let mut options = fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK);
-    }
-    let file = options
-        .open(path)
-        .with_context(|| format!("Failed to open lockfile {} safely", path.display()))?;
-    anyhow::ensure!(
-        file.metadata()?.file_type().is_file(),
-        "Refusing to read lockfile that is not a regular file: {}",
-        path.display()
-    );
-
-    let mut bytes = Vec::new();
-    file.take(MAX_LOCKFILE_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .with_context(|| format!("Failed to read lockfile {}", path.display()))?;
-    anyhow::ensure!(
-        bytes.len() as u64 <= MAX_LOCKFILE_BYTES,
-        "Lockfile exceeds the {} byte limit: {}",
-        MAX_LOCKFILE_BYTES,
-        path.display()
-    );
-    String::from_utf8(bytes).with_context(|| format!("Lockfile is not UTF-8: {}", path.display()))
+    super::files::read_utf8(path, "lockfile", super::files::Symlinks::Refuse)
 }
 
 fn write_lockfile(path: &Path, content: &[u8]) -> Result<()> {
     use std::io::Write;
 
+    super::files::ensure_size(content.len() as u64, "lockfile", path)?;
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())

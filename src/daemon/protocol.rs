@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 /// Every frame is `[u32 LE version][bitcode payload]`. Peers reject frames
 /// whose version differs instead of attempting a decode that could
 /// silently mis-map same-shaped variants.
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 6;
 
 /// Frame layout error for [`encode_frame`] / [`split_frame`].
 #[derive(Debug, thiserror::Error)]
@@ -115,6 +115,10 @@ pub enum Request {
     ListUpdates {
         id: RequestId,
     },
+    /// Runtime versions and validated RPM advisory coverage.
+    StatusMetadata {
+        id: RequestId,
+    },
 }
 
 impl Request {
@@ -135,7 +139,8 @@ impl Request {
             | Self::Suggest { id, .. }
             | Self::DebianSearch { id, .. }
             | Self::Health { id }
-            | Self::ListUpdates { id } => *id,
+            | Self::ListUpdates { id }
+            | Self::StatusMetadata { id } => *id,
         }
     }
 
@@ -173,6 +178,7 @@ impl Request {
             Self::DebianSearch { .. } => "debian_search",
             Self::Health { .. } => "health",
             Self::ListUpdates { .. } => "list_updates",
+            Self::StatusMetadata { .. } => "status_metadata",
         }
     }
 }
@@ -220,6 +226,7 @@ pub enum ResponseResult {
     DebianSearch(Vec<PackageInfo>),
     Health(HealthStatus),
     ListUpdates(Vec<UpdateEntry>),
+    StatusMetadata(StatusMetadata),
 }
 
 #[derive(Serialize, Deserialize)]
@@ -428,6 +435,19 @@ pub struct StatusResult {
     #[serde(default)]
     pub security_unknown_packages: Option<usize>,
     pub runtime_versions: Vec<(String, String)>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StatusMetadata {
+    pub runtime_versions: Vec<(String, String)>,
+    pub rpm_advisories: Option<StatusAdvisorySummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StatusAdvisorySummary {
+    pub installed_packages: usize,
+    pub findings: usize,
+    pub unknown_packages: usize,
 }
 
 impl StatusResult {

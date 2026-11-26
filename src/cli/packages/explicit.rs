@@ -49,6 +49,20 @@ pub fn explicit_sync_with_json(count: bool, json: bool) -> Result<()> {
         return Ok(());
     }
 
+    #[cfg(feature = "fedora")]
+    if backend == crate::package_managers::Backend::Fedora {
+        // The Fedora daemon runs the same live DNF query for every request.
+        let packages = crate::cli::tea::run_blocking_future(
+            crate::package_managers::dnf::DnfPackageManager::read_user_installed_names(),
+        )?
+        .context("Failed to list explicitly installed Fedora packages")?;
+        return if count {
+            print_count(packages.len(), json)
+        } else {
+            display_explicit_list(packages.into_iter().collect(), json)
+        };
+    }
+
     #[cfg(unix)]
     if let Ok(mut client) = if count {
         SyncDaemonClient::acquire_with_timeout(crate::core::client::PROMPT_COUNTER_TIMEOUT)
@@ -87,7 +101,8 @@ pub fn explicit_sync_with_json(count: bool, json: bool) -> Result<()> {
                 | ResponseResult::Message(_)
                 | ResponseResult::DebianSearch(_)
                 | ResponseResult::Health(_)
-                | ResponseResult::ListUpdates(_) => {}
+                | ResponseResult::ListUpdates(_)
+                | ResponseResult::StatusMetadata(_) => {}
             },
             Err(error) => {
                 tracing::debug!("Daemon explicit-list call failed: {error}");
@@ -117,21 +132,6 @@ pub fn explicit_sync_with_json(count: bool, json: bool) -> Result<()> {
             display_explicit_list(packages, json)?;
         }
         return Ok(());
-    }
-
-    #[cfg(feature = "fedora")]
-    if backend == crate::package_managers::Backend::Fedora {
-        let packages: Vec<String> = crate::cli::tea::run_blocking_future(
-            crate::package_managers::dnf::DnfPackageManager::read_user_installed_names(),
-        )?
-        .context("Failed to list explicitly installed Fedora packages")?
-        .into_iter()
-        .collect();
-        return if count {
-            print_count(packages.len(), json)
-        } else {
-            display_explicit_list(packages, json)
-        };
     }
 
     if count {

@@ -168,6 +168,20 @@ pub(crate) async fn update_official_only(
     mode: UpdateMode,
 ) -> Result<()> {
     let pm = crate::package_managers::get_package_manager()?;
+    #[cfg(feature = "fedora")]
+    let fedora = pm.name() == "dnf";
+    #[cfg(feature = "fedora")]
+    let cached_fedora_upgrade =
+        matches!(mode, UpdateMode::Turbo) || matches!(mode, UpdateMode::Standard) && no_sync;
+    let daemon_updates = async {
+        // DNF keeps metadata in the caller's cache. Even a same-user daemon
+        // can have a different home and therefore a different update list.
+        #[cfg(feature = "fedora")]
+        if fedora {
+            return None;
+        }
+        try_daemon_list_updates().await
+    };
 
     // Preview modes must not mutate repository metadata or request elevation.
     // Keep this consistent with the Arch update lane.
@@ -194,9 +208,20 @@ pub(crate) async fn update_official_only(
     };
     crate::cli::modern_ui::print_phase_header(icon, title, detail);
 
+    #[cfg(feature = "fedora")]
+    if fedora && cached_fedora_upgrade && !check_only && !dry_run && !crate::core::is_root() {
+        // The elevated DNF planner uses the system cache, which may have
+        // different updates from the caller's read-only preview.
+        crate::cli::modern_ui::print_info("DNF will plan the upgrade using the system cache.");
+        if confirm_proceed_with_upgrade(yes).await? {
+            apply_fedora_upgrade(true, "System DNF cache").await?;
+        }
+        return Ok(());
+    }
+
     let check_start = std::time::Instant::now();
     let official_updates = if use_cached {
-        match try_daemon_list_updates().await {
+        match daemon_updates.await {
             Some(updates) => updates,
             None => pm.list_updates().await?,
         }
@@ -210,7 +235,7 @@ pub(crate) async fn update_official_only(
         official_updates_after_sync(
             pm.as_ref(),
             refresh_daemon_index_after_sync(),
-            try_daemon_list_updates(),
+            daemon_updates,
         )
         .await?
     };
@@ -243,42 +268,22 @@ pub(crate) async fn update_official_only(
         return Ok(());
     }
 
-    if !yes && console::user_attended() {
-        println!();
-        if !confirm_proceed_with_upgrade().await? {
-            println!();
-            println!("  {} Upgrade cancelled", crate::cli::style::caution("✗"));
-            println!();
-            return Ok(());
-        }
-    } else if !yes {
-        anyhow::bail!("Use --yes for non-interactive updates");
+    if !confirm_proceed_with_upgrade(yes).await? {
+        return Ok(());
+    }
+
+    let count = official_updates.len();
+    let detail = format!("{count} official packages");
+    #[cfg(feature = "fedora")]
+    if fedora {
+        return apply_fedora_upgrade(cached_fedora_upgrade, &detail).await;
     }
 
     println!();
     crate::cli::modern_ui::print_section("Installing updates");
 
-    let count = official_updates.len();
-    let pb =
-        crate::cli::modern_ui::modern_spinner("Upgrading", &format!("{count} official packages"));
+    let pb = crate::cli::modern_ui::modern_spinner("Upgrading", &detail);
     let history = crate::core::history::HistoryManager::new()?;
-    #[cfg(feature = "fedora")]
-    if crate::package_managers::resolve_backend()? == crate::package_managers::Backend::Fedora {
-        let cached =
-            matches!(mode, UpdateMode::Turbo) || matches!(mode, UpdateMode::Standard) && no_sync;
-        let changes = crate::package_managers::DnfPackageManager::new()
-            .update_with_history(cached, Some(&history))
-            .await;
-        pb.finish_and_clear();
-        if let Some(changes) = changes?.filter(|&count| count != 0) {
-            let label = if changes == 1 { "change" } else { "changes" };
-            crate::cli::modern_ui::print_success(&format!(
-                "System updated successfully · {changes} package {label}"
-            ));
-            crate::core::usage::track_update_result(changes, true);
-        }
-        return Ok(());
-    }
 
     let native_operation = select_native_update(
         mode,
@@ -304,16 +309,49 @@ pub(crate) async fn update_official_only(
     Ok(())
 }
 
-/// Blocking terminal prompt moved off the async executor thread.
-async fn confirm_proceed_with_upgrade() -> Result<bool> {
-    Ok(tokio::task::spawn_blocking(|| {
+#[cfg(feature = "fedora")]
+async fn apply_fedora_upgrade(cached: bool, detail: &str) -> Result<()> {
+    println!();
+    crate::cli::modern_ui::print_section("Installing updates");
+    let pb = crate::cli::modern_ui::modern_spinner("Upgrading", detail);
+    let history = crate::core::history::HistoryManager::new()?;
+    let changes = crate::package_managers::DnfPackageManager::new()
+        .update_with_history(cached, Some(&history))
+        .await;
+    pb.finish_and_clear();
+    if let Some(changes) = changes?.filter(|&count| count != 0) {
+        let label = if changes == 1 { "change" } else { "changes" };
+        crate::cli::modern_ui::print_success(&format!(
+            "System updated successfully · {changes} package {label}"
+        ));
+        crate::core::usage::track_update_result(changes, true);
+    }
+    Ok(())
+}
+
+async fn confirm_proceed_with_upgrade(yes: bool) -> Result<bool> {
+    if yes {
+        return Ok(true);
+    }
+    anyhow::ensure!(
+        console::user_attended(),
+        "Use --yes for non-interactive updates"
+    );
+    println!();
+    let confirmed = tokio::task::spawn_blocking(|| {
         dialoguer::Confirm::with_theme(&crate::cli::ui::prompt_theme())
             .with_prompt("Proceed with upgrade?")
             .default(true)
             .interact()
     })
     .await
-    .map_err(|error| anyhow::anyhow!("Confirmation prompt task failed: {error}"))??)
+    .map_err(|error| anyhow::anyhow!("Confirmation prompt task failed: {error}"))??;
+    if !confirmed {
+        println!();
+        println!("  {} Upgrade cancelled", crate::cli::style::caution("✗"));
+        println!();
+    }
+    Ok(confirmed)
 }
 
 /// Dry-run preview shared by the Debian and generic backends.

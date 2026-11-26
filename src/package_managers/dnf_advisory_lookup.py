@@ -8,8 +8,7 @@ try:
 except ModuleNotFoundError as error:
     if error.name != "libdnf5":
         raise
-    print('{"applicable":[],"details":[]}')
-    sys.exit(0)
+    raise SystemExit("Install python3-libdnf5 for supplemental Fedora advisory lookups.") from None
 
 
 def available_packages(base, security, mode, subjects):

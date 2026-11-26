@@ -91,16 +91,14 @@ pub async fn run(package: &str, reverse: bool) -> Result<()> {
 async fn show_reason_fedora(package: &str, reverse: bool) -> Result<Cmd<()>> {
     use crate::cli::components::Components;
     use crate::package_managers::dnf::{DnfPackageManager, InstalledReasonQuery};
+    use anyhow::Context as _;
 
-    let mut selected =
+    let selected =
         DnfPackageManager::installed_package_reasons(InstalledReasonQuery::Package(package))
             .await?;
-    anyhow::ensure!(!selected.is_empty(), "Package '{package}' is not installed");
-    anyhow::ensure!(
-        selected.len() == 1,
-        "Package '{package}' matches multiple installed builds; specify a version and architecture"
-    );
-    let root = selected.remove(0);
+    let root =
+        DnfPackageManager::select_installed_build(package, selected, |row| row.identity.clone())?
+            .with_context(|| format!("Package '{package}' is not installed"))?;
     if !reverse {
         return Ok(Cmd::batch(vec![
             Cmd::header("Recorded Install Reason", &root.identity),

@@ -44,14 +44,12 @@ pub async fn run(package: &str) -> Result<()> {
 async fn build_blame_fedora(package: &str) -> Result<Cmd<()>> {
     use crate::cli::components::Components;
     use crate::package_managers::dnf::{DnfPackageManager, InstalledReasonQuery};
+    use anyhow::Context as _;
 
-    let mut selected = DnfPackageManager::installed_package_details(package).await?;
-    anyhow::ensure!(!selected.is_empty(), "Package '{package}' is not installed");
-    anyhow::ensure!(
-        selected.len() == 1,
-        "Package '{package}' matches multiple installed builds; specify a version and architecture"
-    );
-    let root = selected.remove(0);
+    let selected = DnfPackageManager::installed_package_details(package).await?;
+    let root =
+        DnfPackageManager::select_installed_build(package, selected, |row| row.identity.clone())?
+            .with_context(|| format!("Package '{package}' is not installed"))?;
     let mut dependents = DnfPackageManager::installed_package_reasons(
         InstalledReasonQuery::RequiredBy(&root.identity),
     )

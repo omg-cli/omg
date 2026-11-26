@@ -74,17 +74,15 @@ pub async fn run(tree: Option<&str>, limit: usize) -> Result<()> {
 async fn show_sizes_fedora(tree: Option<&str>, limit: usize) -> Result<Cmd<()>> {
     use crate::cli::components::Components;
     use crate::package_managers::dnf::{DnfPackageManager, InstalledSizeQuery};
+    use anyhow::Context as _;
 
     let (mut packages, root_description) = if let Some(package) = tree {
-        let mut selected =
+        let selected =
             DnfPackageManager::installed_package_sizes(InstalledSizeQuery::Package(package))
                 .await?;
-        anyhow::ensure!(!selected.is_empty(), "Package '{package}' is not installed");
-        anyhow::ensure!(
-            selected.len() == 1,
-            "Package '{package}' matches multiple installed builds; specify a version and architecture"
-        );
-        let root = selected.remove(0);
+        let root =
+            DnfPackageManager::select_installed_build(package, selected, |row| row.0.clone())?
+                .with_context(|| format!("Package '{package}' is not installed"))?;
         let mut providers = DnfPackageManager::installed_package_sizes(
             InstalledSizeQuery::RequirementProviders(&root.0),
         )
