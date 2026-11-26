@@ -328,15 +328,22 @@ impl InstalledPackage {
         )
     }
 
+    fn full_nevra(&self) -> String {
+        if self.version.contains(':') {
+            self.nevra()
+        } else {
+            format!(
+                "{}-0:{}-{}.{}",
+                self.name, self.version, self.release, self.architecture
+            )
+        }
+    }
+
     fn matches_selector(&self, selector: &str) -> bool {
         self.name == selector
             || self.identity() == selector
             || self.nevra() == selector
-            || (!self.version.contains(':')
-                && format!(
-                    "{}-0:{}-{}.{}",
-                    self.name, self.version, self.release, self.architecture
-                ) == selector)
+            || (!self.version.contains(':') && self.full_nevra() == selector)
     }
 
     fn as_package(&self) -> Package {
@@ -1464,6 +1471,28 @@ impl DnfPackageManager {
     async fn available_packages(package: Option<&str>) -> Result<Vec<Package>> {
         let bytes = Self::repository_output(RepositoryQuery::Available(package)).await?;
         Self::parse_available_packages(&bytes)
+    }
+
+    pub(crate) fn select_installed_build<T>(
+        selector: &str,
+        mut candidates: Vec<T>,
+        identity: impl Fn(&T) -> String,
+    ) -> Result<Option<T>> {
+        if candidates.len() <= 1 {
+            return Ok(candidates.pop());
+        }
+        let mut identities: Vec<_> = candidates.iter().map(identity).collect();
+        identities.sort_unstable();
+        identities.dedup();
+        anyhow::ensure!(
+            identities.len() > 1,
+            "RPM reports multiple installed records for '{}'",
+            identities[0]
+        );
+        anyhow::bail!(
+            "Package '{selector}' matches multiple installed builds. Choose an exact installed identity.\n  {}",
+            identities.join("\n  ")
+        )
     }
 
     fn search_repository_paths() -> Result<(catalog::RepositoryPaths, catalog::Stamps)> {
@@ -3707,14 +3736,12 @@ impl PackageManager for DnfPackageManager {
             Self::validate_query_selector(&package)?;
             let manager = self.cache_handle();
             let selector = package.clone();
-            let mut matches =
+            let matches =
                 tokio::task::spawn_blocking(move || manager.matching_installed_packages(&selector))
                     .await??;
-            anyhow::ensure!(
-                matches.len() <= 1,
-                "Package '{package}' has multiple installed builds; specify the full NEVRA"
-            );
-            if let Some(pkg) = matches.pop() {
+            if let Some(pkg) =
+                Self::select_installed_build(&package, matches, InstalledPackage::full_nevra)?
+            {
                 return Ok(Some(Package {
                     name: pkg.identity(),
                     version: parse_version_or_zero(&format!("{}-{}", pkg.version, pkg.release)),
@@ -4920,6 +4947,32 @@ mod tests {
                 .expect_err("multiple default builds are ambiguous")
                 .to_string()
                 .contains("multiple available builds")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn installed_build_selection_reports_sorted_exact_identities() -> Result<()> {
+        let older = "fixture-0:1-1.noarch";
+        let newer = "fixture-2:2-1.noarch";
+        let select = |builds| {
+            DnfPackageManager::select_installed_build(
+                "fixture",
+                builds,
+                std::string::ToString::to_string,
+            )
+        };
+        assert_eq!(select(vec![])?, None);
+        assert_eq!(select(vec![newer])?, Some(newer));
+        let error = select(vec![newer, older]).unwrap_err().to_string();
+        assert!(
+            error.ends_with(&format!("\n  {older}\n  {newer}")),
+            "{error}"
+        );
+        let duplicate = select(vec![older, older]).unwrap_err().to_string();
+        assert_eq!(
+            duplicate,
+            format!("RPM reports multiple installed records for '{older}'")
         );
         Ok(())
     }
