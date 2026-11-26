@@ -64,10 +64,17 @@ pub async fn remove(packages: &[String], recursive: bool, yes: bool, dry_run: bo
 async fn remove_fedora(packages: &[String], yes: bool, dry_run: bool) -> Result<()> {
     use crate::package_managers::DnfPackageManager;
 
-    if !crate::core::is_root() {
-        return DnfPackageManager::remove_with_elevation(packages, yes, dry_run).await;
+    if dry_run {
+        let (plan, diagnostics) = DnfPackageManager::preview_removal(packages).await?;
+        crate::cli::modern_ui::print_phase_header("🗑️", "Remove Preview", "dry run");
+        super::common::print_dnf_preview(&plan, &diagnostics);
+        crate::cli::ui::print_dry_run_footer();
+        return Ok(());
     }
-    let Some(plan) = review_fedora_removal(packages, yes, dry_run).await? else {
+    if !crate::core::is_root() {
+        return DnfPackageManager::remove_with_elevation(packages, yes).await;
+    }
+    let Some(plan) = review_fedora_removal(packages, yes).await? else {
         return Ok(());
     };
     let history = crate::core::history::HistoryManager::new()?;
@@ -79,7 +86,6 @@ async fn remove_fedora(packages: &[String], yes: bool, dry_run: bool) -> Result<
 pub(crate) async fn review_fedora_removal(
     packages: &[String],
     yes: bool,
-    dry_run: bool,
 ) -> Result<Option<crate::package_managers::dnf::PreparedDnfRemoval>> {
     use crate::package_managers::DnfPackageManager;
 
@@ -90,10 +96,7 @@ pub(crate) async fn review_fedora_removal(
         crate::cli::modern_ui::print_info("DNF reported no packages to remove");
         return Ok(None);
     };
-    generic::report_preview(plan.packages(), true, dry_run);
-    if dry_run {
-        return Ok(None);
-    }
+    generic::report_preview(plan.packages(), true, false);
     if !super::common::confirm_package_mutation("removal", plan.packages().len(), yes).await? {
         crate::cli::modern_ui::print_warning("Removal cancelled");
         return Ok(None);

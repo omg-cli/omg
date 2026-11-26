@@ -1536,6 +1536,19 @@ mod dnf_integration {
                     && String::from_utf8(blame.stdout)?.contains("OMG Transaction History (1)"),
                 "blame did not find real installation history"
             );
+            let installed = snapshot()?;
+            let removal_preview = run(&["remove", package, "--dry-run", "--yes"])?;
+            assert!(
+                removal_preview.status.success(),
+                "{}",
+                String::from_utf8_lossy(&removal_preview.stderr)
+            );
+            let plan = std::str::from_utf8(&removal_preview.stdout)?;
+            assert!(plan.contains("Removing:\n"), "{plan}");
+            assert!(plan.contains("Transaction Summary:"), "{plan}");
+            assert!(plan.contains("No changes made (dry run)"), "{plan}");
+            assert_eq!(snapshot()?, installed);
+            assert_eq!(history.load()?.len(), 1);
             Ok(())
         })();
         let present = std::process::Command::new("rpm")

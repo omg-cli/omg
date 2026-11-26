@@ -443,7 +443,6 @@ enum DnfAdmission<'a> {
         packages: &'a [String],
         comment: Option<&'a str>,
         yes: bool,
-        dry_run: bool,
         output: OutputMode,
     },
 }
@@ -835,18 +834,8 @@ impl DnfPackageManager {
             .await
     }
 
-    pub(crate) async fn remove_with_elevation(
-        packages: &[String],
-        yes: bool,
-        dry_run: bool,
-    ) -> Result<()> {
-        let mode = if dry_run {
-            "--dry-run"
-        } else if yes {
-            "-y"
-        } else {
-            "--confirm"
-        };
+    pub(crate) async fn remove_with_elevation(packages: &[String], yes: bool) -> Result<()> {
+        let mode = if yes { "-y" } else { "--confirm" };
         let output = match crate::cli::modern_ui::output_mode() {
             OutputMode::Quiet => Some("--quiet"),
             OutputMode::Verbose => Some("--verbose"),
@@ -859,9 +848,6 @@ impl DnfPackageManager {
             args.extend_from_slice(packages);
             crate::core::privilege::run_privileged_dnf(&args).await
         };
-        if dry_run {
-            return operation(None).await;
-        }
         let history = crate::core::history::HistoryManager::new()?;
         Self::record_native_mutation(
             crate::core::history::TransactionType::Remove,
@@ -2412,10 +2398,9 @@ impl DnfPackageManager {
                 _ => (OutputMode::Plain, packages),
             };
             anyhow::ensure!(!packages.is_empty(), "Remove requires package operands");
-            let (yes, dry_run) = match mode.as_str() {
-                "-y" => (true, false),
-                "--confirm" => (false, false),
-                "--dry-run" if correlation.is_none() => (false, true),
+            let yes = match mode.as_str() {
+                "-y" => true,
+                "--confirm" => false,
                 _ => anyhow::bail!("Unsupported DNF removal mode"),
             };
             Self::validate_package_selectors(packages)?;
@@ -2423,7 +2408,6 @@ impl DnfPackageManager {
                 packages,
                 comment: correlation,
                 yes,
-                dry_run,
                 output,
             });
         }
@@ -2457,15 +2441,13 @@ impl DnfPackageManager {
                 packages,
                 comment,
                 yes,
-                dry_run,
                 output,
             } => {
                 crate::cli::modern_ui::configure_output(
                     u8::from(output == OutputMode::Verbose),
                     output == OutputMode::Quiet,
                 );
-                let Some(plan) =
-                    crate::cli::packages::review_fedora_removal(packages, yes, dry_run).await?
+                let Some(plan) = crate::cli::packages::review_fedora_removal(packages, yes).await?
                 else {
                     return Ok(());
                 };
@@ -2922,6 +2904,16 @@ impl DnfPackageManager {
 
     pub(crate) async fn preview_cached_upgrade() -> Result<(String, String)> {
         Self::preview_declined_transaction(["--cacheonly", "upgrade"]).await
+    }
+
+    pub(crate) async fn preview_removal(packages: &[String]) -> Result<(String, String)> {
+        Self::validate_package_selectors(packages)?;
+        Self::preview_declined_transaction(
+            ["--cacheonly", "remove"]
+                .into_iter()
+                .chain(packages.iter().map(String::as_str)),
+        )
+        .await
     }
 
     pub(crate) async fn preview_install(packages: &[String]) -> Result<(String, String)> {
@@ -3545,8 +3537,6 @@ mod tests {
         for values in [
             vec!["install", "-y", "example"],
             vec!["install", "-y", "example-2:1.0~rc1-1.fc44.x86_64"],
-            vec!["remove", "--dry-run", "example"],
-            vec!["remove", "--dry-run", "--quiet", "example"],
             vec!["remove", "--confirm", "example"],
             vec!["remove", "--confirm", "--verbose", "example"],
             vec!["remove", "-y", "example"],
@@ -3579,6 +3569,8 @@ mod tests {
             vec!["remove", "-y", "--quiet"],
             vec!["remove", "-y", "--quiet", "--verbose", "example"],
             vec!["remove", "--confirm", "/tmp/caller-plan"],
+            vec!["remove", "--dry-run", "example"],
+            vec!["remove", "--dry-run", "--quiet", "example"],
             vec!["remove", "--dry-run", "--installroot=/tmp/root"],
             vec!["--setopt=cacheonly=metadata", "remove", "-y", "example"],
             vec![

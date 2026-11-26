@@ -858,6 +858,16 @@ native_installed_identity() {
 check_native_remove_preview() {
   local output=$1 version=$2 identity=${3:-bash} distro=${4:-}
   awk -v version="$version" -v identity="$identity" -v distro="$distro" '
+    distro == "fedora" {
+      if (/^Removing( dependent packages| unused dependencies)?:$/) in_list = 1;
+      else if (/^[^[:space:]]/ || !NF) in_list = 0;
+      else if (in_list && $1 "." $2 == identity) {
+        found++;
+        sub(/^0:/, "", $3);
+        if (NF < 5 || $3 != version) invalid = 1;
+      }
+      next;
+    }
     /The following .*packages would be removed:/ { in_list = 1; next }
     /No changes made \(dry run\)/ { in_list = 0 }
     in_list && $1 == "✗" && $2 == identity {
@@ -3421,18 +3431,7 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
       # network namespace while running the lifecycle itself as the SSH user.
       remote="sudo -n unshare --net -- sudo -n -u '$ssh_user' env HOME=\"\$HOME\" USER='$ssh_user' LOGNAME='$ssh_user' $remote"
     else
-      # Native DNF5 stored-plan resolution requires authenticated root even
-      # for a dry run. Admit only this exact validated, prerequisite-free row;
-      # keep its initial user/group/capability drop and offline namespace.
       native_privilege=false
-      if [[ "$distro" == fedora && "$case" == remove && "$safety" == read
-            && "$assertions" == package-dry-run-remove && "${row_exit[$case]}" == 0
-            && "$expected_ux" == pass && "$requires" == - && ${#chain[@]} == 0
-            && "$tier" == hermetic && "$targets" == hermetic:pass
-            && "$cleanup" == tempdir-drop && "$ssh_user" != root ]] \
-        && jq -e '. == ["remove", "--dry-run", "jq"]' <<< "$args_json" >/dev/null; then
-        native_privilege=true
-      fi
       # Doctor must seed and remove a capability on its private exact-copy
       # executable through authenticated sudo. Keep this exception row-exact;
       # no_new_privs or a dropped bounding set prevents that native transition.
