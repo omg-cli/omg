@@ -340,6 +340,62 @@ with tempfile.TemporaryDirectory(prefix="omg-fedora-cache-scope-", dir="/tmp") a
     inspect_doctor("doctor-empty-installroot-without-repositories", empty, 0)
     config.write_text(host_config)
 
+    def inspect_daemon_metrics():
+        phase = "daemon-metrics"
+        names = (
+            "requests_total", "requests_failed_total", "rate_limit_hits_total",
+            "validation_failures_total", "active_connections", "security_audit_requests_total",
+            "search_requests_total", "info_requests_total", "status_requests_total",
+            "cache_hits_total", "cache_misses_total", "bytes_received_total", "bytes_sent_total",
+        )
+
+        def scrape(label):
+            response = command([cli, "metrics"], env, ordinary)
+            lines = response.stdout.splitlines()
+            values = {}
+            checks.append(dict(phase=phase, case=f"{label}-exit", passed=response.returncode == 0,
+                               status=response.returncode, diagnostic=response.stderr[-600:]))
+            for name in names:
+                metric = f"omg_{name}"
+                kind = "gauge" if name == "active_connections" else "counter"
+                sample = [line.removeprefix(f"{metric} ") for line in lines if line.startswith(f"{metric} ")]
+                help_text = [line for line in lines if line.startswith(f"# HELP {metric} ")]
+                typed = lines.count(f"# TYPE {metric} {kind}") == 1
+                passed = len(sample) == len(help_text) == 1 and sample[0].isascii() and sample[0].isdigit() and typed
+                if passed:
+                    values[name] = int(sample[0])
+                checks.append(dict(phase=phase, case=f"{label}-{name}", passed=passed, value=sample))
+            return values
+
+        before = scrape("before")
+        status = command([cli, "daemon-status"], env, ordinary)
+        checks.append(dict(phase=phase, case="daemon-status", passed=status.returncode == 0
+                           and "Daemon is running" in status.stdout and "Package Cache" in status.stdout
+                           and "Requests total:" in status.stdout, status=status.returncode,
+                           diagnostic=status.stderr[-600:]))
+        after = scrape("after")
+        for metric, delta in (("requests_total", 4), ("status_requests_total", 1),
+                              ("requests_failed_total", 0), ("bytes_received_total", None),
+                              ("bytes_sent_total", None)):
+            old = before.get(metric)
+            new = after.get(metric)
+            observed = new - old if old is not None and new is not None else None
+            expected = observed is not None and (observed > 0 if delta is None else observed == delta)
+            checks.append(dict(phase=phase, case=f"delta-{metric}", passed=expected, value=observed))
+
+        for label, mode in (("disabled", disabled), ("missing", dict(env, OMG_SOCKET_PATH=str(runtime / "missing.sock")))):
+            response = command([cli, "metrics"], mode, ordinary)
+            checks.append(dict(phase=phase, case=label, passed=response.returncode != 0
+                               and not response.stdout and "Daemon not running" in response.stderr,
+                               status=response.returncode, diagnostic=response.stderr[-600:]))
+
+        with open("/dev/full", "wb") as sink:
+            write = subprocess.run([str(cli), "metrics"], cwd=work, env=env, stdout=sink,
+                                   stderr=subprocess.PIPE, text=True, timeout=15, **ordinary)
+        checks.append(dict(phase=phase, case="output-error", passed=write.returncode == 1
+                           and "No space left on device" in write.stderr and "panicked" not in write.stderr,
+                           status=write.returncode, diagnostic=write.stderr[-600:]))
+
     def request_counters():
         counters = dict(line.split() for line in checked([cli, "metrics"], env, ordinary).splitlines()
                         if line.startswith(("omg_requests_total ", "omg_requests_failed_total ")))
@@ -8804,6 +8860,7 @@ exec {shlex.quote(str(binary))} "$@"
                 inspect("initial-host", host_count, host_explicit, host=True)
                 mark_progress("initial host inventory")
                 if consent_oracle is not None:
+                    inspect_daemon_metrics()
                     inspect_history_locks()
                     inspect_audit_segments()
                     inspect_audit_log_selection()
@@ -9184,6 +9241,6 @@ mark_progress("completed with host inventory unchanged")
 report = dict(binaries=binaries, checks=checks, total=len(checks),
               passed=sum(entry["passed"] for entry in checks), host_unchanged=True)
 print(json.dumps(report))
-expected_checks = 303 if consent_oracle is None else 2886
+expected_checks = 303 if consent_oracle is None else 2923
 if report["passed"] != report["total"] or report["total"] != expected_checks:
     sys.exit(4)

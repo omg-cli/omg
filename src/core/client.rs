@@ -24,8 +24,8 @@ use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
 #[cfg(unix)]
 use crate::daemon::protocol::{
-    DetailedPackageInfo, MAX_FRAME_SIZE, Request, Response, ResponseResult, SearchResult,
-    SecurityAuditResult, StatusResult, UpdateEntry,
+    DetailedPackageInfo, MAX_FRAME_SIZE, MetricsSnapshot, Request, Response, ResponseResult,
+    SearchResult, SecurityAuditResult, StatusResult, UpdateEntry,
 };
 #[cfg(unix)]
 use std::os::unix::net::UnixStream as SyncUnixStream;
@@ -251,6 +251,15 @@ impl DaemonClient {
             })
             .await?;
         extract_response(response, id, as_info)
+    }
+
+    /// Fetch counters from the connected daemon.
+    pub async fn metrics(&mut self) -> Result<MetricsSnapshot> {
+        let id = self.request_id.fetch_add(1, Ordering::Relaxed);
+        match self.call(Request::Metrics { id }).await? {
+            ResponseResult::Metrics(metrics) => Ok(metrics),
+            _ => anyhow::bail!("Unexpected metrics response from daemon"),
+        }
     }
 
     /// List available package updates via daemon (uses hot ALPM worker)

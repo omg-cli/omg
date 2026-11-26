@@ -3,25 +3,23 @@
 //! Provides atomic counters and gauges for monitoring system health and security.
 
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Mutex, OnceLock, PoisonError};
+use std::time::Instant;
 
 /// Trailing window, in milliseconds, used by the health-oriented failure
 /// count. Failures older than this are forgotten, so a long-lived daemon is
 /// not latched unhealthy by its lifetime error history.
 pub const FAILURE_HEALTH_WINDOW_MS: u64 = 300_000;
 
-/// Sentinel meaning "no failure window has been opened yet". It is larger than
-/// any realistic epoch-millisecond value, and is checked explicitly rather
-/// than relying on wrapping arithmetic.
-const FAILURE_WINDOW_UNSET: u64 = u64::MAX;
+/// Failed requests above this threshold make daemon health unhealthy.
+pub(crate) const HEALTH_UNHEALTHY_FAILURES_THRESHOLD: u64 = 1000;
+const HEALTH_FAILURE_CAPACITY: usize = HEALTH_UNHEALTHY_FAILURES_THRESHOLD as usize + 1;
 
-/// Wall-clock milliseconds since the Unix epoch, saturating at 0 if the system
-/// clock is set before 1970.
 fn now_millis() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_millis() as u64)
+    static CLOCK_START: OnceLock<Instant> = OnceLock::new();
+    CLOCK_START.get_or_init(Instant::now).elapsed().as_millis() as u64
 }
 
 /// Snapshot of current metrics state
@@ -57,11 +55,9 @@ pub struct Metrics {
     search_requests: AtomicU64,
     info_requests: AtomicU64,
     status_requests: AtomicU64,
-    /// Start of the current trailing failure window; `FAILURE_WINDOW_UNSET`
-    /// until the first failure is recorded.
-    failures_window_start_ms: AtomicU64,
-    /// Failures recorded inside the current trailing window.
-    failures_in_window: AtomicU64,
+    // The newest threshold + 1 timestamps fully determine the health verdict.
+    // Keep exact ages without an unbounded log during prolonged failures.
+    health_failures: Mutex<VecDeque<u64>>,
 }
 
 impl Default for Metrics {
@@ -86,8 +82,7 @@ impl Metrics {
             search_requests: AtomicU64::new(0),
             info_requests: AtomicU64::new(0),
             status_requests: AtomicU64::new(0),
-            failures_window_start_ms: AtomicU64::new(FAILURE_WINDOW_UNSET),
-            failures_in_window: AtomicU64::new(0),
+            health_failures: Mutex::new(VecDeque::new()),
         }
     }
 
@@ -97,41 +92,53 @@ impl Metrics {
 
     pub fn inc_requests_failed(&self) {
         self.requests_failed.fetch_add(1, Ordering::Relaxed);
-        self.record_request_failure_at(now_millis());
+        let mut failures = self
+            .health_failures
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        // Sample inside the lock so concurrent recorders append in time order.
+        Self::append_failure(&mut failures, now_millis());
     }
 
-    /// Records a failed request at an explicit epoch-millisecond timestamp.
-    /// Split out from [`Metrics::inc_requests_failed`] so the trailing-window
-    /// behaviour can be exercised deterministically without sleeping.
+    fn append_failure(failures: &mut VecDeque<u64>, now_ms: u64) {
+        if failures.len() == HEALTH_FAILURE_CAPACITY {
+            failures.pop_front();
+        }
+        failures.push_back(now_ms);
+    }
+
+    fn count_recent(failures: &VecDeque<u64>, now_ms: u64) -> u64 {
+        let expired = failures
+            .partition_point(|time| now_ms.saturating_sub(*time) >= FAILURE_HEALTH_WINDOW_MS);
+        (failures.len() - expired) as u64
+    }
+
+    #[cfg(test)]
     pub(crate) fn record_request_failure_at(&self, now_ms: u64) {
-        let start = self.failures_window_start_ms.load(Ordering::Relaxed);
-        if start != FAILURE_WINDOW_UNSET && now_ms.wrapping_sub(start) < FAILURE_HEALTH_WINDOW_MS {
-            self.failures_in_window.fetch_add(1, Ordering::Relaxed);
-            return;
-        }
-        // Window unopened or expired: open a fresh one. Concurrent recorders
-        // can both land here; the resulting count is approximate, which is
-        // acceptable for a health heuristic and never latches permanently.
-        self.failures_window_start_ms
-            .store(now_ms, Ordering::Relaxed);
-        self.failures_in_window.store(1, Ordering::Relaxed);
+        let mut failures = self
+            .health_failures
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        Self::append_failure(&mut failures, now_ms);
     }
 
-    /// Failed requests recorded within the trailing
-    /// [`FAILURE_HEALTH_WINDOW_MS`] window ending at `now_ms`.
+    #[cfg(test)]
     pub(crate) fn request_failures_within_window(&self, now_ms: u64) -> u64 {
-        let start = self.failures_window_start_ms.load(Ordering::Relaxed);
-        if start == FAILURE_WINDOW_UNSET || now_ms.wrapping_sub(start) >= FAILURE_HEALTH_WINDOW_MS {
-            return 0;
-        }
-        self.failures_in_window.load(Ordering::Relaxed)
+        let failures = self
+            .health_failures
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        Self::count_recent(&failures, now_ms)
     }
 
-    /// Failed requests inside the trailing window as of now. Unlike the
-    /// cumulative `requests_failed` counter this recovers once failures stop,
-    /// which keeps health gates from latching red for the daemon's lifetime.
+    /// Recent failures for daemon health, capped at the unhealthy threshold plus one.
+    /// Lifetime counts remain available in the metrics snapshot.
     pub(crate) fn recent_request_failures(&self) -> u64 {
-        self.request_failures_within_window(now_millis())
+        let failures = self
+            .health_failures
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        Self::count_recent(&failures, now_millis())
     }
 
     pub fn inc_rate_limit_hits(&self) {
@@ -211,7 +218,7 @@ mod tests {
 
     /// Health reports unhealthy above this many failures, mirroring the
     /// daemon health threshold.
-    const UNHEALTHY_THRESHOLD: u64 = 1000;
+    const UNHEALTHY_THRESHOLD: u64 = HEALTH_UNHEALTHY_FAILURES_THRESHOLD;
     const EPOCH_MS: u64 = 1_700_000_000_000;
 
     #[test]
@@ -296,6 +303,60 @@ mod tests {
         assert_eq!(
             metrics.request_failures_within_window(EPOCH_MS + FAILURE_HEALTH_WINDOW_MS),
             1
+        );
+    }
+
+    #[test]
+    fn recent_failures_expire_individually_across_the_original_window() {
+        let metrics = Metrics::new();
+        metrics.record_request_failure_at(EPOCH_MS);
+        metrics.record_request_failure_at(EPOCH_MS + FAILURE_HEALTH_WINDOW_MS - 2);
+
+        assert_eq!(
+            metrics.request_failures_within_window(EPOCH_MS + FAILURE_HEALTH_WINDOW_MS),
+            1,
+            "the newer failure must survive expiry of the oldest failure"
+        );
+        metrics.record_request_failure_at(EPOCH_MS + FAILURE_HEALTH_WINDOW_MS);
+        assert_eq!(
+            metrics.request_failures_within_window(EPOCH_MS + FAILURE_HEALTH_WINDOW_MS),
+            2
+        );
+        assert_eq!(
+            metrics.request_failures_within_window(EPOCH_MS + 2 * FAILURE_HEALTH_WINDOW_MS - 2),
+            1
+        );
+    }
+
+    #[test]
+    fn concurrent_failures_keep_complete_lifetime_and_recent_counts_below_threshold() {
+        let metrics = Metrics::new();
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                scope.spawn(|| {
+                    for _ in 0..200 {
+                        metrics.inc_requests_failed();
+                    }
+                });
+            }
+        });
+        assert_eq!(metrics.snapshot().requests_failed, 800);
+        assert_eq!(metrics.recent_request_failures(), 800);
+    }
+
+    #[test]
+    fn health_capacity_retains_the_newest_failures_without_capping_lifetime_metrics() {
+        let metrics = Metrics::new();
+        for _ in 0..2 * HEALTH_FAILURE_CAPACITY {
+            metrics.inc_requests_failed();
+        }
+        assert_eq!(
+            metrics.snapshot().requests_failed,
+            (2 * HEALTH_FAILURE_CAPACITY) as u64
+        );
+        assert_eq!(
+            metrics.recent_request_failures(),
+            HEALTH_FAILURE_CAPACITY as u64
         );
     }
 

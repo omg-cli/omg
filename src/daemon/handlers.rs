@@ -15,7 +15,7 @@ use super::protocol::{
     ResponseResult, SearchResult, UpdateEntry, WirePackageSource, error_codes,
 };
 use crate::core::fast_status::{StatusScope, StatusScopes};
-use crate::core::metrics::GLOBAL_METRICS;
+use crate::core::metrics::{GLOBAL_METRICS, HEALTH_UNHEALTHY_FAILURES_THRESHOLD};
 use crate::core::security::{AuditEventType, AuditSeverity, audit_log_nonblocking};
 use crate::package_managers::{
     InstalledCatalogObservation, PackageManager, VersionDisplay, get_package_manager,
@@ -1061,11 +1061,6 @@ const MAX_SUGGEST_LIMIT: usize = 50;
 const HEALTH_DEGRADED_CACHE_THRESHOLD: usize = 50_000;
 /// Cache size threshold for "unhealthy" health status
 const HEALTH_UNHEALTHY_CACHE_THRESHOLD: usize = 100_000;
-/// Failed request threshold for "unhealthy" health status. Compared against
-/// failures in the trailing `FAILURE_HEALTH_WINDOW_MS` window, not the
-/// lifetime total, so a long-lived daemon recovers once failures stop.
-const HEALTH_UNHEALTHY_FAILURES_THRESHOLD: u64 = 1000;
-
 /// Pure health-status decision, split out from [`handle_health`] so the
 /// thresholds are testable without a live daemon.
 fn health_status(cache_size: usize, recent_failures: u64) -> &'static str {
@@ -3901,6 +3896,32 @@ pub(super) mod tests {
                 burst.request_failures_within_window(EPOCH_MS + FAILURE_HEALTH_WINDOW_MS)
             ),
             "healthy"
+        );
+    }
+
+    #[test]
+    fn health_detects_a_burst_across_a_failure_window_boundary() {
+        use crate::core::metrics::{FAILURE_HEALTH_WINDOW_MS, Metrics};
+
+        let metrics = Metrics::new();
+        metrics.record_request_failure_at(0);
+        let boundary = FAILURE_HEALTH_WINDOW_MS;
+        for _ in 0..600 {
+            metrics.record_request_failure_at(boundary - 1);
+        }
+        for _ in 0..401 {
+            metrics.record_request_failure_at(boundary);
+        }
+
+        assert_eq!(
+            health_status(0, metrics.request_failures_within_window(boundary)),
+            "unhealthy",
+            "a single expired failure cannot hide a current 1001-request burst"
+        );
+        assert_eq!(
+            health_status(0, metrics.request_failures_within_window(2 * boundary - 1)),
+            "healthy",
+            "health recovers when the older part of the burst expires"
         );
     }
 

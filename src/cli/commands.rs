@@ -602,74 +602,91 @@ pub fn status_sync() -> Result<()> {
 /// Show system metrics in Prometheus format
 #[cfg(unix)]
 pub async fn metrics() -> Result<()> {
-    let response = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+    use std::io::Write as _;
+
+    let snapshot = tokio::time::timeout(std::time::Duration::from_secs(2), async {
         let mut client = crate::core::client::DaemonClient::connect().await.context(
             "Daemon not running. Performance metrics require the daemon (start it with: omg daemon)",
         )?;
-        client
-            .call(crate::daemon::protocol::Request::Metrics { id: 0 })
-            .await
+        client.metrics().await
     })
     .await
     .context("Timed out waiting for daemon metrics")??;
 
-    match response {
-        crate::daemon::protocol::ResponseResult::Metrics(snapshot) => {
-            // Output in Prometheus text format
-            println!("# HELP omg_requests_total Total number of requests handled");
-            println!("# TYPE omg_requests_total counter");
-            println!("omg_requests_total {}", snapshot.requests_total);
-
-            println!("# HELP omg_requests_failed_total Total number of failed requests");
-            println!("# TYPE omg_requests_failed_total counter");
-            println!("omg_requests_failed_total {}", snapshot.requests_failed);
-
-            println!("# HELP omg_rate_limit_hits_total Total number of rate limit exceeded events");
-            println!("# TYPE omg_rate_limit_hits_total counter");
-            println!("omg_rate_limit_hits_total {}", snapshot.rate_limit_hits);
-
-            println!(
-                "# HELP omg_validation_failures_total Total number of input validation failures"
-            );
-            println!("# TYPE omg_validation_failures_total counter");
-            println!(
-                "omg_validation_failures_total {}",
-                snapshot.validation_failures
-            );
-
-            println!("# HELP omg_active_connections Number of currently active client connections");
-            println!("# TYPE omg_active_connections gauge");
-            println!("omg_active_connections {}", snapshot.active_connections);
-
-            println!(
-                "# HELP omg_security_audit_requests_total Total number of security audits performed"
-            );
-            println!("# TYPE omg_security_audit_requests_total counter");
-            println!(
-                "omg_security_audit_requests_total {}",
-                snapshot.security_audit_requests
-            );
-
-            println!(
-                "# HELP omg_search_requests_total Package search requests handled by the daemon"
-            );
-            println!("# TYPE omg_search_requests_total counter");
-            println!("omg_search_requests_total {}", snapshot.search_requests);
-
-            println!("# HELP omg_info_requests_total Package info requests handled by the daemon");
-            println!("# TYPE omg_info_requests_total counter");
-            println!("omg_info_requests_total {}", snapshot.info_requests);
-
-            println!("# HELP omg_bytes_received_total Total bytes received by daemon");
-            println!("# TYPE omg_bytes_received_total counter");
-            println!("omg_bytes_received_total {}", snapshot.bytes_received);
-
-            println!("# HELP omg_bytes_sent_total Total bytes sent by daemon");
-            println!("# TYPE omg_bytes_sent_total counter");
-            println!("omg_bytes_sent_total {}", snapshot.bytes_sent);
-        }
-        _ => anyhow::bail!("Unexpected response from daemon"),
+    let counters = [
+        (
+            "requests_total",
+            "Total number of requests handled",
+            snapshot.requests_total,
+        ),
+        (
+            "requests_failed_total",
+            "Total number of failed requests",
+            snapshot.requests_failed,
+        ),
+        (
+            "rate_limit_hits_total",
+            "Total number of rate limit exceeded events",
+            snapshot.rate_limit_hits,
+        ),
+        (
+            "validation_failures_total",
+            "Total number of input validation failures",
+            snapshot.validation_failures,
+        ),
+        (
+            "security_audit_requests_total",
+            "Total number of security audit requests",
+            snapshot.security_audit_requests,
+        ),
+        (
+            "search_requests_total",
+            "Package search requests handled by the daemon",
+            snapshot.search_requests,
+        ),
+        (
+            "info_requests_total",
+            "Package info requests handled by the daemon",
+            snapshot.info_requests,
+        ),
+        (
+            "status_requests_total",
+            "Package status requests handled by the daemon",
+            snapshot.status_requests,
+        ),
+        (
+            "cache_hits_total",
+            "Number of daemon cache hits",
+            snapshot.cache_hits,
+        ),
+        (
+            "cache_misses_total",
+            "Number of daemon cache misses",
+            snapshot.cache_misses,
+        ),
+        (
+            "bytes_received_total",
+            "Total bytes received by daemon",
+            snapshot.bytes_received,
+        ),
+        (
+            "bytes_sent_total",
+            "Total bytes sent by daemon",
+            snapshot.bytes_sent,
+        ),
+    ];
+    let mut out = std::io::stdout().lock();
+    for (name, help, value) in counters {
+        writeln!(
+            out,
+            "# HELP omg_{name} {help}\n# TYPE omg_{name} counter\nomg_{name} {value}"
+        )?;
     }
+    writeln!(
+        out,
+        "# HELP omg_active_connections Number of currently active client connections\n# TYPE omg_active_connections gauge\nomg_active_connections {}",
+        snapshot.active_connections
+    )?;
     Ok(())
 }
 

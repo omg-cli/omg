@@ -4,7 +4,7 @@ use crate::cli::components::Components;
 use crate::cli::tea::Cmd;
 use crate::cli::{CliContext, EnterpriseCommands, EnterprisePolicyCommands, LocalCommandRunner};
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
@@ -57,12 +57,16 @@ pub async fn reports(report_type: &str, _ctx: &CliContext) -> Result<()> {
     let content = serde_json::to_string_pretty(&report)?;
     crate::core::safe_ops::atomic_write_file_sync(&filename, &content)?;
 
-    let report_sections = vec![
-        "Observed fleet machine count".to_string(),
-        "Validation failure count".to_string(),
-        "Rate-limit event count".to_string(),
-        "Security audit request count".to_string(),
-    ];
+    let mut report_sections = vec!["Observed fleet machine count".to_string()];
+    if report.summary.validation_failures.is_some() {
+        report_sections.extend([
+            "Local daemon validation failure count".to_string(),
+            "Local daemon rate-limit event count".to_string(),
+            "Local daemon security audit request count".to_string(),
+        ]);
+    } else {
+        report_sections.push("Local daemon counters unavailable".to_string());
+    }
 
     execute_cmd(Cmd::batch([
         Cmd::success(format!("Generated {filename}")),
@@ -282,7 +286,7 @@ pub mod policy {
 
 // Helper types and functions
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize)]
 struct Report {
     generated_at: i64,
     #[serde(rename = "report_type")]
@@ -290,25 +294,39 @@ struct Report {
     summary: ReportSummary,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize)]
 struct ReportSummary {
     total_machines: usize,
-    validation_failures: u64,
-    rate_limit_hits: u64,
-    security_audit_requests: u64,
+    daemon_metrics_scope: &'static str,
+    validation_failures: Option<u64>,
+    rate_limit_hits: Option<u64>,
+    security_audit_requests: Option<u64>,
 }
 
-fn observed_report_summary(
-    total_machines: usize,
-    validation_failures: u64,
-    rate_limit_hits: u64,
-    security_audit_requests: u64,
-) -> ReportSummary {
-    ReportSummary {
-        total_machines,
-        validation_failures,
-        rate_limit_hits,
-        security_audit_requests,
+impl ReportSummary {
+    fn new(total_machines: usize) -> Self {
+        Self {
+            total_machines,
+            daemon_metrics_scope: "local_daemon",
+            validation_failures: None,
+            rate_limit_hits: None,
+            security_audit_requests: None,
+        }
+    }
+
+    #[cfg(unix)]
+    async fn with_daemon_metrics(mut self) -> Self {
+        let response = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let mut client = crate::core::client::DaemonClient::connect().await?;
+            client.metrics().await
+        })
+        .await;
+        if let Ok(Ok(metrics)) = response {
+            self.validation_failures = Some(metrics.validation_failures);
+            self.rate_limit_hits = Some(metrics.rate_limit_hits);
+            self.security_audit_requests = Some(metrics.security_audit_requests);
+        }
+        self
     }
 }
 
@@ -317,19 +335,14 @@ async fn generate_report(report_type: &str) -> Result<Report> {
     let members = license::fetch_team_members()
         .await
         .context("Failed to fetch team members for enterprise report")?;
-    let machine_count = members.len();
-
-    let metrics = crate::core::metrics::GLOBAL_METRICS.snapshot();
+    let summary = ReportSummary::new(members.len());
+    #[cfg(unix)]
+    let summary = summary.with_daemon_metrics().await;
 
     Ok(Report {
         generated_at: jiff::Timestamp::now().as_second(),
         kind: report_type.to_string(),
-        summary: observed_report_summary(
-            machine_count,
-            metrics.validation_failures,
-            metrics.rate_limit_hits,
-            metrics.security_audit_requests,
-        ),
+        summary,
     })
 }
 
@@ -581,13 +594,104 @@ mod tests {
     use super::*;
 
     #[test]
-    fn executive_summary_uses_observed_counters_without_estimates() {
-        let summary = observed_report_summary(3, 4, 5, 6);
+    fn executive_summary_distinguishes_unavailable_daemon_counters() {
+        let summary = serde_json::to_value(ReportSummary::new(3)).unwrap();
+        assert_eq!(summary["total_machines"], 3);
+        assert_eq!(summary["daemon_metrics_scope"], "local_daemon");
+        for metric in [
+            "validation_failures",
+            "rate_limit_hits",
+            "security_audit_requests",
+        ] {
+            assert_eq!(summary.get(metric), Some(&serde_json::Value::Null));
+        }
+    }
 
-        assert_eq!(summary.total_machines, 3);
-        assert_eq!(summary.validation_failures, 4);
-        assert_eq!(summary.rate_limit_hits, 5);
-        assert_eq!(summary.security_audit_requests, 6);
+    #[cfg(unix)]
+    #[test]
+    fn executive_summary_reads_observed_local_daemon_counters() {
+        use crate::daemon::protocol::{
+            MetricsSnapshot, Request, Response, ResponseResult, encode_frame, split_frame,
+        };
+        use futures::{SinkExt as _, StreamExt as _};
+        use std::os::unix::fs::PermissionsExt as _;
+        use tokio_util::codec::{Framed, LengthDelimitedCodec};
+
+        const TEST: &str =
+            "cli::enterprise::tests::executive_summary_reads_observed_local_daemon_counters";
+        if crate::core::testing::run_isolated_test(TEST) {
+            return;
+        }
+
+        let directory = tempfile::tempdir().expect("private daemon directory");
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("private socket ownership");
+        let socket = directory.path().join("report.sock");
+        temp_env::with_vars(
+            [
+                ("OMG_SOCKET_PATH", socket.to_str()),
+                ("OMG_DISABLE_DAEMON", None),
+                ("OMG_TEST_MODE", None),
+            ],
+            || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                runtime.block_on(async {
+                    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+                    let serve = async {
+                        let (stream, _) = listener.accept().await.unwrap();
+                        let mut peer = Framed::new(stream, LengthDelimitedCodec::new());
+                        let frame = peer.next().await.unwrap().unwrap();
+                        let (_, payload) = split_frame(&frame).unwrap();
+                        let Request::Metrics { id } =
+                            bitcode::deserialize::<Request>(payload).unwrap()
+                        else {
+                            panic!("the report must query the daemon's metrics");
+                        };
+                        let response = Response::Success {
+                            id,
+                            result: ResponseResult::Metrics(MetricsSnapshot {
+                                validation_failures: 4,
+                                rate_limit_hits: 0,
+                                security_audit_requests: 6,
+                                requests_total: 0,
+                                requests_failed: 0,
+                                active_connections: 0,
+                                bytes_received: 0,
+                                bytes_sent: 0,
+                                cache_hits: 0,
+                                cache_misses: 0,
+                                search_requests: 0,
+                                info_requests: 0,
+                                status_requests: 0,
+                            }),
+                        };
+                        peer.send(encode_frame(&response).unwrap().into())
+                            .await
+                            .unwrap();
+                    };
+                    let ((), summary) =
+                        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                            tokio::join!(serve, ReportSummary::new(3).with_daemon_metrics())
+                        })
+                        .await
+                        .expect("report and daemon must finish");
+                    let summary = serde_json::to_value(summary).unwrap();
+                    assert_eq!(summary["total_machines"], 3);
+                    assert_eq!(summary["daemon_metrics_scope"], "local_daemon");
+                    assert_eq!(summary["validation_failures"], 4);
+                    assert_eq!(summary["rate_limit_hits"], 0);
+                    assert_eq!(summary["security_audit_requests"], 6);
+
+                    drop(listener);
+                    std::fs::remove_file(&socket).unwrap();
+                    let unavailable = ReportSummary::new(3).with_daemon_metrics().await;
+                    assert!(unavailable.validation_failures.is_none());
+                });
+            },
+        );
     }
 
     #[test]
