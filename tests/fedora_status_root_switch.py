@@ -2442,7 +2442,7 @@ run = 'fixture-environment "$@"'
                     if value is None:
                         launch.pop(key, None)
                     else:
-                        launch[key] = value
+                        launch[key] = value(project) if callable(value) else value
                 try:
                     args = [cli, "run", "fixture" if native_task else tool.name, "--", "one value", "--flag"]
                     result, opened = observe_config_opens(args, project, launch, reads)
@@ -2452,7 +2452,6 @@ run = 'fixture-environment "$@"'
                     results = [line[len(marker):] for line in output.splitlines() if line.startswith(marker)]
                     if error:
                         passed = result.returncode != 0 and not results and error in diagnostic and "panicked" not in diagnostic
-                        passed &= not any(value in diagnostic for value in diagnostic_excludes)
                     else:
                         wanted = expected(project) if callable(expected) else (expected or {})
                         payload = json.loads(results[0]) if len(results) == 1 else {}
@@ -2460,6 +2459,7 @@ run = 'fixture-environment "$@"'
                         passed = (result.returncode == 0 and payload.get("args") == ["one value", "--flag"]
                                   and all(values.get(key.hex()) == (value.hex() if value is not None else None)
                                           for key, value in wanted.items()))
+                    passed &= not any(value in output or value in diagnostic for value in diagnostic_excludes)
                     behavior_ok = passed
                     passed &= reads is None or opened == reads
                     checks.append(dict(phase=phase, case=label, passed=passed, status=result.returncode,
@@ -2701,6 +2701,89 @@ run = "cp next.toml mise.local.toml"
                 conf="[env._]\nfile = { path = 'fixture.toml', expand = true }\n",
                 files=(("fixture.toml", "OMG_FIXTURE_OUT = '$OMG_FIXTURE_RAW'\n"),),
                 env={raw_key: b"seed"}, expected={result_key: b"seed"})
+
+            phase = "mise-source-snapshot"
+            ready = "export OMG_FIXTURE_OUT=ready\n"
+
+            def source_case(label, script, *, expected=None, error=None, diagnostic_excludes=(),
+                            env=None, file="source.sh", local=False, opaque=False):
+                selected = f"source = '{file}'\n"
+                configuration = (task + "[tasks.fixture.env._]\n" if local else "[env._]\n") + selected
+                run(label, conf=configuration, files=() if script is None else ((file, script),),
+                    expected=expected, error=error, env=env, native_task=local,
+                    opaque_root=opaque, diagnostic_excludes=diagnostic_excludes)
+
+            for label, script, result in [
+                ("exports-value", ready, b"ready"),
+                ("inherits-unchanged-value", "# no edits\n", b"before"),
+                ("unsets-value", "unset OMG_FIXTURE_OUT\n", None),
+                ("keeps-empty-export", "export OMG_FIXTURE_OUT=''\n", b""),
+                ("keeps-equals-and-spaces", "export OMG_FIXTURE_OUT='hello = world'\n", b"hello = world"),
+                ("keeps-multiline-export", "export OMG_FIXTURE_OUT='first\nsecond'\n", b"first\nsecond"),
+                ("unexported-local-not-imported", "OMG_FIXTURE_OUT=unexported\nunset OMG_FIXTURE_OUT\nOMG_FIXTURE_OUT=local\n", None),
+                ("explicit-return-zero", ready + "return 0\n", b"ready"),
+                ("uses-ordinary-last-command-status", "false\n" + ready, b"ready"),
+                ("handles-conditional-failure", "false || :\n" + ready, b"ready"),
+                ("changes-positional-arguments", "set -- changed arguments\n" + ready, b"ready"),
+                ("source-starts-with-no-positional-arguments", 'export OMG_FIXTURE_OUT="$#"\n', b"0"),
+            ]:
+                source_case(label, script, env={result_key: b"before"}, expected={result_key: result})
+            source_case("source-logs-stay-private",
+                        "printf 'source-private-out\\n'; printf 'source-private-err\\n' >&2\n" + ready,
+                        expected={result_key: b"ready"}, diagnostic_excludes=("source-private-out", "source-private-err"))
+            source_case("source-file-path-with-space", ready, file="my source.sh", expected={result_key: b"ready"})
+            source_case("source-in-opaque-project", ready, opaque=True, expected={result_key: b"ready"})
+            source_case("source-task-local", ready, local=True, expected={result_key: b"ready"})
+            source_case("source-preserves-opaque-export", "export OMG_FIXTURE_OUT=$(printf '\\377')\n",
+                        expected={result_key: b"\xff"})
+            source_case("source-not-found", None, error="failed while sourcing")
+            source_case("source-return-failure", ready + "return 7\n", error="failed while sourcing")
+            source_case("source-shell-explicit-failure", ready + "exit 9\n", error="failed while sourcing")
+            source_case("source-explicit-errexit", ready + "set -e\nfalse\nexport OMG_FIXTURE_OUT=unexpected\n",
+                        error="failed while sourcing")
+            source_case("source-early-zero-exit", ready + "exit 0\n", error="Incomplete environment snapshot")
+            source_case("source-early-replacement", ready + "exec /usr/bin/true\n", error="Incomplete environment snapshot")
+            source_case("task-local-source-early-exit", "exit 0\n", local=True, error="Incomplete environment snapshot")
+
+            run("source-path-change-keeps-collector",
+                conf=source_config,
+                files=(("source.sh", f'export PATH="$PWD/tooling"\n{ready}'),), local_tool=True,
+                expected=lambda cwd: {result_key: b"ready", path_key: os.fsencode(cwd/"tooling")})
+            run("configured-path-keeps-source-shell",
+                conf="[env]\nPATH = '{{config_root}}/tooling'\n" + source_config,
+                files=(("source.sh", ready),), local_tool=True,
+                expected=lambda cwd: {result_key: b"ready", path_key: os.fsencode(cwd/"tooling")})
+            run("ordered-sources-share-resolved-environment",
+                conf="[env._]\nsource = ['one.sh', 'two.sh']\n",
+                files=(("one.sh", "export OMG_FIXTURE_RAW=first\n"),
+                       ("two.sh", 'export OMG_FIXTURE_OUT="$OMG_FIXTURE_RAW-second"\n')),
+                expected={result_key: b"first-second", raw_key: b"first"})
+            run("task-source-sees-project-source",
+                native_task=True, conf=task + source_config + "[tasks.fixture.env._]\nsource = 'local.sh'\n",
+                files=(("source.sh", "export OMG_FIXTURE_RAW=project\n"),
+                       ("local.sh", 'export OMG_FIXTURE_OUT="$OMG_FIXTURE_RAW-local"\n')),
+                expected={result_key: b"project-local", raw_key: b"project"})
+            run("startup-runs-once-per-source",
+                conf=source_config,
+                env={b"BASH_ENV": lambda cwd: os.fsencode(cwd/"startup.sh"),
+                     b"OMG_FIXTURE_STARTS": lambda cwd: os.fsencode(cwd.parent/"starts")},
+                files=(("startup.sh", 'printf "start\\n" >> "$OMG_FIXTURE_STARTS"\n'),
+                       ("source.sh", 'export OMG_FIXTURE_OUT=$(wc -l < "$OMG_FIXTURE_STARTS")\n')),
+                expected={result_key: b"1"})
+            run("startup-output-does-not-obscure-snapshot",
+                conf=source_config, env={b"BASH_ENV": lambda cwd: os.fsencode(cwd/"startup.sh")},
+                files=(("startup.sh", 'printf "startup-private-noise\\n"\n'), ("source.sh", ready)),
+                expected={result_key: b"ready"}, diagnostic_excludes=("startup-private-noise",))
+
+            for name, suffix, value in [
+                ("json-nested-object-diagnostic", "json", '{"OMG_FIXTURE_OUT":{"probe":"fixture-private-object"}}'),
+                ("json-array-diagnostic", "json", '{"OMG_FIXTURE_OUT":["fixture-private-object"]}'),
+                ("toml-nested-table-diagnostic", "toml", '[OMG_FIXTURE_OUT]\nprobe = "fixture-private-object"\n'),
+                ("toml-array-diagnostic", "toml", 'OMG_FIXTURE_OUT = ["fixture-private-object"]\n'),
+            ]:
+                filename = f"fixture.{suffix}"
+                run(name, conf=f"[env._]\nfile = '{filename}'\n", files=((filename, value),),
+                    error="Non-scalar value for OMG_FIXTURE_OUT", diagnostic_excludes=("fixture-private-object",))
 
 
     def inspect_task_package_metadata():
@@ -5075,6 +5158,6 @@ assert inventory() == before
 report = dict(binaries=binaries, checks=checks, total=len(checks),
               passed=sum(entry["passed"] for entry in checks), host_unchanged=True)
 print(json.dumps(report))
-expected_checks = 303 if consent_oracle is None else 1560
+expected_checks = 303 if consent_oracle is None else 1594
 if report["passed"] != report["total"] or report["total"] != expected_checks:
     sys.exit(4)

@@ -23,7 +23,7 @@
 //!   YAML is rejected with an explicit error (no YAML parser vendored).
 //!   Missing files fail closed in strict contexts; lenient loaders warn and skip.
 //! - `_.source` — shell scripts evaluated by explicit `run` and task
-//!   execution via `bash -c … && env -0` snapshots. Automatic hooks ignore
+//!   execution using one shell with before/after environment snapshots. Hooks ignore
 //!   all project environment directives.
 //! - `{{env.NAME}}` / `{{config_root}}` templates in TOML string values.
 //!   Full Tera is out of scope: any other `{{…}}` is a hard error rather
@@ -700,7 +700,7 @@ fn flat_scalar(value: &serde_json::Value, key: &str, path: &Path) -> Result<Opti
         serde_json::Value::Number(number) => Ok(Some(number.to_string())),
         serde_json::Value::Bool(flag) => Ok(Some(flag.to_string())),
         serde_json::Value::Null => Ok(None),
-        other => anyhow::bail!("Non-scalar value for {key} in {}: {other}", path.display()),
+        _ => anyhow::bail!("Non-scalar value for {key} in {}", path.display()),
     }
 }
 
@@ -753,10 +753,9 @@ fn load_env_file(directive: &EnvFileDirective) -> Result<Option<FileBindings>> {
                     toml::Value::String(text) => text.clone(),
                     toml::Value::Integer(number) => number.to_string(),
                     toml::Value::Boolean(flag) => flag.to_string(),
-                    other => anyhow::bail!(
-                        "Non-scalar value for {key} in {}: {other}",
-                        directive.path.display()
-                    ),
+                    _ => {
+                        anyhow::bail!("Non-scalar value for {key} in {}", directive.path.display())
+                    }
                 };
                 pairs.push((key.clone(), EnvFileValue::new(text, directive.expand)));
             }
@@ -1133,41 +1132,69 @@ pub(crate) fn resolve_mise_env_chain(
 /// environment must never silently apply.
 #[cfg(unix)]
 pub(crate) fn eval_sourced_file(script: &Path, base: &Environment) -> Result<ResolvedEnv> {
-    fn snapshot(
-        shell: &str,
-        script: Option<&Path>,
-        base: &Environment,
-    ) -> Result<HashMap<String, OsString>> {
-        let mut command = std::process::Command::new(shell);
-        command.env_clear().envs(base);
-        command.arg("-c");
-        if let Some(script) = script {
-            command.arg(". \"$0\" >/dev/null 2>&1 && env -0");
-            command.arg(script);
-        } else {
-            command.arg("env -0");
-        }
-        // A hostile script path must not become shell syntax: it travels as
-        // `$0`, never interpolated into the program text.
-        let output = command.output().with_context(|| {
-            format!(
-                "Failed to run {shell} for {}",
-                script.map_or_else(|| "-".into(), |s: &Path| s.display().to_string())
-            )
-        })?;
-        if !output.status.success() {
-            let which = script.map_or_else(
-                || "baseline snapshot".to_string(),
-                |s| format!("sourcing {}", s.display()),
-            );
-            anyhow::bail!("{shell} failed while {which}");
-        }
-        Ok(parse_nul_env(&output.stdout))
-    }
+    use crate::core::runtime_resolver::find_in_path;
 
-    let shell = if which_shell("bash") { "bash" } else { "sh" };
-    let before = snapshot(shell, None, base)?;
-    let after = snapshot(shell, Some(script), base)?;
+    // Resolve the collector and shell before applying the project's PATH. A
+    // source script can change PATH again or reset its own positional arguments.
+    let shell = find_in_path("bash")
+        .or_else(|| find_in_path("sh"))
+        .or_else(|| find_in_path("/bin/sh"))
+        .context("No shell found for mise environment source")?;
+    let collector = find_in_path("env")
+        .or_else(|| find_in_path("/usr/bin/env"))
+        .or_else(|| find_in_path("/bin/env"))
+        .context("No env executable found for mise environment source")?;
+    let output = std::process::Command::new(&shell)
+        .env_clear()
+        .envs(base)
+        .arg("-c")
+        .arg(
+            r#"
+readonly __omg_source_env_program="$1"
+shift
+command printf '\000omg-source-snapshot\000'
+"$__omg_source_env_program" -0 || exit $?
+command printf '\000omg-source-snapshot\000'
+. "$0" >/dev/null 2>&1
+case $? in 0) ;; *) exit $? ;; esac
+"$__omg_source_env_program" -0 || exit $?
+command printf '\000omg-source-snapshot\000'
+"#,
+        )
+        .arg(script)
+        .arg(collector)
+        .stderr(std::process::Stdio::null())
+        .output()
+        .with_context(|| format!("Failed to run {} for {}", shell.display(), script.display()))?;
+
+    anyhow::ensure!(
+        output.status.success(),
+        "{} failed while sourcing {}",
+        shell.display(),
+        script.display()
+    );
+
+    const BOUNDARY: &[u8] = b"omg-source-snapshot";
+    let incomplete = || {
+        format!(
+            "Incomplete environment snapshot while sourcing {}",
+            script.display()
+        )
+    };
+    // A boundary is a separate NUL-delimited record. It cannot match a
+    // binding, and the final one distinguishes an empty env from an early exit.
+    let mut records = output.stdout.split(|byte| *byte == 0);
+    anyhow::ensure!(records.any(|record| record == BOUNDARY), incomplete());
+    let mut snapshots = std::iter::from_fn(|| {
+        let mut ended = false;
+        let values = parse_nul_env(records.by_ref().take_while(|record| {
+            ended = *record == BOUNDARY;
+            !ended
+        }));
+        ended.then_some(values)
+    });
+    let before = snapshots.next().with_context(incomplete)?;
+    let after = snapshots.next().with_context(incomplete)?;
     let unset = before
         .keys()
         .filter(|key| !after.contains_key(*key))
@@ -1183,21 +1210,14 @@ pub(crate) fn eval_sourced_file(script: &Path, base: &Environment) -> Result<Res
     })
 }
 
-/// Whether `shell` resolves on `PATH` (checked without spawning it).
-#[cfg(unix)]
-fn which_shell(name: &str) -> bool {
-    std::env::var_os("PATH")
-        .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(name).is_file()))
-}
-
 /// Parse NUL-separated `KEY=value` records from `env -0` output. Records
 /// without `=` cannot come from `env` and are ignored defensively.
 #[cfg(unix)]
-fn parse_nul_env(output: &[u8]) -> HashMap<String, OsString> {
+fn parse_nul_env<'a>(records: impl Iterator<Item = &'a [u8]>) -> HashMap<String, OsString> {
     use std::os::unix::ffi::OsStringExt as _;
 
     let mut vars = HashMap::new();
-    for record in output.split(|byte| *byte == 0) {
+    for record in records {
         let mut parts = record.splitn(2, |byte| *byte == b'=');
         if let (Some(key), Some(value)) = (parts.next(), parts.next())
             && let Ok(key) = std::str::from_utf8(key)
@@ -1686,7 +1706,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn nul_env_parsing_skips_junk() {
-        let vars = parse_nul_env(b"GOOD=1\x00NOEQUALS\x00BAD-NAME=2\x00EMPTY=\x00");
+        let records = b"GOOD=1\x00NOEQUALS\x00BAD-NAME=2\x00EMPTY=\x00".split(|byte| *byte == 0);
+        let vars = parse_nul_env(records);
         assert_eq!(vars.get("GOOD").and_then(|value| value.to_str()), Some("1"));
         assert!(!vars.contains_key("BAD-NAME"));
         assert_eq!(vars.get("EMPTY").and_then(|value| value.to_str()), Some(""));
@@ -1695,9 +1716,6 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn sourced_script_diff_returns_new_vars() {
-        if !which_shell("bash") && !which_shell("sh") {
-            return;
-        }
         let dir = tempfile::TempDir::new().expect("tempdir");
         let script = dir.path().join("env.sh");
         std::fs::write(
