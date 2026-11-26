@@ -510,7 +510,7 @@ fn dnf_check_details(stdout: &[u8], stderr: &[u8]) -> Vec<String> {
             .take(limit)
         {
             details.push(
-                style::sanitize_terminal_text(line)
+                style::sanitize_terminal_diagnostic(line)
                     .chars()
                     .take(160)
                     .collect(),
@@ -2825,6 +2825,23 @@ mod tests {
         assert!(details[2].starts_with("missing require"));
         assert_eq!(details[2].chars().count(), 160);
         assert_eq!(details.len(), 3);
+    }
+
+    #[test]
+    fn dnf_health_diagnostics_hide_repository_credentials() {
+        let details = dnf_check_details(
+            b"fixture-0:1-1.noarch\nconflict in https://mirror.invalid/meta?token=example\n",
+            b"DNF check failed while reading https://account:example@mirror.invalid/cache#example\n",
+        );
+
+        assert_eq!(
+            details,
+            [
+                "DNF check failed while reading https://mirror.invalid/cache",
+                "fixture-0:1-1.noarch",
+                "conflict in https://mirror.invalid/meta",
+            ]
+        );
     }
 
     #[cfg(target_os = "linux")]

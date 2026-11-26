@@ -8,6 +8,7 @@
 //! - **Accessibility**: WCAG AA compliant contrast ratios
 
 use std::env;
+use std::sync::LazyLock;
 #[cfg(not(test))]
 use std::sync::OnceLock;
 
@@ -264,6 +265,21 @@ pub fn sanitize_terminal_text(text: &str) -> String {
                 )
         })
         .collect()
+}
+
+/// Remove terminal controls and private URL components from a diagnostic line.
+#[must_use]
+pub(crate) fn sanitize_terminal_diagnostic(line: &str) -> String {
+    static URL: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r#"(?i)(?:https?|ftps?)://[^\s"<>]+"#).expect("diagnostic URL pattern")
+    });
+    let text = sanitize_terminal_text(line);
+    match URL.replace_all(&text, |captures: &regex::Captures<'_>| {
+        crate::core::http::redact_url(&captures[0])
+    }) {
+        std::borrow::Cow::Borrowed(_) => text,
+        std::borrow::Cow::Owned(redacted) => redacted,
+    }
 }
 
 // Preserve the owned callback's coverage ownership; exhaustive scalar parity prevents drift.

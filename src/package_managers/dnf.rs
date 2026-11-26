@@ -20,9 +20,10 @@ use std::pin::Pin;
 use anyhow::{Context, Result};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, LazyLock, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use crate::cli::modern_ui::OutputMode;
+use crate::cli::style::sanitize_terminal_diagnostic;
 use crate::core::{Package, PackageSource, is_root};
 use crate::package_managers::PackageManager;
 use crate::package_managers::types::{PackageStatus, UpdateInfo, parse_version_or_zero};
@@ -2136,22 +2137,10 @@ impl DnfPackageManager {
             .map(str::trim)
             .rfind(|line| !line.is_empty())
         {
-            let detail = Self::safe_query_diagnostic(detail);
+            let detail = sanitize_terminal_diagnostic(detail);
             anyhow::bail!("{program} query failed: {}: {detail}", output.status);
         }
         anyhow::bail!("{program} query failed: {}", output.status);
-    }
-
-    fn safe_query_diagnostic(line: &str) -> String {
-        static URL: LazyLock<regex::Regex> = LazyLock::new(|| {
-            regex::Regex::new(r#"(?i)(?:https?|ftps?)://[^\s"<>]+"#)
-                .expect("diagnostic URL pattern")
-        });
-        let text = crate::cli::style::sanitize_terminal_text(line);
-        URL.replace_all(&text, |captures: &regex::Captures<'_>| {
-            crate::core::http::redact_url(&captures[0])
-        })
-        .into_owned()
     }
 
     async fn capture_query_diagnostics(
@@ -2176,7 +2165,7 @@ impl DnfPackageManager {
             }
             if forward {
                 let raw = String::from_utf8_lossy(&bytes[start..]);
-                eprintln!("{}", Self::safe_query_diagnostic(raw.trim_end()));
+                eprintln!("{}", sanitize_terminal_diagnostic(raw.trim_end()));
             }
         }
         drop(reader);
@@ -3346,7 +3335,7 @@ impl DnfPackageManager {
                 let (line, newline) = line
                     .strip_suffix('\n')
                     .map_or((line, ""), |line| (line, "\n"));
-                output.push_str(&Self::safe_query_diagnostic(line));
+                output.push_str(&sanitize_terminal_diagnostic(line));
                 output.push_str(newline);
             }
             output
@@ -3559,7 +3548,7 @@ impl DnfPackageManager {
             let raw = raw.trim_end_matches(['\r', '\n']);
             inspect_line(raw);
             if forward {
-                let mut safe = Self::safe_query_diagnostic(raw);
+                let mut safe = sanitize_terminal_diagnostic(raw);
                 safe.push('\n');
                 // Continue inspecting after a log reader closes its pipe.
                 forward = terminal.write_all(safe.as_bytes()).is_ok();
