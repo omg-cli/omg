@@ -5,13 +5,10 @@
 //! a single build per (distro, arch) pair plus `install.sh`, `build.log`, and
 //! a `php<minor>.log` recording the exact patch currently baked in (e.g.
 //! `php-8.5.10` for the `8.5` channel). Rebuilds overwrite the previous
-//! assets (`--clobber`), and `setup-php` itself truncates every request to
-//! `major.minor`, so exact patches cannot be pinned: versions here are the
-//! rolling `major.minor` channels, the install directory is the channel, and
-//! reinstalling refreshes to the latest patch. The newest channel may bake an
-//! in-development snapshot (`8.6` currently bakes `8.6.0-dev` per its
-//! `php8.6.log`); pin an explicit stable channel such as `8.5` when that
-//! matters.
+//! assets (`--clobber`). OMG installs rolling `major.minor` channels, and
+//! reinstalling refreshes the channel payload. The publisher may mark a
+//! development channel as a regular release. Pin a stable channel when
+//! that matters.
 //!
 //! Payloads are Debian/Ubuntu system-root tarballs
 //! (`php_<channel>+<distro>[_arm64].tar.xz`, where `<distro>` is `debian11`,
@@ -34,9 +31,9 @@ use std::path::{Path, PathBuf};
 use super::common::{
     GithubAsset, GithubRelease, activate_version_with_linked_binary, begin_staged_install,
     clear_dir_contents, complete_staged_install, download_with_progress, extract_tar_xz,
-    fetch_github_releases, is_valid_version_dir, normalize_version, parse_sha256_digest,
-    print_installed, print_using, remove_file_best_effort, replace_staged_install,
-    uninstall_version, validate_download_filename,
+    fetch_github_release_json, fetch_github_releases, is_valid_version_dir, normalize_version,
+    parse_sha256_digest, print_installed, print_using, remove_file_best_effort,
+    replace_staged_install, uninstall_version, validate_download_filename,
 };
 use crate::{cli::style, core::http::download_client};
 
@@ -207,20 +204,18 @@ fn parse_channel_versions(releases: Vec<GithubRelease>) -> Vec<PhpVersion> {
     versions
 }
 
-/// Numeric dotted-version comparison; non-numeric components compare as zero
-/// so a malformed tag can never panic sorting.
-fn version_parts(version: &str) -> Vec<u64> {
+fn channel_parts(version: &str) -> (u64, u64) {
     version
-        .split('.')
-        .map(|part| part.parse().unwrap_or(0))
-        .collect()
+        .split_once('.')
+        .map(|(major, minor)| (major.parse().unwrap_or(0), minor.parse().unwrap_or(0)))
+        .unwrap_or_default()
 }
 
 /// Sort newest-first for `list_available` and `latest` resolution.
 fn sort_versions_desc(versions: &mut [PhpVersion]) {
     versions.sort_by(|left, right| {
-        version_parts(&right.version)
-            .cmp(&version_parts(&left.version))
+        channel_parts(&right.version)
+            .cmp(&channel_parts(&left.version))
             .then_with(|| left.version.cmp(&right.version))
     });
 }
@@ -238,9 +233,15 @@ fn select_asset<'a>(
     version: &str,
     distro: &str,
     arch_suffix: &str,
-) -> Option<&'a GithubAsset> {
+) -> Result<Option<&'a GithubAsset>> {
     let expected = asset_name(version, distro, arch_suffix);
-    assets.iter().find(|asset| asset.name == expected)
+    let mut matching = assets.iter().filter(|asset| asset.name == expected);
+    let selected = matching.next();
+    anyhow::ensure!(
+        matching.next().is_none(),
+        "GitHub release lists multiple matching PHP assets named {expected}"
+    );
+    Ok(selected)
 }
 
 /// Resolve the SHA-256 for an asset from the GitHub asset digest. Fail closed
@@ -353,6 +354,12 @@ fn pathdiff_relative(target: &Path, base: &Path) -> PathBuf {
     relative
 }
 
+fn unavailable_channel(version: &str) -> String {
+    format!(
+        "PHP version {version} not found: php-builder publishes rolling major.minor channels (never exact patches), so request a channel such as 8.5. Check available versions with: omg list php --available"
+    )
+}
+
 impl PhpManager {
     pub fn new() -> Self {
         Self {
@@ -364,7 +371,11 @@ impl PhpManager {
 
     /// List available upstream channels (newest first).
     pub async fn list_available(&self) -> Result<Vec<PhpVersion>> {
-        let releases = fetch_github_releases(
+        Ok(parse_channel_versions(self.release_catalog().await?))
+    }
+
+    async fn release_catalog(&self) -> Result<Vec<GithubRelease>> {
+        fetch_github_releases(
             self.client,
             PHP_BUILDER_RELEASES_URL,
             LIST_PER_PAGE,
@@ -372,68 +383,82 @@ impl PhpManager {
             |_| false,
         )
         .await
-        .context("Failed to fetch PHP releases from GitHub")?;
-        Ok(parse_channel_versions(releases))
+        .context("Failed to fetch PHP releases from GitHub")
     }
 
-    /// Resolve `latest` and partial requests (`8`) against the upstream
-    /// channel list. Exact channels pass through so the installed fast path
-    /// and the existing not-found UX are preserved.
-    pub async fn resolve_alias(&self, alias: &str) -> Result<String> {
-        let alias = normalize_version(alias);
-        if alias == "latest" {
-            let versions = self.list_available().await?;
-            versions
-                .into_iter()
-                .find(|version| !version.prerelease)
-                .map(|version| version.version)
-                .context("No PHP versions found upstream")
-        } else {
-            Ok(alias)
-        }
+    async fn release_for_channel(&self, version: &str) -> Result<GithubRelease> {
+        let url = format!("{PHP_BUILDER_RELEASES_URL}/tags/{version}");
+        let result = fetch_github_release_json::<GithubRelease>(self.client, &url).await;
+        let release = match result {
+            Err(error)
+                if error
+                    .downcast_ref::<reqwest::Error>()
+                    .and_then(reqwest::Error::status)
+                    == Some(reqwest::StatusCode::NOT_FOUND) =>
+            {
+                return Err(error.context(unavailable_channel(version)));
+            }
+            result => result
+                .with_context(|| format!("Failed to fetch PHP channel {version} from GitHub"))?,
+        };
+        anyhow::ensure!(
+            release.tag_name == version,
+            "GitHub release tag {} does not match PHP channel {version}",
+            release.tag_name
+        );
+        Ok(release)
     }
 
-    /// Resolve a partial version against the upstream channel list.
-    async fn resolve_requested_version(&self, version: &str) -> Result<String> {
-        if !super::common::is_partial_version(version) {
-            return Ok(version.to_owned());
+    async fn resolve_channel(&self, requested: &str) -> Result<GithubRelease> {
+        let releases = self.release_catalog().await?;
+        let releases = releases
+            .into_iter()
+            .filter(|release| is_channel_tag(&release.tag_name));
+        if requested == "latest" {
+            return releases
+                .filter(|release| !release.prerelease)
+                .max_by(|left, right| {
+                    channel_parts(&left.tag_name)
+                        .cmp(&channel_parts(&right.tag_name))
+                        .then_with(|| right.tag_name.cmp(&left.tag_name))
+                })
+                .context("No PHP versions found upstream");
         }
-        let available = self.list_available().await?;
-        let names: Vec<String> = available
+        let releases: Vec<_> = releases.collect();
+        let tags: Vec<_> = releases
             .iter()
-            .map(|version| version.version.clone())
+            .map(|release| release.tag_name.clone())
             .collect();
-        Ok(super::resolve_version_request(&names, version))
-    }
-
-    /// Fetch the rolling release for one resolved channel.
-    async fn release_for_version(&self, version: &str) -> Result<GithubRelease> {
-        let releases = fetch_github_releases(
-            self.client,
-            PHP_BUILDER_RELEASES_URL,
-            LIST_PER_PAGE,
-            LIST_MAX_PAGES,
-            |release| release.tag_name == version,
-        )
-        .await
-        .context("Failed to fetch PHP releases from GitHub")?;
+        let channel = super::resolve_version_request(&tags, requested);
         releases
             .into_iter()
-            .find(|release| release.tag_name == version)
-            .with_context(|| {
-                format!(
-                    "PHP version {version} not found: php-builder publishes rolling major.minor channels (never exact patches), so request a channel such as 8.5. Check available versions with: omg list php --available"
-                )
-            })
+            .find(|release| release.tag_name == channel)
+            .with_context(|| unavailable_channel(requested))
     }
 
     /// Install PHP from a php-builder prebuilt tarball.
     pub async fn install(&self, version: &str) -> Result<()> {
         ensure_linux()?;
-        let version = self.resolve_alias(version).await?;
-        let version = self.resolve_requested_version(&version).await?;
-        crate::core::security::validate_runtime_version(&version)?;
-        let version_dir = self.versions_dir.join(&version);
+        let requested = normalize_version(version);
+        crate::core::security::validate_runtime_version(&requested)?;
+        let exact = is_channel_tag(&requested);
+        anyhow::ensure!(
+            exact || requested == "latest" || requested.bytes().all(|byte| byte.is_ascii_digit()),
+            "{}",
+            unavailable_channel(&requested)
+        );
+        let distro = php_distro()?;
+        let arch_suffix = host_arch_suffix()?;
+        let selection = if exact {
+            None
+        } else {
+            Some(self.resolve_channel(&requested).await?)
+        };
+        let version = selection
+            .as_ref()
+            .map_or(requested.as_str(), |release| release.tag_name.as_str());
+        crate::core::security::validate_runtime_version(version)?;
+        let version_dir = self.versions_dir.join(version);
 
         if version_dir.exists() {
             anyhow::ensure!(
@@ -446,13 +471,17 @@ impl PhpManager {
         println!(
             "{} Installing PHP {}...\n",
             style::runtime("OMG"),
-            style::caution(&version)
+            style::caution(version)
         );
 
-        let distro = php_distro()?;
-        let arch_suffix = host_arch_suffix()?;
-        let release = self.release_for_version(&version).await?;
-        let asset = select_asset(&release.assets, &version, &distro, arch_suffix).with_context(|| {
+        let exact_release;
+        let release = if let Some(release) = selection.as_ref() {
+            release
+        } else {
+            exact_release = self.release_for_channel(version).await?;
+            &exact_release
+        };
+        let asset = select_asset(&release.assets, version, &distro, arch_suffix)?.with_context(|| {
             format!(
                 "No installable PHP {version} asset for distro {distro} on {} (php-builder publishes Debian/Ubuntu builds only); try OMG_PHP_DISTRO=<distro>",
                 std::env::consts::ARCH
@@ -475,11 +504,10 @@ impl PhpManager {
         download_with_progress(self.client, &url, &download_path, &checksum).await?;
 
         println!("{} Extracting (pure Rust)...", style::informative("→"));
-        self.publish_download(&download_path, &url, &version)
-            .await?;
+        self.publish_download(&download_path, &url, version).await?;
         remove_file_best_effort(&download_path, "runtime archive");
-        print_installed("PHP", &version);
-        self.use_version(&version)?;
+        print_installed("PHP", version);
+        self.use_version(version)?;
 
         Ok(())
     }
@@ -634,19 +662,14 @@ mod tests {
         .unwrap();
         let filename = asset_name(version, &php_distro().unwrap(), host_arch_suffix().unwrap());
         let path = format!("/shivammathur/php-builder/releases/download/{version}/{filename}");
-        let metadata = serde_json::to_vec(&serde_json::json!([{
+        let metadata = serde_json::to_vec(&serde_json::json!({
             "tag_name":version,"prerelease":false,
             "assets":[{"name":filename,"browser_download_url":format!("https://github.com{path}"),"digest":format!("sha256:{}",hex::encode(Sha256::digest(&archive)))}]
-        }])).unwrap();
+        })).unwrap();
         super::super::test_https::fixed_public_routes(&[
             (
                 "api.github.com",
-                "/repos/shivammathur/php-builder/releases?per_page=50&page=1",
-                &metadata,
-            ),
-            (
-                "api.github.com",
-                "/repos/shivammathur/php-builder/releases?per_page=50&page=1",
+                "/repos/shivammathur/php-builder/releases/tags/8.5",
                 &metadata,
             ),
             ("github.com", &path, &archive),
@@ -743,6 +766,66 @@ mod tests {
         assert!(versions.iter().all(|version| !version.prerelease));
     }
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn alias_install_reuses_selected_release_metadata() -> Result<()> {
+        let catalog = "/repos/shivammathur/php-builder/releases?per_page=50&page=1";
+        let releases = br#"[
+            {"tag_name":"8.4"},
+            {"tag_name":"8.7","prerelease":true},
+            {"tag_name":"libraries"},
+            {"tag_name":"8.6"}
+        ]"#;
+        let fixture = super::super::test_https::HttpsFixture::new(
+            "api.github.com",
+            vec![
+                (catalog.to_owned(), releases.to_vec()),
+                (catalog.to_owned(), releases.to_vec()),
+            ],
+        )
+        .await?;
+        let home = tempfile::tempdir()?;
+        let manager = PhpManager {
+            versions_dir: home.path().join("php"),
+            client: Box::leak(Box::new(fixture.client(true)?)),
+            ..PhpManager::new()
+        };
+        let latest = manager.install("latest").await.expect_err("no host asset");
+        let major = manager.install("8").await.expect_err("no host asset");
+        assert_eq!(
+            fixture.finish().await?,
+            vec![format!("GET {catalog} HTTP/1.1"); 2]
+        );
+        assert!(
+            format!("{latest:#}").contains("No installable PHP 8.6 asset"),
+            "{latest:#}"
+        );
+        assert!(
+            format!("{major:#}").contains("No installable PHP 8.7 asset"),
+            "{major:#}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn release_catalog_rejects_partial_success_response() -> Result<()> {
+        let catalog = "/repos/shivammathur/php-builder/releases?per_page=50&page=1";
+        let fixture = super::super::test_https::HttpsFixture::new_with_statuses(
+            "api.github.com",
+            vec![(catalog.to_owned(), 206, br#"[{"tag_name":"8.5"}]"#.to_vec())],
+        )
+        .await?;
+        let manager = PhpManager {
+            client: Box::leak(Box::new(fixture.client(true)?)),
+            ..PhpManager::new()
+        };
+        let result = manager.list_available().await;
+        assert_eq!(fixture.finish().await?, [format!("GET {catalog} HTTP/1.1")]);
+        let error = result.expect_err("a release catalog requires HTTP 200");
+        assert!(format!("{error:#}").contains("HTTP 206"), "{error:#}");
+        Ok(())
+    }
+
     #[test]
     fn asset_selection_matches_exact_xz_payload_only() {
         let digest = format!("sha256:{}", "ab".repeat(32));
@@ -758,14 +841,24 @@ mod tests {
             asset("php_8.5+debian12.tar.xz", Some(&digest)),
             asset("php_8.5+ubuntu24.04.tar.xz", Some(&digest)),
         ];
-        let selected =
-            select_asset(&assets, "8.5", "ubuntu24.04", "").expect("xz payload must win");
+        let selected = select_asset(&assets, "8.5", "ubuntu24.04", "")
+            .unwrap()
+            .expect("xz payload must win");
         assert_eq!(selected.name, "php_8.5+ubuntu24.04.tar.xz");
         let arm = select_asset(&assets, "8.5", "ubuntu24.04", "_arm64")
+            .unwrap()
             .expect("arm64 payload must be selectable");
         assert_eq!(arm.name, "php_8.5+ubuntu24.04_arm64.tar.xz");
-        assert!(select_asset(&assets, "8.5", "ubuntu22.04", "").is_none());
-        assert!(select_asset(&assets, "8.4", "ubuntu24.04", "").is_none());
+        assert!(
+            select_asset(&assets, "8.5", "ubuntu22.04", "")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            select_asset(&assets, "8.4", "ubuntu24.04", "")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

@@ -77,26 +77,8 @@ where
 {
     let mut releases = Vec::new();
     for page in 1..=max_pages {
-        let response = client
-            .get(format!("{releases_url}?per_page={per_page}&page={page}"))
-            .header("User-Agent", GITHUB_USER_AGENT)
-            .timeout(std::time::Duration::from_secs(30))
-            .send()
-            .await
-            .with_context(|| format!("Failed to fetch GitHub releases from {releases_url}"))?;
-
-        if let Some(diagnostic) =
-            github_rate_limit_diagnostic(response.status(), response.headers())
-        {
-            anyhow::bail!("{diagnostic}");
-        }
-
-        let page_releases: Vec<GithubRelease> = response
-            .error_for_status()
-            .with_context(|| format!("GitHub releases request failed: {releases_url}"))?
-            .bounded_json()
-            .await
-            .with_context(|| format!("Failed to parse GitHub releases payload: {releases_url}"))?;
+        let url = format!("{releases_url}?per_page={per_page}&page={page}");
+        let page_releases: Vec<GithubRelease> = fetch_github_release_json(client, &url).await?;
         let short = page_releases.len() < per_page as usize;
         let stop = page_releases.iter().any(&stop_when);
         releases.extend(page_releases);
@@ -105,6 +87,35 @@ where
         }
     }
     Ok(releases)
+}
+
+/// Fetch a complete GitHub release document, either a release or a list page.
+pub(crate) async fn fetch_github_release_json<T: serde::de::DeserializeOwned>(
+    client: &reqwest::Client,
+    url: &str,
+) -> Result<T> {
+    let response = client
+        .get(url)
+        .header("User-Agent", GITHUB_USER_AGENT)
+        .timeout(std::time::Duration::from_secs(30))
+        .send()
+        .await
+        .with_context(|| format!("Failed to fetch GitHub releases from {url}"))?;
+    if let Some(diagnostic) = github_rate_limit_diagnostic(response.status(), response.headers()) {
+        anyhow::bail!("{diagnostic}");
+    }
+    let response = response
+        .error_for_status()
+        .with_context(|| format!("GitHub releases request failed: {url}"))?;
+    anyhow::ensure!(
+        response.status() == reqwest::StatusCode::OK,
+        "GitHub releases response returned HTTP {} for {url}",
+        response.status()
+    );
+    response
+        .bounded_json()
+        .await
+        .with_context(|| format!("Failed to parse GitHub releases payload: {url}"))
 }
 
 pub(crate) fn host_os_tag(

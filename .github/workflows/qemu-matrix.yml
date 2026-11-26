@@ -310,7 +310,7 @@ jobs:
           tool: nextest
 
       - name: Run library and binary unit tests (including omgd)
-        run: python3 scripts/run-native-contracts.py --staged-units --features ${{ matrix.features }} --output "$RUNNER_TEMP/staged-unit-tests"
+        run: python3 scripts/run-native-contracts.py --staged-units --features ${{ matrix.features }} --output target/staged-unit-tests
 
       - name: Build
         run: |
@@ -323,7 +323,7 @@ jobs:
           name: cargo-timings-arm64-${{ matrix.distro }}
           path: |
             target/cargo-timings/
-            ${{ runner.temp }}/staged-unit-tests/
+            target/staged-unit-tests/
           retention-days: 7
           if-no-files-found: ignore
 
