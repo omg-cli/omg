@@ -329,11 +329,34 @@ async fn info_fallback(package: &str, #[cfg(feature = "arch")] aur_rpc: &str) ->
         return Ok(());
     }
 
-    // Try sync path first
     if info_sync(package)? {
         return Ok(());
     }
+    info_local_fallback(
+        package,
+        #[cfg(feature = "arch")]
+        aur_rpc,
+    )
+    .await
+}
 
+/// Continue a text info command after a synchronous lookup returned no result.
+///
+/// # Errors
+///
+/// Returns an error if the selector is invalid, the local lookup fails,
+/// or the package is absent.
+pub async fn info_after_sync_miss(package: &str) -> Result<()> {
+    validate_info_selector(package)?;
+    info_local_fallback(
+        package,
+        #[cfg(feature = "arch")]
+        AUR_RPC_URL,
+    )
+    .await
+}
+
+async fn info_local_fallback(package: &str, #[cfg(feature = "arch")] aur_rpc: &str) -> Result<()> {
     #[cfg(any(feature = "debian", feature = "debian-pure"))]
     if is_debian_like() {
         anyhow::bail!("Package '{package}' not found. Try: omg search {package}");

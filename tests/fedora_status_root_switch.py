@@ -378,6 +378,103 @@ with tempfile.TemporaryDirectory(prefix="omg-fedora-cache-scope-", dir="/tmp") a
                            value=no_daemon.stdout[-600:].strip(), status=no_daemon.returncode,
                            diagnostic=no_daemon.stderr[-1000:] if no_daemon.returncode else None))
 
+
+    def inspect_info_attempts():
+        phase = "info-single-daemon-attempt"
+        identity = f"{package}.noarch"
+        native = ordinary_control([dnf, "--cacheonly", "repoquery", "--installed",
+                                   "--qf", "%{name}.%{arch}\t%{evr}\\n", package])
+        assert native.splitlines() == [f"{identity}\t1-1"], native
+
+        def info_count():
+            metrics = checked([cli, "metrics"], env, ordinary)
+            prefix = "omg_info_requests_total "
+            count, = (int(line.removeprefix(prefix)) for line in metrics.splitlines() if line.startswith(prefix))
+            return count
+
+        selectors = (
+            ("name", package, "found"),
+            ("arch", identity, "found"),
+            ("nevra", f"{package}-0:1-1.noarch", "found"),
+            ("missing", "omg-fixture-name-absent", "missing"),
+            ("wrong-arch", f"{package}.aarch64", "missing"),
+            ("invalid", f"../{package}", "invalid"),
+        )
+        formats = (
+            ("text", ["info"]),
+            ("text-after-separator", ["info", "--"]),
+            ("json", ["--json", "info"]),
+        )
+        for role, mode in (("daemon", env), ("direct", disabled)):
+            for form, options in formats:
+                for label, selector, outcome in selectors:
+                    before = info_count()
+                    started = time.monotonic_ns()
+                    result = command([cli, *options, selector], mode, ordinary)
+                    elapsed_ms = (time.monotonic_ns() - started) / 1_000_000
+                    calls = info_count() - before
+                    expected_calls = int(role == "daemon" and outcome != "invalid")
+                    if outcome == "found" and form == "json":
+                        try:
+                            value = json.loads(result.stdout)
+                            output_ok = (value["name"] == identity and value["version"] == "1-1"
+                                         and value["installed"] is True and result.returncode == 0)
+                        except (ValueError, KeyError, TypeError):
+                            output_ok = False
+                    elif outcome == "found":
+                        fields = dict(line.strip().split(": ", 1) for line in result.stdout.splitlines()
+                                      if ": " in line)
+                        output_ok = (fields.get("Name") == identity and fields.get("Version") == "1-1"
+                                     and fields.get("Installed") == "yes" and result.returncode == 0)
+                    else:
+                        expected_error = ("Package name cannot start with '.'" if outcome == "invalid"
+                                          else f"Package '{selector}' not found")
+                        output_ok = result.returncode != 0 and not result.stdout.strip() and expected_error in result.stderr
+                    checks.append(dict(phase=phase, case=f"{role}-{form}-{label}",
+                                       passed=output_ok and calls == expected_calls,
+                                       status=result.returncode, output_ok=output_ok, requests=calls,
+                                       expected_requests=expected_calls, elapsed_ms=round(elapsed_ms, 3),
+                                       diagnostic=(result.stderr or result.stdout)[-750:]))
+
+
+    def inspect_epoch_read_paths():
+        phase = "read-nonzero-rpm-epoch"
+        values = checked([rpm, "-qa", "--qf", r"%{NAME}\t%{EPOCHNUM}\t%{VERSION}\t%{RELEASE}\t%{ARCH}\n"])
+        rows = [tuple(line.split("\t")) for line in values.splitlines()]
+        matching = sorted(row for row in rows if row[0] in ("findutils", "xz-libs", "openssl-libs", "gmp")
+                          and int(row[1]) > 0
+                          and sum((other[0], other[4]) == (row[0], row[4]) for other in rows) == 1)
+        assert matching, "Fedora host fixture requires a package with a nonzero RPM epoch"
+        name, epoch, version, release, architecture = matching[0]
+        identity = f"{name}.{architecture}"
+        evr = f"{epoch}:{version}-{release}"
+        for role, mode in (("daemon", env), ("direct", disabled)):
+            for args, label in (
+                (["--json", "info", identity], "json-info-arch"),
+                (["--json", "info", f"{name}-{evr}.{architecture}"], "json-info-nevra"),
+                (["--json", "search", "--limit", "20", identity], "json-search"),
+                (["info", identity], "text-info-arch"),
+                (["info", f"{name}-{evr}.{architecture}"], "text-info-nevra"),
+            ):
+                result = command([cli, *args], mode, ordinary)
+                try:
+                    if label == "json-search":
+                        row, = [item for item in json.loads(result.stdout) if item["name"] == identity]
+                        correct = row["version"] == evr and row["source"] == "Official"
+                    elif label.startswith("json"):
+                        row = json.loads(result.stdout)
+                        correct = row["name"] == identity and row["version"] == evr and row["installed"] is True
+                    else:
+                        fields = dict(line.strip().split(": ", 1) for line in result.stdout.splitlines()
+                                      if ": " in line)
+                        correct = (fields.get("Name") == identity and fields.get("Version") == evr
+                                   and fields.get("Installed") == "yes")
+                except (ValueError, KeyError, TypeError):
+                    correct = False
+                checks.append(dict(phase=phase, case=f"{role}-{label}", passed=correct and result.returncode == 0,
+                                   status=result.returncode, expected=(identity, evr),
+                                   diagnostic=(result.stderr or result.stdout)[-900:]))
+
     def inspect_repository(phase, expected_available):
         native = ordinary_control([dnf, "--cacheonly", "repoquery", "--available",
                                    "--qf", r"%{name}.%{arch}\n", package]).splitlines()
@@ -1312,8 +1409,12 @@ exec {shlex.quote(str(binary))} "$@"
                 assert expected == [package], expected
                 assert persisted.read_bytes() == initial_status
                 inspect("switched-alternate", 1, 1, fixture_explicit=True)
+                if consent_oracle is not None:
+                    inspect_info_attempts()
                 config.write_text(host_config)
                 inspect("returned-host", host_count, host_explicit, host=True)
+                if consent_oracle is not None:
+                    inspect_epoch_read_paths()
                 original_manifest = manifest.read_bytes()
                 inspect_repository("repository-initial", True)
                 repo_file.write_text(repo_config.replace("enabled=1", "enabled=0"))
@@ -1616,6 +1717,6 @@ assert inventory() == before
 report = dict(binaries=binaries, checks=checks, total=len(checks),
               passed=sum(entry["passed"] for entry in checks), host_unchanged=True)
 print(json.dumps(report))
-expected_checks = 303 if consent_oracle is None else 602
+expected_checks = 303 if consent_oracle is None else 648
 if report["passed"] != report["total"] or report["total"] != expected_checks:
     sys.exit(4)
