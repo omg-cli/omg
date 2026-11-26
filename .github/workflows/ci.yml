@@ -1244,16 +1244,18 @@ jobs:
           python3 scripts/native-build-artifact.py build --distro "$DISTRO" \
             --image "$BUILD_IMAGE" --features "$BUILD_FEATURES" --destination "$RUNNER_TEMP/native-release"
 
-      - name: Verify Fedora release binary with distro smoke checks
-        if: matrix.phase == 'validation' && matrix.platform == 'fedora'
+      - name: Verify release binary with distro smoke checks
+        if: matrix.phase == 'validation' && (matrix.platform == 'fedora' || matrix.platform == 'arch')
         shell: bash
+        env:
+          DISTRO: ${{ matrix.platform }}
         run: |
           set -euo pipefail
           expected=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["binaries"]["omg"])' \
             "$RUNNER_TEMP/native-release/native-build.json")
           [[ "$expected" =~ ^[0-9a-f]{64}$ ]]
           printf '%s  %s\n' "$expected" ./target/release/omg | sha256sum --strict --check -
-          bash scripts/distro-e2e.sh fedora ./target/release/omg --metadata-ready
+          bash scripts/distro-e2e.sh "$DISTRO" ./target/release/omg --metadata-ready
 
       - name: Build Ubuntu 26.04 validation binary
         if: matrix.phase == 'validation' && matrix.platform == 'ubuntu-2604'

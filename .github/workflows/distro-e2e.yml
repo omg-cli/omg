@@ -67,11 +67,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - distro: arch
-            arch: x86_64
-            runner: ubuntu-24.04
-            image: archlinux:latest@sha256:f3691b4dde62ba4c4b6f0ae2c1fbf28e8c0c8c4b9a35c7e06dc1f70e21aa29f6
-            features: "arch,pgp,license"
           - distro: debian
             arch: x86_64
             runner: ubuntu-24.04
@@ -200,19 +195,26 @@ jobs:
         shell: bash
         run: sccache --show-stats || true
 
-  # Source changes run the Fedora x86_64 smoke checks in the required native CI job.
-  fedora-x86-standalone:
-    name: "Distro E2E (fedora / x86_64)"
+  # Source changes run Arch and Fedora x86_64 smoke checks in required native CI.
+  native-x86-standalone:
+    name: "Distro E2E (${{ matrix.distro }} / x86_64)"
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     container:
-      image: fedora:latest@sha256:6c75d5bf57cb0fa5aa4b92c6a83c86c791644496d9ac230de7711f5b8ec3b898
+      image: ${{ matrix.image }}
     strategy:
+      fail-fast: false
       matrix:
-        distro: [fedora]
-        arch: [x86_64]
-        features: ["fedora,pgp,license"]
+        include:
+          - distro: arch
+            arch: x86_64
+            image: archlinux:latest@sha256:f3691b4dde62ba4c4b6f0ae2c1fbf28e8c0c8c4b9a35c7e06dc1f70e21aa29f6
+            features: "arch,pgp,license"
+          - distro: fedora
+            arch: x86_64
+            image: fedora:latest@sha256:6c75d5bf57cb0fa5aa4b92c6a83c86c791644496d9ac230de7711f5b8ec3b898
+            features: "fedora,pgp,license"
     steps: *distro-smoke-steps
 
   systemd-daemon-e2e:
