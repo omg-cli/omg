@@ -370,6 +370,10 @@ incremental = false
 [profile.ci.package."*"]
 opt-level = 0
 
+# Root CI fixtures hash the test binary in both the parent and unprivileged child.
+[profile.ci.package."sha2:0.10.9"]
+opt-level = 2
+
 # ----------------------------------------------------------------------------
 # Feature policy
 #

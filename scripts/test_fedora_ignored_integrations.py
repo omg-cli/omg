@@ -2,6 +2,7 @@ import configparser
 import importlib.util
 import json
 from pathlib import Path
+import tempfile
 import unittest
 
 
@@ -11,6 +12,22 @@ SPEC.loader.exec_module(SUBJECT)
 
 
 class FedoraIgnoredIntegrationTests(unittest.TestCase):
+    def test_libtest_admission_uses_the_selected_cargo_profile(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory).resolve() / 'target'
+            binaries = {}
+            for profile, output in (('test', 'debug'), ('ci', 'ci')):
+                binary = target / output / 'deps' / 'omg_lib-fixture'
+                binary.parent.mkdir(parents=True)
+                binary.write_bytes(b'fixture')
+                binaries[profile] = binary
+                self.assertEqual(SUBJECT.libtest_path(binary, target, profile), binary)
+            for profile, other in (('test', 'ci'), ('ci', 'test')):
+                with self.subTest(profile=profile), self.assertRaisesRegex(ValueError, 'Unsafe libtest location'):
+                    SUBJECT.libtest_path(binaries[other], target, profile)
+            with self.assertRaisesRegex(ValueError, 'Unsafe libtest location'):
+                SUBJECT.libtest_path(target / 'ci/deps/missing', target, 'ci')
+
     def test_existing_libtest_artifact_keeps_dependency_feature_closure(self):
         manifest = dict(features=dict(fedora=['rusqlite'], pgp=['sequoia-openpgp'], license=[]),
                         dependencies={'rusqlite': {'optional': True}, 'sequoia-openpgp': {'optional': True}})

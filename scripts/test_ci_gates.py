@@ -111,7 +111,8 @@ class NativePhaseMatrixTests(unittest.TestCase):
                 self.assertIn(f"        if: {condition}\n", self.steps[name])
         clippy = self.steps["Platform clippy"]
         self.assertIn("cargo clippy --all-targets --no-default-features --features ${{ matrix.features }} \\\n"
-                      '            "${cargo_source[@]}" --locked -- -D warnings', clippy)
+                      '            "${cargo_source[@]}" --profile ', clippy)
+        self.assertIn("${{ matrix.platform == 'debian' && 'dev' || 'ci' }} --locked -- -D warnings", clippy)
         self.assertIn("if [ '${{ matrix.platform }}' = debian ]; then\n", clippy)
         self.assertIn('cargo_source=(--config "$RUNNER_TEMP/omg-alpm-source/cargo-config.toml")', clippy)
         for name, command in {
@@ -121,6 +122,11 @@ class NativePhaseMatrixTests(unittest.TestCase):
             "Prepare sandbox regression executable": "cargo test --lib --no-run --no-default-features --features arch,pgp,license",
         }.items():
             self.assertIn(command, self.steps[name])
+        self.assertIn("--cargo-profile ${{ matrix.platform == 'debian' && 'test' || 'ci' }}", self.steps["Run unit tests"])
+        serial = self.steps["Run serial library and binary contracts"]
+        self.assertIn("--profile ci --locked --no-fail-fast --message-format=json", serial)
+        self.assertIn("--profile ${{ matrix.platform == 'debian' && 'test' || 'ci' }}", serial)
+        self.assertIn("${{ github.workspace }}/target/ci/omg", self.steps["Test emitted shell hooks"])
         self.assertIn("name: native-release-${{ matrix.platform }}-${{ github.run_attempt }}", self.steps["Upload native release pair"])
         self.assertIn("name: cli-surfaces-${{ matrix.platform }}", self.steps["Preserve compiled parser surfaces"])
 
@@ -132,6 +138,12 @@ class NativePhaseMatrixTests(unittest.TestCase):
         self.assertIn('python3 scripts/check-alpm-pins.py --prepare-cargo-source "$source"', prepare)
         self.assertIn('cat "$source/cargo-config.toml"', prepare)
         self.assertIn('} >> "$config"', prepare)
+
+    def test_native_profiles_keep_existing_compatible_cache_names(self) -> None:
+        self.assertIn("          prefix-key: v2-platform-dependencies\n", self.steps["Cache Rust dependencies"])
+        ubuntu = job_block(self.workflow, "ubuntu")
+        cache = ubuntu.split("      - name: Setup cache\n", 1)[1].split("\n      - name:", 1)[0]
+        self.assertIn('          prefix-key: "v1-ubuntu-debian"\n', cache)
 
     def test_cache_keeps_compatibility_hash_without_run_specific_diagnostics_or_extra_writers(self) -> None:
         cache = self.steps["Cache Rust dependencies"]
@@ -454,6 +466,7 @@ class FedoraSetupSourceTests(unittest.TestCase):
                     (root / "python3").write_text(
                         f"#!{sys.executable}\n"
                         "import os,sys\nfrom pathlib import Path\nfrom types import SimpleNamespace\n"
+                        "assert sys.argv[sys.argv.index('--cargo-profile')+1] == 'ci'\n"
                         "args=SimpleNamespace(evidence_dir=Path(sys.argv[sys.argv.index('--evidence-dir')+1]))\n"
                         + allocation_source + "\n"
                         "Path(os.environ['HELPER_CALL']).write_text(str(out))\n"

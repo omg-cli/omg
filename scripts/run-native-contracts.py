@@ -439,6 +439,7 @@ def staged_units(features, directory):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--features', required=True)
+    parser.add_argument('--cargo-profile', choices=('ci', 'test'), help='Cargo compilation profile')
     parser.add_argument('--staged-units', action='store_true')
     parser.add_argument('--output', type=Path)
     args = parser.parse_args()
@@ -468,6 +469,8 @@ def main():
             os.environ[runner_key] = 'bash scripts/native-test-runner.sh'
         COVERAGE.strings(features)
         cargo_args = cargo_test_args(args.features)
+        if args.cargo_profile:
+            cargo_args.extend(('--cargo-profile', args.cargo_profile))
         recipe = {
             'source_sha': source, 'args': cargo_args,
             'rustc': command_output(['rustc', '-vV']),
