@@ -122,11 +122,18 @@ class OptimizationContracts(unittest.TestCase):
         configure = workflow.split('      - name: Configure signed Ubuntu archive\n', 1)[1]
         archive_step, install = configure.split('      - name: Install Python workflow test dependencies\n', 1)
         install_step = install.split('      - name:', 1)[0]
-        gate = "if: github.event_name == 'push' || needs.quick-gate.outputs.checks-required == 'true'"
+        gate = "if: matrix.shard == 0 && (github.event_name == 'push' || needs.quick-gate.outputs.checks-required == 'true')"
         self.assertIn('uses: ./.github/actions/ubuntu-apt', archive_step)
         self.assertIn(gate, archive_step)
         self.assertIn(gate, install_step)
         self.assertIn('sudo apt-get install -y --no-install-recommends python3-venv', install_step)
+        rust_step = workflow.split('      - name: Install Rust\n', 1)[1].split('\n      - name:', 1)[0]
+        self.assertIn(gate, rust_step)
+        checkout = workflow.split('    steps:\n', 1)[1].split('\n      - name:', 1)[0]
+        self.assertIn("fetch-depth: ${{ matrix.shard == 0 && '0' || '1' }}", checkout)
+        execute = workflow.split('      - name: Execute complete helper shard\n', 1)[1].split('\n      - name:', 1)[0]
+        self.assertIn("if: github.event_name == 'push' || needs.quick-gate.outputs.checks-required == 'true'", execute)
+        self.assertIn('--shard "${{ matrix.shard }}" --shards 2', execute)
 
     @unittest.skipUnless(os.name != 'nt' and shutil.which('jq'), 'Hosted Inspector proof uses Bash and jq')
     def test_inspector_contracts_require_the_event_checkout_before_running(self):

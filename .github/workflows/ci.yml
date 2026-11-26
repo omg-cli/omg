@@ -102,7 +102,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          fetch-depth: 0
+          fetch-depth: ${{ matrix.shard == 0 && '0' || '1' }}
 
       - name: Test workflow guards on docs-only changes
         if: matrix.shard == 0 && github.event_name != 'push' && needs.quick-gate.outputs.checks-required != 'true'
@@ -121,18 +121,18 @@ jobs:
         run: python3 scripts/debt-ratchet.py --ci
 
       - name: Install Rust
-        if: github.event_name == 'push' || needs.quick-gate.outputs.checks-required == 'true'
+        if: matrix.shard == 0 && (github.event_name == 'push' || needs.quick-gate.outputs.checks-required == 'true')
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           toolchain: "1.95.0"
           components: rustfmt
 
       - name: Configure signed Ubuntu archive
-        if: github.event_name == 'push' || needs.quick-gate.outputs.checks-required == 'true'
+        if: matrix.shard == 0 && (github.event_name == 'push' || needs.quick-gate.outputs.checks-required == 'true')
         uses: ./.github/actions/ubuntu-apt
 
       - name: Install Python workflow test dependencies
-        if: github.event_name == 'push' || needs.quick-gate.outputs.checks-required == 'true'
+        if: matrix.shard == 0 && (github.event_name == 'push' || needs.quick-gate.outputs.checks-required == 'true')
         run: sudo apt-get install -y --no-install-recommends python3-venv
 
       - name: Install Worker runtime
