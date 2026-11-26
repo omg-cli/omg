@@ -7,6 +7,7 @@
 
 #[cfg(unix)]
 use nix::libc;
+use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
@@ -682,9 +683,18 @@ impl AuditLogger {
 
     /// Get recent audit entries. A missing log is empty; a corrupt line is an error.
     pub fn get_recent(&self, limit: usize) -> Result<Vec<AuditEntry>, AuditError> {
-        let mut entries = read_all_entries(&self.log_path)?;
+        self.get_recent_filtered(limit, None)
+    }
+
+    pub(crate) fn get_recent_filtered(
+        &self,
+        limit: usize,
+        min_severity: Option<AuditSeverity>,
+    ) -> Result<Vec<AuditEntry>, AuditError> {
+        let mut entries = read_entries(&self.log_path, limit, |entry| {
+            min_severity.is_none_or(|minimum| entry.severity >= minimum)
+        })?;
         entries.reverse();
-        entries.truncate(limit);
         Ok(entries)
     }
 
@@ -693,11 +703,9 @@ impl AuditLogger {
         &self,
         min_severity: AuditSeverity,
     ) -> Result<Vec<AuditEntry>, AuditError> {
-        let entries = read_all_entries(&self.log_path)?;
-        Ok(entries
-            .into_iter()
-            .filter(|e| e.severity >= min_severity)
-            .collect())
+        read_entries(&self.log_path, usize::MAX, |entry| {
+            entry.severity >= min_severity
+        })
     }
 }
 
@@ -859,19 +867,34 @@ fn with_audit_read_lock<T>(
     }
 }
 
-/// Read every JSONL entry. Missing files are empty; IO and parse failures are errors.
+#[cfg(test)]
 fn read_all_entries(path: &Path) -> Result<Vec<AuditEntry>, AuditError> {
-    with_audit_read_lock(path, || read_all_entries_unlocked(path))
+    read_entries(path, usize::MAX, |_| true)
 }
 
-fn read_all_entries_unlocked(path: &Path) -> Result<Vec<AuditEntry>, AuditError> {
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
+/// Read the latest matching entries in file order while parsing every line.
+fn read_entries(
+    path: &Path,
+    limit: usize,
+    matches: impl Fn(&AuditEntry) -> bool,
+) -> Result<Vec<AuditEntry>, AuditError> {
+    with_audit_read_lock(path, || read_entries_unlocked(path, limit, matches))
+}
 
+fn read_entries_unlocked(
+    path: &Path,
+    limit: usize,
+    matches: impl Fn(&AuditEntry) -> bool,
+) -> Result<Vec<AuditEntry>, AuditError> {
+    let file = match open_read_file(path) {
+        Ok(file) => file,
+        Err(AuditError::Open { source, .. }) if source.kind() == io::ErrorKind::NotFound => {
+            return Ok(Vec::new());
+        }
+        Err(error) => return Err(error),
+    };
     let path_str = path.display().to_string();
-    let file = open_read_file(path)?;
-    let mut entries = Vec::new();
+    let mut entries = VecDeque::new();
     for (index, line) in BufReader::new(file).lines().enumerate() {
         let line = line.map_err(|source| AuditError::Read {
             path: path_str.clone(),
@@ -887,9 +910,14 @@ fn read_all_entries_unlocked(path: &Path) -> Result<Vec<AuditEntry>, AuditError>
                 source,
             }
         })?;
-        entries.push(entry);
+        if limit != 0 && matches(&entry) {
+            if entries.len() == limit {
+                entries.pop_front();
+            }
+            entries.push_back(entry);
+        }
     }
-    Ok(entries)
+    Ok(entries.into())
 }
 
 fn get_last_hash(path: &Path) -> Result<String, AuditError> {
@@ -1805,6 +1833,28 @@ mod tests {
             matches!(err, AuditError::CorruptLine { line: 1, .. }),
             "got: {err}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn limited_reader_refuses_a_dangling_audit_log() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let log_path = directory.path().join("audit.jsonl");
+        let logger = AuditLogger::new_in(&log_path)?;
+        std::os::unix::fs::symlink("absent-audit-file", &log_path)?;
+
+        for result in [
+            logger.get_recent(1),
+            logger.filter_by_severity(AuditSeverity::Warning),
+        ] {
+            let error = result.expect_err("dangling audit log must be rejected");
+            assert!(
+                matches!(&error, AuditError::Open { source, .. }
+                    if source.raw_os_error() == Some(libc::ELOOP)),
+                "unexpected audit read error: {error:?}"
+            );
+        }
+        Ok(())
     }
 
     #[test]

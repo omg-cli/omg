@@ -611,35 +611,35 @@ exec {shlex.quote(str(native_executable))} "$@"
 
 
 
+    def audit_fixture_segment(tag, count, *, legacy=False, broken_link=False, severities=None):
+        previous = "genesis"
+        rows = []
+        for sequence in range(count):
+            row = dict(id=f"{tag}-{sequence}", timestamp=f"2026-01-01T12:00:0{sequence}Z",
+                       event_type="policy_violation", severity=severities[sequence] if severities is not None else "info", user="fixture",
+                       resource=f"{tag}-{sequence}", description=f"Inventory event {sequence}", prev_hash=previous)
+            if broken_link and sequence == 1:
+                row["prev_hash"] = "unlinked"
+            parts = [row["id"], row["timestamp"], "PolicyViolation", row["severity"].capitalize(),
+                     row["user"], row["resource"], row["description"]]
+            if legacy:
+                preimage = "".join([*parts, row["prev_hash"]]).encode()
+            else:
+                row["hash_version"] = 1
+                fields = [value.encode() for value in (*parts, "", row["prev_hash"])]
+                preimage = bytes((255, 1)) + b"".join(len(value).to_bytes(8, "big") + value for value in fields)
+            row["hash"] = hashlib.sha256(preimage).hexdigest()
+            previous = row["hash"]
+            rows.append(row)
+        return rows
+
+    def write_audit_fixture_segment(path, rows):
+        path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+        path.chmod(0o600)
+        os.chown(path, account.pw_uid, account.pw_gid)
+
     def inspect_audit_segments():
         phase = "audit-segment-verification"
-
-        def segment(tag, count, *, legacy=False, broken_link=False):
-            previous = "genesis"
-            rows = []
-            for sequence in range(count):
-                row = dict(id=f"{tag}-{sequence}", timestamp=f"2026-01-01T12:00:0{sequence}Z",
-                           event_type="policy_violation", severity="info", user="fixture",
-                           resource="test-package", description="Known inventory event", prev_hash=previous)
-                if broken_link and sequence == 1:
-                    row["prev_hash"] = "unlinked"
-                parts = [row["id"], row["timestamp"], "PolicyViolation", "Info",
-                         row["user"], row["resource"], row["description"]]
-                if legacy:
-                    preimage = "".join([*parts, row["prev_hash"]]).encode()
-                else:
-                    row["hash_version"] = 1
-                    fields = [value.encode() for value in (*parts, "", row["prev_hash"])]
-                    preimage = bytes((255, 1)) + b"".join(len(value).to_bytes(8, "big") + value for value in fields)
-                row["hash"] = hashlib.sha256(preimage).hexdigest()
-                previous = row["hash"]
-                rows.append(row)
-            return rows
-
-        def write_segment(path, rows):
-            path.write_text("".join(json.dumps(row) + "\n" for row in rows))
-            path.chmod(0o600)
-            os.chown(path, account.pw_uid, account.pw_gid)
 
         cases = [(index, kind) for index in range(1, 6) for kind in
                  ("valid", "archive-only", "invalid-digest", "invalid-link", "invalid-json", "invalid-file", "incomplete")]
@@ -656,19 +656,19 @@ exec {shlex.quote(str(native_executable))} "$@"
             active = directory / "audit.jsonl"
             archive = directory / f"audit.jsonl.{index}"
             if kind not in ("empty", "archive-only"):
-                write_segment(active, segment("active", 1))
+                write_audit_fixture_segment(active, audit_fixture_segment("active", 1))
             if kind == "invalid-file":
                 archive.mkdir()
             elif kind != "empty":
-                rows = segment(f"archive-{index}", 2, legacy=index % 2 == 1, broken_link=kind == "invalid-link")
+                rows = audit_fixture_segment(f"archive-{index}", 2, legacy=index % 2 == 1, broken_link=kind == "invalid-link")
                 if kind == "invalid-digest":
                     rows[1]["description"] = "Unexpected inventory event"
-                write_segment(archive, rows)
+                write_audit_fixture_segment(archive, rows)
                 if kind == "invalid-json":
                     with archive.open("ab") as file:
                         file.write(b"{incomplete record\n")
             if kind == "multiple-segments":
-                write_segment(directory / "audit.jsonl.1", segment("second-segment", 1))
+                write_audit_fixture_segment(directory / "audit.jsonl.1", audit_fixture_segment("second-segment", 1))
             if kind == "incomplete":
                 (directory / "incomplete").touch()
             before = {path.name: path.read_bytes() for path in directory.iterdir() if path.is_file()}
@@ -699,6 +699,72 @@ exec {shlex.quote(str(native_executable))} "$@"
             assert before == after, (index, kind)
             checks.append(dict(phase=phase, case=f"{index}-{kind}", passed=correct, status=result.returncode,
                                diagnostic=(result.stdout + result.stderr)[-1200:]))
+
+
+    def inspect_audit_log_selection():
+        import csv
+
+        severities = ("debug", "error", "info", "critical", "warning", "error", "info", "critical")
+        entries = audit_fixture_segment("selection", len(severities), severities=severities)
+        cases = (
+            ("text-all", ["--limit", "40"], range(7, -1, -1), None),
+            ("text-zero", ["--limit", "0"], [], None),
+            ("text-two", ["--limit", "2"], [7, 6], None),
+            ("text-error", ["--severity", "error"], [7, 5, 3, 1], None),
+            ("text-warn-two", ["--severity", "warning", "--limit", "2"], [7, 5], None),
+            ("text-critical-one", ["--severity", "critical", "--limit", "1"], [7], None),
+            ("json-all", [], range(7, -1, -1), "json"),
+            ("json-zero", ["--limit", "0"], [], "json"),
+            ("json-error-two", ["--severity", "error", "--limit", "2"], [7, 5], "json"),
+            ("json-critical-all", ["--severity", "critical"], [7, 3], "json"),
+            ("csv-three", ["--limit", "3"], [7, 6, 5], "csv"),
+            ("csv-warn-all", ["--severity", "warning"], [7, 5, 4, 3, 1], "csv"),
+        )
+        for kind in ("valid", "missing", "corrupt-prefix"):
+            data = Path(tempfile.mkdtemp(prefix=f"audit-log-selection-{kind}-", dir=work))
+            os.chown(data, account.pw_uid, account.pw_gid)
+            directory = data / "audit"
+            directory.mkdir(mode=0o700)
+            os.chown(directory, account.pw_uid, account.pw_gid)
+            active = directory / "audit.jsonl"
+            if kind != "missing":
+                write_audit_fixture_segment(active, entries)
+            if kind == "corrupt-prefix":
+                active.write_bytes(b"{incomplete event\n" + active.read_bytes())
+            prior = active.read_bytes() if active.exists() else None
+            mode = dict(disabled, OMG_DATA_DIR=str(data))
+            for label, args, indices, extension in cases:
+                export = data / f"{label}.{extension}" if extension is not None else None
+                flags = [*args, "--export", export] if export is not None else args
+                result = command([cli, "audit", "log", *flags], mode, ordinary)
+                expected = [entries[index] for index in indices] if kind == "valid" else []
+                try:
+                    if kind == "corrupt-prefix":
+                        correct = (result.returncode == 1 and "Corrupt audit log" in result.stderr
+                                   and "No audit entries found." not in result.stdout
+                                   and (export is None or not export.exists()))
+                    elif extension == "json":
+                        assert stat.S_IMODE(export.stat().st_mode) == 0o600
+                        correct = result.returncode == 0 and json.loads(export.read_text()) == expected
+                    elif extension == "csv":
+                        assert stat.S_IMODE(export.stat().st_mode) == 0o600
+                        with export.open() as stream:
+                            actual = list(csv.reader(stream))
+                        header = ["Timestamp", "Severity", "Event", "Description", "Resource"]
+                        expected_csv = [header] + [[item["timestamp"], item["severity"].upper(),
+                                                    "PolicyViolation", item["description"], item["resource"]]
+                                                   for item in expected]
+                        correct = result.returncode == 0 and actual == expected_csv
+                    else:
+                        actual = re.findall(r"(?m)^\s*Resource: (selection-\d+)\s*$", result.stdout)
+                        correct = (result.returncode == 0 and actual == [item["resource"] for item in expected]
+                                   and ("No audit entries found." in result.stdout) == (not expected))
+                except (AssertionError, OSError, ValueError):
+                    correct = False
+                assert (active.read_bytes() if active.exists() else None) == prior
+                checks.append(dict(phase="audit-log-selection", case=f"{kind}-{label}",
+                                   passed=correct, status=result.returncode,
+                                   diagnostic=(result.stdout + result.stderr)[-1200:]))
 
     def inspect_history_locks():
         phase = "history-lock"
@@ -1633,6 +1699,7 @@ exec {shlex.quote(str(binary))} "$@"
                 if consent_oracle is not None:
                     inspect_history_locks()
                     inspect_audit_segments()
+                    inspect_audit_log_selection()
                 config.write_text(alternate_config)
                 refresh_fixture()
                 expected = ordinary_control([dnf, "--cacheonly", "repoquery",
@@ -1950,6 +2017,6 @@ assert inventory() == before
 report = dict(binaries=binaries, checks=checks, total=len(checks),
               passed=sum(entry["passed"] for entry in checks), host_unchanged=True)
 print(json.dumps(report))
-expected_checks = 303 if consent_oracle is None else 762
+expected_checks = 303 if consent_oracle is None else 798
 if report["passed"] != report["total"] or report["total"] != expected_checks:
     sys.exit(4)

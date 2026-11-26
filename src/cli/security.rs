@@ -18,24 +18,20 @@ fn read_audit_entries(
     limit: usize,
     severity_filter: Option<&str>,
 ) -> Result<Vec<crate::core::security::audit::AuditEntry>> {
-    let result = if let Some(sev) = severity_filter {
-        let min_severity = match sev.to_lowercase().as_str() {
+    let min_severity = if let Some(sev) = severity_filter {
+        Some(match sev.to_lowercase().as_str() {
             "debug" => AuditSeverity::Debug,
             "info" => AuditSeverity::Info,
             "warning" | "warn" => AuditSeverity::Warning,
             "error" => AuditSeverity::Error,
             "critical" => AuditSeverity::Critical,
             _ => anyhow::bail!("Invalid severity: {sev}"),
-        };
-        logger.filter_by_severity(min_severity).map(|mut entries| {
-            entries.reverse();
-            entries
         })
     } else {
-        logger.get_recent(limit)
+        None
     };
-    match result {
-        Ok(entries) => Ok(entries.into_iter().take(limit).collect()),
+    match logger.get_recent_filtered(limit, min_severity) {
+        Ok(entries) => Ok(entries),
         Err(error) if error.is_not_found() => Ok(Vec::new()),
         Err(error) => Err(error).context("Failed to read audit log entries"),
     }
