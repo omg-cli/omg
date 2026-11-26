@@ -14,12 +14,9 @@
 //!   /swift-<version>-RELEASE-ubuntu24.04[-aarch64].tar.gz  # dotted distro, `.sig` sidecar
 //! ```
 //!
-//! Version discovery uses the `swiftlang/swift` GitHub Releases endpoint
-//! (newest first, no snapshot spam — the raw tags endpoint buries stable
-//! `swift-<X.Y[.Z]>-RELEASE` tags under thousands of
-//! `*-DEVELOPMENT-SNAPSHOT-*` tags). Entries flagged `prerelease` plus any
-//! tag that is not exactly `swift-<numeric>-RELEASE` (`PREVIEW`,
-//! `GM-CANDIDATE`, snapshots, branch junk) are excluded.
+//! The Swift.org release API lists the stable tags and their distribution
+//! and architecture builds. A release must have an exact host match before
+//! the manager fetches its detached signature and archive.
 //!
 //! Verification is fail-closed GPG: every tarball ships a detached
 //! `<tarball>.sig` sidecar verified with Sequoia-OpenPGP against a cached
@@ -32,20 +29,18 @@
 //! Layout: tarballs extract to `<top>/usr/bin/swift`, so the `usr/` tree is
 //! kept intact (strip 1 removes only the `<top>` directory). The parent must
 //! add `<versions>/swift/<version>/usr/bin` to `PATH`
-//! (`current/usr/bin` once activated). Scope is Ubuntu-only: Swift.org
-//! publishes `ubuntu2204`/`ubuntu2404` builds, so any other host bails with
-//! a clear message instead of downloading an incompatible toolchain.
+//! (`current/usr/bin` once activated). Supported Linux targets are Ubuntu
+//! 22.04 and 24.04 and Fedora 39 and 41 when the release advertises that build.
 
 use anyhow::{Context, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use super::common::{
-    GithubRelease, activate_version_with_linked_binary, begin_staged_install,
-    complete_staged_install, download_to_temp_for_signature, extract_tar_gz_with_budget,
-    fetch_github_releases, is_valid_version_dir, normalize_version, print_already_installed,
-    print_installed, print_using, remove_file_best_effort, uninstall_version,
-    validate_download_filename,
+    activate_version_with_linked_binary, begin_staged_install, complete_staged_install,
+    download_to_temp_for_signature, extract_tar_gz_with_budget, is_valid_version_dir,
+    normalize_version, print_already_installed, print_installed, print_using,
+    remove_file_best_effort, uninstall_version, validate_download_filename,
 };
 
 // Published at https://www.swift.org/keys/active/. Keep this list explicit so
@@ -56,14 +51,12 @@ const SWIFT_SIGNING_FINGERPRINTS: &[&str] = &[
     "A62AE125BBBFBB96A6E042EC925CC1CCED3D1561", // Swift 5.x releases
     "52BB7E3DE28A71BE22EC05FFEF80A866B47A981F", // Swift 6.x releases
 ];
+use crate::cli::style;
+use crate::core::http::{BoundedResponseExt, download_client};
 #[cfg(feature = "pgp")]
 use crate::core::security::pgp::PgpVerifier;
-use crate::{cli::style, core::http::download_client};
 
-/// GitHub Releases endpoint for version discovery (newest first).
-const SWIFT_RELEASES_URL: &str = "https://api.github.com/repos/swiftlang/swift/releases";
-const SWIFT_LIST_PER_PAGE: u32 = 100;
-const SWIFT_LIST_MAX_PAGES: u32 = 5;
+const SWIFT_RELEASES_URL: &str = "https://www.swift.org/api/v1/install/releases.json";
 
 /// Official Swift release-signing keyring (same URL the swiftly install docs
 /// pipe into `gpg --import`).
@@ -80,6 +73,11 @@ const SWIFT_BINARY: &str = "usr/bin/swift";
 // TAR headers and padding. This finite SDK-specific budget is available only
 // after the existing pinned vendor-signature verification succeeds.
 const MAX_SWIFT_DECOMPRESSED_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
+// Swift 6.4.3 SDK archives exceed the shared 1 GiB transfer limit. Detached
+// signatures are much smaller and have their own limit before any SDK transfer.
+const MAX_SWIFT_ARCHIVE_BYTES: u64 = 1280 * 1024 * 1024;
+const MAX_SWIFT_SIGNATURE_BYTES: u64 = 64 * 1024;
 
 /// A stable upstream Swift release. `prerelease` is always false today (the
 /// parser drops prerelease entries); the field mirrors sibling managers so a
@@ -99,16 +97,46 @@ pub(crate) struct SwiftManager {
     client: &'static reqwest::Client,
 }
 
-/// Map `/etc/os-release` identity to a Swift.org Ubuntu build. Swift.org only
-/// publishes `ubuntu2204`/`ubuntu2404` toolchains, so anything else —
-/// other Ubuntu series, Debian, Fedora, Arch — has no compatible build and
-/// maps to `None` instead of a closest guess.
-fn map_os_release(distro_id: &str, version_id: &str) -> Option<&'static str> {
-    match (distro_id, version_id) {
-        ("ubuntu", "22.04") => Some("22.04"),
-        ("ubuntu", "24.04") => Some("24.04"),
-        _ => None,
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SwiftDistribution {
+    name: &'static str,
+    directory: &'static str,
+    filename: &'static str,
+}
+
+#[derive(Clone, Copy)]
+struct SwiftHost {
+    distribution: SwiftDistribution,
+    arch: &'static str,
+}
+
+#[derive(serde::Deserialize)]
+struct SwiftRelease {
+    name: String,
+    tag: String,
+    platforms: Vec<ReleasePlatform>,
+}
+
+#[derive(serde::Deserialize)]
+struct ReleasePlatform {
+    name: String,
+    platform: String,
+    archs: Vec<String>,
+}
+
+fn map_os_release(distro_id: &str, version_id: &str) -> Option<SwiftDistribution> {
+    let (name, directory, filename) = match (distro_id, version_id) {
+        ("ubuntu", "22.04") => ("Ubuntu 22.04", "ubuntu2204", "ubuntu22.04"),
+        ("ubuntu", "24.04") => ("Ubuntu 24.04", "ubuntu2404", "ubuntu24.04"),
+        ("fedora", "39") => ("Fedora 39", "fedora39", "fedora39"),
+        ("fedora", "41") => ("Fedora 41", "fedora41", "fedora41"),
+        _ => return None,
+    };
+    Some(SwiftDistribution {
+        name,
+        directory,
+        filename,
+    })
 }
 
 /// Parse one `ID=`/`VERSION_ID=` field out of os-release content.
@@ -121,50 +149,46 @@ fn os_release_field(content: &str, key: &str) -> String {
         .unwrap_or_default()
 }
 
-/// Detect the Swift.org Ubuntu build for this host, bailing on anything
-/// without a published toolchain.
-fn ubuntu_release() -> Result<String> {
-    if std::env::consts::OS != "linux" {
-        anyhow::bail!(
-            "Unsupported operating system for Swift: {} (Swift toolchains are Ubuntu 22.04/24.04 Linux builds)",
-            std::env::consts::OS
-        );
-    }
+fn swift_host() -> Result<SwiftHost> {
+    anyhow::ensure!(
+        std::env::consts::OS == "linux",
+        "Unsupported operating system for Swift: {} (OMG installs Swift.org Linux toolchains)",
+        std::env::consts::OS
+    );
     let content = fs::read_to_string("/etc/os-release").unwrap_or_default();
     let distro = os_release_field(&content, "ID");
     let release = os_release_field(&content, "VERSION_ID");
-    map_os_release(&distro, &release).map(str::to_string).with_context(|| {
+    let distribution = map_os_release(&distro, &release).with_context(|| {
         format!(
-            "Unsupported Linux distribution for Swift: {distro} {release} (Swift.org publishes Ubuntu 22.04 and 24.04 toolchains only)"
+            "Unsupported Linux distribution for Swift: {distro} {release} (OMG uses published Ubuntu 22.04/24.04 and Fedora 39/41 builds)"
         )
-    })
+    })?;
+    let arch = std::env::consts::ARCH;
+    anyhow::ensure!(
+        matches!(arch, "x86_64" | "aarch64"),
+        "Unsupported architecture for Swift: {arch}"
+    );
+    Ok(SwiftHost { distribution, arch })
 }
 
-/// Arch suffix shared by the directory slug (`ubuntu2404-aarch64`) and the
-/// file slug (`ubuntu24.04-aarch64`); x86_64 builds carry no suffix.
-fn host_arch_suffix() -> Result<&'static str> {
-    match std::env::consts::ARCH {
-        "x86_64" => Ok(""),
-        "aarch64" => Ok("-aarch64"),
-        arch => anyhow::bail!(
-            "Unsupported architecture for Swift: {arch} (Swift.org publishes x86_64 and aarch64 toolchains only)"
-        ),
-    }
-}
-
-/// Tarball download URL for one version on this host. Note the slug quirks:
-/// the release dir is lowercase (`swift-6.3.3-release`), the tag dir is
-/// uppercase (`swift-6.3.3-RELEASE`), the distro dir is dotless
-/// (`ubuntu2404`) while the file slug is dotted (`ubuntu24.04`).
-fn tarball_url(version: &str, ubuntu: &str, arch_suffix: &str) -> String {
-    let compact = ubuntu.replace('.', "");
+fn tarball_url(version: &str, host: SwiftHost) -> String {
+    let SwiftDistribution {
+        directory,
+        filename,
+        ..
+    } = host.distribution;
+    let suffix = if host.arch == "aarch64" {
+        "-aarch64"
+    } else {
+        ""
+    };
     format!(
-        "{SWIFT_DOWNLOAD_BASE}/swift-{version}-release/ubuntu{compact}{arch_suffix}\
-         /swift-{version}-RELEASE/swift-{version}-RELEASE-ubuntu{ubuntu}{arch_suffix}.tar.gz"
+        "{SWIFT_DOWNLOAD_BASE}/swift-{version}-release/{directory}{suffix}\
+         /swift-{version}-RELEASE/swift-{version}-RELEASE-{filename}{suffix}.tar.gz"
     )
 }
 
-/// Whether a GitHub release tag is a stable Swift release. Only
+/// Whether a publisher release tag identifies a stable Swift release. Only
 /// `swift-<two or three numeric components>-RELEASE` qualifies; snapshots,
 /// previews, GM candidates, and branch junk are rejected.
 fn parse_release_tag(tag: &str) -> Option<String> {
@@ -180,15 +204,21 @@ fn is_stable_version(version: &str) -> bool {
             .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
-/// Filter GitHub releases down to stable versions, newest first.
-fn parse_swift_versions(releases: &[GithubRelease]) -> Vec<SwiftVersion> {
+fn parse_swift_versions(releases: &[SwiftRelease], host: SwiftHost) -> Vec<SwiftVersion> {
     let mut versions: Vec<SwiftVersion> = releases
         .iter()
-        .filter(|release| !release.prerelease)
+        .filter(|release| {
+            release.platforms.iter().any(|platform| {
+                platform.platform == "Linux"
+                    && platform.name == host.distribution.name
+                    && platform.archs.iter().any(|arch| arch == host.arch)
+            })
+        })
         .filter_map(|release| {
-            parse_release_tag(&release.tag_name).map(|version| SwiftVersion {
+            let version = parse_release_tag(&release.tag)?;
+            (version == release.name).then_some(SwiftVersion {
                 version,
-                prerelease: release.prerelease,
+                prerelease: false,
             })
         })
         .collect();
@@ -196,14 +226,27 @@ fn parse_swift_versions(releases: &[GithubRelease]) -> Vec<SwiftVersion> {
         super::common::version_cmp(&right.version, &left.version)
             .then_with(|| left.version.cmp(&right.version))
     });
+    versions.dedup();
     versions
+}
+
+fn unavailable_release(version: &str, host: SwiftHost) -> String {
+    format!(
+        "Version {version} not found for Swift on {} {}. Check available versions with: omg list swift --available",
+        host.distribution.name, host.arch
+    )
 }
 
 /// Download into the install's private staging directory with the common
 /// bounded retry and validated range path. Integrity remains the caller's
 /// detached GPG verification before extraction.
-async fn download_file(client: &reqwest::Client, url: &str, dest: &Path) -> Result<()> {
-    download_to_temp_for_signature(client, url, dest)
+async fn download_file(
+    client: &reqwest::Client,
+    url: &str,
+    dest: &Path,
+    max_bytes: u64,
+) -> Result<()> {
+    download_to_temp_for_signature(client, url, dest, max_bytes)
         .await?
         .persist(dest)
         .map_err(|error| error.error)
@@ -293,61 +336,29 @@ impl SwiftManager {
 
     /// List available stable upstream releases (newest first).
     pub async fn list_available(&self) -> Result<Vec<SwiftVersion>> {
-        let releases = fetch_github_releases(
-            self.client,
-            SWIFT_RELEASES_URL,
-            SWIFT_LIST_PER_PAGE,
-            SWIFT_LIST_MAX_PAGES,
-            |_| false,
-        )
-        .await
-        .context("Failed to fetch Swift releases from GitHub")?;
-        Ok(parse_swift_versions(&releases))
+        self.list_for(swift_host()?).await
     }
 
-    /// Resolve `latest` against the upstream list. Exact versions pass
-    /// through so the installed fast path and the existing not-found UX are
-    /// preserved.
-    pub async fn resolve_alias(&self, alias: &str) -> Result<String> {
-        let alias = normalize_version(alias);
-        if alias == "latest" {
-            let versions = self.list_available().await?;
-            versions
-                .first()
-                .map(|version| version.version.clone())
-                .context("No Swift versions found upstream")
-        } else {
-            Ok(alias)
-        }
-    }
-
-    /// Resolve a partial version request (`6`, `6.3`) to the newest matching
-    /// upstream release before any tarball URL is built.
-    async fn resolve_requested_version(&self, version: &str) -> Result<String> {
-        if !super::common::is_partial_version(version) {
-            return Ok(version.to_owned());
-        }
-        let available = self.list_available().await?;
-        let names: Vec<String> = available
-            .iter()
-            .map(|version| version.version.clone())
-            .collect();
-        Ok(super::resolve_version_request(&names, version))
-    }
-
-    /// Refuse versions Swift.org never published before downloading ~1 GiB.
-    async fn ensure_known_version(&self, version: &str) -> Result<()> {
-        let available = self.list_available().await?;
-        if available
-            .iter()
-            .any(|candidate| candidate.version == version)
-        {
-            Ok(())
-        } else {
-            anyhow::bail!(
-                "Version {version} not found for Swift. Check available versions with: omg list swift --available"
-            )
-        }
+    async fn list_for(&self, host: SwiftHost) -> Result<Vec<SwiftVersion>> {
+        let response = self
+            .client
+            .get(SWIFT_RELEASES_URL)
+            .timeout(std::time::Duration::from_secs(30))
+            .send()
+            .await
+            .context("Failed to fetch releases from Swift.org")?
+            .error_for_status()
+            .context("Swift release catalog request failed")?;
+        anyhow::ensure!(
+            response.status() == reqwest::StatusCode::OK,
+            "Swift release catalog returned HTTP {}",
+            response.status()
+        );
+        let releases: Vec<SwiftRelease> = response
+            .bounded_json()
+            .await
+            .context("Failed to parse Swift release catalog")?;
+        Ok(parse_swift_versions(&releases, host))
     }
 
     /// Fetch the release-signing keyring, refreshing the cache on every
@@ -404,11 +415,35 @@ impl SwiftManager {
     /// Install the Swift toolchain from an official Swift.org tarball after
     /// fail-closed GPG verification.
     pub async fn install(&self, version: &str) -> Result<()> {
-        let version = self.resolve_alias(version).await?;
-        let version = self.resolve_requested_version(&version).await?;
-        crate::core::security::validate_runtime_version(&version)?;
-        let ubuntu = ubuntu_release()?;
-        let arch_suffix = host_arch_suffix()?;
+        let requested = normalize_version(version);
+        crate::core::security::validate_runtime_version(&requested)?;
+        let (version, resolved_host) =
+            if requested == "latest" || super::common::is_partial_version(&requested) {
+                let host = swift_host()?;
+                let releases = self.list_for(host).await?;
+                let version = if requested == "latest" {
+                    releases
+                        .into_iter()
+                        .next()
+                        .map(|release| release.version)
+                        .with_context(|| {
+                            format!(
+                                "No Swift releases found for {} {}",
+                                host.distribution.name, host.arch
+                            )
+                        })?
+                } else {
+                    let names: Vec<_> = releases
+                        .into_iter()
+                        .map(|release| release.version)
+                        .collect();
+                    super::common::resolve_partial_version(&names, &requested)
+                        .with_context(|| unavailable_release(&requested, host))?
+                };
+                (version, Some(host))
+            } else {
+                (requested, None)
+            };
         let _install_lease = super::common::try_lock_runtime_install(&self.versions_dir, &version)?;
         let version_dir = self.versions_dir.join(&version);
 
@@ -424,9 +459,25 @@ impl SwiftManager {
             style::caution(&version)
         );
 
-        self.ensure_known_version(&version).await?;
-
-        let url = tarball_url(&version, &ubuntu, arch_suffix);
+        anyhow::ensure!(
+            cfg!(feature = "pgp"),
+            "Swift installs require GPG signature verification, which needs the `pgp` cargo feature"
+        );
+        let host = if let Some(host) = resolved_host {
+            host
+        } else {
+            let host = swift_host()?;
+            anyhow::ensure!(
+                self.list_for(host)
+                    .await?
+                    .iter()
+                    .any(|release| release.version == version),
+                "{}",
+                unavailable_release(&version, host)
+            );
+            host
+        };
+        let url = tarball_url(&version, host);
         let sig_url = format!("{url}.sig");
         let filename = url
             .rsplit('/')
@@ -437,25 +488,18 @@ impl SwiftManager {
         let sig_filename = format!("{filename}.sig");
         validate_download_filename(&sig_filename)?;
 
+        let downloads = super::common::begin_download(&self.versions_dir)?;
+        let download_path = downloads.path().join(filename);
+        let sig_path = downloads.path().join(&sig_filename);
+        download_file(self.client, &sig_url, &sig_path, MAX_SWIFT_SIGNATURE_BYTES).await?;
+
         println!(
             "{} Fetching Swift release-signing keys...",
             style::informative("→")
         );
         let keyring = self.ensure_keyring().await?;
-
-        fs::create_dir_all(&self.versions_dir)?;
-
         println!("{} Downloading {filename}...", style::informative("→"));
-        let downloads = tempfile::Builder::new()
-            .prefix(".download-")
-            .tempdir_in(&self.versions_dir)?;
-        let download_path = downloads.path().join(filename);
-        let sig_path = downloads.path().join(&sig_filename);
-        download_file(self.client, &url, &download_path).await?;
-        if let Err(error) = download_file(self.client, &sig_url, &sig_path).await {
-            remove_file_best_effort(&download_path, "runtime archive");
-            return Err(error);
-        }
+        download_file(self.client, &url, &download_path, MAX_SWIFT_ARCHIVE_BYTES).await?;
 
         let staging =
             verify_and_extract_tarball(&keyring, &download_path, &sig_path, &self.versions_dir)
@@ -639,14 +683,16 @@ mod tests {
     async fn genuine_public_install_refuses_changed_signed_content() {
         use super::super::test_archive::{PublicationFixture, mutation_security};
         let version = "6.0.3";
-        assert_eq!(ubuntu_release().unwrap(), "24.04");
+        let host = swift_host().unwrap();
+        assert_eq!(host.distribution.name, "Ubuntu 24.04");
         let metadata = serde_json::to_vec(&serde_json::json!([{
-            "tag_name":"swift-6.0.3-RELEASE", "prerelease":false, "assets":[]
+            "name": version, "tag": "swift-6.0.3-RELEASE",
+            "platforms": [{"name": "Ubuntu 24.04", "platform": "Linux", "archs": [host.arch]}]
         }]))
         .unwrap();
         super::super::test_https::fixed_public_routes(&[(
-            "api.github.com",
-            "/repos/swiftlang/swift/releases?per_page=100&page=1",
+            "www.swift.org",
+            "/api/v1/install/releases.json",
             &metadata,
         )]);
         let directory = Path::new("/swift-authenticated-inputs");
@@ -658,11 +704,11 @@ mod tests {
         let plan_path = Path::new("/tmp/omg-runtime-public-fixture/routes.json");
         let mut plan: Vec<serde_json::Value> =
             serde_json::from_slice(&fs::read(plan_path).unwrap()).unwrap();
-        let archive_url = tarball_url(version, "24.04", host_arch_suffix().unwrap());
+        let archive_url = tarball_url(version, host);
         for (filename, url) in [
-            ("all-keys.asc", SWIFT_KEYS_URL.to_owned()),
-            ("swift.tar.gz", archive_url.clone()),
             ("swift.tar.gz.sig", format!("{archive_url}.sig")),
+            ("all-keys.asc", SWIFT_KEYS_URL.to_owned()),
+            ("swift.tar.gz", archive_url),
         ] {
             let url = reqwest::Url::parse(&url).unwrap();
             let identity = &inputs["files"][filename];
@@ -757,7 +803,10 @@ mod tests {
         const CHILD: &str = "OMG_SWIFT_DOWNLOAD_FIXTURE";
         if std::env::var(CHILD).as_deref() == Ok("1") {
             anyhow::ensure!(crate::core::paths::test_mode());
-            tokio::runtime::Runtime::new()?.block_on(swift_download_fixture())?;
+            tokio::runtime::Runtime::new()?.block_on(async {
+                swift_download_fixture().await?;
+                swift_download_limits_fixture().await
+            })?;
             println!(
                 "[omg-runtime-download-child] test=runtimes::swift::tests::swift_download_retries_and_refuses_invalid_transfers"
             );
@@ -846,7 +895,7 @@ mod tests {
                 Ok::<_, anyhow::Error>(())
             };
             let client = reqwest::Client::new();
-            let download = download_file(&client, &url, &dest);
+            let download = download_file(&client, &url, &dest, MAX_SWIFT_ARCHIVE_BYTES);
             let (served, result) =
                 tokio::time::timeout(std::time::Duration::from_secs(10), async {
                     tokio::join!(server, download)
@@ -871,6 +920,79 @@ mod tests {
                 1,
                 "temporary transfer must be cleaned"
             );
+        }
+        Ok(())
+    }
+
+    async fn swift_download_limits_fixture() -> Result<()> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let client = reqwest::Client::new();
+        let directory = tempfile::tempdir()?;
+        let dest = directory.path().join("artifact");
+        let signature_body = vec![0u8; usize::try_from(MAX_SWIFT_SIGNATURE_BYTES + 1)?];
+        for (max_bytes, length, body, connections, diagnostic) in [
+            (
+                MAX_SWIFT_SIGNATURE_BYTES,
+                Some(MAX_SWIFT_SIGNATURE_BYTES + 1),
+                [].as_slice(),
+                1,
+                "65536-byte limit",
+            ),
+            (
+                MAX_SWIFT_SIGNATURE_BYTES,
+                None,
+                signature_body.as_slice(),
+                1,
+                "65536-byte limit",
+            ),
+            (
+                MAX_SWIFT_ARCHIVE_BYTES,
+                Some(1_120_304_027), // Size of the official Fedora 41 Swift 6.4.3 SDK.
+                [].as_slice(),
+                3,
+                "Error downloading chunk",
+            ),
+            (
+                MAX_SWIFT_ARCHIVE_BYTES,
+                Some(MAX_SWIFT_ARCHIVE_BYTES + 1),
+                [].as_slice(),
+                1,
+                "1342177280-byte limit",
+            ),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let url = format!("http://{}/artifact", listener.local_addr()?);
+            let serve = async {
+                let length_header =
+                    length.map_or_else(String::new, |size| format!("Content-Length: {size}\r\n"));
+                for _ in 0..connections {
+                    let (mut stream, _) = listener.accept().await?;
+                    let mut request = Vec::new();
+                    while !request.ends_with(b"\r\n\r\n") {
+                        anyhow::ensure!(request.len() < 4096, "fixture request too large");
+                        request.push(stream.read_u8().await?);
+                    }
+                    assert!(request.starts_with(b"GET /artifact HTTP/1.1\r\n"));
+                    stream
+                        .write_all(
+                            format!("HTTP/1.1 200 OK\r\n{length_header}Connection: close\r\n\r\n")
+                                .as_bytes(),
+                        )
+                        .await?;
+                    stream.write_all(body).await?;
+                    stream.shutdown().await?;
+                }
+                Ok::<_, anyhow::Error>(())
+            };
+            let download = download_file(&client, &url, &dest, max_bytes);
+            let (served, result) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                tokio::join!(serve, download)
+            })
+            .await?;
+            served?;
+            let error = result.expect_err("invalid artifact transfer must fail");
+            assert!(format!("{error:#}").contains(diagnostic), "{error:#}");
+            assert_eq!(fs::read_dir(directory.path())?.count(), 0);
         }
         Ok(())
     }
@@ -972,11 +1094,10 @@ mod tests {
         Ok(())
     }
 
-    fn release(tag: &str, prerelease: bool) -> GithubRelease {
-        GithubRelease {
-            tag_name: tag.to_string(),
-            prerelease,
-            assets: Vec::new(),
+    fn host(distro: &str, version: &str, arch: &'static str) -> SwiftHost {
+        SwiftHost {
+            distribution: map_os_release(distro, version).unwrap(),
+            arch,
         }
     }
 
@@ -1059,22 +1180,44 @@ mod tests {
     }
 
     #[test]
-    fn releases_filter_prereleases_and_sort_newest_first() {
-        let releases = vec![
-            release("swift-6.0.3-RELEASE", false),
-            release("swift-6.3.3-RELEASE", false),
-            release("swift-3.0-PREVIEW-1", true),
-            release("swift-6.0-DEVELOPMENT-SNAPSHOT-2024-03-21-a", false),
-            release("swift-5.10.1-RELEASE", false),
-            release("swift-6.0-RELEASE", false),
-        ];
-        let versions = parse_swift_versions(&releases);
-        let names: Vec<&str> = versions
+    fn releases_match_host_and_stable_identity_and_sort_newest_first() {
+        let releases = [
+            ("6.2.4", "swift-6.2.4-RELEASE", "Fedora 41", "x86_64"),
+            ("6.3", "swift-6.3-RELEASE", "Fedora 41", "x86_64"),
+            ("6.3.2", "swift-6.3.2-RELEASE", "Fedora 41", "aarch64"),
+            ("6.4.0", "swift-6.4.0-RELEASE", "Ubuntu 24.04", "x86_64"),
+            (
+                "6.5.0",
+                "swift-6.5.0-DEVELOPMENT-SNAPSHOT",
+                "Fedora 41",
+                "x86_64",
+            ),
+            ("6.5.1", "swift-6.5.2-RELEASE", "Fedora 41", "x86_64"),
+            ("6.3", "swift-6.3-RELEASE", "Fedora 41", "x86_64"),
+        ]
+        .map(|(name, tag, distro, arch)| SwiftRelease {
+            name: name.to_owned(),
+            tag: tag.to_owned(),
+            platforms: vec![ReleasePlatform {
+                name: distro.to_owned(),
+                platform: "Linux".to_owned(),
+                archs: vec![arch.to_owned()],
+            }],
+        });
+        let versions = parse_swift_versions(&releases, host("fedora", "41", "x86_64"));
+        let names: Vec<_> = versions
             .iter()
             .map(|version| version.version.as_str())
             .collect();
-        assert_eq!(names, vec!["6.3.3", "6.0.3", "6.0", "5.10.1"]);
+        assert_eq!(names, ["6.3", "6.2.4"]);
         assert!(versions.iter().all(|version| !version.prerelease));
+        let arm = parse_swift_versions(&releases, host("fedora", "41", "aarch64"));
+        assert_eq!(
+            arm.into_iter()
+                .map(|release| release.version)
+                .collect::<Vec<_>>(),
+            ["6.3.2"]
+        );
     }
 
     #[test]
@@ -1082,23 +1225,23 @@ mod tests {
         // Lowercase `-release` dir, dotless distro dir, uppercase `-RELEASE`
         // tag dir, dotted distro file slug.
         assert_eq!(
-            tarball_url("6.0.3", "24.04", ""),
+            tarball_url("6.0.3", host("ubuntu", "24.04", "x86_64")),
             "https://download.swift.org/swift-6.0.3-release/ubuntu2404\
              /swift-6.0.3-RELEASE/swift-6.0.3-RELEASE-ubuntu24.04.tar.gz"
         );
         assert_eq!(
-            tarball_url("6.2.4", "22.04", ""),
+            tarball_url("6.2.4", host("ubuntu", "22.04", "x86_64")),
             "https://download.swift.org/swift-6.2.4-release/ubuntu2204\
              /swift-6.2.4-RELEASE/swift-6.2.4-RELEASE-ubuntu22.04.tar.gz"
         );
         // aarch64 appends `-aarch64` to both the distro dir and the file slug.
         assert_eq!(
-            tarball_url("6.3.3", "24.04", "-aarch64"),
+            tarball_url("6.3.3", host("ubuntu", "24.04", "aarch64")),
             "https://download.swift.org/swift-6.3.3-release/ubuntu2404-aarch64\
              /swift-6.3.3-RELEASE/swift-6.3.3-RELEASE-ubuntu24.04-aarch64.tar.gz"
         );
         assert_eq!(
-            tarball_url("6.2.4", "22.04", "-aarch64"),
+            tarball_url("6.2.4", host("ubuntu", "22.04", "aarch64")),
             "https://download.swift.org/swift-6.2.4-release/ubuntu2204-aarch64\
              /swift-6.2.4-RELEASE/swift-6.2.4-RELEASE-ubuntu22.04-aarch64.tar.gz"
         );
@@ -1106,12 +1249,43 @@ mod tests {
 
     #[test]
     fn os_release_mapping_accepts_only_published_builds() {
-        assert_eq!(map_os_release("ubuntu", "22.04"), Some("22.04"));
-        assert_eq!(map_os_release("ubuntu", "24.04"), Some("24.04"));
+        assert_eq!(
+            map_os_release("ubuntu", "22.04").unwrap().directory,
+            "ubuntu2204"
+        );
+        assert_eq!(
+            map_os_release("ubuntu", "24.04").unwrap().directory,
+            "ubuntu2404"
+        );
+        for (version, fedora, arch, expected) in [
+            (
+                "6.0.3",
+                "39",
+                "x86_64",
+                "https://download.swift.org/swift-6.0.3-release/fedora39/swift-6.0.3-RELEASE/swift-6.0.3-RELEASE-fedora39.tar.gz",
+            ),
+            (
+                "6.4.3",
+                "41",
+                "aarch64",
+                "https://download.swift.org/swift-6.4.3-release/fedora41-aarch64/swift-6.4.3-RELEASE/swift-6.4.3-RELEASE-fedora41-aarch64.tar.gz",
+            ),
+        ] {
+            assert_eq!(tarball_url(version, host("fedora", fedora, arch)), expected);
+        }
         assert_eq!(map_os_release("ubuntu", "20.04"), None);
         assert_eq!(map_os_release("ubuntu", "25.10"), None);
         assert_eq!(map_os_release("debian", "12"), None);
+        assert!(
+            map_os_release("fedora", "39").is_some(),
+            "Swift.org publishes Fedora 39 toolchains"
+        );
+        assert!(
+            map_os_release("fedora", "41").is_some(),
+            "Swift.org publishes Fedora 41 toolchains"
+        );
         assert_eq!(map_os_release("fedora", "42"), None);
+        assert_eq!(map_os_release("fedora", "44"), None);
         assert_eq!(map_os_release("arch", ""), None);
         assert_eq!(map_os_release("", ""), None);
     }
@@ -1135,15 +1309,6 @@ mod tests {
         assert_eq!(manager.current_version(), None);
     }
 
-    #[test]
-    fn host_arch_suffix_names_the_platform() {
-        let suffix = host_arch_suffix().expect("host arch should be supported");
-        match std::env::consts::ARCH {
-            "x86_64" => assert_eq!(suffix, ""),
-            "aarch64" => assert_eq!(suffix, "-aarch64"),
-            arch => panic!("unexpected test host arch: {arch}"),
-        }
-    }
     #[cfg(unix)]
     #[test]
     fn verified_swift_publication_refuses_changed_content_before_execution_and_keeps_prior_version()

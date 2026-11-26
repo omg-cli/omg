@@ -470,6 +470,7 @@ where
         dest,
         DOWNLOAD_HEARTBEAT_PERIOD,
         DOWNLOAD_LOW_SPEED_MIN_BYTES,
+        MAX_RUNTIME_DOWNLOAD_BYTES,
     )
     .await
 }
@@ -480,6 +481,7 @@ async fn stream_runtime_download_to_temp_with_low_speed<D, F, Fut>(
     dest: &Path,
     heartbeat_period: std::time::Duration,
     low_speed_min_bytes: u64,
+    max_bytes: u64,
 ) -> Result<(tempfile::TempPath, String)>
 where
     D: Digest + Default,
@@ -644,8 +646,8 @@ where
             |(total, _)| *total,
         );
         anyhow::ensure!(
-            total_size <= MAX_RUNTIME_DOWNLOAD_BYTES,
-            "Runtime download declares {total_size} bytes, exceeding the {MAX_RUNTIME_DOWNLOAD_BYTES}-byte limit"
+            total_size <= max_bytes,
+            "Runtime download declares {total_size} bytes, exceeding the {max_bytes}-byte limit"
         );
         let task = ProgressTask::start(&TaskSpec {
             label: label.clone(),
@@ -699,7 +701,7 @@ where
                     break;
                 }
             };
-            let next_size = bounded_download_size(downloaded, chunk.len())?;
+            let next_size = bounded_download_size(downloaded, chunk.len(), max_bytes)?;
             if let Some((total, _)) = &representation {
                 anyhow::ensure!(
                     next_size <= *total,
@@ -828,12 +830,16 @@ pub(crate) async fn download_to_temp_for_signature(
     client: &reqwest::Client,
     url: &str,
     dest: &Path,
+    max_bytes: u64,
 ) -> Result<tempfile::TempPath> {
     crate::core::http::validate_download_url(url)?;
-    let (temporary_path, _) = stream_runtime_download_to_temp::<Sha256, _, _>(
+    let (temporary_path, _) = stream_runtime_download_to_temp_with_low_speed::<Sha256, _, _>(
         &extract_domain(url),
         |resume| request_runtime_download(client, url, resume),
         dest,
+        DOWNLOAD_HEARTBEAT_PERIOD,
+        DOWNLOAD_LOW_SPEED_MIN_BYTES,
+        max_bytes,
     )
     .await?;
     Ok(temporary_path)
@@ -908,13 +914,13 @@ pub async fn download_with_progress_sha512(
     Ok(())
 }
 
-fn bounded_download_size(downloaded: u64, chunk_size: usize) -> Result<u64> {
+fn bounded_download_size(downloaded: u64, chunk_size: usize, max_bytes: u64) -> Result<u64> {
     let next = downloaded
         .checked_add(u64::try_from(chunk_size).context("Download chunk size does not fit u64")?)
         .context("Runtime download byte count overflowed")?;
     anyhow::ensure!(
-        next <= MAX_RUNTIME_DOWNLOAD_BYTES,
-        "Runtime download exceeded the {MAX_RUNTIME_DOWNLOAD_BYTES}-byte limit"
+        next <= max_bytes,
+        "Runtime download exceeded the {max_bytes}-byte limit"
     );
     Ok(next)
 }
@@ -2679,6 +2685,7 @@ mod tests {
             &dest,
             Duration::from_millis(80),
             64,
+            MAX_RUNTIME_DOWNLOAD_BYTES,
         );
         let outcome = tokio::time::timeout(Duration::from_secs(3), async {
             tokio::join!(serve, download)
@@ -2779,6 +2786,7 @@ mod tests {
             &dest,
             std::time::Duration::from_millis(80),
             64,
+            MAX_RUNTIME_DOWNLOAD_BYTES,
         )
         .await?;
         server.await??;
@@ -4132,8 +4140,12 @@ mod tests {
 
     #[test]
     fn runtime_download_size_is_bounded_even_without_content_length() {
-        assert_eq!(bounded_download_size(10, 5).unwrap(), 15);
-        assert!(bounded_download_size(MAX_RUNTIME_DOWNLOAD_BYTES, 1).is_err());
+        assert_eq!(bounded_download_size(10, 5, 15).unwrap(), 15);
+        assert!(bounded_download_size(10, 6, 15).is_err());
+        assert!(
+            bounded_download_size(MAX_RUNTIME_DOWNLOAD_BYTES, 1, MAX_RUNTIME_DOWNLOAD_BYTES)
+                .is_err()
+        );
     }
 
     #[test]
