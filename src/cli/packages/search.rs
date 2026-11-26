@@ -51,13 +51,10 @@ fn rank_display_packages(
 fn group_langpacks(query: &str, packages: Vec<DisplayPackage>) -> Vec<DisplayPackage> {
     let query_lower = query.to_lowercase();
     let mut grouped: Vec<DisplayPackage> = Vec::with_capacity(packages.len());
-    let mut pending: Option<(String, DisplayPackage, usize)> = None;
+    let mut pending: Option<(String, DisplayPackage)> = None;
     let flush = |grouped: &mut Vec<DisplayPackage>,
-                 pending: &mut Option<(String, DisplayPackage, usize)>| {
-        if let Some((_, mut first, count)) = pending.take() {
-            if count > 1 {
-                first.name = format!("{} (+{} language packs)", first.name, count - 1);
-            }
+                 pending: &mut Option<(String, DisplayPackage)>| {
+        if let Some((_, first)) = pending.take() {
             grouped.push(first);
         }
     };
@@ -70,18 +67,18 @@ fn group_langpacks(query: &str, packages: Vec<DisplayPackage>) -> Vec<DisplayPac
         }
         let base = group_base(&pkg.name).map(str::to_string);
         let matches = match (&pending, &base) {
-            (Some((pending_base, _, _)), Some(base)) => pending_base == base,
+            (Some((pending_base, _)), Some(base)) => pending_base == base,
             _ => false,
         };
         if matches {
-            if let Some((_, _, count)) = pending.as_mut() {
-                *count += 1;
+            if let Some((_, first)) = pending.as_mut() {
+                first.extra_language_packs += 1;
             }
             continue;
         }
         flush(&mut grouped, &mut pending);
         match base {
-            Some(base) => pending = Some((base, pkg, 1)),
+            Some(base) => pending = Some((base, pkg)),
             None => grouped.push(pkg),
         }
     }
@@ -122,6 +119,8 @@ use crate::package_managers::AurClient;
 #[derive(Serialize)]
 struct DisplayPackage {
     name: String,
+    #[serde(skip)]
+    extra_language_packs: usize,
     version: String,
     description: String,
     source: String,
@@ -136,6 +135,16 @@ struct DisplayPackage {
 }
 
 impl DisplayPackage {
+    fn display_name(&self) -> std::borrow::Cow<'_, str> {
+        if self.extra_language_packs == 0 {
+            return std::borrow::Cow::Borrowed(&self.name);
+        }
+        std::borrow::Cow::Owned(format!(
+            "{} (+{} language packs)",
+            self.name, self.extra_language_packs
+        ))
+    }
+
     #[cfg(unix)]
     fn from_wire(p: crate::daemon::protocol::PackageInfo) -> Self {
         Self {
@@ -147,6 +156,7 @@ impl DisplayPackage {
             popularity: None,
             maintainer: None,
             out_of_date: None,
+            extra_language_packs: 0,
         }
     }
 
@@ -160,6 +170,7 @@ impl DisplayPackage {
             popularity: None,
             maintainer: None,
             out_of_date: None,
+            extra_language_packs: 0,
         }
     }
 
@@ -174,6 +185,7 @@ impl DisplayPackage {
             popularity: Some(p.popularity),
             maintainer: p.maintainer,
             out_of_date: Some(p.out_of_date.is_some()),
+            extra_language_packs: 0,
         }
     }
 }
@@ -318,7 +330,12 @@ fn should_offer_picker(json: bool) -> bool {
 }
 
 fn picker_label(pkg: &DisplayPackage) -> String {
-    format!("{} {} ({})", pkg.name, pkg.version, pkg.source)
+    format!(
+        "{} {} ({})",
+        style::sanitize_terminal_text(&pkg.display_name()),
+        style::sanitize_terminal_text(&pkg.version),
+        pkg.source
+    )
 }
 
 /// Blocking TTY selection over preformatted `(name, label)` entries.
@@ -464,6 +481,7 @@ fn search_sync_official_only(query: &str, limit: usize, backend: Backend) -> Res
         let Ok(res) = client.search(query, Some(limit)) else {
             return Ok(false);
         };
+        drop(client);
 
         if res.packages.is_empty() {
             use crate::cli::components::Components;
@@ -502,16 +520,25 @@ fn search_sync_official_only(query: &str, limit: usize, backend: Backend) -> Res
         stdout.flush()?;
         drop(stdout);
 
-        // Pre-clap fast path: no async runtime exists here, so the blocking
-        // picker runs inline and detail goes through the sync info entry.
+        // Keep the synchronous detail path when the daemon can still answer.
         if should_offer_picker(false) {
             let entries: Vec<(String, String)> = packages
                 .iter()
                 .take(limit)
                 .map(|pkg| (pkg.name.clone(), picker_label(pkg)))
                 .collect();
-            if let Some(name) = pick_package(&entries) {
-                let _ = super::info_sync(&name);
+            if let Some(name) = pick_package(&entries)
+                && !matches!(super::info_sync(&name), Ok(true))
+            {
+                let details = crate::cli::tea::run_blocking_future(async move {
+                    super::info_after_fast_miss(&name).await
+                });
+                if let Err(error) = details.and_then(std::convert::identity) {
+                    eprintln!(
+                        "Failed to show package details: {}",
+                        style::sanitize_terminal_diagnostic(&format!("{error:#}"))
+                    );
+                }
             }
         }
         Ok(true)
@@ -533,7 +560,7 @@ fn write_package_line<W: Write>(w: &mut W, pkg: &DisplayPackage) -> std::io::Res
     write!(
         w,
         "  {} {}  {}",
-        style::package(&style::sanitize_terminal_text(&pkg.name)),
+        style::package(&style::sanitize_terminal_text(&pkg.display_name())),
         style::version(&style::sanitize_terminal_text(&pkg.version)),
         source_style,
     )?;
@@ -642,6 +669,7 @@ mod tests {
             popularity: None,
             maintainer: None,
             out_of_date: None,
+            extra_language_packs: 0,
         }
     }
 
@@ -795,6 +823,7 @@ mod tests {
                 popularity: None,
                 maintainer: None,
                 out_of_date: None,
+                extra_language_packs: 0,
             })
             .collect::<Vec<_>>();
 
@@ -814,6 +843,7 @@ mod tests {
             popularity: None,
             maintainer: None,
             out_of_date: None,
+            extra_language_packs: 0,
         };
 
         let output = format_package(&package);
@@ -879,10 +909,13 @@ mod tests {
         ];
         let grouped = group_langpacks("firefox", packages);
         assert_eq!(grouped.len(), 2);
+        let name = "firefox-developer-edition-i18n-af";
+        assert_eq!(grouped[1].name, name);
         assert_eq!(
-            grouped[1].name,
-            "firefox-developer-edition-i18n-af (+2 language packs)"
+            picker_label(&grouped[1]),
+            format!("{name} (+2 language packs) 1 (Official)")
         );
+        assert!(format_package(&grouped[1]).contains(&format!("{name} (+2 language packs)")));
     }
 
     #[test]
@@ -926,10 +959,8 @@ mod tests {
             Backend::Arch,
         );
         assert_eq!(human.len(), 2);
-        assert_eq!(
-            human[1].name,
-            "firefox-developer-edition-i18n-af (+2 language packs)"
-        );
+        assert_eq!(human[1].name, "firefox-developer-edition-i18n-af");
+        assert!(format_package(&human[1]).contains("(+2 language packs)"));
     }
 
     #[test]
@@ -972,6 +1003,7 @@ mod tests {
             popularity: None,
             maintainer: None,
             out_of_date: None,
+            extra_language_packs: 0,
         };
 
         let formatted = format_package(&pkg);
@@ -982,6 +1014,20 @@ mod tests {
 
     #[test]
     fn aur_popularity_is_not_rendered_as_a_percentage() {
+        #[cfg(feature = "arch")]
+        let package = DisplayPackage::from_aur_detail(
+            serde_json::from_value(serde_json::json!({
+                "Name": "yay",
+                "Version": "12.0.0",
+                "Description": "AUR helper",
+                "NumVotes": 10,
+                "Popularity": 0.73,
+                "FirstSubmitted": 1,
+                "LastModified": 2
+            }))
+            .expect("AUR RPC fixture"),
+        );
+        #[cfg(not(feature = "arch"))]
         let package = DisplayPackage {
             name: "yay".to_string(),
             version: "12.0.0".to_string(),
@@ -991,6 +1037,7 @@ mod tests {
             popularity: Some(0.73),
             maintainer: None,
             out_of_date: None,
+            extra_language_packs: 0,
         };
         let formatted = format_package(&package);
         assert!(formatted.contains("0.7"));
@@ -1008,6 +1055,7 @@ mod tests {
             popularity: None,
             maintainer: None,
             out_of_date: None,
+            extra_language_packs: 0,
         };
 
         let formatted = format_package(&pkg);
@@ -1202,6 +1250,7 @@ mod tests {
                 popularity: None,
                 maintainer: None,
                 out_of_date: None,
+                extra_language_packs: 0,
             })
             .collect();
         let actual = present_search_results("tree", packages, true, 20, Backend::Fedora);
@@ -1228,6 +1277,7 @@ mod tests {
                 popularity: None,
                 maintainer: None,
                 out_of_date: None,
+                extra_language_packs: 0,
             })
             .collect();
         packages.push(DisplayPackage {
@@ -1239,6 +1289,7 @@ mod tests {
             popularity: None,
             maintainer: None,
             out_of_date: None,
+            extra_language_packs: 0,
         });
         let actual = present_search_results("tree", packages, true, 1000, Backend::Fedora);
         assert_eq!(actual.len(), 1000);
