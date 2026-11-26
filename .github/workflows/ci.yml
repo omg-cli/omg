@@ -708,7 +708,7 @@ jobs:
             image: fedora:latest@sha256:6c75d5bf57cb0fa5aa4b92c6a83c86c791644496d9ac230de7711f5b8ec3b898
             features: fedora,pgp,license
             setup: |
-              timeout -k 10s 12m dnf \
+              timeout -k 10s 12m dnf --refresh \
                 --setopt='*.skip_if_unavailable=False' --disable-repo=fedora-cisco-openh264 \
                 install -y --setopt=install_weak_deps=False \
                 git clang cmake make perl-core openssl-devel pkgconfig findutils curl procps-ng python3 zsh fish \
@@ -1243,6 +1243,17 @@ jobs:
         run: |
           python3 scripts/native-build-artifact.py build --distro "$DISTRO" \
             --image "$BUILD_IMAGE" --features "$BUILD_FEATURES" --destination "$RUNNER_TEMP/native-release"
+
+      - name: Verify Fedora release binary with distro smoke checks
+        if: matrix.phase == 'validation' && matrix.platform == 'fedora'
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["binaries"]["omg"])' \
+            "$RUNNER_TEMP/native-release/native-build.json")
+          [[ "$expected" =~ ^[0-9a-f]{64}$ ]]
+          printf '%s  %s\n' "$expected" ./target/release/omg | sha256sum --strict --check -
+          bash scripts/distro-e2e.sh fedora ./target/release/omg --metadata-ready
 
       - name: Build Ubuntu 26.04 validation binary
         if: matrix.phase == 'validation' && matrix.platform == 'ubuntu-2604'

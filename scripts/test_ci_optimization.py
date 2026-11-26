@@ -830,6 +830,56 @@ git() { printf '%040d\\n' 1; }
         lifecycle = step_script('distro-e2e.yml', 'Verify omgd lifecycle and socket IPC on real systemd host')
         self.assertIn('export OMG_DISABLE_TELEMETRY=1\n', lifecycle)
 
+    def test_fedora_x86_smoke_uses_required_ci_on_automatic_runs(self):
+        distro_workflow = (WORKFLOWS / 'distro-e2e.yml').read_text(encoding='utf-8')
+        matrix = job_block(distro_workflow, 'container-e2e')
+        standalone = job_block(distro_workflow, 'fedora-x86-standalone')
+        fedora_image = re.search(r'(?m)^\s+image: (fedora:latest@sha256:[a-f0-9]{64})$', standalone)
+        self.assertIsNotNone(fedora_image)
+        self.assertNotIn(fedora_image[1], matrix)
+        self.assertIn('distro: fedora\n            arch: aarch64', matrix)
+        self.assertIn("if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'", standalone)
+        self.assertIn('features: ["fedora,pgp,license"]', standalone)
+        self.assertIn('steps: &distro-smoke-steps', matrix)
+        self.assertIn('steps: *distro-smoke-steps', standalone)
+
+        ci = (WORKFLOWS / 'ci.yml').read_text(encoding='utf-8')
+        native = job_block(ci, 'linux-matrix')
+        self.assertIn(fedora_image[1], native)
+        self.assertIn('features: fedora,pgp,license', native)
+        smoke = native.split('      - name: Verify Fedora release binary with distro smoke checks\n', 1)[1]
+        self.assertIn("if: matrix.phase == 'validation' && matrix.platform == 'fedora'", smoke.split('\n      - ', 1)[0])
+        self.assertLess(native.index('      - name: Build release\n'), native.index(smoke))
+        self.assertLess(native.index(smoke), native.index('      - name: Upload native release pair\n'))
+        self.assertRegex(job_block(ci, 'ci-success'), r'(?m)^    needs: \[.*\blinux-matrix\b')
+
+    @unittest.skipIf(os.name == 'nt', 'Native Fedora verification uses POSIX Bash and sha256sum')
+    def test_fedora_smoke_refuses_a_binary_different_from_the_release_manifest(self):
+        script = step_script('ci.yml', 'Verify Fedora release binary with distro smoke checks')
+        for matches in (True, False):
+            with self.subTest(matches=matches), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                cli = root / 'target/release/omg'
+                cli.parent.mkdir(parents=True)
+                cli.write_bytes(b'inert Fedora release fixture\n')
+                script_path = root / 'scripts/distro-e2e.sh'
+                script_path.parent.mkdir()
+                script_path.write_text('printf "%s\\n" "$@" > smoke-arguments\n')
+                manifest = root / 'native-release/native-build.json'
+                manifest.parent.mkdir()
+                digest = hashlib.sha256(cli.read_bytes()).hexdigest() if matches else '0' * 64
+                manifest.write_text(json.dumps({'binaries': {'omg': digest}}))
+                result = subprocess.run([BASH, '-euo', 'pipefail', '-c', script], cwd=root,
+                    env=dict(os.environ, RUNNER_TEMP=directory), capture_output=True, text=True, timeout=10)
+                arguments = root / 'smoke-arguments'
+                if matches:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(arguments.read_text().splitlines(),
+                                     ['fedora', './target/release/omg', '--metadata-ready'])
+                else:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertFalse(arguments.exists())
+
     def test_region_artifact_survives_downstream_comparison_failure_with_short_retention(self):
         text = (WORKFLOWS / 'coverage.yml').read_text()
         for name in ('Generate region evidence', 'Preserve region evidence'):
