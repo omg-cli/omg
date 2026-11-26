@@ -1762,6 +1762,70 @@ mod tests {
         assert!(error.to_string().contains("Failed to listen for SIGINT"));
     }
 
+    #[tokio::test]
+    async fn background_fast_status_preserves_stale_and_unwritable_paths() -> Result<()> {
+        for stale in [true, false] {
+            let directory = tempfile::tempdir()?;
+            let fast_status = directory.path().join("omg.status");
+            if !stale {
+                std::fs::create_dir(&fast_status)?;
+            }
+            let backend = Arc::new(PausedInfoBackend {
+                inner: crate::package_managers::mock::MockPackageManager::new_in(
+                    "arch",
+                    directory.path(),
+                ),
+                started: tokio::sync::Notify::new(),
+                resume: tokio::sync::Notify::new(),
+                lookup: PausedLookup::Status,
+            });
+            let state = Arc::new(DaemonState::new_isolated(
+                directory.path(),
+                super::super::index::PackageIndex::empty(),
+                backend.clone(),
+            )?);
+            let socket = directory.path().join("omgd.sock");
+            let listener = UnixListener::bind(&socket)?;
+            let task = tokio::spawn(run_with_status_path(
+                listener,
+                state.clone(),
+                socket,
+                fast_status.clone(),
+            ));
+            let result = tokio::time::timeout(Duration::from_secs(4), async {
+                backend.started.notified().await;
+                if stale {
+                    state.replace_index(
+                        super::super::index::PackageIndex::empty(),
+                        #[cfg(feature = "arch")]
+                        crate::package_managers::pacman_db::AlpmCatalogEpoch::UNIX_EPOCH,
+                    );
+                }
+                backend.resume.notify_one();
+                while state.cache.get_explicit().is_none() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await;
+            task.abort();
+            let _ = task.await;
+            result
+                .context("fast-status refresh must complete before prewarming explicit packages")?;
+            if stale {
+                assert!(
+                    !fast_status.exists(),
+                    "stale counts must remain unpublished"
+                );
+            } else {
+                assert!(
+                    fast_status.is_dir(),
+                    "the obstructing directory must survive"
+                );
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     fn internal_daemon_failures_produce_unsuccessful_exit_results() {
         assert!(daemon_shutdown_result(None).is_ok());

@@ -2970,6 +2970,7 @@ pub(super) mod tests {
     pub(in crate::daemon) enum PausedLookup {
         Info,
         Explicit,
+        Status,
     }
 
     pub(in crate::daemon) struct PausedInfoBackend {
@@ -3013,7 +3014,14 @@ pub(super) mod tests {
             self.inner.list_installed()
         }
         fn get_status(&self, fast: bool) -> BackendFuture<'_, (usize, usize, usize, usize)> {
-            self.inner.get_status(fast)
+            Box::pin(async move {
+                let result = self.inner.get_status(fast).await;
+                if matches!(self.lookup, PausedLookup::Status) {
+                    self.started.notify_one();
+                    self.resume.notified().await;
+                }
+                result
+            })
         }
         fn list_explicit(&self) -> BackendFuture<'_, Vec<String>> {
             Box::pin(async move {

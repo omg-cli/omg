@@ -1220,6 +1220,7 @@ impl TestProject {
                 | ["status", "--fast", "--json"]
                 | ["info", "--", _]
                 | ["--json", "info", _]
+                | ["search", _, "--no-aur", "--limit", _]
         ));
         self.run_native_arch_readonly_report(
             args,
