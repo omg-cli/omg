@@ -2777,7 +2777,11 @@ mod tests {
             );
         }
         let script = fixture.path().join("dnf5.sh");
-        std::fs::write(&script, b"#!/bin/sh\nexit 23\n").expect("failing DNF fixture");
+        std::fs::write(
+            &script,
+            b"#!/bin/sh\nprintf 'fixture-0:1-1.noarch\nmissing requirement\n'\nprintf 'Check discovered 1 problem\n' >&2\nexit 23\n",
+        )
+        .expect("failing DNF fixture");
         let mut command = std::process::Command::new(&program);
         command.arg(&script);
         let issues = check_fedora_package_db(command, Duration::from_secs(2)).await;

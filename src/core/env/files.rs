@@ -20,17 +20,22 @@ pub(crate) fn ensure_size(size: u64, kind: &str, path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn require_regular_file(metadata: &fs::Metadata, kind: &str, path: &Path) -> Result<()> {
+    anyhow::ensure!(
+        metadata.is_file(),
+        "Refusing to read {kind} that is not a regular file: {} (symlink or special file)",
+        path.display()
+    );
+    Ok(())
+}
+
 pub(crate) fn read_utf8(path: &Path, kind: &str, symlinks: Symlinks) -> Result<String> {
     let metadata = match symlinks {
         Symlinks::Follow => fs::metadata(path),
         Symlinks::Refuse => fs::symlink_metadata(path),
     }
     .with_context(|| format!("Failed to inspect {kind} {}", path.display()))?;
-    anyhow::ensure!(
-        metadata.is_file(),
-        "Refusing to read {kind} that is not a regular file: {} (symlink or special file)",
-        path.display()
-    );
+    require_regular_file(&metadata, kind, path)?;
 
     let mut options = OpenOptions::new();
     options.read(true);
@@ -47,11 +52,7 @@ pub(crate) fn read_utf8(path: &Path, kind: &str, symlinks: Symlinks) -> Result<S
         .open(path)
         .with_context(|| format!("Failed to open {kind} {} safely", path.display()))?;
     let metadata = file.metadata()?;
-    anyhow::ensure!(
-        metadata.is_file(),
-        "Refusing to read {kind} that is not a regular file: {}",
-        path.display()
-    );
+    require_regular_file(&metadata, kind, path)?;
     ensure_size(metadata.len(), kind, path)?;
 
     let mut bytes = Vec::new();
