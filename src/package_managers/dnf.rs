@@ -1065,12 +1065,11 @@ impl DnfPackageManager {
     const USER_INSTALLED_QUERY_FORMAT: &str = "%{name}\\n";
 
     fn user_installed_command() -> Result<std::process::Command> {
-        // Installation reasons are local DNF state. Keep this read offline and
-        // include packages hidden by repository exclude rules.
+        // --userinstalled reads the system repo only. An unmatched repo glob
+        // would reject a valid local inventory on a host with no configured repos.
         let mut command = crate::core::privilege::system_command("dnf")?;
         command.args([
             "--cacheonly",
-            "--disable-repo=*",
             "--setopt=disable_excludes=*",
             "repoquery",
             "--userinstalled",
@@ -2926,7 +2925,6 @@ impl PackageManager for DnfPackageManager {
             // packages. Installed inventory needs no repository metadata.
             command.args([
                 "--cacheonly",
-                "--disable-repo=*",
                 "--setopt=disable_excludes=*",
                 "repoquery",
                 "--installed",
