@@ -1284,6 +1284,7 @@ mod dnf_integration {
         );
         let empty = String::from_utf8(empty.stdout)?;
         assert!(empty.contains("No OMG transaction history found"));
+        assert!(!fixture.path().join("history.lock").exists());
         let native = std::process::Command::new("dnf")
             .args([
                 "--setopt=disable_excludes=*",
@@ -1375,6 +1376,24 @@ mod dnf_integration {
         assert!(!corrupt.status.success());
         assert!(!String::from_utf8(corrupt.stdout)?.contains("No OMG transaction history"));
         assert_eq!(std::fs::read(&history_path)?, b"invalid history");
+
+        std::fs::remove_file(&history_path)?;
+        std::fs::remove_file(fixture.path().join("history.lock"))?;
+        std::fs::write(
+            fixture.path().join("history.json.archive.jsonl"),
+            serde_json::to_vec(&transaction(
+                "archived-build",
+                "2025-12-31T00:00:00Z",
+                true,
+            )?)?,
+        )?;
+        let archived = invoke(&selector)?;
+        assert!(
+            archived.status.success(),
+            "{}",
+            String::from_utf8_lossy(&archived.stderr)
+        );
+        assert!(String::from_utf8(archived.stdout)?.contains("installed → archived-build"));
         fixture.close()?;
         Ok(())
     }
@@ -1891,8 +1910,9 @@ mod dnf_operations {
             );
             Ok(output.status.success())
         };
+        let orphan_query = ["repoquery", "--unneeded", "--queryformat", "%{name}\n"];
         let orphans = std::process::Command::new("dnf")
-            .args(["repoquery", "--unneeded", "--queryformat", "%{name}\n"])
+            .args(orphan_query)
             .output()?;
         anyhow::ensure!(
             orphans.status.success() && orphans.stdout.is_empty(),
@@ -1939,7 +1959,7 @@ mod dnf_operations {
                 .output()?;
             anyhow::ensure!(mark.status.success(), "Cannot mark fixture as dependency");
             let selected = std::process::Command::new("dnf")
-                .args(["repoquery", "--unneeded", "--queryformat", "%{name}\n"])
+                .args(orphan_query)
                 .output()?;
             anyhow::ensure!(
                 selected.status.success()
