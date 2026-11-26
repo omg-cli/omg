@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::cli::style;
+use crate::package_managers::{Backend, resolve_backend};
 #[cfg(test)]
 use crate::runtimes::npm::ManagedNpm;
 use crate::runtimes::npm::install_reviewed_npm;
@@ -83,7 +84,7 @@ fn validate_managed_package(manager: &str, package: &str) -> Result<()> {
         "npm" => crate::core::security::npm::NpmSpec::parse(package).is_ok(),
         "cargo" => crate::runtimes::cargo_tool::validate_request(package).is_ok(),
         "pip" => crate::runtimes::pip_tool::validate_request(package).is_ok(),
-        "pacman" => !package.contains('/') && !package.contains('@') && registry_name(package),
+        "system" => !package.contains('/') && !package.contains('@') && registry_name(package),
         "go" => crate::runtimes::go_tool::validate_request(package).is_ok(),
         _ => false,
     };
@@ -411,6 +412,26 @@ fn find_registry_entry(tool: &str) -> Option<anyhow::Result<RegistryEntry>> {
         })
 }
 
+fn system_manager_label(backend: Backend) -> &'static str {
+    match backend {
+        Backend::Arch => "pacman",
+        Backend::Debian => "apt",
+        Backend::Fedora => "dnf",
+        Backend::MacOS => "brew",
+        Backend::Mock => "system",
+    }
+}
+
+fn resolve_system_tool(package: &str) -> Result<(&str, &'static str)> {
+    let backend = resolve_backend()?;
+    let package = match (backend, package) {
+        (Backend::Fedora, "fd") => "fd-find",
+        (Backend::Fedora, "dust") => "du-dust",
+        _ => package,
+    };
+    Ok((package, system_manager_label(backend)))
+}
+
 /// Whether `name` is base-environment plumbing of a Python virtualenv rather
 /// than an installed tool's entry point (`python`, pip, activate variants).
 fn is_venv_base_tool(name: &std::ffi::OsStr) -> bool {
@@ -561,47 +582,47 @@ impl LocalCommandRunner for ToolCommands {
 /// Tool registry - maps common tool names to their optimal installation source
 /// Format: (name, source, description, category)
 const TOOL_REGISTRY: &[(&str, &str, &str, &str)] = &[
-    // System tools (pacman)
+    // System tools
     (
         "ripgrep",
-        "pacman:ripgrep",
+        "system:ripgrep",
         "Ultra-fast regex search tool",
         "search",
     ),
-    ("rg", "pacman:ripgrep", "Alias for ripgrep", "search"),
-    ("fd", "pacman:fd", "Fast find alternative", "search"),
-    ("fzf", "pacman:fzf", "Fuzzy finder", "search"),
-    ("jq", "pacman:jq", "JSON processor", "data"),
-    ("yq", "pacman:yq", "YAML processor", "data"),
-    ("bat", "pacman:bat", "Cat with syntax highlighting", "files"),
-    ("eza", "pacman:eza", "Modern ls replacement", "files"),
+    ("rg", "system:ripgrep", "Alias for ripgrep", "search"),
+    ("fd", "system:fd", "Fast find alternative", "search"),
+    ("fzf", "system:fzf", "Fuzzy finder", "search"),
+    ("jq", "system:jq", "JSON processor", "data"),
+    ("yq", "system:yq", "YAML processor", "data"),
+    ("bat", "system:bat", "Cat with syntax highlighting", "files"),
+    ("eza", "system:eza", "Modern ls replacement", "files"),
     (
         "zoxide",
-        "pacman:zoxide",
+        "system:zoxide",
         "Smarter cd command",
         "navigation",
     ),
-    ("delta", "pacman:git-delta", "Better git diffs", "git"),
-    ("lazygit", "pacman:lazygit", "Terminal UI for git", "git"),
+    ("delta", "system:git-delta", "Better git diffs", "git"),
+    ("lazygit", "system:lazygit", "Terminal UI for git", "git"),
     (
         "htop",
-        "pacman:htop",
+        "system:htop",
         "Interactive process viewer",
         "system",
     ),
-    ("btop", "pacman:btop", "Resource monitor", "system"),
-    ("dust", "pacman:dust", "Disk usage analyzer", "system"),
-    ("duf", "pacman:duf", "Disk usage/free utility", "system"),
-    ("procs", "pacman:procs", "Modern ps replacement", "system"),
+    ("btop", "system:btop", "Resource monitor", "system"),
+    ("dust", "system:dust", "Disk usage analyzer", "system"),
+    ("duf", "system:duf", "Disk usage/free utility", "system"),
+    ("procs", "system:procs", "Modern ps replacement", "system"),
     (
         "hyperfine",
-        "pacman:hyperfine",
+        "system:hyperfine",
         "Command benchmarking",
         "dev",
     ),
-    ("tokei", "pacman:tokei", "Code statistics", "dev"),
-    ("just", "pacman:just", "Command runner", "dev"),
-    ("watchexec", "pacman:watchexec", "File watcher", "dev"),
+    ("tokei", "system:tokei", "Code statistics", "dev"),
+    ("just", "system:just", "Command runner", "dev"),
+    ("watchexec", "system:watchexec", "File watcher", "dev"),
     // Node.js tools (npm)
     ("tldr", "npm:tldr", "Simplified man pages", "docs"),
     ("serve", "npm:serve", "Static file server", "web"),
@@ -756,7 +777,7 @@ fn installed_tool_locations(tools_dir: &Path) -> Result<BTreeMap<PathBuf, String
             continue;
         };
         let (manager, package, _) = entry?;
-        if manager == "pacman" {
+        if manager == "system" {
             continue;
         }
         let current = tools_dir.join(manager).join(name);
@@ -874,13 +895,21 @@ pub async fn install(name: &str) -> Result<()> {
     // 1. Check Registry
     if let Some(resolved) = find_registry_entry(name) {
         let (manager, pkg, desc) = resolved?;
+        let (pkg, label) = if manager == "system" {
+            resolve_system_tool(pkg)?
+        } else {
+            (pkg, manager)
+        };
         println!(
             "{} Found in registry: {} ({})",
             style::success("✓"),
             style::package(pkg),
-            style::info(manager)
+            style::info(label)
         );
         println!("  {} {}", style::dim("→"), desc);
+        if manager == "system" {
+            return crate::cli::packages::install(&[pkg.to_owned()], false, false, false).await;
+        }
         return install_managed(manager, pkg, name, &tools_dir, &bin_dir).await;
     }
 
@@ -889,12 +918,12 @@ pub async fn install(name: &str) -> Result<()> {
     if !user_attended() || crate::core::paths::test_mode() {
         anyhow::bail!(
             "Tool '{name}' not in registry. Re-run in an interactive shell to choose a source.\n\
-             Available sources: Pacman, Cargo, NPM, Pip, Go\n\
+             Available sources: System packages, Cargo, NPM, Pip, Go\n\
              Example: omg install {name}  # for system installation"
         );
     }
     let choices = [
-        ("Pacman (System)", Source::System),
+        ("System packages", Source::System),
         ("Cargo (Isolated)", Source::Cargo),
         ("NPM (Isolated)", Source::Npm),
         ("Pip (Isolated)", Source::Pip),
@@ -932,6 +961,17 @@ async fn install_managed(
     tools_dir: &Path,
     bin_dir: &Path,
 ) -> Result<()> {
+    if manager == "system" {
+        validate_managed_package(manager, pkg)?;
+        let (package, label) = resolve_system_tool(pkg)?;
+        println!(
+            "  System package {} via {}",
+            style::package(package),
+            style::info(label)
+        );
+        return crate::cli::packages::install(&[package.to_owned()], false, false, false).await;
+    }
+
     install_managed_with_advisories(
         manager,
         pkg,
@@ -980,12 +1020,6 @@ async fn install_managed_with_advisories(
             });
         }
     };
-
-    if manager == "pacman" {
-        // Pacman installs globally, breaks isolation pattern but is preferred for OS tools
-        // We just delegate and return
-        return crate::cli::packages::install(&[pkg.to_string()], false, false, false).await;
-    }
 
     let manager = manager.to_owned();
     let pkg = pkg.to_owned();
@@ -1076,9 +1110,9 @@ fn install_managed_blocking(
                     runtime_security,
                 )?);
             }
-            _ => anyhow::bail!(
-                "Unknown package manager '{manager}'. Supported: npm, cargo, pip, go, pacman"
-            ),
+            _ => {
+                anyhow::bail!("Unknown package manager '{manager}'. Supported: npm, cargo, pip, go")
+            }
         }
         if let Some(admission) = &npm_admission {
             admission.verify(&staging_dir)?;
@@ -1394,8 +1428,9 @@ pub async fn remove(name: &str) -> Result<()> {
     let mut candidates = Vec::new();
     if let Some(entry) = find_registry_entry(name) {
         let (manager, package, _) = entry?;
-        if manager == "pacman" {
-            return crate::cli::packages::remove(&[package.to_string()], false, false, false).await;
+        if manager == "system" {
+            let (package, _) = resolve_system_tool(package)?;
+            return crate::cli::packages::remove(&[package.to_owned()], false, false, false).await;
         }
         candidates.push((manager, tools_dir.join(manager).join(name)));
         let legacy = tools_dir.join(manager).join(package);
@@ -1588,8 +1623,14 @@ pub fn search(query: &str) -> Result<()> {
     }
 
     println!("  Found {} tools:\n", matches.len());
+    let system_label = resolve_backend().map_or("system", system_manager_label);
     for (name, source, desc, category) in matches {
         let manager = source.split(':').next().unwrap_or("unknown");
+        let manager = if manager == "system" {
+            system_label
+        } else {
+            manager
+        };
         println!(
             "  {} {} {}",
             style::package(name),
@@ -1620,6 +1661,7 @@ pub fn registry() -> Result<()> {
 
     let mut sorted_cats: Vec<_> = categories.keys().collect();
     sorted_cats.sort();
+    let system_label = resolve_backend().map_or("system", system_manager_label);
 
     for category in sorted_cats {
         let tools = &categories[category];
@@ -1630,6 +1672,11 @@ pub fn registry() -> Result<()> {
         );
         for (name, source, desc) in tools {
             let manager = source.split(':').next().unwrap_or("?");
+            let manager = if manager == "system" {
+                system_label
+            } else {
+                manager
+            };
             println!(
                 "    {} {} - {}",
                 style::package(name),
@@ -2852,8 +2899,8 @@ exit 1
             ("npm", "@scope/name/extra"),
             ("pip", "relative/package"),
             ("cargo", "relative/crate"),
-            ("pacman", "core/fixture-tool"),
-            ("pacman", "fixture-tool@stable"),
+            ("system", "core/fixture-tool"),
+            ("system", "fixture-tool@stable"),
             ("unknown-manager", "eslint"),
         ] {
             assert!(
@@ -2866,7 +2913,7 @@ exit 1
             ("npm", "@angular/cli"),
             ("pip", "yt-dlp"),
             ("cargo", "cargo-audit"),
-            ("pacman", "fixture-tool++"),
+            ("system", "fixture-tool++"),
             ("go", "github.com/rakyll/hey"),
             ("go", "github.com/rakyll/hey@v0.1.4"),
         ] {

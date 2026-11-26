@@ -3217,6 +3217,92 @@ print("fixture python " + json.dumps({
                         and not install.exists() and not link.is_symlink())
 
 
+    def inspect_fedora_system_tool_registry():
+        phase = "fedora-system-tool-registry"
+        cases = (
+            ("fd", "fd-find", "search"),
+            ("dust", "du-dust", "system"),
+            ("rg", "ripgrep", "search"),
+            ("ripgrep", "ripgrep", "search"),
+            ("delta", "git-delta", "git"),
+            ("procs", "procs", "system"),
+            ("jq", "jq", "data"),
+            ("duf", "duf", "system"),
+        )
+        with tempfile.TemporaryDirectory(prefix="system-tool-registry-", dir=root) as directory:
+            owner = Path(directory)
+            owner.chmod(0o755)
+            home = owner / "home"
+            home.mkdir()
+            os.chown(home, account.pw_uid, account.pw_gid)
+            witness = owner / "selected-package"
+            wrapper = owner / "observe-system-tool"
+            wrapper.write_text(f"""#!/bin/bash
+set -eu
+printf '%s\\n' "$@" > {shlex.quote(str(witness))}
+printf 'Controlled registry probe stopped before the DNF operation\\n' >&2
+exit 95
+""")
+            wrapper.chmod(0o755)
+            native = Path(dnf).resolve(strict=True)
+            env = dict(disabled, HOME=str(home), OMG_DATA_DIR=str(home/"data"),
+                       OMG_CONFIG_DIR=str(home/"config"/"omg"), OMG_NATIVE_TEST_DATA_DIR="1",
+                       XDG_CONFIG_HOME=str(home/"config"), XDG_DATA_HOME=str(home/"xdg-data"),
+                       XDG_CACHE_HOME=str(home/"cache"), XDG_STATE_HOME=str(home/"state"))
+            (owner/"root-data").mkdir(mode=0o700)
+            root_env = dict(base_env, HOME=str(owner), OMG_DISABLE_DAEMON="1",
+                            OMG_DISABLE_TELEMETRY="1", NO_COLOR="1",
+                            OMG_DATA_DIR=str(owner/"root-data"), OMG_NATIVE_TEST_DATA_DIR="1",
+                            OMG_CONFIG_DIR=str(owner/"root-config"/"omg"),
+                            XDG_CONFIG_HOME=str(owner/"root-config"),
+                            XDG_DATA_HOME=str(owner/"root-xdg-data"),
+                            XDG_CACHE_HOME=str(owner/"root-cache"),
+                            XDG_STATE_HOME=str(owner/"root-state"))
+
+            def run(label, args, inspect, *, privileged=False):
+                witness.unlink(missing_ok=True)
+                result = subprocess.run([cli, *args], cwd=home,
+                                        env=root_env if privileged else env,
+                                        stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                                        timeout=8, **({} if privileged else ordinary))
+                selected = witness.read_text().splitlines() if witness.exists() else []
+                checks.append(dict(
+                    phase=phase, case=label, status=result.returncode,
+                    passed=inspect(result, selected), native_args=selected,
+                    diagnostic=(result.stdout + result.stderr)[-1200:],
+                ))
+
+            checked(["/usr/bin/mount", "--bind", wrapper, native])
+            try:
+                for name, package_name, category in cases:
+                    run(f"{name}-search", ("tool", "search", name),
+                        lambda result, selected: result.returncode == 0 and not selected
+                        and f"  {name} [{category}] via dnf" in result.stdout.splitlines())
+                    run(f"{name}-install", ("tool", "install", name),
+                        lambda result, selected: result.returncode != 0 and not selected
+                        and f"Found in registry: {package_name} (dnf)" in result.stdout
+                        and "Use --yes for non-interactive package installation" in result.stderr)
+                    run(f"{name}-update", ("tool", "update", name),
+                        lambda result, selected: result.returncode != 0 and not selected
+                        and f"System package {package_name} via dnf" in result.stdout
+                        and "Use --yes for non-interactive package installation" in result.stderr)
+                    run(f"{name}-remove", ("tool", "remove", name),
+                        lambda result, selected: result.returncode != 0 and selected.count(package_name) == 1
+                        and "remove" in selected and any(arg.startswith("--store") for arg in selected)
+                        and (name == package_name or name not in selected), privileged=True)
+
+                run("registry", ("tool", "registry"),
+                    lambda result, selected: result.returncode == 0 and not selected
+                    and all(f"    {name} (dnf) -" in result.stdout for name, _, _ in cases))
+                for name, category, manager in (("black", "python", "pip"), ("diesel", "rust", "cargo"),
+                                                ("typescript", "node", "npm")):
+                    run(f"{manager}-registry-control", ("tool", "search", name),
+                        lambda result, selected: result.returncode == 0 and not selected
+                        and f"  {name} [{category}] via {manager}" in result.stdout.splitlines())
+            finally:
+                checked(["/usr/bin/umount", native])
+
+
     def inspect_task_environment_bytes():
         phase = "task-environment-bytes"
         raw = b"test-\xff-value"
@@ -5927,6 +6013,7 @@ exec {shlex.quote(str(binary))} "$@"
                     inspect_python_inventory_and_removal()
                     inspect_python_tool_prerequisites()
                     inspect_managed_tool_inventory()
+                    inspect_fedora_system_tool_registry()
                     mark_progress("runtime selection and Python environments")
                     inspect_task_environment_bytes()
                     inspect_task_package_metadata()
@@ -6252,6 +6339,6 @@ mark_progress("completed with host inventory unchanged")
 report = dict(binaries=binaries, checks=checks, total=len(checks),
               passed=sum(entry["passed"] for entry in checks), host_unchanged=True)
 print(json.dumps(report))
-expected_checks = 303 if consent_oracle is None else 2096
+expected_checks = 303 if consent_oracle is None else 2132
 if report["passed"] != report["total"] or report["total"] != expected_checks:
     sys.exit(4)
