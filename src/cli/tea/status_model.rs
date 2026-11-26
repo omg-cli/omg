@@ -25,6 +25,70 @@ pub struct StatusData {
 }
 
 impl StatusData {
+    pub(crate) async fn load(fast: bool) -> anyhow::Result<Self> {
+        let start = std::time::Instant::now();
+        let elapsed_ms = || start.elapsed().as_secs_f64() * 1000.0;
+
+        #[cfg(unix)]
+        if fast
+            && !DaemonClient::daemon_disabled()
+            && let Ok(Some((total_packages, explicit_packages))) = tokio::task::spawn_blocking(
+                crate::core::fast_status::FastStatus::read_installed_counts,
+            )
+            .await
+        {
+            return Ok(Self {
+                total_packages,
+                explicit_packages,
+                duration_ms: elapsed_ms(),
+                fast_mode: true,
+                ..Self::default()
+            });
+        }
+
+        #[cfg(unix)]
+        if !fast
+            && let Ok(Some(status)) =
+                tokio::time::timeout(std::time::Duration::from_millis(500), async {
+                    let mut client = DaemonClient::connect().await.ok()?;
+                    match client.call(Request::Status { id: 0 }).await.ok()? {
+                        ResponseResult::Status(status) => Some(status),
+                        other => {
+                            tracing::debug!("Unexpected daemon status response: {other:?}");
+                            None
+                        }
+                    }
+                })
+                .await
+        {
+            return Ok(Self {
+                total_packages: status.total_packages,
+                explicit_packages: status.explicit_packages,
+                orphan_packages: status.orphan_packages,
+                updates_available: status.updates_available,
+                advisory_coverage: status.scanned_vulnerability_summary(),
+                duration_ms: elapsed_ms(),
+                fast_mode: false,
+            });
+        }
+
+        let (total_packages, explicit_packages, orphan_packages, updates_available) =
+            get_package_manager()?.get_status(fast).await?;
+        Ok(Self {
+            total_packages,
+            explicit_packages,
+            orphan_packages,
+            updates_available,
+            advisory_coverage: None,
+            duration_ms: elapsed_ms(),
+            fast_mode: fast,
+        })
+    }
+
+    pub(crate) fn loading_view() -> String {
+        style::accent("⟳ Gathering system status...")
+    }
+
     pub(crate) fn render(&self) -> String {
         let mut output = format!(
             "{}\n\n  {} packages installed · {} explicit\n",
@@ -148,61 +212,11 @@ impl Model for StatusModel {
                 let fast = self.fast_mode;
 
                 Cmd::exec(move || {
-                    // This logic mirrors the original status.rs logic
-                    let start = std::time::Instant::now();
-
-                    // 1. Try Daemon (Hot Path)
-                    #[cfg(unix)]
-                    let daemon_result =
-                        crate::cli::tea::async_bridge::run_blocking_future(async move {
-                            tokio::time::timeout(std::time::Duration::from_millis(500), async {
-                                if let Ok(mut client) = DaemonClient::connect().await
-                                    && let Ok(ResponseResult::Status(status)) =
-                                        client.call(Request::Status { id: 0 }).await
-                                {
-                                    return Some(StatusData {
-                                        total_packages: status.total_packages,
-                                        explicit_packages: status.explicit_packages,
-                                        orphan_packages: status.orphan_packages,
-                                        updates_available: status.updates_available,
-                                        advisory_coverage: status.scanned_vulnerability_summary(),
-                                        duration_ms: start.elapsed().as_secs_f64() * 1000.0,
-                                        fast_mode: fast,
-                                    });
-                                }
-                                None
-                            })
-                            .await
-                            .unwrap_or(None)
-                        })
-                        .unwrap_or(None);
-
-                    #[cfg(not(unix))]
-                    let daemon_result: Option<StatusData> = None;
-
-                    if let Some(data) = daemon_result {
-                        return StatusMsg::Loaded(data);
-                    }
-
-                    // 2. Fallback to direct path
-                    let fallback_result =
-                        crate::cli::tea::async_bridge::run_blocking_future(async move {
-                            let pm = get_package_manager()?;
-                            pm.get_status(fast).await
-                        })
-                        .and_then(std::convert::identity);
-
-                    match fallback_result {
-                        Ok((total, explicit, orphans, updates)) => StatusMsg::Loaded(StatusData {
-                            total_packages: total,
-                            explicit_packages: explicit,
-                            orphan_packages: orphans,
-                            updates_available: updates,
-                            advisory_coverage: None,
-                            duration_ms: start.elapsed().as_secs_f64() * 1000.0,
-                            fast_mode: fast,
-                        }),
-                        Err(e) => StatusMsg::Error(e.to_string()),
+                    match crate::cli::tea::run_blocking_future(StatusData::load(fast))
+                        .and_then(std::convert::identity)
+                    {
+                        Ok(data) => StatusMsg::Loaded(data),
+                        Err(error) => StatusMsg::Error(format!("{error:#}")),
                     }
                 })
             }
@@ -224,7 +238,7 @@ impl Model for StatusModel {
         match self.state {
             // The returned failure command leaves reporting to the process owner.
             StatusState::Idle | StatusState::Failed => String::new(),
-            StatusState::Loading => style::accent("⟳ Gathering system status..."),
+            StatusState::Loading => StatusData::loading_view(),
             StatusState::Complete => {
                 if let Some(data) = &self.data {
                     data.render()
@@ -454,7 +468,7 @@ mod tests {
                 ],
                 || -> anyhow::Result<()> {
                     ready_rx.recv_timeout(Duration::from_secs(3))?;
-                    let mut model = StatusModel::new().with_fast_mode(true);
+                    let mut model = StatusModel::new();
                     let message = run_status_load(model.update(StatusMsg::Load))?;
                     let data = loaded_status(&message)?;
                     let counters = (
@@ -468,7 +482,7 @@ mod tests {
                         "daemon inventory counters were lost: {counters:?}"
                     );
                     anyhow::ensure!(
-                        data.advisory_coverage == expected && data.fast_mode,
+                        data.advisory_coverage == expected && !data.fast_mode,
                         "daemon scope or requested mode was lost"
                     );
                     let _ = model.update(message);

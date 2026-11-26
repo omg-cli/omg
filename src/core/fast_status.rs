@@ -231,6 +231,16 @@ impl FastStatus {
         Self::read_default_for(false)
     }
 
+    /// Read both installed counts from one validated snapshot.
+    #[cfg(unix)]
+    pub(crate) fn read_installed_counts() -> Option<(usize, usize)> {
+        let status = Self::read_default_for(true)?;
+        Some((
+            status.total_packages as usize,
+            status.explicit_packages as usize,
+        ))
+    }
+
     /// Read the installed total using only the installed-state scope.
     pub fn read_total_count() -> Option<u32> {
         Self::read_default_for(true).map(|status| status.total_packages)

@@ -568,11 +568,11 @@ with tempfile.TemporaryDirectory(prefix="omg-fedora-cache-scope-", dir="/tmp") a
             ("uc", ["uc"], env, lambda value: int(value) == expected_updates),
             ("direct-uc", ["--json", "uc"], disabled, lambda value: json.loads(value) == {"count": expected_updates}),
             ("status-json", ["--json", "status"], env, lambda value: json.loads(value)["updates_available"] == expected_updates),
-            ("status-fast-json", ["--json", "status", "--fast"], env, lambda value: json.loads(value)["updates_available"] == expected_updates),
+            ("status-fast-json", ["--json", "status", "--fast"], env, lambda value: json.loads(value)["updates_available"] == 0),
             ("direct-status-json", ["--json", "status"], disabled, lambda value: json.loads(value)["updates_available"] == expected_updates),
             ("tc", ["--json", "tc"], env, lambda value: json.loads(value) == {"count": 1}),
             ("ec", ["--json", "ec"], env, lambda value: json.loads(value) == {"count": 1}),
-            ("advisory-status", ["status", "--fast"], env, lambda value: advisory_status(value, expected_findings)),
+            ("advisory-status", ["status", "--fast"], env, lambda value: "Advisory coverage unreported" in value),
             ("advisory-bare-status", ["status"], env, lambda value: advisory_status(value, expected_findings) and updates_status(value)),
             ("direct-bare-status", ["status"], disabled, lambda value: advisory_status(value, False) and updates_status(value)),
         ]
@@ -7694,6 +7694,58 @@ env.OMG_FIXTURE_TASK = "changed"
                                        passed=passed, status=result.returncode,
                                        diagnostic=(result.stderr or result.stdout)[-750:]))
 
+    def inspect_fast_status_modes(phase, explicit_count):
+        ready = json.loads(checked([cli, "--json", "status"], env, ordinary))
+        assert ready["updates_available"] == 1 and ready["explicit_packages"] == explicit_count
+        assert ready["orphan_packages"] == 1 - explicit_count
+
+        variants = (
+            ("long-text", ["status", "--fast"], False),
+            ("short-text", ["status", "-f"], False),
+            ("long-json", ["--json", "status", "--fast"], True),
+            ("short-json", ["--json", "status", "-f"], True),
+        )
+        for option in ("--upgrades", "--unneeded"):
+            with reject_native_selection(option):
+                for role, mode in (("daemon-ready", env), ("direct", disabled)):
+                    before = request_counters()
+                    for label, args, as_json in variants:
+                        result = command([cli, *args], mode, ordinary)
+                        try:
+                            if as_json:
+                                data = json.loads(result.stdout)
+                                counts = tuple(data[key] for key in ("total_packages", "explicit_packages",
+                                                                      "orphan_packages", "updates_available"))
+                                matched = counts == (1, explicit_count, 0, 0)
+                            else:
+                                matched = (
+                                    f"1 packages installed · {explicit_count} explicit" in result.stdout
+                                    and "Updates and orphans not checked" in result.stdout
+                                    and "Advisory coverage unreported" in result.stdout
+                                    and not re.search(r"(?m)^\s*(Orphans|Updates)\s+\d+\s*$", result.stdout)
+                                )
+                        except (TypeError, ValueError, KeyError):
+                            matched = False
+                        checks.append(dict(phase=phase, case=f"{role}-{option[2:]}-{label}",
+                                           passed=matched and result.returncode == 0 and not result.stderr,
+                                           status=result.returncode, value=result.stdout[-600:],
+                                           diagnostic=result.stderr[-700:]))
+                    after = request_counters()
+                    calls = (after[0] - before[0] - 1, after[1] - before[1])
+                    checks.append(dict(phase=phase, case=f"{role}-{option[2:]}-ipc",
+                                       passed=calls == (0, 0), value=calls))
+
+    def inspect_status_write_failures():
+        for label, args in (("json", ["--json", "status"]), ("fast-json", ["--json", "status", "--fast"])):
+            with open("/dev/full", "wb") as sink:
+                result = subprocess.run([str(cli), *args], cwd=work, env=disabled, stdout=sink,
+                                        stderr=subprocess.PIPE, text=True, timeout=30, **ordinary)
+            error = result.stderr
+            checks.append(dict(phase="status-unwritable-output", case=label,
+                               passed=result.returncode == 1 and "No space left on device" in error
+                               and "panicked" not in error, status=result.returncode,
+                               diagnostic=error[-750:]))
+
     def inspect_advisory_details(phase, matches_installed):
         with reject_native_selection("info", after="advisory"):
             result = command([cli, "audit", "scan", "--fail-on-findings"], disabled, ordinary)
@@ -8828,9 +8880,12 @@ exec {shlex.quote(str(binary))} "$@"
                     inspect_update_query_refusal("update-present-native-installed", "--installed", False)
                     inspect_overlapping_status("status-metadata-restored", 1)
                     inspect_status_inventory_scope("status-metadata-restored", 1, custom_state)
+                    inspect_fast_status_modes("fast-status-with-upgrade", 1)
+                    inspect_status_write_failures()
                     mark("dependency")
                     try:
                         inspect_independent_counters("independent-counters-populated", 1, 1)
+                        inspect_fast_status_modes("fast-status-with-upgrade-and-orphan", 0)
                         inspect_read_only_updates("update-read-upgrades", 1)
                     finally:
                         mark("user")
@@ -8932,6 +8987,6 @@ mark_progress("completed with host inventory unchanged")
 report = dict(binaries=binaries, checks=checks, total=len(checks),
               passed=sum(entry["passed"] for entry in checks), host_unchanged=True)
 print(json.dumps(report))
-expected_checks = 303 if consent_oracle is None else 2785
+expected_checks = 303 if consent_oracle is None else 2827
 if report["passed"] != report["total"] or report["total"] != expected_checks:
     sys.exit(4)
