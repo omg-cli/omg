@@ -5564,6 +5564,123 @@ fixture["seed_runtime_advisory_fixture"](root, "node", version, config)
                     passed=bool(removed),diagnostic=(unlink.stdout[-380:],unlink.stderr[-550:])))
 
 
+    def inspect_machine_identity():
+        phase = "fedora-machine-identity"
+        system_path = Path("/etc/machine-id")
+        valid_system = b"13579bdf2468ace00000000000000099\n"
+        legacy = b"already-linked-fixture\n"
+        for case, system, stored in (
+            ("system-valid", valid_system, legacy),
+            ("system-first-boot", b"uninitialized\n", legacy),
+            ("system-oversized", valid_system.ljust(129), legacy),
+            ("fallback-existing", b"", legacy),
+            ("fallback-create", b"", None),
+            ("fallback-repair", b"", b" \n"),
+            ("fallback-oversized", b"", legacy.ljust(129)),
+            ("fallback-symlink", b"", legacy),
+        ):
+            with tempfile.TemporaryDirectory(prefix="machine-identity-", dir=work) as directory:
+                home = Path(directory)
+                data, config = home/"data", home/"config"
+                for path in (home,data,config):
+                    path.mkdir(exist_ok=True)
+                    path.chmod(0o700)
+                    os.chown(path, account.pw_uid, account.pw_gid)
+
+                def write(path, value, mode=0o600):
+                    path.write_bytes(value)
+                    path.chmod(mode)
+                    os.chown(path, account.pw_uid, account.pw_gid)
+
+                system_fixture = home/"system-id"
+                write(system_fixture,system,0o644)
+                write(config/"config.toml",b"telemetry_enabled = false\n")
+                identity_path = data/"machine-id"
+                target = data/"separate-id"
+                lock_path = data/"machine-id.lock"
+                if case=="fallback-symlink":
+                    write(target,stored)
+                    identity_path.symlink_to(target.name)
+                elif stored is not None:
+                    write(identity_path,stored)
+                held = case in ("fallback-existing","fallback-create","fallback-repair")
+                waits = case in ("fallback-create","fallback-repair")
+                if held:
+                    write(lock_path,b"")
+                chosen = dict(disabled, HOME=str(home), OMG_DATA_DIR=str(data), OMG_CONFIG_DIR=str(config),
+                              XDG_CONFIG_HOME=str(home/"xdg-config"), XDG_DATA_HOME=str(home/"xdg-data"),
+                              XDG_STATE_HOME=str(home/"state"), XDG_CACHE_HOME=str(home/"cache"),
+                              CI="1", OMG_NO_UPDATE_CHECK="1", RUST_LOG="omg_lib::core::license=debug")
+                lock = None
+                children = []
+                checked(["/usr/bin/mount","--bind",system_fixture,system_path])
+                try:
+                    if held:
+                        lock = lock_path.open("r+b")
+                        fcntl.flock(lock,fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    for index in range(4):
+                        stdout, stderr = home/f"stdout-{index}", home/f"stderr-{index}"
+                        with stdout.open("w") as output, stderr.open("w") as errors:
+                            process = subprocess.Popen([str(cli),"account","link","--token-stdin"],
+                                cwd=home,env=chosen,stdin=subprocess.PIPE,stdout=output,
+                                stderr=errors,text=True,**ordinary)
+                        process.stdin.write("qa-identity-example\n")
+                        process.stdin.close()
+                        children.append((process,stdout,stderr))
+                    lease_ok = True
+                    if waits:
+                        deadline = time.monotonic()+8
+                        while not all("Validating token..." in out.read_text() for _,out,_ in children):
+                            assert time.monotonic()<deadline, "account callers must reach validation"
+                            time.sleep(0.02)
+                        time.sleep(0.25)
+                        before = identity_path.read_bytes() if identity_path.is_file() else None
+                        lease_ok = (before==stored and all(child.poll() is None for child,_,_ in children)
+                                    and all("Generated machine ID fingerprint" not in err.read_text()
+                                            for _,_,err in children))
+                        fcntl.flock(lock,fcntl.LOCK_UN)
+                    for child,_,_ in children:
+                        child.wait(timeout=12)
+
+                    observed = identity_path.read_bytes() if identity_path.is_file() else None
+                    rejected = case in ("fallback-oversized","fallback-symlink")
+                    if waits:
+                        durable = observed is not None and observed!=stored
+                        if durable:
+                            try:
+                                durable = (uuid.UUID(observed.decode()).version==4 and
+                                           identity_path.stat().st_mode & 0o777==0o600)
+                            except (UnicodeError,ValueError):
+                                durable = False
+                    else:
+                        durable = observed==stored
+                    if case=="fallback-symlink":
+                        durable = durable and identity_path.is_symlink() and target.read_bytes()==stored
+                    raw_id = system if case=="system-valid" else observed
+                    expected = hashlib.sha256(raw_id.strip()).hexdigest()[:16] if raw_id else None
+                    for index,(child,out,err) in enumerate(children,1):
+                        logs = err.read_text()
+                        fingerprints = re.findall(r"Generated machine ID fingerprint: ([a-f0-9]{16})",logs)
+                        if rejected:
+                            reason = "byte limit" if case=="fallback-oversized" else "regular file"
+                            correct = len(fingerprints)==1 and fingerprints[0]!=expected and reason in logs
+                        else:
+                            correct = fingerprints==[expected]
+                        offline = (child.returncode==1 and "Failed to connect to dashboard" in logs
+                                   and "Dashboard account linked." not in out.read_text())
+                        checks.append(dict(phase=phase,case=f"{case}-{index}",status=child.returncode,
+                            passed=bool(offline and correct and durable and lease_ok),
+                            diagnostic=(fingerprints,expected,durable,lease_ok,offline)))
+                finally:
+                    if lock is not None:
+                        lock.close()
+                    for child,_,_ in children:
+                        if child.poll() is None:
+                            child.kill()
+                        child.wait()
+                    checked(["/usr/bin/umount",system_path])
+
+
     def inspect_task_environment_bytes():
         phase = "task-environment-bytes"
         raw = b"test-\xff-value"
@@ -8306,6 +8423,7 @@ exec {shlex.quote(str(binary))} "$@"
                     inspect_usage_dispatch_admission()
                     inspect_saved_usage_stats()
                     inspect_account_storage()
+                    inspect_machine_identity()
                 config.write_text(host_config)
                 inspect("returned-host", host_count, host_explicit, host=True)
                 mark_progress("root switch and return")
@@ -8617,6 +8735,6 @@ mark_progress("completed with host inventory unchanged")
 report = dict(binaries=binaries, checks=checks, total=len(checks),
               passed=sum(entry["passed"] for entry in checks), host_unchanged=True)
 print(json.dumps(report))
-expected_checks = 303 if consent_oracle is None else 2682
+expected_checks = 303 if consent_oracle is None else 2714
 if report["passed"] != report["total"] or report["total"] != expected_checks:
     sys.exit(4)

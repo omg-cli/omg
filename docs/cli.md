@@ -1991,6 +1991,8 @@ omg account <SUBCOMMAND>
 OMG reads the local credential and its clock watermark from regular files.
 The credential is limited to 16 MiB. If you keep it behind a symlink, run
 `omg account link --token-stdin` to recreate the local credential file.
+When a system machine ID is unavailable, OMG stores a private fallback ID and
+shares it across CLI invocations using the same data directory.
 
 ### omg daemon
 

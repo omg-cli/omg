@@ -12,6 +12,7 @@
 use anyhow::{Context, Result};
 use jsonwebtoken::{DecodingKey, Validation, decode};
 use serde::{Deserialize, Serialize};
+use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::OnceLock;
@@ -23,6 +24,7 @@ const LICENSE_TOKEN_ISSUER: &str = super::service_api::ORIGIN;
 const LICENSE_TOKEN_AUDIENCE: &str = "omg-cli";
 const MAX_LICENSE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_LICENSE_CLOCK_BYTES: u64 = 64;
+const MAX_MACHINE_ID_BYTES: u64 = 128;
 
 /// Production Ed25519 public key used for offline license-token verification.
 ///
@@ -479,26 +481,7 @@ fn license_clock_floor_with(path: &Path, now: i64) -> Result<i64> {
         )
     })?;
 
-    let lock_path = path.with_extension("lock");
-    let mut options = std::fs::OpenOptions::new();
-    options.create(true).read(true).write(true).truncate(false);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options
-            .mode(0o600)
-            .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK | nix::libc::O_NOCTTY);
-    }
-    let lock = options
-        .open(&lock_path)
-        .with_context(|| format!("Failed to open license clock lock: {}", lock_path.display()))?;
-    anyhow::ensure!(
-        lock.metadata()?.is_file(),
-        "License clock lock must be a regular file: {}",
-        lock_path.display()
-    );
-    lock.lock()
-        .with_context(|| format!("Failed to lock license clock: {}", lock_path.display()))?;
+    let lock = lock_private_state(&path.with_extension("lock"), "license clock lock")?;
 
     let result: Result<i64> = (|| {
         let stored = load_clock_watermark(path)?;
@@ -539,13 +522,9 @@ pub fn get_machine_id() -> String {
 }
 
 fn compute_machine_id() -> String {
-    // Use only the machine-id source that is stable across privilege changes.
-    // DMI identifiers are commonly root-readable only, so including every
-    // readable source produced different fingerprints before and after sudo.
-    let identity = std::fs::read_to_string("/etc/machine-id")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
+    // The system ID is stable across privilege changes. Privileged-only
+    // sources, such as some of the DMI identifiers, would break that property.
+    let identity = read_system_machine_id(Path::new("/etc/machine-id"))
         .unwrap_or_else(persisted_machine_id_fallback);
 
     let hash = sha256_hex(identity.as_bytes());
@@ -554,25 +533,109 @@ fn compute_machine_id() -> String {
     fingerprint.to_string()
 }
 
+fn read_system_machine_id(path: &Path) -> Option<String> {
+    use std::io::Read as _;
+
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        // The administrator may configure the system path as a symlink.
+        options.custom_flags(nix::libc::O_NONBLOCK | nix::libc::O_NOCTTY);
+    }
+    let file = options.open(path).ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file() || metadata.len() > MAX_MACHINE_ID_BYTES {
+        return None;
+    }
+    let mut contents = String::new();
+    file.take(MAX_MACHINE_ID_BYTES + 1)
+        .read_to_string(&mut contents)
+        .ok()?;
+    let id = contents.trim();
+    // systemd can leave an empty file or an "uninitialized" marker during
+    // first boot. Only a configured 128-bit ID can identify the host.
+    if contents.len() as u64 > MAX_MACHINE_ID_BYTES
+        || id.len() != 32
+        || !id.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || !id.bytes().any(|byte| byte != b'0')
+    {
+        return None;
+    }
+    Some(id.to_owned())
+}
+
 fn persisted_machine_id_fallback() -> String {
-    let fallback_path = crate::core::paths::data_dir().join("machine-id");
-    std::fs::read_to_string(&fallback_path)
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| {
-            let generated = uuid::Uuid::new_v4().to_string();
-            if let Some(parent) = fallback_path.parent()
-                && let Err(error) = crate::core::paths::create_private_data_directory(parent)
-            {
-                tracing::warn!("Failed to create machine ID directory: {error}");
-                return generated;
-            }
-            if let Err(error) = write_private_file(&fallback_path, generated.as_bytes()) {
-                tracing::warn!("Failed to persist generated machine ID: {error}");
-            }
-            generated
-        })
+    let path = crate::core::paths::data_dir().join("machine-id");
+    match read_or_create_fallback_id(&path) {
+        Ok(identity) => identity,
+        Err(error) => {
+            tracing::warn!("Cannot persist fallback machine ID: {error:#}");
+            uuid::Uuid::new_v4().to_string()
+        }
+    }
+}
+
+fn read_or_create_fallback_id(path: &Path) -> Result<String> {
+    if let Some(identity) = load_fallback_id(path)? {
+        return Ok(identity);
+    }
+    let parent = path
+        .parent()
+        .context("Machine ID path needs a parent directory")?;
+    crate::core::paths::create_private_data_directory(parent)?;
+    let _lock = lock_private_state(&path.with_extension("lock"), "fallback machine ID lock")?;
+    if let Some(identity) = load_fallback_id(path)? {
+        return Ok(identity);
+    }
+    let identity = uuid::Uuid::new_v4().to_string();
+    write_private_file(path, identity.as_bytes())?;
+    Ok(identity)
+}
+
+fn load_fallback_id(path: &Path) -> Result<Option<String>> {
+    match super::safe_ops::read_bounded_regular_file(
+        path,
+        "Fallback machine ID",
+        MAX_MACHINE_ID_BYTES,
+    ) {
+        Ok(contents) => {
+            let identity = contents.trim();
+            Ok((!identity.is_empty()).then(|| identity.to_owned()))
+        }
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|cause| cause.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn lock_private_state(path: &Path, kind: &str) -> Result<File> {
+    let mut options = OpenOptions::new();
+    options.create(true).read(true).write(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options
+            .mode(0o600)
+            .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK | nix::libc::O_NOCTTY);
+    }
+    let lock = options
+        .open(path)
+        .with_context(|| format!("Failed to open {kind}: {}", path.display()))?;
+    anyhow::ensure!(
+        lock.metadata()?.is_file(),
+        "{kind} must be a regular file: {}",
+        path.display()
+    );
+    lock.lock()
+        .with_context(|| format!("Failed to acquire {kind}: {}", path.display()))?;
+    Ok(lock)
 }
 
 /// SHA256 hash as hex string
@@ -1049,6 +1112,25 @@ pub fn features_for_tier(tier: Tier) -> Vec<&'static Feature> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn system_identity_accepts_a_regular_alias_and_rejects_a_zero_id() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("system-id");
+        std::fs::write(&path, b"00000000000000000000000000000000")?;
+        assert!(read_system_machine_id(&path).is_none());
+
+        let identity = "0123456789abcdef0123456789abcdef";
+        std::fs::write(&path, format!("{identity}\n"))?;
+        assert_eq!(read_system_machine_id(&path).as_deref(), Some(identity));
+        #[cfg(unix)]
+        {
+            let alias = directory.path().join("alias");
+            std::os::unix::fs::symlink(&path, &alias)?;
+            assert_eq!(read_system_machine_id(&alias).as_deref(), Some(identity));
+        }
+        Ok(())
+    }
 
     #[test]
     fn fallback_machine_identity_is_private_stable_and_recovers_empty_state() {
