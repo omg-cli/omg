@@ -100,8 +100,7 @@ jobs:
       - name: Stage verified Linux archives
         id: stage
         if: >-
-          inputs.smoke_ci_sha != '' ||
-          (vars.OMG_RELEASE_REUSE_CI_LINUX == 'true' && steps.evidence.outputs.ci-run != '')
+          inputs.smoke_ci_sha != '' || github.event_name == 'push' || inputs.dry_run != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           SOURCE_SHA: ${{ inputs.smoke_ci_sha || github.sha }}

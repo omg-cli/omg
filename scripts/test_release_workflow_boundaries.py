@@ -124,6 +124,7 @@ class ReleaseWorkflowBoundaryTests(unittest.TestCase):
             ('missing attempt', {'GITHUB_RUN_ATTEMPT': ''}, [], False, False),
             ('invalid publish input', {'PUBLISH_RELEASE': ''}, [], False, False),
             ('failed push CI', {'PUSH_CI': 'failure'}, all_lookups, False, False),
+            ('refused native archive', {'NATIVE_STAGE': 'failure'}, all_lookups, False, False),
             ('validation with failed CI', {'PUSH_CI': 'failure', 'PUBLISH_RELEASE': 'false'},
              all_lookups, False, False),
             ('drift before tag', {'BEFORE_TAG': 'drifted'}, all_lookups, False, False),
@@ -161,7 +162,9 @@ class ReleaseWorkflowBoundaryTests(unittest.TestCase):
                     'python3': f'if [ "$1" != {EVIDENCE_SCRIPT} ]; then\n'
                                '  touch advisory-status-called; exit 1\n'
                                'fi\nprintf "%s %s\\n" "$1" "$2" >> lookups\n'
-                               'test "$PUSH_CI" = success\n',
+                               'test "$PUSH_CI" = success || exit 1\n'
+                               '[ "$3" = --stage-linux ] || exit 2\n'
+                               'test "$NATIVE_STAGE" = success\n',
                 }
                 (root / 'scripts').mkdir()
                 for name, body in fixtures.items():
@@ -171,8 +174,9 @@ class ReleaseWorkflowBoundaryTests(unittest.TestCase):
                 env = dict(os.environ, PATH=str(root) + os.pathsep + os.environ['PATH'],
                            GITHUB_EVENT_NAME='workflow_dispatch', GITHUB_REF=main, GITHUB_SHA=sha,
                            GITHUB_RUN_ATTEMPT='1', GITHUB_STEP_SUMMARY=str(root / 'summary'),
+                           RUNNER_TEMP=str(root),
                            RELEASE_CANDIDATE=approved, BEFORE_TAG='current', AFTER_TAG='current',
-                           PUSH_CI='success', PUBLISH_RELEASE='true')
+                           PUSH_CI='success', NATIVE_STAGE='success', PUBLISH_RELEASE='true')
                 env.update(overrides)
                 result = subprocess.run([BASH, '-e', '-o', 'pipefail', '-c', script], cwd=root,
                                         env=env, capture_output=True, text=True, timeout=10)
@@ -185,7 +189,8 @@ class ReleaseWorkflowBoundaryTests(unittest.TestCase):
                     self.assertIn(f'v0.1.225 at {sha}', (root / 'summary').read_text())
                 self.assertFalse((root / 'advisory-status-called').exists())
                 reads = root / 'main-reads'
-                expected_reads = [env['BEFORE_TAG']] if expected_lookups and env['PUSH_CI'] == 'success' else []
+                preflight_passed = env['PUSH_CI'] == env['NATIVE_STAGE'] == 'success'
+                expected_reads = [env['BEFORE_TAG']] if expected_lookups and preflight_passed else []
                 if tagged:
                     expected_reads.append(env['AFTER_TAG'])
                 self.assertEqual(reads.read_text().splitlines() if reads.exists() else [], expected_reads)

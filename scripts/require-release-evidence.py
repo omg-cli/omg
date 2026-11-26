@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime
 import json
 import os
+from pathlib import Path
 import re
 import subprocess
 import sys
@@ -126,9 +127,16 @@ def require_release_evidence(repository, sha, snapshot=github_snapshot):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('commit')
+    parser.add_argument('--stage-linux', type=Path)
     arguments = parser.parse_args()
     try:
         ci_run = require_release_evidence(os.environ['GITHUB_REPOSITORY'], arguments.commit)
+        if arguments.stage_linux is not None:
+            subprocess.run([
+                sys.executable, str(Path(__file__).with_name('native-build-artifact.py')),
+                'stage-release', '--destination', str(arguments.stage_linux),
+                '--commit', arguments.commit, '--ci-run', str(ci_run.id), '--ci-attempt', str(ci_run.attempt),
+            ], check=True)
         if output := os.environ.get('GITHUB_OUTPUT'):
             with open(output, 'a', encoding='utf-8') as stream:
                 stream.write(f'ci-run={ci_run.id}\nci-attempt={ci_run.attempt}\n')
