@@ -50,6 +50,12 @@ class RequireReleaseEvidence(unittest.TestCase):
         self.assertEqual(self.stdout.getvalue().count(' passed for '), len(WORKFLOWS))
         self.sleep.assert_not_called()
 
+    def test_staging_gets_the_admitted_ci_run_and_attempt(self):
+        data = release_snapshot()
+        data['workflow_runs'][0]['run_attempt'] = 2
+        run = GATE['require_release_evidence'](REPO, SHA, mock.Mock(return_value=data))
+        self.assertEqual((run.id, run.attempt), (1, 2))
+
     def test_a_known_failure_refuses_while_ci_is_pending(self):
         data = release_snapshot()
         data['workflow_runs'][0].update(status='in_progress', conclusion=None)

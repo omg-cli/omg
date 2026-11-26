@@ -26,6 +26,13 @@ MAX_HTTP_HEADERS = 64 * 1024
 FEATURES = {'arch': 'arch,pgp,license', 'debian': 'debian,pgp,license',
             'debian-trixie': 'debian,pgp,license',
             'ubuntu': 'debian,pgp,license', 'fedora': 'fedora,pgp,license'}
+RELEASE_IMAGES = {
+    'arch': 'archlinux:latest@sha256:f3691b4dde62ba4c4b6f0ae2c1fbf28e8c0c8c4b9a35c7e06dc1f70e21aa29f6',
+    'debian': 'debian:bookworm@sha256:813017f3d62be4b5891a7acca6a01bdcd4b8513daa81b1ab99d3a50385b26931',
+    'debian-trixie': 'debian:trixie@sha256:34cd9e9fd437c0a095ec39cb2e73422c9f30821b0d0848ed74fd0d43bae4d958',
+    'ubuntu': 'ubuntu-24.04',
+    'fedora': 'fedora:latest@sha256:6c75d5bf57cb0fa5aa4b92c6a83c86c791644496d9ac230de7711f5b8ec3b898',
+}
 
 
 def require(condition, message):
@@ -547,20 +554,25 @@ def verify_clippy(root, destination, context, event):
     return result
 
 
+def bundle_identity(repository, source, run_id, attempt, distro, image, version, toolchain):
+    return {
+        'repository': repository, 'source_sha': source, 'run_id': str(run_id),
+        'run_attempt': attempt, 'workflow_path': '.github/workflows/ci.yml',
+        'distro': distro, 'image': image, 'features': sorted(FEATURES[distro].split(',')),
+        'target': 'x86_64-unknown-linux-gnu', 'profile': 'release', 'instrumentation': 'none',
+        'cpu': 'x86-64-v2' if distro == 'arch' else 'generic', 'toolchain': toolchain, 'version': version,
+    }
+
+
 def reuse(root, distro, image, features, destination, context, event, timeout=1500):
     build_command(distro, features, {})
     started = time.monotonic()
     artifact, run, expected_run, artifact_attempt = find_native_artifact(root, distro, context, event, timeout)
     repository, selected_id, current_attempt = expected_run['repository'], run['id'], run['run_attempt']
-    expected = {
-        'repository': repository, 'source_sha': context['GITHUB_SHA'], 'run_id': str(selected_id),
-        'run_attempt': artifact_attempt, 'workflow_path': '.github/workflows/ci.yml',
-        'distro': distro, 'image': image, 'features': sorted(features.split(',')),
-        'target': 'x86_64-unknown-linux-gnu', 'profile': 'release', 'instrumentation': 'none',
-        'cpu': 'x86-64-v2' if distro == 'arch' else 'generic',
-        'toolchain': tomllib.loads((root / 'rust-toolchain.toml').read_text(encoding='utf-8'))['toolchain']['channel'],
-        'version': tomllib.loads((root / 'Cargo.toml').read_text(encoding='utf-8'))['package']['version'],
-    }
+    toolchain = tomllib.loads((root / 'rust-toolchain.toml').read_text(encoding='utf-8'))['toolchain']['channel']
+    version = tomllib.loads((root / 'Cargo.toml').read_text(encoding='utf-8'))['package']['version']
+    expected = bundle_identity(repository, context['GITHUB_SHA'], selected_id, artifact_attempt,
+                               distro, image, version, toolchain)
     content = download_artifact(f'repos/{repository}/actions/artifacts/{artifact["id"]}/zip')
     provenance, files = validate_bundle(content, artifact.get('digest'), expected)
     refreshed = api_json(f'repos/{repository}/actions/runs/{selected_id}')
@@ -573,6 +585,72 @@ def reuse(root, distro, image, features, destination, context, event, timeout=15
     (destination / 'native-build.json').write_text(json.dumps(provenance, indent=2) + '\n', encoding='utf-8')
     print(f'Verified native CI artifact {artifact["id"]}; waited {time.monotonic() - started:.1f}s', flush=True)
     return provenance
+
+
+def stage_release(root, destination, repository, source, run_id, attempt):
+    require(re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', repository), 'invalid repository')
+    require(re.fullmatch(r'[a-f0-9]{40}', source), 'release staging requires a full commit SHA')
+    require(all(type(value) is int and value > 0 for value in (run_id, attempt)),
+            'release staging requires a positive CI run and attempt')
+    require(not destination.exists() and not destination.is_symlink(), 'release staging destination exists')
+    manifest = command_output(['git', '-C', str(root), 'show', f'{source}:Cargo.toml'])
+    toolchain_file = command_output(['git', '-C', str(root), 'show', f'{source}:rust-toolchain.toml'])
+    version = tomllib.loads(manifest)['package']['version']
+    toolchain = tomllib.loads(toolchain_file)['toolchain']['channel']
+    path = f'repos/{repository}/actions'
+    workflow = api_json(path + '/workflows/ci.yml')
+    require(workflow.get('path') == '.github/workflows/ci.yml' and type(workflow.get('id')) is int,
+            'invalid CI workflow identity')
+    expected_run = dict(repository=repository, workflow_id=workflow['id'], event='push', head_sha=source)
+    run_path = f'{path}/runs/{run_id}'
+
+    def successful_run():
+        run = api_json(run_path)
+        validate_producer_run(run, expected_run)
+        require((run['id'], run['run_attempt']) == (run_id, attempt), 'release producer run or attempt changed')
+        require((run.get('head_branch'), run['status'], run['conclusion']) == ('main', 'completed', 'success'),
+                'release producer is not a successful main push')
+        return run
+
+    run = successful_run()
+    repo_id = run['repository']['id']
+    require(type(repo_id) is int and repo_id > 0, 'invalid producer repository ID')
+    identity = dict(id=run_id, repository_id=repo_id, head_repository_id=repo_id,
+                    head_branch='main', head_sha=source)
+    listing = read_native_artifact_listing(repository, run_id)
+    candidates = {}
+    for distro in RELEASE_IMAGES:
+        selected = select_native_artifact(repository, run, expected_run, distro, listing)
+        require(selected is not None, f'CI finished without the required {distro} release artifact')
+        artifact, artifact_attempt = selected
+        owner = artifact.get('workflow_run', {})
+        require(isinstance(owner, dict) and all(type(owner.get(key)) is type(value) and owner[key] == value
+                                                for key, value in identity.items()),
+                f'{distro} release artifact identity does not match the main CI run')
+        candidates[distro] = (artifact, artifact_attempt)
+    require(len({artifact['id'] for artifact, _ in candidates.values()}) == len(candidates),
+            'duplicate release artifact IDs')
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    receipt = dict(repository=repository, source_sha=source, run_id=run_id, run_attempt=attempt, archives={})
+    with tempfile.TemporaryDirectory(prefix='native-release-', dir=destination.parent) as scratch:
+        stage = Path(scratch) / 'verified'
+        for distro, (artifact, artifact_attempt) in candidates.items():
+            expected = bundle_identity(repository, source, run_id, artifact_attempt, distro,
+                                       RELEASE_IMAGES[distro], version, toolchain)
+            content = download_artifact(f'{path}/artifacts/{artifact["id"]}/zip')
+            provenance, files = validate_bundle(content, artifact.get('digest'), expected)
+            package = stage / f'{distro}-build'
+            package.mkdir(parents=True)
+            for name, data in files.items():
+                (package / name).write_bytes(data)
+            receipt['archives'][distro] = dict(provenance, artifact_id=artifact['id'],
+                                               artifact_attempt=artifact_attempt, artifact_digest=artifact['digest'])
+        successful_run()
+        (stage / 'native-release-provenance.json').write_text(json.dumps(receipt, indent=2) + '\n', encoding='utf-8')
+        require(not destination.exists() and not destination.is_symlink(), 'release staging destination exists')
+        stage.rename(destination)
+    return receipt
 
 
 def validate_bundle(content, server_digest, expected):
@@ -661,14 +739,25 @@ def validate_bundle(content, server_digest, expected):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('mode', choices=('build', 'reuse', 'wait', 'ready', 'clippy-record', 'clippy-verify'))
+    parser.add_argument('mode', choices=('build', 'reuse', 'wait', 'ready', 'clippy-record', 'clippy-verify',
+                                         'stage-release'))
     parser.add_argument('--distro', choices=tuple(FEATURES))
     parser.add_argument('--platform', choices=CLIPPY_PLATFORMS)
     parser.add_argument('--image')
     parser.add_argument('--features')
     parser.add_argument('--destination', type=Path)
     parser.add_argument('--timeout', type=int, default=1500)
+    parser.add_argument('--commit')
+    parser.add_argument('--ci-run', type=int)
+    parser.add_argument('--ci-attempt', type=int)
     args = parser.parse_args(argv)
+    if args.mode == 'stage-release':
+        if any(value is None for value in (args.destination, args.commit, args.ci_run, args.ci_attempt)):
+            parser.error('stage-release requires --destination, --commit, --ci-run and --ci-attempt')
+        return stage_release(Path.cwd(), args.destination, os.environ['GITHUB_REPOSITORY'],
+                             args.commit, args.ci_run, args.ci_attempt)
+    if any(value is not None for value in (args.commit, args.ci_run, args.ci_attempt)):
+        parser.error('--commit, --ci-run and --ci-attempt only apply to stage-release')
     if args.mode in ('clippy-record', 'clippy-verify'):
         require(args.destination is not None, 'Clippy proof destination is required')
         if args.mode == 'clippy-record':
