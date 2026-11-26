@@ -15,6 +15,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+const MAX_USAGE_BYTES: u64 = 16 * 1024 * 1024;
+
 /// Time saved per operation (in milliseconds)
 /// Based on benchmark comparisons vs traditional tools
 pub mod time_saved {
@@ -214,39 +216,48 @@ impl UsageStats {
         Self::load_from(&Self::path()?)
     }
 
-    fn load_from(path: &std::path::Path) -> Result<Self> {
-        let read = || -> std::io::Result<String> {
-            use std::io::Read as _;
-            let mut options = std::fs::OpenOptions::new();
-            options.read(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt as _;
-                options.custom_flags(nix::libc::O_NONBLOCK);
-            }
-            let mut file = options.open(path)?;
-            if !file.metadata()?.is_file() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "usage storage must be a regular file",
-                ));
-            }
-            let mut content = String::new();
-            file.read_to_string(&mut content)?;
-            Ok(content)
-        };
-        let content = match read() {
-            Ok(content) => content,
+    fn load_from(path: &Path) -> Result<Self> {
+        use std::io::Read as _;
+
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.custom_flags(nix::libc::O_NONBLOCK | nix::libc::O_NOCTTY);
+        }
+
+        let source_context = || format!("Failed to read usage stats: {}", path.display());
+        let file = match options.open(path) {
+            Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(Self::default());
             }
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("Failed to read usage stats: {}", path.display()));
-            }
+            Err(error) => return Err(error).with_context(source_context),
         };
-        serde_json::from_str(&content)
+        let metadata = file.metadata().with_context(source_context)?;
+        anyhow::ensure!(
+            metadata.is_file(),
+            "Usage storage must be a regular file: {}",
+            path.display()
+        );
+        Self::check_size(path, metadata.len())?;
+        let mut content = Vec::with_capacity(metadata.len() as usize + 1);
+        file.take(MAX_USAGE_BYTES + 1)
+            .read_to_end(&mut content)
+            .with_context(source_context)?;
+        Self::check_size(path, content.len() as u64)?;
+        serde_json::from_slice(&content)
             .with_context(|| format!("Malformed usage stats: {}", path.display()))
+    }
+
+    fn check_size(path: &Path, size: u64) -> Result<()> {
+        anyhow::ensure!(
+            size <= MAX_USAGE_BYTES,
+            "Usage stats exceeds the {MAX_USAGE_BYTES} byte limit: {}",
+            path.display()
+        );
+        Ok(())
     }
 
     /// Save usage stats to disk.
@@ -257,7 +268,8 @@ impl UsageStats {
     }
 
     fn save_to(&self, path: &std::path::Path) -> Result<()> {
-        let content = serde_json::to_vec_pretty(self).context("Failed to serialize usage stats")?;
+        let content = serde_json::to_vec(self).context("Failed to serialize usage stats")?;
+        Self::check_size(path, content.len() as u64)?;
         crate::core::safe_ops::atomic_write_file_sync(path, content)?;
         Ok(())
     }
@@ -291,21 +303,23 @@ impl UsageStats {
         today: jiff::civil::Date,
     ) {
         self.record_command_on(command, time_saved_ms, today);
-        match operation {
-            DailyOperation::Install => self.installs_today += 1,
-            DailyOperation::Search => self.searches_today += 1,
-            DailyOperation::RuntimeSwitch => self.runtimes_today += 1,
-        }
+        let counter = match operation {
+            DailyOperation::Install => &mut self.installs_today,
+            DailyOperation::Search => &mut self.searches_today,
+            DailyOperation::RuntimeSwitch => &mut self.runtimes_today,
+        };
+        *counter = counter.saturating_add(1);
     }
 
     fn record_command_on(&mut self, command: &str, time_saved_ms: u64, today: jiff::civil::Date) {
         self.rollover_for(today);
-        self.total_commands += 1;
-        self.time_saved_ms += time_saved_ms;
-        *self.commands.entry(command.to_string()).or_insert(0) += 1;
-        self.queries_today += 1;
-        self.time_saved_today_ms += time_saved_ms;
-        self.queries_this_month += 1;
+        self.total_commands = self.total_commands.saturating_add(1);
+        self.time_saved_ms = self.time_saved_ms.saturating_add(time_saved_ms);
+        let count = self.commands.entry(command.to_string()).or_insert(0);
+        *count = count.saturating_add(1);
+        self.queries_today = self.queries_today.saturating_add(1);
+        self.time_saved_today_ms = self.time_saved_today_ms.saturating_add(time_saved_ms);
+        self.queries_this_month = self.queries_this_month.saturating_add(1);
         self.check_achievements();
     }
 
@@ -317,7 +331,6 @@ impl UsageStats {
 
     fn rollover_for(&mut self, today: jiff::civil::Date) {
         let today_string = today.to_string();
-        let month = today_string[..7].to_string();
 
         if self.first_use_date.is_empty() {
             self.first_use_date.clone_from(&today_string);
@@ -325,9 +338,13 @@ impl UsageStats {
 
         if self.last_query_date != today_string {
             if let Ok(last_date) = jiff::civil::Date::strptime("%Y-%m-%d", &self.last_query_date) {
+                if today < last_date {
+                    // Keep the most recent counters together until the clock catches up.
+                    return;
+                }
                 let elapsed_days = (today - last_date).get_days();
                 if elapsed_days == 1 {
-                    self.current_streak += 1;
+                    self.current_streak = self.current_streak.saturating_add(1);
                 } else if elapsed_days > 1 {
                     self.current_streak = 1;
                 }
@@ -343,9 +360,11 @@ impl UsageStats {
             self.last_query_date = today_string;
         }
 
+        let month = &self.last_query_date[..7];
         if self.last_month != month {
             self.queries_this_month = 0;
-            self.last_month = month;
+            self.last_month.clear();
+            self.last_month.push_str(month);
         }
     }
 
@@ -402,10 +421,19 @@ impl UsageStats {
     /// Get most used commands (top 5)
     #[must_use]
     pub fn top_commands(&self) -> Vec<(String, u64)> {
-        let mut sorted: Vec<_> = self.commands.iter().map(|(k, v)| (k.clone(), *v)).collect();
-        sorted.sort_by_key(|&(_, count)| std::cmp::Reverse(count));
-        sorted.truncate(5);
-        sorted
+        let mut commands: Vec<_> = self.commands.iter().collect();
+        let rank = |left: &(&String, &u64), right: &(&String, &u64)| {
+            right.1.cmp(left.1).then_with(|| left.0.cmp(right.0))
+        };
+        if commands.len() > 5 {
+            commands.select_nth_unstable_by(5, rank);
+            commands.truncate(5);
+        }
+        commands.sort_unstable_by(rank);
+        commands
+            .into_iter()
+            .map(|(name, count)| (name.clone(), *count))
+            .collect()
     }
 
     /// Check if sync is needed (every 30 seconds for real-time dashboard)
@@ -415,7 +443,7 @@ impl UsageStats {
             return false;
         }
         let now = jiff::Timestamp::now().as_second();
-        now - self.last_sync > 30 // 30 seconds for near real-time updates
+        now.saturating_sub(self.last_sync) > 30
     }
 
     /// Check if immediate sync is needed (for important events)
@@ -664,7 +692,8 @@ pub fn track_install(packages: &[String]) {
         };
 
         for pkg in packages {
-            *stats.installed_packages.entry(pkg.clone()).or_insert(0) += 1;
+            let count = stats.installed_packages.entry(pkg.clone()).or_insert(0);
+            *count = count.saturating_add(1);
         }
 
         stats.record_specialized_command(
@@ -683,10 +712,11 @@ pub fn track_runtime_switch(runtime: &str) {
             return;
         };
 
-        *stats
+        let count = stats
             .runtime_usage_counts
             .entry(runtime.to_string())
-            .or_insert(0) += 1;
+            .or_insert(0);
+        *count = count.saturating_add(1);
 
         // Batched with the specialized-command record below into a single
         // locked save instead of writing usage.json once per mutation.
@@ -1071,6 +1101,69 @@ mod tests {
         };
         assert!(!stats.needs_sync());
         assert!(!stats.needs_immediate_sync());
+    }
+
+    #[test]
+    fn sync_interval_handles_extreme_saved_timestamps() {
+        for (last_sync, expected) in [(i64::MIN, true), (i64::MAX, false)] {
+            let stats = UsageStats {
+                total_commands: 7,
+                last_sync,
+                ..UsageStats::default()
+            };
+            assert_eq!(stats.needs_sync(), expected);
+        }
+    }
+
+    #[test]
+    fn ranking_keeps_the_five_highest_counts_and_breaks_ties_by_name() {
+        let counts = [
+            ("zeta", 4),
+            ("delta", 4),
+            ("alpha", 4),
+            ("echo", 8),
+            ("charlie", 5),
+            ("bravo", 4),
+            ("aardvark", 1),
+        ];
+        let stats = UsageStats {
+            commands: counts
+                .into_iter()
+                .map(|(name, count)| (name.to_owned(), count))
+                .collect(),
+            ..UsageStats::default()
+        };
+        let ranked: Vec<_> = stats.top_commands();
+        let ranks: Vec<_> = ranked
+            .iter()
+            .map(|(name, count)| (name.as_str(), *count))
+            .collect();
+        assert_eq!(
+            ranks,
+            [
+                ("echo", 8),
+                ("charlie", 5),
+                ("alpha", 4),
+                ("bravo", 4),
+                ("delta", 4)
+            ]
+        );
+    }
+
+    #[test]
+    fn streak_saturates_at_rollover_and_updates_the_longest_streak() {
+        let mut stats = UsageStats {
+            last_query_date: "2025-04-09".into(),
+            last_month: "2025-04".into(),
+            current_streak: u32::MAX,
+            longest_streak: u32::MAX - 1,
+            ..UsageStats::default()
+        };
+        let today = jiff::civil::Date::strptime("%Y-%m-%d", "2025-04-10").unwrap();
+        stats.record_command_on("search", 10, today);
+        assert_eq!(stats.current_streak, u32::MAX);
+        assert_eq!(stats.longest_streak, u32::MAX);
+        assert_eq!(stats.queries_today, 1);
     }
 
     #[test]

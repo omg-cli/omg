@@ -1560,7 +1560,12 @@ pub fn stats(json: bool) -> Result<()> {
 
     let stats = UsageStats::load().context("Failed to load usage statistics")?;
     if json {
-        println!("{}", serde_json::to_string_pretty(&stats)?);
+        use std::io::{self, Write as _};
+
+        let mut output = io::BufWriter::new(io::stdout().lock());
+        serde_json::to_writer_pretty(&mut output, &stats)?;
+        writeln!(output)?;
+        output.flush()?;
         return Ok(());
     }
 

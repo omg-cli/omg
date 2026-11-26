@@ -1913,6 +1913,9 @@ omg dash [aliases: d]
 
 Display usage statistics.
 
+OMG limits the local usage file to 16 MiB. Daily and monthly counters stay in
+their latest recorded periods if the system clock moves backward.
+
 ```bash
 omg stats
 ```

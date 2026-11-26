@@ -24,6 +24,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import datetime
 import uuid
 import tomllib
 from urllib.parse import parse_qs
@@ -5303,6 +5304,148 @@ fresh:
                                         count,logged,len(retained),untouched)))
 
 
+    def inspect_saved_usage_stats():
+        phase = "fedora-usage-storage"
+        limit = 16 * 1024 * 1024
+        maximum = (1 << 64) - 1
+        today = datetime.datetime.now(datetime.timezone.utc).date()
+        version = "24.15.3"
+        helper = Path(__file__).with_name("runtime_advisory_fixture.py")
+        if not helper.is_file():
+            helper = fixture.parents[1] / "runtime_advisory_fixture.py"
+        seed = r"""
+import runpy, sys
+from pathlib import Path
+helper, directory, version = sys.argv[1:]
+home = Path(directory)
+fixture = runpy.run_path(helper)
+root = home/"data/versions/node"/version
+program = root/"bin/node"
+program.parent.mkdir(parents=True)
+program.write_text("#!/bin/sh\nprintf 'v" + version + "\\n'\n")
+program.chmod(0o755)
+config = Path(fixture["fixture_cli_environment"](home)["OMG_CONFIG_DIR"])
+fixture["seed_runtime_advisory_fixture"](root, "node", version, config)
+"""
+
+        with tempfile.TemporaryDirectory(prefix="usage-storage-", dir=work) as directory:
+            home = Path(directory)
+            os.chown(home, account.pw_uid, account.pw_gid)
+            checked([sys.executable, "-I", "-B", "-c", seed, helper, home, version],
+                    dict(disabled, HOME=str(home)), ordinary)
+            data = home/"data"
+            chosen = dict(disabled, HOME=str(home), OMG_DATA_DIR=str(data), OMG_CONFIG_DIR=str(home/"config/omg"),
+                          OMG_NATIVE_TEST_DATA_DIR="1", XDG_CONFIG_HOME=str(home/"config"),
+                          XDG_DATA_HOME=str(home/"xdg-data"), XDG_CACHE_HOME=str(home/"cache"),
+                          XDG_STATE_HOME=str(home/"state"), TZ="UTC", CI="1", OMG_NO_UPDATE_CHECK="1")
+            path = data/"usage.json"
+            target = data/"historic-usage.json"
+            current = data/"versions/node/current"
+            normal = {
+                "total_commands":7,"commands":{"runtime_switch":7},"time_saved_ms":1036,
+                "queries_today":7,"queries_this_month":7,"last_query_date":today.isoformat(),
+                "last_month":today.isoformat()[:7],"last_sync":0,"current_streak":2,
+                "longest_streak":3,"runtimes_today":7,"time_saved_today_ms":1036,
+                "runtime_usage_counts":{"node":7},
+            }
+            high = dict(normal,total_commands=maximum,time_saved_ms=maximum)
+            high_map = dict(normal,commands={"runtime_switch":maximum},runtime_usage_counts={"node":maximum})
+            high_daily = dict(normal,queries_today=maximum,queries_this_month=maximum,
+                              runtimes_today=maximum,time_saved_today_ms=maximum)
+            previous = today-datetime.timedelta(days=1)
+            prior_month = today.replace(day=1)-datetime.timedelta(days=1)
+            future = today+datetime.timedelta(days=1)
+            later_month = (today.replace(day=28)+datetime.timedelta(days=4)).replace(day=1)
+            ties = dict(normal, commands={f"fixture-{n:02d}":17 for n in reversed(range(48))})
+            cases = (
+                ("missing", None),
+                ("current", normal),
+                ("previous-day", dict(normal,last_query_date=previous.isoformat(),
+                                      last_month=previous.isoformat()[:7])),
+                ("previous-month", dict(normal,last_query_date=prior_month.isoformat(),
+                                        last_month=prior_month.isoformat()[:7])),
+                ("legacy", {k:v for k,v in normal.items() if k not in
+                            ("runtime_usage_counts","runtimes_today","time_saved_today_ms")}),
+                ("total-saturation", high),
+                ("map-saturation", high_map),
+                ("daily-saturation", high_daily),
+                ("future-day", dict(normal,last_query_date=future.isoformat(),last_month=future.isoformat()[:7])),
+                ("future-month", dict(normal,last_query_date=later_month.isoformat(),
+                                      last_month=later_month.isoformat()[:7])),
+                ("ties", ties),
+                ("size-boundary", normal),
+                ("size-excess", normal),
+                ("regular-symlink", normal),
+                ("malformed", b"{"),
+            )
+
+            def write(destination, value):
+                destination.write_bytes(value)
+                destination.chmod(0o600)
+                os.chown(destination, account.pw_uid, account.pw_gid)
+
+            for label, initial in cases:
+                path.unlink(missing_ok=True)
+                raw = json.dumps(initial).encode() if isinstance(initial, dict) else initial
+                if label in ("size-boundary", "size-excess"):
+                    raw = raw.ljust(limit + int(label=="size-excess"))
+                if label=="regular-symlink":
+                    write(target, raw)
+                    path.symlink_to(target.name)
+                elif initial is not None:
+                    write(path, raw)
+                rejected = {"size-excess":"byte limit","malformed":"Malformed usage stats"}.get(label)
+                shown = command([cli, "stats"] if label=="ties" else [cli, "--json", "stats"], chosen, ordinary, timeout=8)
+                unchanged = path.read_bytes()==raw if raw is not None else not path.exists()
+                if rejected:
+                    shown_ok = shown.returncode != 0 and not shown.stdout and rejected in shown.stderr
+                elif label=="ties":
+                    order = re.findall(r"fixture-\d{2}", shown.stdout)
+                    shown_ok = shown.returncode==0 and order==[f"fixture-{n:02d}" for n in range(5)]
+                else:
+                    shown_ok = (shown.returncode==0 and json.loads(shown.stdout)["total_commands"]==
+                                (initial["total_commands"] if initial else 0))
+                checks.append(dict(phase=phase, case=f"{label}-read", status=shown.returncode,
+                    passed=bool(shown_ok and unchanged), diagnostic=(shown.stdout[-560:],shown.stderr[-550:],unchanged)))
+
+                result = command([cli, "use", "node", version], chosen, ordinary, timeout=12)
+                acquired = (result.returncode==0 and "Now using Node.js" in result.stdout
+                            and "Downloading" not in result.stdout and current.resolve().name==version)
+                if rejected:
+                    updated = path.is_file() and path.read_bytes()==raw and rejected in result.stderr
+                    detail = rejected
+                else:
+                    prior = initial or {}
+                    try:
+                        stored = json.loads(path.read_bytes())
+                    except (OSError, ValueError):
+                        stored = {}
+                    day = (dt if (dt := prior.get("last_query_date","")) >= today.isoformat()
+                           else today.isoformat())
+                    month = day[:7]
+                    same_day = prior.get("last_query_date")==day
+                    same_month = prior.get("last_month")==month
+                    expected = {
+                        "total_commands":min(maximum,prior.get("total_commands",0)+1),
+                        "time_saved_ms":min(maximum,prior.get("time_saved_ms",0)+148),
+                        "last_query_date":day,"last_month":month,
+                        "queries_today":min(maximum,(prior.get("queries_today",0) if same_day else 0)+1),
+                        "queries_this_month":min(maximum,(prior.get("queries_this_month",0) if same_month else 0)+1),
+                        "time_saved_today_ms":min(maximum,(prior.get("time_saved_today_ms",0) if same_day else 0)+148),
+                        "runtimes_today":min(maximum,(prior.get("runtimes_today",0) if same_day else 0)+1),
+                    }
+                    detail = {key:(stored.get(key),value) for key,value in expected.items() if stored.get(key)!=value}
+                    updated = (not detail
+                               and stored.get("commands",{}).get("runtime_switch")==min(
+                                    maximum,prior.get("commands",{}).get("runtime_switch",0)+1)
+                               and stored.get("runtime_usage_counts",{}).get("node")==min(
+                                    maximum,prior.get("runtime_usage_counts",{}).get("node",0)+1)
+                               and (label!="regular-symlink" or
+                                    not path.is_symlink() and target.read_bytes()==raw))
+                checks.append(dict(phase=phase, case=f"{label}-record", status=result.returncode,
+                    passed=bool(acquired and updated), diagnostic=(result.stdout[-400:],result.stderr[-650:],detail)))
+
+
     def inspect_task_environment_bytes():
         phase = "task-environment-bytes"
         raw = b"test-\xff-value"
@@ -8043,6 +8186,7 @@ exec {shlex.quote(str(binary))} "$@"
                     inspect_telemetry_consent_transitions()
                     inspect_install_telemetry_admission()
                     inspect_usage_dispatch_admission()
+                    inspect_saved_usage_stats()
                 config.write_text(host_config)
                 inspect("returned-host", host_count, host_explicit, host=True)
                 mark_progress("root switch and return")
@@ -8354,6 +8498,6 @@ mark_progress("completed with host inventory unchanged")
 report = dict(binaries=binaries, checks=checks, total=len(checks),
               passed=sum(entry["passed"] for entry in checks), host_unchanged=True)
 print(json.dumps(report))
-expected_checks = 303 if consent_oracle is None else 2622
+expected_checks = 303 if consent_oracle is None else 2652
 if report["passed"] != report["total"] or report["total"] != expected_checks:
     sys.exit(4)
