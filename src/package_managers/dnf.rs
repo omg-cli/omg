@@ -550,7 +550,7 @@ impl crate::core::security::vulnerability::VulnerabilitySource for PlannedDnfAdv
                 // This installed-name-filtered source is supplemental evidence only.
                 // It never establishes complete coverage for proposed dependencies.
                 let native = super::dnf_advisory::audit_result(
-                    DnfPackageManager::native_advisories().await?,
+                    DnfPackageManager::native_advisories(Some(packages)).await?,
                 )?;
                 let mut assessments = Vec::with_capacity(packages.len());
                 let mut comparisons = 0;
@@ -2126,18 +2126,35 @@ impl DnfPackageManager {
             .collect())
     }
 
-    async fn native_advisories() -> Result<
+    async fn native_advisories(
+        planned: Option<&[SecurityPackage]>,
+    ) -> Result<
         Vec<(
             super::dnf_advisory::ApplicableAdvisory,
             super::dnf_advisory::AdvisoryDetails,
         )>,
     > {
-        let mut outputs = Vec::with_capacity(2);
-        for details in [false, true] {
-            let mut command = Self::advisory_command()?;
-            command.args(super::dnf_advisory::query_args(details));
-            outputs.push(Self::query_output(command).await?);
-        }
+        let mut list = Self::advisory_command()?;
+        list.args(super::dnf_advisory::query_args(false));
+        let wanted = planned.map(|packages| {
+            packages
+                .iter()
+                .filter_map(|package| {
+                    Some((package.name.as_str(), package.architecture.as_deref()?))
+                })
+                .collect()
+        });
+        let rows = super::dnf_advisory::select_applicable_advisories(
+            &Self::query_output(list).await?,
+            wanted.as_ref(),
+        )?;
+        let joined = if rows.is_empty() {
+            Vec::new()
+        } else {
+            let mut details = Self::advisory_command()?;
+            details.args(super::dnf_advisory::query_args(true));
+            super::dnf_advisory::join_advisories(rows, &Self::query_output(details).await?)?
+        };
         let mut repositories = Self::advisory_command()?;
         repositories.args([
             "--cacheonly",
@@ -2150,7 +2167,7 @@ impl DnfPackageManager {
         super::dnf_advisory::require_enabled_repositories(
             &Self::query_output(repositories).await?,
         )?;
-        super::dnf_advisory::join_advisories(&outputs[0], &outputs[1])
+        Ok(joined)
     }
 
     async fn native_history(since: Option<u64>) -> Result<Vec<NativeTransaction>> {
@@ -2902,7 +2919,7 @@ impl PackageManager for DnfPackageManager {
         Some(Box::pin(async move {
             async {
                 let installed = self.security_inventory().await?;
-                let rows = Self::native_advisories().await?;
+                let rows = Self::native_advisories(None).await?;
                 let affected =
                     Self::affected_installed_packages(rows.iter().map(|(row, _)| row), &installed)?;
                 let mut after = self.security_inventory().await?;

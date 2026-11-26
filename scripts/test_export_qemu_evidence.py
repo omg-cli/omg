@@ -530,6 +530,21 @@ class DescriptorTests(unittest.TestCase):
         self.assertEqual(first.read_bytes(), b"first")
         self.assertEqual(second.read_bytes(), b"second")
 
+    def test_fedora_status_switch_failure_exports_only_the_exact_receipt(self):
+        name = "fedora-status-root-switch.json"
+        prefix = "run-test/guest/evidence/"
+        path = prefix + name
+        payload = b'{"passed":302,"total":303,"checks":[{"case":"fixture-example","passed":false}]}\n'
+        self.fixture(path, payload)
+        self.fixture(prefix + "private/" + name, b"private-state")
+        self.fixture(path + ".bak", b"private-backup")
+        self.fixture("run-test/" + name, b"wrong-scope")
+
+        status, report = self.run_export()
+        self.assertEqual(status, 0, report)
+        self.assertEqual(report["copied"], [path])
+        self.assertEqual((self.destination / path).read_bytes(), payload)
+
     def test_fedora_exclusion_diagnostics_copy_without_private_neighbors(self):
         prefix = "run-test/guest/evidence/fedora-advisory/"
         expected = {prefix + name: ("native-exclusion-diagnostic:" + name + "\n").encode()

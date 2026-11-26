@@ -1,5 +1,5 @@
 //! DNF owns RPM version applicability; detailed collections are not installed inventory.
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
@@ -194,14 +194,32 @@ pub(super) fn audit_result(
     })
 }
 
-/// Join an applicable list to metadata without expanding collection packages.
-/// Missing or conflicting metadata invalidates the whole result.
-pub(super) fn join_advisories(
+pub(super) fn select_applicable_advisories(
     applicable: &[u8],
-    details: &[u8],
-) -> Result<Vec<(ApplicableAdvisory, AdvisoryDetails)>> {
+    wanted: Option<&HashSet<(&str, &str)>>,
+) -> Result<Vec<ApplicableAdvisory>> {
     let rows: Vec<ApplicableAdvisory> =
         serde_json::from_slice(applicable).context("Invalid DNF applicable advisory list")?;
+    let mut selected = Vec::new();
+    for row in rows {
+        ensure!(!row.name.is_empty(), "Empty DNF advisory selection");
+        ensure!(
+            row.kind == "security",
+            "Unexpected non-security DNF advisory"
+        );
+        let identity = package_identity(&row.nevra)?;
+        if wanted.is_none_or(|wanted| wanted.contains(&identity)) {
+            selected.push(row);
+        }
+    }
+    Ok(selected)
+}
+
+/// Join the selected advisory rows to metadata without expanding collections.
+pub(super) fn join_advisories(
+    rows: Vec<ApplicableAdvisory>,
+    details: &[u8],
+) -> Result<Vec<(ApplicableAdvisory, AdvisoryDetails)>> {
     let metadata: Vec<AdvisoryDetails> =
         serde_json::from_slice(details).context("Invalid DNF advisory details")?;
     let mut by_id = BTreeMap::new();
@@ -217,16 +235,11 @@ pub(super) fn join_advisories(
     let mut joined = Vec::new();
     let mut selected = std::collections::BTreeSet::new();
     for row in rows {
-        ensure!(
-            !row.name.is_empty() && !row.nevra.is_empty(),
-            "Empty DNF advisory selection"
-        );
-        package_identity(&row.nevra)?;
         let detail = by_id
             .get(&row.name)
             .context("Missing DNF advisory metadata")?;
         ensure!(
-            row.kind == "security" && detail.kind == "security",
+            detail.kind == "security",
             "Unexpected non-security DNF advisory"
         );
         ensure!(
@@ -243,6 +256,33 @@ pub(super) fn join_advisories(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn join_advisories(
+        applicable: &[u8],
+        details: &[u8],
+    ) -> Result<Vec<(ApplicableAdvisory, AdvisoryDetails)>> {
+        super::join_advisories(select_applicable_advisories(applicable, None)?, details)
+    }
+
+    #[test]
+    fn planned_scope_selects_only_matching_name_and_architecture() -> Result<()> {
+        for wanted in [
+            HashSet::from([("bind-libs", "i686")]),
+            HashSet::from([("other-package", "x86_64")]),
+            HashSet::new(),
+        ] {
+            assert!(select_applicable_advisories(LIST, Some(&wanted))?.is_empty());
+        }
+        let wanted = HashSet::from([("bind-libs", "x86_64")]);
+        let selected = select_applicable_advisories(LIST, Some(&wanted))?;
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].nevra, "bind-libs-32:9.18-2.fc44.x86_64");
+        assert!(super::join_advisories(selected, b"[]").is_err());
+
+        let unrelated_malformed = br#"[{"name":"FEDORA-invalid","type":"security","severity":"Important","nevra":"bad"}]"#;
+        assert!(select_applicable_advisories(unrelated_malformed, Some(&wanted)).is_err());
+        Ok(())
+    }
 
     #[test]
     fn enabled_feed_reports_coverage_only_for_exact_affected_identities() {

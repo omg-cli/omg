@@ -449,9 +449,10 @@ with tempfile.TemporaryDirectory(prefix="omg-fedora-cache-scope-", dir="/tmp") a
                                    value=(after[0] - before[0], after[1] - before[1])))
 
     @contextmanager
-    def reject_native_selection(option, *, executable=dnf, prefix=False):
+    def reject_native_selection(option, *, executable=dnf, prefix=False, after=None):
         target = Path(executable).resolve(strict=True)
         pattern = shlex.quote(option) + ("*" if prefix else "")
+        preceding = f' && "$previous" == {shlex.quote(after)}' if after else ""
         diagnostic = ("Unexpected DNF selection subprocess" if executable == dnf
                       else "Unexpected RPM version comparison subprocess")
         with tempfile.TemporaryDirectory(prefix="native-selection-", dir=root) as directory:
@@ -461,11 +462,13 @@ with tempfile.TemporaryDirectory(prefix="omg-fedora-cache-scope-", dir="/tmp") a
             shutil.copy2(target, native_executable)
             wrapper = gate / "check-native-query"
             wrapper.write_text(f"""#!/usr/bin/bash
+previous=""
 for argument in "$@"; do
-    if [[ "$argument" == {pattern} ]]; then
+    if [[ "$argument" == {pattern}{preceding} ]]; then
         printf '%s\\n' {shlex.quote(diagnostic)} >&2
         exit 197
     fi
+    previous=$argument
 done
 exec {shlex.quote(str(native_executable))} "$@"
 """)
@@ -475,6 +478,19 @@ exec {shlex.quote(str(native_executable))} "$@"
                 yield
             finally:
                 checked(["/usr/bin/umount", target])
+
+    def inspect_advisory_details(phase, matches_installed):
+        with reject_native_selection("info", after="advisory"):
+            result = command([cli, "audit", "scan", "--fail-on-findings"], disabled, ordinary)
+        blocked = "Unexpected DNF selection subprocess" in result.stderr
+        if matches_installed:
+            passed = result.returncode == 1 and blocked and "Failed to query native security advisories" in result.stderr
+        else:
+            passed = (result.returncode == 0 and not blocked
+                      and "Advisory scope: 0 assessed package(s), 1 package(s) with unknown coverage" in result.stdout
+                      and "No findings were reported; advisory coverage is incomplete." in result.stdout)
+        checks.append(dict(phase=phase, case="advisory-details-guard", passed=passed,
+                           status=result.returncode, diagnostic=(result.stdout + result.stderr)[-1800:]))
 
     def inspect_security_inventory(phase, expected_count=None):
         native = ordinary_control([dnf, "--cacheonly", "--setopt=disable_excludes=*",
@@ -1184,6 +1200,7 @@ exec {shlex.quote(str(binary))} "$@"
                                    diagnostic=(root / "daemon.log").read_text(errors="replace")[-1200:]
                                    if findings != 1 or updates != 1 else None))
                 inspect_update_status("status-repository-initial", 1, True)
+                inspect_advisory_details("with-matching-advisories", True)
                 normal_manifests = cached_manifests(normal_cache)
                 advisory_manifests = cached_manifests(advisory_cache)
                 assert normal_manifests and advisory_manifests
@@ -1195,6 +1212,7 @@ exec {shlex.quote(str(binary))} "$@"
                 ordinary_control([dnf, *advisory_options, "clean", "metadata"])
                 ordinary_control([dnf, *advisory_options, "--refresh", "-y", "makecache"])
                 native_advisories([])
+                inspect_advisory_details("without-matching-advisories", False)
                 assert cached_manifests(normal_cache) == normal_manifests
                 assert cached_manifests(advisory_cache) != advisory_manifests
                 inspect_update_status("status-advisory-only", 1, False)
@@ -1325,6 +1343,6 @@ assert inventory() == before
 report = dict(binaries=binaries, checks=checks, total=len(checks),
               passed=sum(entry["passed"] for entry in checks), host_unchanged=True)
 print(json.dumps(report))
-expected_checks = 301 if consent_oracle is None else 552
+expected_checks = 303 if consent_oracle is None else 554
 if report["passed"] != report["total"] or report["total"] != expected_checks:
     sys.exit(4)

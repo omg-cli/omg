@@ -37,6 +37,7 @@ HOST_FILES = {
 }
 GUEST_FILES = {
     "fedora-sqlite-before.json", "fedora-sqlite-after.json", "fedora-sqlite-final.json",
+    "fedora-status-root-switch.json",
     "aur-search-flags.json", "aur-fixture-events.jsonl", "aur-detailed.json",
     "aur-no-aur.json", "aur-basic.json", "aur-cert.log", "aur-fixture-preflight.log",
     "aur-fixture.stdout", "aur-fixture.stderr",
