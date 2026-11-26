@@ -937,6 +937,72 @@ mod dnf_integration {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn native_fedora_counters_ignore_daemon_status_file() -> Result<()> {
+        use omg_lib::core::fast_status::FastStatus;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let runtime = tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()?;
+        let stale = u32::MAX as usize;
+        let status = runtime.path().join("omg.status");
+        FastStatus::new(stale, stale, stale, stale).write_to_file(&status)?;
+        assert_eq!(
+            FastStatus::read_validated(&status)
+                .context("status fixture must be trusted")?
+                .total_packages,
+            u32::MAX
+        );
+        let manager = DnfPackageManager::new();
+        let total = manager.installed_count()?;
+        let explicit = manager.list_explicit().await?.len();
+        let orphans = DnfPackageManager::orphan_count().await?;
+        for (arguments, expected) in [
+            (&["tc"][..], total),
+            (&["oc"][..], orphans),
+            (&["ec"][..], explicit),
+            (&["explicit", "--count"][..], explicit),
+        ] {
+            for json in [false, true] {
+                let mut command =
+                    tokio::process::Command::new(assert_cmd::cargo::cargo_bin!("omg"));
+                if json {
+                    command.arg("--json");
+                }
+                command
+                    .args(arguments)
+                    .env("XDG_RUNTIME_DIR", runtime.path())
+                    .env_remove("OMG_SOCKET_PATH")
+                    .env_remove("OMG_DISABLE_DAEMON")
+                    .env("OMG_DISABLE_TELEMETRY", "1")
+                    .env("OMG_TEST_MODE", "0")
+                    .env_remove("OMG_TEST_DISTRO")
+                    .env_remove("OMG_NATIVE_TEST_DATA_DIR");
+                let mut child = spawn_bounded_child(&mut command)?;
+                let output =
+                    bounded_child_output(&mut child, std::time::Duration::from_mins(1)).await?;
+                assert!(
+                    output.status.success(),
+                    "{arguments:?}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                if json {
+                    let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+                    assert_eq!(value["count"], expected);
+                } else {
+                    assert_eq!(
+                        std::str::from_utf8(&output.stdout)?
+                            .trim()
+                            .parse::<usize>()?,
+                        expected
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     fn size_cli_matches_native_installed_packages() -> Result<()> {
         let before = std::process::Command::new("rpm")
@@ -1859,13 +1925,14 @@ mod dnf_operations {
                     "-q",
                     "tree",
                     "--qf",
-                    "%{EPOCHNUM}:%{VERSION}-%{RELEASE}\t%{NAME}-%{EPOCHNUM}:%{VERSION}-%{RELEASE}.%{ARCH}",
+                    "%{NAME}\t%{ARCH}\t%{EPOCHNUM}:%{VERSION}-%{RELEASE}",
                 ])
                 .output()?;
             anyhow::ensure!(native.status.success(), "Cannot read fixture version");
             let native = std::str::from_utf8(&native.stdout)?;
-            let (version, full_identity) =
-                native.split_once('\t').context("Native RPM identity")?;
+            let [name, architecture, version] = native.split('\t').collect::<Vec<_>>()[..] else {
+                anyhow::bail!("Invalid native RPM identity: {native}");
+            };
             let mark = std::process::Command::new("sudo")
                 .args(["-n", "dnf", "-y", "mark", "dependency", "tree"])
                 .stdin(std::process::Stdio::null())
@@ -1888,8 +1955,13 @@ mod dnf_operations {
             anyhow::ensure!(
                 preview_stdout
                     .lines()
-                    .any(|line| line.trim() == full_identity),
-                "Preview omitted the full RPM identity: {preview_stdout}"
+                    .any(|line| line.trim() == "Removing:")
+                    && preview_stdout.lines().any(|line| {
+                        line.split_ascii_whitespace()
+                            .take(3)
+                            .eq([name, architecture, version])
+                    }),
+                "Preview omitted the exact native removal row: {preview_stdout}"
             );
             let decline = run(&["clean", "--orphans"], b"n\n")?;
             anyhow::ensure!(

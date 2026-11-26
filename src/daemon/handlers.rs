@@ -2065,7 +2065,6 @@ pub(super) mod tests {
         Ok((directory, Arc::new(state)))
     }
 
-    #[cfg(feature = "fedora")]
     fn mutable_fedora_catalog(
         observe: bool,
         gate: Option<Arc<(tokio::sync::Notify, tokio::sync::Notify)>>,
@@ -2114,7 +2113,6 @@ pub(super) mod tests {
         ))
     }
 
-    #[cfg(feature = "fedora")]
     #[tokio::test]
     async fn fedora_explicit_list_and_count_read_current_dnf_reasons() -> anyhow::Result<()> {
         let (_directory, state, _, revision, _, _) = mutable_fedora_catalog(true, None)?;

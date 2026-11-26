@@ -2367,7 +2367,7 @@ esac
                     trace.write_text(
                         '122 execve("/usr/bin/rpm", ["/usr/bin/rpm", "-qa"], 0x7ffd) = 0\n'
                         '123 execve("/usr/bin/dnf5", ["/usr/bin/dnf5", "--cacheonly", '
-                        '"--disable-repo=*", "check"], 0x7ffd /* 1 var */) = 0\n',
+                        '"check"], 0x7ffd /* 1 var */) = 0\n',
                         encoding='utf-8')
                     command = oracle + '\ncheck_doctor_native_backend "$1" "$2" "$3" "$4"\n'
                     def probe():
@@ -2407,7 +2407,7 @@ esac
                         output.write_text(healthy, encoding='utf-8')
                         trace.write_text(
                             '123 execve("/usr/bin/dnf5", ["/usr/bin/dnf5", "--cacheonly", '
-                            '"--disable-repo=*", "check"], 0x7ffd /* 1 var */) = 0\n',
+                            '"check"], 0x7ffd /* 1 var */) = 0\n',
                             encoding='utf-8')
                         self.assertEqual(probe().returncode, 1, 'Fedora health text without an RPM query is not proof')
                         trace.write_text('122 execve("/usr/bin/rpm", ["/usr/bin/rpm", "-qa"], 0x7ffd) = 0\n', encoding='utf-8')
@@ -2417,7 +2417,7 @@ esac
                         trace.write_text(
                             '122 execve("/usr/bin/rpm", ["/usr/bin/rpm", "-qa"], 0x7ffd) = 0\n'
                             '123 execve("/usr/bin/dnf5", ["/usr/bin/dnf5", "--cacheonly", '
-                            '"--disable-repo=*", "check"], 0x7ffd /* 1 var */) = 0\n',
+                            '"check"], 0x7ffd /* 1 var */) = 0\n',
                             encoding='utf-8')
                     output.write_text('  Arch Linux detected\n' if distro != 'arch'
                                       else '  Fedora/RHEL detected (dnf backend)\n', encoding='utf-8')
