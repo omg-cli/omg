@@ -471,14 +471,15 @@ pub fn verify_audit_log(_ctx: &CliContext) -> Result<()> {
         style::runtime("OMG")
     );
 
-    crate::core::security::audit::ensure_complete_collection(
-        &crate::core::paths::data_dir().join("audit/incomplete"),
-    )?;
+    use crate::core::security::audit::ensure_complete_collection;
+
+    let marker = crate::core::paths::data_dir().join("audit/incomplete");
+    ensure_complete_collection(&marker)?;
     let logger = AuditLogger::new().context("Failed to open audit log")?;
-    let Some(report) = logger
-        .verify_retained_integrity()
-        .context("Failed to verify audit log integrity")?
-    else {
+    let verification = logger.verify_retained_integrity();
+    // The writer can record a loss while verification is waiting for the log lock.
+    ensure_complete_collection(&marker)?;
+    let Some(report) = verification.context("Failed to verify audit log integrity")? else {
         println!(
             "  {} No audit log exists yet.",
             style::maybe_color("ℹ", |t| t.blue().to_string())

@@ -701,6 +701,102 @@ exec {shlex.quote(str(native_executable))} "$@"
                                diagnostic=(result.stdout + result.stderr)[-1200:]))
 
 
+
+    def inspect_audit_marker_snapshot():
+        layout_counts = {"empty": 0, "active": 1, "archived": 2, "mixed": 3, "sparse": 4, "malformed": 4}
+        phases = ("unmarked", "marked-first", "late-record", "late-empty", "late-directory", "late-dangling")
+
+        def publish_marker(marker, phase):
+            if phase == "late-directory":
+                marker.mkdir()
+            elif phase == "late-dangling":
+                marker.symlink_to("missing-marker-target")
+            else:
+                with marker.open("xb") as handle:
+                    if phase != "late-empty":
+                        handle.write(b"Fixture event loss recorded.\n")
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            parent = os.open(marker.parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(parent)
+            finally:
+                os.close(parent)
+
+        for layout, count in layout_counts.items():
+            for phase in phases:
+                data = Path(tempfile.mkdtemp(prefix=f"audit-marker-{layout}-{phase}-", dir=work))
+                os.chown(data, account.pw_uid, account.pw_gid)
+                directory = data / "audit"
+                directory.mkdir(mode=0o700)
+                os.chown(directory, account.pw_uid, account.pw_gid)
+                active = directory / "audit.jsonl"
+                if layout in ("active", "mixed", "sparse", "malformed"):
+                    write_audit_fixture_segment(active, audit_fixture_segment("active", 1))
+                if layout in ("archived", "mixed", "sparse", "malformed"):
+                    first = directory / "audit.jsonl.1"
+                    write_audit_fixture_segment(first, audit_fixture_segment("archived", 2, legacy=True))
+                    if layout == "malformed":
+                        with first.open("ab") as file:
+                            file.write(b"{malformed\n")
+                if layout == "sparse":
+                    write_audit_fixture_segment(directory / "audit.jsonl.5", audit_fixture_segment("older", 1))
+                marker = directory / "incomplete"
+                previous = {path.name: path.read_bytes() for path in directory.iterdir()}
+                mode = dict(disabled, OMG_DATA_DIR=str(data))
+                if phase == "marked-first":
+                    publish_marker(marker, phase)
+                if phase.startswith("late-"):
+                    lock = directory / "audit.lock"
+                    with lock.open("xb") as handle:
+                        lock.chmod(0o600)
+                        os.chown(lock, account.pw_uid, account.pw_gid)
+                        fcntl.flock(handle, fcntl.LOCK_EX)
+                        with subprocess.Popen([cli, "audit", "verify"], env=mode, cwd=work, text=True,
+                                              stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                              stderr=subprocess.PIPE, **ordinary) as verifier:
+                            try:
+                                blocked = re.compile(rf"\s-> FLOCK\s+ADVISORY\s+READ\s+{verifier.pid}\s")
+                                deadline = time.monotonic() + 8
+                                while time.monotonic() < deadline:
+                                    assert verifier.poll() is None, (layout, phase, verifier.returncode)
+                                    if blocked.search(Path("/proc/locks").read_text()):
+                                        break
+                                    time.sleep(0.005)
+                                else:
+                                    raise AssertionError((layout, phase, "verifier never waited for the shared lock"))
+                                publish_marker(marker, phase)
+                            except BaseException:
+                                verifier.kill()
+                                raise
+                            finally:
+                                fcntl.flock(handle, fcntl.LOCK_UN)
+                            try:
+                                stdout, stderr = verifier.communicate(timeout=12)
+                            except subprocess.TimeoutExpired:
+                                verifier.kill()
+                                verifier.communicate()
+                                raise
+                            status = verifier.returncode
+                else:
+                    result = command([cli, "audit", "verify"], mode, ordinary)
+                    stdout, stderr, status = result.stdout, result.stderr, result.returncode
+                verified = "Local audit chain consistency verified" in stdout
+                empty = "No audit log exists yet." in stdout
+                if phase != "unmarked":
+                    passed = status == 1 and not verified and not empty and "Audit collection is incomplete" in stderr
+                elif layout == "empty":
+                    passed = status == 0 and empty and not verified
+                elif layout == "malformed":
+                    passed = (status == 1 and not verified and "Total: 4 entries" in stdout
+                              and "audit.jsonl.1: line_3" in stdout and "Audit log integrity FAILED" in stderr)
+                else:
+                    passed = (status == 0 and verified and f"Total: {count} entries" in stdout
+                              and f"Valid: {count} entries" in stdout)
+                assert {name: (directory / name).read_bytes() for name in previous} == previous
+                checks.append(dict(phase="audit-marker-snapshot", case=f"{layout}-{phase}", passed=passed,
+                                   status=status, diagnostic=(stdout + stderr)[-1100:]))
+
     def inspect_audit_log_selection():
         import csv
 
@@ -1700,6 +1796,7 @@ exec {shlex.quote(str(binary))} "$@"
                     inspect_history_locks()
                     inspect_audit_segments()
                     inspect_audit_log_selection()
+                    inspect_audit_marker_snapshot()
                 config.write_text(alternate_config)
                 refresh_fixture()
                 expected = ordinary_control([dnf, "--cacheonly", "repoquery",
@@ -2017,6 +2114,6 @@ assert inventory() == before
 report = dict(binaries=binaries, checks=checks, total=len(checks),
               passed=sum(entry["passed"] for entry in checks), host_unchanged=True)
 print(json.dumps(report))
-expected_checks = 303 if consent_oracle is None else 798
+expected_checks = 303 if consent_oracle is None else 834
 if report["passed"] != report["total"] or report["total"] != expected_checks:
     sys.exit(4)
