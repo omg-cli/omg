@@ -71,13 +71,6 @@ async fn preview_packages(
     pm: &dyn crate::package_managers::PackageManager,
     packages: &[String],
 ) -> Result<Vec<crate::core::Package>> {
-    #[cfg(feature = "fedora")]
-    if pm.name() == "dnf" {
-        crate::package_managers::DnfPackageManager::validate_install_selectors(packages)?;
-    } else {
-        crate::core::security::validate_package_names(packages)?;
-    }
-    #[cfg(not(feature = "fedora"))]
     crate::core::security::validate_package_names(packages)?;
     let mut preview = Vec::with_capacity(packages.len());
     for package in packages {

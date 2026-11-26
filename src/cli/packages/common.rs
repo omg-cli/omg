@@ -13,6 +13,16 @@ use anyhow::Result;
 
 pub(crate) use crate::core::packages::search::validate_search_query;
 
+#[cfg(feature = "fedora")]
+pub(super) fn print_dnf_preview(plan: &str, diagnostics: &str) {
+    for line in plan.lines() {
+        println!("{}", crate::cli::style::sanitize_terminal_text(line));
+    }
+    for line in diagnostics.lines() {
+        eprintln!("{}", crate::cli::style::sanitize_terminal_text(line));
+    }
+}
+
 /// Check if a search query passes validation (returns false on failure).
 ///
 /// Convenience wrapper for sync code paths that return `bool` instead of `Result`.

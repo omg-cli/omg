@@ -619,11 +619,16 @@ mod dnf_integration {
             String::from_utf8_lossy(&output.stderr)
         );
         let stdout = std::str::from_utf8(&output.stdout)?;
+        let stderr = std::str::from_utf8(&output.stderr)?;
+        let (package, arch) = name.rsplit_once('.').context("Native bash architecture")?;
         assert!(
-            stdout.contains(&name) && stdout.contains(&version),
-            "{stdout}"
+            stderr.contains(&format!(
+                "Package \"{package}-{version}.{arch}\" is already installed."
+            )),
+            "{stderr}"
         );
-        assert!(stdout.contains("No changes will be made"), "{stdout}");
+        assert!(stdout.contains("Nothing to do."), "{stdout}");
+        assert!(stdout.contains("No changes made (dry run)"), "{stdout}");
         assert_eq!(installed_bash_full_nevra()?, (selector, name, version));
         Ok(())
     }
@@ -1446,6 +1451,31 @@ mod dnf_integration {
             command.args(arguments).output()
         };
         let verified = (|| -> Result<()> {
+            let native_preview = std::process::Command::new("dnf")
+                .env("LC_ALL", "C")
+                .args([
+                    "--color=never",
+                    "--setopt=assumeyes=false",
+                    "--assumeno",
+                    "install",
+                    package,
+                ])
+                .output()?;
+            assert_eq!(native_preview.status.code(), Some(1));
+            let native_plan = std::str::from_utf8(&native_preview.stdout)?.trim_end();
+            assert!(native_plan.contains("Transaction Summary:"));
+            let preview = run(&["install", package, "--dry-run", "--yes"])?;
+            assert!(
+                preview.status.success(),
+                "{}",
+                String::from_utf8_lossy(&preview.stderr)
+            );
+            let stdout = std::str::from_utf8(&preview.stdout)?;
+            assert!(stdout.contains(native_plan), "{stdout}");
+            assert!(stdout.contains("No changes made (dry run)"), "{stdout}");
+            assert_eq!(snapshot()?, before);
+            assert!(history.load()?.is_empty());
+
             let mut attended = std::process::Command::new("python3");
             prepare(&mut attended);
             let install = attended

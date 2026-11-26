@@ -2917,24 +2917,33 @@ impl DnfPackageManager {
     }
 
     pub(crate) async fn preview_orphan_cleanup() -> Result<(String, String)> {
+        Self::preview_declined_transaction(["--cacheonly", "autoremove"]).await
+    }
+
+    pub(crate) async fn preview_install(packages: &[String]) -> Result<(String, String)> {
+        Self::validate_install_selectors(packages)?;
+        Self::preview_declined_transaction(
+            std::iter::once("install").chain(packages.iter().map(String::as_str)),
+        )
+        .await
+    }
+
+    async fn preview_declined_transaction<'a>(
+        args: impl IntoIterator<Item = &'a str>,
+    ) -> Result<(String, String)> {
         let mut command =
             tokio::process::Command::from(crate::core::privilege::system_command("dnf")?);
         command
             .env("LC_ALL", "C")
             .stderr(std::process::Stdio::piped())
-            .args([
-                "--cacheonly",
-                "--color=never",
-                "--setopt=assumeyes=false",
-                "--assumeno",
-                "autoremove",
-            ]);
+            .args(["--color=never", "--setopt=assumeyes=false", "--assumeno"])
+            .args(args);
         let output =
             Self::capture_query("DNF", command, std::time::Duration::from_mins(1), None).await?;
-        Self::orphan_cleanup_preview_output(&output)
+        Self::transaction_preview_output(&output)
     }
 
-    fn orphan_cleanup_preview_output(output: &std::process::Output) -> Result<(String, String)> {
+    fn transaction_preview_output(output: &std::process::Output) -> Result<(String, String)> {
         let plan = String::from_utf8_lossy(&output.stdout);
         let diagnostics = String::from_utf8_lossy(&output.stderr);
         // DNF5 exits 1 after displaying a nonempty plan that --assumeno declined.
@@ -2946,6 +2955,15 @@ impl DnfPackageManager {
             && (prefix.is_empty() || prefix.ends_with('\n'))
         {
             return Ok((plan.into_owned(), prefix.trim_end().to_owned()));
+        }
+        if !output.status.success() && !diagnostics.trim().is_empty() {
+            let diagnostics = diagnostics
+                .trim()
+                .lines()
+                .map(crate::cli::style::sanitize_terminal_text)
+                .collect::<Vec<_>>()
+                .join("\n");
+            anyhow::bail!("DNF query failed ({})\n{diagnostics}", output.status);
         }
         Self::require_query_success("DNF", output)?;
         Ok((plan.into_owned(), diagnostics.into_owned()))
@@ -5245,7 +5263,7 @@ mod tests {
             stdout: stdout.as_bytes().to_vec(),
             stderr: stderr.as_bytes().to_vec(),
         };
-        let preview = DnfPackageManager::orphan_cleanup_preview_output;
+        let preview = DnfPackageManager::transaction_preview_output;
         let protected = "Unneeded protected package: leaf-0:1-1.noarch";
         assert_eq!(
             preview(&output(0, "Nothing to do.\n", protected))?,
@@ -5268,6 +5286,15 @@ mod tests {
         ] {
             assert!(preview(&failure).is_err());
         }
+        let failure = preview(&output(
+            1,
+            "",
+            "Failed to resolve the transaction\nNo match for argument: package\n  --skip-unavailable to skip unavailable packages\n",
+        ))
+        .expect_err("an unresolved request must fail the preview")
+        .to_string();
+        assert!(failure.contains("No match for argument: package"));
+        assert!(failure.contains("--skip-unavailable"));
         Ok(())
     }
 
