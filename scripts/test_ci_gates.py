@@ -457,6 +457,7 @@ class FedoraSetupSourceTests(unittest.TestCase):
                     (root / "python3").write_text(
                         f"#!{sys.executable}\n"
                         "import os,sys\nfrom pathlib import Path\nfrom types import SimpleNamespace\n"
+                        "assert sys.argv[sys.argv.index('--cargo-profile')+1] == 'ci'\n"
                         "args=SimpleNamespace(evidence_dir=Path(sys.argv[sys.argv.index('--evidence-dir')+1]))\n"
                         + allocation_source + "\n"
                         "Path(os.environ['HELPER_CALL']).write_text(str(out))\n"

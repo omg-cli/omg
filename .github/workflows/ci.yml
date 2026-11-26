@@ -1369,7 +1369,7 @@ jobs:
           [[ "$status" == 0 ]] || exit "$status"
           timeout --kill-after=5s 140s python3 -I -B scripts/run-fedora-ignored-integrations.py \
             --artifacts target/fedora-serial-libtest.jsonl --features '${{ matrix.features }}' \
-            --evidence-dir "$FEDORA_IGNORED_EVIDENCE_DIR/fixture"
+            --cargo-profile ci --evidence-dir "$FEDORA_IGNORED_EVIDENCE_DIR/fixture"
           test -s "$FEDORA_IGNORED_EVIDENCE_DIR/fixture/receipt.json"
 
       - name: Upload native Fedora ignored integration evidence

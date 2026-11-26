@@ -20,6 +20,7 @@ SELECTORS = (
     'package_managers::dnf::tests::native_removal_simulation_preserves_installed_inventory',
     'package_managers::dnf_advisory::tests::native_advisory_scope_includes_excluded_installed_packages',
 )
+CARGO_PROFILE_DIRECTORIES = {'test': 'debug', 'ci': 'ci'}
 
 
 def require(condition, message):
@@ -67,6 +68,13 @@ def select_libtest(text, manifest_path, features):
     return artifacts[0]
 
 
+def libtest_path(binary, target, cargo_profile):
+    directory = target / CARGO_PROFILE_DIRECTORIES[cargo_profile] / 'deps'
+    require(binary.is_file() and not binary.is_symlink()
+            and binary.resolve().is_relative_to(directory), 'Unsafe libtest location')
+    return binary
+
+
 def require_exact_pass(selector, stdout, exit_code):
     named = re.findall(r'^test (\S+) \.\.\. (\S+)$', stdout, re.M)
     summaries = re.findall(r'^test result: ([^\n]+)$', stdout, re.M)
@@ -104,6 +112,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--artifacts', type=Path, required=True)
     parser.add_argument('--features', required=True)
+    parser.add_argument('--cargo-profile', choices=CARGO_PROFILE_DIRECTORIES, default='test')
     parser.add_argument('--evidence-dir', type=Path, required=True)
     args = parser.parse_args()
     project = Path(__file__).resolve().parent.parent
@@ -116,10 +125,8 @@ def main():
     require({'fedora', 'pgp', 'license', 'rusqlite', 'sequoia-openpgp'} == features,
             'Expected native Fedora CI feature closure')
     artifact = select_libtest(args.artifacts.read_text(), manifest, features)
-    binary = Path(artifact['executable'])
     target = Path(os.environ.get('CARGO_TARGET_DIR', project/'target')).resolve()
-    require(binary.is_file() and not binary.is_symlink()
-            and binary.resolve().is_relative_to(target/'debug/deps'), 'Unsafe libtest location')
+    binary = libtest_path(Path(artifact['executable']), target, args.cargo_profile)
     with binary.open('rb') as stream:
         require(stream.read(4) == b'\x7fELF', 'Expected native ELF')
     before_hash = digest(binary)
@@ -127,7 +134,7 @@ def main():
     out.mkdir(parents=True, exist_ok=False)
     receipt = dict(accepted=False, source_sha=os.environ.get('GITHUB_SHA'),
                    binary=str(binary), binary_sha256_before=before_hash,
-                   features=sorted(features), commands=[], methods=[],
+                   features=sorted(features), cargo_profile=args.cargo_profile, commands=[], methods=[],
                    scope='Native Fedora container, two exact ignored fixture methods, no host package writes')
     require(re.fullmatch(r'[0-9a-f]{40}', receipt['source_sha'] or ''), 'Missing CI source identity')
     source_paths = ['Cargo.toml', 'Cargo.lock', 'src/package_managers/dnf.rs',
