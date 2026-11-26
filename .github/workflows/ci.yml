@@ -392,7 +392,7 @@ jobs:
 
       - name: Verify Node authentication fails closed without PGP
         run: |
-          cargo test --lib --no-default-features --features license --locked \
+          cargo test --profile ci --lib --no-default-features --features license --locked \
             runtimes::node::tests::node_install_without_pgp_refuses_before_contacting_the_publisher \
             -- --exact --nocapture
 
