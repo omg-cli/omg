@@ -173,7 +173,7 @@ pub(crate) fn install_reviewed_npm<'a>(
         node_admission.verify(&runtime.version_dir)?;
         anyhow::ensure!(
             active_security_overrides("npm", package) == overrides
-                && NpmLock::parse(&read_npm_metadata(&lock_path, 16 * 1024 * 1024)?, &spec)?.sha256
+                && super::tool_artifacts::hash(&read_npm_metadata(&lock_path, 16 * 1024 * 1024)?)
                     == lock.sha256,
             "NPM dependencies or security options changed after advisory review; installation cancelled"
         );
@@ -315,12 +315,10 @@ fn verify_installation(
     node_admission.verify(&runtime.version_dir)?;
     anyhow::ensure!(
         active_security_overrides("npm", package) == overrides
-            && crate::core::security::npm::NpmLock::parse(
-                &read_npm_metadata(&prefix.join("package-lock.json"), 16 * 1024 * 1024)?,
-                spec
-            )?
-            .sha256
-                == lock.sha256,
+            && super::tool_artifacts::hash(&read_npm_metadata(
+                &prefix.join("package-lock.json"),
+                16 * 1024 * 1024,
+            )?) == lock.sha256,
         "NPM dependencies or security options changed after advisory review; activation cancelled"
     );
     lock.verify_installed(prefix, spec)
@@ -1237,6 +1235,53 @@ esac
             fs::read(receipt_path).expect("previous authority survives refused replacement"),
             previous
         );
+    }
+
+    #[test]
+    fn frozen_npm_install_must_materialize_required_dependencies_before_signatures() -> Result<()> {
+        for (relation, optional, required) in [
+            ("dependencies", false, true),
+            ("dependencies", true, true),
+            ("peerDependencies", false, true),
+            ("optionalDependencies", true, false),
+        ] {
+            let fixture = Fixture::new();
+            let lock = fixture.owner.path().join("lock.fixture.json");
+            let mut value: serde_json::Value = serde_json::from_slice(&fs::read(&lock)?)?;
+            let root = &mut value["packages"]["node_modules/@earendil-works/pi-coding-agent"];
+            let integrity = root["integrity"].clone();
+            root[relation] = serde_json::json!({ "fixture-dependency": "1.0.0" });
+            value["packages"]["node_modules/fixture-dependency"] = serde_json::json!({
+                "version": "1.0.0",
+                "resolved": "https://registry.npmjs.org/fixture-dependency/-/fixture-dependency-1.0.0.tgz",
+                "integrity": integrity,
+                "optional": optional,
+            });
+            fs::write(lock, serde_json::to_vec(&value)?)?;
+            let receipt = fixture.prefix.join(".omg-npm-advisory-review.json");
+
+            let result = fixture.install();
+            let phases = fs::read_to_string(fixture.owner.path().join("phases"))?;
+            if required {
+                let error = result
+                    .err()
+                    .context("Missing required dependency was admitted")?;
+                assert!(
+                    format!("{error:#}").contains("fixture-dependency"),
+                    "{relation}, optional={optional}: {error:#}"
+                );
+                assert_eq!(phases, "install\nci\n");
+                assert!(!receipt.exists(), "Incomplete install produced a receipt");
+            } else {
+                result?.verify(&fixture.prefix)?;
+                assert_eq!(phases, "install\nci\naudit\n");
+                assert!(
+                    receipt.is_file(),
+                    "Optional absence prevented receipt publication"
+                );
+            }
+        }
+        Ok(())
     }
 
     #[test]

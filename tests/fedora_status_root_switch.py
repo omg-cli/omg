@@ -8238,6 +8238,192 @@ raise SystemExit(int(os.environ.get("OMG_FIXTURE_ENGINE_STATUS", "0")))
                    lambda result: "already exists" in result.stderr and recipe.is_file()
                    and recipe.read_bytes() == initial, status=1)
 
+    def inspect_pi_dependency_activation():
+        phase = "pi-dependency-activation"
+        version, node_version = "0.83.0", "24.22.3"
+        seed = r"""
+import base64, datetime, json, os, runpy, stat, sys
+from pathlib import Path
+
+helper, directory, version, node_version, variant = sys.argv[1:]
+home = Path(directory)
+fixture = runpy.run_path(helper)
+data = home / "data"
+node = data / "versions/node" / node_version
+pi = data / "versions/pi" / version
+config = Path(fixture["fixture_cli_environment"](home)["OMG_CONFIG_DIR"])
+(config / "config.toml").touch()
+(home / ".tool-versions").write_text(f"pi {version}\n")
+
+def write(path, content, mode=0o644):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content)
+    path.chmod(mode)
+
+def encode(value):
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+
+sha256 = fixture["sha256"]
+npmdir = node / "lib/node_modules/npm"
+npm_entry = npmdir / "bin/npm-cli.js"
+write(npm_entry, "#!/bin/sh\nexit 81\n", 0o755)
+write(npmdir / "package.json", '{"name":"npm","version":"11.15.0"}\n')
+node_entry = node / "bin/node"
+write(node_entry, f"#!/bin/sh\nprintf 'unexpected Node execution\\n' >> '{home}/node-ran'\nexit 82\n", 0o755)
+(node / "bin/npm").symlink_to("../lib/node_modules/npm/bin/npm-cli.js")
+(node.parent / "current").symlink_to(node_version)
+
+app = "@earendil-works/pi-coding-agent"
+paths = {
+    "app": f"node_modules/{app}",
+    "required": "node_modules/fixture-required",
+    "nested": f"node_modules/{app}/node_modules/@fixture/nested",
+    "peer": "node_modules/fixture-peer",
+    "addon": "node_modules/fixture-addon",
+    "native": "node_modules/fixture-addon/node_modules/fixture-native",
+    "fallback": "node_modules/fixture-native",
+    "platform": "node_modules/fixture-platform",
+    "addon-peer": "node_modules/fixture-addon-peer",
+}
+versions = dict(app=version, fallback="2.0.0")
+missing = {
+    "complete": set(),
+    "platform-omitted": {"platform"},
+    "addon-omitted": {"addon", "native", "addon-peer"},
+    "optional-omitted": {"addon", "native", "addon-peer", "fallback", "platform"},
+    "fallback-omitted": {"fallback"},
+    "required-omitted": {"required"},
+    "nested-omitted": {"nested"},
+    "peer-omitted": {"peer"},
+    "native-omitted": {"native", "fallback"},
+    "native-shadowed": {"native"},
+    "addon-peer-omitted": {"addon-peer"},
+    "required-claims-optional": {"required"},
+    "optional-overrides-required": {"platform"},
+    "optional-peer-unresolved": set(),
+    "wrong-version": set(),
+    "unexpected-package": set(),
+}[variant]
+integrity = "sha512-" + base64.b64encode(bytes(range(64))).decode()
+packages = {"": {"dependencies": {app: version}}}
+coordinates = set()
+for label, location in paths.items():
+    name = location.rsplit("node_modules/", 1)[1]
+    resolved = versions.get(label, "1.0.0")
+    coordinates.add((name, resolved))
+    entry = {"version": resolved, "integrity": integrity,
+             "resolved": f"https://registry.npmjs.org/{name}/-/{name.rsplit('/', 1)[-1]}-{resolved}.tgz"}
+    if label in {"addon", "native", "fallback", "platform", "addon-peer"} or (
+        label == "required" and variant == "required-claims-optional"
+    ):
+        entry["optional"] = True
+    packages[location] = entry
+    if label not in missing:
+        observed = "7.0.0" if label == "required" and variant == "wrong-version" else resolved
+        write(pi / location / "package.json", json.dumps({"name": name, "version": observed}))
+packages[paths["app"]].update(
+    dependencies={"fixture-required": "1.0.0", "@fixture/nested": "1.0.0"},
+    optionalDependencies={"fixture-addon": "1.0.0", "fixture-platform": "1.0.0", "fixture-native": "2.0.0"},
+    peerDependencies={"fixture-peer": "1.0.0"},
+)
+packages[paths["addon"]].update(dependencies={"fixture-native": "1.0.0"},
+                                peerDependencies={"fixture-addon-peer": "1.0.0"})
+if variant == "optional-overrides-required":
+    packages[paths["app"]]["dependencies"]["fixture-platform"] = "1.0.0"
+if variant == "optional-peer-unresolved":
+    packages[paths["app"]]["peerDependencies"]["fixture-unused-peer"] = "1.0.0"
+    packages[paths["app"]]["peerDependenciesMeta"] = {"fixture-unused-peer": {"optional": True}}
+if variant == "unexpected-package":
+    write(pi / "node_modules/fixture-extra/package.json", '{"name":"fixture-extra","version":"1.0.0"}')
+
+entry = pi / paths["app"] / "dist/cli.js"
+write(entry, "console.log('private Pi fixture');\n")
+(pi / "node_modules/.bin").mkdir()
+(pi / "node_modules/.bin/pi").symlink_to(f"../{app}/dist/cli.js")
+write(pi / "bin/pi", f"#!/bin/sh\nexec '{node_entry}' '{entry}' \"$@\"\n", 0o755)
+write(pi / ".omg-install-complete", version)
+(pi.parent / "current").symlink_to("0.82.0")
+lock = pi / "package-lock.json"
+write(lock, json.dumps({"lockfileVersion": 3, "packages": packages}))
+
+# This witness covers the synthetic release tree only. It supplies local prior
+# evidence so the production CLI exercises cached activation without network.
+identity = {}
+for path in [npmdir, *npmdir.rglob("*"), node_entry, node / "bin/npm"]:
+    relative = path.relative_to(node).as_posix()
+    target = path.resolve(strict=True)
+    meta = target.stat()
+    identity[f"metadata:{relative}"] = sha256(f"{meta.st_mode}:{meta.st_uid}:{meta.st_gid}".encode())
+    if path.is_symlink():
+        identity[f"link:{relative}"] = sha256(target.relative_to(node).as_posix().encode())
+    if stat.S_ISDIR(meta.st_mode):
+        identity[f"directory:{relative}"] = sha256(b"")
+    else:
+        identity[relative] = sha256(target.read_bytes())
+receipt = {
+    "schema_version": 2, "package": f"{app}@{version}", "lock_sha256": sha256(lock.read_bytes()),
+    "node_version": node_version, "node_path": str(node_entry), "node_root": str(node),
+    "runtime_content_sha256": sha256(encode(identity)),
+    "reviewed_at": datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z"),
+    "review_id": None, "risk_accepted": False, "coverage": "assessed", "security_overrides": [],
+    "lifecycle_scripts_ran": False, "npm_signatures_verified": True,
+    "assessments": [{"name": name, "version": exact, "source": {"kind": "osv", "ecosystem": "npm"},
+                     "findings": []} for name, exact in sorted(coordinates)],
+}
+write(pi / ".omg-npm-advisory-review.json", json.dumps(receipt), 0o600)
+fixture["seed_runtime_advisory_fixture"](node, "node", node_version, config)
+fixture["seed_runtime_advisory_fixture"](pi, "pi", version, config)
+"""
+        accepted = ("complete", "platform-omitted", "addon-omitted", "optional-omitted",
+                    "fallback-omitted", "optional-overrides-required", "optional-peer-unresolved")
+        denied = {
+            "required-omitted": "fixture-required",
+            "nested-omitted": "@fixture/nested",
+            "peer-omitted": "fixture-peer",
+            "native-omitted": "fixture-native",
+            "native-shadowed": "fixture-native",
+            "addon-peer-omitted": "fixture-addon-peer",
+            "required-claims-optional": "fixture-required",
+            "wrong-version": "differs from the reviewed version",
+            "unexpected-package": "was not reviewed",
+        }
+        for variant in (*accepted, *denied):
+            with tempfile.TemporaryDirectory(prefix=f"pi-inventory-{variant}-", dir=work) as directory:
+                home = Path(directory)
+                os.chown(home, account.pw_uid, account.pw_gid)
+                config_dir = home / "config/omg"
+                mode = dict(disabled, HOME=str(home), OMG_CONFIG_DIR=str(config_dir),
+                            OMG_DATA_DIR=str(home / "data"), OMG_NATIVE_TEST_DATA_DIR="1",
+                            XDG_CONFIG_HOME=str(config_dir.parent), XDG_DATA_HOME=str(home / "xdg-data"),
+                            XDG_CACHE_HOME=str(home / "cache"), XDG_STATE_HOME=str(home / "state"),
+                            OMG_NO_UPDATE_CHECK="1")
+                checked([sys.executable, "-I", "-B", "-c", seed, runtime_advisory_fixture, home,
+                         version, node_version, variant], mode, ordinary)
+                parent = home / "data/versions/pi"
+                current = parent / "current"
+                receipt = parent / version / ".omg-npm-advisory-review.json"
+                original = receipt.read_bytes()
+                for shorthand, args in (
+                    ("positional", ["use", "pi", version]),
+                    ("project-pin", ["use", "pi"]),
+                ):
+                    current.unlink()
+                    current.symlink_to("0.82.0")
+                    result = command([cli, *args], mode, ordinary)
+                    value = os.readlink(current) if current.is_symlink() else None
+                    if variant in accepted:
+                        correct = (result.returncode == 0 and value is not None and Path(value).name == version
+                                   and f"Now using Pi {version}" in result.stdout)
+                    else:
+                        correct = (result.returncode == 1 and value == "0.82.0"
+                                   and denied[variant] in result.stderr and "Now using Pi" not in result.stdout)
+                    checks.append(dict(
+                        phase=phase, case=f"{variant}-{shorthand}",
+                        passed=(correct and receipt.read_bytes() == original and not (home / "node-ran").exists()),
+                        status=result.returncode, current=value, diagnostic=result.stderr[-1600:],
+                        output=result.stdout[-450:],
+                    ))
+
     def inspect_dashboard_terminal():
         import pty
         import select
@@ -9359,6 +9545,7 @@ exec {shlex.quote(str(binary))} "$@"
                     inspect_enterprise_inventory()
                     inspect_audit_licenses()
                     inspect_container_cli()
+                    inspect_pi_dependency_activation()
                     inspect_info_attempts()
                     inspect_info_json_writes()
                     inspect_dashboard_terminal()
@@ -9691,6 +9878,6 @@ mark_progress("completed with host inventory unchanged")
 report = dict(binaries=binaries, checks=checks, total=len(checks),
               passed=sum(entry["passed"] for entry in checks), host_unchanged=True)
 print(json.dumps(report))
-expected_checks = 303 if consent_oracle is None else 3051
+expected_checks = 303 if consent_oracle is None else 3083
 if report["passed"] != report["total"] or report["total"] != expected_checks:
     sys.exit(4)

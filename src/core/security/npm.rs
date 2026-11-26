@@ -4,7 +4,8 @@ use anyhow::{Context, Result, ensure};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct NpmSpec {
@@ -39,6 +40,8 @@ pub(crate) struct NpmPackage {
     pub(crate) version: String,
     pub(crate) resolved: String,
     pub(crate) integrity: String,
+    can_be_absent: bool,
+    required_dependencies: Vec<Arc<str>>,
 }
 
 #[derive(Debug)]
@@ -63,7 +66,7 @@ impl NpmLock {
         metadata: &dyn Fn(&std::path::Path) -> std::io::Result<std::fs::Metadata>,
     ) -> Result<()> {
         let mut pending = vec![(staging.join("node_modules"), false)];
-        let mut seen = std::collections::BTreeSet::new();
+        let mut seen = BTreeSet::new();
         let mut examined = 0;
         while let Some((directory, scope)) = pending.pop() {
             ensure!(
@@ -98,9 +101,9 @@ impl NpmLock {
                     .to_str()
                     .context("Installed npm path is not UTF-8")?
                     .replace('\\', "/");
-                let expected = self
+                let (reviewed_path, expected) = self
                     .packages
-                    .get(&relative)
+                    .get_key_value(&relative)
                     .context("Installed npm package was not reviewed")?;
                 let bytes = read_metadata(&path.join("package.json"), 1024 * 1024)?;
                 let package: serde_json::Value = serde_json::from_slice(&bytes)?;
@@ -109,7 +112,7 @@ impl NpmLock {
                         && package["version"].as_str() == Some(expected.version.as_str()),
                     "Installed npm identity differs from the reviewed version"
                 );
-                seen.insert(relative);
+                seen.insert(reviewed_path.as_str());
                 let nested = path.join("node_modules");
                 match metadata(&nested) {
                     Ok(metadata) => {
@@ -125,9 +128,26 @@ impl NpmLock {
             }
         }
         ensure!(
-            seen.contains(&format!("node_modules/{}", requested.name)),
+            seen.contains(format!("node_modules/{}", requested.name).as_str()),
             "The requested npm package was not installed"
         );
+        for (path, package) in &self.packages {
+            if !seen.contains(path.as_str()) {
+                ensure!(
+                    package.can_be_absent,
+                    "Installed npm tree is missing required package '{path}'"
+                );
+                continue;
+            }
+            // An optional package can be absent. Once installed, it must have
+            // every regular dependency and required peer from the reviewed tree.
+            for dependency in &package.required_dependencies {
+                ensure!(
+                    seen.contains(dependency.as_ref()),
+                    "Installed npm package '{path}' is missing its reviewed dependency '{dependency}'"
+                );
+            }
+        }
         Ok(())
     }
 
@@ -236,40 +256,53 @@ impl NpmLock {
                     version: version.into(),
                     resolved: resolved.into(),
                     integrity: integrity.into(),
+                    can_be_absent: entry.optional || entry.dev || entry.dev_optional,
+                    required_dependencies: Vec::new(),
                 },
             );
         }
+        let paths: BTreeMap<_, Arc<str>> = lock
+            .packages
+            .keys()
+            .filter(|path| !path.is_empty())
+            .map(|path| (path.as_str(), Arc::from(path.as_str())))
+            .collect();
         for (path, entry) in &lock.packages {
-            for dependency in entry
-                .dependencies
-                .keys()
-                .chain(entry.optional_dependencies.keys())
-            {
-                ensure!(
-                    registry_name(dependency),
-                    "npm dependency has no registry identity"
-                );
-                let mut parent = path.as_str();
-                loop {
-                    let candidate = if parent.is_empty() {
-                        format!("node_modules/{dependency}")
-                    } else {
-                        format!("{parent}/node_modules/{dependency}")
-                    };
-                    if packages.contains_key(&candidate) {
-                        break;
-                    }
-                    ensure!(!parent.is_empty(), "npm lock omits a resolved dependency");
-                    parent = parent
-                        .rsplit_once("/node_modules/")
-                        .map_or("", |(ancestor, _)| ancestor);
-                }
+            let required_dependencies = entry.required_dependencies(path, &paths)?;
+            if let Some(package) = packages.get_mut(path) {
+                package.required_dependencies = required_dependencies;
             }
         }
         Ok(Self {
             sha256: hex::encode(Sha256::digest(bytes)),
             packages,
         })
+    }
+}
+
+fn parent_package(path: &str) -> &str {
+    path.rsplit_once("/node_modules/")
+        .map_or("", |(parent, _)| parent)
+}
+
+fn resolve_dependency<'a>(
+    paths: &'a BTreeMap<&str, Arc<str>>,
+    mut parent: &str,
+    name: &str,
+) -> Option<&'a Arc<str>> {
+    loop {
+        let candidate = if parent.is_empty() {
+            format!("node_modules/{name}")
+        } else {
+            format!("{parent}/node_modules/{name}")
+        };
+        if let Some(path) = paths.get(candidate.as_str()) {
+            return Some(path);
+        }
+        if parent.is_empty() {
+            return None;
+        }
+        parent = parent_package(parent);
     }
 }
 
@@ -501,6 +534,72 @@ struct RawPackage {
     dependencies: BTreeMap<String, String>,
     #[serde(default)]
     optional_dependencies: BTreeMap<String, String>,
+    #[serde(default)]
+    peer_dependencies: BTreeMap<String, String>,
+    #[serde(default)]
+    peer_dependencies_meta: BTreeMap<String, RawPeerMetadata>,
+    #[serde(default)]
+    optional: bool,
+    #[serde(default)]
+    dev: bool,
+    #[serde(default)]
+    dev_optional: bool,
+}
+
+#[derive(Deserialize)]
+struct RawPeerMetadata {
+    #[serde(default)]
+    optional: bool,
+}
+
+impl RawPackage {
+    fn required_dependencies(
+        &self,
+        path: &str,
+        paths: &BTreeMap<&str, Arc<str>>,
+    ) -> Result<Vec<Arc<str>>> {
+        let mut required = Vec::new();
+        for dependency in self.optional_dependencies.keys() {
+            ensure!(
+                registry_name(dependency),
+                "npm dependency has no registry identity"
+            );
+            ensure!(
+                resolve_dependency(paths, path, dependency).is_some(),
+                "npm lock omits a resolved dependency '{dependency}'"
+            );
+        }
+        for dependency in self.dependencies.keys() {
+            if self.optional_dependencies.contains_key(dependency) {
+                continue;
+            }
+            ensure!(
+                registry_name(dependency),
+                "npm dependency has no registry identity"
+            );
+            let target = resolve_dependency(paths, path, dependency)
+                .with_context(|| format!("npm lock omits a resolved dependency '{dependency}'"))?;
+            required.push(Arc::clone(target));
+        }
+        for peer in self.peer_dependencies.keys() {
+            if self.dependencies.contains_key(peer) || self.optional_dependencies.contains_key(peer)
+            {
+                continue;
+            }
+            ensure!(registry_name(peer), "npm peer has no registry identity");
+            if self
+                .peer_dependencies_meta
+                .get(peer)
+                .is_some_and(|metadata| metadata.optional)
+            {
+                continue;
+            }
+            let target = resolve_dependency(paths, parent_package(path), peer)
+                .with_context(|| format!("npm lock omits a resolved peer dependency '{peer}'"))?;
+            required.push(Arc::clone(target));
+        }
+        Ok(required)
+    }
 }
 
 #[cfg(test)]
