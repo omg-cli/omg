@@ -1707,6 +1707,162 @@ exec {shlex.quote(git)} "$@"
                                    passed=blocked and updated and code == 0, diagnostic=output[-1050:]))
 
 
+    def inspect_workspace_graph_and_diff():
+        phase = "workspace-graph-diff"
+        executable = shutil.which("git", path=base_env["PATH"])
+        assert executable is not None
+        with tempfile.TemporaryDirectory(prefix="workspace-graph-diff-", dir=work) as directory:
+            here = Path(directory)
+            os.chown(here, account.pw_uid, account.pw_gid)
+            env = dict(disabled, HOME=str(here), GIT_CONFIG_NOSYSTEM="1",
+                       XDG_DATA_HOME=str(here/"data"), XDG_CONFIG_HOME=str(here/"config"),
+                       XDG_CACHE_HOME=str(here/"cache"), XDG_STATE_HOME=str(here/"state"))
+            config = here / "omg-workspace.toml"
+            trace = here / "trace"
+
+            def run(label, args, markers=(), *, fails=False, inspect=None):
+                trace.unlink(missing_ok=True)
+                try:
+                    result = command([cli, "workspace", *args], env, ordinary, timeout=7)
+                except subprocess.TimeoutExpired:
+                    checks.append(dict(phase=phase, case=label, passed=False, status=None,
+                                       diagnostic="command exceeded local deadline"))
+                    return
+                output = result.stdout + result.stderr
+                okay = ((result.returncode != 0) == fails and all(marker in output for marker in markers)
+                        and (inspect is None or inspect()))
+                checks.append(dict(phase=phase, case=label, passed=okay, status=result.returncode,
+                                   diagnostic=output[-1200:]))
+
+            def graph(entries):
+                lines = ['name = "graph"', 'created_at = "2026-01-01T00:00:00Z"']
+                for name, relative, dependencies, script in entries:
+                    lines.extend((f"[projects.{name}]", f"path = {json.dumps(relative)}",
+                                  f"depends_on = {json.dumps(dependencies)}"))
+                    if script is not None:
+                        lines.extend((f"[projects.{name}.commands]", f"probe = {json.dumps(script)}"))
+                config.write_text("\n".join(lines) + "\n")
+
+            def entry(name, dependencies=(), script=None):
+                return name, ".", dependencies, script if script is not None else f"printf '%s\\n' {name} >> trace"
+
+            def recorded(*expected):
+                return trace.is_file() and trace.read_text().splitlines() == list(expected)
+
+            sequential = ("run", "probe", "--yes")
+            parallel = ("run", "probe", "--yes", "--parallel")
+            graph([])
+            run("empty-list", ("list",), ("No projects in workspace",))
+            run("empty-run", sequential, ("No matching projects",), inspect=lambda: not trace.exists())
+            graph([entry("base"), entry("middle", ["base", "base"]), entry("leaf", ["middle"])])
+            run("list-ordered", ("list",), ("1. base", "2. middle", "3. leaf"))
+            run("sequential-dependencies", sequential, ("3 succeeded, 0 failed",),
+                inspect=lambda: recorded("base", "middle", "leaf"))
+            run("parallel-dependencies", parallel, ("3 succeeded, 0 failed",),
+                inspect=lambda: recorded("base", "middle", "leaf"))
+            run("filtered-dependent", (*parallel, "--filter", "leaf"), ("1 succeeded, 0 failed",),
+                inspect=lambda: recorded("leaf"))
+            run("filter-no-match", (*parallel, "--filter", "unknown"), ("No matching projects",),
+                inspect=lambda: not trace.exists())
+
+            graph([entry("main", ["missing"])])
+            run("missing-dependency-list", ("list",), ("Unknown project 'missing'",), fails=True)
+            run("missing-dependency-run", parallel, ("Unknown project 'missing'",), fails=True,
+                inspect=lambda: not trace.exists())
+            graph([entry("first", ["second"]), entry("second", ["first"])])
+            run("cycle-list", ("list",), ("Circular dependency",), fails=True)
+            run("cycle-sequential", sequential, ("Circular dependency",), fails=True, inspect=lambda: not trace.exists())
+            run("cycle-parallel", parallel, ("Circular dependency",), fails=True, inspect=lambda: not trace.exists())
+
+            graph([entry("bad", script="exit 23"), entry("dependent", ["bad"]),
+                   entry("transitive", ["dependent"]), entry("independent")])
+            run("sequential-failure-propagation", sequential, ("1 succeeded, 3 failed",), fails=True,
+                inspect=lambda: recorded("independent"))
+            run("parallel-failure-propagation", parallel, ("1 succeeded, 3 failed",), fails=True,
+                inspect=lambda: recorded("independent"))
+
+            graph([entry("argument", script="printf '%s\\n' \"$@\" > trace")])
+            run("parallel-keeps-args", (*parallel, "--", "one value", "--flag"), ("1 succeeded, 0 failed",),
+                inspect=lambda: recorded("one value", "--flag"))
+            run("parallel-refuses-unattended-task", ("run", "probe", "--parallel"),
+                ("without an interactive terminal",), fails=True, inspect=lambda: not trace.exists())
+            graph([entry("a_base"),
+                   entry("b_dependent", ["a_base"], "printf 'b_dependent\\n' >> trace; : > ready"),
+                   entry("z_independent", script="for step in $(seq 1 60); do "
+                         "if test -f ready; then printf 'z_saw_dependent\\n' >> trace; exit 0; fi; "
+                         "sleep 0.02; done; exit 31")])
+            run("parallel-releases-ready-dependent", parallel, ("3 succeeded, 0 failed",),
+                inspect=lambda: recorded("a_base", "b_dependent", "z_saw_dependent"))
+
+            def git(repo, *args):
+                result = command([executable, *args], dict(env, HOME=str(repo)), ordinary, timeout=9)
+                assert result.returncode == 0, (args, result.stderr)
+                return result.stdout
+
+            def owned_dir(path):
+                path.mkdir()
+                os.chown(path, account.pw_uid, account.pw_gid)
+
+            repo = here / "repo"
+            owned_dir(repo)
+            graph([("member", "repo", [], None)])
+            run("no-repo-no-lock", ("diff", "main"), ("No omg.lock file",))
+            git(repo, "init", "--quiet", "--initial-branch=main")
+            git(repo, "config", "user.name", "Fedora audit")
+            git(repo, "config", "user.email", "fixture@example.invalid")
+            git(repo, "config", "commit.gpgsign", "false")
+            git(repo, "commit", "--allow-empty", "--quiet", "-m", "Empty base")
+            run("empty-branch-no-lock", ("diff", "main"), ("No omg.lock file",))
+            lock = repo / "omg.lock"
+            initial = "one\nsecond row\n"
+            lock.write_text(initial)
+            run("untracked-lock-added", ("diff", "main"), ("+2 lines, -0 lines",),
+                inspect=lambda: git(repo, "ls-files", "--", "omg.lock") == "")
+            git(repo, "add", "--", "omg.lock")
+            git(repo, "commit", "--quiet", "-m", "Track lock")
+            run("tracked-identical", ("diff", "main"), ("No changes",))
+            lock.write_text("one\nchanged row\n")
+            run("tracked-one-line-edit", ("diff", "main"), ("+1 lines, -1 lines",))
+            lock.write_text(initial + "++preserve leading plus signs\n")
+            run("added-plus-prefixed-line", ("diff", "main"), ("+1 lines, -0 lines",))
+            lock.write_text(initial)
+            git(repo, "rm", "-qf", "--cached", "--", "omg.lock")
+            run("staged-deletion-worktree-identical", ("diff", "main"), ("No changes",),
+                inspect=lambda: git(repo, "ls-files", "--", "omg.lock") == "")
+            lock.unlink()
+            run("missing-tracked-lock", ("diff", "main"), ("+0 lines, -2 lines",))
+            lock.mkdir()
+            run("nonregular-active-lock", ("diff", "main"), ("not a regular file",), fails=True)
+            lock.rmdir()
+            lock.write_bytes(b"\xff\n")
+            run("invalid-active-utf8", ("diff", "main"), ("not UTF-8",), fails=True)
+            lock.write_text(initial)
+            run("unknown-revision", ("diff", "no-such-branch"), ("git diff failed",), fails=True)
+
+            nested = repo / "nested"
+            owned_dir(nested)
+            (nested/"omg.lock").write_text("nested fixture\n")
+            git(repo, "add", "--", "omg.lock", "nested/omg.lock")
+            git(repo, "commit", "--quiet", "-m", "Nested lock")
+            graph([("nested", "repo/nested", [], None)])
+            run("nested-revision-path", ("diff", "main"), ("No changes",))
+            (nested/"omg.lock").write_text("nested fixture\nadditional text\n")
+            run("nested-lock-updated", ("diff", "main"), ("+1 lines, -0 lines",))
+            graph([("missing", "repo/missing", [], None), ("nested", "repo/nested", [], None)])
+            run("missing-project-still-reports-other-members", ("diff", "main"),
+                ("Missing project directory", "+1 lines, -0 lines"), fails=True)
+
+            graph([("member", "repo", [], None)])
+            lock.unlink()
+            (repo/"saved-lock").write_text(initial)
+            lock.symlink_to(repo/"saved-lock")
+            git(repo, "add", "--", "omg.lock")
+            git(repo, "commit", "--quiet", "-m", "Fixture symlink")
+            lock.unlink()
+            lock.write_text(initial)
+            run("nonregular-reference-lock", ("diff", "main"), ("Reference omg.lock must be a regular file",), fails=True)
+
+
     def inspect_environment_lockfiles():
         phase = "environment-lockfiles"
         with tempfile.TemporaryDirectory(prefix="environment-locks-", dir=work) as directory:
@@ -3408,6 +3564,7 @@ exec {shlex.quote(str(binary))} "$@"
                     inspect_git_workflow()
                     inspect_scaffold_publication()
                     inspect_workspace_lifecycle()
+                    inspect_workspace_graph_and_diff()
                 config.write_text(alternate_config)
                 refresh_fixture()
                 expected = ordinary_control([dnf, "--cacheonly", "repoquery",
@@ -3725,6 +3882,6 @@ assert inventory() == before
 report = dict(binaries=binaries, checks=checks, total=len(checks),
               passed=sum(entry["passed"] for entry in checks), host_unchanged=True)
 print(json.dumps(report))
-expected_checks = 303 if consent_oracle is None else 1256
+expected_checks = 303 if consent_oracle is None else 1288
 if report["passed"] != report["total"] or report["total"] != expected_checks:
     sys.exit(4)

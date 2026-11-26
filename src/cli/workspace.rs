@@ -7,13 +7,16 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use crate::cli::style;
-use crate::core::env::{fingerprint::EnvironmentState, lock_regular_file};
+use crate::core::env::{
+    fingerprint::{EnvironmentState, MAX_LOCKFILE_BYTES, read_lockfile},
+    lock_regular_file,
+};
 use crate::core::safe_ops;
 
 /// Workspace configuration file name
@@ -133,49 +136,43 @@ impl Workspace {
 
     /// Get topologically sorted projects (respecting dependencies)
     pub fn sorted_projects(&self) -> Result<Vec<String>> {
-        let mut result = Vec::new();
+        let mut result = Vec::with_capacity(self.projects.len());
         let mut visited = HashSet::new();
-        let mut temp_mark = HashSet::new();
+        let mut active = HashSet::new();
+        let mut stack = Vec::new();
+        let mut names: Vec<_> = self.projects.keys().map(String::as_str).collect();
+        names.sort_unstable();
 
-        let mut names: Vec<&String> = self.projects.keys().collect();
-        names.sort();
-        for name in names {
-            self.visit_project(name, &mut visited, &mut temp_mark, &mut result)?;
+        for root in names {
+            stack.push((root, false));
+            while let Some((name, complete)) = stack.pop() {
+                if complete {
+                    active.remove(name);
+                    visited.insert(name);
+                    result.push(name.to_owned());
+                } else if !visited.contains(name) {
+                    anyhow::ensure!(
+                        active.insert(name),
+                        "Circular dependency detected involving project: {name}"
+                    );
+                    let project = self.projects.get(name).with_context(|| {
+                        format!(
+                            "Unknown project '{name}' referenced in depends_on; add it with \
+                             'omg workspace add' or fix the reference"
+                        )
+                    })?;
+                    stack.push((name, true));
+                    stack.extend(
+                        project
+                            .depends_on
+                            .iter()
+                            .rev()
+                            .map(|dep| (dep.as_str(), false)),
+                    );
+                }
+            }
         }
-
         Ok(result)
-    }
-
-    fn visit_project<'a>(
-        &'a self,
-        name: &'a str,
-        visited: &mut HashSet<&'a str>,
-        temp_mark: &mut HashSet<&'a str>,
-        result: &mut Vec<String>,
-    ) -> Result<()> {
-        if visited.contains(name) {
-            return Ok(());
-        }
-        if !temp_mark.insert(name) {
-            anyhow::bail!("Circular dependency detected involving project: {name}");
-        }
-
-        // A dependency that isn't a registered project would otherwise appear as a
-        // phantom entry in the sorted output and be silently skipped by `run`.
-        let Some(project) = self.projects.get(name) else {
-            anyhow::bail!(
-                "Unknown project '{name}' referenced in depends_on; add it with \
-                 'omg workspace add' or fix the reference"
-            );
-        };
-        for dep in &project.depends_on {
-            self.visit_project(dep, visited, temp_mark, result)?;
-        }
-
-        temp_mark.remove(name);
-        visited.insert(name);
-        result.push(name.to_string());
-        Ok(())
     }
 }
 
@@ -446,30 +443,72 @@ fn dependency_failed(
         .any(|dependency| selected.contains(dependency.as_str()) && failed.contains(dependency))
 }
 
+struct DependencyQueue<'a> {
+    remaining: HashMap<&'a str, usize>,
+    dependents: HashMap<&'a str, Vec<&'a str>>,
+    ready: BTreeSet<&'a str>,
+}
+
+impl<'a> DependencyQueue<'a> {
+    fn new(workspace: &Workspace, projects: &[&'a str]) -> Result<Self> {
+        let selected: HashSet<_> = projects.iter().copied().collect();
+        let mut queue = Self {
+            remaining: HashMap::with_capacity(selected.len()),
+            dependents: HashMap::new(),
+            ready: BTreeSet::new(),
+        };
+        for &name in &selected {
+            let project = workspace
+                .projects
+                .get(name)
+                .context("Unknown scheduled project")?;
+            let mut pending = 0;
+            for dependency in &project.depends_on {
+                if let Some(&dependency) = selected.get(dependency.as_str()) {
+                    queue.dependents.entry(dependency).or_default().push(name);
+                    pending += 1;
+                }
+            }
+            queue.remaining.insert(name, pending);
+            if pending == 0 {
+                queue.ready.insert(name);
+            }
+        }
+        Ok(queue)
+    }
+
+    fn completed(&mut self, name: &str) -> Result<()> {
+        self.remaining.remove(name);
+        for dependent in self.dependents.remove(name).into_iter().flatten() {
+            let pending = self
+                .remaining
+                .get_mut(dependent)
+                .context("Unknown dependent project")?;
+            *pending -= 1;
+            if *pending == 0 {
+                self.ready.insert(dependent);
+            }
+        }
+        Ok(())
+    }
+}
+
 fn dependency_levels(workspace: &Workspace, projects: &[&str]) -> Result<Vec<Vec<String>>> {
-    let mut remaining: std::collections::BTreeSet<String> =
-        projects.iter().map(|name| (*name).to_string()).collect();
+    let mut queue = DependencyQueue::new(workspace, projects)?;
     let mut levels = Vec::new();
 
-    while !remaining.is_empty() {
-        let ready: Vec<String> = remaining
-            .iter()
-            .filter(|name| {
-                workspace.projects[*name]
-                    .depends_on
-                    .iter()
-                    .all(|dependency| !remaining.contains(dependency))
-            })
-            .cloned()
-            .collect();
+    while !queue.remaining.is_empty() {
+        let ready = std::mem::take(&mut queue.ready);
         anyhow::ensure!(
             !ready.is_empty(),
-            "Circular dependency detected while scheduling parallel workspace tasks"
+            "Circular dependency detected while scheduling workspace tasks"
         );
-        for name in &ready {
-            remaining.remove(name);
+        let mut level = Vec::with_capacity(ready.len());
+        for name in ready {
+            queue.completed(name)?;
+            level.push(name.to_owned());
         }
-        levels.push(ready);
+        levels.push(level);
     }
 
     Ok(levels)
@@ -481,63 +520,96 @@ async fn run_parallel(
     command: &str,
     args: &[String],
 ) -> Result<()> {
-    use tokio::task;
-
-    let levels = dependency_levels(workspace, projects)?;
+    let mut queue = DependencyQueue::new(workspace, projects)?;
     let selected: HashSet<&str> = projects.iter().copied().collect();
     let mut failed_projects = HashSet::new();
+    let mut running = tokio::task::JoinSet::new();
+    let worker_limit = std::thread::available_parallelism()
+        .map_or(2, std::num::NonZeroUsize::get)
+        .clamp(2, 32);
     let mut success = 0;
     let mut failed = 0;
 
-    for level in levels {
-        let mut handles = Vec::new();
-        for name in level {
-            let project = &workspace.projects[&name];
+    loop {
+        while running.len() < worker_limit
+            && let Some(name) = queue.ready.pop_first()
+        {
+            let project = &workspace.projects[name];
             if dependency_failed(project, &selected, &failed_projects) {
                 println!(
                     "{} {} {}",
                     style::error("✗"),
-                    style::package(&name),
+                    style::package(&consent_text(name)),
                     style::dim("skipped because a dependency failed")
                 );
-                failed_projects.insert(name);
+                failed_projects.insert(name.to_owned());
                 failed += 1;
+                queue.completed(name)?;
                 continue;
             }
 
-            let project = project.clone();
-            let command = command.to_string();
-            let args = args.to_vec();
-            let project_name = name.clone();
-            handles.push(task::spawn_blocking(move || {
-                let result = run_project_command(&project.path, &project, &command, &args);
-                (project_name, result)
-            }));
+            // One coordinator owns the consent prompts. Child processes run
+            // on the blocking pool and report completion independently.
+            let prepared = prepare_project_command(&project.path, project, command, args);
+            let name = name.to_owned();
+            running.spawn_blocking(move || (name, prepared.and_then(PreparedProjectCommand::run)));
         }
 
-        // Wait for the complete dependency level before starting dependents.
-        for handle in handles {
-            let (name, result) = handle.await?;
-            match result {
-                Ok(()) => {
-                    println!(
-                        "{} {} {}",
-                        style::success("✓"),
-                        style::package(&name),
-                        style::dim("completed")
-                    );
-                    success += 1;
-                }
-                Err(error) => {
-                    println!("{} {} {error}", style::error("✗"), style::package(&name));
-                    failed_projects.insert(name);
-                    failed += 1;
-                }
+        let Some(result) = running.join_next().await else {
+            anyhow::ensure!(
+                queue.remaining.is_empty(),
+                "Circular dependency detected while scheduling workspace tasks"
+            );
+            break;
+        };
+        let (name, result) = result?;
+        queue.completed(&name)?;
+        match result {
+            Ok(()) => {
+                println!(
+                    "{} {} {}",
+                    style::success("✓"),
+                    style::package(&consent_text(&name)),
+                    style::dim("completed")
+                );
+                success += 1;
+            }
+            Err(error) => {
+                println!(
+                    "{} {} {error}",
+                    style::error("✗"),
+                    style::package(&consent_text(&name))
+                );
+                failed_projects.insert(name);
+                failed += 1;
             }
         }
     }
 
     print_summary(command, success, failed)
+}
+
+struct PreparedProjectCommand {
+    command: std::process::Command,
+    label: String,
+    path: String,
+}
+
+impl PreparedProjectCommand {
+    fn run(mut self) -> Result<()> {
+        let status = self
+            .command
+            .status()
+            .with_context(|| format!("Failed to execute '{}' in '{}'", self.label, self.path))?;
+        anyhow::ensure!(
+            status.success(),
+            "'{}' in '{}' exited with code {}",
+            self.label,
+            self.path,
+            status.code().unwrap_or(-1)
+        );
+        Ok(())
+    }
 }
 
 fn run_project_command(
@@ -546,6 +618,15 @@ fn run_project_command(
     command: &str,
     args: &[String],
 ) -> Result<()> {
+    prepare_project_command(path, project, command, args)?.run()
+}
+
+fn prepare_project_command(
+    path: &str,
+    project: &WorkspaceProject,
+    command: &str,
+    args: &[String],
+) -> Result<PreparedProjectCommand> {
     // Check for custom command first
     if let Some(custom_cmd) = project.commands.get(command) {
         // Repo-defined shell: ask before running it in an attended
@@ -575,36 +656,25 @@ fn run_project_command(
         // parameters ($1, "$@", ...) inside the script, so extra args reach the
         // command without ad-hoc shell quoting of interpolated values.
         // https://pubs.opengroup.org/onlinepubs/9699919799/utilities/sh.html
-        let status = std::process::Command::new("sh")
+        let mut process = std::process::Command::new("sh");
+        process
             .arg("-c")
             .arg(custom_cmd)
             .arg("sh")
             .args(args)
-            .current_dir(path)
-            .status()
-            .with_context(|| format!("Failed to execute '{command}' in '{path}'"))?;
-
-        if !status.success() {
-            anyhow::bail!(
-                "'{command}' in '{path}' exited with code {}",
-                status.code().unwrap_or(-1)
-            );
-        }
-        return Ok(());
+            .current_dir(path);
+        return Ok(PreparedProjectCommand {
+            command: process,
+            label: consent_text(command),
+            path: consent_text(path),
+        });
     }
 
-    let status = workspace_task_command(Path::new(path), command, args)?
-        .status()
-        .with_context(|| format!("Failed to execute 'omg run {command}' in '{path}'"))?;
-
-    if !status.success() {
-        anyhow::bail!(
-            "'omg run {command}' in '{path}' exited with code {}",
-            status.code().unwrap_or(-1)
-        );
-    }
-
-    Ok(())
+    Ok(PreparedProjectCommand {
+        command: workspace_task_command(Path::new(path), command, args)?,
+        label: format!("omg run {}", consent_text(command)),
+        path: consent_text(path),
+    })
 }
 
 fn workspace_task_command(
@@ -649,81 +719,214 @@ fn load_project_lock(project: &Path) -> Result<EnvironmentState> {
 /// Show environment diff across workspace
 pub fn diff(branch: &str) -> Result<()> {
     let workspace = Workspace::load()?;
+    validate_git_revision(branch)?;
 
     println!(
         "{} Comparing workspace environments vs {}\n",
         style::header("OMG"),
-        branch
+        consent_text(branch)
     );
-
-    // Sort names so output order is deterministic despite HashMap iteration
-    let mut names: Vec<&String> = workspace.projects.keys().collect();
-    names.sort();
-
+    let mut names: Vec<_> = workspace.projects.keys().collect();
+    names.sort_unstable();
+    let mut failed = 0;
     for name in names {
-        let project = &workspace.projects[name];
-        println!("{} {}", style::arrow("→"), style::package(name));
-
-        let lock_path = PathBuf::from(&project.path).join("omg.lock");
-        if !lock_path.exists() {
-            println!("  {}", style::dim("No omg.lock file"));
-            continue;
-        }
-
-        let diff_bytes = git_lockfile_diff(Path::new(&project.path), branch)?;
-
-        if diff_bytes.is_empty() {
-            println!("  {}", style::success("No changes"));
-        } else {
-            let diff = String::from_utf8_lossy(&diff_bytes);
-            // Skip the +++/--- file-header lines so they aren't counted as changes
-            let added = diff
-                .lines()
-                .filter(|l| l.starts_with('+') && !l.starts_with("+++"))
-                .count();
-            let removed = diff
-                .lines()
-                .filter(|l| l.starts_with('-') && !l.starts_with("---"))
-                .count();
-            println!(
-                "  {} +{} lines, -{} lines",
-                style::warning("Changes:"),
-                added,
-                removed
-            );
+        let project = Path::new(&workspace.projects[name].path);
+        println!(
+            "{} {}",
+            style::arrow("→"),
+            style::package(&consent_text(name))
+        );
+        match git_lockfile_diff(project, branch) {
+            Ok(None) => println!("  {}", style::dim("No omg.lock file")),
+            Ok(Some((0, 0))) => println!("  {}", style::success("No changes")),
+            Ok(Some((added, removed))) => println!(
+                "  {} +{added} lines, -{removed} lines",
+                style::warning("Changes:")
+            ),
+            Err(error) => {
+                eprintln!("  {}", consent_text(&format!("{error:#}")));
+                failed += 1;
+            }
         }
         println!();
     }
+    anyhow::ensure!(
+        failed == 0,
+        "{failed} project(s) failed to compare environment lockfiles"
+    );
+    Ok(())
+}
 
+fn validate_git_revision(branch: &str) -> Result<()> {
+    anyhow::ensure!(
+        !branch.trim_start().starts_with('-'),
+        "Git branch or revision must not begin with '-'"
+    );
     Ok(())
 }
 
 fn git_inspection_command() -> Result<std::process::Command> {
     let mut command = crate::core::privilege::system_command("git")?;
-    command.args(["diff", "--no-ext-diff", "--no-textconv"]);
+    command
+        .arg("--no-replace-objects")
+        .env("GIT_NO_LAZY_FETCH", "1")
+        .env("GIT_OPTIONAL_LOCKS", "0");
+    for variable in [
+        "GIT_DIR",
+        "GIT_COMMON_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    ] {
+        command.env_remove(variable);
+    }
     Ok(command)
 }
 
-fn git_lockfile_diff(project_path: &Path, branch: &str) -> Result<Vec<u8>> {
+fn git_lockfile_diff(project_path: &Path, branch: &str) -> Result<Option<(usize, usize)>> {
+    validate_git_revision(branch)?;
+    let metadata = project_path
+        .metadata()
+        .with_context(|| format!("Missing project directory: {}", project_path.display()))?;
     anyhow::ensure!(
-        !branch.trim_start().starts_with('-'),
-        "Git branch or revision must not begin with '-'"
+        metadata.is_dir(),
+        "Project path is not a directory: {}",
+        project_path.display()
     );
-    let output = git_inspection_command()?
-        .args([branch, "--", "omg.lock"])
+    let current = match read_lockfile(&project_path.join("omg.lock")) {
+        Ok(current) => Some(current),
+        Err(error) if is_missing(&error) => None,
+        Err(error) => return Err(error),
+    };
+
+    // A project without Git or a working lockfile has no environment diff.
+    if current.is_none()
+        && !std::env::current_dir()?
+            .join(project_path)
+            .ancestors()
+            .any(|path| path.join(".git").symlink_metadata().is_ok())
+    {
+        return Ok(None);
+    }
+    let reference = read_reference_lock(project_path, branch).with_context(|| {
+        format!(
+            "git diff failed in {} against {branch}",
+            project_path.display()
+        )
+    })?;
+    match (reference.as_deref(), current.as_deref()) {
+        (None, None) => Ok(None),
+        (None, Some(current)) => Ok(Some((current.lines().count(), 0))),
+        (Some(reference), None) => Ok(Some((0, reference.lines().count()))),
+        (Some(reference), Some(current)) if reference == current => Ok(Some((0, 0))),
+        (Some(reference), Some(current)) => count_changed_lines(reference, current).map(Some),
+    }
+}
+
+fn read_reference_lock(project_path: &Path, branch: &str) -> Result<Option<String>> {
+    let tree = git_inspection_command()?
+        .args([
+            "ls-tree",
+            "-l",
+            "-z",
+            &format!("{branch}^{{tree}}"),
+            "--",
+            "omg.lock",
+        ])
         .current_dir(project_path)
         .output()
-        .with_context(|| format!("Failed to run git diff in {}", project_path.display()))?;
-    if !output.status.success() {
-        let stderr =
-            crate::cli::style::sanitize_terminal_text(&String::from_utf8_lossy(&output.stderr));
-        anyhow::bail!(
-            "git diff failed in {} against {branch}: {}",
-            project_path.display(),
-            stderr.trim()
-        );
+        .context("Failed to inspect the reference Git tree")?;
+    anyhow::ensure!(
+        tree.status.success(),
+        "{}",
+        String::from_utf8_lossy(&tree.stderr).trim()
+    );
+    if tree.stdout.is_empty() {
+        return Ok(None);
     }
-    Ok(output.stdout)
+    let entry = std::str::from_utf8(&tree.stdout)?;
+    let (fields, path) = entry.split_once('\t').context("Invalid Git tree entry")?;
+    let fields: Vec<_> = fields.split_ascii_whitespace().collect();
+    let [mode, kind, object, size] = fields.as_slice() else {
+        anyhow::bail!("Invalid Git tree entry for omg.lock");
+    };
+    anyhow::ensure!(path == "omg.lock\0", "Invalid reference path for omg.lock");
+    anyhow::ensure!(
+        matches!(*mode, "100644" | "100755") && *kind == "blob",
+        "Reference omg.lock must be a regular file"
+    );
+    anyhow::ensure!(
+        matches!(object.len(), 40 | 64) && object.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "Invalid Git object for omg.lock"
+    );
+    let size = size
+        .parse::<u64>()
+        .context("Invalid reference omg.lock size")?;
+    anyhow::ensure!(
+        size <= MAX_LOCKFILE_BYTES,
+        "Reference omg.lock exceeds the {MAX_LOCKFILE_BYTES} byte limit"
+    );
+
+    let blob = git_inspection_command()?
+        .args(["cat-file", "blob", object])
+        .current_dir(project_path)
+        .output()
+        .context("Failed to read the reference Git lockfile")?;
+    anyhow::ensure!(
+        blob.status.success(),
+        "{}",
+        String::from_utf8_lossy(&blob.stderr).trim()
+    );
+    anyhow::ensure!(
+        blob.stdout.len() as u64 == size,
+        "Reference omg.lock size changed"
+    );
+    String::from_utf8(blob.stdout)
+        .map(Some)
+        .context("Reference omg.lock is not UTF-8")
+}
+
+fn line_diff_command() -> Result<std::process::Command> {
+    let mut git = git_inspection_command()?;
+    git.args([
+        "diff",
+        "--no-index",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--numstat",
+        "--text",
+    ]);
+    Ok(git)
+}
+
+fn count_changed_lines(old: &str, new: &str) -> Result<(usize, usize)> {
+    let scratch = tempfile::tempdir().context("Failed to create private lockfile comparison")?;
+    fs::write(scratch.path().join("reference.lock"), old)?;
+    fs::write(scratch.path().join("working.lock"), new)?;
+    let diff = line_diff_command()?
+        .args(["--", "reference.lock", "working.lock"])
+        .current_dir(scratch.path())
+        .output()
+        .context("Failed to compare lockfile lines")?;
+    anyhow::ensure!(
+        matches!(diff.status.code(), Some(0 | 1)),
+        "{}",
+        String::from_utf8_lossy(&diff.stderr).trim()
+    );
+    if diff.stdout.is_empty() && diff.status.success() {
+        return Ok((0, 0));
+    }
+    let mut fields = std::str::from_utf8(&diff.stdout)?.splitn(3, '\t');
+    let added = fields
+        .next()
+        .context("No added line count in Git diff")?
+        .parse()?;
+    let removed = fields
+        .next()
+        .context("No removed line count in Git diff")?
+        .parse()?;
+    Ok((added, removed))
 }
 
 /// Check all project environments without mutating them.
@@ -991,6 +1194,29 @@ mod tests {
     }
 
     #[test]
+    fn large_dependency_chain_keeps_its_order() -> Result<()> {
+        const COUNT: usize = 8000;
+        let mut workspace = Workspace::default();
+        for index in 0..COUNT {
+            let name = format!("project-{index:04}");
+            let mut node = project(".", &[]);
+            if index + 1 < COUNT {
+                node.depends_on.push(format!("project-{:04}", index + 1));
+            }
+            workspace.projects.insert(name, node);
+        }
+        let ordered = workspace.sorted_projects()?;
+        assert_eq!(ordered.len(), COUNT);
+        assert_eq!(ordered.first().map(String::as_str), Some("project-7999"));
+        assert_eq!(ordered.last().map(String::as_str), Some("project-0000"));
+        let selected: Vec<_> = ordered.iter().map(String::as_str).collect();
+        let levels = dependency_levels(&workspace, &selected)?;
+        assert_eq!(levels.len(), COUNT);
+        assert!(levels.into_iter().flatten().eq(ordered));
+        Ok(())
+    }
+
+    #[test]
     fn independent_projects_share_a_parallel_level() {
         let mut workspace = Workspace::default();
         workspace
@@ -1074,7 +1300,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn git_inspection_uses_a_trusted_program_and_disables_external_filters() {
-        let command = git_inspection_command().expect("trusted Git");
+        let command = line_diff_command().expect("trusted Git");
         assert!(Path::new(command.get_program()).is_absolute());
         let arguments: Vec<_> = command.get_args().collect();
         assert!(arguments.contains(&std::ffi::OsStr::new("--no-ext-diff")));
@@ -1086,6 +1312,7 @@ mod tests {
     #[test]
     fn git_diff_failures_are_not_reported_as_no_changes() {
         let directory = tempfile::tempdir().expect("temp directory");
+        fs::write(directory.path().join("omg.lock"), "fixture lock").expect("working lockfile");
 
         let error = git_lockfile_diff(directory.path(), "main")
             .expect_err("a non-repository must fail instead of returning an empty diff");

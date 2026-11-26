@@ -250,10 +250,10 @@ fn fingerprint_requires_backend() -> Result<Vec<String>> {
     )
 }
 
+pub(crate) const MAX_LOCKFILE_BYTES: u64 = 16 * 1024 * 1024;
+
 pub(crate) fn read_lockfile(path: &Path) -> Result<String> {
     use std::io::Read as _;
-
-    const MAX_LOCKFILE_BYTES: u64 = 16 * 1024 * 1024;
 
     let metadata = fs::symlink_metadata(path)
         .with_context(|| format!("Failed to inspect lockfile {}", path.display()))?;
