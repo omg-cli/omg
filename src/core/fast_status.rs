@@ -3,7 +3,7 @@
 //! The daemon writes a binary status file that CLI reads directly,
 //! bypassing socket connection and IPC serialization overhead.
 
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::Path;
 
@@ -84,6 +84,43 @@ const UNSCOPED_SIZE: usize = std::mem::offset_of!(FastStatus, scope);
 /// in `daemon/server.rs` enforces the relationship.
 pub const FAST_STATUS_FRESHNESS_SECS: u64 = 300;
 
+/// Open the same kind of file our atomic status writers publish.
+pub(crate) fn open_status_snapshot(path: &Path) -> std::io::Result<(File, u64)> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        options.custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK | nix::libc::O_NOCTTY);
+    }
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Status cache is not a regular file",
+        ));
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+
+        if metadata.uid() != nix::unistd::geteuid().as_raw()
+            || metadata.mode() & 0o022 != 0
+            || metadata.nlink() != 1
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "Status cache must be singly linked and writable only by its owner",
+            ));
+        }
+    }
+
+    Ok((file, metadata.len()))
+}
+
 impl FastStatus {
     /// Create a new fast status
     #[must_use]
@@ -157,8 +194,11 @@ impl FastStatus {
     /// Read status from file (sub-millisecond)
     #[must_use]
     pub fn read_from_file(path: &Path) -> Option<Self> {
-        let mut file = File::open(path).ok()?;
+        let (mut file, size) = open_status_snapshot(path).ok()?;
         let mut bytes = [0u8; std::mem::size_of::<Self>()];
+        if size != UNSCOPED_SIZE as u64 && size != bytes.len() as u64 {
+            return None;
+        }
         file.read_exact(&mut bytes[..UNSCOPED_SIZE]).ok()?;
         match bytes[std::mem::offset_of!(Self, version)] {
             UNSCOPED_VERSION => {}
@@ -217,11 +257,9 @@ impl FastStatus {
         (self.scope == scope.0).then_some(self)
     }
 
-    /// Read a status file only when its parent directory passes the same
-    /// runtime-directory validation the daemon applies before binding
-    /// (real, current-uid-owned, owner-only). The status path is selected by
-    /// environment, so an unvalidated read would accept a foreign or
-    /// symlinked cache file (csf_fdd4999c).
+    /// Read a status file in a runtime directory that passes the daemon's
+    /// directory checks. On Unix the reader also verifies the opened file's
+    /// type, ownership, permissions and link count before decoding it.
     pub fn read_validated(path: &Path) -> Option<Self> {
         #[cfg(unix)]
         paths::validate_socket_parent(path).ok()?;
@@ -334,6 +372,43 @@ mod tests {
         status.write_to_file(&path).unwrap();
 
         assert!(FastStatus::read_from_file(&path).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validated_reads_require_a_regular_status_owned_by_the_caller() -> anyhow::Result<()> {
+        use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _, symlink};
+
+        let directory = tempdir()?;
+        let runtime = directory.path().join("runtime");
+        std::fs::DirBuilder::new().mode(0o700).create(&runtime)?;
+        let status = FastStatus::new(40, 20, 1, 2);
+        let path = runtime.join("omg.status");
+        status.write_to_file(&path)?;
+        assert_eq!(
+            FastStatus::read_validated(&path)
+                .expect("writer's private file must be readable")
+                .total_packages,
+            40
+        );
+
+        let linked = runtime.join("linked.status");
+        symlink(&path, &linked)?;
+        assert!(FastStatus::read_validated(&linked).is_none());
+        std::fs::remove_file(&linked)?;
+
+        std::fs::hard_link(&path, &linked)?;
+        assert!(FastStatus::read_validated(&path).is_none());
+        std::fs::remove_file(&linked)?;
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666))?;
+        assert!(FastStatus::read_validated(&path).is_none());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))?;
+        assert!(FastStatus::read_validated(&path).is_some());
+        let status_directory = runtime.join("status-directory");
+        std::fs::create_dir(&status_directory)?;
+        assert!(FastStatus::read_validated(&status_directory).is_none());
+        Ok(())
     }
 
     #[cfg(unix)]

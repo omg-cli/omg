@@ -9,14 +9,16 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use super::protocol::StatusResult;
-use crate::core::fast_status::StatusScope;
+use crate::core::fast_status::{StatusScope, open_status_snapshot};
 
 /// Current on-disk status snapshot format.
 const STATUS_FORMAT_VERSION: u32 = 3;
+const MAX_STATUS_CACHE_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Deserialize)]
 struct StatusVersion {
@@ -86,8 +88,8 @@ impl PersistentCache {
 
     /// Validate known versions without rewriting legacy or forward-version files.
     fn read_snapshot(&self) -> Result<Option<PersistedStatus>> {
-        let content = match std::fs::read_to_string(&self.path) {
-            Ok(content) => content,
+        let (file, size) = match open_status_snapshot(&self.path) {
+            Ok(snapshot) => snapshot,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => {
                 return Err(error).context(format!(
@@ -96,6 +98,21 @@ impl PersistentCache {
                 ));
             }
         };
+        let maximum = MAX_STATUS_CACHE_BYTES as u64;
+        anyhow::ensure!(
+            size <= maximum,
+            "Daemon status cache exceeds {maximum} bytes"
+        );
+        let mut content = String::new();
+        file.take(maximum + 1)
+            .read_to_string(&mut content)
+            .with_context(|| {
+                format!("Failed to read daemon status cache {}", self.path.display())
+            })?;
+        anyhow::ensure!(
+            content.len() <= MAX_STATUS_CACHE_BYTES,
+            "Daemon status cache exceeds {maximum} bytes"
+        );
         let version: StatusVersion = serde_json::from_str(&content)
             .with_context(|| format!("Malformed daemon status cache: {}", self.path.display()))?;
         match version.format_version {
@@ -145,6 +162,10 @@ impl PersistentCache {
         };
         let content =
             serde_json::to_vec(&persisted).context("Failed to serialize daemon status cache")?;
+        anyhow::ensure!(
+            content.len() <= MAX_STATUS_CACHE_BYTES,
+            "Daemon status cache exceeds {MAX_STATUS_CACHE_BYTES} bytes"
+        );
         crate::core::safe_ops::atomic_write_file_sync(&self.path, content)
             .with_context(|| format!("Failed to write {}", self.path.display()))
     }
@@ -290,6 +311,45 @@ mod tests {
             cache.invalidate_status();
             assert_eq!(std::fs::read(&cache.path)?, bytes);
         }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linked_status_is_neither_read_nor_replaced() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir()?;
+        let cache = PersistentCache::new(directory.path())?;
+        cache.set_status(&status())?;
+        let backing = directory.path().join("saved-status.json");
+        std::fs::rename(&cache.path, &backing)?;
+        let original = std::fs::read(&backing)?;
+        symlink(&backing, &cache.path)?;
+        assert!(cache.get_status(Duration::from_mins(2)).is_err());
+        assert!(cache.set_status(&status()).is_err());
+        cache.invalidate_status();
+        assert!(std::fs::symlink_metadata(&cache.path)?.is_symlink());
+        assert_eq!(std::fs::read(backing)?, original);
+        Ok(())
+    }
+
+    #[test]
+    fn oversized_valid_snapshot_is_neither_used_nor_replaced() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let cache = PersistentCache::new(directory.path())?;
+        cache.set_status(&status())?;
+        let mut bytes = std::fs::read(&cache.path)?;
+        bytes.resize(MAX_STATUS_CACHE_BYTES + 1, b' ');
+        std::fs::write(&cache.path, &bytes)?;
+
+        let error = cache
+            .get_status(Duration::from_mins(2))
+            .expect_err("an oversized valid snapshot must be refused");
+        assert!(format!("{error:#}").contains("status cache exceeds"));
+        assert!(cache.set_status(&status()).is_err());
+        cache.invalidate_status();
+        assert_eq!(std::fs::metadata(&cache.path)?.len(), bytes.len() as u64);
         Ok(())
     }
 
