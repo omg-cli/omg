@@ -25,6 +25,44 @@ for query in frfx gt unmatched failure; do
 done
 BASH
 
+fish --no-config -c '
+    source "$argv[1]"
+    function omg
+        switch "$argv[9]"
+            case "omg install ba" "omg --quiet install git ba" "omg remove glibc ba"
+                printf "%s\n" bash.x86_64
+            case "omg use node 22."
+                printf "%s\n" 22.14.0
+            case "omg sy no"
+                printf "%s\n" node
+            case "omg install fa"
+                printf "%s\n" failed-package
+                return 1
+        end
+    end
+    for line in "omg install ba" "omg --quiet install git ba" "omg remove glibc ba"
+        set -l suggestions (complete -C "$line")
+        contains -- bash.x86_64 $suggestions
+        or begin
+            printf "Fish missed package completion in %s\n" "$line" >&2
+            exit 1
+        end
+    end
+    set -l suggestions (complete -C "omg use node 22.")
+    contains -- 22.14.0 $suggestions
+    or begin
+        printf "Fish missed the runtime version completion\n" >&2
+        exit 1
+    end
+    set -l suggestions (complete -C "omg sy no")
+    contains -- node $suggestions
+    set -l suggestions (complete -C "omg install fa")
+    if contains -- failed-package $suggestions
+        printf "Fish accepted partial output from a failing completion\n" >&2
+        exit 1
+    end
+' "${0:A:h}/../src/hooks/completions/fish.fish"
+
 zmodload zsh/zpty
 zmodload zsh/system
 zmodload zsh/datetime
@@ -82,9 +120,11 @@ compinit -i -D
 print -r -- 'child: compinit done' >> /tmp/omg-zsh-child.log
 PROMPT='READY> '
 omg() {
+    print -r -- "$5" >> "$ZDOTDIR/completion-calls"
     case "$5" in
         frfx) print -r -- firefox ;;
         gt) print -r -- git ;;
+        failure) print -r -- firefox; return 1 ;;
     esac
 }
 capture_buffer() {
@@ -117,4 +157,12 @@ read_until '*CAPTURE:*:END*' 'unmatched capture'
 print -r -- 'phase: captured unmatched'
 print -r -- "$output"
 [[ "$output" == *'CAPTURE:omg install zzzz-unmatched:END'* ]]
+[[ $(grep -c '^zzzz-unmatched$' "$fixture/completion-calls") == 1 ]] || {
+    print -r -u2 -- 'Zsh requested suggestions more than once for an unmatched token'
+    exit 1
+}
+zpty -w -n child $'\C-a\C-komg install failure\t\C-x'
+read_until '*CAPTURE:*:END*' 'failed suggestion capture'
+[[ "$output" == *'CAPTURE:omg install failure:END'* ]]
+[[ $(grep -c '^failure$' "$fixture/completion-calls") == 1 ]]
 print -r -- 'phase: all captures verified'
