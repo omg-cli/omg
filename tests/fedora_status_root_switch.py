@@ -4061,6 +4061,153 @@ exec {shlex.quote(str(native))} "$@"
                                diagnostic=(result.stdout + result.stderr)[-1100:]))
 
 
+    def inspect_migration():
+        phase = "fedora-migration"
+        with tempfile.TemporaryDirectory(prefix="migration-", dir=work) as directory:
+            files = Path(directory)
+            os.chown(files, account.pw_uid, account.pw_gid)
+
+            data = files / "omg-data"
+            node = data / "versions/node"
+            release = node / "22.0.0"
+            release.mkdir(parents=True)
+            marker = release / ".omg-install-complete"
+            marker.write_text("22.0.0\n")
+            current = node / "current"
+            current.symlink_to(release.name)
+            for path in (data, node.parent, node, release, marker):
+                os.chown(path, account.pw_uid, account.pw_gid)
+            migration_env = dict(disabled, OMG_DATA_DIR=str(data))
+
+            def run(label, args, verify):
+                result = command([cli, "migrate", *args], migration_env, ordinary, timeout=10)
+                checks.append(dict(phase=phase, case=label, passed=verify(result),
+                                   status=result.returncode, diagnostic=(result.stdout[-700:],
+                                                                          result.stderr[-700:])))
+
+            def package_row(name):
+                return dict(original_name=name, category="application", description=None,
+                            alternatives=[])
+
+            def write_manifest(label, *, names=(), runtimes=None, distro="fedora", version="1.0"):
+                path = files / f"{label}.json"
+                path.write_text(json.dumps(dict(version=version, source_distro=distro, created_at=0,
+                                                packages=[package_row(name) for name in names],
+                                                runtimes=runtimes or {})))
+                return path
+
+            def preview(result, packages, runtimes, expected=""):
+                return (result.returncode == 0 and not result.stderr
+                        and f"{packages} package installation(s), {runtimes} runtime installation(s)"
+                        in result.stdout and "No changes made (dry run)" in result.stdout
+                        and expected in result.stdout)
+
+            def refused(result, expected):
+                return (result.returncode != 0 and expected.lower() in result.stderr.lower()
+                        and "Mutation summary" not in result.stdout and "Applying..." not in result.stdout
+                        and "No changes made (dry run)" not in result.stdout)
+
+            explicit_query = [dnf, "--cacheonly", "--setopt=disable_excludes=*",
+                              "repoquery", "--userinstalled", "--qf", r"%{name}\n"]
+            original_config = config.read_text()
+            config.write_text(alternate_config)
+            try:
+                expected_packages = sorted(set(ordinary_control(explicit_query).splitlines()))
+                assert expected_packages == [package], expected_packages
+                exported = files / "Fedora user's export.json"
+
+                def command_hint(stdout):
+                    hints = [line[line.index("omg migrate import"):] for line in stdout.splitlines()
+                             if "omg migrate import" in line]
+                    if len(hints) != 1:
+                        return False
+                    try:
+                        argv = shlex.split(hints[0])
+                    except ValueError:
+                        return False
+                    return argv == ["omg", "migrate", "import", "--", str(exported)]
+
+                def matches_inventory(result):
+                    if result.returncode != 0 or not exported.is_file():
+                        return False
+                    value = json.loads(exported.read_text())
+                    return (value["version"] == "1.0" and value["source_distro"] == "fedora"
+                            and value["created_at"] > 0 and value["runtimes"] == {"node": "22.0.0"}
+                            and [row["original_name"] for row in value["packages"]] == expected_packages
+                            and f"Packages: {len(expected_packages)}" in result.stdout
+                            and command_hint(result.stdout))
+
+                run("export-native-inventory", ["export", "--output", exported], matches_inventory)
+                first_inode = exported.stat().st_ino if exported.is_file() else None
+                run("export-replaces-atomically", ["export", "-o", exported],
+                    lambda result: matches_inventory(result) and exported.stat().st_ino != first_inode)
+                run("export-import-round-trip", ["import", "--dry-run", "--", exported],
+                    lambda result: preview(result, len(expected_packages), 1, "node @ 22.0.0")
+                    and command_hint(result.stdout))
+                run("export-directory-error", ["export", "--output", files],
+                    lambda result: result.returncode != 0 and "Exported to" not in result.stdout)
+
+                for label, names, runtimes, distro, count, runtime_count, expected in (
+                    ("native-rpm-name", (package,), {}, "fedora", 1, 0, package),
+                    ("fedora-arch-selector", ("glibc.x86_64", "glibc.i686"), {}, "fedora", 2, 0, "glibc.i686"),
+                    ("arch-portable-fallback", ("git", "curl"), {}, "arch", 2, 0, "Source: arch"),
+                    ("debian-portable-fallback", ("git",), {}, "debian", 1, 0, "Source: debian"),
+                    ("empty", (), {}, "fedora", 0, 0, ""),
+                    ("node-lts", (), {"node": "lts/*"}, "fedora", 0, 1, "node @ lts/*"),
+                    ("python-constraint", (), {"python": ">=3.13,<3.14"}, "fedora", 0, 1, "python @ >=3.13,<3.14"),
+                    ("managed-tool", (), {"ripgrep": "14.1.1"}, "fedora", 0, 1, "ripgrep @ 14.1.1"),
+                    ("runtime-alias", (), {"nodejs": "22"}, "fedora", 0, 1, "node @ 22"),
+                    ("same-runtime-aliases", (), {"node": "22", "nodejs": "22"}, "fedora", 0, 1, "node @ 22"),
+                    ("duplicate-packages", (package, package, "git", "git"), {}, "fedora", 2, 0, "git"),
+                    ("unknown-source-distro", ("git",), {}, "custom-linux", 1, 0, "Source: custom-linux"),
+                ):
+                    path = write_manifest(label, names=names, runtimes=runtimes, distro=distro)
+                    run(label, ["import", path, "--dry-run"],
+                        lambda result: preview(result, count, runtime_count, expected))
+
+                for label, names, runtimes, version, expected in (
+                    ("empty-package", ("",), {}, "1.0", "package"),
+                    ("name-with-spaces", ("two words",), {"node": "22"}, "1.0", "package"),
+                    ("empty-runtime", (), {"": "22"}, "1.0", "runtime"),
+                    ("empty-runtime-version", (), {"node": ""}, "1.0", "version"),
+                    ("unknown-runtime", (), {"unknown-example-runtime": "22"}, "1.0", "unsupported runtime"),
+                    ("conflicting-runtime-aliases", (), {"node": "22", "nodejs": "24"}, "1.0", "conflicting versions"),
+                    ("future-manifest", (), {}, "2.0", "unsupported migration manifest version"),
+                ):
+                    path = write_manifest(label, names=names, runtimes=runtimes, version=version)
+                    for suffix, options in (("preview", ["--dry-run"]), ("apply", [])):
+                        run(f"{label}-{suffix}", ["import", path, *options],
+                            lambda result: refused(result, expected))
+
+                valid = write_manifest("valid", names=(package,), runtimes={"node": "22"})
+                run("unattended-apply", ["import", valid],
+                    lambda result: result.returncode != 0 and "interactive terminal" in result.stderr
+                    and "Applying..." not in result.stdout)
+                run("empty-unattended-apply", ["import", write_manifest("empty-apply")],
+                    lambda result: result.returncode == 0 and "Migration complete!" in result.stdout)
+                run("directory-manifest", ["import", files, "--dry-run"],
+                    lambda result: refused(result, "regular file"))
+                run("missing-manifest", ["import", files / "missing.json", "--dry-run"],
+                    lambda result: refused(result, "migration manifest"))
+                malformed = files / "malformed.json"
+                malformed.write_text('{"version":')
+                run("invalid-json", ["import", malformed, "--dry-run"],
+                    lambda result: refused(result, "JSON"))
+                oversized = write_manifest("oversized")
+                with oversized.open("ab") as stream:
+                    for _ in range(16):
+                        stream.write(b" " * (1024 * 1024))
+                run("oversized-manifest", ["import", oversized, "--dry-run"],
+                    lambda result: refused(result, "byte limit"))
+                assert sorted(set(ordinary_control(explicit_query).splitlines())) == expected_packages
+                assert list(node.parent.iterdir()) == [node]
+                assert set(node.iterdir()) == {release, current}
+                assert current.readlink() == Path(release.name)
+                assert list(release.iterdir()) == [marker] and marker.read_text() == "22.0.0\n"
+            finally:
+                config.write_text(original_config)
+
+
     def inspect_task_environment_bytes():
         phase = "task-environment-bytes"
         raw = b"test-\xff-value"
@@ -6792,6 +6939,7 @@ exec {shlex.quote(str(binary))} "$@"
                 inspect("switched-alternate", 1, 1, fixture_explicit=True)
                 if consent_oracle is not None:
                     inspect_info_attempts()
+                    inspect_migration()
                 config.write_text(host_config)
                 inspect("returned-host", host_count, host_explicit, host=True)
                 mark_progress("root switch and return")
@@ -7103,6 +7251,6 @@ mark_progress("completed with host inventory unchanged")
 report = dict(binaries=binaries, checks=checks, total=len(checks),
               passed=sum(entry["passed"] for entry in checks), host_unchanged=True)
 print(json.dumps(report))
-expected_checks = 303 if consent_oracle is None else 2321
+expected_checks = 303 if consent_oracle is None else 2357
 if report["passed"] != report["total"] or report["total"] != expected_checks:
     sys.exit(4)

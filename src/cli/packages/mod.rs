@@ -26,6 +26,7 @@ pub use clean::clean;
 pub use explicit::{explicit, explicit_sync, explicit_sync_with_json};
 pub use info::{info, info_after_sync_miss, info_sync, info_with_json};
 pub use install::install;
+pub(crate) use install::{deduplicate_packages, validate_install_target_syntax};
 pub use remove::remove;
 pub use search::{search, search_sync_cli, search_sync_cli_with_limit, search_with_json};
 pub use status::{status, status_with_json};

@@ -113,7 +113,7 @@ pub async fn install(
     .await
 }
 
-fn deduplicate_packages(packages: &[String]) -> Vec<String> {
+pub(crate) fn deduplicate_packages(packages: &[String]) -> Vec<String> {
     let mut seen = std::collections::HashSet::with_capacity(packages.len());
     packages
         .iter()
@@ -177,7 +177,16 @@ async fn install_with_replacement_budget(
 }
 
 fn validate_install_targets(packages: &[String]) -> Result<()> {
-    match crate::core::env::distro::detect_distro() {
+    validate_install_target_syntax(packages, crate::core::env::distro::detect_distro())?;
+    crate::package_managers::resolve_backend()?;
+    Ok(())
+}
+
+pub(crate) fn validate_install_target_syntax(
+    packages: &[String],
+    distro: crate::core::env::distro::Distro,
+) -> Result<()> {
+    match distro {
         crate::core::env::distro::Distro::Debian | crate::core::env::distro::Distro::Ubuntu => {
             crate::core::security::validate_debian_package_names_or_files(packages)?;
         }
@@ -192,7 +201,6 @@ fn validate_install_targets(packages: &[String]) -> Result<()> {
             crate::core::security::validate_package_names(packages)?;
         }
     }
-    crate::package_managers::resolve_backend()?;
     Ok(())
 }
 

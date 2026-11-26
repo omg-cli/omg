@@ -170,6 +170,20 @@ fn validate_requested_version(runtime: &str, version: &str) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn validate_restore_request(runtime: &str, version: &str) -> Result<String> {
+    crate::core::security::validate_package_name(runtime)
+        .map_err(|error| anyhow::anyhow!("Invalid runtime name: {error}"))?;
+    let runtime = canonical_runtime_name(runtime);
+    anyhow::ensure!(
+        SUPPORTED_RUNTIMES.contains(&runtime.as_str())
+            || crate::runtimes::tool_registry::is_registry_tool(&runtime),
+        "Unsupported runtime '{runtime}'"
+    );
+    validate_requested_version(&runtime, version)
+        .map_err(|error| anyhow::anyhow!("Invalid version for runtime '{runtime}': {error}"))?;
+    Ok(runtime)
+}
+
 pub async fn use_version(runtime: &str, version: Option<&str>) -> Result<()> {
     select_version(runtime, version, false).await
 }

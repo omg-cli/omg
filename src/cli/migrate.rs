@@ -1,14 +1,14 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use owo_colors::OwoColorize;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
-use std::fs;
+use std::collections::{BTreeMap, HashSet};
 
 use crate::cli::style;
 use crate::core::env::distro::detect_distro;
 use crate::core::env::fingerprint::EnvironmentState;
 
 const MANIFEST_FORMAT_VERSION: &str = "1.0";
+const MAX_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct MigrationManifest {
@@ -49,13 +49,18 @@ pub async fn export(output: &str) -> Result<()> {
         packages,
     };
 
-    let content = serde_json::to_string_pretty(&manifest)?;
+    let content = serde_json::to_vec_pretty(&manifest)?;
+    anyhow::ensure!(
+        content.len() as u64 <= MAX_MANIFEST_BYTES,
+        "Migration manifest exceeds the {MAX_MANIFEST_BYTES} byte limit"
+    );
     crate::core::safe_ops::atomic_write_file_sync(output, content)?;
+    let output_display = style::sanitize_terminal_text(output);
 
     println!(
         "  {} Exported to {}",
         style::maybe_color("✓", |t| t.green().to_string()),
-        style::maybe_color(output, |t| t.cyan().to_string())
+        style::path(&output_display)
     );
     println!();
     println!("  Source distro: {}", style::path(&manifest.source_distro));
@@ -70,14 +75,19 @@ pub async fn export(output: &str) -> Result<()> {
     );
     println!(
         "    1. Copy {} to the target machine",
-        style::maybe_color(output, |t| t.cyan().to_string())
+        style::path(&output_display)
     );
-    println!(
-        "    2. Run {}",
-        style::command(&format!("omg migrate import {output}"))
-    );
+    println!("    2. Run {}", import_command(output));
 
     Ok(())
+}
+
+fn import_command(path: &str) -> String {
+    if style::sanitize_terminal_text(path) != path {
+        return style::command("omg migrate import <manifest>");
+    }
+    let quoted = path.replace('\'', "'\\''");
+    style::command(&format!("omg migrate import -- '{quoted}'"))
 }
 
 pub async fn import(manifest_path: &str, dry_run: bool) -> Result<()> {
@@ -89,16 +99,38 @@ pub async fn import(manifest_path: &str, dry_run: bool) -> Result<()> {
         if dry_run { "Previewing" } else { "Importing" }
     );
 
-    let content = fs::read_to_string(&manifest_path)?;
-    let manifest: MigrationManifest = serde_json::from_str(&content)?;
-
+    let path = manifest_path.clone();
+    let manifest: MigrationManifest = tokio::task::spawn_blocking(move || {
+        let content = crate::core::safe_ops::read_bounded_regular_file(
+            &path,
+            "Migration manifest",
+            MAX_MANIFEST_BYTES,
+        )?;
+        serde_json::from_str(&content)
+            .map_err(|error| anyhow::anyhow!("Invalid migration manifest JSON: {error}"))
+    })
+    .await
+    .context("Migration manifest reader task failed")??;
     validate_manifest_version(&manifest)?;
 
-    let target_distro = format!("{:?}", detect_distro()).to_lowercase();
+    let distro = detect_distro();
+    let target_distro = format!("{distro:?}").to_lowercase();
+    let import_plan = ImportPlan {
+        runtimes: plan_runtime_migration(&manifest.runtimes)?,
+        packages: plan_package_migration(
+            &manifest.packages,
+            &manifest.source_distro,
+            &target_distro,
+        ),
+    };
+    let targets = &import_plan.packages.to_install;
+    crate::core::security::ensure_local_archive_consent(targets, false)?;
+    crate::cli::packages::validate_install_target_syntax(targets, distro)
+        .map_err(|error| anyhow::anyhow!("Invalid migration package targets: {error}"))?;
 
     println!(
         "  Source: {} → Target: {}",
-        style::path(&manifest.source_distro),
+        style::path(&style::sanitize_terminal_text(&manifest.source_distro)),
         style::maybe_color(&target_distro, |t| t.cyan().to_string())
     );
     println!();
@@ -107,15 +139,6 @@ pub async fn import(manifest_path: &str, dry_run: bool) -> Result<()> {
         "  {}",
         style::maybe_color("Package mapping:", |t| t.bold().to_string())
     );
-
-    let import_plan = ImportPlan {
-        runtimes: &manifest.runtimes,
-        packages: plan_package_migration(
-            &manifest.packages,
-            &manifest.source_distro,
-            &target_distro,
-        ),
-    };
 
     for (original, target) in &import_plan.packages.mapped {
         println!(
@@ -138,7 +161,7 @@ pub async fn import(manifest_path: &str, dry_run: bool) -> Result<()> {
     println!(
         "  Mapped: {}/{} packages ({} unmapped)",
         style::version(&import_plan.packages.mapped.len().to_string()),
-        manifest.packages.len(),
+        import_plan.packages.mapped.len() + import_plan.packages.unmapped.len(),
         import_plan.packages.unmapped.len()
     );
 
@@ -147,12 +170,12 @@ pub async fn import(manifest_path: &str, dry_run: bool) -> Result<()> {
         "  {}",
         style::maybe_color("Runtimes:", |t| t.bold().to_string())
     );
-    for (runtime, version) in import_plan.runtimes {
+    for (runtime, version) in &import_plan.runtimes {
         println!(
             "    {} {} @ {}",
             style::maybe_color("→", |t| t.blue().to_string()),
             runtime,
-            style::maybe_color(version, |t| t.cyan().to_string())
+            style::path(&style::sanitize_terminal_text(version))
         );
     }
 
@@ -171,7 +194,7 @@ pub async fn import(manifest_path: &str, dry_run: bool) -> Result<()> {
         );
         println!(
             "  Run without --dry-run to install: {}",
-            style::command(&format!("omg migrate import {}", manifest_path.display()))
+            import_command(&manifest_path.to_string_lossy())
         );
         return Ok(());
     }
@@ -192,7 +215,7 @@ pub async fn import(manifest_path: &str, dry_run: bool) -> Result<()> {
     );
 
     let mut runtime_failures = 0usize;
-    for (runtime, version) in import_plan.runtimes {
+    for (runtime, version) in &import_plan.runtimes {
         println!(
             "    Installing {} {}...",
             style::sanitize_terminal_text(runtime),
@@ -247,15 +270,15 @@ fn validate_manifest_version(manifest: &MigrationManifest) -> Result<()> {
         manifest.version == MANIFEST_FORMAT_VERSION,
         "Unsupported migration manifest version '{}' (this build reads '{}'); \
          regenerate the manifest with a matching omg version",
-        manifest.version,
+        style::sanitize_terminal_text(&manifest.version),
         MANIFEST_FORMAT_VERSION
     );
     Ok(())
 }
 
 struct ImportPlan<'a> {
-    runtimes: &'a BTreeMap<String, String>,
-    packages: PackageMigrationPlan,
+    runtimes: BTreeMap<String, &'a str>,
+    packages: PackageMigrationPlan<'a>,
 }
 
 impl ImportPlan<'_> {
@@ -264,10 +287,10 @@ impl ImportPlan<'_> {
     }
 }
 
-struct PackageMigrationPlan {
+struct PackageMigrationPlan<'a> {
     to_install: Vec<String>,
-    mapped: Vec<(String, String)>,
-    unmapped: Vec<String>,
+    mapped: Vec<(&'a str, &'a str)>,
+    unmapped: Vec<&'a str>,
 }
 
 #[cfg(test)]
@@ -413,25 +436,50 @@ async fn install_import_packages(packages: &[String]) -> Result<()> {
     crate::cli::packages::install(packages, true, false, false).await
 }
 
-fn plan_package_migration(
-    packages: &[PackageMapping],
+fn plan_runtime_migration(runtimes: &BTreeMap<String, String>) -> Result<BTreeMap<String, &str>> {
+    let mut plan = BTreeMap::new();
+    for (name, version) in runtimes {
+        let runtime = crate::cli::runtimes::validate_restore_request(name, version)?;
+        match plan.entry(runtime) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(version.as_str());
+            }
+            std::collections::btree_map::Entry::Occupied(entry) => anyhow::ensure!(
+                *entry.get() == version,
+                "Conflicting versions for runtime '{}'",
+                entry.key()
+            ),
+        }
+    }
+    Ok(plan)
+}
+
+fn plan_package_migration<'a>(
+    packages: &'a [PackageMapping],
     source_distro: &str,
     target_distro: &str,
-) -> PackageMigrationPlan {
+) -> PackageMigrationPlan<'a> {
     let mut plan = PackageMigrationPlan {
         to_install: Vec::with_capacity(packages.len()),
         mapped: Vec::new(),
         unmapped: Vec::new(),
     };
+    let mut seen = HashSet::with_capacity(packages.len());
     for package in packages {
-        let target = map_package(&package.original_name, source_distro, target_distro);
-        if target == package.original_name {
-            plan.unmapped.push(package.original_name.clone());
-        } else {
-            plan.mapped
-                .push((package.original_name.clone(), target.clone()));
+        if !seen.insert(package.original_name.as_str()) {
+            continue;
         }
-        plan.to_install.push(target);
+        let original = package.original_name.as_str();
+        let target = map_package(original, source_distro, target_distro);
+        if target == original {
+            plan.unmapped.push(original);
+        } else {
+            plan.mapped.push((original, target));
+        }
+        plan.to_install.push(target.to_owned());
+    }
+    if !plan.mapped.is_empty() {
+        plan.to_install = crate::cli::packages::deduplicate_packages(&plan.to_install);
     }
     plan
 }
@@ -469,7 +517,7 @@ fn get_alternatives(name: &str) -> Vec<String> {
     alternatives.iter().map(ToString::to_string).collect()
 }
 
-fn map_package(name: &str, from: &str, to: &str) -> String {
+fn map_package<'a>(name: &'a str, from: &str, to: &str) -> &'a str {
     match (from, to) {
         ("arch", "debian" | "ubuntu") => match name {
             "base-devel" => "build-essential",
@@ -488,7 +536,6 @@ fn map_package(name: &str, from: &str, to: &str) -> String {
         },
         _ => name,
     }
-    .to_string()
 }
 
 #[cfg(test)]

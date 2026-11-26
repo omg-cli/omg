@@ -1728,12 +1728,15 @@ omg migrate import my-setup.json --dry-run
 omg migrate import my-setup.json
 ```
 
-**Manifest includes:**
+The version 1.0 JSON manifest records the source distribution, capture time, explicitly
+installed package names, and active OMG-managed runtime versions. Import accepts regular
+manifest files up to 16 MiB.
 
-- All installed packages with versions
-- Runtime versions
-- Configuration settings
-- Automatic package name mapping between distros
+Import previews validate package selectors and runtime requests, and count each installation
+target once. Built-in package name mappings cover selected Arch and Debian/Ubuntu names.
+On Fedora, the preview retains the original package names. Check those names against the target
+repositories before importing. A migration with installations requires confirmation
+in an interactive terminal.
 
 ---
 
