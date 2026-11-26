@@ -163,6 +163,7 @@ zip = { version = "9.0.5", default-features = false, features = [
 ] }
 lzma-rust2 = { version = "0.21.0", default-features = false, features = ["std", "xz"] }
 regex = "1.12.2"
+shell-words = { version = "1.1.1", optional = true }
 ruzstd = "0.9.0" # Pure Rust zstd decoder (replaces zstd)
 
 # Git operations - using command-line git (always available on Arch)
@@ -408,7 +409,7 @@ debian = ["ar", "rust-apt"]
 debian-pure = ["ar"]
 
 # Fedora/RHEL support (DNF/RPM) with bundled SQLite.
-fedora = ["rusqlite", "serde_json/raw_value"]
+fedora = ["rusqlite", "serde_json/raw_value", "dep:shell-words"]
 
 # macOS/Homebrew support.
 macos = []

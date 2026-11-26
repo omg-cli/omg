@@ -5,7 +5,7 @@ use std::pin::Pin;
 
 use anyhow::Result;
 
-use super::types::PackageStatus;
+use super::types::{PackageStatus, SbomPackage};
 use crate::core::Package;
 
 /// A retained observation of package inventory inputs.
@@ -59,6 +59,20 @@ pub trait PackageManager: Send + Sync {
                     description: package.description,
                     licenses: Vec::new(),
                 })
+                .collect())
+        })
+    }
+
+    /// Collect installed software and its native SBOM metadata.
+    fn sbom_inventory(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<SbomPackage>>> + Send + '_>> {
+        Box::pin(async {
+            Ok(self
+                .security_inventory()
+                .await?
+                .into_iter()
+                .map(SbomPackage::from)
                 .collect())
         })
     }
