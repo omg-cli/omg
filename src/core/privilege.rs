@@ -781,7 +781,7 @@ async fn run_privileged_program_in(
     crate::core::security::audit::record_operation(program, &audit_targets, "attempt")?;
     let mut elevated = tokio::process::Command::new(sudo_program);
     scrub_privileged_env(&mut elevated);
-    let status = elevated
+    elevated
         // Authentication is complete. If credentials expire now, fail rather
         // than offering a second prompt inside a previously confirmed mutation.
         .arg("-n")
@@ -790,10 +790,19 @@ async fn run_privileged_program_in(
         .args(args)
         .stdin(std::process::Stdio::inherit())
         .stdout(std::process::Stdio::inherit())
-        .stderr(std::process::Stdio::inherit())
-        .status()
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to run {program} under sudo: {e}"))?;
+        .stderr(std::process::Stdio::inherit());
+    #[cfg(feature = "fedora")]
+    let status = if program == "dnf" {
+        tokio::task::spawn_blocking(move || {
+            crate::package_managers::DnfPackageManager::run_native_command(elevated.into_std())
+        })
+        .await?
+    } else {
+        elevated.status().await
+    };
+    #[cfg(not(feature = "fedora"))]
+    let status = elevated.status().await;
+    let status = status.map_err(|e| anyhow::anyhow!("Failed to run {program} under sudo: {e}"))?;
 
     crate::core::security::audit::record_operation(
         program,
@@ -1570,10 +1579,14 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     fn run_isolated_sudo_test(name: &str) -> bool {
+        isolated_sudo_test_output(name).is_some()
+    }
+
+    fn isolated_sudo_test_output(name: &str) -> Option<std::process::Output> {
         const CHILD: &str = "OMG_ISOLATED_SUDO_TEST";
         let full_name = format!("core::privilege::tests::{name}");
         if std::env::var(CHILD).as_deref() == Ok(full_name.as_str()) {
-            return false;
+            return None;
         }
         // Create executable fixtures after exec, outside sibling tests that
         // may fork while their script-writing file descriptors are still open.
@@ -1588,7 +1601,7 @@ mod tests {
             String::from_utf8_lossy(&result.stdout),
             String::from_utf8_lossy(&result.stderr)
         );
-        true
+        Some(result)
     }
 
     fn fake_sudo(
@@ -2114,7 +2127,17 @@ mod tests {
 
     #[tokio::test]
     async fn external_sudo_authenticates_once_then_runs_one_payload() {
-        if run_isolated_sudo_test("external_sudo_authenticates_once_then_runs_one_payload") {
+        if let Some(output) =
+            isolated_sudo_test_output("external_sudo_authenticates_once_then_runs_one_payload")
+        {
+            #[cfg(feature = "fedora")]
+            {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert!(stderr.contains("Repository example https://mirror.example/repo"));
+                assert!(stderr.contains("Native progress after oversized diagnostic"));
+                assert!(!stderr.contains("fixture-sensitive"));
+            }
+            assert!(String::from_utf8_lossy(&output.stdout).contains("native transaction output"));
             return;
         }
         set_yes_flag(false);
@@ -2139,7 +2162,13 @@ mod tests {
             log.display(),
         );
         std::fs::write(&sudo, script).expect("write interactive authentication fixture");
-        let completion = format!("printf 'completed\\n' > '{}'", completed.display());
+        let completion = format!(
+            "printf 'completed\\n' > '{}'; printf 'native transaction output\\n'; \
+             printf '%s\\n' 'Repository example https://fixture-user:fixture-sensitive@mirror.example/repo?token=fixture-sensitive' >&2; \
+             printf '%s' 'https://fixture-sensitive' >&2; head -c 65536 /dev/zero >&2; \
+             printf '\\nNative progress after oversized diagnostic\\n' >&2",
+            completed.display(),
+        );
         run_privileged_program_in(
             &sudo,
             "dnf",
