@@ -361,10 +361,17 @@ impl InstalledPackage {
     }
 }
 
+#[derive(Debug)]
 struct AvailablePackage<'a> {
     name: &'a str,
     version: &'a str,
     summary: &'a str,
+}
+
+#[derive(Debug)]
+struct AvailableInfo<'a> {
+    package: AvailablePackage<'a>,
+    repository: &'a str,
 }
 
 impl AvailablePackage<'_> {
@@ -1485,8 +1492,8 @@ impl DnfPackageManager {
             .collect()
     }
 
-    async fn available_packages(package: Option<&str>) -> Result<Vec<Package>> {
-        let bytes = Self::repository_output(RepositoryQuery::Available(package)).await?;
+    async fn available_packages() -> Result<Vec<Package>> {
+        let bytes = Self::repository_output(RepositoryQuery::Available(None)).await?;
         Self::parse_available_packages(&bytes)
     }
 
@@ -1576,12 +1583,33 @@ impl DnfPackageManager {
         Self::parse_available_packages(&output)
     }
 
-    fn select_available_info(
+    fn available_info_rows(output: &[u8]) -> Result<Vec<AvailableInfo<'_>>> {
+        Self::available_rows(output)?
+            .map(|row| {
+                let row = row?;
+                let (repository, summary) = row
+                    .summary
+                    .split_once('\t')
+                    .context("DNF package info row lacks repository or summary")?;
+                anyhow::ensure!(
+                    !repository.is_empty() && !repository.chars().any(char::is_control),
+                    "Invalid DNF package info repository"
+                );
+                Ok(AvailableInfo {
+                    package: AvailablePackage { summary, ..row },
+                    repository,
+                })
+            })
+            .collect()
+    }
+
+    fn prefer_available_info<'a>(
         selector: &str,
-        mut candidates: Vec<Package>,
-    ) -> Result<Option<Package>> {
-        let preferred = |package: &Package| {
-            package
+        mut candidates: Vec<AvailableInfo<'a>>,
+    ) -> Result<Vec<AvailableInfo<'a>>> {
+        let preferred = |candidate: &AvailableInfo<'_>| {
+            candidate
+                .package
                 .name
                 .rsplit_once('.')
                 .is_some_and(|(_, arch)| arch == std::env::consts::ARCH || arch == "noarch")
@@ -1591,11 +1619,75 @@ impl DnfPackageManager {
         if candidates.iter().any(preferred) {
             candidates.retain(preferred);
         }
+        if let Some(first) = candidates.first() {
+            anyhow::ensure!(
+                candidates.iter().all(|candidate| {
+                    candidate.package.name == first.package.name
+                        && candidate.package.version == first.package.version
+                }),
+                "Package '{selector}' has multiple available builds; specify the full NEVRA"
+            );
+        }
+        Ok(candidates)
+    }
+
+    fn available_info_from_native_selection(
+        candidates: Vec<AvailableInfo<'_>>,
+        output: &[u8],
+    ) -> Result<Package> {
+        let native = Self::parse_package_listing(output, "Available packages")?;
+        let [selected] = native.as_slice() else {
+            anyhow::bail!("DNF did not select one available build for the exact NEVRA");
+        };
+        let identity = format!("{}.{}", selected.name, selected.architecture);
+        let mut matches = candidates.into_iter().filter(|candidate| {
+            candidate.package.name == identity
+                && candidate.package.version == selected.version
+                && candidate.repository == selected.repository
+        });
+        let chosen = matches.next().context(
+            "DNF selected a build or repository absent from the package info candidates",
+        )?;
         anyhow::ensure!(
-            candidates.len() <= 1,
-            "Package '{selector}' has multiple available builds; specify the full NEVRA"
+            matches.next().is_none(),
+            "The selected DNF repository returned conflicting metadata for the same build"
         );
-        Ok(candidates.pop())
+        Ok(chosen.package.into_package())
+    }
+
+    async fn available_info(selector: &str) -> Result<Option<Package>> {
+        let output = Self::repository_output(RepositoryQuery::Available(Some(selector))).await?;
+        let mut candidates =
+            Self::prefer_available_info(selector, Self::available_info_rows(&output)?)?;
+        if candidates
+            .windows(2)
+            .all(|pair| pair[0].package.summary == pair[1].package.summary)
+        {
+            return Ok(candidates
+                .pop()
+                .map(|candidate| candidate.package.into_package()));
+        }
+
+        let first = &candidates[0].package;
+        let (name, arch) = first
+            .name
+            .rsplit_once('.')
+            .context("DNF package info lacks architecture")?;
+        let epoch = if first.version.contains(':') {
+            ""
+        } else {
+            "0:"
+        };
+        let exact = format!("{name}-{epoch}{}.{arch}", first.version);
+        Self::validate_query_selector(&exact)?;
+        // DNF's package listing applies repository priority to the exact build.
+        // Use it only when repositories disagree on the summary for the same build.
+        let mut command: tokio::process::Command = Self::native_package_command("dnf")?.into();
+        command
+            .env("LC_ALL", "C")
+            .args(["--color=never", "list", "--available", &exact]);
+        let selected = Self::query_output(command).await?;
+        Self::available_info_from_native_selection(candidates, &selected).map(Some)
     }
 
     // Put the native newest build first for each installed identity. Keep
@@ -1815,7 +1907,10 @@ impl DnfPackageManager {
     /// through as text instead of a tab, which also fails parsing.
     fn repository_query_format(query: &RepositoryQuery<'_>) -> &'static str {
         match query {
-            RepositoryQuery::Available(_) => "%{name}.%{arch}\t%{evr}\t%{summary}\\n",
+            RepositoryQuery::Available(None) => "%{name}.%{arch}\t%{evr}\t%{summary}\\n",
+            RepositoryQuery::Available(Some(_)) => {
+                "%{name}.%{arch}\t%{evr}\t%{repoid}\t%{summary}\\n"
+            }
             RepositoryQuery::InstalledSizes(_) => "%{full_nevra}\t%{installsize}\\n",
             RepositoryQuery::InstalledReasons(_) => "%{full_nevra}\t%{reason}\\n",
             RepositoryQuery::InstalledDetails(_) => "%{name}\t%{evr}\t%{full_nevra}\t%{reason}\\n",
@@ -3017,25 +3112,22 @@ impl DnfPackageManager {
         Ok(())
     }
 
-    fn parse_available_upgrades(output: &[u8]) -> Result<Vec<VersionedPackage>> {
-        let text = std::str::from_utf8(output).context("DNF upgrade listing is not UTF-8")?;
+    fn parse_package_listing(output: &[u8], heading: &str) -> Result<Vec<VersionedPackage>> {
+        let text = std::str::from_utf8(output).context("DNF package listing is not UTF-8")?;
         let mut lines = text.lines().map(str::trim).filter(|line| !line.is_empty());
         let Some(header) = lines.next() else {
             return Ok(Vec::new());
         };
-        anyhow::ensure!(
-            header == "Available upgrades",
-            "Invalid DNF upgrade heading"
-        );
+        anyhow::ensure!(header == heading, "Invalid DNF package listing heading");
         lines
             .map(|line| {
                 let fields: Vec<_> = line.split_ascii_whitespace().take(4).collect();
                 let &[name_arch, version, repository] = fields.as_slice() else {
-                    anyhow::bail!("DNF upgrade row must have three fields");
+                    anyhow::bail!("DNF package listing row must have three fields");
                 };
                 let (name, architecture) = name_arch
                     .rsplit_once('.')
-                    .context("DNF upgrade row lacks architecture")?;
+                    .context("DNF package listing row lacks architecture")?;
                 Self::validate_versioned_fields(&[name, architecture, version, repository])?;
                 Ok(VersionedPackage {
                     name: name.to_owned(),
@@ -3670,7 +3762,7 @@ impl PackageManager for DnfPackageManager {
             let installed = self.load_installed_packages().await?;
             let (installed, available) = tokio::try_join!(
                 Self::order_installed_search_builds(&installed),
-                Self::available_packages(None)
+                Self::available_packages()
             )?;
             Ok(Self::search_candidates(installed, available))
         })
@@ -3757,8 +3849,7 @@ impl PackageManager for DnfPackageManager {
                 }));
             }
 
-            let available = Self::available_packages(Some(&package)).await?;
-            Self::select_available_info(&package, available)
+            Self::available_info(&package).await
         })
     }
 
@@ -3823,7 +3914,7 @@ impl PackageManager for DnfPackageManager {
             )?;
             Self::match_updates(
                 &Self::parse_versioned_packages(&installed)?,
-                &Self::parse_available_upgrades(&upgrades)?,
+                &Self::parse_package_listing(&upgrades, "Available upgrades")?,
             )
             .await
         })
@@ -4807,10 +4898,9 @@ mod tests {
 
     #[test]
     fn cached_upgrade_listing_distinguishes_empty_results_from_invalid_data() -> Result<()> {
-        assert!(DnfPackageManager::parse_available_upgrades(b"\n")?.is_empty());
-        let candidate = DnfPackageManager::parse_available_upgrades(
-            b"Available upgrades\nlib.compat.noarch   2:1-1   updates\n",
-        )?;
+        let parse = |output| DnfPackageManager::parse_package_listing(output, "Available upgrades");
+        assert!(parse(b"\n")?.is_empty());
+        let candidate = parse(b"Available upgrades\nlib.compat.noarch   2:1-1   updates\n")?;
         assert_eq!(candidate[0].name, "lib.compat");
         assert_eq!(candidate[0].version, "2:1-1");
         assert_eq!(candidate[0].architecture, "noarch");
@@ -4821,14 +4911,14 @@ mod tests {
             b"Available upgrades\nlib 2:1-1 updates",
             b"Available upgrades\nlib.noarch 2:1-1 up\x1bdates",
         ] {
-            assert!(DnfPackageManager::parse_available_upgrades(invalid).is_err());
+            assert!(parse(invalid).is_err());
         }
         Ok(())
     }
 
     #[tokio::test]
     async fn repository_lookup_rejects_option_operands_before_spawning() {
-        let error = DnfPackageManager::available_packages(Some("--config=untrusted"))
+        let error = DnfPackageManager::available_info("--config=untrusted")
             .await
             .expect_err("option-like operand must be rejected");
         assert!(
@@ -4926,24 +5016,30 @@ mod tests {
 
     #[test]
     fn available_info_keeps_native_preference_and_accepts_a_unique_multilib_build() -> Result<()> {
-        let manager = DnfPackageManager::select_available_info;
-        let parse = DnfPackageManager::parse_available_packages;
+        let manager = DnfPackageManager::prefer_available_info;
+        let parse = DnfPackageManager::available_info_rows;
         let host = std::env::consts::ARCH;
         let foreign = if host == "i686" { "x86_64" } else { "i686" };
-        let foreign_row = format!("widget.lib.{foreign}\t1.2-3.fc44\tMultilib package\n");
-        let native_row = format!("widget.lib.{host}\t2.0-1.fc44\tNative package\n");
+        let foreign_row = format!("widget.lib.{foreign}\t1.2-3.fc44\tupdates\tMultilib package\n");
+        let native_row = format!("widget.lib.{host}\t2.0-1.fc44\tupdates\tNative package\n");
         let combined = format!("{foreign_row}{native_row}");
-        let selected =
-            manager("widget.lib", parse(combined.as_bytes())?)?.context("native build")?;
+        let selected = manager("widget.lib", parse(combined.as_bytes())?)?
+            .pop()
+            .context("native build")?
+            .package
+            .into_package();
         assert_eq!(selected.name, format!("widget.lib.{host}"));
         assert_eq!(selected.version.to_string(), "2.0-1.fc44");
 
         let selector = format!("widget.lib-0:1.2-3.fc44.{foreign}");
-        let selected =
-            manager(&selector, parse(foreign_row.as_bytes())?)?.context("explicit build")?;
+        let selected = manager(&selector, parse(foreign_row.as_bytes())?)?
+            .pop()
+            .context("explicit build")?
+            .package
+            .into_package();
         assert_eq!(selected.name, format!("widget.lib.{foreign}"));
         assert!(!selected.installed);
-        let independent_row = b"widget.lib.noarch\t2.0-1.fc44\tArchitecture-independent\n";
+        let independent_row = b"widget.lib.noarch\t2.0-1.fc44\tfedora\tArchitecture-independent\n";
         let mut ambiguous = parse(native_row.as_bytes())?;
         ambiguous.extend(parse(independent_row)?);
         assert!(
@@ -4951,6 +5047,46 @@ mod tests {
                 .expect_err("multiple default builds are ambiguous")
                 .to_string()
                 .contains("multiple available builds")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn available_info_uses_the_repository_native_dnf_selected_for_the_exact_build() -> Result<()> {
+        let candidates = || {
+            let rows = DnfPackageManager::available_info_rows(
+                b"widget.lib.noarch\t2:1-1\tfedora\tFirst summary\n\
+                  widget.lib.noarch\t2:1-1\tupdates\tPreferred\tsummary\n",
+            )?;
+            DnfPackageManager::prefer_available_info("widget.lib-2:1-1.noarch", rows)
+        };
+        let native = "Available packages\nwidget.lib.noarch 2:1-1 updates\n";
+        let resolved = DnfPackageManager::available_info_from_native_selection(
+            candidates()?,
+            native.as_bytes(),
+        )?;
+        assert_eq!(resolved.name, "widget.lib.noarch");
+        assert_eq!(resolved.version.to_string(), "2:1-1");
+        assert_eq!(resolved.description, "Preferred\tsummary");
+        for changed in [
+            native.replace("updates", "other"),
+            native.replace("2:1-1", "3:1-1"),
+        ] {
+            assert!(
+                DnfPackageManager::available_info_from_native_selection(
+                    candidates()?,
+                    changed.as_bytes()
+                )
+                .is_err()
+            );
+        }
+        let conflicting = DnfPackageManager::available_info_rows(
+            b"widget.lib.noarch\t2:1-1\tupdates\tOriginal\n\
+              widget.lib.noarch\t2:1-1\tupdates\tConflicting\n",
+        )?;
+        assert!(
+            DnfPackageManager::available_info_from_native_selection(conflicting, native.as_bytes())
+                .is_err()
         );
         Ok(())
     }
@@ -5025,7 +5161,7 @@ mod tests {
             "../widget-1:2-1.x86_64",
             "widget-1:2;id-1.x86_64",
         ] {
-            DnfPackageManager::available_packages(Some(selector))
+            DnfPackageManager::available_info(selector)
                 .await
                 .expect_err("malformed selector must fail before native spawning");
         }
