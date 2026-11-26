@@ -409,6 +409,7 @@ impl PackageService {
                 .context("Failed to check AUR for updates")?
             {
                 updates.push(UpdateInfo {
+                    architecture: None,
                     name,
                     old_version: old.to_string(),
                     new_version: new.to_string(),

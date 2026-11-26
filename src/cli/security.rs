@@ -1947,6 +1947,7 @@ mod tests {
         let backend = crate::core::testing::TestPackageManager::new();
         backend.add_package("example", "2.0", "Example");
         backend.set_updates(vec![UpdateInfo {
+            architecture: None,
             name: "example".to_string(),
             old_version: "1.0".to_string(),
             new_version: "2.0".to_string(),
@@ -2026,6 +2027,7 @@ mod tests {
         let backend = TestPackageManager::new();
         backend.add_package("example", "2.0", "Example");
         backend.set_updates(vec![UpdateInfo {
+            architecture: None,
             name: "example".to_string(),
             old_version: "1.0".to_string(),
             new_version: "2.0".to_string(),

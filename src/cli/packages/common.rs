@@ -47,18 +47,7 @@ pub fn is_valid_search_query(query: &str) -> bool {
 #[cfg(unix)]
 pub(crate) async fn try_daemon_list_updates() -> Option<Vec<UpdateInfo>> {
     let mut client = DaemonClient::connect().await.ok()?;
-    let entries = client.list_updates().await.ok()?;
-    Some(
-        entries
-            .into_iter()
-            .map(|e| UpdateInfo {
-                name: e.name,
-                old_version: e.old_version,
-                new_version: e.new_version,
-                repo: e.repo,
-            })
-            .collect(),
-    )
+    client.list_updates().await.ok()
 }
 
 /// Non-Unix stub preserving the asynchronous command interface.
@@ -593,6 +582,7 @@ mod tests {
         let flag = std::sync::Arc::clone(&refreshed);
 
         let daemon_updates = vec![UpdateInfo {
+            architecture: None,
             name: "curl".to_string(),
             old_version: "1.0".to_string(),
             new_version: "2.0".to_string(),
@@ -625,6 +615,7 @@ mod tests {
     fn dry_run_preview_reports_unknown_download_size() {
         // The preview must never fabricate download sizes it did not resolve.
         let updates = vec![crate::package_managers::types::UpdateInfo {
+            architecture: None,
             name: "example".to_string(),
             old_version: "1.0".to_string(),
             new_version: "2.0".to_string(),

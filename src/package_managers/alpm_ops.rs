@@ -157,6 +157,7 @@ pub fn get_update_list() -> Result<Vec<UpdateInfo>> {
         return Ok(updates
             .into_iter()
             .map(|update| UpdateInfo {
+                architecture: None,
                 name: update.name,
                 old_version: update.old_version.to_string(),
                 new_version: update.new_version.to_string(),
@@ -210,6 +211,7 @@ pub(crate) fn collect_updates(alpm: &alpm::Alpm) -> Result<Vec<UpdateInfo>> {
                 == std::cmp::Ordering::Greater
         {
             updates.push(UpdateInfo {
+                architecture: None,
                 name: name.to_string(),
                 old_version: local_ver_str.to_string(),
                 new_version: sync_pkg.version().to_string(),

@@ -1,5 +1,13 @@
-import hashlib,importlib.util,json,os,pathlib,subprocess,tempfile,unittest
+import hashlib,importlib.util,json,os,pathlib,re,subprocess,tempfile,unittest
 C=pathlib.Path(__file__).resolve().parents[1]
+
+
+def expression_contexts(expression):
+    unquoted = re.sub(r"'(?:[^']|'')*'", "''", expression)
+    dotted = re.sub(r'\s*\.\s*', '.', unquoted)
+    return set(re.findall(r'(?<![\w.-])([A-Za-z_][\w-]*)\s*[.\[]', dotted))
+
+
 def helper():
  p=C/'scripts/ci-rustup-diagnostics.py'
  spec=importlib.util.spec_from_file_location('diagnostics',p);m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m);return m
@@ -223,8 +231,17 @@ class WorkflowBytesTests(unittest.TestCase):
     result=subprocess.run(['sh','-e','-c',snippet],env=environment,capture_output=True,text=True,timeout=5)
     self.assertEqual(result.returncode,0,result.stdout+result.stderr);arguments=json.loads(record.read_text());self.assertEqual(arguments[:2],['component','add']);self.assertLessEqual(required,set(arguments[2:]),lane+' bootstrap omits declared toolchain components')
     result=subprocess.run(['sh','-e','-c',snippet],env=dict(environment,FAKE_EXIT='42'),capture_output=True,text=True,timeout=5);self.assertEqual(result.returncode,42,'component failure must propagate')
+ def test_job_environment_contexts_distinguish_roots_from_properties(self):
+  self.assertEqual(
+   expression_contexts("needs.quick-gate.outputs.result == 'runner.temp' && github.sha"),
+   {'needs','github'},
+  )
+  self.assertEqual(
+   expression_contexts("needs['quick-gate'].outputs[env['KEY']] || runner . temp || 'it''s steps.fake'"),
+   {'needs','env','runner'},
+  )
+
  def test_job_environment_contexts_and_private_diagnostic_path(self):
-  import re
   text=(C/'.github/workflows/ci.yml').read_text()
   allowed={'github','needs','strategy','matrix','vars','secrets','inputs'}
   # GitHub's jobs.<job_id>.env context table excludes runner and env.
@@ -232,7 +249,7 @@ class WorkflowBytesTests(unittest.TestCase):
    env=re.search(r'^    env:(?: &[\w-]+)?\n(.*?)(?=^    \S|\Z)',body,re.M|re.S)
    if env:
     for expression in re.findall(r'\$\{\{(.*?)\}\}',env.group(1),re.S):
-     roots=set(re.findall(r'\b([A-Za-z_]\w*)\s*[.\[]',expression))
+     roots=expression_contexts(expression)
      self.assertLessEqual(roots,allowed,f'{job} job env uses unavailable contexts: {roots-allowed}')
   block=text.split('  linux-matrix:',1)[1].split('\n  sandbox-cancellation:',1)[0]
   template=re.search(r'^      RUSTUP_DIAGNOSTICS_DIR: (.+)$',block,re.M).group(1)

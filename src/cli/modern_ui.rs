@@ -634,7 +634,11 @@ pub fn print_update_summary(updates: &[crate::package_managers::types::UpdateInf
     // badge inline so long update lists stay scannable.
     let display_limit = SUMMARY_LIST_CAP;
     for update in updates.iter().take(display_limit) {
-        let name = crate::cli::style::sanitize_terminal_text(&update.name);
+        let label = crate::package_managers::types::update_package_name(
+            &update.name,
+            update.architecture.as_deref(),
+        );
+        let name = crate::cli::style::sanitize_terminal_text(&label);
         let old_version = crate::cli::style::sanitize_terminal_text(&update.old_version);
         let new_version = crate::cli::style::sanitize_terminal_text(&update.new_version);
         let repo = crate::cli::style::sanitize_terminal_text(&update.repo);

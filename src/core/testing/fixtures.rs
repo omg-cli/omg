@@ -83,6 +83,7 @@ impl UpdateFixture {
 
 fn update(name: &str, old_version: &str, new_version: &str) -> UpdateInfo {
     UpdateInfo {
+        architecture: None,
         name: name.to_owned(),
         old_version: old_version.to_owned(),
         new_version: new_version.to_owned(),

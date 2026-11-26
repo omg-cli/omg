@@ -3255,6 +3255,7 @@ impl DnfPackageManager {
                 "DNF upgrade has an unchanged version"
             );
             updates.push(UpdateInfo {
+                architecture: Some(candidate.architecture.clone()),
                 name: candidate.name.clone(),
                 old_version: old.version.clone(),
                 new_version: candidate.version.clone(),
@@ -4970,6 +4971,10 @@ mod tests {
         assert_eq!(updates.len(), candidates.len());
         for (update, candidate) in updates.iter().zip(&candidates) {
             assert_eq!(update.name, candidate.name);
+            assert_eq!(
+                update.architecture.as_deref(),
+                Some(candidate.architecture.as_str())
+            );
             assert_eq!(update.new_version, candidate.version);
             assert_eq!(update.repo, candidate.repository);
         }
@@ -4989,6 +4994,8 @@ mod tests {
             .await
             .expect("matched upgrades");
         assert_eq!(updates.len(), 2);
+        assert_eq!(updates[0].architecture.as_deref(), Some("x86_64"));
+        assert_eq!(updates[1].architecture.as_deref(), Some("i686"));
         assert_eq!(updates[0].old_version, "1:2-1");
         assert_eq!(updates[1].old_version, "1:1-1");
         assert_eq!(updates[0].new_version, "1:4-1");

@@ -2631,6 +2631,7 @@ mod tests {
     #[cfg(feature = "arch")]
     fn pending_update() -> Vec<omg_lib::package_managers::types::UpdateInfo> {
         vec![omg_lib::package_managers::types::UpdateInfo {
+            architecture: None,
             name: "example".to_string(),
             old_version: "1.0".to_string(),
             new_version: "2.0".to_string(),
