@@ -4266,7 +4266,10 @@ RUNTIME_FIXTURE_REVIEW
                 (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8').splitlines()
                 if line.split('\t', 1)[0] in ids]
         self.assertEqual(len(rows), len(ids))
-        refusal = ('if [[ "$1" == audit ]]; then\n'
+        refusal = ('if [[ " $* " == *" --check-policy "* && ! -f "$OMG_CONFIG_DIR/config.toml" ]]; then\n'
+                   '  printf "WARN missing config.toml at %s\\n" "$OMG_CONFIG_DIR" >&2\n'
+                   'fi\n'
+                   'if [[ "$1" == audit ]]; then\n'
                    '  echo "Error: License scanning of installed packages is not available without the Arch backend" >&2\n'
                    'else\n'
                    '  echo "Error: Enterprise license scan requires the Arch package backend" >&2\n'

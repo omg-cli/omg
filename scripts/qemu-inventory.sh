@@ -3051,7 +3051,7 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
       if [[ "$distro" == arch ]]; then
         remote+="; [[ \$(id -u) != 0 ]] || { printf 'assertion failed: license policy fixture requires an unprivileged guest user\n' >&2; exit 2; }"
       fi
-      remote+="; export OMG_CONFIG_DIR=\"\$rowdir/license-policy\"; mkdir -p \"\$OMG_CONFIG_DIR\"; printf '%s\n' 'allowed_licenses = [\"LicenseRef-QemuNoInstalledLicense\"]' > \"\$OMG_CONFIG_DIR/policy.toml\""
+      remote+="; export OMG_CONFIG_DIR=\"\$rowdir/license-policy\"; mkdir -p \"\$OMG_CONFIG_DIR\"; : > \"\$OMG_CONFIG_DIR/config.toml\"; printf '%s\n' 'allowed_licenses = [\"LicenseRef-QemuNoInstalledLicense\"]' > \"\$OMG_CONFIG_DIR/policy.toml\""
     fi
   fi
   remote+="; mkdir -p project; printf '# Nested audit fixture\n' > project/README.md"
