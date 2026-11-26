@@ -61,14 +61,14 @@ load_distro() {
     debian)
       distro_suffix="-x86_64-linux-debian"
       distro_image="debian:bookworm@sha256:813017f3d62be4b5891a7acca6a01bdcd4b8513daa81b1ab99d3a50385b26931"
-      distro_index_cmd="apt-get update && apt-get install -y --no-install-recommends ca-certificates python3"
+      distro_index_cmd="apt-cache show tree >/dev/null"
       distro_installed_assert="dpkg-query -W -f='\${db:Status-Abbrev}' tree | grep -q '^ii'"
       distro_removed_assert="! dpkg-query -W -f='\${db:Status-Abbrev}' tree | grep -q '^ii'"
       ;;
     ubuntu)
       distro_suffix="-x86_64-linux-ubuntu"
       distro_image="ubuntu:24.04@sha256:33ceb71981b602c1a7443a53469e4dba065f7503eab3078a2d7a57a2ab987517"
-      distro_index_cmd="apt-get update && apt-get install -y --no-install-recommends ca-certificates python3"
+      distro_index_cmd="apt-cache show tree >/dev/null"
       distro_installed_assert="dpkg-query -W -f='\${db:Status-Abbrev}' tree | grep -q '^ii'"
       distro_removed_assert="! dpkg-query -W -f='\${db:Status-Abbrev}' tree | grep -q '^ii'"
       ;;
@@ -442,8 +442,8 @@ record_cleanup_error() {
     printf 'result=HARNESS_ERROR\n'
     printf 'release=%s\n' "$tag"
     printf 'engine=%s\n' "$engine"
-    if [[ -f "$run_evidence/fedora-cache-seed-cleanup.log" ]]; then
-      printf 'cleanup_log=%s\n' "$run_evidence/fedora-cache-seed-cleanup.log"
+    if [[ -f "$run_evidence/$distro-cache-seed-cleanup.log" ]]; then
+      printf 'cleanup_log=%s\n' "$run_evidence/$distro-cache-seed-cleanup.log"
     fi
   } > "$evidence_dir/metadata.txt"
   write_result "$evidence_dir" "$case_id" "$distro" HARNESS_ERROR 3 0 required-harness
@@ -634,34 +634,50 @@ run_case() (
   esac
 )
 
-prepare_fedora_cache_image() {
-  local workdir=$1 context="$1/fedora-cache-seed-context" recipe
+prepare_package_cache_image() {
+  local workdir=$1 distro=$2 seed="$2-cache-seed" context recipe build_timeout image_id
   local -a build_args=(build --no-cache)
+  context="$workdir/$seed-context"
   recipe="$context/Dockerfile"
   mkdir -p "$context" || return 1
   printf 'FROM %s\n' "$distro_image" > "$recipe" || return 1
-  cat >> "$recipe" <<'DOCKERFILE' || return 1
+  case "$distro" in
+    fedora)
+      build_timeout=180
+      cat >> "$recipe" <<'DOCKERFILE' || return 1
 RUN dnf config-manager setopt '*.skip_if_unavailable=False'
 RUN dnf install -y --setopt=install_weak_deps=False python3
 RUN dnf makecache --refresh
 DOCKERFILE
-  cp "$recipe" "$run_evidence/fedora-cache-seed.Dockerfile" || return 1
+      ;;
+    debian|ubuntu)
+      build_timeout=240
+      cat >> "$recipe" <<'DOCKERFILE' || return 1
+RUN set -- -o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 \
+ && apt-get "$@" update --error-on=any \
+ && DEBIAN_FRONTEND=noninteractive apt-get "$@" install -y --no-install-recommends ca-certificates python3 \
+ && apt-cache show tree >/dev/null
+DOCKERFILE
+      ;;
+  esac
+  cp "$recipe" "$run_evidence/$seed.Dockerfile" || return 1
   # Buildx drivers need --load before the image is available to run. The
   # legacy Docker builder does not support that flag, so select Buildx only
   # when its plugin is installed.
   if [[ "$engine" == docker ]] && "$engine" buildx version >/dev/null 2>&1; then
     build_args=(buildx build --no-cache --load)
   fi
-  if ! "$TIMEOUT_BIN" --kill-after=5s 180s "$engine" "${build_args[@]}" \
-    --iidfile "$workdir/fedora-cache-seed.id" -f "$recipe" "$context" \
-    > "$run_evidence/fedora-cache-seed.log" 2>&1; then
+  if ! "$TIMEOUT_BIN" --kill-after=5s "${build_timeout}s" "$engine" "${build_args[@]}" \
+    --iidfile "$workdir/$seed.id" -f "$recipe" "$context" \
+    > "$run_evidence/$seed.log" 2>&1; then
     return 1
   fi
-  prepared_image=$(cat "$workdir/fedora-cache-seed.id") || return 1
-  [[ "$prepared_image" =~ ^sha256:[0-9a-f]{64}$ ]] || return 1
+  image_id=$(cat "$workdir/$seed.id") || return 1
+  [[ "$image_id" =~ ^sha256:[0-9a-f]{64}$ ]] || return 1
+  prepared_image=$image_id
   "$engine" image inspect "$prepared_image" \
-    > "$run_evidence/fedora-cache-seed-inspect.json" 2>&1 || return 1
-  cp "$workdir/fedora-cache-seed.id" "$run_evidence/fedora-cache-seed-image.txt" || return 1
+    > "$run_evidence/$seed-inspect.json" 2>&1 || return 1
+  cp "$workdir/$seed.id" "$run_evidence/$seed-image.txt" || return 1
 }
 
 run_distro() (
@@ -677,7 +693,7 @@ run_distro() (
     trap - EXIT
     if [[ -n "$prepared_image" ]]; then
       "$TIMEOUT_BIN" --kill-after=5s 20s "$engine" image rm "$prepared_image" \
-        > "$run_evidence/fedora-cache-seed-cleanup.log" 2>&1 || cleanup_error="prepared Fedora image removal failed"
+        > "$run_evidence/$distro-cache-seed-cleanup.log" 2>&1 || cleanup_error="prepared $distro image removal failed"
     fi
     rm -rf "$workdir" || cleanup_error="${cleanup_error:+$cleanup_error; }temporary workdir removal failed"
     if [[ -n "$cleanup_error" ]]; then
@@ -717,10 +733,14 @@ run_distro() (
     record_harness_error "$distro" "failed to pull the pinned container image"
     return 3
   fi
-  if [[ "$distro" == fedora ]] && ! prepare_fedora_cache_image "$workdir"; then
-    record_harness_error "$distro" "failed to seed bounded Fedora metadata cache; see fedora-cache-seed.log"
-    return 3
-  fi
+  case "$distro" in
+    fedora|debian|ubuntu)
+      if ! prepare_package_cache_image "$workdir" "$distro"; then
+        record_harness_error "$distro" "failed to seed package metadata cache; see $distro-cache-seed.log"
+        return 3
+      fi
+      ;;
+  esac
 
   for case_id in "${selected_cases[@]}"; do
     rc=0
