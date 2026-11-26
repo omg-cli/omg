@@ -479,6 +479,27 @@ exec {shlex.quote(str(native_executable))} "$@"
             finally:
                 checked(["/usr/bin/umount", target])
 
+    def inspect_update_query_refusal(phase, blocked_option, expected_empty):
+        operations = [
+            ("count", ["uc"], lambda value: value == {"count": 0}),
+            ("outdated", ["outdated"], lambda value: value == []),
+            ("status", ["status"], lambda value: value["total_packages"] == 1
+             and value["updates_available"] == 0),
+        ]
+        with reject_native_selection(blocked_option):
+            for label, args, check in operations:
+                result = command([cli, "--json", *args], disabled, ordinary)
+                blocked = "Unexpected DNF selection subprocess" in result.stderr
+                if expected_empty:
+                    try:
+                        passed = result.returncode == 0 and not blocked and check(json.loads(result.stdout))
+                    except (KeyError, TypeError, ValueError):
+                        passed = False
+                else:
+                    passed = result.returncode != 0 and blocked and not result.stdout.strip()
+                checks.append(dict(phase=phase, case=f"blocked-update-native-{label}", passed=passed,
+                                   status=result.returncode, diagnostic=(result.stderr or result.stdout)[-900:]))
+
     def inspect_advisory_details(phase, matches_installed):
         with reject_native_selection("info", after="advisory"):
             result = command([cli, "audit", "scan", "--fail-on-findings"], disabled, ordinary)
@@ -1338,12 +1359,17 @@ exec {shlex.quote(str(binary))} "$@"
                                    and "Package status inputs changed during the query" in stderr,
                                    status=exit_code, value=(stdout + stderr)[-1200:]))
                 inspect_update_status("status-metadata-only", 0, False)
+                if consent_oracle is not None:
+                    inspect_update_query_refusal("update-empty-native-installed", "--installed", True)
+                    inspect_update_query_refusal("update-empty-native-upgrades", "--upgrades", False)
 
                 manifest.write_bytes(original_manifest)
                 sign_manifest()
                 ordinary_control([dnf, "clean", "metadata"])
                 ordinary_control([dnf, "--refresh", "-y", "makecache"])
                 inspect_update_status("status-metadata-restored", 1, False)
+                if consent_oracle is not None:
+                    inspect_update_query_refusal("update-present-native-installed", "--installed", False)
                 normal_manifests = cached_manifests(normal_cache)
 
                 def disable_repository_while_counting():
@@ -1412,7 +1438,7 @@ exec {shlex.quote(str(binary))} "$@"
                     groups.write_bytes(initial_groups)
                     packages_state.write_bytes(initial_packages)
                 inspect_upgrade_review(old_rpm)
-            inspect_removal_replay()
+                inspect_removal_replay()
             config.write_text(host_config)
             inspect_security_inventory("inventory-host")
             if consent_oracle is not None:
@@ -1431,6 +1457,6 @@ assert inventory() == before
 report = dict(binaries=binaries, checks=checks, total=len(checks),
               passed=sum(entry["passed"] for entry in checks), host_unchanged=True)
 print(json.dumps(report))
-expected_checks = 312 if consent_oracle is None else 563
+expected_checks = 303 if consent_oracle is None else 572
 if report["passed"] != report["total"] or report["total"] != expected_checks:
     sys.exit(4)

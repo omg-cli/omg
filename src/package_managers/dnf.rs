@@ -3282,12 +3282,15 @@ impl PackageManager for DnfPackageManager {
 
     fn list_updates(&self) -> Pin<Box<dyn Future<Output = Result<Vec<UpdateInfo>>> + Send + '_>> {
         Box::pin(async move {
+            let upgrades = Self::parse_versioned_packages(
+                &Self::repository_output(RepositoryQuery::Upgrades).await?,
+            )?;
+            if upgrades.is_empty() {
+                return Ok(Vec::new());
+            }
+
             let installed = Self::repository_output(RepositoryQuery::Installed).await?;
-            let upgrades = Self::repository_output(RepositoryQuery::Upgrades).await?;
-            Self::match_updates(
-                &Self::parse_versioned_packages(&installed)?,
-                &Self::parse_versioned_packages(&upgrades)?,
-            )
+            Self::match_updates(&Self::parse_versioned_packages(&installed)?, &upgrades)
         })
     }
 
