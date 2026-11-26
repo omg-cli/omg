@@ -12,6 +12,8 @@ use std::path::{Path, PathBuf};
 
 /// Maximum number of transactions to retain in the live file
 const MAX_HISTORY_TRANSACTIONS: usize = 1000;
+/// Leave room for new transactions before validating the archive again.
+const LIVE_HISTORY_AFTER_RETIREMENT: usize = 900;
 
 /// Kind of package operation recorded in the history.
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
@@ -96,6 +98,20 @@ impl HistoryManager {
 
     /// Reads the default history without initializing a new store.
     pub(crate) fn load_existing() -> Result<Vec<Transaction>> {
+        Self::load_existing_with_live_window(None)
+    }
+
+    /// Reads the newest entries for the dashboard. The archive is needed
+    /// only if the live file cannot supply a complete, unique window.
+    pub(crate) fn load_recent_existing(limit: usize) -> Result<Vec<Transaction>> {
+        Ok(Self::load_existing_with_live_window(Some(limit))?
+            .into_iter()
+            .rev()
+            .take(limit)
+            .collect())
+    }
+
+    fn load_existing_with_live_window(live_window: Option<usize>) -> Result<Vec<Transaction>> {
         let manager = Self {
             log_path: Self::default_log_path(),
         };
@@ -106,7 +122,7 @@ impl HistoryManager {
             &manager.archive_path(),
         ] {
             match path.symlink_metadata() {
-                Ok(_) => return manager.load(),
+                Ok(_) => return manager.load_with_live_window(live_window),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => {
                     return Err(error).with_context(|| {
@@ -172,8 +188,18 @@ impl HistoryManager {
     /// Identical records from interrupted retirement are returned once;
     /// conflicting IDs or malformed data fail rather than choosing a version.
     pub fn load(&self) -> Result<Vec<Transaction>> {
+        self.load_with_live_window(None)
+    }
+
+    fn load_with_live_window(&self, live_window: Option<usize>) -> Result<Vec<Transaction>> {
         self.with_history_lock(|| {
             let live = self.load_locked()?;
+            if live_window.is_some_and(|limit| live.len() >= limit) {
+                let mut ids = std::collections::HashSet::with_capacity(live.len());
+                if live.iter().all(|entry| ids.insert(entry.id.as_str())) {
+                    return Ok(live);
+                }
+            }
             let archive_path = self.archive_path();
             let mut options = fs::OpenOptions::new();
             options.read(true);
@@ -387,12 +413,13 @@ impl HistoryManager {
             success,
         });
 
-        let excess = history.len().saturating_sub(MAX_HISTORY_TRANSACTIONS);
-        if excess > 0 {
+        if history.len() > MAX_HISTORY_TRANSACTIONS {
             // Retired entries move to a sibling JSONL archive instead of
             // vanishing: rollback plans and audits can still read them,
             // and a full history is never silently truncated.
-            self.archive_drained(&history.drain(0..excess).collect::<Vec<_>>())?;
+            let retiring = history.len() - LIVE_HISTORY_AFTER_RETIREMENT;
+            self.archive_drained(&history[..retiring])?;
+            drop(history.drain(..retiring));
         }
         self.save(&history)
     }
@@ -897,18 +924,24 @@ mod tests {
                 success: true,
             })
             .collect();
-        let oldest = &history[0];
-        let mut conflict = oldest.clone();
+        let retiring = &history[..MAX_HISTORY_TRANSACTIONS + 1 - LIVE_HISTORY_AFTER_RETIREMENT];
+        let mut conflict = retiring[0].clone();
         conflict.success = false;
 
-        for archived in [oldest, &conflict] {
+        for (archived, should_succeed) in
+            [(retiring, true), (std::slice::from_ref(&conflict), false)]
+        {
             manager.save(&history)?;
             let original_live = fs::read(&manager.log_path)?;
-            let original_archive = serde_json::to_vec(archived)?;
+            let original_archive = archived
+                .iter()
+                .map(serde_json::to_string)
+                .collect::<serde_json::Result<Vec<_>>>()?
+                .join("\n");
             fs::write(manager.archive_path(), &original_archive)?;
 
             let result = manager.add_transaction(TransactionType::Sync, Vec::new(), true);
-            if archived == oldest {
+            if should_succeed {
                 result?;
                 let loaded = manager.load()?;
                 assert_eq!(loaded.len(), MAX_HISTORY_TRANSACTIONS + 1);
@@ -922,7 +955,10 @@ mod tests {
                 assert!(error.to_string().contains("Conflicting history records"));
                 assert_eq!(fs::read(&manager.log_path)?, original_live);
             }
-            assert_eq!(fs::read(manager.archive_path())?, original_archive);
+            assert_eq!(
+                fs::read_to_string(manager.archive_path())?,
+                original_archive
+            );
         }
         Ok(())
     }
@@ -979,15 +1015,24 @@ mod tests {
             })
             .collect::<Vec<_>>();
         manager.save(&seeded)?;
-        for index in (MAX_HISTORY_TRANSACTIONS - 1)..(MAX_HISTORY_TRANSACTIONS + 5) {
-            manager.add_transaction(TransactionType::Install, vec![package_change(index)], true)?;
-            if index == MAX_HISTORY_TRANSACTIONS - 1 {
-                assert_eq!(manager.load()?.len(), MAX_HISTORY_TRANSACTIONS);
-                assert!(!manager.archive_path().exists());
-            }
+        let add_package = |index| {
+            manager.add_transaction(TransactionType::Install, vec![package_change(index)], true)
+        };
+        add_package(MAX_HISTORY_TRANSACTIONS - 1)?;
+        assert_eq!(manager.load()?.len(), MAX_HISTORY_TRANSACTIONS);
+        assert!(!manager.archive_path().exists());
+
+        add_package(MAX_HISTORY_TRANSACTIONS)?;
+        let first_archive = fs::read(manager.archive_path())?;
+        for index in (MAX_HISTORY_TRANSACTIONS + 1)..(MAX_HISTORY_TRANSACTIONS + 5) {
+            add_package(index)?;
         }
+        assert!(
+            fs::read(manager.archive_path())? == first_archive,
+            "writes below the live capacity must not append to the archive"
+        );
         let live: Vec<Transaction> = serde_json::from_slice(&fs::read(&manager.log_path)?)?;
-        assert_eq!(live.len(), MAX_HISTORY_TRANSACTIONS);
+        assert_eq!(live.len(), 904);
         let combined = manager.load()?;
         assert_eq!(combined.len(), MAX_HISTORY_TRANSACTIONS + 5);
         assert_eq!(&combined[..seeded.len()], seeded.as_slice());
@@ -1002,7 +1047,7 @@ mod tests {
             .lines()
             .map(serde_json::from_str)
             .collect::<serde_json::Result<_>>()?;
-        assert_eq!(archived.len(), 5);
+        assert_eq!(archived.len(), 101);
         assert_eq!(archived[0].changes[0].name, "pkg-0");
         Ok(())
     }

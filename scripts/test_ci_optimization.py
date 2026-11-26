@@ -36,6 +36,37 @@ def coverage_report_script(name):
 
 
 class OptimizationContracts(unittest.TestCase):
+    def test_macos_native_tests_share_the_independent_nextest_runner(self):
+        workflow = (WORKFLOWS / 'ci.yml').read_text(encoding='utf-8')
+        release = job_block(workflow, 'macos')
+        native = job_block(workflow, 'macos-nextest-source')
+        for job in (release, native):
+            self.assertIn('needs: quick-gate\n', job)
+            self.assertIn('runs-on: macos-15\n', job)
+        for check in (
+            'Install nextest',
+            'Preserve nextest installer receipts',
+            'Install Fish unit test dependency',
+            'Provision relocatable Python virtualenv fixture',
+            'Run unit tests',
+            'Run macOS platform integration tests',
+            'Preserve compiled parser surfaces',
+        ):
+            with self.subTest(check=check):
+                self.assertIn(f'      - name: {check}\n', native)
+                self.assertNotIn(f'      - name: {check}\n', release)
+        self.assertIn('name: native-release-macos-', release)
+        self.assertIn('scripts/verify-macos-doctor.py target/release/omg', release)
+        self.assertIn('GITHUB_PATH= python3 scripts/install-nextest-macos.py --source-only', native)
+        self.assertIn('name: nextest-source-contract-macos\n', native)
+        self.assertIn('OMG_CONTRACT_PLATFORM: macos\n', native)
+        self.assertIn('name: cli-surfaces-macos\n', native)
+        self.assertIn('prefix-key: macos-tests-v1', native)
+        self.assertIn("save-if: ${{ github.ref == 'refs/heads/main' }}", native)
+        gate = job_block(workflow, 'ci-success')
+        self.assertIn('MACOS: ${{ needs.macos.result }}', gate)
+        self.assertIn('MACOS_NEXTEST_SOURCE: ${{ needs.macos-nextest-source.result }}', gate)
+
     def test_native_qemu_cache_identity_binds_the_exact_reviewed_image(self):
         script = step_script('coverage.yml', 'Identify pinned native QEMU image cache')
         manifest = json.loads((ROOT / 'tests/qemu-image-provenance/manifest.json').read_text())

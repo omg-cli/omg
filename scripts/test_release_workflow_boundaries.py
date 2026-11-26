@@ -24,6 +24,100 @@ def step_script(block, name):
 
 
 class ReleaseWorkflowBoundaryTests(unittest.TestCase):
+    def replay_r2_publication(self, failure='none', workflow=None):
+        if workflow is None:
+            workflow = (WORKFLOWS / 'release.yml').read_text(encoding='utf-8')
+        job = job_block(workflow, 'sync-r2')
+        mirror = step_script(job, 'Upload release artifacts to R2')
+        if '      - name: Verify round-trip integrity of uploaded objects\n' in job:
+            mirror += '\n' + step_script(job, 'Verify round-trip integrity of uploaded objects')
+        script = 'set -euo pipefail\n' + mirror + '\n' + step_script(job, 'Upload latest-version marker')
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release = root / 'release'
+            release.mkdir()
+            scratch = root / 'scratch'
+            scratch.mkdir()
+            objects = root / 'objects'
+            objects.mkdir()
+            expected = {}
+            for target in ('x86_64-linux-arch', 'x86_64-linux-debian', 'x86_64-linux-debian-trixie',
+                           'x86_64-linux-ubuntu', 'x86_64-linux-fedora', 'aarch64-darwin'):
+                archive = f'omg-v1.2.3-{target}.tar.gz'
+                expected[archive] = target.encode()
+                expected[archive + '.sha256'] = f'checksum for {archive}'.encode()
+            for name, data in expected.items():
+                (release / name).write_bytes(data)
+            (root / 'install.sh').write_bytes(b'installer fixture\n')
+
+            wrangler = root / '.github/deps/release-tools/node_modules/.bin/wrangler'
+            wrangler.parent.mkdir(parents=True)
+            wrangler.write_text(textwrap.dedent("""\
+                #!/usr/bin/env bash
+                set -euo pipefail
+                if [[ "$1" == --version ]]; then
+                  echo '4.153.0'
+                  exit
+                fi
+                [[ "$1 $2" == 'r2 object' && "$4" == omg-releases/* && "$5" == --remote ]]
+                key=${4#omg-releases/}
+                file=${6#--file=}
+                action=$3
+                printf 'begin %s %s\\n' "$action" "$key" >> events
+                trap 'printf "end %s %s\\n" "$action" "$key" >> events' EXIT
+                sleep 0.12
+                if [[ "$key" == omg-v1.2.3-aarch64-darwin.tar.gz ]]; then
+                  [[ "$FAILURE" != "$action" ]] || exit 43
+                fi
+                case "$action" in
+                  put) cp -- "$file" "objects/$key" ;;
+                  get)
+                    cp -- "objects/$key" "$file"
+                    if [[ "$FAILURE" == corrupt && "$key" == omg-v1.2.3-aarch64-darwin.tar.gz ]]; then
+                      printf 'changed bytes' > "$file"
+                    fi ;;
+                  *) exit 42 ;;
+                esac
+                """), encoding='utf-8', newline='\n')
+            wrangler.chmod(0o700)
+            result = subprocess.run(
+                [BASH, '-c', script], cwd=root, env=dict(os.environ, VERSION='1.2.3',
+                    TMPDIR=scratch.as_posix(), FAILURE=failure),
+                capture_output=True, text=True, timeout=20,
+            )
+            events = (root / 'events').read_text(encoding='utf-8').splitlines()
+            return result, events, {path.name: path.read_bytes() for path in objects.iterdir()}, expected
+
+    def test_release_objects_are_verified_in_parallel_before_publishing_the_marker(self):
+        result, events, objects, expected = self.replay_r2_publication()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual({key: objects[key] for key in expected}, expected)
+        self.assertEqual(objects['latest-version'], b'1.2.3')
+        marker = events.index('begin put latest-version')
+        active = peak = 0
+        for event in events[:marker]:
+            kind, _, key = event.split()
+            if key in expected:
+                active += 1 if kind == 'begin' else -1
+                peak = max(peak, active)
+        self.assertEqual(active, 0)
+        self.assertEqual(peak, 3)
+        for key in expected:
+            self.assertLess(events.index(f'end put {key}'), events.index(f'end get {key}'))
+            self.assertLess(events.index(f'end get {key}'), marker)
+
+    def test_release_mirror_failure_prevents_installer_and_marker_publication(self):
+        for failure in ('put', 'get', 'corrupt'):
+            with self.subTest(failure=failure):
+                result, events, objects, _ = self.replay_r2_publication(failure)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertNotIn('latest-version', objects)
+                self.assertNotIn('install.sh', objects)
+                self.assertCountEqual(
+                    (event.removeprefix('begin ') for event in events if event.startswith('begin ')),
+                    (event.removeprefix('end ') for event in events if event.startswith('end ')),
+                )
+
     def test_published_upgrade_requires_explicit_installer_method(self):
         workflow = (WORKFLOWS / 'release-smoke.yml').read_text(encoding='utf-8')
         script = step_script(job_block(workflow, 'upgrade'),

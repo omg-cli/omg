@@ -9,6 +9,7 @@ from pathlib import Path
 import subprocess
 import tarfile
 import tempfile
+import threading
 import unittest
 import zipfile
 from unittest.mock import patch
@@ -132,6 +133,31 @@ class NativeReleaseStaging(unittest.TestCase):
                              {archive.name, archive.name + '.sha256'})
             self.assertEqual(receipt['archives'][distro]['artifact_id'], row['id'])
             self.assertEqual(receipt['archives'][distro]['archive_sha256'], BUILD.sha256(archive.read_bytes()))
+
+    def test_release_staging_overlaps_independent_downloads(self):
+        first_batch = set(list(self.downloads)[:3])
+        rendezvous = threading.Barrier(3, timeout=2)
+        lock = threading.Lock()
+        active = peak = 0
+
+        def download(path):
+            nonlocal active, peak
+            with lock:
+                active += 1
+                peak = max(peak, active)
+            try:
+                if path in first_batch:
+                    rendezvous.wait()
+                return self.downloads[path]
+            finally:
+                with lock:
+                    active -= 1
+
+        self.download.side_effect = download
+        receipt = self.stage()
+        self.assertEqual(peak, 3)
+        self.assertEqual(active, 0)
+        self.assertEqual(tuple(receipt['archives']), tuple(BUILD.RELEASE_IMAGES))
 
     def test_rejects_in_progress_failed_foreign_or_replaced_run(self):
         original = dict(self.run)

@@ -10,6 +10,7 @@ import unittest
 
 
 WORKFLOW = Path(__file__).resolve().parents[1] / '.github/workflows/docker-e2e.yml'
+DOCKERFILE = WORKFLOW.parents[2] / 'Dockerfile.arch-e2e'
 
 
 def step(name):
@@ -18,6 +19,24 @@ def step(name):
 
 
 class DockerProvenanceTests(unittest.TestCase):
+    def test_arch_image_build_is_keyed_to_cargo_inputs(self):
+        recipe = DOCKERFILE.read_text(encoding='utf-8')
+        self.assertNotRegex(recipe, r'(?m)^COPY\s+\.\s')
+        sources = recipe.split('FROM toolchain AS sources\n', 1)[1].split('\nFROM ', 1)[0]
+        self.assertIn('COPY Cargo.toml Cargo.lock build.rs rust-toolchain.toml ./', sources)
+        for directory in ('.cargo', 'benches', 'contracts', 'examples', 'src', 'tests', 'vendor'):
+            self.assertIn(f'COPY {directory}/ {directory}/', sources)
+        builder = recipe.split('FROM toolchain AS builder\n', 1)[1].split('\nFROM ', 1)[0]
+        self.assertIn('FROM sources AS planner\n', recipe)
+        self.assertIn('COPY --from=sources /opt/omg/ /opt/omg/', builder)
+        self.assertIn('RUN cargo build --release --locked -j 2', builder)
+
+    def test_arch_image_pr_gate_includes_contracts_and_vendored_sources(self):
+        paths = WORKFLOW.read_text(encoding='utf-8').split('  pull_request:\n', 1)[1].split(
+            '\n  schedule:', 1)[0]
+        self.assertIn('- "contracts/**"', paths)
+        self.assertIn('- "vendor/**"', paths)
+
     def test_restores_registry_cache_without_granting_fork_write_access(self):
         workflow = WORKFLOW.read_text(encoding='utf-8')
         build = step('Build native Arch test image')

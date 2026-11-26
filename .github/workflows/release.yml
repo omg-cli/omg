@@ -1023,66 +1023,53 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
+          set -euo pipefail
           WRANGLER="$PWD/.github/deps/release-tools/node_modules/.bin/wrangler"
           "$WRANGLER" --version
-          # Wrangler 4 defaults R2 CLI commands to local Miniflare storage.
-          # Without --remote the job succeeds against a runner-local fake bucket.
-          for artifact in release/omg-v*.tar.gz; do
-            [ -f "$artifact" ] || continue
-            basename=$(basename "$artifact")
-            content_type="application/octet-stream"
-            "$WRANGLER" r2 object put "omg-releases/$basename" --remote \
+          artifact_verify_dir="$(mktemp -d)"
+          trap 'rm -rf -- "$artifact_verify_dir"' EXIT
+
+          sync_object() {
+            local artifact="$1" content_type="$2"
+            local name="${artifact##*/}"
+            # Wrangler defaults to local storage unless --remote is explicit.
+            "$WRANGLER" r2 object put "omg-releases/$name" --remote \
               --file="$artifact" \
               --content-type="$content_type" \
-              --cache-control="public, max-age=31536000, immutable"
-            echo "✓ Uploaded $basename"
-          done
+              --cache-control="public, max-age=31536000, immutable" || return
+            "$WRANGLER" r2 object get "omg-releases/$name" --remote \
+              --file="$artifact_verify_dir/$name" >/dev/null || return
+            if ! cmp -s "$artifact" "$artifact_verify_dir/$name"; then
+              echo "::error::Round-trip verification failed for $name"
+              return 1
+            fi
+            echo "Round-trip verified: $name"
+          }
 
-          for checksum in release/omg-v*.sha256; do
-            [ -f "$checksum" ] || continue
-            basename=$(basename "$checksum")
-            "$WRANGLER" r2 object put "omg-releases/$basename" --remote \
-              --file="$checksum" \
-              --content-type="text/plain" \
-              --cache-control="public, max-age=31536000, immutable"
-            echo "✓ Uploaded $basename"
-          done
+          shopt -s nullglob
+          archives=(release/omg-v"$VERSION"-*.tar.gz)
+          if (( ${#archives[@]} == 0 )); then
+            echo "::error::No validated release archives to mirror"
+            exit 1
+          fi
+          batch_size=3
+          for ((offset=0; offset<${#archives[@]}; offset+=batch_size)); do
+            pids=()
+            for artifact in "${archives[@]:offset:batch_size}"; do
+              (
+                sync_object "$artifact" application/octet-stream &&
+                  sync_object "$artifact.sha256" text/plain
+              ) &
+              pids+=("$!")
+            done
 
-      - name: Verify round-trip integrity of uploaded objects
-        # Fail closed: if a single uploaded object cannot be re-downloaded
-        # byte-identical, abort *before* the latest-version marker publishes
-        # the release to clients.
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-        run: |
-          WRANGLER="$PWD/.github/deps/release-tools/node_modules/.bin/wrangler"
-          verify_dir="$(mktemp -d)"
-
-          for artifact in release/omg-v*.tar.gz; do
-            [ -f "$artifact" ] || continue
-            basename=$(basename "$artifact")
-            "$WRANGLER" r2 object get "omg-releases/$basename" --remote \
-              --file="$verify_dir/$basename" >/dev/null
-            expected=$(sha256sum "$artifact" | awk '{print $1}')
-            actual=$(sha256sum "$verify_dir/$basename" | awk '{print $1}')
-            if [[ "$actual" != "$expected" ]]; then
-              echo "::error::Round-trip verification failed for $basename"
+            failed=0
+            for pid in "${pids[@]}"; do
+              wait "$pid" || failed=1
+            done
+            if (( failed != 0 )); then
               exit 1
             fi
-            echo "✓ Round-trip verified: $basename"
-          done
-
-          for checksum in release/omg-v*.sha256; do
-            [ -f "$checksum" ] || continue
-            basename=$(basename "$checksum")
-            "$WRANGLER" r2 object get "omg-releases/$basename" --remote \
-              --file="$verify_dir/$basename" >/dev/null
-            if ! cmp -s "$checksum" "$verify_dir/$basename"; then
-              echo "::error::Round-trip verification failed for $basename"
-              exit 1
-            fi
-            echo "✓ Round-trip verified: $basename"
           done
 
       # Publish this last: clients only learn about the new version after every
