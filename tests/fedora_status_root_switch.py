@@ -15,6 +15,7 @@ from pathlib import Path
 import pwd
 import re
 import shlex
+import socket
 import shutil
 import signal
 import stat
@@ -71,10 +72,10 @@ def advisory_metadata(manifest):
     </updates>""".encode()
     append_metadata(manifest, "updateinfo", "repodata/updateinfo.xml.gz", payload)
 
-def command(args, env=base_env, identity=None):
+def command(args, env=base_env, identity=None, *, timeout=30):
     return subprocess.run([str(part) for part in args], cwd=env.get("HOME", "/"),
                           stdin=subprocess.DEVNULL, capture_output=True, text=True,
-                          env=env, timeout=30, **(identity or {}))
+                          env=env, timeout=timeout, **(identity or {}))
 
 def checked(args, env=base_env, identity=None):
     result = command(args, env, identity)
@@ -702,6 +703,103 @@ exec {shlex.quote(str(native_executable))} "$@"
                                diagnostic=(result.stdout + result.stderr)[-1200:]))
 
 
+
+    def inspect_artifact_signature_inputs():
+        phase = "artifact-signature-inputs"
+        identity_args = ("--certificate-identity", "signer@example.invalid")
+        issuer_args = ("--certificate-oidc-issuer", "https://issuer.example.invalid")
+        network_failure = "Failed to query Rekor"
+        not_regular = "not a regular file"
+
+        with tempfile.TemporaryDirectory(prefix="artifact-signature-", dir=work) as directory:
+            scope = Path(directory)
+            scope.chmod(0o755)
+            invocation = dict(disabled, HOME=str(scope), HTTPS_PROXY="http://127.0.0.1:1", NO_PROXY="")
+
+            def run(label, artifact, expected, *, signer=identity_args, issuer=issuer_args, help_only=False):
+                if help_only:
+                    args = [cli, "audit", "slsa", "--help"]
+                else:
+                    args = [cli, "audit", "slsa"]
+                    if artifact is not None:
+                        args.append(artifact)
+                    args.extend((*signer, *issuer))
+                try:
+                    result = command(args, invocation, ordinary, timeout=2)
+                except subprocess.TimeoutExpired:
+                    checks.append(dict(phase=phase, case=label, passed=False, status=None,
+                                       diagnostic="command exceeded its local input deadline"))
+                    return
+
+                combined = result.stdout + result.stderr
+                reached_request = network_failure in combined
+                unverified = "Artifact signature verified" not in result.stdout
+                passed = (
+                    (result.returncode == 0 if help_only else result.returncode != 0)
+                    and expected in combined
+                    and reached_request == (expected == network_failure)
+                    and unverified
+                )
+                checks.append(dict(phase=phase, case=label, passed=passed,
+                                   status=result.returncode, diagnostic=combined[-1000:]))
+
+            for size in (0, 1, 8191, 8192, 8193, 65535, 65536, 65537):
+                name = f"payload-{size}.rpm"
+                (scope / name).write_bytes((b"\x00\xef\xfd\n" * (size // 4 + 1))[:size])
+                run(f"regular-{size}-bytes", name, network_failure)
+            target = scope / "payload-1.rpm"
+            nested = scope / "nested"
+            nested.mkdir()
+            (nested / "package.rpm").write_bytes(b"nested fixture")
+            run("nested-file", "nested/package.rpm", network_failure)
+            run("dot-prefixed-file", "./payload-1.rpm", network_failure)
+            (scope / "linked.rpm").symlink_to(target.name)
+            run("file-symlink", "linked.rpm", network_failure)
+            (scope / "café.rpm").write_bytes(b"utf-8 path fixture")
+            run("utf8-filename", "café.rpm", network_failure)
+
+            run("missing-file", "missing.rpm", "File not found")
+            run("absolute-path", str(target), "Absolute paths not allowed")
+            run("parent-path", "../missing.rpm", "Path traversal detected")
+            run("empty-path", "", "Path cannot be empty")
+            run("repeated-slash", "nested//package.rpm", "Suspicious path pattern")
+            run("trailing-slash-on-file", "payload-1.rpm/", "File not found")
+            run("overlong-path", "a" * 4097, "Path too long")
+            (scope / "dangling.rpm").symlink_to("missing.rpm")
+            run("dangling-symlink", "dangling.rpm", "File not found")
+
+            run("directory", "nested", not_regular)
+            run("working-directory", ".", not_regular)
+            (scope / "directory-link").symlink_to("nested", target_is_directory=True)
+            run("directory-symlink", "directory-link", not_regular)
+            os.mkfifo(scope / "artifact.pipe")
+            run("fifo", "artifact.pipe", not_regular)
+            (scope / "fifo-link").symlink_to("artifact.pipe")
+            run("fifo-symlink", "fifo-link", not_regular)
+            # Bound to a short relative name to stay within the Unix socket path limit.
+            sock_path = scope / "input.sock"
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+                listener.bind(str(sock_path))
+                run("socket", "input.sock", not_regular)
+                (scope / "socket-link").symlink_to("input.sock")
+                run("socket-symlink", "socket-link", not_regular)
+            unreadable = scope / "unreadable.rpm"
+            unreadable.write_bytes(b"owned fixture")
+            unreadable.chmod(0)
+            run("unreadable-file", unreadable.name, "Permission denied")
+
+            run("missing-artifact-argument", None, "<PACKAGE>")
+            run("missing-signer-argument", target.name, "--certificate-identity", signer=())
+            run("missing-issuer-argument", target.name, "--certificate-oidc-issuer", issuer=())
+            run("blank-signer", target.name, "An exact --certificate-identity is required",
+                signer=("--certificate-identity", " \t "))
+            run("blank-issuer", target.name, "An exact --certificate-oidc-issuer is required",
+                issuer=("--certificate-oidc-issuer", " \t "))
+            run("help", None, "Verify an artifact signature against a trusted Sigstore identity", help_only=True)
+            run("empty-signer", target.name, "An exact --certificate-identity is required",
+                signer=("--certificate-identity", ""))
+            run("empty-issuer", target.name, "An exact --certificate-oidc-issuer is required",
+                issuer=("--certificate-oidc-issuer", ""))
 
     def inspect_secret_scan():
         phase = "secret-scan"
@@ -2123,6 +2221,7 @@ exec {shlex.quote(str(binary))} "$@"
                     inspect_audit_record_windows()
                     inspect_daemon_audit_recovery()
                     inspect_secret_scan()
+                    inspect_artifact_signature_inputs()
                 config.write_text(alternate_config)
                 refresh_fixture()
                 expected = ordinary_control([dnf, "--cacheonly", "repoquery",
@@ -2440,6 +2539,6 @@ assert inventory() == before
 report = dict(binaries=binaries, checks=checks, total=len(checks),
               passed=sum(entry["passed"] for entry in checks), host_unchanged=True)
 print(json.dumps(report))
-expected_checks = 303 if consent_oracle is None else 942
+expected_checks = 303 if consent_oracle is None else 978
 if report["passed"] != report["total"] or report["total"] != expected_checks:
     sys.exit(4)
