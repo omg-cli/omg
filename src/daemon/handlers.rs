@@ -2367,7 +2367,6 @@ pub(super) mod tests {
         Ok(())
     }
 
-    #[cfg(feature = "fedora")]
     #[tokio::test]
     async fn fedora_catalog_sequential_refresh_does_not_acknowledge_an_old_catalog()
     -> anyhow::Result<()> {
@@ -2615,7 +2614,6 @@ pub(super) mod tests {
         Ok(())
     }
 
-    #[cfg(feature = "fedora")]
     #[tokio::test]
     async fn fedora_catalog_refuses_continuous_changes_without_publishing() -> anyhow::Result<()> {
         let (_directory, state, database, _, builds, fault) = mutable_fedora_catalog(true, None)?;
