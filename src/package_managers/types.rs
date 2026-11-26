@@ -1,5 +1,32 @@
 //! Shared package manager types
 
+#[derive(Debug, PartialEq, Eq)]
+pub struct PackageStatus {
+    pub total: usize,
+    pub explicit: usize,
+    /// The orphan and update counts, in that order, when both were checked.
+    pub maintenance: Option<(usize, usize)>,
+}
+
+impl PackageStatus {
+    /// Preserve the zero placeholders for callers of the original count API.
+    #[must_use]
+    pub fn into_counts(self) -> (usize, usize, usize, usize) {
+        let (orphans, updates) = self.maintenance.unwrap_or_default();
+        (self.total, self.explicit, orphans, updates)
+    }
+}
+
+impl From<(usize, usize, usize, usize)> for PackageStatus {
+    fn from((total, explicit, orphans, updates): (usize, usize, usize, usize)) -> Self {
+        Self {
+            total,
+            explicit,
+            maintenance: Some((orphans, updates)),
+        }
+    }
+}
+
 /// One installed package selected by a native removal solver.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemovalPackage {

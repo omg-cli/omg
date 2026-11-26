@@ -1217,6 +1217,7 @@ impl TestProject {
             args,
             ["status" | "daemon-status" | "oc" | "ec" | "explicit"]
                 | ["status", "--fast"]
+                | ["status", "--fast", "--json"]
                 | ["info", "--", _]
                 | ["--json", "info", _]
         ));

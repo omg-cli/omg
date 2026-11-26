@@ -25,7 +25,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use crate::cli::modern_ui::OutputMode;
 use crate::core::{Package, PackageSource, is_root};
 use crate::package_managers::PackageManager;
-use crate::package_managers::types::{UpdateInfo, parse_version_or_zero};
+use crate::package_managers::types::{PackageStatus, UpdateInfo, parse_version_or_zero};
 
 use rusqlite::{Connection, OpenFlags};
 use zerocopy::{FromBytes, Immutable, KnownLayout, big_endian::U32};
@@ -324,12 +324,20 @@ impl AvailablePackage<'_> {
 enum RepositoryQuery<'a> {
     Available(Option<&'a str>),
     Installed,
-    Upgrades,
     Unneeded,
     InstalledSizes(InstalledSizeQuery<'a>),
     InstalledReasons(InstalledReasonQuery<'a>),
     InstalledDetails(&'a str),
 }
+
+const UPGRADE_QUERY_ARGS: [&str; 6] = [
+    "--quiet",
+    "--color=never",
+    "--cacheonly",
+    "--setopt=*.skip_if_unavailable=false",
+    "list",
+    "--upgrades",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum InstalledSizeQuery<'a> {
@@ -457,6 +465,17 @@ impl VersionedPackage {
 
 struct PlannedDnfAdvisories;
 
+enum AdvisoryLookup<'a> {
+    ArchitectureChanges,
+    Proposed(&'a [super::types::SecurityPackage]),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InstalledAdvisoryMatch {
+    Exact,
+    ArchitectureChange,
+}
+
 struct CancelStoredQuery(Option<tokio::sync::oneshot::Sender<()>>);
 
 impl Drop for CancelStoredQuery {
@@ -489,11 +508,18 @@ impl crate::core::security::vulnerability::VulnerabilitySource for PlannedDnfAdv
                 PackageAssessment, PackageCoverage, UnknownCoverage, VulnerabilityError,
             };
             let assess = async {
-                // This installed-name-filtered source is supplemental evidence only.
-                // It never establishes complete coverage for proposed dependencies.
-                let native = super::dnf_advisory::audit_result(
-                    DnfPackageManager::native_advisories().await?,
-                )?;
+                let (mut rows, mut supplemental) =
+                    DnfPackageManager::native_advisories(AdvisoryLookup::Proposed(packages))
+                        .await?;
+                let native_ids: BTreeSet<_> = rows
+                    .iter()
+                    .map(|(row, _)| (row.name.as_str(), row.nevra.as_str()))
+                    .collect();
+                supplemental.retain(|(row, _)| {
+                    !native_ids.contains(&(row.name.as_str(), row.nevra.as_str()))
+                });
+                rows.extend(supplemental);
+                let native = super::dnf_advisory::audit_result(rows)?;
                 let mut assessments = Vec::with_capacity(packages.len());
                 let mut comparisons = Vec::new();
                 let mut candidates = Vec::new();
@@ -1540,7 +1566,7 @@ impl DnfPackageManager {
             RepositoryQuery::InstalledSizes(_) => "%{full_nevra}\t%{installsize}\\n",
             RepositoryQuery::InstalledReasons(_) => "%{full_nevra}\t%{reason}\\n",
             RepositoryQuery::InstalledDetails(_) => "%{name}\t%{evr}\t%{full_nevra}\t%{reason}\\n",
-            RepositoryQuery::Installed | RepositoryQuery::Upgrades | RepositoryQuery::Unneeded => {
+            RepositoryQuery::Installed | RepositoryQuery::Unneeded => {
                 "%{name}\t%{arch}\t%{evr}\t%{repoid}\\n"
             }
         }
@@ -1566,20 +1592,16 @@ impl DnfPackageManager {
             | RepositoryQuery::InstalledSizes(_)
             | RepositoryQuery::InstalledReasons(_)
             | RepositoryQuery::InstalledDetails(_) => "--installed",
-            RepositoryQuery::Upgrades => "--upgrades",
             RepositoryQuery::Unneeded => "--unneeded",
         };
         let mut args = Vec::new();
-        // Status/update/orphan queries are cached reads. Their callers own any
+        // Installed and orphan queries are cached reads. Their callers own any
         // explicit sync; repoquery must not refresh metadata behind a read.
         if matches!(
             query,
-            RepositoryQuery::Installed | RepositoryQuery::Upgrades | RepositoryQuery::Unneeded
+            RepositoryQuery::Installed | RepositoryQuery::Unneeded
         ) {
             args.push("--cacheonly".to_owned());
-        }
-        if matches!(query, RepositoryQuery::Upgrades) {
-            args.push("--setopt=*.skip_if_unavailable=false".to_owned());
         }
         if matches!(
             query,
@@ -1592,7 +1614,7 @@ impl DnfPackageManager {
         args.extend(["repoquery", selection, "--queryformat", query_format].map(str::to_owned));
         if matches!(
             query,
-            RepositoryQuery::Available(_) | RepositoryQuery::Installed | RepositoryQuery::Upgrades
+            RepositoryQuery::Available(_) | RepositoryQuery::Installed
         ) {
             args.push("--latest-limit=1".to_owned());
         }
@@ -1614,7 +1636,6 @@ impl DnfPackageManager {
                 None
             }
             RepositoryQuery::Installed
-            | RepositoryQuery::Upgrades
             | RepositoryQuery::Unneeded
             | RepositoryQuery::InstalledSizes(InstalledSizeQuery::All) => None,
         };
@@ -1839,8 +1860,7 @@ impl DnfPackageManager {
         .context("DNF stored transaction owner failed")?
     }
 
-    fn advisory_command() -> Result<tokio::process::Command> {
-        let cache = crate::core::paths::cache_dir().join("dnf-security");
+    fn advisory_command(cache: &Path) -> Result<tokio::process::Command> {
         let cache = cache
             .to_str()
             .context("DNF advisory cache path is not UTF-8")?;
@@ -1859,17 +1879,18 @@ impl DnfPackageManager {
     async fn affected_installed_packages<'a>(
         rows: impl IntoIterator<Item = &'a super::dnf_advisory::ApplicableAdvisory>,
         installed: &[super::types::SecurityPackage],
+        scope: InstalledAdvisoryMatch,
     ) -> Result<BTreeMap<String, Vec<crate::core::security::scan::InstalledIdentity>>> {
         use crate::core::security::scan::InstalledIdentity;
         use std::collections::btree_map::Entry;
 
-        let mut by_identity: HashMap<_, Vec<_>> = HashMap::new();
+        let mut by_name: HashMap<_, Vec<_>> = HashMap::new();
         for package in installed {
             if let Some(architecture) = package.architecture.as_deref() {
-                by_identity
-                    .entry((package.name.as_str(), architecture))
+                by_name
+                    .entry(package.name.as_str())
                     .or_default()
-                    .push(package);
+                    .push((architecture, package));
             }
         }
 
@@ -1882,7 +1903,21 @@ impl DnfPackageManager {
             };
             let (name, architecture) = super::dnf_advisory::package_identity(&row.nevra)?;
             let evr = &row.nevra[name.len() + 1..row.nevra.len() - architecture.len() - 1];
-            for &package in by_identity.get(&(name, architecture)).into_iter().flatten() {
+            for &(installed_arch, package) in by_name.get(name).into_iter().flatten() {
+                let matches = match scope {
+                    InstalledAdvisoryMatch::Exact => installed_arch == architecture,
+                    InstalledAdvisoryMatch::ArchitectureChange => {
+                        installed_arch != architecture
+                            && (installed_arch == "noarch" || architecture == "noarch")
+                    }
+                };
+                if !matches {
+                    continue;
+                }
+                anyhow::ensure!(
+                    scope == InstalledAdvisoryMatch::Exact || comparisons.len() < 10_000,
+                    "Supplemental RPM comparisons exceed their bound"
+                );
                 comparisons.push((package.version.clone(), evr.to_owned()));
                 candidates.push((row.nevra.as_str(), package));
             }
@@ -1902,7 +1937,7 @@ impl DnfPackageManager {
             .into_iter()
             .map(|(nevra, (advisory, affected))| {
                 anyhow::ensure!(
-                    !affected.is_empty(),
+                    scope == InstalledAdvisoryMatch::ArchitectureChange || !affected.is_empty(),
                     "Advisory {advisory} has no affected installed identity: {nevra}"
                 );
                 Ok((nevra.to_owned(), affected))
@@ -1910,19 +1945,20 @@ impl DnfPackageManager {
             .collect()
     }
 
-    async fn native_advisories() -> Result<
-        Vec<(
-            super::dnf_advisory::ApplicableAdvisory,
-            super::dnf_advisory::AdvisoryDetails,
-        )>,
-    > {
+    async fn native_advisories(
+        mode: AdvisoryLookup<'_>,
+    ) -> Result<(
+        super::dnf_advisory::AdvisoryRows,
+        super::dnf_advisory::AdvisoryRows,
+    )> {
+        let cache = crate::core::paths::cache_dir().join("dnf-security");
         let mut outputs = Vec::with_capacity(2);
         for details in [false, true] {
-            let mut command = Self::advisory_command()?;
+            let mut command = Self::advisory_command(&cache)?;
             command.args(super::dnf_advisory::query_args(details));
             outputs.push(Self::query_output(command).await?);
         }
-        let mut repositories = Self::advisory_command()?;
+        let mut repositories = Self::advisory_command(&cache)?;
         repositories.args([
             "--cacheonly",
             "--setopt=*.skip_if_unavailable=false",
@@ -1931,10 +1967,70 @@ impl DnfPackageManager {
             "--enabled",
             "--json",
         ]);
-        super::dnf_advisory::require_enabled_repositories(
-            &Self::query_output(repositories).await?,
-        )?;
-        super::dnf_advisory::join_advisories(&outputs[0], &outputs[1])
+        let repository_ids =
+            super::dnf_advisory::enabled_repository_ids(&Self::query_output(repositories).await?)?;
+        let native = super::dnf_advisory::join_advisories(&outputs[0], &outputs[1])?;
+        let supplemental = Self::cached_advisory_lookup(&cache, &repository_ids, mode)
+            .await
+            .unwrap_or_else(|error| {
+                tracing::warn!("Supplemental Fedora advisory lookup unavailable: {error:#}");
+                Vec::new()
+            });
+        Ok((native, supplemental))
+    }
+
+    async fn cached_advisory_lookup(
+        cache: &Path,
+        repository_ids: &BTreeSet<String>,
+        lookup: AdvisoryLookup<'_>,
+    ) -> Result<super::dnf_advisory::AdvisoryRows> {
+        let (mode, subjects) = match lookup {
+            AdvisoryLookup::ArchitectureChanges => ("architecture-changes", Vec::new()),
+            AdvisoryLookup::Proposed(packages) => {
+                let subjects: Vec<_> = packages
+                    .iter()
+                    .filter_map(|package| {
+                        let architecture = package.architecture.as_deref()?;
+                        let epoch = if package.version.contains(':') {
+                            ""
+                        } else {
+                            "0:"
+                        };
+                        Some(format!(
+                            "{}-{epoch}{}.{architecture}",
+                            package.name, package.version
+                        ))
+                    })
+                    .collect();
+                if subjects.is_empty() {
+                    return Ok(Vec::new());
+                }
+                ("proposed", subjects)
+            }
+        };
+        anyhow::ensure!(
+            subjects.len() <= 10_000
+                && subjects.iter().map(|id| id.len() + 1).sum::<usize>() <= 512 * 1024,
+            "Supplemental advisory subjects exceed their bound"
+        );
+        for subject in &subjects {
+            Self::validate_query_selector(subject)?;
+        }
+        let repositories = serde_json::to_string(repository_ids)?;
+        anyhow::ensure!(
+            repositories.len() <= 64 * 1024,
+            "DNF repository scope exceeds its bound"
+        );
+        let mut command =
+            tokio::process::Command::from(crate::core::privilege::system_command("python3")?);
+        command
+            .args(["-I", "-B", "-c", include_str!("dnf_advisory_lookup.py")])
+            .arg(cache)
+            .args([mode, &repositories])
+            .args(subjects);
+        let output =
+            Self::query_output_with_deadline(command, std::time::Duration::from_secs(30)).await?;
+        super::dnf_advisory::cached_lookup_result(&output)
     }
 
     async fn native_history(since: Option<u64>) -> Result<Vec<NativeTransaction>> {
@@ -2302,7 +2398,7 @@ impl DnfPackageManager {
         })
         .await??;
         let context = serde_json::to_string(&("omg-native-dnf-stored-v1", args, &digest))?;
-        let gaps = vec!["DNF5's native advisory CLI filters by currently installed package names; it cannot establish complete coverage for newly selected dependencies. Vendor fixed versions do not establish introduced ranges or branch applicability. Matching native advisories below remain possible; CVE/disclosed-zero-day coverage remains unknown. https://dnf5.readthedocs.io/en/stable/commands/advisory.8.html".into()];
+        let gaps = vec!["Fedora advisory matches are possible findings. Vendor fixed versions do not establish introduced ranges or branch applicability. CVE and disclosed zero-day coverage remains unknown. https://dnf5.readthedocs.io/en/stable/commands/advisory.8.html".into()];
         let source = PlannedDnfAdvisories;
         crate::core::security::package_review::review_async(&inventory, &context, &gaps, &source)
             .await?;
@@ -2557,13 +2653,7 @@ impl DnfPackageManager {
             .map(|line| {
                 let fields: Vec<_> = line.split('\t').take(5).collect();
                 anyhow::ensure!(fields.len() == 4, "DNF version row must have four fields");
-                anyhow::ensure!(
-                    fields.iter().all(|field| !field.is_empty()
-                        && !field
-                            .chars()
-                            .any(|ch| ch.is_whitespace() || ch.is_control())),
-                    "DNF version row has an invalid field"
-                );
+                Self::validate_versioned_fields(&fields)?;
                 Ok(VersionedPackage {
                     name: fields[0].to_owned(),
                     architecture: fields[1].to_owned(),
@@ -2574,45 +2664,111 @@ impl DnfPackageManager {
             .collect()
     }
 
-    fn match_updates(
-        installed: &[VersionedPackage],
-        upgrades: &[VersionedPackage],
-    ) -> Result<Vec<UpdateInfo>> {
-        let mut by_identity = HashMap::new();
-        for package in installed {
-            anyhow::ensure!(
-                by_identity
-                    .insert(
-                        (package.name.as_str(), package.architecture.as_str()),
-                        package
-                    )
-                    .is_none(),
-                "DNF returned duplicate installed name/architecture"
-            );
-        }
-        upgrades
-            .iter()
-            .map(|candidate| {
-                let old = by_identity
-                    .get(&(candidate.name.as_str(), candidate.architecture.as_str()))
-                    .with_context(|| {
-                        format!(
-                            "DNF upgrade {}.{} has no matching installed package",
-                            candidate.name, candidate.architecture
-                        )
-                    })?;
-                anyhow::ensure!(
-                    old.version != candidate.version,
-                    "DNF upgrade has an unchanged version"
-                );
-                Ok(UpdateInfo {
-                    name: candidate.name.clone(),
-                    old_version: old.version.clone(),
-                    new_version: candidate.version.clone(),
-                    repo: candidate.repository.clone(),
+    fn validate_versioned_fields(fields: &[&str]) -> Result<()> {
+        anyhow::ensure!(
+            fields.iter().all(|field| !field.is_empty()
+                && !field
+                    .chars()
+                    .any(|ch| ch.is_whitespace() || ch.is_control())),
+            "DNF version row has an invalid field"
+        );
+        Ok(())
+    }
+
+    fn parse_available_upgrades(output: &[u8]) -> Result<Vec<VersionedPackage>> {
+        let text = std::str::from_utf8(output).context("DNF upgrade listing is not UTF-8")?;
+        let mut lines = text.lines().map(str::trim).filter(|line| !line.is_empty());
+        let Some(header) = lines.next() else {
+            return Ok(Vec::new());
+        };
+        anyhow::ensure!(
+            header == "Available upgrades",
+            "Invalid DNF upgrade heading"
+        );
+        lines
+            .map(|line| {
+                let fields: Vec<_> = line.split_ascii_whitespace().take(4).collect();
+                let &[name_arch, version, repository] = fields.as_slice() else {
+                    anyhow::bail!("DNF upgrade row must have three fields");
+                };
+                let (name, architecture) = name_arch
+                    .rsplit_once('.')
+                    .context("DNF upgrade row lacks architecture")?;
+                Self::validate_versioned_fields(&[name, architecture, version, repository])?;
+                Ok(VersionedPackage {
+                    name: name.to_owned(),
+                    architecture: architecture.to_owned(),
+                    version: version.to_owned(),
+                    repository: repository.to_owned(),
                 })
             })
             .collect()
+    }
+
+    async fn match_updates(
+        installed: &[VersionedPackage],
+        upgrades: &[VersionedPackage],
+    ) -> Result<Vec<UpdateInfo>> {
+        let mut by_name: HashMap<&str, Vec<&VersionedPackage>> = HashMap::new();
+        for package in installed {
+            let installed = by_name.entry(package.name.as_str()).or_default();
+            anyhow::ensure!(
+                !installed
+                    .iter()
+                    .any(|other| other.architecture == package.architecture),
+                "DNF returned duplicate installed name/architecture"
+            );
+            installed.push(package);
+        }
+        let mut updates = Vec::with_capacity(upgrades.len());
+        let mut seen = BTreeSet::new();
+        for candidate in upgrades {
+            let arch = candidate.architecture.as_str();
+            // DNF has already filtered by repository priority and latest EVR.
+            // Tied mirrors are alternative sources for the same update.
+            if !seen.insert((candidate.name.as_str(), arch)) {
+                continue;
+            }
+            let same_name = by_name
+                .get(candidate.name.as_str())
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            let mut compatible = same_name.iter().filter(|package| {
+                let installed_arch = package.architecture.as_str();
+                installed_arch == arch
+                    || ((installed_arch == "noarch" || arch == "noarch")
+                        && !matches!(installed_arch, "src" | "nosrc")
+                        && !matches!(arch, "src" | "nosrc"))
+            });
+            let mut old = compatible.next().with_context(|| {
+                format!(
+                    "DNF upgrade {}.{arch} has no matching installed package",
+                    candidate.name
+                )
+            })?;
+            // When noarch crosses architectures, use the newest compatible
+            // installed EVR, the same version DNF compares against.
+            for package in compatible {
+                if package.version != old.version
+                    && Self::compare_native_evrs(&[(old.version.clone(), package.version.clone())])
+                        .await?[0]
+                        < 0
+                {
+                    old = package;
+                }
+            }
+            anyhow::ensure!(
+                old.version != candidate.version,
+                "DNF upgrade has an unchanged version"
+            );
+            updates.push(UpdateInfo {
+                name: candidate.name.clone(),
+                old_version: old.version.clone(),
+                new_version: candidate.version.clone(),
+                repo: candidate.repository.clone(),
+            });
+        }
+        Ok(updates)
     }
 
     /// A handle sharing this manager's caches, so blocking workers mutate
@@ -2766,10 +2922,24 @@ impl PackageManager for DnfPackageManager {
         Some(Box::pin(async move {
             async {
                 let installed = self.security_inventory().await?;
-                let rows = Self::native_advisories().await?;
-                let affected =
-                    Self::affected_installed_packages(rows.iter().map(|(row, _)| row), &installed)
-                        .await?;
+                let (rows, supplemental) =
+                    Self::native_advisories(AdvisoryLookup::ArchitectureChanges).await?;
+                let affected = Self::affected_installed_packages(
+                    rows.iter().map(|(row, _)| row),
+                    &installed,
+                    InstalledAdvisoryMatch::Exact,
+                )
+                .await?;
+                let possible = Self::affected_installed_packages(
+                    supplemental.iter().map(|(row, _)| row),
+                    &installed,
+                    InstalledAdvisoryMatch::ArchitectureChange,
+                )
+                .await
+                .unwrap_or_else(|error| {
+                    tracing::warn!("Could not associate supplemental Fedora advisories: {error:#}");
+                    BTreeMap::new()
+                });
                 let mut after = self.security_inventory().await?;
                 let mut before = installed;
                 let identity = |package: &super::types::SecurityPackage| {
@@ -2799,6 +2969,11 @@ impl PackageManager for DnfPackageManager {
                             .clone();
                     }
                 }
+                super::dnf_advisory::add_architecture_findings(
+                    &mut result,
+                    supplemental,
+                    &possible,
+                )?;
                 Ok(result)
             }
             .await
@@ -2979,22 +3154,37 @@ impl PackageManager for DnfPackageManager {
         fast: bool,
     ) -> Pin<Box<dyn Future<Output = Result<(usize, usize, usize, usize)>> + Send + '_>> {
         Box::pin(async move {
+            self.get_status_details(fast)
+                .await
+                .map(PackageStatus::into_counts)
+        })
+    }
+
+    fn get_status_details(
+        &self,
+        fast: bool,
+    ) -> Pin<Box<dyn Future<Output = Result<PackageStatus>> + Send + '_>> {
+        Box::pin(async move {
             let installed = self.load_installed_packages().await?;
             let total = installed.len();
             let explicit = Self::current_explicit_package_names(&installed)
                 .await?
                 .len();
 
-            let (orphans, updates) = if fast {
-                (0, 0)
+            let maintenance = if fast {
+                None
             } else {
-                (
+                Some((
                     Self::orphan_count().await?,
                     self.list_updates().await?.len(),
-                )
+                ))
             };
 
-            Ok((total, explicit, orphans, updates))
+            Ok(PackageStatus {
+                total,
+                explicit,
+                maintenance,
+            })
         })
     }
 
@@ -3008,11 +3198,16 @@ impl PackageManager for DnfPackageManager {
     fn list_updates(&self) -> Pin<Box<dyn Future<Output = Result<Vec<UpdateInfo>>> + Send + '_>> {
         Box::pin(async move {
             let installed = Self::repository_output(RepositoryQuery::Installed).await?;
-            let upgrades = Self::repository_output(RepositoryQuery::Upgrades).await?;
+            let mut command =
+                tokio::process::Command::from(crate::core::privilege::system_command("dnf")?);
+            // list honors repository priority. JSON for list requires DNF5 5.4.
+            command.env("LC_ALL", "C").args(UPGRADE_QUERY_ARGS);
+            let upgrades = Self::query_output(command).await?;
             Self::match_updates(
                 &Self::parse_versioned_packages(&installed)?,
-                &Self::parse_versioned_packages(&upgrades)?,
+                &Self::parse_available_upgrades(&upgrades)?,
             )
+            .await
         })
     }
 
@@ -3547,6 +3742,7 @@ mod tests {
         let affected = DnfPackageManager::affected_installed_packages(
             [&row, &other_architecture, &row],
             &installed,
+            InstalledAdvisoryMatch::Exact,
         )
         .await
         .unwrap();
@@ -3566,10 +3762,32 @@ mod tests {
         assert!(
             DnfPackageManager::affected_installed_packages(
                 [&other_architecture, &row],
-                &installed[1..]
+                &installed[1..],
+                InstalledAdvisoryMatch::Exact,
             )
             .await
             .is_err()
+        );
+        let cross_architecture = super::super::dnf_advisory::ApplicableAdvisory {
+            name: "FEDORA-cross-architecture".into(),
+            kind: "security".into(),
+            severity: "Important".into(),
+            nevra: "fixture-1:1.0-2.noarch".into(),
+        };
+        let possible = DnfPackageManager::affected_installed_packages(
+            [&row, &cross_architecture],
+            &installed,
+            InstalledAdvisoryMatch::ArchitectureChange,
+        )
+        .await
+        .unwrap();
+        assert!(possible[&row.nevra].is_empty());
+        assert_eq!(
+            possible[&cross_architecture.nevra],
+            [
+                InstalledIdentity::from(&installed[0]),
+                InstalledIdentity::from(&installed[3]),
+            ]
         );
     }
 
@@ -3621,11 +3839,9 @@ mod tests {
         let root = fixture.path();
         std::fs::create_dir(root.join("repos")).unwrap();
         let configure = || {
-            let mut command = DnfPackageManager::advisory_command().unwrap();
+            let mut command = DnfPackageManager::advisory_command(&root.join("cache")).unwrap();
             command.args([
                 format!("--setopt=reposdir={}", root.join("repos").display()),
-                format!("--setopt=cachedir={}", root.join("cache").display()),
-                format!("--setopt=system_cachedir={}", root.join("cache").display()),
                 format!("--setopt=persistdir={}", root.join("persist").display()),
                 format!("--setopt=logdir={}", root.join("logs").display()),
                 format!(
@@ -3657,7 +3873,7 @@ mod tests {
         assert!(error.to_string().contains("DNF query failed"), "{error:#}");
 
         let mut upgrades = configure();
-        upgrades.args(DnfPackageManager::repository_query_args(RepositoryQuery::Upgrades).unwrap());
+        upgrades.env("LC_ALL", "C").args(UPGRADE_QUERY_ARGS);
         let error = DnfPackageManager::query_output(upgrades).await.unwrap_err();
         assert!(error.to_string().contains("DNF query failed"), "{error:#}");
 
@@ -3668,20 +3884,12 @@ mod tests {
 
     #[test]
     fn update_queries_never_refresh_repository_metadata() {
-        for (query, require_repository_metadata) in [
-            (RepositoryQuery::Installed, false),
-            (RepositoryQuery::Upgrades, true),
-            (RepositoryQuery::Unneeded, false),
-        ] {
+        for query in [RepositoryQuery::Installed, RepositoryQuery::Unneeded] {
             let args = DnfPackageManager::repository_query_args(query).unwrap();
             assert!(args.iter().any(|arg| arg == "--cacheonly"), "{args:?}");
-            assert_eq!(
-                args.iter()
-                    .any(|arg| arg == "--setopt=*.skip_if_unavailable=false"),
-                require_repository_metadata,
-                "{args:?}"
-            );
         }
+        assert!(UPGRADE_QUERY_ARGS.contains(&"--cacheonly"));
+        assert!(UPGRADE_QUERY_ARGS.contains(&"--setopt=*.skip_if_unavailable=false"));
     }
 
     #[test]
@@ -3850,8 +4058,8 @@ mod tests {
         assert_eq!(manager.name(), "dnf");
     }
 
-    #[test]
-    fn native_fedora_update_snapshot_has_matching_installed_versions() {
+    #[tokio::test]
+    async fn native_fedora_update_snapshot_has_matching_installed_versions() {
         let installed = DnfPackageManager::parse_versioned_packages(include_bytes!(
             "../../tests/data/fedora-installed.tsv"
         ))
@@ -3862,6 +4070,7 @@ mod tests {
         .expect("native upgrade rows");
         assert!(!candidates.is_empty());
         let updates = DnfPackageManager::match_updates(&installed, &candidates)
+            .await
             .expect("every native upgrade matches an installed identity");
         assert_eq!(updates.len(), candidates.len());
         for (update, candidate) in updates.iter().zip(&candidates) {
@@ -3871,8 +4080,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn update_matching_uses_architecture_and_preserves_native_versions() {
+    #[tokio::test]
+    async fn update_matching_uses_architecture_and_preserves_native_versions() {
         let installed = DnfPackageManager::parse_versioned_packages(
             b"lib\ti686\t1:1-1\t@System\nlib\tx86_64\t1:2-1\t@System\n",
         )
@@ -3881,8 +4090,9 @@ mod tests {
             b"lib\tx86_64\t1:4-1\tupdates\nlib\ti686\t1:3-1\tupdates\n",
         )
         .expect("upgrade records");
-        let updates =
-            DnfPackageManager::match_updates(&installed, &candidates).expect("matched upgrades");
+        let updates = DnfPackageManager::match_updates(&installed, &candidates)
+            .await
+            .expect("matched upgrades");
         assert_eq!(updates.len(), 2);
         assert_eq!(updates[0].old_version, "1:2-1");
         assert_eq!(updates[1].old_version, "1:1-1");
@@ -3890,16 +4100,55 @@ mod tests {
         assert_eq!(updates[0].repo, "updates");
     }
 
-    #[test]
-    fn update_matching_rejects_unmatched_and_unchanged_candidates() {
+    #[tokio::test]
+    async fn update_matching_accepts_noarch_transitions_and_counts_mirrors_once() -> Result<()> {
+        let installed = DnfPackageManager::parse_versioned_packages(
+            concat!(
+                "lib\tx86_64\t99-1\t@System\n",
+                "lib\ti686\t1:1~rc-1\t@System\n",
+                "tool\tnoarch\t1-1\t@System\n",
+            )
+            .as_bytes(),
+        )?;
+        let candidates = DnfPackageManager::parse_versioned_packages(
+            concat!(
+                "lib\tnoarch\t1:1-1\tupdates\n",
+                "lib\tnoarch\t1:1-1\tmirror\n",
+                "tool\tx86_64\t2-1\tupdates\n",
+            )
+            .as_bytes(),
+        )?;
+
+        let updates = DnfPackageManager::match_updates(&installed, &candidates).await?;
+
+        assert_eq!(updates.len(), 2);
+        assert_eq!(updates[0].old_version, "1:1~rc-1");
+        assert_eq!(updates[0].new_version, "1:1-1");
+        assert_eq!(updates[0].repo, "updates");
+        assert_eq!(updates[1].old_version, "1-1");
+        assert_eq!(updates[1].new_version, "2-1");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn update_matching_rejects_unmatched_and_unchanged_candidates() {
         let installed = DnfPackageManager::parse_versioned_packages(b"lib\tx86_64\t1-1\t@System\n")
             .expect("installed");
         let wrong_arch = DnfPackageManager::parse_versioned_packages(b"lib\ti686\t2-1\tupdates\n")
             .expect("candidate");
-        assert!(DnfPackageManager::match_updates(&installed, &wrong_arch).is_err());
-        assert!(DnfPackageManager::match_updates(&installed, &installed).is_err());
+        assert!(
+            DnfPackageManager::match_updates(&installed, &wrong_arch)
+                .await
+                .is_err()
+        );
+        assert!(
+            DnfPackageManager::match_updates(&installed, &installed)
+                .await
+                .is_err()
+        );
         assert!(
             DnfPackageManager::match_updates(&installed, &[])
+                .await
                 .expect("no updates")
                 .is_empty()
         );
@@ -3911,6 +4160,25 @@ mod tests {
         ] {
             assert!(DnfPackageManager::parse_versioned_packages(malformed).is_err());
         }
+    }
+
+    #[test]
+    fn cached_upgrade_listing_distinguishes_empty_results_from_invalid_data() -> Result<()> {
+        assert!(DnfPackageManager::parse_available_upgrades(b"\n")?.is_empty());
+        let candidate = DnfPackageManager::parse_available_upgrades(
+            b"Available upgrades\nlib.compat.noarch   2:1-1   updates\n",
+        )?;
+        assert_eq!(candidate[0].full_nevra(), "lib.compat-2:1-1.noarch");
+        assert_eq!(candidate[0].repository, "updates");
+        for invalid in [
+            b"Unexpected heading".as_slice(),
+            b"Available upgrades\nlib.noarch updates",
+            b"Available upgrades\nlib 2:1-1 updates",
+            b"Available upgrades\nlib.noarch 2:1-1 up\x1bdates",
+        ] {
+            assert!(DnfPackageManager::parse_available_upgrades(invalid).is_err());
+        }
+        Ok(())
     }
 
     #[tokio::test]
@@ -4253,7 +4521,6 @@ mod tests {
             RepositoryQuery::Available(None),
             RepositoryQuery::Available(Some("tree")),
             RepositoryQuery::Installed,
-            RepositoryQuery::Upgrades,
             RepositoryQuery::Unneeded,
             RepositoryQuery::InstalledSizes(InstalledSizeQuery::All),
             RepositoryQuery::InstalledSizes(InstalledSizeQuery::Package("tree")),

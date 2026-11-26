@@ -1,8 +1,9 @@
 //! DNF owns RPM version applicability; detailed collections are not installed inventory.
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, btree_map::Entry};
 
 use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
+use serde_json::value::RawValue;
 
 use crate::core::security::scan::{
     AdvisoryProvenance, AuditCoverage, InstalledIdentity, UnassessedPackage,
@@ -50,7 +51,7 @@ pub(super) fn query_args(details: bool) -> Vec<&'static str> {
     ]
 }
 
-pub(super) fn require_enabled_repositories(bytes: &[u8]) -> Result<()> {
+pub(super) fn enabled_repository_ids(bytes: &[u8]) -> Result<BTreeSet<String>> {
     #[derive(Deserialize)]
     struct Repository {
         id: String,
@@ -58,19 +59,18 @@ pub(super) fn require_enabled_repositories(bytes: &[u8]) -> Result<()> {
     }
     let repositories: Vec<Repository> =
         serde_json::from_slice(bytes).context("Invalid DNF repository metadata")?;
+    let mut ids = BTreeSet::new();
+    for repo in repositories {
+        ensure!(
+            repo.is_enabled && !repo.id.is_empty() && ids.insert(repo.id),
+            "Unexpected repository in enabled DNF metadata"
+        );
+    }
     ensure!(
-        repositories
-            .iter()
-            .any(|repo| repo.is_enabled && !repo.id.is_empty()),
+        !ids.is_empty(),
         "Cannot audit without enabled DNF repositories"
     );
-    ensure!(
-        repositories
-            .iter()
-            .all(|repo| repo.is_enabled && !repo.id.is_empty()),
-        "Unexpected repository in enabled DNF metadata"
-    );
-    Ok(())
+    Ok(ids)
 }
 
 #[derive(Debug, Deserialize)]
@@ -103,6 +103,8 @@ pub(super) struct AdvisoryReference {
     pub kind: String,
     pub url: String,
 }
+
+pub(super) type AdvisoryRows = Vec<(ApplicableAdvisory, AdvisoryDetails)>;
 
 /// Split only the structural NEVRA fields; DNF performs RPM ordering.
 pub(super) fn package_identity(nevra: &str) -> Result<(&str, &str)> {
@@ -138,7 +140,7 @@ pub(super) fn package_identity(nevra: &str) -> Result<(&str, &str)> {
 }
 
 pub(super) fn audit_result(
-    rows: Vec<(ApplicableAdvisory, AdvisoryDetails)>,
+    rows: AdvisoryRows,
 ) -> Result<crate::core::security::scan::SecurityAuditResult> {
     use crate::core::security::scan::{
         AdvisoryReference as Reference, AdvisorySeverity, MinimumSeverity, NativeAdvisory,
@@ -194,35 +196,106 @@ pub(super) fn audit_result(
     })
 }
 
+pub(super) fn add_architecture_findings(
+    result: &mut crate::core::security::scan::SecurityAuditResult,
+    rows: AdvisoryRows,
+    candidates: &BTreeMap<String, Vec<InstalledIdentity>>,
+) -> Result<()> {
+    use crate::core::security::scan::{FindingApplicability, MinimumSeverity};
+
+    let supplemental = audit_result(rows)?;
+    let mut groups: BTreeMap<_, _> = std::mem::take(&mut result.vulnerabilities)
+        .into_iter()
+        .collect();
+    for (name, findings) in supplemental.vulnerabilities {
+        let existing = groups.entry(name).or_default();
+        for mut finding in findings {
+            let fixed = &finding
+                .native_advisory
+                .as_ref()
+                .context("Supplemental DNF advisory lacks its native evidence")?
+                .advisory_nevra;
+            finding.affected_installed = candidates
+                .get(fixed)
+                .into_iter()
+                .flatten()
+                .filter(|identity| {
+                    !existing.iter().any(|previous| {
+                        previous.id == finding.id && previous.affected_installed.contains(identity)
+                    })
+                })
+                .cloned()
+                .collect();
+            if finding.affected_installed.is_empty() {
+                continue;
+            }
+            finding.applicability = FindingApplicability::Possible;
+            result.total_vulnerabilities += 1;
+            result.high_severity += usize::from(finding.meets_minimum(MinimumSeverity::High));
+            existing.push(finding);
+        }
+        existing.sort_by(|left, right| left.id.cmp(&right.id));
+    }
+    result.vulnerabilities = groups
+        .into_iter()
+        .filter(|(_, findings)| !findings.is_empty())
+        .collect();
+    Ok(())
+}
+
 /// Join an applicable list to metadata without expanding collection packages.
 /// Missing or conflicting metadata invalidates the whole result.
-pub(super) fn join_advisories(
-    applicable: &[u8],
-    details: &[u8],
-) -> Result<Vec<(ApplicableAdvisory, AdvisoryDetails)>> {
+pub(super) fn join_advisories(applicable: &[u8], details: &[u8]) -> Result<AdvisoryRows> {
     let rows: Vec<ApplicableAdvisory> =
         serde_json::from_slice(applicable).context("Invalid DNF applicable advisory list")?;
-    let metadata: Vec<AdvisoryDetails> =
+    let metadata: Vec<&RawValue> =
         serde_json::from_slice(details).context("Invalid DNF advisory details")?;
-    let mut by_id = BTreeMap::new();
-    for detail in metadata {
+    join_rows(rows, metadata)
+}
+
+pub(super) fn cached_lookup_result(bytes: &[u8]) -> Result<AdvisoryRows> {
+    #[derive(Deserialize)]
+    struct CachedLookup<'a> {
+        applicable: Vec<ApplicableAdvisory>,
+        #[serde(borrow)]
+        details: Vec<&'a RawValue>,
+    }
+    let lookup: CachedLookup<'_> =
+        serde_json::from_slice(bytes).context("Invalid cached DNF advisory lookup")?;
+    join_rows(lookup.applicable, lookup.details)
+}
+
+fn join_rows(rows: Vec<ApplicableAdvisory>, metadata: Vec<&RawValue>) -> Result<AdvisoryRows> {
+    let mut by_id: BTreeMap<String, (&RawValue, AdvisoryDetails)> = BTreeMap::new();
+    for raw in metadata {
+        let detail: AdvisoryDetails =
+            serde_json::from_str(raw.get()).context("Invalid DNF advisory details")?;
         ensure!(!detail.name.is_empty(), "Empty DNF advisory identity");
-        ensure!(
-            by_id.insert(detail.name.clone(), detail).is_none(),
-            "Duplicate DNF advisory metadata"
-        );
+        match by_id.entry(detail.name.clone()) {
+            Entry::Vacant(entry) => {
+                entry.insert((raw, detail));
+            }
+            Entry::Occupied(entry) => {
+                // DNF can emit the same record from multiple mirror IDs.
+                // Compare the full row, including fields unused by the report.
+                ensure!(
+                    entry.get().0.get() == raw.get(),
+                    "Conflicting DNF advisory metadata"
+                );
+            }
+        }
     }
     // Retain each selected detail independently: one advisory may apply to
     // multiple installed packages, while unselected collection entries stay out.
     let mut joined = Vec::new();
-    let mut selected = std::collections::BTreeSet::new();
+    let mut selected = BTreeSet::new();
     for row in rows {
         ensure!(
             !row.name.is_empty() && !row.nevra.is_empty(),
             "Empty DNF advisory selection"
         );
         package_identity(&row.nevra)?;
-        let detail = by_id
+        let (_, detail) = by_id
             .get(&row.name)
             .context("Missing DNF advisory metadata")?;
         ensure!(
@@ -318,9 +391,12 @@ mod tests {
             br#"[{"id":"updates","is_enabled":false}]"#,
             br#"[{"id":"","is_enabled":true}]"#,
         ] {
-            assert!(require_enabled_repositories(bytes).is_err());
+            assert!(enabled_repository_ids(bytes).is_err());
         }
-        require_enabled_repositories(br#"[{"id":"updates","is_enabled":true}]"#).unwrap();
+        assert_eq!(
+            enabled_repository_ids(br#"[{"id":"updates","is_enabled":true}]"#).unwrap(),
+            BTreeSet::from(["updates".to_owned()])
+        );
     }
 
     const LIST: &[u8] = br#"[{"name":"FEDORA-test","type":"security","severity":"Important","nevra":"bind-libs-32:9.18-2.fc44.x86_64"}]"#;
@@ -375,8 +451,68 @@ mod tests {
         assert!(join_advisories(&partial, DETAILS).is_err());
         let detail: serde_json::Value =
             serde_json::from_slice::<Vec<_>>(DETAILS).unwrap().remove(0);
-        let duplicated = serde_json::to_vec(&vec![detail.clone(), detail]).unwrap();
-        assert!(join_advisories(LIST, &duplicated).is_err());
+        let duplicated = serde_json::to_vec(&vec![detail.clone(), detail.clone()]).unwrap();
+        let result = audit_result(join_advisories(&list, &duplicated).unwrap()).unwrap();
+        assert_eq!(result.total_vulnerabilities, 2);
+        assert_eq!(result.high_severity, 2);
+
+        for field in ["Description", "collections"] {
+            let mut different = detail.clone();
+            different[field] = "Conflicting mirror data".into();
+            let conflict = serde_json::to_vec(&vec![detail.clone(), different]).unwrap();
+            let error = join_advisories(LIST, &conflict).unwrap_err();
+            assert!(
+                error.to_string().contains("Conflicting DNF advisory"),
+                "{error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn cached_architecture_findings_stay_possible_and_preserve_unknown_coverage() -> Result<()> {
+        use crate::core::security::scan::FindingApplicability;
+
+        let payload = serde_json::json!({
+            "applicable": serde_json::from_slice::<serde_json::Value>(LIST)?,
+            "details": serde_json::from_slice::<serde_json::Value>(DETAILS)?,
+        });
+        let bytes = serde_json::to_vec(&payload)?;
+        let installed = InstalledIdentity {
+            name: "bind-libs".into(),
+            version: "32:9.18-1.fc44".into(),
+            architecture: Some("noarch".into()),
+        };
+        let mut report = audit_result(Vec::new())?;
+        report.coverage = AuditCoverage::Reported {
+            assessed: Vec::new(),
+            unassessed: vec![UnassessedPackage {
+                package: installed.clone(),
+                reason: UnknownCoverage::EvidenceUnavailable,
+            }],
+            sources: vec![AdvisoryProvenance::NativeDnf],
+        };
+        let candidates = BTreeMap::from([(
+            "bind-libs-32:9.18-2.fc44.x86_64".into(),
+            vec![installed.clone()],
+        )]);
+        for _ in 0..2 {
+            add_architecture_findings(&mut report, cached_lookup_result(&bytes)?, &candidates)?;
+        }
+        report.validate()?;
+        assert_eq!(report.total_vulnerabilities, 1);
+        assert_eq!(report.high_severity, 1);
+        assert_eq!(
+            report.vulnerabilities[0].1[0].applicability,
+            FindingApplicability::Possible
+        );
+        assert_eq!(
+            report.vulnerabilities[0].1[0].affected_installed,
+            [installed]
+        );
+        assert!(
+            matches!(report.coverage, AuditCoverage::Reported { assessed, .. } if assessed.is_empty())
+        );
+        Ok(())
     }
 
     #[test]

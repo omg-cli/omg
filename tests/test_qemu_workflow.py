@@ -869,10 +869,42 @@ class SecurityBoundaryTests(unittest.TestCase):
     def test_staged_fedora_target_is_executed_and_reconciled(self):
         bash = shutil.which('bash')
         self.assertIsNotNone(bash, 'staged workflow regression requires Bash')
+        repo = WORKFLOW.parents[2]
+        native_runner = repo / 'scripts/run-native-contracts.py'
+        preflight = subprocess.run(
+            [sys.executable, '-c',
+             "import runpy, sys; runpy.run_path(sys.argv[1])['fedora_source_tests']()",
+             str(native_runner)],
+            cwd=repo, capture_output=True, text=True, timeout=10,
+        )
+        self.assertEqual(preflight.returncode, 0, preflight.stdout + preflight.stderr)
+        fixture_source = """#![cfg(all(target_os = "linux", feature = "fedora"))]
+mod dnf_integration {
+    #[test]
+    fn ordinary_probe() {}
+    #[tokio::test]
+    async fn async_probe() {}
+}
+mod dnf_rpm_database {
+    #[test]
+    fn database_probe() {}
+}
+mod dnf_operations {
+    #[test]
+    #[ignore = "requires a disposable Fedora guest"]
+    #[serial_test::serial(history_ownership)]
+    fn cleanup_probe() {}
+}
+mod dnf_error_handling {
+    #[test]
+    fn command_error_probe() {}
+}
+"""
         for (label, workflow, feature_expression), mode in itertools.product((
             ('lane', LANE, '${{ inputs.features }}'),
             ('matrix-arm', PARENT, '${{ matrix.features }}'),
-        ), ('intact', 'missing-target', 'missing-library', 'missing-cli', 'missing-declaration', 'missing-body', 'selected-skip',
+        ), ('intact', 'missing-target', 'missing-library', 'missing-cli', 'missing-declaration',
+            'extra-compiled', 'missing-body', 'selected-skip',
             'default-ignored', 'ignored-selected', 'default-filtered', 'reused-refusal')):
             with self.subTest(workflow=label, mode=mode), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
@@ -880,16 +912,24 @@ class SecurityBoundaryTests(unittest.TestCase):
                 tools.mkdir()
                 capture = root / 'calls.jsonl'
                 for name in ('Cargo.toml', 'Cargo.lock', '.config/nextest.toml',
-                             'tests/fedora_tests.rs', 'tests/common/mod.rs', 'tests/platform_semantics.rs'):
+                             'tests/common/mod.rs', 'tests/platform_semantics.rs'):
                     target = root / name
                     target.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copyfile(WORKFLOW.parents[2] / name, target)
+                    shutil.copyfile(repo / name, target)
+                (root / 'tests/fedora_tests.rs').write_text(fixture_source, encoding='utf-8')
                 cargo = tools / 'cargo'
                 cargo.write_text(f'#!{sys.executable}\n' + r'''
 import json, os, pathlib, sys, xml.etree.ElementTree as ET
 args = sys.argv[1:]
 with open(os.environ['CAPTURE'], 'a') as output: output.write(json.dumps(args)+'\n')
-fedora = {'dnf_integration::bounded_cli_child_is_terminated_and_reaped_after_timeout': False, 'dnf_integration::bounded_cli_child_rejects_excess_output': False, 'dnf_integration::native_daemon_starts_and_searches_without_installed_inventory_changes': False, 'dnf_integration::native_catalog_observation_survives_readonly_rpm_and_dnf_queries': False, 'dnf_integration::native_catalog_observation_survives_ordinary_user_readonly_wal': False, 'dnf_integration::test_dnf_package_manager_creation': False, 'dnf_integration::repository_lookup_finds_uninstalled_package': False, 'dnf_integration::repository_info_resolves_architecture_and_nevra_selectors': False, 'dnf_integration::installed_info_resolves_native_full_nevra_with_zero_epoch': False, 'dnf_integration::cli_install_preview_accepts_native_full_nevra': False, 'dnf_integration::installed_status_resolves_native_full_nevra_with_zero_epoch': False, 'dnf_integration::cli_info_resolves_native_full_nevra': False, 'dnf_integration::cli_json_info_resolves_native_full_nevra': False, 'dnf_integration::repository_search_has_one_installed_row_per_architecture': False, 'dnf_integration::explicit_cli_matches_native_backend_without_a_daemon': False, 'dnf_integration::size_cli_matches_native_installed_packages': False, 'dnf_integration::installed_metadata_does_not_hide_excluded_packages': False, 'dnf_integration::why_cli_matches_native_reasons_and_reverse_requirements': False, 'dnf_integration::blame_cli_uses_native_details_and_canonical_omg_history': False, 'dnf_integration::native_transactions_record_install_remove_and_ignore_noops': True, 'dnf_integration::native_history_honors_custom_and_disabled_service_history': True, 'dnf_integration::cleanup_preview_preserves_installed_packages': False, 'dnf_integration::test_search_common_package': False, 'dnf_integration::test_search_nonexistent_package': False, 'dnf_integration::test_list_installed_packages': False, 'dnf_integration::installed_rpm_selection_rejects_inexact_or_noninstalled_records': False, 'dnf_integration::test_list_updates': False, 'dnf_integration::test_is_installed_check': False, 'dnf_rpm_database::test_rpm_database_query': False, 'dnf_operations::test_orphan_cleanup_history': True, 'dnf_operations::test_update_all_packages': True, 'dnf_operations::test_sync_repository_metadata': True, 'dnf_error_handling::test_install_invalid_package': False, 'common::tests::explicit_timeout_overrides_inherited_timeout': False}
+fedora = {
+    'dnf_integration::ordinary_probe': False,
+    'dnf_integration::async_probe': False,
+    'dnf_rpm_database::database_probe': False,
+    'dnf_operations::cleanup_probe': True,
+    'dnf_error_handling::command_error_probe': False,
+    'common::tests::explicit_timeout_overrides_inherited_timeout': False,
+}
 listing = {'rust-suites': {
     'omg': {'binary-id': 'omg', 'status': 'listed', 'testcases': {
         'library_smoke': {'ignored': False, 'filter-match': {'status': 'matches'}}}},
@@ -904,13 +944,16 @@ if mode == 'missing-target': del listing['rust-suites']['omg::fedora_tests']
 if mode == 'missing-library': del listing['rust-suites']['omg']
 if mode == 'missing-cli': del listing['rust-suites']['omg::bin/omg']
 if mode == 'missing-declaration':
-    del listing['rust-suites']['omg::fedora_tests']['testcases']['dnf_integration::installed_info_resolves_native_full_nevra_with_zero_epoch']
+    del listing['rust-suites']['omg::fedora_tests']['testcases']['dnf_integration::ordinary_probe']
+if mode == 'extra-compiled':
+    listing['rust-suites']['omg::fedora_tests']['testcases']['dnf_integration::undeclared'] = {
+        'ignored': False, 'filter-match': {'status': 'matches'}}
 if mode in ('default-ignored', 'default-filtered'):
-    case = listing['rust-suites']['omg::fedora_tests']['testcases']['dnf_integration::installed_info_resolves_native_full_nevra_with_zero_epoch']
+    case = listing['rust-suites']['omg::fedora_tests']['testcases']['dnf_integration::ordinary_probe']
     if mode == 'default-ignored': case['ignored'] = True
     else: case['filter-match']['status'] = 'mismatch'
 if mode == 'ignored-selected':
-    listing['rust-suites']['omg::fedora_tests']['testcases']['dnf_operations::test_orphan_cleanup_history']['ignored'] = False
+    listing['rust-suites']['omg::fedora_tests']['testcases']['dnf_operations::cleanup_probe']['ignored'] = False
 listing['test-count'] = sum(len(suite['testcases']) for suite in listing['rust-suites'].values())
 if args[:2] == ['nextest', 'list']:
     print(json.dumps(listing))
@@ -939,7 +982,7 @@ elif args[:2] == ['nextest', 'run']:
                 match = re.match(r'        run: (.*)\n', block)
                 self.assertIsNotNone(match)
                 script = match.group(1).replace(feature_expression, 'fedora,pgp,license')
-                script = script.replace('scripts/run-native-contracts.py', str(WORKFLOW.parents[2] / 'scripts/run-native-contracts.py'))
+                script = script.replace('scripts/run-native-contracts.py', str(native_runner))
                 env = dict(os.environ, PATH=str(tools)+os.pathsep+os.environ['PATH'],
                            CAPTURE=str(capture), STAGED_FIXTURE=mode, RUNNER_TEMP=str(root), GITHUB_SHA='fixture-stage-source',
                            OMG_CONTRACT_SOURCE_SHA='fixture-stage-source', PYTHONDONTWRITEBYTECODE='1')
@@ -975,10 +1018,11 @@ elif args[:2] == ['nextest', 'run']:
                 error = root / 'staged-unit-tests' / 'admission-error.json'
                 self.assertEqual(result.returncode, int(mode != 'intact'), result.stdout+result.stderr+
                                  (error.read_text() if error.exists() else ''))
-                if mode in ('missing-target', 'missing-library', 'missing-cli', 'missing-declaration', 'missing-body',
+                if mode in ('missing-target', 'missing-library', 'missing-cli', 'missing-declaration', 'extra-compiled', 'missing-body',
                             'default-ignored', 'ignored-selected', 'default-filtered'):
                     self.assertIn('required binary missing' if mode in ('missing-target', 'missing-library', 'missing-cli') else
                                   'Fedora declaration missing' if mode == 'missing-declaration' else
+                                  'unreviewed compiled Fedora test' if mode == 'extra-compiled' else
                                   'Fedora declaration disposition mismatch' if mode in
                                   ('default-ignored', 'ignored-selected', 'default-filtered') else 'missing selected execution',
                                   json.loads(error.read_text())['error'])
@@ -987,12 +1031,21 @@ elif args[:2] == ['nextest', 'run']:
                           status=result.returncode, calls=calls, error=json.loads(error.read_text()))))
                     continue
                 observed = json.loads((root / 'staged-unit-tests' / 'selection.json').read_text())
-                self.assertEqual(observed['counts'], dict(discovered=37, selected=32, executed=32,
-                                      passed=32, failed=0, skipped=5, filtered=0, retried=0) if mode == 'intact'
-                                      else dict(discovered=37, selected=32, executed=31, passed=31, failed=0,
-                                            skipped=6, filtered=0, retried=0))
+                self.assertEqual(observed['counts'], dict(discovered=9, selected=8, executed=8,
+                                      passed=8, failed=0, skipped=1, filtered=0, retried=0) if mode == 'intact'
+                                      else dict(discovered=9, selected=8, executed=7, passed=7, failed=0,
+                                            skipped=2, filtered=0, retried=0))
                 self.assertTrue(observed['executed_required_binaries'])
-                self.assertEqual(set(observed['tests']), {'omg::fedora_tests::dnf_integration::bounded_cli_child_is_terminated_and_reaped_after_timeout', 'omg::fedora_tests::dnf_integration::bounded_cli_child_rejects_excess_output', 'omg::bin/omg::cli_smoke', 'omg::fedora_tests::dnf_integration::installed_rpm_selection_rejects_inexact_or_noninstalled_records', 'omg::fedora_tests::dnf_integration::explicit_cli_matches_native_backend_without_a_daemon', 'omg::fedora_tests::dnf_integration::test_is_installed_check', 'omg::fedora_tests::dnf_integration::why_cli_matches_native_reasons_and_reverse_requirements', 'omg::fedora_tests::dnf_integration::installed_metadata_does_not_hide_excluded_packages', 'omg::fedora_tests::dnf_integration::cli_info_resolves_native_full_nevra', 'omg::fedora_tests::dnf_integration::test_search_common_package', 'omg::fedora_tests::dnf_integration::repository_search_has_one_installed_row_per_architecture', 'omg::fedora_tests::dnf_integration::size_cli_matches_native_installed_packages', 'omg::fedora_tests::dnf_integration::native_catalog_observation_survives_ordinary_user_readonly_wal', 'omg::fedora_tests::dnf_integration::test_list_installed_packages', 'omg::fedora_tests::dnf_rpm_database::test_rpm_database_query', 'omg::fedora_tests::dnf_integration::repository_lookup_finds_uninstalled_package', 'omg::fedora_tests::dnf_integration::native_catalog_observation_survives_readonly_rpm_and_dnf_queries', 'omg::fedora_tests::dnf_integration::cleanup_preview_preserves_installed_packages', 'omg::fedora_tests::dnf_integration::test_list_updates', 'omg::library_smoke', 'omg::fedora_tests::dnf_integration::installed_status_resolves_native_full_nevra_with_zero_epoch', 'omg::fedora_tests::dnf_integration::native_daemon_starts_and_searches_without_installed_inventory_changes', 'omg::fedora_tests::dnf_integration::repository_info_resolves_architecture_and_nevra_selectors', 'omg::bin/omgd::daemon_smoke', 'omg::fedora_tests::dnf_integration::installed_info_resolves_native_full_nevra_with_zero_epoch', 'omg::fedora_tests::dnf_integration::cli_install_preview_accepts_native_full_nevra', 'omg::fedora_tests::common::tests::explicit_timeout_overrides_inherited_timeout', 'omg::fedora_tests::dnf_error_handling::test_install_invalid_package', 'omg::fedora_tests::dnf_integration::test_dnf_package_manager_creation', 'omg::fedora_tests::dnf_integration::test_search_nonexistent_package', 'omg::fedora_tests::dnf_integration::cli_json_info_resolves_native_full_nevra', 'omg::fedora_tests::dnf_integration::blame_cli_uses_native_details_and_canonical_omg_history'})
+                self.assertEqual(set(observed['tests']), {
+                    'omg::library_smoke',
+                    'omg::bin/omg::cli_smoke',
+                    'omg::bin/omgd::daemon_smoke',
+                    'omg::fedora_tests::dnf_integration::ordinary_probe',
+                    'omg::fedora_tests::dnf_integration::async_probe',
+                    'omg::fedora_tests::dnf_rpm_database::database_probe',
+                    'omg::fedora_tests::dnf_error_handling::command_error_probe',
+                    'omg::fedora_tests::common::tests::explicit_timeout_overrides_inherited_timeout',
+                })
                 print('STAGED_UNIT_FIXTURE '+json.dumps(dict(workflow=label, mode=mode,
                       status=result.returncode, calls=calls, selection=observed)))
 

@@ -216,13 +216,13 @@ fn display_security_audit(
                 vulns.len()
             );
             for vuln in vulns {
-                let score = vuln.score.map_or_else(
+                let score = vuln.score.as_deref().map_or_else(
                     || {
                         vuln.advisory_severity
                             .map(|severity| format!(" [Advisory severity: {severity:?}]"))
                             .unwrap_or_default()
                     },
-                    |s| format!(" [Score: {}]", style::sanitize_terminal_text(&s)),
+                    |s| format!(" [Score: {}]", style::sanitize_terminal_text(s)),
                 );
                 println!(
                     "    {} {} - {}{}{}",
@@ -240,6 +240,11 @@ fn display_security_audit(
                         ""
                     }
                 );
+                if let Some(url) =
+                    crate::core::security::advisory_review::primary_advisory_link(&vuln)
+                {
+                    println!("      {url}");
+                }
             }
             println!();
         }
@@ -1767,6 +1772,17 @@ mod tests {
                 assert!(text.contains("[Score: 9.8]"));
                 assert!(text.contains("[Advisory severity: Important]"));
                 assert_eq!(
+                    text.matches("https://www.cve.org/CVERecord?id=CVE-2026-1235")
+                        .count(),
+                    2
+                );
+                assert_eq!(
+                    text.matches("https://example.invalid/native-advisory")
+                        .count(),
+                    2
+                );
+                assert!(!text.contains("http://example.invalid/unverified"));
+                assert_eq!(
                     text.matches("[possible match; applicability unverified]")
                         .count(),
                     2
@@ -1790,8 +1806,9 @@ mod tests {
             return Ok(());
         }
         use crate::core::security::scan::{
-            AdvisorySeverity, AuditCoverage, FindingApplicability, InstalledIdentity,
-            SecurityAuditResult, UnassessedPackage, Vulnerability,
+            AdvisoryReference, AdvisorySeverity, AuditCoverage, FindingApplicability,
+            InstalledIdentity, NativeAdvisory, SecurityAuditResult, UnassessedPackage,
+            Vulnerability,
         };
         let identity = InstalledIdentity {
             name: "fixture\u{1b}]52;c;PKG-INJECT\u{7}".into(),
@@ -1843,6 +1860,29 @@ mod tests {
                 native_advisory: None,
                 affected_installed: vec![identity.clone()],
             };
+        let mut native = finding(
+            "FEDORA-fixture",
+            None,
+            None,
+            FindingApplicability::Applicable,
+        );
+        native.native_advisory = Some(NativeAdvisory {
+            source: "dnf5".into(),
+            advisory_nevra: "fixture-0:2-1.x86_64".into(),
+            published_severity: "Unspecified".into(),
+            description: "Local advisory fixture".into(),
+            references: [
+                "http://example.invalid/unverified",
+                "https://example.invalid/native-advisory",
+            ]
+            .into_iter()
+            .map(|url| AdvisoryReference {
+                id: "fixture".into(),
+                kind: "cve".into(),
+                url: url.into(),
+            })
+            .collect(),
+        });
         let result = SecurityAuditResult {
             coverage: partial,
             total_vulnerabilities: 3,
@@ -1862,12 +1902,7 @@ mod tests {
                         Some(AdvisorySeverity::Important),
                         FindingApplicability::Possible,
                     ),
-                    finding(
-                        "CVE-2026-1236",
-                        None,
-                        None,
-                        FindingApplicability::Applicable,
-                    ),
+                    native,
                 ],
             )],
         };

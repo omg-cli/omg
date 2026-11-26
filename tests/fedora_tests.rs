@@ -722,6 +722,28 @@ mod dnf_integration {
     }
 
     #[test]
+    fn fast_status_json_marks_fedora_package_checks_as_skipped() -> Result<()> {
+        let output = std::process::Command::new(assert_cmd::cargo::cargo_bin!("omg"))
+            .args(["status", "--fast", "--json"])
+            .env("OMG_DISABLE_DAEMON", "1")
+            .env("OMG_DISABLE_TELEMETRY", "1")
+            .env("OMG_TEST_MODE", "0")
+            .env_remove("OMG_TEST_DISTRO")
+            .env_remove("OMG_TEST_BACKEND")
+            .output()?;
+        anyhow::ensure!(
+            output.status.success(),
+            "Fedora fast status failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let counts: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+        assert_eq!(counts["updates_and_orphans_checked"], false, "{counts}");
+        assert_eq!(counts["updates_available"], 0, "{counts}");
+        assert_eq!(counts["orphan_packages"], 0, "{counts}");
+        Ok(())
+    }
+
+    #[test]
     fn cli_json_info_resolves_native_full_nevra() -> Result<()> {
         let (selector, name, version) = installed_bash_full_nevra()?;
         let output = std::process::Command::new(assert_cmd::cargo::cargo_bin!("omg"))
