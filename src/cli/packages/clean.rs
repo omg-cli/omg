@@ -44,8 +44,9 @@ pub async fn clean(
         "Package cleanup is not implemented for the Homebrew backend"
     );
     #[cfg(feature = "fedora")]
-    if aur && backend == crate::package_managers::Backend::Fedora {
-        anyhow::bail!("AUR cleanup is not available on Fedora");
+    if backend == crate::package_managers::Backend::Fedora {
+        anyhow::ensure!(!aur, "AUR cleanup is not available on Fedora");
+        return handle_fedora_clean(orphans, cache, all, dry_run, yes).await;
     }
     if dry_run {
         crate::cli::modern_ui::print_phase_header("🧹", "Clean Preview", "dry run");
@@ -57,11 +58,6 @@ pub async fn clean(
     #[cfg(not(feature = "arch"))]
     if aur {
         anyhow::bail!("AUR cleanup is not available without the Arch backend");
-    }
-
-    #[cfg(feature = "fedora")]
-    if backend == crate::package_managers::Backend::Fedora {
-        return handle_fedora_clean(orphans, cache, all, dry_run, yes).await;
     }
 
     // AUR cleanup needs an Arch-style package database. On Debian-like hosts
@@ -404,20 +400,31 @@ async fn handle_fedora_clean(
 ) -> Result<()> {
     use crate::package_managers::dnf::{DnfCleanup, DnfPackageManager};
 
-    let manager = DnfPackageManager::new();
-    if !orphans && !cache && !all {
-        let packages = DnfPackageManager::orphan_packages().await?;
+    let orphans = orphans || all;
+    let cache = cache || all;
+    let scope = match (orphans, cache) {
+        (true, true) => "Unneeded packages and downloaded archives",
+        (true, false) => "Unneeded packages",
+        (false, true) => "Downloaded package archives",
+        (false, false) => "Available cleanup options",
+    };
+    let phase = if dry_run { "Clean Preview" } else { "Clean" };
+    crate::cli::modern_ui::print_phase_header("🧹", phase, scope);
+    println!();
+
+    if !orphans && !cache {
+        let count = DnfPackageManager::orphan_count().await?;
         println!(
-            "DNF found {} unneeded packages (omg clean --orphans --dry-run to preview removals)",
-            packages.len()
+            "DNF found {count} unneeded packages (omg clean --orphans --dry-run to preview removals)"
         );
         println!("To clear downloaded package archives: omg clean --cache");
         return Ok(());
     }
+    let manager = DnfPackageManager::new();
     // No top-level prompt here: DnfPackageManager::cleanup owns the y/n
     // contract. A second prompt would double-consume piped answers; forward
     // explicit confirmation to the native transaction instead.
-    if orphans || all {
+    if orphans {
         if dry_run {
             let (plan, diagnostics) = DnfPackageManager::preview_orphan_cleanup().await?;
             super::common::print_dnf_preview(&plan, &diagnostics);
@@ -428,7 +435,7 @@ async fn handle_fedora_clean(
                 .await?;
         }
     }
-    if cache || all {
+    if cache {
         if dry_run {
             println!("Would clear downloaded package archives (dnf clean packages)");
         } else {

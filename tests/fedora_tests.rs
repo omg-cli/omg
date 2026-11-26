@@ -2109,6 +2109,23 @@ mod dnf_rpm_database {
 mod dnf_operations {
     use super::*;
 
+    #[test]
+    fn test_cache_cleanup_preview_declares_downloaded_archives() -> Result<()> {
+        let output = std::process::Command::new(assert_cmd::cargo::cargo_bin!("omg"))
+            .args(["clean", "--cache", "--dry-run"])
+            .env("NO_COLOR", "1")
+            .output()?;
+        let stdout = std::str::from_utf8(&output.stdout)?;
+        assert!(output.status.success(), "{output:?}");
+        assert!(
+            stdout.contains("Clean Preview\n    Downloaded package archives"),
+            "{stdout}"
+        );
+        assert!(stdout.contains("Would clear downloaded package archives (dnf clean packages)"));
+        assert!(stdout.contains("No changes made (dry run)"));
+        Ok(())
+    }
+
     #[tokio::test]
     #[ignore = "requires a disposable VM; installs and removes an orphan fixture"]
     async fn test_orphan_cleanup_history() -> Result<()> {
@@ -2138,6 +2155,7 @@ mod dnf_operations {
         let run = |args: &[&str], answer: &[u8]| -> Result<std::process::Output> {
             let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin!("omg"))
                 .env("OMG_DATA_DIR", fixture.path())
+                .env("NO_COLOR", "1")
                 .args(args)
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
@@ -2187,9 +2205,10 @@ mod dnf_operations {
             );
             let preview_stdout = String::from_utf8_lossy(&preview.stdout);
             anyhow::ensure!(
-                preview_stdout
-                    .lines()
-                    .any(|line| line.trim() == "Removing:")
+                preview_stdout.contains("Clean Preview\n    Unneeded packages")
+                    && preview_stdout
+                        .lines()
+                        .any(|line| line.trim() == "Removing:")
                     && preview_stdout.lines().any(|line| {
                         line.split_ascii_whitespace()
                             .take(3)
@@ -2217,6 +2236,9 @@ mod dnf_operations {
             anyhow::ensure!(
                 accepted.status.success() && !installed()?,
                 "Accepted cleanup did not remove the orphan"
+            );
+            assert!(
+                std::str::from_utf8(&accepted.stdout)?.contains("Clean\n    Unneeded packages")
             );
             let records = history.load()?;
             anyhow::ensure!(
