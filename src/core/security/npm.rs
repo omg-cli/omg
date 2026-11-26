@@ -3,7 +3,7 @@
 use anyhow::{Context, Result, ensure};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Deserializer};
-use sha2::{Digest as _, Sha256};
+use sha2::{Digest as _, Sha256, Sha512};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
@@ -112,7 +112,14 @@ impl std::fmt::Display for NpmRegistryPackage {
 }
 
 impl NpmRegistryPackage {
-    fn tarball_url(&self) -> String {
+    pub(crate) fn from_exact_spec(spec: &NpmSpec) -> Option<Self> {
+        Some(Self {
+            name: spec.name.clone(),
+            version: spec.version.clone()?,
+        })
+    }
+
+    pub(crate) fn tarball_url(&self) -> String {
         let basename = self.name.rsplit('/').next().unwrap_or(&self.name);
         format!(
             "{NPM_REGISTRY}{}/-/{basename}-{}.tgz",
@@ -156,6 +163,147 @@ impl NpmRegistryPackage {
             .context("Invalid npm registry SHA-512 integrity")?;
         Ok(metadata.dist.integrity)
     }
+}
+
+pub(crate) const MAX_PUBLISHED_ARCHIVE_BYTES: usize = 32 * 1024 * 1024;
+const MAX_PUBLISHED_TAR_BYTES: u64 = 128 * 1024 * 1024;
+
+pub(crate) struct PublishedNpmPlan {
+    pub(crate) manifest: Vec<u8>,
+    pub(crate) lock: Vec<u8>,
+}
+
+impl PublishedNpmPlan {
+    pub(crate) fn from_archive(
+        package: &NpmRegistryPackage,
+        archive: &[u8],
+        integrity: &str,
+        mut project: serde_json::Value,
+    ) -> Result<Self> {
+        validate_integrity(integrity)?;
+        ensure!(
+            archive.len() <= MAX_PUBLISHED_ARCHIVE_BYTES,
+            "Published npm archive exceeds its byte limit"
+        );
+        ensure!(
+            integrity
+                .strip_prefix("sha512-")
+                .is_some_and(|expected| { STANDARD.encode(Sha512::digest(archive)) == expected }),
+            "Published npm archive SHA-512 does not match exact registry metadata for {package}"
+        );
+        let (manifest, mut shrinkwrap) = read_published_npm_metadata(archive)?;
+        for document in [&manifest, &shrinkwrap] {
+            ensure!(
+                document["name"].as_str() == Some(&package.name)
+                    && document["version"].as_str() == Some(&package.version),
+                "Published npm metadata does not match {package}"
+            );
+        }
+        ensure!(
+            shrinkwrap["lockfileVersion"] == 3,
+            "Published npm shrinkwrap must use version 3"
+        );
+        let packages = shrinkwrap["packages"]
+            .as_object_mut()
+            .context("Published npm shrinkwrap has no package inventory")?;
+        let mut root = packages
+            .remove("")
+            .context("Published npm shrinkwrap has no root package")?;
+        ensure!(
+            root["name"] == manifest["name"] && root["version"] == manifest["version"],
+            "Published npm shrinkwrap root does not match its package manifest"
+        );
+        for field in [
+            "dependencies",
+            "optionalDependencies",
+            "peerDependencies",
+            "peerDependenciesMeta",
+        ] {
+            ensure!(
+                root[field] == manifest[field],
+                "Published npm shrinkwrap root differs from package manifest field '{field}'"
+            );
+        }
+        root.as_object_mut()
+            .context("Published npm shrinkwrap root is invalid")?
+            .remove("devDependencies");
+        root["resolved"] = package.tarball_url().into();
+        root["integrity"] = integrity.into();
+        root["hasShrinkwrap"] = true.into();
+        let project_deps = BTreeMap::from([(package.name.as_str(), package.version.as_str())]);
+        project["dependencies"] = serde_json::to_value(project_deps)?;
+        let prefix = format!("node_modules/{}", package.name);
+        let mut staged = serde_json::Map::from_iter([
+            (
+                String::new(),
+                serde_json::json!({
+                    "name": project["name"],
+                    "version": project["version"],
+                    "dependencies": project["dependencies"]
+                }),
+            ),
+            (prefix.clone(), root),
+        ]);
+        for (path, entry) in packages {
+            ensure!(
+                path.starts_with("node_modules/"),
+                "Published npm shrinkwrap contains a non-package path"
+            );
+            if entry["dev"].as_bool() != Some(true) {
+                staged.insert(format!("{prefix}/{path}"), std::mem::take(entry));
+            }
+        }
+        let lock = serde_json::to_vec(&serde_json::json!({
+            "name": project["name"],
+            "version": project["version"],
+            "lockfileVersion": 3,
+            "requires": true,
+            "packages": staged,
+        }))?;
+        Ok(Self {
+            manifest: serde_json::to_vec(&project)?,
+            lock,
+        })
+    }
+}
+
+fn read_published_npm_metadata(input: &[u8]) -> Result<(serde_json::Value, serde_json::Value)> {
+    use std::io::Read as _;
+
+    let decoded = flate2::read::GzDecoder::new(input).take(MAX_PUBLISHED_TAR_BYTES + 1);
+    let mut archive = tar::Archive::new(decoded);
+    let mut manifest = None;
+    let mut shrinkwrap = None;
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let (name, destination) = match entry.path_bytes().as_ref() {
+            b"package/package.json" => ("package.json", &mut manifest),
+            b"package/npm-shrinkwrap.json" => ("npm-shrinkwrap.json", &mut shrinkwrap),
+            _ => continue,
+        };
+        ensure!(
+            destination.is_none() && entry.header().entry_type().is_file(),
+            "Published npm archive has an invalid or duplicate {name}"
+        );
+        ensure!(
+            entry.size() <= MAX_LOCK_BYTES as u64,
+            "Published npm archive {name} exceeds its byte limit"
+        );
+        let mut contents = Vec::new();
+        entry.read_to_end(&mut contents)?;
+        *destination = Some(
+            serde_json::from_slice(&contents)
+                .with_context(|| format!("Invalid published npm archive {name}"))?,
+        );
+    }
+    ensure!(
+        archive.into_inner().limit() > 0,
+        "Published npm archive exceeds its expanded byte limit"
+    );
+    Ok((
+        manifest.context("Published npm archive has no package.json")?,
+        shrinkwrap.context("Published npm archive has no npm-shrinkwrap.json")?,
+    ))
 }
 
 impl NpmLock {
@@ -929,6 +1077,115 @@ mod tests {
             NpmLock::parse(&serde_json::to_vec(&changed)?, &spec())?.sha256,
             reviewed.sha256
         );
+        Ok(())
+    }
+
+    fn published_fixture(
+        manifest: &Value,
+        shrinkwrap: &Value,
+        duplicate_entry: bool,
+    ) -> Result<Vec<u8>> {
+        let mut archive = tar::Builder::new(flate2::write::GzEncoder::new(
+            Vec::new(),
+            flate2::Compression::fast(),
+        ));
+        for (path, document) in [
+            ("package/package.json", manifest),
+            ("package/npm-shrinkwrap.json", shrinkwrap),
+        ] {
+            let contents = serde_json::to_vec(document)?;
+            let mut header = tar::Header::new_ustar();
+            header.set_size(contents.len() as u64);
+            header.set_mode(0o644);
+            archive.append_data(&mut header, path, contents.as_slice())?;
+            if duplicate_entry && path.ends_with("npm-shrinkwrap.json") {
+                let mut duplicate = tar::Header::new_ustar();
+                duplicate.set_size(contents.len() as u64);
+                duplicate.set_mode(0o644);
+                archive.append_data(&mut duplicate, path, contents.as_slice())?;
+            }
+        }
+        Ok(archive.into_inner()?.finish()?)
+    }
+
+    #[test]
+    fn published_lock_builds_the_same_required_inventory_under_its_exact_registry_package()
+    -> Result<()> {
+        let request = NpmSpec::parse("app@1.0.0")?;
+        let exact = NpmRegistryPackage::from_exact_spec(&request).context("exact package")?;
+        let mut shrinkwrap = json!({
+            "name": "app", "version": "1.0.0", "lockfileVersion": 3,
+            "packages": {
+                "": {"name":"app","version":"1.0.0","dependencies":{"helper":"2.0.0"},"devDependencies":{"test-only":"3.0.0"}},
+                "node_modules/helper": package("helper", "2.0.0"),
+                "node_modules/test-only": package("test-only", "3.0.0")
+            }
+        });
+        shrinkwrap["packages"]["node_modules/test-only"]["dev"] = json!(true);
+        let manifest = shrinkwrap["packages"][""].clone();
+        let archive = published_fixture(&manifest, &shrinkwrap, false)?;
+        let digest = format!("sha512-{}", STANDARD.encode(Sha512::digest(&archive)));
+        let project = json!({"name":"omg-managed-tool","version":"0.0.0","private":true});
+        let staged = PublishedNpmPlan::from_archive(&exact, &archive, &digest, project.clone())?;
+        let lock = NpmLock::parse(&staged.lock, &request)?;
+        assert_eq!(
+            lock.packages.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["node_modules/app", "node_modules/app/node_modules/helper"]
+        );
+        let outer: Value = serde_json::from_slice(&staged.manifest)?;
+        assert_eq!(outer["dependencies"], json!({"app":"1.0.0"}));
+        assert!(outer["devDependencies"].is_null());
+        let frozen: Value = serde_json::from_slice(&staged.lock)?;
+        assert_eq!(frozen["packages"]["node_modules/app"]["integrity"], digest);
+        assert_eq!(
+            frozen["packages"]["node_modules/app"]["resolved"],
+            "https://registry.npmjs.org/app/-/app-1.0.0.tgz"
+        );
+        assert!(frozen["packages"]["node_modules/app"]["devDependencies"].is_null());
+
+        let selected = tempfile::tempdir()?;
+        materialize_fixture(selected.path(), &lock)?;
+        lock.verify_installed(selected.path(), &request)?;
+        Ok(())
+    }
+
+    #[test]
+    fn published_archive_must_match_the_registry_and_have_consistent_metadata() -> Result<()> {
+        let request = NpmSpec::parse("app@1.0.0")?;
+        let exact = NpmRegistryPackage::from_exact_spec(&request).context("exact package")?;
+        let manifest = json!({"name":"app","version":"1.0.0","dependencies":{"helper":"2.0.0"}});
+        let shrinkwrap = json!({
+            "name":"app","version":"1.0.0","lockfileVersion":3,
+            "packages": {"":manifest,"node_modules/helper":package("helper","2.0.0")}
+        });
+        let project = json!({"name":"omg-managed-tool","version":"0.0.0","private":true});
+        let ordinary = published_fixture(&manifest, &shrinkwrap, false)?;
+        let wrong_hash = format!("sha512-{}", STANDARD.encode([0; 64]));
+        let error = PublishedNpmPlan::from_archive(&exact, &ordinary, &wrong_hash, project.clone())
+            .err()
+            .context("different archive hash must fail")?;
+        assert!(format!("{error:#}").contains("SHA-512 does not match"));
+        let mut wrong_dependency = shrinkwrap.clone();
+        wrong_dependency["packages"][""]["dependencies"]["helper"] = json!("9.0.0");
+        let mut invalid_path = shrinkwrap.clone();
+        invalid_path["packages"]["../unreviewed"] = package("unreviewed", "1.0.0");
+        for (document, duplicate, expected) in [
+            (&shrinkwrap, true, "duplicate npm-shrinkwrap.json"),
+            (
+                &wrong_dependency,
+                false,
+                "differs from package manifest field",
+            ),
+            (&invalid_path, false, "contains a non-package path"),
+        ] {
+            let archive = published_fixture(&manifest, document, duplicate)?;
+            let integrity = format!("sha512-{}", STANDARD.encode(Sha512::digest(&archive)));
+            let error =
+                PublishedNpmPlan::from_archive(&exact, &archive, &integrity, project.clone())
+                    .err()
+                    .context("invalid published package must fail")?;
+            assert!(format!("{error:#}").contains(expected), "{error:#}");
+        }
         Ok(())
     }
 

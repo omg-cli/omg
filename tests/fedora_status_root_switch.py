@@ -8424,8 +8424,8 @@ fixture["seed_runtime_advisory_fixture"](pi, "pi", version, config)
                         output=result.stdout[-450:],
                     ))
 
-    def inspect_pi_integrity_admission():
-        phase = "pi-registry-integrity"
+    def inspect_pi_integrity_admission(*, legacy=False):
+        phase = "pi-published-shrinkwrap" if legacy else "pi-registry-integrity"
         version, node_version = "0.83.0", "24.22.3"
         seed = r"""
 import base64, json, runpy, shlex, sys
@@ -8451,8 +8451,9 @@ cli.write_text(
     'while [ "${1#--}" != "$1" ]; do shift; done\n'
     'printf "%s\\n" "$1" >> "$home/manager-phases"\n'
     '[ "$1" = install ] && [ "$2" = --prefix ] || exit 81\n'
-    'cp "$home/witness-lock.json" "$3/package-lock.json"\n'
     'if [ -f "$home/materialize-early" ]; then mkdir "$3/node_modules"; fi\n'
+    'if [ -f "$home/resolver-error" ]; then cat "$home/resolver-error"; exit 1; fi\n'
+    'cp "$home/witness-lock.json" "$3/package-lock.json"\n'
 )
 cli.chmod(0o755)
 (node / "bin/npm").symlink_to("../lib/node_modules/npm/bin/npm-cli.js")
@@ -8541,6 +8542,29 @@ pi.mkdir()
             "unresolved-peer": "npm lock omits a resolved peer dependency '@fixture/missing'",
             "early-materialization": "NPM lock resolution materialized packages before advisory review",
         }
+        recovery = "Failed to load the published npm shrinkwrap"
+        ordinary_failure = "failed; no package was admitted"
+        legacy_resolutions = {
+            "remote-code": ('{"error":{"code":"EALLOWREMOTE"}}', recovery),
+            "remote-details": ('{"error":{"code":"EALLOWREMOTE","summary":"remote","detail":""}}', recovery),
+            "remote-pretty": ('{\n  "error": { "summary": "remote", "code": "EALLOWREMOTE" }\n}\n', recovery),
+            "missing-body": ("", ordinary_failure),
+            "unstructured": ("EALLOWREMOTE", ordinary_failure),
+            "trailing-json": ('{"error":{"code":"EALLOWREMOTE"}}{}', ordinary_failure),
+            "wrong-envelope": ('{"code":"EALLOWREMOTE"}', ordinary_failure),
+            "wrong-error-type": ('{"error":"EALLOWREMOTE"}', ordinary_failure),
+            "missing-code": ('{"error":{"summary":"EALLOWREMOTE"}}', ordinary_failure),
+            "wrong-code-type": ('{"error":{"code":["EALLOWREMOTE"]}}', ordinary_failure),
+            "wrong-case": ('{"error":{"code":"eallowremote"}}', ordinary_failure),
+            "trailing-space": ('{"error":{"code":"EALLOWREMOTE "}}', ordinary_failure),
+            "git-refusal": ('{"error":{"code":"EALLOWGIT"}}', ordinary_failure),
+            "offline-refusal": ('{"error":{"code":"ENOTFOUND"}}', ordinary_failure),
+            "dependency-conflict": ('{"error":{"code":"ERESOLVE","detail":"EALLOWREMOTE"}}', ordinary_failure),
+            "failed-after-materializing": ('{"error":{"code":"EALLOWREMOTE"}}',
+                                           "NPM lock resolution materialized packages before advisory review"),
+        }
+        if legacy:
+            cases = {key: value[1] for key, value in legacy_resolutions.items()}
         for variant, diagnostic in cases.items():
             with tempfile.TemporaryDirectory(prefix=f"pi-integrity-{variant}-", dir=work) as directory:
                 home = Path(directory)
@@ -8553,6 +8577,12 @@ pi.mkdir()
                             OMG_NO_UPDATE_CHECK="1")
                 checked([sys.executable, "-I", "-B", "-c", seed, runtime_advisory_fixture, home,
                          version, node_version, variant], mode, ordinary)
+                if legacy:
+                    failure = home / "resolver-error"
+                    failure.write_text(legacy_resolutions[variant][0])
+                    os.chown(failure, account.pw_uid, account.pw_gid)
+                    if variant == "failed-after-materializing":
+                        (home / "materialize-early").touch()
                 versions = home / "data/versions/pi"
                 phases = home / "manager-phases"
                 original = (home / "witness-lock.json").read_bytes()
@@ -9698,6 +9728,7 @@ exec {shlex.quote(str(binary))} "$@"
                     inspect_container_cli()
                     inspect_pi_dependency_activation()
                     inspect_pi_integrity_admission()
+                    inspect_pi_integrity_admission(legacy=True)
                     inspect_info_attempts()
                     inspect_info_json_writes()
                     inspect_dashboard_terminal()
@@ -10030,6 +10061,6 @@ mark_progress("completed with host inventory unchanged")
 report = dict(binaries=binaries, checks=checks, total=len(checks),
               passed=sum(entry["passed"] for entry in checks), host_unchanged=True)
 print(json.dumps(report))
-expected_checks = 303 if consent_oracle is None else 3115
+expected_checks = 303 if consent_oracle is None else 3147
 if report["passed"] != report["total"] or report["total"] != expected_checks:
     sys.exit(4)

@@ -5,13 +5,15 @@ use crate::cli::tool::{
     host_environment_is_allowed, package_is_allowed, secured_manager_command,
 };
 use crate::core::security::npm::{
-    MAX_LOCK_BYTES, MissingNpmIntegrity, NpmLock, NpmLockStatus, NpmRegistryPackage, NpmSpec,
-    read_metadata as read_npm_metadata,
+    MAX_LOCK_BYTES, MAX_PUBLISHED_ARCHIVE_BYTES, MissingNpmIntegrity, NpmLock, NpmLockStatus,
+    NpmRegistryPackage, NpmSpec, PublishedNpmPlan, read_metadata as read_npm_metadata,
 };
 use anyhow::{Context, Result};
 use std::collections::BTreeMap;
+use std::io::{Read as _, Seek as _};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 pub(crate) struct ManagedNpm {
     versions_dir: PathBuf,
@@ -102,44 +104,50 @@ impl ManagedNpm {
     }
 }
 
+fn registry_client() -> Result<&'static reqwest::Client> {
+    static CLIENT: std::sync::LazyLock<Result<reqwest::Client, reqwest::Error>> =
+        std::sync::LazyLock::new(|| {
+            reqwest::Client::builder()
+                .user_agent("omg-package-manager")
+                .redirect(reqwest::redirect::Policy::none())
+                .connect_timeout(Duration::from_secs(5))
+                .timeout(Duration::from_secs(30))
+                .build()
+        });
+    CLIENT
+        .as_ref()
+        .map_err(|error| anyhow::anyhow!("Cannot create npm registry HTTPS client: {error}"))
+}
+
+async fn registry_integrity(package: &NpmRegistryPackage) -> Result<String> {
+    let response = registry_client()?
+        .get(package.metadata_url()?)
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+        .with_context(|| format!("Fetching npm metadata for {package}"))?;
+    anyhow::ensure!(
+        response.status().is_success(),
+        "npm registry metadata for {package} returned HTTP {}",
+        response.status()
+    );
+    let bytes = crate::core::http::bounded_metadata_body_with_limit(response, 1024 * 1024)
+        .await
+        .with_context(|| format!("Reading npm metadata for {package}"))?;
+    package.integrity_from_metadata(&bytes)
+}
+
 fn recover_registry_integrities(
     missing: &MissingNpmIntegrity,
 ) -> Result<BTreeMap<NpmRegistryPackage, String>> {
     use futures::{StreamExt as _, TryStreamExt as _};
-    use std::sync::LazyLock;
-    use std::time::Duration;
 
-    static CLIENT: LazyLock<Result<reqwest::Client, reqwest::Error>> = LazyLock::new(|| {
-        reqwest::Client::builder()
-            .user_agent("omg-package-manager")
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(Duration::from_secs(5))
-            .timeout(Duration::from_secs(10))
-            .build()
-    });
-    let client = CLIENT
-        .as_ref()
-        .map_err(|error| anyhow::anyhow!("Cannot create npm registry HTTPS client: {error}"))?;
     let packages = missing.packages().cloned().collect::<Vec<_>>();
     crate::cli::tea::run_blocking_future(async move {
         tokio::time::timeout(Duration::from_secs(30), async move {
             futures::stream::iter(packages)
                 .map(|package| async move {
-                    let response = client
-                        .get(package.metadata_url()?)
-                        .send()
-                        .await
-                        .with_context(|| format!("Fetching npm metadata for {package}"))?;
-                    anyhow::ensure!(
-                        response.status().is_success(),
-                        "npm registry metadata for {package} returned HTTP {}",
-                        response.status()
-                    );
-                    let bytes =
-                        crate::core::http::bounded_metadata_body_with_limit(response, 1024 * 1024)
-                            .await
-                            .with_context(|| format!("Reading npm metadata for {package}"))?;
-                    let integrity = package.integrity_from_metadata(&bytes)?;
+                    let integrity = registry_integrity(&package).await?;
                     Ok((package, integrity))
                 })
                 .buffer_unordered(8)
@@ -149,6 +157,39 @@ fn recover_registry_integrities(
         .await
         .context("npm registry integrity resolution exceeded its deadline")?
     })?
+}
+
+fn published_npm_plan(
+    package: NpmRegistryPackage,
+    project: serde_json::Value,
+) -> Result<PublishedNpmPlan> {
+    crate::cli::tea::run_blocking_future(async move {
+        let integrity = registry_integrity(&package).await?;
+        let response = registry_client()?.get(package.tarball_url()).send().await?;
+        anyhow::ensure!(
+            response.status().is_success(),
+            "Published npm archive for {package} returned HTTP {}",
+            response.status()
+        );
+        let archive = crate::core::http::bounded_metadata_body_with_limit(
+            response,
+            MAX_PUBLISHED_ARCHIVE_BYTES,
+        )
+        .await?;
+        PublishedNpmPlan::from_archive(&package, &archive, &integrity, project)
+    })?
+}
+
+fn is_npm_remote_refusal(output: &mut std::fs::File) -> Result<bool> {
+    const MAX_ERROR_BYTES: u64 = 64 * 1024;
+    output.rewind()?;
+    let mut data = Vec::new();
+    output.take(MAX_ERROR_BYTES + 1).read_to_end(&mut data)?;
+    if data.len() > MAX_ERROR_BYTES as usize {
+        return Ok(false);
+    }
+    Ok(serde_json::from_slice::<serde_json::Value>(&data)
+        .is_ok_and(|error| error["error"]["code"].as_str() == Some("EALLOWREMOTE")))
 }
 
 fn prepare_npm_lock(
@@ -224,6 +265,7 @@ fn install_reviewed_npm_with_registry<'a>(
         .context("npm staging path is not UTF-8")?;
     runtime.verify()?;
     node_admission.verify(&runtime.version_dir)?;
+    let mut resolution_output = tempfile::tempfile_in(staging_dir)?;
     let status = runtime
         .command(staging_dir, package)?
         .args([
@@ -234,21 +276,38 @@ fn install_reviewed_npm_with_registry<'a>(
             "--save-exact",
             "--ignore-scripts",
             "--package-lock=true",
+            "--json",
             "--",
             package,
         ])
-        .stdout(std::process::Stdio::null())
+        .stdout(resolution_output.try_clone()?)
         .stderr(std::process::Stdio::inherit())
         .status()?;
-    anyhow::ensure!(
-        status.success(),
-        "NPM install resolution of '{package}' failed; no package was admitted"
-    );
     anyhow::ensure!(
         !staging_dir.join("node_modules").try_exists()?,
         "NPM lock resolution materialized packages before advisory review"
     );
     let lock_path = staging_dir.join("package-lock.json");
+    if !status.success() {
+        let no_lock = match std::fs::symlink_metadata(&lock_path) {
+            Ok(_) => false,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+            Err(error) => return Err(error.into()),
+        };
+        let requested = NpmRegistryPackage::from_exact_spec(&spec);
+        let legacy_refusal = no_lock && is_npm_remote_refusal(&mut resolution_output)?;
+        let Some(requested) = requested.filter(|_| legacy_refusal) else {
+            anyhow::bail!("NPM install resolution of '{package}' failed; no package was admitted");
+        };
+        let plan = published_npm_plan(requested, manifest)
+            .context("Failed to load the published npm shrinkwrap")?;
+        NpmLock::inspect(&plan.lock, &spec)?;
+        crate::core::safe_ops::atomic_write_file_sync(
+            staging_dir.join("package.json"),
+            plan.manifest,
+        )?;
+        crate::core::safe_ops::atomic_write_file_sync(&lock_path, plan.lock)?;
+    }
     let lock = prepare_npm_lock(&lock_path, &spec, recover)?;
     let review = review_lock(
         package,
