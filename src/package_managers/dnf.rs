@@ -4,7 +4,7 @@
 //! fast queries without CLI overhead.
 //!
 //! ## Architecture
-//! 1. Read installed packages from `/var/lib/rpm/rpmdb.sqlite`
+//! 1. Read installed packages from RPM's configured SQLite database
 //!    (`rpm -qa` subprocess fallback for BDB/NDB systems)
 //! 2. Parse RPM header blobs for metadata extraction
 //!
@@ -52,11 +52,53 @@ mod rpm_tags {
 
 /// DNF Package Manager implementation
 pub struct DnfPackageManager {
-    /// Path to RPM `SQLite` database
-    rpm_db_path: PathBuf,
+    rpm_database: RpmDatabaseSource,
     /// Complete RPM inventory bound to database/WAL identity and SQLite commits.
     /// Install reasons belong to DNF's separate state and are queried on demand.
     installed_cache: Arc<RwLock<Option<InstalledSnapshot>>>,
+}
+
+#[derive(Clone)]
+enum RpmDatabaseSource {
+    System,
+    #[cfg(test)]
+    Fixture(PathBuf),
+}
+
+impl RpmDatabaseSource {
+    fn sqlite_path(&self) -> Result<Option<PathBuf>> {
+        match self {
+            Self::System => {
+                // Resolve each observation against native configuration. A
+                // live daemon can outlast an administrator's macro change.
+                let output = DnfPackageManager::rpm_query(
+                    ["--eval", "%{_db_backend}\t%{_dbpath}"],
+                    std::time::Duration::from_secs(2),
+                )
+                .context("Could not read RPM database configuration")?;
+                Self::parse(&output)
+            }
+            #[cfg(test)]
+            Self::Fixture(path) => Ok(Some(path.clone())),
+        }
+    }
+
+    fn parse(output: &[u8]) -> Result<Option<PathBuf>> {
+        let (backend, directory) = std::str::from_utf8(output)
+            .context("RPM database configuration is not UTF-8")?
+            .trim_end_matches('\n')
+            .split_once('\t')
+            .context("RPM database configuration must specify backend and path")?;
+        if backend != "sqlite" {
+            return Ok(None);
+        }
+        let path = Path::new(directory);
+        anyhow::ensure!(
+            path.is_absolute() && !directory.chars().any(char::is_control),
+            "RPM database path must be an absolute path without control characters"
+        );
+        Ok(Some(path.join("rpmdb.sqlite")))
+    }
 }
 
 #[derive(Debug)]
@@ -154,13 +196,15 @@ struct RpmDatabaseObservation {
 }
 
 struct RpmInstalledCatalogObservation {
+    source: RpmDatabaseSource,
     path: PathBuf,
     database: RpmDatabaseObservation,
 }
 
 impl super::InstalledCatalogObservation for RpmInstalledCatalogObservation {
     fn is_current(&self) -> Result<bool> {
-        Ok(self.database.is_current(&self.path))
+        Ok(self.source.sqlite_path()?.as_ref() == Some(&self.path)
+            && self.database.is_current(&self.path))
     }
 }
 
@@ -607,10 +651,15 @@ impl DnfPackageManager {
                 input.len() <= 64 * 1024,
                 "Native RPM comparison input exceeds limit"
             );
-            let mut command =
-                tokio::process::Command::from(crate::core::privilege::system_command("rpm")?);
+            let mut command = Self::rpm_query_command()?;
             command.env("OMG_EVR_PAIRS", input).args(["--eval", r#"%{lua:local left=nil; for value in string.gmatch(os.getenv("OMG_EVR_PAIRS"), "[^\n]+") do if left then print(string.format("%d\n",rpm.vercmp(left,value))); left=nil else left=value end end; if left then error("incomplete comparison") end}"#]);
-            let output = Self::query_output(command).await?;
+            let output = Self::controlled_query_output(
+                "RPM",
+                command,
+                std::time::Duration::from_mins(1),
+                None,
+            )
+            .await?;
             let compared = std::str::from_utf8(&output)?
                 .split_whitespace()
                 .map(|value| match value {
@@ -826,7 +875,7 @@ impl DnfPackageManager {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            rpm_db_path: PathBuf::from("/var/lib/rpm/rpmdb.sqlite"),
+            rpm_database: RpmDatabaseSource::System,
             installed_cache: Arc::new(RwLock::new(None)),
         }
     }
@@ -850,24 +899,26 @@ impl DnfPackageManager {
         *self.cache_write() = None;
     }
 
-    fn cached_installed_packages(&self) -> Option<Arc<Vec<InstalledPackage>>> {
+    fn cached_installed_packages(&self, path: &Path) -> Option<Arc<Vec<InstalledPackage>>> {
         self.cache_read()
             .as_ref()
-            .filter(|snapshot| snapshot.observation.is_current(&self.rpm_db_path))
+            .filter(|snapshot| snapshot.observation.is_current(path))
             .map(|snapshot| Arc::clone(&snapshot.packages))
     }
 
     fn publish_installed_packages(
         &self,
+        path: Option<&Path>,
         packages: Arc<Vec<InstalledPackage>>,
         observed_identity: Option<RpmDatabaseObservation>,
     ) {
         // Never label an old read with a newer generation, or cache a CLI
         // fallback whose actual database was not observed. Empty inventories
         // are valid snapshots too.
-        let snapshot = observed_identity
-            .filter(|observation| observation.is_current(&self.rpm_db_path))
-            .map(|observation| InstalledSnapshot {
+        let snapshot = path
+            .zip(observed_identity)
+            .filter(|(path, observation)| observation.is_current(path))
+            .map(|(_, observation)| InstalledSnapshot {
                 observation,
                 packages,
             });
@@ -898,12 +949,14 @@ impl DnfPackageManager {
     /// # Errors
     /// Returns an error when the installed RPM inventory cannot be read.
     pub fn installed_count(&self) -> Result<usize> {
-        Ok(self.load_installed_packages_blocking()?.len())
+        let path = self.rpm_database.sqlite_path()?;
+        let (packages, _) = Self::read_rpm_database(path.as_deref(), false)?;
+        Ok(packages.len())
     }
 
     /// Load installed packages from RPM `SQLite` database
     ///
-    /// Reads directly from `/var/lib/rpm/rpmdb.sqlite` and parses RPM header blobs
+    /// Reads directly from the configured SQLite database and parses RPM header blobs
     /// to extract package metadata. Caches results in memory for subsequent calls.
     async fn load_installed_packages(&self) -> Result<Arc<Vec<InstalledPackage>>> {
         let manager = self.cache_handle();
@@ -911,12 +964,20 @@ impl DnfPackageManager {
     }
 
     fn load_installed_packages_blocking(&self) -> Result<Arc<Vec<InstalledPackage>>> {
-        if let Some(cached) = self.cached_installed_packages() {
+        let path = self.rpm_database.sqlite_path()?;
+        self.load_installed_packages_at(path.as_deref())
+    }
+
+    fn load_installed_packages_at(
+        &self,
+        path: Option<&Path>,
+    ) -> Result<Arc<Vec<InstalledPackage>>> {
+        if let Some(cached) = path.and_then(|path| self.cached_installed_packages(path)) {
             return Ok(cached);
         }
-        let (packages, identity) = Self::read_rpm_database(&self.rpm_db_path)?;
+        let (packages, identity) = Self::read_rpm_database(path, true)?;
         let packages = Arc::new(packages);
-        self.publish_installed_packages(Arc::clone(&packages), identity);
+        self.publish_installed_packages(path, Arc::clone(&packages), identity);
         Ok(packages)
     }
 
@@ -925,13 +986,16 @@ impl DnfPackageManager {
     }
 
     fn matching_installed_packages(&self, selector: &str) -> Result<Vec<InstalledPackage>> {
-        match Self::read_rpm_name_index(&self.rpm_db_path, selector) {
-            Ok(packages) if !packages.is_empty() => return Ok(packages),
-            Ok(_) => {}
-            Err(error) => tracing::debug!("RPM name lookup unavailable: {error:#}"),
+        let path = self.rpm_database.sqlite_path()?;
+        if let Some(path) = &path {
+            match Self::read_rpm_name_index(path, selector) {
+                Ok(packages) if !packages.is_empty() => return Ok(packages),
+                Ok(_) => {}
+                Err(error) => tracing::debug!("RPM name lookup unavailable: {error:#}"),
+            }
         }
         Ok(self
-            .load_installed_packages_blocking()?
+            .load_installed_packages_at(path.as_deref())?
             .iter()
             .filter(|package| package.matches_selector(selector))
             .cloned()
@@ -978,13 +1042,14 @@ impl DnfPackageManager {
     }
 
     /// Read RPM database, trying `SQLite` first then falling back to subprocess
-    #[cfg(feature = "fedora")]
     fn read_rpm_database(
-        db_path: &Path,
+        db_path: Option<&Path>,
+        observe_snapshot: bool,
     ) -> Result<(Vec<InstalledPackage>, Option<RpmDatabaseObservation>)> {
-        // Try SQLite first (Fedora 33+, RHEL 9+) - 50-100x faster
-        if db_path.exists() {
-            let identity = RpmDatabaseObservation::read(db_path);
+        if let Some(db_path) = db_path.filter(|path| path.exists()) {
+            let identity = observe_snapshot
+                .then(|| RpmDatabaseObservation::read(db_path))
+                .flatten();
             // Opening another SQLite connection can chmod the WAL and change
             // its ctime even without a commit. Read through the observer so
             // the inventory and its commit generation share one connection.
@@ -1013,23 +1078,16 @@ impl DnfPackageManager {
     ///
     /// Fallback for systems without `SQLite` RPM database (`BerkeleyDB`, `NDB`).
     fn read_rpm_via_query() -> Result<Vec<InstalledPackage>> {
-        let output = crate::core::privilege::system_command("rpm")?
-            // Match the system inventory used by the direct database reader.
-            .env("HOME", "/")
-            .env("LC_ALL", "C")
-            .args([
+        let output = Self::rpm_query(
+            [
                 "-qa",
                 "--queryformat",
                 "%{NAME}\t%{VERSION}\t%{RELEASE}\t%{EPOCHNUM}\t%{ARCH}\t%{SUMMARY}\n",
-            ])
-            .output()
-            .context("Failed to execute rpm -qa")?;
+            ],
+            std::time::Duration::from_mins(1),
+        )?;
 
-        if !output.status.success() {
-            anyhow::bail!("rpm command failed: {}", output.status);
-        }
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stdout = String::from_utf8_lossy(&output);
         let mut packages = Vec::with_capacity(2048);
 
         for line in stdout.lines() {
@@ -1040,6 +1098,28 @@ impl DnfPackageManager {
         }
 
         Ok(packages)
+    }
+
+    fn rpm_query_command() -> Result<tokio::process::Command> {
+        let mut command =
+            tokio::process::Command::from(crate::core::privilege::system_command("rpm")?);
+        // Exclude caller macros and preserve the system macro configuration.
+        command
+            .env("HOME", "/")
+            .env("LC_ALL", "C")
+            .stderr(std::process::Stdio::piped());
+        Ok(command)
+    }
+
+    fn rpm_query<const N: usize>(
+        arguments: [&str; N],
+        deadline: std::time::Duration,
+    ) -> Result<Vec<u8>> {
+        let mut command = Self::rpm_query_command()?;
+        command.args(arguments);
+        crate::cli::tea::run_blocking_future(Self::controlled_query_output(
+            "RPM", command, deadline, None,
+        ))?
     }
 
     fn parse_user_installed_names(output: &[u8]) -> Result<HashSet<String>> {
@@ -1292,7 +1372,7 @@ impl DnfPackageManager {
 
     /// Read RPM database directly from `SQLite` (Fedora 33+, RHEL 9+)
     ///
-    /// Opens `/var/lib/rpm/rpmdb.sqlite` in read-only mode and parses
+    /// Opens the configured database in read-only mode and parses
     /// RPM header blobs from the `Packages` table without a subprocess.
     fn read_rpm_sqlite(db_path: &Path) -> Result<Vec<InstalledPackage>> {
         let conn = Connection::open_with_flags(
@@ -1584,9 +1664,13 @@ impl DnfPackageManager {
         ) {
             args.push("--cacheonly".to_owned());
         }
+        // Installed records describe what is on disk, including an older
+        // build excluded from repository selection. DNF still selects the
+        // upgrades using the configured policy.
         if matches!(
             query,
-            RepositoryQuery::InstalledSizes(_)
+            RepositoryQuery::Installed
+                | RepositoryQuery::InstalledSizes(_)
                 | RepositoryQuery::InstalledReasons(_)
                 | RepositoryQuery::InstalledDetails(_)
         ) {
@@ -1695,20 +1779,21 @@ impl DnfPackageManager {
         command: tokio::process::Command,
         deadline: std::time::Duration,
     ) -> Result<Vec<u8>> {
-        Self::controlled_query_output(command, deadline, None).await
+        Self::controlled_query_output("DNF", command, deadline, None).await
     }
 
     async fn controlled_query_output(
+        program: &str,
         command: tokio::process::Command,
         deadline: std::time::Duration,
         cancelled: Option<tokio::sync::oneshot::Receiver<()>>,
     ) -> Result<Vec<u8>> {
-        let output = Self::capture_query(command, deadline, cancelled).await?;
-        Self::require_query_success(&output)?;
+        let output = Self::capture_query(program, command, deadline, cancelled).await?;
+        Self::require_query_success(program, &output)?;
         Ok(output.stdout)
     }
 
-    fn require_query_success(output: &std::process::Output) -> Result<()> {
+    fn require_query_success(program: &str, output: &std::process::Output) -> Result<()> {
         if output.status.success() {
             return Ok(());
         }
@@ -1719,12 +1804,13 @@ impl DnfPackageManager {
             .rfind(|line| !line.is_empty())
         {
             let detail = crate::cli::style::sanitize_terminal_text(detail);
-            anyhow::bail!("DNF query failed: {}: {detail}", output.status);
+            anyhow::bail!("{program} query failed: {}: {detail}", output.status);
         }
-        anyhow::bail!("DNF query failed: {}", output.status);
+        anyhow::bail!("{program} query failed: {}", output.status);
     }
 
     async fn capture_query(
+        program: &str,
         mut command: tokio::process::Command,
         deadline: std::time::Duration,
         mut cancelled: Option<tokio::sync::oneshot::Receiver<()>>,
@@ -1738,7 +1824,7 @@ impl DnfPackageManager {
                     cancelled.try_recv(),
                     Err(tokio::sync::oneshot::error::TryRecvError::Empty)
                 ),
-                "DNF stored query cancelled before execution"
+                "{program} stored query cancelled before execution"
             );
         }
         let mut child = command
@@ -1746,10 +1832,13 @@ impl DnfPackageManager {
             .stdout(std::process::Stdio::piped())
             .kill_on_drop(true)
             .spawn()
-            .context("Could not start DNF query")?;
+            .with_context(|| format!("Could not start {program} query"))?;
         let result = {
             let operation = async {
-                let stdout = child.stdout.take().context("DNF stdout was not captured")?;
+                let stdout = child
+                    .stdout
+                    .take()
+                    .with_context(|| format!("{program} stdout was not captured"))?;
                 let stderr = child.stderr.take();
                 let output = async {
                     let mut bytes = Vec::new();
@@ -1759,7 +1848,7 @@ impl DnfPackageManager {
                         .await?;
                     anyhow::ensure!(
                         bytes.len() as u64 <= MAX_OUTPUT_BYTES,
-                        "DNF query output exceeds 64 MiB"
+                        "{program} query output exceeds 64 MiB"
                     );
                     Ok(bytes)
                 };
@@ -1775,7 +1864,10 @@ impl DnfPackageManager {
                     Ok(bytes)
                 };
                 let (stdout, stderr) = tokio::try_join!(output, diagnostics)?;
-                let status = child.wait().await.context("Could not wait for DNF query")?;
+                let status = child
+                    .wait()
+                    .await
+                    .with_context(|| format!("Could not wait for {program} query"))?;
                 Ok(std::process::Output {
                     status,
                     stdout,
@@ -1793,16 +1885,19 @@ impl DnfPackageManager {
             tokio::select! {
                 result = tokio::time::timeout(deadline, operation) => match result {
                     Ok(result) => result,
-                    Err(error) => Err(anyhow::Error::new(error).context(format!("DNF query timed out after {} seconds", deadline.as_secs()))),
+                    Err(error) => Err(anyhow::Error::new(error).context(format!("{program} query timed out after {} seconds", deadline.as_secs()))),
                 },
-                () = cancellation => Err(anyhow::anyhow!("DNF stored query cancelled")),
+                () = cancellation => Err(anyhow::anyhow!("{program} stored query cancelled")),
             }
         };
         if result.is_err() {
             if let Err(error) = child.start_kill() {
-                tracing::debug!(%error, "DNF query may have exited before cancellation kill");
+                tracing::debug!(%error, %program, "Query may have exited before cancellation kill");
             }
-            child.wait().await.context("Could not reap DNF query")?;
+            child
+                .wait()
+                .await
+                .with_context(|| format!("Could not reap {program} query"))?;
         }
         result
     }
@@ -1837,6 +1932,7 @@ impl DnfPackageManager {
                 .enable_all()
                 .build()?
                 .block_on(Self::controlled_query_output(
+                    "DNF",
                     command,
                     deadline,
                     Some(cancelled),
@@ -2775,7 +2871,7 @@ impl DnfPackageManager {
     #[must_use]
     fn cache_handle(&self) -> Self {
         Self {
-            rpm_db_path: self.rpm_db_path.clone(),
+            rpm_database: self.rpm_database.clone(),
             installed_cache: Arc::clone(&self.installed_cache),
         }
     }
@@ -2811,7 +2907,8 @@ impl DnfPackageManager {
                 "--assumeno",
                 "autoremove",
             ]);
-        let output = Self::capture_query(command, std::time::Duration::from_mins(1), None).await?;
+        let output =
+            Self::capture_query("DNF", command, std::time::Duration::from_mins(1), None).await?;
         Self::orphan_cleanup_preview_output(&output)
     }
 
@@ -2828,7 +2925,7 @@ impl DnfPackageManager {
         {
             return Ok((plan.into_owned(), prefix.trim_end().to_owned()));
         }
-        Self::require_query_success(output)?;
+        Self::require_query_success("DNF", output)?;
         Ok((plan.into_owned(), diagnostics.into_owned()))
     }
 
@@ -2892,10 +2989,15 @@ impl PackageManager for DnfPackageManager {
     fn installed_catalog_observation(
         &self,
     ) -> Result<Option<Arc<dyn super::InstalledCatalogObservation>>> {
-        let database = RpmDatabaseObservation::read(&self.rpm_db_path)
+        let path = self
+            .rpm_database
+            .sqlite_path()?
+            .context("RPM catalog observation requires a SQLite database")?;
+        let database = RpmDatabaseObservation::read(&path)
             .context("Cannot observe RPM SQLite inventory for daemon catalog")?;
         Ok(Some(Arc::new(RpmInstalledCatalogObservation {
-            path: self.rpm_db_path.clone(),
+            source: self.rpm_database.clone(),
+            path,
             database,
         })))
     }
@@ -3455,11 +3557,14 @@ mod tests {
         let mut pairs = vec![("1.0-1.fc44".to_owned(), "1.0-1.fc44".to_owned()); 129];
         pairs[0] = ("2:1.0-1.fc44".into(), "1:9.9-9.fc44".into());
         pairs[1] = ("1.0~rc1-1.fc44".into(), "1.0-1.fc44".into());
+        pairs[2] = ("0:1.0-1.fc44".into(), "1.0-1.fc44".into());
+        pairs[3] = ("1.0-2.fc44".into(), "1.0-10.fc44".into());
         pairs[128] = ("1.0^git1-1.fc44".into(), "1.0.1-1.fc44".into());
         let compared = DnfPackageManager::compare_native_evrs(&pairs).await?;
         assert_eq!(compared.len(), 129);
-        assert_eq!((compared[0], compared[1], compared[128]), (1, -1, -1));
-        assert!(compared[2..128].iter().all(|value| *value == 0));
+        assert_eq!(&compared[..4], &[1, -1, 0, -1]);
+        assert_eq!(compared[128], -1);
+        assert!(compared[4..128].iter().all(|value| *value == 0));
         assert!(
             DnfPackageManager::compare_native_evrs(&[("1.0\n2.0".into(), "3.0".into())])
                 .await
@@ -3501,6 +3606,23 @@ mod tests {
             br#"{"version":"2.0","rpms":[]}"#,
             br#"{"version":"1.0","groups":[{}]}"#,
         ] { assert!(DnfPackageManager::proposed_inventory(bytes).is_err()); }
+        Ok(())
+    }
+
+    #[test]
+    fn rpm_configuration_selects_only_the_configured_sqlite_database() -> Result<()> {
+        assert_eq!(
+            RpmDatabaseSource::parse(b"sqlite\t/var/lib/rpm archive\n")?,
+            Some(PathBuf::from("/var/lib/rpm archive/rpmdb.sqlite"))
+        );
+        assert!(RpmDatabaseSource::parse(b"ndb\t/var/lib/rpm\n")?.is_none());
+        for invalid in [
+            b"sqlite\trelative\n".as_slice(),
+            b"sqlite\t/one\n/another\n",
+            b"sqlite\n",
+        ] {
+            assert!(RpmDatabaseSource::parse(invalid).is_err());
+        }
         Ok(())
     }
 
@@ -3551,8 +3673,8 @@ mod tests {
         let amd64 = make_header("x86_64");
         let i686 = make_header("i686");
         let directory = write_packages_db(&[&amd64, &i686]);
-        let mut manager = DnfPackageManager::new();
-        manager.rpm_db_path = directory.path().join("rpmdb.sqlite");
+        let rpm_db_path = directory.path().join("rpmdb.sqlite");
+        let manager = manager_for_database(&rpm_db_path);
         let mut installed = manager.list_installed().await?;
         installed.sort_by(|left, right| left.name.cmp(&right.name));
         assert_eq!(
@@ -3581,8 +3703,8 @@ mod tests {
     async fn installed_catalog_observation_survives_manager_cache_republication() -> Result<()> {
         let native = include_bytes!("../../tests/data/fedora-publicsuffix.rpmhdr");
         let directory = write_packages_db(&[native.as_slice()]);
-        let mut manager = DnfPackageManager::new();
-        manager.rpm_db_path = directory.path().join("rpmdb.sqlite");
+        let rpm_db_path = directory.path().join("rpmdb.sqlite");
+        let manager = manager_for_database(&rpm_db_path);
         let observed = manager
             .installed_catalog_observation()?
             .expect("SQLite observation available");
@@ -3591,7 +3713,7 @@ mod tests {
             manager.list_installed().await?[0].name,
             "publicsuffix-list-dafsa.noarch"
         );
-        let database = Connection::open(&manager.rpm_db_path)?;
+        let database = Connection::open(&rpm_db_path)?;
         database.execute("DELETE FROM Packages", [])?;
         assert!(manager.list_installed().await?.is_empty());
         assert!(
@@ -3612,9 +3734,9 @@ mod tests {
     {
         let native = include_bytes!("../../tests/data/fedora-publicsuffix.rpmhdr");
         let directory = write_packages_db(&[native.as_slice()]);
-        let mut manager = DnfPackageManager::new();
-        manager.rpm_db_path = directory.path().join("rpmdb.sqlite");
-        let database = Connection::open(&manager.rpm_db_path)?;
+        let rpm_db_path = directory.path().join("rpmdb.sqlite");
+        let manager = manager_for_database(&rpm_db_path);
+        let database = Connection::open(&rpm_db_path)?;
         database.pragma_update(None, "journal_mode", "WAL")?;
         let observed = manager
             .installed_catalog_observation()?
@@ -3648,9 +3770,9 @@ mod tests {
     #[test]
     fn installed_catalog_observation_rejects_wal_replacement() -> Result<()> {
         let directory = write_packages_db(&[]);
-        let mut manager = DnfPackageManager::new();
-        manager.rpm_db_path = directory.path().join("rpmdb.sqlite");
-        let database = Connection::open(&manager.rpm_db_path)?;
+        let rpm_db_path = directory.path().join("rpmdb.sqlite");
+        let manager = manager_for_database(&rpm_db_path);
+        let database = Connection::open(&rpm_db_path)?;
         database.pragma_update(None, "journal_mode", "WAL")?;
         let observed = manager
             .installed_catalog_observation()?
@@ -3910,9 +4032,15 @@ mod tests {
         for query in [RepositoryQuery::Installed, RepositoryQuery::Unneeded] {
             let args = DnfPackageManager::repository_query_args(query).unwrap();
             assert!(args.iter().any(|arg| arg == "--cacheonly"), "{args:?}");
+            assert_eq!(
+                args.iter().any(|arg| arg == "--setopt=disable_excludes=*"),
+                query == RepositoryQuery::Installed,
+                "{args:?}"
+            );
         }
         assert!(UPGRADE_QUERY_ARGS.contains(&"--cacheonly"));
         assert!(UPGRADE_QUERY_ARGS.contains(&"--setopt=*.skip_if_unavailable=false"));
+        assert!(!UPGRADE_QUERY_ARGS.contains(&"--setopt=disable_excludes=*"));
     }
 
     #[test]
@@ -5514,12 +5642,12 @@ mod tests {
     async fn installed_inventory_observes_external_removal() -> Result<()> {
         let blob = include_bytes!("../../tests/data/fedora-publicsuffix.rpmhdr");
         let directory = write_packages_db(&[blob.as_slice()]);
-        let mut manager = DnfPackageManager::new();
-        manager.rpm_db_path = directory.path().join("rpmdb.sqlite");
+        let rpm_db_path = directory.path().join("rpmdb.sqlite");
+        let manager = manager_for_database(&rpm_db_path);
         assert_eq!(manager.list_installed().await?.len(), 1);
         assert!(manager.is_installed_fast("publicsuffix-list-dafsa")?);
         assert!(!manager.is_installed_fast("definitely-not-installed")?);
-        let database = Connection::open(&manager.rpm_db_path)?;
+        let database = Connection::open(&rpm_db_path)?;
         database.execute("DELETE FROM Packages", [])?;
 
         assert!(
@@ -5542,8 +5670,8 @@ mod tests {
             (rpm_tags::ARCH, "i686"),
         ]);
         let directory = write_packages_db(&[&first, &middle, &last]);
-        let mut manager = DnfPackageManager::new();
-        manager.rpm_db_path = directory.path().join("rpmdb.sqlite");
+        let rpm_db_path = directory.path().join("rpmdb.sqlite");
+        let manager = manager_for_database(&rpm_db_path);
 
         for _ in 0..2 {
             let names: Vec<_> = manager
@@ -5562,13 +5690,13 @@ mod tests {
         for journal_mode in ["DELETE", "WAL"] {
             let blob = include_bytes!("../../tests/data/fedora-publicsuffix.rpmhdr");
             let directory = write_packages_db(&[blob.as_slice()]);
-            let mut manager = DnfPackageManager::new();
-            manager.rpm_db_path = directory.path().join("rpmdb.sqlite");
-            let database = Connection::open(&manager.rpm_db_path)?;
+            let rpm_db_path = directory.path().join("rpmdb.sqlite");
+            let manager = manager_for_database(&rpm_db_path);
+            let database = Connection::open(&rpm_db_path)?;
             database.pragma_update(None, "journal_mode", journal_mode)?;
             assert_eq!(manager.list_installed().await?.len(), 1);
             assert!(
-                manager.cached_installed_packages().is_some(),
+                manager.cached_installed_packages(&rpm_db_path).is_some(),
                 "first inventory read must initialize a cache in {journal_mode} mode"
             );
             database.execute("DELETE FROM Packages", [])?;
@@ -5581,8 +5709,7 @@ mod tests {
                 .as_mut()
                 .expect("cached inventory")
                 .observation
-                .identity =
-                RpmDatabaseIdentity::read(&manager.rpm_db_path).expect("database identity");
+                .identity = RpmDatabaseIdentity::read(&rpm_db_path).expect("database identity");
             assert!(
                 !manager.is_installed("publicsuffix-list-dafsa").await?,
                 "{journal_mode}"
@@ -5601,24 +5728,21 @@ mod tests {
     async fn installed_inventory_observes_wal_only_removal() -> Result<()> {
         let blob = include_bytes!("../../tests/data/fedora-publicsuffix.rpmhdr");
         let directory = write_packages_db(&[blob.as_slice()]);
-        let mut manager = DnfPackageManager::new();
-        manager.rpm_db_path = directory.path().join("rpmdb.sqlite");
-        let database = Connection::open(&manager.rpm_db_path)?;
+        let rpm_db_path = directory.path().join("rpmdb.sqlite");
+        let manager = manager_for_database(&rpm_db_path);
+        let database = Connection::open(&rpm_db_path)?;
         database.pragma_update(None, "journal_mode", "WAL")?;
         assert_eq!(manager.list_installed().await?.len(), 1);
         assert!(
             manager.is_installed("publicsuffix-list-dafsa").await?,
             "the private fixture package must be present before testing its removal"
         );
-        let original_bytes = std::fs::read(&manager.rpm_db_path)?;
-        let original_mtime = std::fs::metadata(&manager.rpm_db_path)?.modified()?;
+        let original_bytes = std::fs::read(&rpm_db_path)?;
+        let original_mtime = std::fs::metadata(&rpm_db_path)?.modified()?;
 
         database.execute("DELETE FROM Packages", [])?;
-        assert_eq!(std::fs::read(&manager.rpm_db_path)?, original_bytes);
-        assert_eq!(
-            std::fs::metadata(&manager.rpm_db_path)?.modified()?,
-            original_mtime
-        );
+        assert_eq!(std::fs::read(&rpm_db_path)?, original_bytes);
+        assert_eq!(std::fs::metadata(&rpm_db_path)?.modified()?, original_mtime);
         assert!(
             !manager.is_installed("publicsuffix-list-dafsa").await?,
             "committed WAL changes must invalidate an unchanged main file"
@@ -5630,24 +5754,21 @@ mod tests {
     async fn installed_inventory_observes_replacement_with_preserved_mtime() -> Result<()> {
         let blob = include_bytes!("../../tests/data/fedora-publicsuffix.rpmhdr");
         let directory = write_packages_db(&[blob.as_slice()]);
-        let mut manager = DnfPackageManager::new();
-        manager.rpm_db_path = directory.path().join("rpmdb.sqlite");
+        let rpm_db_path = directory.path().join("rpmdb.sqlite");
+        let manager = manager_for_database(&rpm_db_path);
         assert_eq!(manager.list_installed().await?.len(), 1);
         assert!(
             manager.is_installed("publicsuffix-list-dafsa").await?,
             "the private fixture package must be present before testing its removal"
         );
-        let original_mtime = std::fs::metadata(&manager.rpm_db_path)?.modified()?;
+        let original_mtime = std::fs::metadata(&rpm_db_path)?.modified()?;
         let replacement = write_packages_db(&[]);
         let replacement_path = replacement.path().join("rpmdb.sqlite");
         std::fs::File::open(&replacement_path)?
             .set_times(std::fs::FileTimes::new().set_modified(original_mtime))?;
-        std::fs::rename(replacement_path, &manager.rpm_db_path)?;
+        std::fs::rename(replacement_path, &rpm_db_path)?;
 
-        assert_eq!(
-            std::fs::metadata(&manager.rpm_db_path)?.modified()?,
-            original_mtime
-        );
+        assert_eq!(std::fs::metadata(&rpm_db_path)?.modified()?, original_mtime);
         assert!(!manager.is_installed("publicsuffix-list-dafsa").await?);
         Ok(())
     }
@@ -5655,23 +5776,25 @@ mod tests {
     #[tokio::test]
     async fn installed_inventory_refreshes_an_empty_snapshot_after_installation() -> Result<()> {
         let directory = write_packages_db(&[]);
-        let mut manager = DnfPackageManager::new();
-        manager.rpm_db_path = directory.path().join("rpmdb.sqlite");
+        let rpm_db_path = directory.path().join("rpmdb.sqlite");
+        let manager = manager_for_database(&rpm_db_path);
+        assert_eq!(manager.installed_count()?, 0);
+        assert!(manager.cache_read().is_none());
         assert!(manager.list_installed().await?.is_empty());
         assert!(
             manager
-                .cached_installed_packages()
+                .cached_installed_packages(&rpm_db_path)
                 .expect("empty snapshot")
                 .is_empty()
         );
-        let database = Connection::open(&manager.rpm_db_path)?;
+        let database = Connection::open(&rpm_db_path)?;
         let blob = include_bytes!("../../tests/data/fedora-publicsuffix.rpmhdr");
         database.execute("INSERT INTO Packages (blob) VALUES (?1)", [blob.as_slice()])?;
 
         assert!(manager.is_installed("publicsuffix-list-dafsa").await?);
         assert_eq!(manager.list_installed().await?.len(), 1);
         manager.cache_handle().invalidate_installed_cache();
-        assert!(manager.cached_installed_packages().is_none());
+        assert!(manager.cached_installed_packages(&rpm_db_path).is_none());
         Ok(())
     }
 
@@ -5679,22 +5802,22 @@ mod tests {
     fn installed_cache_rejects_changed_or_unobserved_generation() -> Result<()> {
         let blob = include_bytes!("../../tests/data/fedora-publicsuffix.rpmhdr");
         let directory = write_packages_db(&[blob.as_slice()]);
-        let mut manager = DnfPackageManager::new();
-        manager.rpm_db_path = directory.path().join("rpmdb.sqlite");
-        let mut observed = RpmDatabaseObservation::read(&manager.rpm_db_path);
-        let packages = DnfPackageManager::read_rpm_sqlite(&manager.rpm_db_path)?;
-        let database = Connection::open(&manager.rpm_db_path)?;
+        let rpm_db_path = directory.path().join("rpmdb.sqlite");
+        let manager = manager_for_database(&rpm_db_path);
+        let mut observed = RpmDatabaseObservation::read(&rpm_db_path);
+        let packages = DnfPackageManager::read_rpm_sqlite(&rpm_db_path)?;
+        let database = Connection::open(&rpm_db_path)?;
         database.execute("DELETE FROM Packages", [])?;
 
         // Even if metadata fails to reveal a commit between the inventory read
         // and publication, the original observer must reject the old inventory.
         observed.as_mut().expect("database observer").identity =
-            RpmDatabaseIdentity::read(&manager.rpm_db_path).expect("database identity");
+            RpmDatabaseIdentity::read(&rpm_db_path).expect("database identity");
         let packages = Arc::new(packages);
-        manager.publish_installed_packages(Arc::clone(&packages), observed);
-        assert!(manager.cached_installed_packages().is_none());
-        manager.publish_installed_packages(packages, None);
-        assert!(manager.cached_installed_packages().is_none());
+        manager.publish_installed_packages(Some(&rpm_db_path), Arc::clone(&packages), observed);
+        assert!(manager.cached_installed_packages(&rpm_db_path).is_none());
+        manager.publish_installed_packages(Some(&rpm_db_path), packages, None);
+        assert!(manager.cached_installed_packages(&rpm_db_path).is_none());
         Ok(())
     }
 
@@ -5702,11 +5825,11 @@ mod tests {
     async fn installed_cache_rejects_unobservable_database_files() -> Result<()> {
         let blob = include_bytes!("../../tests/data/fedora-publicsuffix.rpmhdr");
         let directory = write_packages_db(&[blob.as_slice()]);
-        let mut manager = DnfPackageManager::new();
-        manager.rpm_db_path = directory.path().join("rpmdb.sqlite");
+        let rpm_db_path = directory.path().join("rpmdb.sqlite");
+        let manager = manager_for_database(&rpm_db_path);
         assert_eq!(manager.list_installed().await?.len(), 1);
         let cached = manager
-            .cached_installed_packages()
+            .cached_installed_packages(&rpm_db_path)
             .expect("private fixture cache must exist before testing invalidation");
         assert_eq!(
             cached
@@ -5722,19 +5845,19 @@ mod tests {
         );
         let wal = directory.path().join("rpmdb.sqlite-wal");
         std::fs::create_dir(&wal)?;
-        assert!(manager.cached_installed_packages().is_none());
+        assert!(manager.cached_installed_packages(&rpm_db_path).is_none());
         std::fs::remove_dir(wal)?;
-        std::fs::remove_file(&manager.rpm_db_path)?;
-        assert!(manager.cached_installed_packages().is_none());
+        std::fs::remove_file(&rpm_db_path)?;
+        assert!(manager.cached_installed_packages(&rpm_db_path).is_none());
         Ok(())
     }
 
     #[test]
     fn installed_cache_publication_is_idempotent_and_preserves_multilib_names() {
         let directory = write_packages_db(&[]);
-        let mut manager = DnfPackageManager::new();
-        manager.rpm_db_path = directory.path().join("rpmdb.sqlite");
-        let identity = RpmDatabaseObservation::read(&manager.rpm_db_path);
+        let rpm_db_path = directory.path().join("rpmdb.sqlite");
+        let manager = manager_for_database(&rpm_db_path);
+        let identity = RpmDatabaseObservation::read(&rpm_db_path);
         let packages: Vec<_> = ["x86_64", "i686"]
             .into_iter()
             .map(|architecture| InstalledPackage {
@@ -5747,11 +5870,15 @@ mod tests {
             .collect();
 
         let packages = Arc::new(packages);
-        manager.publish_installed_packages(Arc::clone(&packages), identity.clone());
-        manager.publish_installed_packages(packages, identity);
+        manager.publish_installed_packages(
+            Some(&rpm_db_path),
+            Arc::clone(&packages),
+            identity.clone(),
+        );
+        manager.publish_installed_packages(Some(&rpm_db_path), packages, identity);
 
         let cached = manager
-            .cached_installed_packages()
+            .cached_installed_packages(&rpm_db_path)
             .expect("populated cache");
         assert_eq!(cached.len(), 2);
         let mut identities: Vec<_> = cached
@@ -5814,10 +5941,11 @@ mod tests {
     #[test]
     fn installed_cache_publication_replaces_the_previous_snapshot() {
         let directory = write_packages_db(&[]);
-        let mut manager = DnfPackageManager::new();
-        manager.rpm_db_path = directory.path().join("rpmdb.sqlite");
-        let identity = RpmDatabaseObservation::read(&manager.rpm_db_path);
+        let rpm_db_path = directory.path().join("rpmdb.sqlite");
+        let manager = manager_for_database(&rpm_db_path);
+        let identity = RpmDatabaseObservation::read(&rpm_db_path);
         manager.publish_installed_packages(
+            Some(&rpm_db_path),
             Arc::new(vec![InstalledPackage {
                 name: "glibc".to_string(),
                 version: "2.41".to_string(),
@@ -5828,6 +5956,7 @@ mod tests {
             identity.clone(),
         );
         manager.publish_installed_packages(
+            Some(&rpm_db_path),
             Arc::new(vec![InstalledPackage {
                 name: "bash".to_string(),
                 version: "5.2".to_string(),
@@ -5839,7 +5968,7 @@ mod tests {
         );
 
         let cached = manager
-            .cached_installed_packages()
+            .cached_installed_packages(&rpm_db_path)
             .expect("populated cache");
         assert_eq!(cached.len(), 1);
         assert_eq!(cached[0].name, "bash");
@@ -5947,6 +6076,13 @@ mod tests {
         strict_header(&entries, &data)
     }
 
+    fn manager_for_database(path: &Path) -> DnfPackageManager {
+        DnfPackageManager {
+            rpm_database: RpmDatabaseSource::Fixture(path.to_owned()),
+            ..DnfPackageManager::new()
+        }
+    }
+
     fn write_packages_db(blobs: &[&[u8]]) -> tempfile::TempDir {
         let dir = tempfile::TempDir::new().expect("temp dir");
         let db = dir.path().join("rpmdb.sqlite");
@@ -5968,9 +6104,9 @@ mod tests {
     -> Result<()> {
         let header = named_rpm_header("omg-indexed-read-fixture");
         let directory = write_packages_db(&[header.as_slice(), &[0; 32]]);
-        let mut manager = DnfPackageManager::new();
-        manager.rpm_db_path = directory.path().join("rpmdb.sqlite");
-        let database = Connection::open(&manager.rpm_db_path)?;
+        let rpm_db_path = directory.path().join("rpmdb.sqlite");
+        let manager = manager_for_database(&rpm_db_path);
+        let database = Connection::open(&rpm_db_path)?;
         database.execute_batch(
             "CREATE TABLE Name (key TEXT NOT NULL, hnum INTEGER NOT NULL, idx INTEGER NOT NULL);
              CREATE INDEX Name_key_idx ON Name(key);
@@ -5987,9 +6123,9 @@ mod tests {
         let native = include_bytes!("../../tests/data/fedora-publicsuffix.rpmhdr");
         let literal = named_rpm_header("publicsuffix-list-dafsa.noarch");
         let directory = write_packages_db(&[native.as_slice(), &literal]);
-        let mut manager = DnfPackageManager::new();
-        manager.rpm_db_path = directory.path().join("rpmdb.sqlite");
-        let database = Connection::open(&manager.rpm_db_path)?;
+        let rpm_db_path = directory.path().join("rpmdb.sqlite");
+        let manager = manager_for_database(&rpm_db_path);
+        let database = Connection::open(&rpm_db_path)?;
         database.execute_batch(
             "CREATE TABLE Name (key TEXT NOT NULL, hnum INTEGER NOT NULL, idx INTEGER NOT NULL);
              CREATE INDEX Name_key_idx ON Name(key);
@@ -6018,9 +6154,9 @@ mod tests {
     async fn indexed_installed_lookup_falls_back_on_inconsistent_rows() -> Result<()> {
         let header = named_rpm_header("indexed-fallback-fixture");
         let directory = write_packages_db(&[&header]);
-        let mut manager = DnfPackageManager::new();
-        manager.rpm_db_path = directory.path().join("rpmdb.sqlite");
-        let database = Connection::open(&manager.rpm_db_path)?;
+        let rpm_db_path = directory.path().join("rpmdb.sqlite");
+        let manager = manager_for_database(&rpm_db_path);
+        let database = Connection::open(&rpm_db_path)?;
         database.execute_batch(
             "CREATE TABLE Name (key TEXT NOT NULL, hnum INTEGER NOT NULL, idx INTEGER NOT NULL);
              CREATE INDEX Name_key_idx ON Name(key);
