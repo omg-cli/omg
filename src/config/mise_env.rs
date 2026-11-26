@@ -238,41 +238,42 @@ fn expand_templates<'a>(
 /// (dotenv semantics). Used for dotenv files and `expand = true` files.
 fn expand_dollar<'a>(
     value: &str,
+    literal_dollars: &[usize],
     lookup: &dyn Fn(&str) -> Result<Option<&'a str>>,
 ) -> Result<String> {
     let mut output = String::with_capacity(value.len());
-    let mut chars = value.chars().peekable();
-    while let Some(char) = chars.next() {
-        if char != '$' {
-            output.push(char);
+    let mut cursor = 0;
+    let mut literals = literal_dollars.iter().copied().peekable();
+    for (start, _) in value.match_indices('$') {
+        if literals.next_if_eq(&start).is_some() || start < cursor {
             continue;
         }
-        match chars.peek() {
-            Some('{') => {
-                chars.next();
-                let mut name = String::new();
-                while let Some(c) = chars.next_if(|c| *c != '}') {
-                    name.push(c);
-                }
-                if chars.next().is_none() {
-                    output.push_str("${");
-                    output.push_str(&name);
-                } else if let Some(resolved) = lookup(&name)? {
-                    output.push_str(resolved);
-                }
-            }
-            Some(c) if c.is_ascii_alphabetic() || *c == '_' => {
-                let mut name = String::new();
-                while let Some(c) = chars.next_if(|c| c.is_ascii_alphanumeric() || *c == '_') {
-                    name.push(c);
-                }
-                if let Some(resolved) = lookup(&name)? {
-                    output.push_str(resolved);
-                }
-            }
-            _ => output.push('$'),
+        let tail = &value[start + 1..];
+        let (name, length) = if let Some(braced) = tail.strip_prefix('{') {
+            let Some((name, _)) = braced.split_once('}') else {
+                break;
+            };
+            (name, name.len() + 2)
+        } else if tail
+            .as_bytes()
+            .first()
+            .is_some_and(|c| c.is_ascii_alphabetic() || *c == b'_')
+        {
+            let length = tail
+                .bytes()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == b'_')
+                .count();
+            (&tail[..length], length)
+        } else {
+            continue;
+        };
+        output.push_str(&value[cursor..start]);
+        if let Some(resolved) = lookup(name)? {
+            output.push_str(resolved);
         }
+        cursor = start + 1 + length;
     }
+    output.push_str(&value[cursor..]);
     Ok(output)
 }
 
@@ -565,19 +566,109 @@ fn read_env_file(path: &Path) -> Result<Option<String>> {
     read_bounded_regular_file(path)
 }
 
-/// Parse dotenv content: `KEY=value`, optional `export` prefix, `#`
-/// comments, single/double quotes. Malformed lines are hard errors —
-/// silently skipping a line would set a partial environment that looks
-/// complete.
-fn parse_dotenv(content: &str, path: &Path) -> Result<Vec<(String, String)>> {
+struct EnvFileValue {
+    text: String,
+    // Expansion can be disabled for the directive or by single quotes.
+    // Otherwise these sorted byte offsets mark escaped dollar signs.
+    literal_dollars: Option<Vec<usize>>,
+}
+
+impl EnvFileValue {
+    fn new(text: String, expand: bool) -> Self {
+        Self {
+            text,
+            literal_dollars: expand.then(Vec::new),
+        }
+    }
+
+    fn push_literal_dollar(&mut self) {
+        if let Some(offsets) = &mut self.literal_dollars {
+            offsets.push(self.text.len());
+        }
+        self.text.push('$');
+    }
+}
+
+type FileBindings = Vec<(String, EnvFileValue)>;
+
+fn quoted_dotenv_value<'a>(
+    mut line: &'a str,
+    quote: char,
+    lines: &mut impl Iterator<Item = (usize, &'a str)>,
+    expand: bool,
+) -> Result<EnvFileValue> {
+    let mut value = EnvFileValue::new(String::with_capacity(line.len()), expand && quote == '"');
+    loop {
+        let mut chars = line.char_indices().peekable();
+        while let Some((offset, char)) = chars.next() {
+            if char == quote {
+                let rest = line[offset + 1..].trim_start();
+                anyhow::ensure!(
+                    rest.is_empty() || rest.starts_with('#'),
+                    "unexpected characters after closing quote"
+                );
+                return Ok(value);
+            }
+            if char == '\\' && quote == '"' {
+                match chars.peek().map(|(_, next)| *next) {
+                    Some('$') => {
+                        chars.next();
+                        value.push_literal_dollar();
+                        continue;
+                    }
+                    Some(next @ ('"' | '\\' | 'n' | 'r' | 't')) => {
+                        chars.next();
+                        value.text.push(match next {
+                            'n' => '\n',
+                            'r' => '\r',
+                            't' => '\t',
+                            other => other,
+                        });
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
+            value.text.push(char);
+        }
+        let (_, next) = lines.next().context("missing closing quote")?;
+        value.text.push('\n');
+        line = next;
+    }
+}
+
+fn unquoted_dotenv_value(raw: &str, expand: bool) -> EnvFileValue {
+    let end = raw
+        .match_indices('#')
+        .find(|(offset, _)| raw[..*offset].ends_with(char::is_whitespace))
+        .map_or(raw.len(), |(offset, _)| offset);
+    let text = raw[..end].trim();
+    if !expand || !text.contains("\\$") {
+        return EnvFileValue::new(text.to_owned(), expand);
+    }
+    let mut value = EnvFileValue::new(String::with_capacity(text.len()), true);
+    for (index, part) in text.split("\\$").enumerate() {
+        if index > 0 {
+            value.push_literal_dollar();
+        }
+        value.text.push_str(part);
+    }
+    value
+}
+
+fn parse_dotenv(content: &str, path: &Path, expand: bool) -> Result<FileBindings> {
     let mut pairs = Vec::new();
-    for (index, raw_line) in content.lines().enumerate() {
-        let line = raw_line.trim();
+    let mut lines = content.lines().enumerate();
+    while let Some((index, raw_line)) = lines.next() {
+        let line = raw_line.trim_start();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let line = line.strip_prefix("export ").map_or(line, str::trim);
-        let Some((key, value)) = line.split_once('=') else {
+        let line = line
+            .strip_prefix("export")
+            .filter(|rest| rest.starts_with(char::is_whitespace))
+            .map_or(line, str::trim_start);
+        let Some((key, raw)) = line.split_once('=') else {
             anyhow::bail!(
                 "Malformed line {} in {}: expected KEY=value",
                 index + 1,
@@ -586,23 +677,16 @@ fn parse_dotenv(content: &str, path: &Path) -> Result<Vec<(String, String)>> {
         };
         let key = key.trim();
         validate_env_name(key)?;
-        let value = value.trim();
-        let unquoted = if value.len() >= 2
-            && ((value.starts_with('"') && value.ends_with('"'))
-                || (value.starts_with('\'') && value.ends_with('\'')))
-        {
-            &value[1..value.len() - 1]
-        } else {
-            value
+        let text = raw.trim_start();
+        let value = match text.chars().next() {
+            Some(quote @ ('\'' | '"')) => {
+                quoted_dotenv_value(&text[1..], quote, &mut lines, expand).with_context(|| {
+                    format!("Malformed line {} in {}", index + 1, path.display())
+                })?
+            }
+            _ => unquoted_dotenv_value(raw, expand),
         };
-        // A trailing ` # comment` ends an unquoted value (dotenvy keeps
-        // comments inside quotes intact by construction here).
-        let unquoted = if value == unquoted {
-            unquoted.split(" #").next().unwrap_or(unquoted).trim_end()
-        } else {
-            unquoted
-        };
-        pairs.push((key.to_string(), unquoted.to_string()));
+        pairs.push((key.to_owned(), value));
     }
     Ok(pairs)
 }
@@ -622,7 +706,7 @@ fn flat_scalar(value: &serde_json::Value, key: &str, path: &Path) -> Result<Opti
 
 /// Load one `_.file` directive. Returns `Ok(None)` when the file is missing;
 /// strict callers turn that into an error, lenient callers warn and skip.
-pub(crate) fn load_env_file(directive: &EnvFileDirective) -> Result<Option<Vec<(String, String)>>> {
+fn load_env_file(directive: &EnvFileDirective) -> Result<Option<FileBindings>> {
     let Some(content) = read_env_file(&directive.path)? else {
         return Ok(None);
     };
@@ -648,7 +732,7 @@ pub(crate) fn load_env_file(directive: &EnvFileDirective) -> Result<Option<Vec<(
             for (key, value) in table {
                 validate_env_name(key)?;
                 if let Some(text) = flat_scalar(value, key, &directive.path)? {
-                    pairs.push((key.clone(), text));
+                    pairs.push((key.clone(), EnvFileValue::new(text, directive.expand)));
                 }
             }
             pairs
@@ -665,15 +749,16 @@ pub(crate) fn load_env_file(directive: &EnvFileDirective) -> Result<Option<Vec<(
             let mut pairs = Vec::with_capacity(table.len());
             for (key, value) in table {
                 validate_env_name(key)?;
-                match value {
-                    toml::Value::String(text) => pairs.push((key.clone(), text.clone())),
-                    toml::Value::Integer(number) => pairs.push((key.clone(), number.to_string())),
-                    toml::Value::Boolean(flag) => pairs.push((key.clone(), flag.to_string())),
+                let text = match value {
+                    toml::Value::String(text) => text.clone(),
+                    toml::Value::Integer(number) => number.to_string(),
+                    toml::Value::Boolean(flag) => flag.to_string(),
                     other => anyhow::bail!(
                         "Non-scalar value for {key} in {}: {other}",
                         directive.path.display()
                     ),
-                }
+                };
+                pairs.push((key.clone(), EnvFileValue::new(text, directive.expand)));
             }
             pairs
         }
@@ -683,7 +768,7 @@ pub(crate) fn load_env_file(directive: &EnvFileDirective) -> Result<Option<Vec<(
                 directive.path.display()
             );
         }
-        _ => parse_dotenv(&content, &directive.path)?,
+        _ => parse_dotenv(&content, &directive.path, directive.expand)?,
     };
     Ok(Some(pairs))
 }
@@ -825,17 +910,17 @@ impl Resolver<'_> {
     fn apply_file(
         &mut self,
         directive: &EnvFileDirective,
-        pairs: &[(String, String)],
+        pairs: &[(String, EnvFileValue)],
         tools_phase: bool,
     ) -> Result<()> {
         if directive.tools_phase != tools_phase {
             return Ok(());
         }
         for (key, raw) in pairs {
-            let value = if directive.expand {
-                expand_dollar(raw, &|name| self.lookup_text(name))?
+            let value = if let Some(literals) = &raw.literal_dollars {
+                expand_dollar(&raw.text, literals, &|name| self.lookup_text(name))?
             } else {
-                raw.clone()
+                raw.text.clone()
             };
             self.assign(key, value.into(), directive.redact);
         }
@@ -848,7 +933,7 @@ impl Resolver<'_> {
 /// once `PATH` is final.
 fn resolve_one(
     parsed: &MiseEnv,
-    file_pairs: &[(EnvFileDirective, Vec<(String, String)>)],
+    file_pairs: &[(EnvFileDirective, FileBindings)],
     base: &Environment,
     config_root: &Path,
     patterns: &[String],
@@ -1329,18 +1414,19 @@ mod tests {
         let pairs = parse_dotenv(
             "# comment\nexport A=1\nB=\"two words\"\nC='three'\nD=four # trailing\nE=\n",
             &path,
+            false,
         )
         .expect("dotenv parses");
         let map: HashMap<&str, &str> = pairs
             .iter()
-            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .map(|(key, value)| (key.as_str(), value.text.as_str()))
             .collect();
         assert_eq!(map["A"], "1");
         assert_eq!(map["B"], "two words");
         assert_eq!(map["C"], "three");
         assert_eq!(map["D"], "four");
         assert_eq!(map["E"], "");
-        assert!(parse_dotenv("NO_EQUALS_HERE\n", &path).is_err());
+        assert!(parse_dotenv("NO_EQUALS_HERE\n", &path, false).is_err());
     }
 
     #[test]
@@ -1359,7 +1445,7 @@ mod tests {
         .expect("present");
         let map: HashMap<&str, &str> = pairs
             .iter()
-            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .map(|(key, value)| (key.as_str(), value.text.as_str()))
             .collect();
         assert_eq!(map["A"], "1");
         assert_eq!(map["B"], "2");
@@ -1376,8 +1462,12 @@ mod tests {
         })
         .expect("toml loads")
         .expect("present");
-        assert!(pairs.contains(&("X".to_string(), "yes".to_string())));
-        assert!(pairs.contains(&("Y".to_string(), "7".to_string())));
+        let map: HashMap<&str, &str> = pairs
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.text.as_str()))
+            .collect();
+        assert_eq!(map["X"], "yes");
+        assert_eq!(map["Y"], "7");
 
         let yaml_path = dir.path().join("vars.env.yaml");
         std::fs::write(&yaml_path, "Z: 1\n").expect("write yaml");
@@ -1395,7 +1485,7 @@ mod tests {
     #[test]
     fn expand_dollar_references_earlier_values() {
         assert_eq!(
-            expand_dollar("$A/${B}/lit", &|name| Ok(match name {
+            expand_dollar("$A/${B}/lit", &[], &|name| Ok(match name {
                 "A" => Some("x"),
                 "B" => Some("y"),
                 _ => None,
@@ -1403,9 +1493,9 @@ mod tests {
             .unwrap(),
             "x/y/lit"
         );
-        assert_eq!(expand_dollar("$-$${", &|_| Ok(None)).unwrap(), "$-$${");
+        assert_eq!(expand_dollar("$-$${", &[], &|_| Ok(None)).unwrap(), "$-$${");
         assert_eq!(
-            expand_dollar("${UNFINISHED", &|_| Ok(None)).unwrap(),
+            expand_dollar("${UNFINISHED", &[], &|_| Ok(None)).unwrap(),
             "${UNFINISHED"
         );
     }

@@ -2411,7 +2411,7 @@ run = 'fixture-environment "$@"'
 
             def run(label, *, env=None, conf=None, files=(), parent_conf=None, parent_files=(),
                     expected=None, error=None, opaque_root=False, native_task=False, local_tool=False,
-                    child_name="project", writable=(), reads=None):
+                    child_name="project", writable=(), reads=None, diagnostic_excludes=()):
                 parent = here / label
                 parent.mkdir()
                 os.chown(parent, account.pw_uid, account.pw_gid)
@@ -2452,6 +2452,7 @@ run = 'fixture-environment "$@"'
                     results = [line[len(marker):] for line in output.splitlines() if line.startswith(marker)]
                     if error:
                         passed = result.returncode != 0 and not results and error in diagnostic and "panicked" not in diagnostic
+                        passed &= not any(value in diagnostic for value in diagnostic_excludes)
                     else:
                         wanted = expected(project) if callable(expected) else (expected or {})
                         payload = json.loads(results[0]) if len(results) == 1 else {}
@@ -2617,6 +2618,89 @@ run = "cp next.toml mise.local.toml"
             run("native-mise-rejects-malformed-refreshed-config", native_task=True, conf=refresh,
                 files=(("mise.local.toml", older), ("next.toml", "[env")),
                 writable=("mise.local.toml",), error="Failed to parse mise configuration")
+
+            phase = "mise-dotenv-values"
+            dotenv = "[env._]\nfile = 'fixture.env'\n"
+            expanded = "[env._]\nfile = { path = 'fixture.env', expand = true }\n"
+
+            def value_case(label, assignment, value, *, expand=False, prefix="", parent=False):
+                run(label, conf=None if parent else (expanded if expand else dotenv),
+                    parent_conf=(expanded if expand else dotenv) if parent else None,
+                    files=() if parent else (("fixture.env", prefix + assignment),),
+                    parent_files=(("fixture.env", prefix + assignment),) if parent else (),
+                    expected={result_key: value})
+
+            def out(spec):
+                return "OMG_FIXTURE_OUT=" + spec + "\n"
+
+            for name, spec, expected in [
+                ("unquoted-words", "two words", b"two words"),
+                ("unquoted-extra-equals", "left=right", b"left=right"),
+                ("unquoted-embedded-hash", "socket#name", b"socket#name"),
+                ("unquoted-space-comment", "ready # comment", b"ready"),
+                ("unquoted-tab-comment", "ready\t# comment", b"ready"),
+                ("unquoted-empty-before-comment", " # comment", b""),
+                ("unquoted-leading-hash", "#literal", b"#literal"),
+                ("single-quoted-comment", "'first # second' # trailing", b"first # second"),
+                ("double-quoted-comment", '"first # second" # trailing', b"first # second"),
+                ("quoted-space-preserved", '"  ready  " \t# outside', b"  ready  "),
+                ("quoted-empty-before-comment", "'' # trailing", b""),
+                ("quoted-unicode", '"føø # 水" # outside', "føø # 水".encode()),
+                ("double-quoted-escaped-quote", r'"say \"ready\" # inside" # outside', b'say "ready" # inside'),
+                ("double-quoted-escaped-controls", r'"first\nsecond\rthird\tlast"', b"first\nsecond\rthird\tlast"),
+                ("double-quoted-escaped-backslash", r'"left\\right"', b"left\\right"),
+                ("double-quoted-unknown-escape", r'"left\qright"', b"left\\qright"),
+                ("single-quoted-escapes-stay-literal", r"'first\nsecond'", b"first\\nsecond"),
+                ("double-quoted-multiline", '"first\n# second\n third" # outside', b"first\n# second\n third"),
+                ("single-quoted-multiline", "'first\n# second\n third' # outside", b"first\n# second\n third"),
+                ("inactive-expansion", '"$OMG_FIXTURE_RAW"', b"$OMG_FIXTURE_RAW"),
+            ]:
+                value_case(name, out(spec), expected)
+
+            value_case("export-tab-prefix", "export\t" + out("ready"), b"ready")
+            value_case("windows-line-endings", "export " + out("'ready # value' # outside").replace("\n", "\r\n"),
+                       b"ready # value", parent=True)
+            for name, spec, expected in [
+                ("expand-unquoted", "$OMG_FIXTURE_RAW/${OMG_FIXTURE_RAW}", b"seed/seed"),
+                ("expand-double-quoted", '"$OMG_FIXTURE_RAW # inside" # outside', b"seed # inside"),
+                ("keep-single-quoted-expansion-literal", "'$OMG_FIXTURE_RAW/${OMG_FIXTURE_RAW}'",
+                 b"$OMG_FIXTURE_RAW/${OMG_FIXTURE_RAW}"),
+                ("keep-double-quoted-escaped-dollars-literal", r'"\$OMG_FIXTURE_RAW/\${OMG_FIXTURE_RAW}/$OMG_FIXTURE_RAW"',
+                 b"$OMG_FIXTURE_RAW/${OMG_FIXTURE_RAW}/seed"),
+                ("expand-after-escaped-backslash", r'"\\$OMG_FIXTURE_RAW"', b"\\seed"),
+                ("keep-unquoted-escaped-dollar-literal", r"\$OMG_FIXTURE_RAW/$OMG_FIXTURE_RAW",
+                 b"$OMG_FIXTURE_RAW/seed"),
+                ("missing-expansion-remains-empty", "before$OMG_FIXTURE_MISSING/after", b"before/after"),
+            ]:
+                value_case(name, out(spec), expected, expand=True, prefix="OMG_FIXTURE_RAW=seed\n")
+
+            value_case("later-assignment-sees-earlier-value", out("$OMG_FIXTURE_OUT/last"), b"first/last",
+                       expand=True, prefix=out("first"))
+            run("later-dotenv-file-sees-earlier-file",
+                conf="[env._]\nfile = ['first.env', { path = 'second.env', expand = true }]\n",
+                files=(("first.env", "OMG_FIXTURE_RAW=seed\n"), ("second.env", out('"$OMG_FIXTURE_RAW # ready" # outside'))),
+                expected={result_key: b"seed # ready"})
+            run("task-local-dotenv-uses-same-value-rules", native_task=True,
+                conf=task + "[env]\nOMG_FIXTURE_RAW = 'global'\n" +
+                     "[tasks.fixture.env._]\nfile = { path = 'fixture.env', expand = true }\n",
+                files=(("fixture.env", out('"$OMG_FIXTURE_RAW # local" # outside')),),
+                expected={result_key: b"global # local"})
+            for name, assignment in [
+                ("unterminated-single-quote", out("'private-fixture-value")),
+                ("unterminated-double-quote", out('"private-fixture-value')),
+                ("characters-after-closed-quote", out('"ready" trailing')),
+                ("missing-assignment-delimiter", "NO_EQUALS\n"),
+            ]:
+                run(name, conf=dotenv, files=(("fixture.env", "# first line\n" + assignment),),
+                    error="Malformed line 2", diagnostic_excludes=("private-fixture-value",))
+            run("json-file-expansion-preserved",
+                conf="[env._]\nfile = { path = 'fixture.json', expand = true }\n",
+                files=(("fixture.json", '{"OMG_FIXTURE_OUT":"$OMG_FIXTURE_RAW"}'),),
+                env={raw_key: b"seed"}, expected={result_key: b"seed"})
+            run("toml-file-expansion-preserved",
+                conf="[env._]\nfile = { path = 'fixture.toml', expand = true }\n",
+                files=(("fixture.toml", "OMG_FIXTURE_OUT = '$OMG_FIXTURE_RAW'\n"),),
+                env={raw_key: b"seed"}, expected={result_key: b"seed"})
 
 
     def inspect_task_package_metadata():
@@ -4991,6 +5075,6 @@ assert inventory() == before
 report = dict(binaries=binaries, checks=checks, total=len(checks),
               passed=sum(entry["passed"] for entry in checks), host_unchanged=True)
 print(json.dumps(report))
-expected_checks = 303 if consent_oracle is None else 1522
+expected_checks = 303 if consent_oracle is None else 1560
 if report["passed"] != report["total"] or report["total"] != expected_checks:
     sys.exit(4)

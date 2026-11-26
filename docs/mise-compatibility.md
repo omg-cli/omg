@@ -64,6 +64,8 @@ path = "bin"
 
 Relative directive paths use the declaring configuration root. Environment files may use dotenv, JSON, or TOML. YAML files fail with a conversion message. JSON and TOML values must be flat scalar values. Missing required values and required files fail during explicit task execution.
 
+Dotenv accepts `KEY=value` and an optional `export` prefix. Quotes preserve spaces, line breaks, and `#` characters inside the value. Set `expand = true` on a file directive to expand `$NAME` or `${NAME}` from earlier values. Single-quoted values and escaped dollar signs stay literal.
+
 `_.source` runs a project script when an explicit task environment is resolved. Review it before running a task. Automatic shell hooks read runtime pins but do not load `[env]`, read environment files, or run source scripts.
 
 ## Project tasks
