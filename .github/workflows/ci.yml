@@ -391,8 +391,9 @@ jobs:
             --features debian-pure --locked -- -D warnings
 
       - name: Verify Node authentication fails closed without PGP
+        # Share Cargo dependency artifacts with the portable test suite below.
         run: |
-          cargo test --profile ci --lib --no-default-features --features license --locked \
+          cargo test --lib --no-default-features --features license --locked \
             runtimes::node::tests::node_install_without_pgp_refuses_before_contacting_the_publisher \
             -- --exact --nocapture
 

@@ -794,13 +794,23 @@ git() { printf '%040d\\n' 1; }
 
     def test_distro_e2e_restores_shared_caches_without_saving_per_pr(self):
         workflow = (WORKFLOWS / 'distro-e2e.yml').read_text(encoding='utf-8')
-        for job in ('container-e2e', 'systemd-daemon-e2e'):
+        main = "github.ref == 'refs/heads/main'"
+        for job, condition in (
+            ('container-e2e', main + " && env.RUSTC_WRAPPER != 'sccache'"),
+            ('systemd-daemon-e2e', main),
+        ):
             with self.subTest(job=job):
                 body = job_block(workflow, job)
                 cache = body.split('      - name: Cache Cargo artifacts\n', 1)[1].split('\n      - ', 1)[0]
                 self.assertIn('uses: Swatinem/rust-cache@', cache)
                 self.assertNotIn('\n        if:', cache)
-                self.assertIn("save-if: ${{ github.ref == 'refs/heads/main' }}", cache)
+                self.assertIn('save-if: ${{ ' + condition + ' }}', cache)
+
+    def test_audit_cache_saves_without_build_products_on_main_push(self):
+        workflow = (WORKFLOWS / 'audit.yml').read_text(encoding='utf-8')
+        cache = workflow.split('      - name: Setup Rust cache\n', 1)[1].split('\n      - ', 1)[0]
+        self.assertIn('cache-targets: false', cache)
+        self.assertIn("save-if: ${{ github.ref == 'refs/heads/main' && github.event_name == 'push' }}", cache)
 
     def test_publication_and_alpm_unit_suites_have_one_ci_owner(self):
         workflow = (WORKFLOWS / 'ci.yml').read_text(encoding='utf-8')

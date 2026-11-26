@@ -9,7 +9,7 @@ use omg_lib::core::completion::CompletionEngine;
 static ALLOCATOR: &StatsAlloc<System> = &INSTRUMENTED_SYSTEM;
 
 #[test]
-fn fuzzy_ranking_allocations_grow_with_candidates() {
+fn fuzzy_ranking_reuses_candidate_storage() {
     let engine = CompletionEngine::new();
     for count in [4096, 32768] {
         // Varied prefix/nonprefix, mixed case and Unicode, deterministically shuffled.
@@ -35,11 +35,10 @@ fn fuzzy_ranking_allocations_grow_with_candidates() {
             stats.bytes_reallocated
         );
         assert_eq!(ranked.len(), count);
-        // Scoring may allocate a UTF32 buffer per candidate. Collection growth,
-        // matcher/pattern setup and stable sort require additional allocations.
-        // Two allocations per comparison exceed this linear resource budget.
+        // Matcher setup, the Unicode scratch buffer and collection growth
+        // need only a bounded number of allocations.
         assert!(
-            allocations <= 2 * count + 128,
+            allocations <= 128,
             "{allocations} allocations for {count} candidates"
         );
     }

@@ -43,7 +43,9 @@ jobs:
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           prefix-key: "audit"
+          cache-targets: false
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' && github.event_name == 'push' }}
 
       - name: Install cargo-audit
         uses: taiki-e/install-action@e67fa11c4b9316fa714ddf0abed07a0c3143b95b # v2.87.4
