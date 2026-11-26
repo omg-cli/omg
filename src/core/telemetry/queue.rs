@@ -6,13 +6,17 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use super::{MAX_QUEUE_BYTES, MAX_QUEUE_SIZE, QUEUE_FORMAT_VERSION, read_saved_telemetry};
+use super::{
+    ConsentEpoch, MAX_QUEUE_BYTES, MAX_QUEUE_SIZE, QUEUE_FORMAT_VERSION, read_saved_telemetry,
+};
 use crate::core::telemetry_client::TelemetryEvent;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PersistedQueue {
     format_version: u32,
+    #[serde(default, skip_serializing_if = "ConsentEpoch::is_legacy")]
+    consent_epoch: ConsentEpoch,
     events: Vec<StoredEvent>,
 }
 
@@ -41,11 +45,12 @@ impl PendingEvent {
 
 pub(super) struct QueueStore {
     path: PathBuf,
+    epoch: ConsentEpoch,
 }
 
 impl QueueStore {
-    pub(super) fn new(path: PathBuf) -> Self {
-        Self { path }
+    pub(super) fn new(path: PathBuf, epoch: ConsentEpoch) -> Self {
+        Self { path, epoch }
     }
 
     pub(super) fn validate(&self) -> Result<()> {
@@ -121,13 +126,18 @@ impl QueueStore {
         Ok(lock)
     }
 
+    fn empty(&self) -> PersistedQueue {
+        PersistedQueue {
+            format_version: QUEUE_FORMAT_VERSION,
+            consent_epoch: self.epoch.clone(),
+            events: Vec::new(),
+        }
+    }
+
     fn read(&self) -> Result<PersistedQueue> {
         let Some(content) = read_saved_telemetry(&self.path, "Telemetry queue", MAX_QUEUE_BYTES)?
         else {
-            return Ok(PersistedQueue {
-                format_version: QUEUE_FORMAT_VERSION,
-                events: Vec::new(),
-            });
+            return Ok(self.empty());
         };
         let mut queue: PersistedQueue = serde_json::from_str(&content)
             .with_context(|| format!("Malformed telemetry queue: {}", self.path.display()))?;
@@ -137,6 +147,9 @@ impl QueueStore {
             queue.format_version,
             QUEUE_FORMAT_VERSION
         );
+        if queue.consent_epoch != self.epoch {
+            return Ok(self.empty());
+        }
         let mut ids = HashSet::new();
         for id in queue
             .events
@@ -214,8 +227,8 @@ mod tests {
     fn acknowledgement_keeps_identical_event_from_another_writer() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("telemetry_queue.json");
-        let first = QueueStore::new(path.clone());
-        let second = QueueStore::new(path);
+        let first = QueueStore::new(path.clone(), ConsentEpoch::default());
+        let second = QueueStore::new(path, ConsentEpoch::default());
         first.append(&VecDeque::from([event(7)]))?;
 
         let lease = first.try_dispatch_lock()?.context("first sender lease")?;
@@ -246,11 +259,11 @@ mod tests {
             {"type":"performance","metric_type":"queue-test","duration_ms":7}
         ]}"#,
         )?;
-        let store = QueueStore::new(path.clone());
+        let store = QueueStore::new(path.clone(), ConsentEpoch::default());
         let sent = store.prepare_batch()?;
         assert_eq!(sent.len(), 2);
         assert_ne!(sent[0].queue_id, sent[1].queue_id);
-        let retry = QueueStore::new(path).prepare_batch()?;
+        let retry = QueueStore::new(path, ConsentEpoch::default()).prepare_batch()?;
         assert_eq!(sent[0].queue_id, retry[0].queue_id);
         assert_eq!(sent[1].queue_id, retry[1].queue_id);
         Ok(())
@@ -259,7 +272,10 @@ mod tests {
     #[test]
     fn retrying_the_same_pending_batch_does_not_duplicate_it() -> Result<()> {
         let directory = tempfile::tempdir()?;
-        let store = QueueStore::new(directory.path().join("telemetry_queue.json"));
+        let store = QueueStore::new(
+            directory.path().join("telemetry_queue.json"),
+            ConsentEpoch::default(),
+        );
         let pending = VecDeque::from([event(7)]);
         store.append(&pending)?;
         store.append(&pending)?;
@@ -273,7 +289,7 @@ mod tests {
         let path = directory.path().join("telemetry_queue.json");
         let corrupt = b"{malformed";
         std::fs::write(&path, corrupt)?;
-        let store = QueueStore::new(path.clone());
+        let store = QueueStore::new(path.clone(), ConsentEpoch::default());
         let error = store
             .append(&VecDeque::from([event(7)]))
             .expect_err("reject damaged queue");
@@ -285,7 +301,10 @@ mod tests {
     #[test]
     fn acknowledgement_after_eviction_keeps_later_persisted_events() -> Result<()> {
         let directory = tempfile::tempdir()?;
-        let store = QueueStore::new(directory.path().join("telemetry_queue.json"));
+        let store = QueueStore::new(
+            directory.path().join("telemetry_queue.json"),
+            ConsentEpoch::default(),
+        );
         store.append(&(0..MAX_QUEUE_SIZE as u64).map(event).collect())?;
         let sent = store.prepare_batch()?;
         store.append(&VecDeque::from([event(MAX_QUEUE_SIZE as u64)]))?;

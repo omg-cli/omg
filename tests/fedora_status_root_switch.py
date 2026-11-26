@@ -5027,6 +5027,118 @@ for version in versions:
                     diagnostic=(result.stdout[-430:], result.stderr[-500:])))
 
 
+    def inspect_telemetry_consent_transitions():
+        phase = "fedora-telemetry-consent-transition"
+        opt_out = ("privacy", "opt-out")
+        opt_in = ("privacy", "opt-in")
+        config_off = ("config", "set", "telemetry.enabled", "false")
+        config_on = ("config", "set", "telemetry.enabled", "true")
+        unrelated = ("config", "set", "aur.build_concurrency", "2")
+
+        for label, mutations, revoked, separate_data in (
+            ("privacy", (opt_out, opt_in), True, False),
+            ("config", (config_off, config_on), True, False),
+            ("privacy-then-config", (opt_out, config_on), True, True),
+            ("config-then-privacy", (config_off, opt_in), True, True),
+            ("repeated-opt-in", (opt_in, config_on), False, False),
+            ("unrelated-setting", (unrelated, opt_in), False, False),
+        ):
+            with tempfile.TemporaryDirectory(prefix="consent-transition-", dir=work) as directory:
+                home = Path(directory)
+                data, config = home/"data", home/"config"
+                preference_data = home/"preference-data" if separate_data else data
+                for path in (home, data, config, preference_data):
+                    path.mkdir(exist_ok=True)
+                    path.chmod(0o700)
+                    os.chown(path, account.pw_uid, account.pw_gid)
+
+                def write(path, value):
+                    path.write_text(value)
+                    path.chmod(0o600)
+                    os.chown(path, account.pw_uid, account.pw_gid)
+
+                session = data/"telemetry_session.json"
+                old_session = "before-consent-transition"
+                write(config/"config.toml", "telemetry_enabled = true\n")
+                write(data/".installed", "{}")
+                write(session, json.dumps({
+                    "format_version":1,"session_id":old_session,"started_at":"2026-10-01T01:02:03Z",
+                    "commands_run":40,"last_activity":int(time.time())}))
+                write(home/"Makefile", """held:
+\t@touch ready
+\t@i=0; while [ ! -f release ] && [ $$i -lt 350 ]; do i=$$((i+1)); sleep 0.02; done
+\t@test -f release
+\t@printf 'held command finished\\n'
+fresh:
+\t@printf 'fresh command finished\\n'
+""")
+                queue = data/"telemetry_queue.json"
+                prior = {"type":"performance","metric_type":"old-consent-fixture","duration_ms":4}
+                write(queue, json.dumps({"format_version":1,"events":[prior]}))
+                original_session = session.read_bytes()
+                chosen = {name:value for name,value in disabled.items() if name != "OMG_DISABLE_TELEMETRY"}
+                chosen.update(HOME=str(home), OMG_DATA_DIR=str(data), OMG_CONFIG_DIR=str(config),
+                              XDG_CONFIG_HOME=str(home/"xdg-config"), XDG_DATA_HOME=str(home/"xdg-data"),
+                              XDG_STATE_HOME=str(home/"state"), XDG_CACHE_HOME=str(home/"cache"),
+                              CI="1", OMG_NO_UPDATE_CHECK="1")
+                silent = dict(chosen, OMG_DISABLE_TELEMETRY="1", OMG_DATA_DIR=str(preference_data))
+
+                def record(case, status, passed, *diagnostic):
+                    checks.append(dict(phase=phase, case=f"{label}-{case}", passed=status == 0 and bool(passed),
+                                       status=status, diagnostic=diagnostic))
+
+                child = subprocess.Popen([str(cli), "run", "held"], cwd=home, env=chosen,
+                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    text=True, **ordinary)
+                try:
+                    deadline = time.monotonic() + 12
+                    while not (home/"ready").is_file():
+                        assert child.poll() is None, child.communicate()
+                        assert time.monotonic() < deadline, "command must reach the consent barrier"
+                        time.sleep(0.02)
+
+                    for index, args in enumerate(mutations):
+                        result = command([cli, *args], silent, ordinary, timeout=8)
+                        enabled = tomllib.loads((config/"config.toml").read_text())["telemetry_enabled"]
+                        record(f"change-{index+1}", result.returncode,
+                               enabled is (not revoked or index==1),
+                               result.stdout[-400:], result.stderr[-400:], enabled)
+
+                    result = command([cli, "config", "get", "telemetry.enabled"], silent, ordinary, timeout=8)
+                    record("inspect-opt-in", result.returncode, result.stdout.strip()=="true",
+                           result.stdout[-400:], result.stderr[-400:])
+
+                    (home/"release").touch()
+                    output, errors = child.communicate(timeout=12)
+                    held = json.loads(queue.read_text())["events"] if queue.is_file() else []
+                    held_runs = sum(row.get("command")=="run" for row in held)
+                    held_ids = [row["session_id"] for row in held if row["type"]=="session"]
+                    stopped = (held == [prior] and session.read_bytes() == original_session) if separate_data else not held and not session.exists()
+                    record("finish-held", child.returncode,
+                           "held command finished" in output
+                           and (stopped if revoked
+                                else held_runs==1 and held_ids and set(held_ids)=={old_session}),
+                           output[-400:], errors[-400:], held_runs, held_ids, session.exists())
+
+                    result = subprocess.run([str(cli), "run", "fresh"], cwd=home, env=chosen, timeout=12,
+                        stdin=subprocess.DEVNULL, capture_output=True, text=True, **ordinary)
+                    fresh = json.loads(queue.read_text())["events"] if queue.is_file() else []
+                    fresh_runs = sum(row.get("command")=="run" for row in fresh)
+                    fresh_ids = [row["session_id"] for row in fresh if row["type"]=="session"]
+                    counters = [row["commands_run"] for row in fresh
+                                if row["type"]=="session" and row["event_type"]=="end"]
+                    old_metrics = [row for row in fresh if row.get("metric_type")=="old-consent-fixture"]
+                    record("finish-fresh", result.returncode,
+                           "fresh command finished" in result.stdout and fresh_ids
+                           and ((fresh_runs==1 and old_session not in fresh_ids and counters==[1] and not old_metrics) if revoked
+                                else fresh_runs==2 and old_session in fresh_ids and counters and counters[0]==41 and old_metrics),
+                           result.stdout[-400:], result.stderr[-400:], fresh_runs, fresh_ids, counters)
+                finally:
+                    if child.poll() is None:
+                        child.kill()
+                    child.wait()
+
+
     def inspect_task_environment_bytes():
         phase = "task-environment-bytes"
         raw = b"test-\xff-value"
@@ -7764,6 +7876,7 @@ exec {shlex.quote(str(binary))} "$@"
                     inspect_privacy_commands()
                     inspect_telemetry_storage()
                     inspect_telemetry_queue_overlap()
+                    inspect_telemetry_consent_transitions()
                 config.write_text(host_config)
                 inspect("returned-host", host_count, host_explicit, host=True)
                 mark_progress("root switch and return")
@@ -8075,6 +8188,6 @@ mark_progress("completed with host inventory unchanged")
 report = dict(binaries=binaries, checks=checks, total=len(checks),
               passed=sum(entry["passed"] for entry in checks), host_unchanged=True)
 print(json.dumps(report))
-expected_checks = 303 if consent_oracle is None else 2532
+expected_checks = 303 if consent_oracle is None else 2562
 if report["passed"] != report["total"] or report["total"] != expected_checks:
     sys.exit(4)

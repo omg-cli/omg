@@ -324,12 +324,7 @@ fn apply_telemetry_config(stdout: &mut io::Stdout, enabled: bool) -> Result<()> 
         Print(" Configuring telemetry...")
     )?;
 
-    let _write_lock = Settings::write_lock()?;
-    let mut settings = Settings::load().context("Failed to load OMG settings")?;
-    settings.telemetry_enabled = enabled;
-
-    settings
-        .save()
+    crate::core::telemetry::set_telemetry_preference(enabled)
         .context("Failed to persist telemetry configuration")?;
     let status = if enabled { "enabled" } else { "disabled" };
     execute!(
@@ -1232,6 +1227,13 @@ mod tests {
         );
         let home = tempfile::tempdir().expect("private settings home");
         let config = home.path().join("config");
+        let data = home.path().join("data");
+        std::fs::create_dir(&data).expect("telemetry directory");
+        let queue = data.join("telemetry_queue.json");
+        let session = data.join("telemetry_session.json");
+        for path in [&queue, &session] {
+            std::fs::write(path, "previously saved telemetry").expect("seed telemetry");
+        }
         std::fs::create_dir(&config).expect("settings directory");
         let settings_path = config.join("config.toml");
         let original = format!("telemetry_enabled = {}\n", !enabled);
@@ -1250,6 +1252,7 @@ mod tests {
             [
                 ("HOME", Some(home.path().as_os_str())),
                 ("OMG_CONFIG_DIR", Some(config.as_os_str())),
+                ("OMG_DATA_DIR", Some(data.as_os_str())),
             ],
             || {
                 let result = apply_telemetry_config(&mut io::stdout(), enabled);
@@ -1257,6 +1260,8 @@ mod tests {
                     .expect("restore private directory permissions");
                 if writable {
                     result.expect("persist selected consent");
+                    assert!(!queue.exists(), "init must purge the previous queue");
+                    assert!(!session.exists(), "init must clear the previous session");
                     assert_eq!(
                         Settings::load()
                             .expect("reload saved consent")
@@ -1269,6 +1274,14 @@ mod tests {
                         original
                     );
                     result.expect_err("an unpersisted consent change must fail the init operation");
+                    if !enabled {
+                        for path in [&queue, &session] {
+                            assert_eq!(
+                                std::fs::read_to_string(path).expect("prior telemetry remains"),
+                                "previously saved telemetry"
+                            );
+                        }
+                    }
                 }
             },
         );

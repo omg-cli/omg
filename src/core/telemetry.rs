@@ -168,10 +168,85 @@ fn telemetry_consent_lease() -> Option<std::fs::File> {
     }
 }
 
-fn persist_with_consent(save: impl FnOnce() -> Result<()>) {
-    if let Some(_consent) = telemetry_consent_lease() {
-        persist_best_effort(save());
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+struct ConsentEpoch(Option<String>);
+
+impl ConsentEpoch {
+    fn is_legacy(&self) -> bool {
+        self.0.is_none()
     }
+}
+
+#[derive(PartialEq, Eq)]
+struct CaptureConsent {
+    marker: PathBuf,
+    epoch: ConsentEpoch,
+}
+
+impl CaptureConsent {
+    fn marker_path() -> Result<PathBuf> {
+        Ok(crate::config::Settings::config_path()?.with_extension("telemetry-consent"))
+    }
+
+    fn read() -> Result<Self> {
+        let marker = Self::marker_path()?;
+        let generation = read_saved_telemetry(&marker, "Telemetry consent marker", 36)?;
+        if let Some(generation) = &generation {
+            uuid::Uuid::parse_str(generation).context("Invalid telemetry consent marker")?;
+        }
+        Ok(Self {
+            marker,
+            epoch: ConsentEpoch(generation),
+        })
+    }
+
+    fn rotate() -> Result<()> {
+        crate::core::safe_ops::atomic_write_file_sync_private(
+            &Self::marker_path()?,
+            uuid::Uuid::new_v4().to_string(),
+        )
+        .context("Failed to update the telemetry consent marker")
+    }
+
+    fn try_lease(&self) -> Option<std::fs::File> {
+        let lease = telemetry_consent_lease()?;
+        match Self::read() {
+            Ok(current) if current == *self => Some(lease),
+            Ok(_) => None,
+            Err(error) => {
+                tracing::debug!("Failed to check current telemetry consent: {error:#}");
+                None
+            }
+        }
+    }
+
+    fn persist(&self, save: impl FnOnce() -> Result<()>) {
+        if let Some(_consent) = self.try_lease() {
+            persist_best_effort(save());
+        }
+    }
+}
+
+// A CLI invocation that spans a consent change may finish its work, but its
+// telemetry should never be carried into the new consent period.
+static CAPTURE_CONSENT: OnceLock<Option<CaptureConsent>> = OnceLock::new();
+
+fn capture_consent() -> Option<&'static CaptureConsent> {
+    let opted_out = is_telemetry_opt_out();
+    let captured = CAPTURE_CONSENT.get_or_init(|| {
+        if opted_out {
+            return None;
+        }
+        match CaptureConsent::read() {
+            Ok(consent) => Some(consent),
+            Err(error) => {
+                tracing::warn!("Cannot identify telemetry consent: {error:#}");
+                None
+            }
+        }
+    });
+    if opted_out { None } else { captured.as_ref() }
 }
 
 fn read_saved_telemetry(path: &Path, kind: &str, limit: u64) -> Result<Option<String>> {
@@ -412,8 +487,8 @@ impl EventQueue {
         Ok(telemetry_queue_path())
     }
 
-    fn load() -> Self {
-        let result = Self::path().and_then(|path| Self::load_from(&path));
+    fn load(epoch: &ConsentEpoch) -> Self {
+        let result = Self::path().and_then(|path| Self::load_from(&path, epoch));
         match result {
             Ok(()) => Self::default(),
             Err(error) => {
@@ -428,11 +503,11 @@ impl EventQueue {
         }
     }
 
-    fn load_from(path: &Path) -> Result<()> {
-        QueueStore::new(path.to_path_buf()).validate()
+    fn load_from(path: &Path, epoch: &ConsentEpoch) -> Result<()> {
+        QueueStore::new(path.to_path_buf(), epoch.clone()).validate()
     }
 
-    fn save(&mut self) -> Result<()> {
+    fn save(&mut self, epoch: &ConsentEpoch) -> Result<()> {
         anyhow::ensure!(
             self.persistence_enabled,
             "telemetry queue persistence is disabled after a load failure"
@@ -441,7 +516,7 @@ impl EventQueue {
             return Ok(());
         }
 
-        QueueStore::new(Self::path()?).append(&self.events)?;
+        QueueStore::new(Self::path()?, epoch.clone()).append(&self.events)?;
         self.events.clear();
 
         // Reset persist tracking
@@ -475,6 +550,8 @@ pub struct TelemetrySession {
 #[serde(deny_unknown_fields)]
 struct SerializableSession {
     format_version: u32,
+    #[serde(default, skip_serializing_if = "ConsentEpoch::is_legacy")]
+    consent_epoch: ConsentEpoch,
     session_id: String,
     started_at: String,
     commands_run: u32,
@@ -507,8 +584,8 @@ impl TelemetrySession {
         Ok(data_dir.join("telemetry_session.json"))
     }
 
-    fn load() -> Self {
-        let result = Self::path().and_then(|path| Self::load_from(&path));
+    fn load(epoch: &ConsentEpoch) -> Self {
+        let result = Self::path().and_then(|path| Self::load_from(&path, epoch));
         match result {
             Ok(session) => session,
             Err(error) => {
@@ -523,7 +600,7 @@ impl TelemetrySession {
         }
     }
 
-    fn load_from(path: &std::path::Path) -> Result<Self> {
+    fn load_from(path: &std::path::Path, epoch: &ConsentEpoch) -> Result<Self> {
         let Some(content) = read_saved_telemetry(path, "Telemetry session", MAX_SESSION_BYTES)?
         else {
             return Ok(Self::default());
@@ -536,6 +613,9 @@ impl TelemetrySession {
             session.format_version,
             SESSION_FORMAT_VERSION
         );
+        if session.consent_epoch != *epoch {
+            return Ok(Self::default());
+        }
         session
             .started_at
             .parse::<jiff::Timestamp>()
@@ -557,7 +637,7 @@ impl TelemetrySession {
         })
     }
 
-    fn save(&self) -> Result<()> {
+    fn save(&self, epoch: &ConsentEpoch) -> Result<()> {
         anyhow::ensure!(
             self.persistence_enabled,
             "telemetry session persistence is disabled after a load failure"
@@ -565,6 +645,7 @@ impl TelemetrySession {
         let path = Self::path()?;
         let sess = SerializableSession {
             format_version: SESSION_FORMAT_VERSION,
+            consent_epoch: epoch.clone(),
             session_id: self.session_id.clone(),
             started_at: self.started_at.clone(),
             commands_run: self.commands_run.load(Ordering::Relaxed),
@@ -629,25 +710,25 @@ impl TelemetrySession {
 }
 
 /// Get or create the event queue
-fn get_event_queue() -> &'static Mutex<EventQueue> {
-    EVENT_QUEUE.get_or_init(|| Mutex::new(EventQueue::load()))
+fn get_event_queue(consent: &CaptureConsent) -> &'static Mutex<EventQueue> {
+    EVENT_QUEUE.get_or_init(|| Mutex::new(EventQueue::load(&consent.epoch)))
 }
 
 fn telemetry_queue_path() -> PathBuf {
     crate::core::paths::data_dir().join("telemetry_queue.json")
 }
 
-fn purge_queue_file(path: &std::path::Path) -> Result<()> {
+fn purge_telemetry_file(path: &std::path::Path) -> Result<()> {
     match std::fs::remove_file(path) {
         Ok(()) => crate::core::safe_ops::sync_parent_directory_sync(path).with_context(|| {
             format!(
-                "Failed to make telemetry queue deletion durable: {}",
+                "Failed to make telemetry state deletion durable: {}",
                 path.display()
             )
         }),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error)
-            .with_context(|| format!("Failed to delete telemetry queue: {}", path.display())),
+            .with_context(|| format!("Failed to delete telemetry state: {}", path.display())),
     }
 }
 
@@ -659,7 +740,7 @@ fn purge_queue(queue: Option<&Mutex<EventQueue>>, path: &std::path::Path) -> Res
         queue.events.clear();
         queue.events_since_persist.store(0, Ordering::Relaxed);
     }
-    purge_queue_file(path)
+    purge_telemetry_file(path)
 }
 
 /// Remove queued telemetry after a user opts out.
@@ -667,30 +748,46 @@ pub fn purge_persisted_queue() -> Result<()> {
     purge_queue(EVENT_QUEUE.get(), &telemetry_queue_path())
 }
 
+fn purge_runtime_state() -> Result<()> {
+    let queue = purge_persisted_queue();
+    let session =
+        purge_telemetry_file(&crate::core::paths::data_dir().join("telemetry_session.json"));
+    queue.and(session)
+}
+
 pub(crate) fn set_telemetry_preference(enabled: bool) -> Result<()> {
     use crate::config::Settings;
 
     let _write_lock = Settings::write_lock()?;
     let mut settings = Settings::load().context("Failed to load OMG settings")?;
-    if enabled && !settings.telemetry_enabled {
-        purge_persisted_queue().context("Failed to purge queued telemetry before opting in")?;
+    let changed = enabled != settings.telemetry_enabled;
+    if enabled && changed {
+        purge_runtime_state().context("Failed to purge queued telemetry before opting in")?;
+        CaptureConsent::rotate()?;
     }
 
     settings.telemetry_enabled = enabled;
     settings.save()?;
     if !enabled {
-        purge_persisted_queue().context("Failed to purge queued telemetry after opting out")?;
+        let rotated = if changed {
+            CaptureConsent::rotate()
+        } else {
+            Ok(())
+        };
+        let purged =
+            purge_runtime_state().context("Failed to purge queued telemetry after opting out");
+        rotated.and(purged)?;
     }
     Ok(())
 }
 
 /// Get or create the session state
-fn get_session() -> &'static Mutex<TelemetrySession> {
+fn get_session(consent: &CaptureConsent) -> &'static Mutex<TelemetrySession> {
     SESSION_STATE.get_or_init(|| {
-        let mut session = TelemetrySession::load();
+        let mut session = TelemetrySession::load(&consent.epoch);
         if session.is_expired() {
             session = TelemetrySession::new();
-            persist_with_consent(|| session.save());
+            consent.persist(|| session.save(&consent.epoch));
         }
         Mutex::new(session)
     })
@@ -718,21 +815,27 @@ pub fn get_startup_duration_ms() -> Option<u64> {
 /// Get current session ID
 #[must_use]
 pub fn get_session_id() -> String {
-    if let Ok(session) = get_session().lock() {
-        session.session_id.clone()
-    } else {
-        uuid::Uuid::new_v4().to_string()
-    }
+    static LOCAL_SESSION_ID: OnceLock<String> = OnceLock::new();
+    capture_consent()
+        .and_then(|consent| get_session(consent).lock().ok())
+        .map_or_else(
+            || {
+                LOCAL_SESSION_ID
+                    .get_or_init(|| uuid::Uuid::new_v4().to_string())
+                    .clone()
+            },
+            |session| session.session_id.clone(),
+        )
 }
 
 /// Queue an already-gated event for batching.
-fn enqueue(event: TelemetryEvent) {
-    if let Ok(mut queue) = get_event_queue().lock() {
+fn enqueue(consent: &CaptureConsent, event: TelemetryEvent) {
+    if let Ok(mut queue) = get_event_queue(consent).lock() {
         queue.push(event);
 
         // Only persist periodically, not on every event
         if queue.needs_persist() {
-            persist_with_consent(|| queue.save());
+            consent.persist(|| queue.save(&consent.epoch));
         }
     } else {
         tracing::debug!("Telemetry queue lock poisoned; dropped one event (non-fatal)");
@@ -740,13 +843,13 @@ fn enqueue(event: TelemetryEvent) {
 }
 
 /// Record command activity on the session and persist it periodically.
-fn record_session_activity() {
-    if let Ok(session) = get_session().lock() {
+fn record_session_activity(consent: &CaptureConsent) {
+    if let Ok(session) = get_session(consent).lock() {
         session.record_activity();
 
         // Only persist periodically
         if session.needs_persist() {
-            persist_with_consent(|| session.save());
+            consent.persist(|| session.save(&consent.epoch));
         }
     } else {
         tracing::debug!("Telemetry session lock poisoned; activity not recorded (non-fatal)");
@@ -759,39 +862,42 @@ fn record_session_activity() {
 /// are collected. Positional arguments, package names, search queries, file
 /// paths, and raw error text never cross this boundary.
 pub fn track_command_event(command: &str, duration_ms: u64, success: bool, backend: Option<&str>) {
-    if !is_enhanced_telemetry_enabled() {
+    let Some(consent) = capture_consent() else {
         return;
-    }
+    };
 
-    record_session_activity();
+    record_session_activity(consent);
 
-    enqueue(TelemetryEvent::Command(CommandEvent {
-        command: command.to_string(),
-        duration_ms,
-        success,
-        backend: backend.map(String::from),
-    }));
+    enqueue(
+        consent,
+        TelemetryEvent::Command(CommandEvent {
+            command: command.to_string(),
+            duration_ms,
+            success,
+            backend: backend.map(String::from),
+        }),
+    );
 }
 
 /// Track performance metric
 pub fn track_performance_event(metric_type: &str, duration_ms: u64) {
-    if !is_enhanced_telemetry_enabled() {
+    let Some(consent) = capture_consent() else {
         return;
-    }
+    };
 
     let event = TelemetryEvent::Performance(PerformanceEvent {
         metric_type: metric_type.to_string(),
         duration_ms,
     });
 
-    enqueue(event);
+    enqueue(consent, event);
 }
 
 /// Track session start
 pub fn track_session_start() {
-    if !is_enhanced_telemetry_enabled() {
+    let Some(consent) = capture_consent() else {
         return;
-    }
+    };
 
     let event = TelemetryEvent::Session(SessionEvent {
         session_id: get_session_id(),
@@ -802,30 +908,38 @@ pub fn track_session_start() {
         duration_secs: None,
     });
 
-    enqueue(event);
+    enqueue(consent, event);
 }
 
 /// Flush queued events (call periodically or on exit)
 pub async fn flush_events() {
-    if !is_enhanced_telemetry_enabled() {
-        return;
-    }
-
-    let _flush_guard = FLUSH_LOCK.lock().await;
-    let Some(_consent) = telemetry_consent_lease() else {
+    let Some(consent) = capture_consent() else {
         return;
     };
-    flush_queue(get_event_queue(), crate::core::telemetry_client::send_batch).await;
+
+    let _flush_guard = FLUSH_LOCK.lock().await;
+    let Some(_lease) = consent.try_lease() else {
+        return;
+    };
+    flush_queue(
+        get_event_queue(consent),
+        &consent.epoch,
+        crate::core::telemetry_client::send_batch,
+    )
+    .await;
 }
 
-async fn flush_queue<SendBatch, Sending>(queue: &Mutex<EventQueue>, send_batch: SendBatch)
-where
+async fn flush_queue<SendBatch, Sending>(
+    queue: &Mutex<EventQueue>,
+    epoch: &ConsentEpoch,
+    send_batch: SendBatch,
+) where
     SendBatch: FnOnce(Vec<TelemetryEvent>) -> Sending,
     Sending: std::future::Future<Output = Result<()>>,
 {
     let use_persistence = match queue.lock() {
         Ok(mut local) if local.persistence_enabled => {
-            if let Err(error) = local.save() {
+            if let Err(error) = local.save(epoch) {
                 tracing::warn!("Failed to merge local telemetry: {error:#}");
                 return;
             }
@@ -838,7 +952,7 @@ where
         }
     };
     if use_persistence {
-        if let Err(error) = flush_persisted_queue(send_batch).await {
+        if let Err(error) = flush_persisted_queue(epoch, send_batch).await {
             tracing::debug!("Deferred telemetry dispatch: {error:#}");
         }
     } else {
@@ -846,12 +960,15 @@ where
     }
 }
 
-async fn flush_persisted_queue<SendBatch, Sending>(send_batch: SendBatch) -> Result<()>
+async fn flush_persisted_queue<SendBatch, Sending>(
+    epoch: &ConsentEpoch,
+    send_batch: SendBatch,
+) -> Result<()>
 where
     SendBatch: FnOnce(Vec<TelemetryEvent>) -> Sending,
     Sending: std::future::Future<Output = Result<()>>,
 {
-    let store = QueueStore::new(EventQueue::path()?);
+    let store = QueueStore::new(EventQueue::path()?, epoch.clone());
     let Some(_dispatch) = store.try_dispatch_lock()? else {
         return Ok(());
     };
@@ -894,13 +1011,13 @@ where
 
 /// End session and flush all events (call on CLI exit)
 pub async fn end_session_and_flush() {
-    if !is_enhanced_telemetry_enabled() {
+    let Some(consent) = capture_consent() else {
         return;
-    }
+    };
 
     // Record session end event. A poisoned session lock must not skip the
     // final flush below — queued events are still delivered on CLI exit.
-    let session_summary = get_session().lock().ok().map(|session| {
+    let session_summary = get_session(consent).lock().ok().map(|session| {
         (
             session.session_id.clone(),
             session.commands_run.load(Ordering::Relaxed),
@@ -918,7 +1035,7 @@ pub async fn end_session_and_flush() {
             duration_secs: Some(duration_secs),
         });
 
-        enqueue(event);
+        enqueue(consent, event);
     } else {
         tracing::debug!("Telemetry session lock poisoned; skipping session-end event");
     }
@@ -1249,14 +1366,18 @@ mod tests {
         let (release_tx, release_rx) = oneshot::channel();
         let flush_queue_state = queue.clone();
         let task = tokio::spawn(async move {
-            flush_queue(&flush_queue_state, |events| async move {
-                snapshot_tx
-                    .send(overlap_event_ids(&events))
-                    .expect("publish actual sent batch");
-                release_rx.await.expect("sender release");
-                anyhow::ensure!(accepted, "fixture sender rejected batch");
-                Ok(())
-            })
+            flush_queue(
+                &flush_queue_state,
+                &ConsentEpoch::default(),
+                |events| async move {
+                    snapshot_tx
+                        .send(overlap_event_ids(&events))
+                        .expect("publish actual sent batch");
+                    release_rx.await.expect("sender release");
+                    anyhow::ensure!(accepted, "fixture sender rejected batch");
+                    Ok(())
+                },
+            )
             .await;
         });
         let sent = snapshot_rx.await.expect("flush reached held sender");
@@ -1297,9 +1418,9 @@ mod tests {
         std::fs::write(&queue_path, b"{bad-queue").expect("write malformed queue");
         std::fs::write(&session_path, b"{bad-session").expect("write malformed session");
 
-        let queue_error =
-            EventQueue::load_from(&queue_path).expect_err("malformed queue must be rejected");
-        let session_error = TelemetrySession::load_from(&session_path)
+        let queue_error = EventQueue::load_from(&queue_path, &ConsentEpoch::default())
+            .expect_err("malformed queue must be rejected");
+        let session_error = TelemetrySession::load_from(&session_path, &ConsentEpoch::default())
             .expect_err("malformed session must be rejected");
 
         assert!(
@@ -1350,8 +1471,8 @@ mod tests {
         )
         .expect("write current session");
 
-        assert!(EventQueue::load_from(&queue_path).is_ok());
-        assert!(TelemetrySession::load_from(&session_path).is_ok());
+        assert!(EventQueue::load_from(&queue_path, &ConsentEpoch::default()).is_ok());
+        assert!(TelemetrySession::load_from(&session_path, &ConsentEpoch::default()).is_ok());
 
         std::fs::write(&queue_path, b"[]").expect("write obsolete raw queue");
         std::fs::write(
@@ -1360,11 +1481,11 @@ mod tests {
         )
         .expect("write unversioned session");
         assert!(
-            EventQueue::load_from(&queue_path).is_err(),
+            EventQueue::load_from(&queue_path, &ConsentEpoch::default()).is_err(),
             "unversioned queue must be rejected"
         );
         assert!(
-            TelemetrySession::load_from(&session_path).is_err(),
+            TelemetrySession::load_from(&session_path, &ConsentEpoch::default()).is_err(),
             "unversioned session must be rejected"
         );
 
@@ -1385,13 +1506,13 @@ mod tests {
         )
         .expect("write forward session");
         assert!(
-            EventQueue::load_from(&queue_path)
+            EventQueue::load_from(&queue_path, &ConsentEpoch::default())
                 .expect_err("forward queue must be rejected")
                 .to_string()
                 .contains("Unsupported telemetry queue format version")
         );
         assert!(
-            TelemetrySession::load_from(&session_path)
+            TelemetrySession::load_from(&session_path, &ConsentEpoch::default())
                 .expect_err("forward session must be rejected")
                 .to_string()
                 .contains("Unsupported telemetry session format version")
@@ -1415,7 +1536,7 @@ mod tests {
         )
         .expect("write invalid session");
 
-        let error = TelemetrySession::load_from(&path)
+        let error = TelemetrySession::load_from(&path, &ConsentEpoch::default())
             .expect_err("invalid timestamp must not enter session state");
         assert!(
             error
@@ -1477,11 +1598,12 @@ mod tests {
         let queue_path = directory.path().join("telemetry_queue.json");
         std::fs::create_dir(&queue_path).expect("create invalid queue fixture");
 
-        let error = purge_queue_file(&queue_path).expect_err("directory must not purge as a file");
+        let error =
+            purge_telemetry_file(&queue_path).expect_err("directory must not purge as a file");
         assert!(
             error
                 .to_string()
-                .contains("Failed to delete telemetry queue")
+                .contains("Failed to delete telemetry state")
         );
         assert!(
             error
