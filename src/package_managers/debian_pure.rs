@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 use crate::core::{Package, PackageSource};
 use crate::package_managers::PackageManager;
 use crate::package_managers::debian_db;
-use crate::package_managers::types::UpdateInfo;
+use crate::package_managers::types::{PackageStatus, UpdateInfo};
 
 #[derive(Debug, Default)]
 pub struct PureDebianPackageManager;
@@ -357,6 +357,17 @@ impl PackageManager for PureDebianPackageManager {
         &self,
         fast: bool,
     ) -> Pin<Box<dyn Future<Output = Result<(usize, usize, usize, usize)>> + Send + '_>> {
+        Box::pin(async move {
+            self.get_status_details(fast)
+                .await
+                .map(PackageStatus::into_counts)
+        })
+    }
+
+    fn get_status_details(
+        &self,
+        fast: bool,
+    ) -> Pin<Box<dyn Future<Output = Result<PackageStatus>> + Send + '_>> {
         Box::pin(async move {
             let fast_counts = tokio::task::spawn_blocking(debian_db::get_counts_fast)
                 .await

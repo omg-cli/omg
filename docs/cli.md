@@ -999,6 +999,11 @@ omg status [--fast]
 |--------|-------|-------------|
 | `--fast` | `-f` | Use fast path (counts only, skips full dependency scan) |
 
+With `--json`, check `updates_and_orphans_checked` before using
+`updates_available` or `orphan_packages`. When it is `false`, both counts are
+zero placeholders and this run skipped those checks. A `true` value includes
+counts from the daemon or the selected package backend.
+
 **Output includes:**
 
 - Package counts (total, explicit, orphans)

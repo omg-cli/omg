@@ -15,6 +15,7 @@ import unittest
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
+FEDORA_UPGRADE_QUERY = '--quiet --color=never --cacheonly --setopt=*.skip_if_unavailable=false list --upgrades'
 
 
 
@@ -3114,7 +3115,15 @@ esac
         native = {
             'pacman': "printf 'alpha\\nbeta\\n'\n",
             'rpm': "printf 'alpha.x86_64\\nbeta.x86_64\\n'\n",
-            'dnf': "[[ \"$1\" == --cacheonly ]] || exit 19\nprintf 'alpha.x86_64\\nbeta.x86_64\\n'\n",
+            'dnf': (
+                'case " $* " in\n'
+                f'  " {FEDORA_UPGRADE_QUERY} ") [[ "$LC_ALL" == C ]] || exit 19;\n'
+                '    printf "Available upgrades\\nalpha.x86_64 2 updates\\n'
+                'alpha.x86_64 2 mirror\\nbeta.x86_64\\t3\\tupdates\\n" ;;\n'
+                '  " --cacheonly repoquery "*) printf "alpha.x86_64\\nbeta.x86_64\\n" ;;\n'
+                '  *) exit 19 ;;\n'
+                'esac\n'
+            ),
             'dpkg-query': "printf 'installed\\nconfig-files\\ninstalled\\n'\n",
             'apt-mark': "printf 'alpha\\nbeta\\n'\n",
             'apt-get': "[[ \"$1\" == -s && \"$2\" == autoremove ]] || exit 19\nprintf 'Reading lists...\\nRemv alpha [1.0]\\nRemv beta [2.0]\\n'\n",
@@ -3161,6 +3170,22 @@ esac
             self.assertEqual(evidence[0]['result'], verdict)
             self.assertEqual(result.returncode, int(verdict != 'PASS'))
 
+        fedora_updates = ['updates-shortcut\t["uc"]\tread\t0\tpass\t-\thermetic\thermetic:pass\tnative-count\ttempdir-drop']
+        for listing, verdict in (
+            ('', 'PASS'),
+            ('alpha.x86_64 2 updates\n', 'BLOCKED'),
+            ('Available upgrades\nalpha 2 updates\n', 'BLOCKED'),
+            ('Available upgrades\nalpha.x86_64 2 updates extra\n', 'BLOCKED'),
+        ):
+            with self.subTest(distro='fedora', native_listing=listing):
+                result, evidence, logs = self.run_inventory(
+                    'printf "0\\n"\n', fedora_updates,
+                    native_commands={'dnf': 'printf %s ' + shlex.quote(listing) + '\n'},
+                    distro='fedora',
+                )
+                self.assertEqual(evidence[0]['result'], verdict, logs)
+                self.assertEqual(result.returncode, int(verdict != 'PASS'), logs)
+
     @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
     def test_status_rows_require_distro_native_counts_instead_of_only_exit_zero(self):
         native = {
@@ -3170,7 +3195,14 @@ esac
             'apt-get': 'printf "Remv c [1.0]\\n"\n',
             'apt': 'printf "c/stable 2 amd64 [upgradable from: 1]\\n"\n',
             'rpm': 'printf "a.x86_64\\nb.x86_64\\nc.x86_64\\n"\n',
-            'dnf': 'case " $* " in *--userinstalled*) printf "a\\nb\\n" ;; *--unneeded*|*--upgrades*) printf "c\\n" ;; *) exit 17 ;; esac\n',
+            'dnf': (
+                'case " $* " in\n'
+                '  *" repoquery --userinstalled "*) printf "a\\nb\\n" ;;\n'
+                '  *" repoquery --unneeded "*) printf "c.x86_64\\n" ;;\n'
+                f'  " {FEDORA_UPGRADE_QUERY} ") printf "Available upgrades\\nc.x86_64 2 updates\\n" ;;\n'
+                '  *) exit 17 ;;\n'
+                'esac\n'
+            ),
         }
         rows = (
             'status\t["status","--fast"]\tread\t0\tpass\t-\thermetic\thermetic:pass\tstatus-native-fast\ttempdir-drop',
@@ -3218,7 +3250,10 @@ esac
         native = {
             'pacman': '[[ "$1" == -Quq ]] || exit 17\nprintf "c\\n"\n',
             'apt': 'printf "c/stable 2 amd64 [upgradable from: 1]\\n"\n',
-            'dnf': '[[ " $* " == *--upgrades* ]] || exit 17\nprintf "c.x86_64\\n"\n',
+            'dnf': (
+                f'[[ "$*" == "{FEDORA_UPGRADE_QUERY}" ]] || exit 17\n'
+                'printf "Available upgrades\\nc.x86_64 2 updates\\n"\n'
+            ),
         }
         rows = (
             'outdated\t["outdated"]\tread\t0\tpass\t-\thermetic\thermetic:pass\toutdated-native-count\ttempdir-drop',

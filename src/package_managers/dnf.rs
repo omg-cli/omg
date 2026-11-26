@@ -25,7 +25,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use crate::cli::modern_ui::OutputMode;
 use crate::core::{Package, PackageSource, is_root};
 use crate::package_managers::PackageManager;
-use crate::package_managers::types::{UpdateInfo, parse_version_or_zero};
+use crate::package_managers::types::{PackageStatus, UpdateInfo, parse_version_or_zero};
 
 use rusqlite::{Connection, OpenFlags};
 use zerocopy::{FromBytes, Immutable, KnownLayout, big_endian::U32};
@@ -3042,22 +3042,37 @@ impl PackageManager for DnfPackageManager {
         fast: bool,
     ) -> Pin<Box<dyn Future<Output = Result<(usize, usize, usize, usize)>> + Send + '_>> {
         Box::pin(async move {
+            self.get_status_details(fast)
+                .await
+                .map(PackageStatus::into_counts)
+        })
+    }
+
+    fn get_status_details(
+        &self,
+        fast: bool,
+    ) -> Pin<Box<dyn Future<Output = Result<PackageStatus>> + Send + '_>> {
+        Box::pin(async move {
             let installed = self.load_installed_packages().await?;
             let total = installed.len();
             let explicit = Self::current_explicit_package_names(&installed)
                 .await?
                 .len();
 
-            let (orphans, updates) = if fast {
-                (0, 0)
+            let maintenance = if fast {
+                None
             } else {
-                (
+                Some((
                     Self::orphan_count().await?,
                     self.list_updates().await?.len(),
-                )
+                ))
             };
 
-            Ok((total, explicit, orphans, updates))
+            Ok(PackageStatus {
+                total,
+                explicit,
+                maintenance,
+            })
         })
     }
 

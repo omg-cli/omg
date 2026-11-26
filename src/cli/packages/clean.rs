@@ -14,10 +14,7 @@ use crate::package_managers::{
     AurClient, clean_cache, clean_cache_preview, list_orphans_direct, remove_orphans,
 };
 
-#[cfg(feature = "debian")]
-use crate::package_managers::apt_remove_orphans;
-
-#[cfg(feature = "debian-pure")]
+#[cfg(all(feature = "debian-pure", not(feature = "debian")))]
 use crate::package_managers::debian_db::{clean_package_cache, list_orphans_fast};
 
 /// Clean up orphans and caches
@@ -234,7 +231,7 @@ pub async fn clean(
                 not(feature = "debian-pure")
             ))]
             {
-                apt_remove_orphans().await?;
+                crate::package_managers::apt_remove_orphans().await?;
             }
         }
 
@@ -447,7 +444,7 @@ async fn handle_fedora_clean(
     Ok(())
 }
 
-#[cfg(feature = "debian-pure")]
+#[cfg(all(feature = "debian-pure", not(feature = "debian")))]
 async fn handle_debian_pure_clean(
     orphans: bool,
     cache: bool,
@@ -543,7 +540,7 @@ async fn handle_debian_pure_clean(
     Ok(())
 }
 
-#[cfg(any(test, feature = "debian-pure"))]
+#[cfg(any(test, all(feature = "debian-pure", not(feature = "debian"))))]
 fn report_cache_clean(result: Result<(usize, u64)>) -> Result<()> {
     match result {
         Ok((removed, freed)) => {

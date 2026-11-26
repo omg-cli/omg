@@ -5,6 +5,7 @@ use std::pin::Pin;
 
 use anyhow::Result;
 
+use super::types::PackageStatus;
 use crate::core::Package;
 
 /// A retained observation of the installed inventory used by a package index.
@@ -158,6 +159,14 @@ pub trait PackageManager: Send + Sync {
         &self,
         fast: bool,
     ) -> Pin<Box<dyn Future<Output = Result<(usize, usize, usize, usize)>> + Send + '_>>;
+
+    /// Get package counts with explicit provenance for skipped maintenance checks.
+    fn get_status_details(
+        &self,
+        fast: bool,
+    ) -> Pin<Box<dyn Future<Output = Result<PackageStatus>> + Send + '_>> {
+        Box::pin(async move { self.get_status(fast).await.map(PackageStatus::from) })
+    }
 
     /// List explicitly installed package names
     fn list_explicit(&self) -> Pin<Box<dyn Future<Output = Result<Vec<String>>> + Send + '_>>;
