@@ -1,6 +1,6 @@
 //! Acknowledgement of disclosed advisory risk never changes its classification.
 
-use super::scan::{AdvisoryProvenance, FindingApplicability};
+use super::scan::{AdvisoryProvenance, FindingApplicability, Vulnerability};
 use super::vulnerability::{PackageAssessment, UnknownCoverage};
 use crate::package_managers::types::SecurityOrigin;
 use sha2::{Digest, Sha256};
@@ -269,15 +269,7 @@ impl AdvisoryRiskReview {
                         "  {} ({confidence})",
                         serde_json::to_string(&finding.id)?
                     );
-                    let url = advisory_link(&finding.id).or_else(|| {
-                        finding
-                            .native_advisory
-                            .as_ref()?
-                            .references
-                            .iter()
-                            .find_map(|reference| safe_reference(&reference.url))
-                    });
-                    if let Some(url) = url {
+                    if let Some(url) = primary_advisory_link(finding) {
                         let _ = writeln!(details, "  {url}");
                     } else {
                         let _ = writeln!(details, "  {}", serde_json::to_string(&finding.summary)?);
@@ -327,6 +319,17 @@ impl AdvisoryRiskAcceptance {
     pub(crate) fn matches(&self, review: &AdvisoryRiskReview) -> bool {
         self.review_id == review.id
     }
+}
+
+pub(crate) fn primary_advisory_link(finding: &Vulnerability) -> Option<String> {
+    advisory_link(&finding.id).or_else(|| {
+        finding
+            .native_advisory
+            .as_ref()?
+            .references
+            .iter()
+            .find_map(|reference| safe_reference(&reference.url))
+    })
 }
 
 fn advisory_link(id: &str) -> Option<String> {
