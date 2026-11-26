@@ -1274,10 +1274,10 @@ async fn handle_info(state: Arc<DaemonState>, id: RequestId, package: String) ->
                 url: String::new(), // info.url not in Package struct currently
                 size: 0,
                 download_size: 0,
-                repo: if cache_info {
-                    String::new()
+                repo: if !cache_info && info.installed {
+                    super::protocol::DNF_SYSTEM_REPO.into()
                 } else {
-                    "official".into()
+                    String::new()
                 },
                 depends: Vec::new(),
                 licenses: Vec::new(),
@@ -2757,7 +2757,7 @@ pub(super) mod tests {
                 assert_eq!(info.version, "5.3.9-3", "{query}/{cache_seed}");
                 assert_eq!(info.description, "Installed RPM metadata");
                 assert_eq!(info.source, WirePackageSource::Official);
-                assert_eq!(info.repo, "official");
+                assert_eq!(info.repo, crate::daemon::protocol::DNF_SYSTEM_REPO);
             }
         }
         Ok(())
@@ -2850,7 +2850,7 @@ pub(super) mod tests {
             assert_eq!(info.version, "2.0-2");
             assert_eq!(info.description, "Current available repository metadata");
             assert_eq!(info.source, WirePackageSource::Official);
-            assert_eq!(info.repo, "official");
+            assert!(info.repo.is_empty());
         }
         Ok(())
     }

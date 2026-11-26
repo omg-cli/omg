@@ -520,6 +520,8 @@ pub struct DetailedPackageInfo {
     pub source: WirePackageSource,
 }
 
+pub(crate) const DNF_SYSTEM_REPO: &str = "@System";
+
 pub use crate::core::security::scan::{SecurityAuditResult, Vulnerability};
 
 /// System metrics snapshot

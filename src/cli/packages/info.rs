@@ -21,6 +21,44 @@ const DAEMON_INFO_TIMEOUT: Duration = Duration::from_secs(3);
 #[cfg(feature = "arch")]
 const AUR_INFO_TIMEOUT: Duration = Duration::from_secs(8);
 
+#[derive(Clone, Copy, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum DnfInfoSource {
+    RpmDatabase,
+    DnfRepository,
+    #[cfg(unix)]
+    Dnf,
+}
+
+impl DnfInfoSource {
+    fn from_installed(installed: bool) -> Self {
+        if installed {
+            Self::RpmDatabase
+        } else {
+            Self::DnfRepository
+        }
+    }
+
+    #[cfg(unix)]
+    fn from_daemon_repo(repo: &str) -> Self {
+        match repo {
+            crate::daemon::protocol::DNF_SYSTEM_REPO => Self::RpmDatabase,
+            // Older daemons provide this placeholder for both DNF lookups.
+            "official" => Self::Dnf,
+            _ => Self::DnfRepository,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::RpmDatabase => "Installed RPM database",
+            Self::DnfRepository => "Configured DNF repository",
+            #[cfg(unix)]
+            Self::Dnf => "DNF (repository unspecified)",
+        }
+    }
+}
+
 fn validate_info_selector(package: &str) -> Result<()> {
     #[cfg(feature = "fedora")]
     if crate::package_managers::resolve_backend()? == crate::package_managers::Backend::Fedora {
@@ -143,7 +181,9 @@ fn display_detailed_info(
     backend: crate::package_managers::Backend,
 ) -> Result<()> {
     let selector = daemon_installation_selector(backend, info);
-    let source_label = if info.source == WirePackageSource::Official {
+    let source_label = if backend == crate::package_managers::Backend::Fedora {
+        DnfInfoSource::from_daemon_repo(&info.repo).label().into()
+    } else if info.source == WirePackageSource::Official {
         format!("Official repository ({})", style::info(&info.repo))
     } else {
         style::warning("AUR (Arch User Repository)")
@@ -180,13 +220,23 @@ fn display_detailed_info(
 fn daemon_info_json(
     info: &crate::daemon::protocol::DetailedPackageInfo,
     installed: bool,
+    backend: crate::package_managers::Backend,
 ) -> Result<serde_json::Value> {
     let mut value =
         serde_json::to_value(info).context("Failed to serialize daemon package info")?;
-    value
+    let fields = value
         .as_object_mut()
-        .context("Daemon package info must serialize as an object")?
-        .insert("installed".into(), serde_json::Value::Bool(installed));
+        .context("Daemon package info must serialize as an object")?;
+    fields.insert("installed".into(), serde_json::Value::Bool(installed));
+    if backend == crate::package_managers::Backend::Fedora {
+        fields.insert(
+            "source".into(),
+            serde_json::json!(DnfInfoSource::from_daemon_repo(&info.repo)),
+        );
+        if info.repo == "official" {
+            fields.insert("repo".into(), serde_json::Value::String(String::new()));
+        }
+    }
     Ok(value)
 }
 
@@ -251,7 +301,7 @@ async fn info_json(package: &str) -> Result<()> {
             .is_installed(&selector)
             .await
             .context("Failed to query local package installation state")?;
-        let json_str = serde_json::to_string_pretty(&daemon_info_json(&info, installed)?)
+        let json_str = serde_json::to_string_pretty(&daemon_info_json(&info, installed, backend)?)
             .context("Failed to serialize package info as JSON")?;
         println!("{json_str}");
         return Ok(());
@@ -320,9 +370,13 @@ async fn info_json(package: &str) -> Result<()> {
     if pm.name() != "pacman"
         && let Some(info) = pm.info(package).await?
     {
+        let mut value = serde_json::to_value(&info).context("Failed to serialize package info")?;
+        if backend == crate::package_managers::Backend::Fedora {
+            value["source"] = serde_json::json!(DnfInfoSource::from_installed(info.installed));
+        }
         println!(
             "{}",
-            serde_json::to_string_pretty(&info)
+            serde_json::to_string_pretty(&value)
                 .context("Failed to serialize package info as JSON")?
         );
         return Ok(());
@@ -360,7 +414,11 @@ async fn info_fallback(
             .await?
             .with_context(|| format!("Package '{package}' not found. Try: omg search {package}"))?;
         let version = info.version.to_string();
-        let source = format!("Official repository ({})", pm.name());
+        let source = if pm.name() == "dnf" {
+            DnfInfoSource::from_installed(info.installed).label().into()
+        } else {
+            format!("Official repository ({})", pm.name())
+        };
         ui::print_package_info(
             &ui::InfoCore {
                 name: &info.name,
@@ -561,7 +619,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn daemon_json_info_reports_local_installation_state() {
-        let info = DetailedPackageInfo {
+        use crate::package_managers::Backend;
+
+        let mut info = DetailedPackageInfo {
             name: "bash".into(),
             version: "5.3".into(),
             description: "Shell".into(),
@@ -574,8 +634,27 @@ mod tests {
             source: WirePackageSource::Official,
         };
         for installed in [true, false] {
-            let value = super::daemon_info_json(&info, installed).expect("daemon JSON info");
+            let value =
+                super::daemon_info_json(&info, installed, Backend::Arch).expect("daemon JSON info");
             assert_eq!(value["name"], "bash");
+            assert_eq!(value["installed"], installed);
+        }
+
+        for (repo, source, installed, expected_repo) in [
+            (
+                crate::daemon::protocol::DNF_SYSTEM_REPO,
+                "rpm_database",
+                false,
+                "@System",
+            ),
+            ("", "dnf_repository", true, ""),
+            ("official", "dnf", true, ""),
+        ] {
+            info.repo = repo.into();
+            let value = super::daemon_info_json(&info, installed, Backend::Fedora)
+                .expect("Fedora daemon JSON info");
+            assert_eq!(value["source"], source);
+            assert_eq!(value["repo"], expected_repo);
             assert_eq!(value["installed"], installed);
         }
     }
