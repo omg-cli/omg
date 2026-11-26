@@ -2880,6 +2880,107 @@ run = "cp next.toml mise.local.toml"
                 conf=task + "env.OMG_FIXTURE_OUT = { value = 'ready', tools = true, redact = false }\n",
                 expected=success)
 
+            phase = "mise-env-required"
+            required = "[env]\nOMG_FIXTURE_OUT = { required = true }\n"
+            ready = "[env]\nOMG_FIXTURE_OUT = 'ready'\n"
+            unset = "[env]\nOMG_FIXTURE_OUT = false\n"
+            empty = "[env]\nOMG_FIXTURE_OUT = ''\n"
+            fallback = "[env]\nOMG_FIXTURE_OUT = { default = 'ready' }\n"
+            env_file = "[env._]\nfile = 'fixture.env'\n"
+            tool_file = "[env._]\nfile = { path = 'fixture.env', tools = true }\n"
+            late_source = "[env._]\nsource = { path = 'source.sh', tools = true }\n"
+            export_ready = ("source.sh", "export OMG_FIXTURE_OUT=ready\n")
+            clear_value = ("source.sh", "unset OMG_FIXTURE_OUT\n")
+            export_empty = ("source.sh", "export OMG_FIXTURE_OUT=''\n")
+            env_ready = ("fixture.env", "OMG_FIXTURE_OUT=ready\n")
+            expected_ready = {result_key: b"ready"}
+            missing_value = "Required environment variable OMG_FIXTURE_OUT is not set"
+
+            for label, value, error in [
+                ("inherited-required-present", b"caller", None),
+                ("inherited-required-opaque", raw, None),
+                ("inherited-required-space", b" ", None),
+                ("inherited-required-empty", b"", missing_value),
+                ("inherited-required-missing", None, missing_value),
+            ]:
+                run(label, conf=required, env={result_key: value}, expected={result_key: value}, error=error)
+
+            run("file-in-same-layer-satisfies-required", conf=required + env_file,
+                files=(env_ready,), expected=expected_ready)
+            run("late-file-in-same-layer-satisfies-required", conf=required + tool_file,
+                files=(env_ready,), expected=expected_ready)
+            run("source-in-same-layer-satisfies-required", conf=required + source_config,
+                files=(export_ready,), expected=expected_ready)
+            run("late-source-in-same-layer-satisfies-required", conf=required + late_source,
+                files=(export_ready,), expected=expected_ready)
+            run("same-layer-source-can-replace-required", conf=required + source_config,
+                files=(export_ready,), env={result_key: b"caller"}, expected=expected_ready)
+            run("same-layer-source-unsets-required", conf=required + source_config,
+                files=(clear_value,), env={result_key: b"caller"}, error=missing_value)
+            run("late-source-unsets-file-provided-required",
+                conf=required + "[env._]\nfile = 'fixture.env'\nsource = { path = 'source.sh', tools = true }\n",
+                files=(env_ready, clear_value), error=missing_value)
+            run("same-layer-source-empties-required", conf=required + source_config,
+                files=(export_empty,), env={result_key: b"caller"}, error=missing_value)
+            run("missing-file-error-still-propagates", conf=required + env_file,
+                error="Env file not found")
+            run("failed-source-error-still-propagates", conf=required + source_config,
+                files=(("source.sh", "return 7\n"),), error="failed while sourcing")
+
+            run("child-assignment-satisfies-parent-required", conf=ready, parent_conf=required,
+                expected=expected_ready)
+            run("ancestor-value-satisfies-child-required", conf=required, parent_conf=ready,
+                expected=expected_ready)
+            run("child-default-satisfies-parent-required", conf=fallback, parent_conf=required,
+                expected=expected_ready)
+            run("child-file-satisfies-parent-required", conf=env_file, parent_conf=required,
+                files=(env_ready,), expected=expected_ready)
+            run("selective-layer-satisfies-required", conf=required, env={b"MISE_ENV": b"test"},
+                files=(("mise.test.toml", ready),), expected=expected_ready)
+            run("local-layer-satisfies-required", conf=required, files=(("mise.local.toml", ready),),
+                expected=expected_ready)
+            run("child-unset-overrides-required-inherited-value", conf=unset, parent_conf=required,
+                env={result_key: b"caller"}, error=missing_value)
+            run("selected-empty-override-fails-required", conf=required, env={
+                    result_key: b"caller", b"MISE_ENV": b"test",
+                }, files=(("mise.test.toml", empty),), error=missing_value)
+            run("parent-source-unset-then-child-restores", conf=ready, parent_conf=required + source_config,
+                parent_files=(clear_value,), env={result_key: b"caller"}, expected=expected_ready)
+            run("child-source-can-satisfy-parent-and-child-required", conf=required + source_config,
+                parent_conf=required, files=(export_ready,), expected=expected_ready)
+            run("missing-required-keeps-first-declaration-order",
+                parent_conf="[env]\nOMG_FIXTURE_RAW = { required = true }\n", conf=required,
+                error="Required environment variable OMG_FIXTURE_RAW is not set")
+
+            task_required = task + "[tasks.fixture.env]\nOMG_FIXTURE_OUT = { required = true }\n"
+            task_value = task + "[tasks.fixture.env]\nOMG_FIXTURE_OUT = 'ready'\n"
+            task_unset = task + "[tasks.fixture.env]\nOMG_FIXTURE_OUT = false\n"
+            task_empty = task + "[tasks.fixture.env]\nOMG_FIXTURE_OUT = ''\n"
+            run("task-value-satisfies-project-required", conf=required + task_value, native_task=True,
+                expected=expected_ready)
+            run("task-value-satisfies-ancestor-required", conf=task_value, parent_conf=required, native_task=True,
+                expected=expected_ready)
+            run("task-required-sees-project-assignment", conf=ready + task_required, native_task=True,
+                expected=expected_ready)
+            run("task-required-sees-local-source", conf=task_required + task_source, native_task=True,
+                files=(export_ready,), expected=expected_ready)
+            run("task-required-sees-local-file", conf=task_required + "[tasks.fixture.env._]\nfile = 'fixture.env'\n",
+                native_task=True, files=(env_ready,), expected=expected_ready)
+            run("task-local-source-satisfies-project-required", conf=required + task + task_source,
+                native_task=True, files=(export_ready,), expected=expected_ready)
+            run("task-unset-invalidates-project-required", conf=required + task_unset, native_task=True,
+                env={result_key: b"caller"}, error=missing_value)
+            run("task-empty-invalidates-project-required", conf=required + task_empty, native_task=True,
+                env={result_key: b"caller"}, error=missing_value)
+            run("task-required-fails-after-its-local-source-unsets", conf=ready + task_required + task_source,
+                native_task=True, files=(clear_value,), error=missing_value)
+            run("task-late-file-satisfies-required", conf=task_required +
+                "[tasks.fixture.env._]\nfile = { path = 'fixture.env', tools = true }\n",
+                native_task=True, files=(env_ready,), expected=expected_ready)
+            run("unused-task-requirement-is-independent", conf=task +
+                "[tasks.unused]\nrun = 'true'\nenv.OMG_FIXTURE_OUT = { required = true }\n",
+                native_task=True, expected={result_key: None})
+
 
     def inspect_task_package_metadata():
         import ctypes
@@ -5253,6 +5354,6 @@ assert inventory() == before
 report = dict(binaries=binaries, checks=checks, total=len(checks),
               passed=sum(entry["passed"] for entry in checks), host_unchanged=True)
 print(json.dumps(report))
-expected_checks = 303 if consent_oracle is None else 1637
+expected_checks = 303 if consent_oracle is None else 1674
 if report["passed"] != report["total"] or report["total"] != expected_checks:
     sys.exit(4)

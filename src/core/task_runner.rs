@@ -1124,18 +1124,13 @@ fn execute_process_in(
         command.env("PATH", &path);
         environment.insert("PATH".into(), path);
     }
-    let mise_env = crate::config::mise_env::resolve_mise_env_chain(
+    let resolved = crate::config::mise_env::resolve_launch_env(
         &mise_documents,
-        &environment,
+        environment,
+        task_env.map(|parsed| (parsed, task_root)),
         crate::config::mise_env::Strictness::Strict,
     )?;
-    apply_resolved_environment(&mut command, &mise_env);
-
-    if let Some(parsed) = task_env {
-        mise_env.apply_to(&mut environment);
-        let resolved = crate::config::mise_env::resolve_task_env(parsed, &environment, task_root)?;
-        apply_resolved_environment(&mut command, &resolved);
-    }
+    apply_resolved_environment(&mut command, &resolved);
 
     if let Some(venv) = venv_path.as_ref().filter(|path| path.join("bin").is_dir()) {
         let selected = selected_paths

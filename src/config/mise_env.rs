@@ -796,8 +796,7 @@ struct Resolver<'a> {
     unset: Vec<String>,
     redacted: HashSet<String>,
     patterns: &'a [String],
-    strict: Strictness,
-    warned: bool,
+    required: &'a mut Vec<String>,
 }
 
 impl Resolver<'_> {
@@ -829,17 +828,14 @@ impl Resolver<'_> {
             .transpose()
     }
 
-    fn warn(&mut self, message: &str) {
-        if !self.warned {
-            self.warned = true;
-            tracing::warn!("{message}");
+    fn mark_redacted(&mut self, name: &str, redact: bool) {
+        if ResolvedEnv::is_redacted(name, redact, self.patterns) {
+            self.redacted.insert(name.to_owned());
         }
     }
 
     fn assign(&mut self, name: &str, value: OsString, redact: bool) {
-        if ResolvedEnv::is_redacted(name, redact, self.patterns) {
-            self.redacted.insert(name.to_string());
-        }
+        self.mark_redacted(name, redact);
         if let Some(position) = self.index.get(name) {
             self.assigned[*position] = (name.to_string(), value);
         } else {
@@ -862,11 +858,9 @@ impl Resolver<'_> {
         }
     }
 
-    /// Apply one entry in the current phase. Returns `Ok(false)` when the
-    /// entry belongs to the other phase.
-    fn apply_entry(&mut self, entry: &EnvEntry, tools_phase: bool) -> Result<bool> {
+    fn apply_entry(&mut self, entry: &EnvEntry, tools_phase: bool) -> Result<()> {
         if entry.tools_phase != tools_phase {
-            return Ok(false);
+            return Ok(());
         }
         match &entry.action {
             EnvAction::Set(raw) => {
@@ -883,23 +877,12 @@ impl Resolver<'_> {
                 }
             }
             EnvAction::Required => {
-                let current = self.lookup(&entry.name);
-                if current.is_none_or(OsStr::is_empty) {
-                    let message = format!(
-                        "Required environment variable {} is not set; define it in the shell or mise.local.toml",
-                        entry.name
-                    );
-                    if self.strict == Strictness::Strict {
-                        anyhow::bail!("{message}");
-                    }
-                    self.warn(&message);
-                } else if let Some(value) = current {
-                    self.assign(&entry.name, value.to_owned(), entry.redact);
-                }
+                self.required.push(entry.name.clone());
+                self.mark_redacted(&entry.name, entry.redact);
             }
             EnvAction::Unset => self.remove(&entry.name),
         }
-        Ok(true)
+        Ok(())
     }
 
     /// Apply one loaded file's pairs in the current phase.
@@ -933,7 +916,7 @@ fn resolve_one(
     base: &Environment,
     config_root: &Path,
     patterns: &[String],
-    strict: Strictness,
+    required: &mut Vec<String>,
 ) -> Result<ResolvedEnv> {
     let mut resolver = Resolver {
         base,
@@ -943,8 +926,7 @@ fn resolve_one(
         unset: Vec::new(),
         redacted: HashSet::new(),
         patterns,
-        strict,
-        warned: false,
+        required,
     };
     for tools_phase in [false, true] {
         for (directive, pairs) in file_pairs {
@@ -1005,10 +987,11 @@ fn resolve_one(
     })
 }
 
-pub(crate) fn resolve_task_env(
+fn resolve_task_overlay(
     parsed: &MiseEnv,
     base: &Environment,
     config_root: &Path,
+    required: &mut Vec<String>,
 ) -> Result<ResolvedEnv> {
     let file_pairs = parsed
         .files
@@ -1026,6 +1009,20 @@ pub(crate) fn resolve_task_env(
         base,
         config_root,
         &parsed.redactions,
+        required,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn resolve_task_env(
+    parsed: &MiseEnv,
+    base: &Environment,
+    config_root: &Path,
+) -> Result<ResolvedEnv> {
+    resolve_launch_env(
+        &[],
+        base.clone(),
+        Some((parsed, config_root)),
         Strictness::Strict,
     )
 }
@@ -1070,19 +1067,47 @@ pub(crate) fn load_mise_env_chain(
         base.get(OsStr::new("MISE_ENV")).map(OsString::as_os_str),
     )?;
     let documents = super::mise_config::load(start, &selection)?;
-    resolve_mise_env_chain(&documents, base, strict)
+    resolve_launch_env(&documents, base.clone(), None, strict)
 }
 
-pub(crate) fn resolve_mise_env_chain(
+/// Resolve all applicable layers and check requirements against the child's
+/// final environment.
+pub(crate) fn resolve_launch_env(
     documents: &[super::mise_config::Document],
-    base: &Environment,
+    mut effective: Environment,
+    task: Option<(&MiseEnv, &Path)>,
+    strict: Strictness,
+) -> Result<ResolvedEnv> {
+    let mut required = Vec::new();
+    let mut merged = resolve_mise_env_chain(documents, &mut effective, &mut required, strict)?;
+    if let Some((parsed, root)) = task {
+        let overlay = resolve_task_overlay(parsed, &effective, root, &mut required)?;
+        overlay.apply_to(&mut effective);
+        merge_chain(&mut merged, overlay);
+    }
+    if let Some(name) = required.iter().find(|name| {
+        effective
+            .get(OsStr::new(name))
+            .is_none_or(|value| value.is_empty())
+    }) {
+        let message = format!(
+            "Required environment variable {name} is not set. Define it in the shell, project configuration, or task environment"
+        );
+        if strict == Strictness::Strict {
+            anyhow::bail!("{message}");
+        }
+        tracing::warn!("{message}");
+    }
+    Ok(merged)
+}
+
+fn resolve_mise_env_chain(
+    documents: &[super::mise_config::Document],
+    effective: &mut Environment,
+    required: &mut Vec<String>,
     strict: Strictness,
 ) -> Result<ResolvedEnv> {
     let mut merged = ResolvedEnv::default();
-    if documents.is_empty() {
-        return Ok(merged);
-    }
-    let mut effective = base.clone();
     let mut patterns: Vec<String> = Vec::new();
     for document in documents {
         let parsed = parse_mise_env(&document.value, &document.root)
@@ -1110,12 +1135,12 @@ pub(crate) fn resolve_mise_env_chain(
         let resolved = resolve_one(
             &parsed,
             &file_pairs,
-            &effective,
+            effective,
             config_root,
             &patterns,
-            strict,
+            required,
         )?;
-        resolved.apply_to(&mut effective);
+        resolved.apply_to(effective);
         merge_chain(&mut merged, resolved);
     }
     Ok(merged)
@@ -1318,15 +1343,8 @@ mod tests {
     fn resolve_text(toml_text: &str, base_map: &Environment, strict: Strictness) -> ResolvedEnv {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let parsed = parse_env(toml_text, dir.path());
-        resolve_one(
-            &parsed,
-            &[],
-            base_map,
-            dir.path(),
-            &parsed.redactions,
-            strict,
-        )
-        .expect("test resolve succeeds")
+        resolve_launch_env(&[], base_map.clone(), Some((&parsed, dir.path())), strict)
+            .expect("test resolve succeeds")
     }
 
     fn get(resolved: &ResolvedEnv, name: &str) -> Option<String> {
@@ -1381,16 +1399,29 @@ mod tests {
 
     #[test]
     fn required_strict_fails_lenient_skips() {
-        let text = "[env]\nTOKEN = { required = true }\n";
-        let empty = base(&[]);
+        let text = "[env]\nTOKEN = { required = true, redact = true }\n";
         let dir = tempfile::TempDir::new().expect("tempdir");
         let parsed = parse_env(text, dir.path());
-        assert!(resolve_one(&parsed, &[], &empty, dir.path(), &[], Strictness::Strict).is_err());
-        let lenient =
-            resolve_one(&parsed, &[], &empty, dir.path(), &[], Strictness::Lenient).expect("skips");
+        let task = Some((&parsed, dir.path()));
+        let missing = resolve_launch_env(&[], base(&[]), task, Strictness::Strict)
+            .expect_err("task launch requires TOKEN");
+        assert!(
+            missing
+                .to_string()
+                .contains("Required environment variable TOKEN")
+        );
+        let lenient = resolve_launch_env(&[], base(&[]), task, Strictness::Lenient).expect("skips");
         assert!(get(&lenient, "TOKEN").is_none());
-        let filled = resolve_text(text, &base(&[("TOKEN", "s3cret")]), Strictness::Strict);
-        assert_eq!(get(&filled, "TOKEN").as_deref(), Some("s3cret"));
+        let mut inherited = base(&[("TOKEN", "fixture-value")]);
+        let filled = resolve_launch_env(&[], inherited.clone(), task, Strictness::Strict)
+            .expect("inherited value satisfies requirement");
+        assert!(get(&filled, "TOKEN").is_none());
+        assert!(filled.redacted.contains("TOKEN"));
+        filled.apply_to(&mut inherited);
+        assert_eq!(
+            inherited.get(OsStr::new("TOKEN")).map(OsString::as_os_str),
+            Some(OsStr::new("fixture-value"))
+        );
     }
 
     #[test]
@@ -1411,15 +1442,7 @@ mod tests {
         ] {
             let parsed = parse_env(text, dir.path());
             assert!(
-                resolve_one(
-                    &parsed,
-                    &[],
-                    &base(&[]),
-                    dir.path(),
-                    &[],
-                    Strictness::Strict
-                )
-                .is_err(),
+                resolve_task_env(&parsed, &base(&[]), dir.path()).is_err(),
                 "must fail: {text}"
             );
         }

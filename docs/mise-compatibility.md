@@ -62,7 +62,7 @@ file = ".env"
 path = "bin"
 ```
 
-Relative directive paths use the declaring configuration root. Environment files may use dotenv, JSON, or TOML. YAML files fail with a conversion message. JSON and TOML values must be flat scalar values. Missing required values and required files fail during explicit task execution.
+Relative directive paths use the declaring configuration root. Environment files may use dotenv, JSON, or TOML. YAML files fail with a conversion message. JSON and TOML values must be flat scalar values. OMG stops before launch if a required file is missing or a required variable is unset or empty. Required variables are checked after project and task-specific environment layers are applied, so a file, source script, or later layer can supply the value.
 
 Dotenv accepts `KEY=value` and an optional `export` prefix. Quotes preserve spaces, line breaks, and `#` characters inside the value. Set `expand = true` on a file directive to expand `$NAME` or `${NAME}` from earlier values. Single-quoted values and escaped dollar signs stay literal.
 
