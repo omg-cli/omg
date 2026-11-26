@@ -671,7 +671,6 @@ where
                     let remaining_exceeds_floor = total_size == 0
                         || total_size.saturating_sub(downloaded) > low_speed_min_bytes;
                     if low_speed_min_bytes > 0
-                        && attempt + 1 < MAX_DOWNLOAD_ATTEMPTS
                         && remaining_exceeds_floor
                         && window_bytes < low_speed_min_bytes
                     {
@@ -708,6 +707,10 @@ where
         }
 
         if stalled {
+            anyhow::ensure!(
+                attempt + 1 < MAX_DOWNLOAD_ATTEMPTS,
+                "Runtime download stalled below minimum throughput after {MAX_DOWNLOAD_ATTEMPTS} attempts"
+            );
             drop(stream);
             resume = representation.as_ref().and_then(|(total, validator)| {
                 (downloaded > 0 && downloaded < *total).then(|| ResumeRequest {
@@ -2625,6 +2628,64 @@ mod tests {
         assert!(!dest.exists());
         drop(temporary);
         assert_eq!(fs::read_dir(directory.path())?.count(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_download_enforces_low_speed_on_the_last_attempt() -> Result<()> {
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let url = format!("http://{}/archive", listener.local_addr()?);
+        let client = reqwest::Client::builder().no_proxy().build()?;
+        let directory = tempfile::tempdir()?;
+        let dest = directory.path().join("archive.tar.gz");
+        fs::write(&dest, b"previous archive")?;
+
+        let serve = async {
+            for attempt in 1..=MAX_DOWNLOAD_ATTEMPTS {
+                let (mut stream, _) = listener.accept().await?;
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    anyhow::ensure!(request.len() < 8192, "oversized fixture request");
+                    request.push(stream.read_u8().await?);
+                }
+                assert!(request.starts_with(b"GET /archive HTTP/1.1\r\n"));
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 256\r\nConnection: close\r\n\r\nx",
+                    )
+                    .await?;
+                let mut trailing = [0];
+                assert_eq!(stream.read(&mut trailing).await?, 0, "attempt {attempt}");
+            }
+            Ok::<_, anyhow::Error>(())
+        };
+        let download = stream_runtime_download_to_temp_with_low_speed::<Sha256, _, _>(
+            "localhost",
+            |_| async { Ok(client.get(&url).send().await?) },
+            &dest,
+            Duration::from_millis(80),
+            64,
+        );
+        let outcome = tokio::time::timeout(Duration::from_secs(3), async {
+            tokio::join!(serve, download)
+        })
+        .await;
+        assert_eq!(fs::read(&dest)?, b"previous archive");
+        assert_eq!(
+            fs::read_dir(directory.path())?.count(),
+            1,
+            "temporary file removed"
+        );
+        let (server, download) = outcome.context("final attempt ignored the low-speed limit")?;
+        server?;
+        let error = download.expect_err("all three attempts stalled");
+        assert!(
+            error.to_string().contains("minimum throughput"),
+            "{error:#}"
+        );
         Ok(())
     }
 

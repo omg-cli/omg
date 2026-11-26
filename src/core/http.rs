@@ -157,6 +157,7 @@ pub(crate) async fn fetch_public_download(
     fetch_public_download_with_options(raw, user_agent, None, None, true, false).await
 }
 
+/// Bound DNS, redirects, and the response body to one download deadline.
 pub(crate) async fn fetch_public_download_with_timeout(
     raw: &str,
     user_agent: &str,
@@ -166,6 +167,7 @@ pub(crate) async fn fetch_public_download_with_timeout(
 }
 
 /// Revalidate public metadata through the same pinned-DNS download boundary.
+/// A transient failure can trigger one retry with its own download deadline.
 pub(crate) async fn fetch_public_download_fresh(
     raw: &str,
     user_agent: &str,
@@ -222,6 +224,9 @@ async fn fetch_public_download_with_options(
     binary_transfer: bool,
     fresh: bool,
 ) -> anyhow::Result<reqwest::Response> {
+    let time_budget = total_timeout.map(|timeout| (tokio::time::Instant::now(), timeout));
+    let remaining_time =
+        || time_budget.map(|(started, timeout)| timeout.saturating_sub(started.elapsed()));
     let mut url = Url::parse(raw).map_err(|_| anyhow::anyhow!("Invalid download URL"))?;
     for hop in 0..=MAX_REDIRECTS {
         validate_download_url(url.as_str())?;
@@ -236,12 +241,13 @@ async fn fetch_public_download_with_options(
         let port = url
             .port_or_known_default()
             .ok_or_else(|| anyhow::anyhow!("Download URL has no port"))?;
-        let addresses: Vec<_> = tokio::time::timeout(
-            DOWNLOAD_CONNECT_TIMEOUT,
-            tokio::net::lookup_host((host.as_str(), port)),
-        )
-        .await??
-        .collect();
+        let dns_timeout = remaining_time().map_or(DOWNLOAD_CONNECT_TIMEOUT, |remaining| {
+            remaining.min(DOWNLOAD_CONNECT_TIMEOUT)
+        });
+        let addresses: Vec<_> =
+            tokio::time::timeout(dns_timeout, tokio::net::lookup_host((host.as_str(), port)))
+                .await??
+                .collect();
         let loopback_fixture = url.scheme() == "http"
             && is_loopback_host(url.host_str())
             && crate::core::paths::test_mode();
@@ -254,9 +260,6 @@ async fn fetch_public_download_with_options(
             .resolve_to_addrs(&host, &addresses);
         if binary_transfer {
             builder = builder.no_gzip().no_brotli().no_zstd();
-        }
-        if let Some(timeout) = total_timeout {
-            builder = builder.timeout(timeout);
         }
         let client = builder.build()?;
         let mut request = client
@@ -272,6 +275,10 @@ async fn fetch_public_download_with_options(
             request = request
                 .header(reqwest::header::RANGE, format!("bytes={offset}-"))
                 .header(reqwest::header::IF_RANGE, validator.clone());
+        }
+        if let Some(timeout) = remaining_time() {
+            anyhow::ensure!(!timeout.is_zero(), "Download exceeded its total deadline");
+            request = request.timeout(timeout);
         }
         let response = request.send().await.map_err(reqwest::Error::without_url)?;
         if !response.status().is_redirection() {
@@ -1136,6 +1143,134 @@ mod metadata_limit_tests {
             assert_eq!(exhausted.finish().await?.len(), 2);
             Ok(())
         })
+    }
+
+    #[test]
+    #[expect(unsafe_code)] // Environment is set only in the isolated child.
+    fn public_download_timeout_spans_redirect_headers_and_body() -> anyhow::Result<()> {
+        const NAME: &str = "core::http::metadata_limit_tests::public_download_timeout_spans_redirect_headers_and_body";
+        if crate::core::testing::run_isolated_test(NAME) {
+            return Ok(());
+        }
+        // SAFETY: the isolated child has not started its runtime or any other test.
+        unsafe {
+            std::env::set_var("OMG_TEST_MODE", "1");
+        }
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(async {
+                use futures::StreamExt as _;
+
+                let mut cases = Vec::new();
+                for redirects in 1..=4 {
+                    for delay_body in [false, true] {
+                        for (budget_ms, delays, should_timeout) in [
+                            (None, (650, 700), false),
+                            (Some(4000), (650, 700), false),
+                            (Some(1100), (650, 700), true),
+                            (Some(1100), (30, 30), false),
+                        ] {
+                            cases.push(check_redirect_deadline(
+                                redirects,
+                                delay_body,
+                                budget_ms.map(Duration::from_millis),
+                                delays,
+                                should_timeout,
+                            ));
+                        }
+                    }
+                }
+                let mut wrong = Vec::new();
+                let mut checked = 0;
+                let mut cases = futures::stream::iter(cases).buffer_unordered(4);
+                while let Some(case) = cases.next().await {
+                    if let Some(diagnostic) = case? {
+                        wrong.push(diagnostic);
+                    }
+                    checked += 1;
+                }
+                assert_eq!(checked, 32);
+                println!("Checked {checked} public download deadline cases");
+                assert!(wrong.is_empty(), "wrong deadline outcomes: {wrong:?}");
+                Ok(())
+            })
+    }
+
+    async fn check_redirect_deadline(
+        redirects: usize,
+        delay_body: bool,
+        budget: Option<Duration>,
+        (first_delay_ms, final_delay_ms): (u64, u64),
+        should_timeout: bool,
+    ) -> anyhow::Result<Option<String>> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let first_url = format!("http://{}/manifest", listener.local_addr()?);
+        let serve = async {
+            for hop in 0..=redirects {
+                let (mut stream, _) = listener.accept().await?;
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    anyhow::ensure!(request.len() < 8192, "oversized fixture request");
+                    request.push(stream.read_u8().await?);
+                }
+                assert!(request.starts_with(b"GET /manifest HTTP/1.1\r\n"));
+                if hop < redirects {
+                    if hop == 0 {
+                        tokio::time::sleep(Duration::from_millis(first_delay_ms)).await;
+                    }
+                    stream.write_all(b"HTTP/1.1 302 Found\r\nLocation: /manifest\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await?;
+                } else {
+                    let headers =
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n";
+                    let write = async {
+                        if delay_body {
+                            stream.write_all(headers).await?;
+                        }
+                        tokio::time::sleep(Duration::from_millis(final_delay_ms)).await;
+                        if !delay_body {
+                            stream.write_all(headers).await?;
+                        }
+                        stream.write_all(b"ok").await
+                    };
+                    if let Err(error) = write.await {
+                        anyhow::ensure!(
+                            should_timeout
+                                && matches!(
+                                    error.kind(),
+                                    std::io::ErrorKind::BrokenPipe
+                                        | std::io::ErrorKind::ConnectionReset
+                                ),
+                            "fixture failed to deliver response: {error}"
+                        );
+                    }
+                }
+            }
+            Ok::<_, anyhow::Error>(())
+        };
+        let download = async {
+            let response =
+                fetch_public_download_with_timeout(&first_url, "omg-deadline-fixture", budget)
+                    .await?;
+            response.bounded_text().await
+        };
+        let (server, response) = tokio::time::timeout(Duration::from_secs(4), async {
+            tokio::join!(serve, download)
+        })
+        .await?;
+        server?;
+        let correct = if should_timeout {
+            response.as_ref().is_err_and(|error| {
+                error
+                    .downcast_ref::<reqwest::Error>()
+                    .is_some_and(|transport| transport.is_timeout() && transport.url().is_none())
+            })
+        } else {
+            response.as_deref().is_ok_and(|body| body == "ok")
+        };
+        Ok((!correct).then(|| {
+            format!("redirects={redirects} delay_body={delay_body} budget={budget:?}: {response:?}")
+        }))
     }
 
     #[test]

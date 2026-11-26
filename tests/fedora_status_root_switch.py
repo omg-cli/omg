@@ -5310,9 +5310,7 @@ fresh:
         maximum = (1 << 64) - 1
         today = datetime.datetime.now(datetime.timezone.utc).date()
         version = "24.15.3"
-        helper = Path(__file__).with_name("runtime_advisory_fixture.py")
-        if not helper.is_file():
-            helper = fixture.parents[1] / "runtime_advisory_fixture.py"
+        helper = runtime_advisory_fixture
         seed = r"""
 import runpy, sys
 from pathlib import Path
