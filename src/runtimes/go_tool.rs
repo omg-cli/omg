@@ -95,36 +95,35 @@ fn verify_module_files(
     let mut rows = BTreeMap::new();
     let mut count = 0;
     let mut total = 0u64;
+    let mut hasher = artifacts::RegularFileHasher::new();
     while let Some(parent) = pending.pop() {
         for child in fs::read_dir(parent)? {
             let child = child?;
             count += 1;
             ensure!(count <= 200_000, "Go module source exceeds its entry bound");
             let path = child.path();
-            let kind = child.file_type()?;
-            if kind.is_dir() {
+            let metadata = child.metadata()?;
+            if metadata.is_dir() {
                 pending.push(path);
             } else {
-                ensure!(kind.is_file(), "Go module contains a link or special file");
+                ensure!(
+                    metadata.is_file(),
+                    "Go module contains a link or special file"
+                );
                 let relative = path
                     .strip_prefix(directory)?
                     .to_str()
-                    .context("Go source path is not UTF-8")?
-                    .replace('\\', "/");
+                    .context("Go source path is not UTF-8")?;
+                #[cfg(windows)]
+                let relative = relative.replace('\\', "/");
                 ensure!(
-                    !relative.contains('\n'),
+                    !relative.contains(['\n', '\\']),
                     "Go module source has an ambiguous checksum path"
                 );
-                let bytes = artifacts::read(&path, 256 * 1024 * 1024)?;
-                total += bytes.len() as u64;
-                ensure!(
-                    total <= 1024 * 1024 * 1024,
-                    "Go module source exceeds its byte bound"
-                );
-                rows.insert(
-                    format!("{module}@{version}/{relative}"),
-                    artifacts::hash(&bytes),
-                );
+                let allowance = (1024 * 1024 * 1024 - total).min(256 * 1024 * 1024);
+                let (digest, bytes) = hasher.hash(&path, &metadata, allowance)?;
+                total += bytes;
+                rows.insert(format!("{module}@{version}/{relative}"), digest);
             }
         }
     }
@@ -302,7 +301,11 @@ pub(crate) fn install_reviewed(
         archive.canonicalize()?.starts_with(&cache),
         "Go module archive escaped its private cache"
     );
-    let archive_sha256 = artifacts::hash(&artifacts::read(archive, 256 * 1024 * 1024)?);
+    let (archive_sha256, _) = artifacts::RegularFileHasher::new().hash(
+        archive,
+        &fs::symlink_metadata(archive)?,
+        256 * 1024 * 1024,
+    )?;
     artifacts::tree(&extracted)?;
     let project = work.join("source");
     super::common::copy_regular_tree(&extracted, &project, false)?;
@@ -683,6 +686,37 @@ mod tests {
             );
         }
         Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn go_module_checksum_refuses_literal_backslashes() -> Result<()> {
+        let owner = tempfile::tempdir()?;
+        fs::write(owner.path().join("docs\\readme"), b"ordinary fixture")?;
+        let error = verify_module_files(
+            owner.path(),
+            "example.com/tool",
+            "v1.2.3",
+            "h1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+        )
+        .expect_err("Go paths with literal backslashes are outside the module format");
+        assert!(
+            error.to_string().contains("ambiguous checksum path"),
+            "{error:#}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn go_module_checksum_hashes_large_regular_file() -> Result<()> {
+        let owner = tempfile::tempdir()?;
+        fs::File::create(owner.path().join("payload.bin"))?.set_len(64 * 1024 * 1024)?;
+        verify_module_files(
+            owner.path(),
+            "example.com/tool",
+            "v1.2.3",
+            "h1:mzZm1lljEYJgsQxrEx4xE/NJaL9VLzj5Rl/O0te01Uc=",
+        )
     }
 
     #[test]

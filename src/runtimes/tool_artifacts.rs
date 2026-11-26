@@ -253,12 +253,82 @@ fn run_owned(
     })
 }
 
+pub(super) struct RegularFileHasher {
+    buffer: Box<[u8]>,
+}
+
+impl RegularFileHasher {
+    pub(super) fn new() -> Self {
+        Self {
+            buffer: vec![0; 64 * 1024].into_boxed_slice(),
+        }
+    }
+
+    pub(super) fn hash(
+        &mut self,
+        path: &Path,
+        expected: &fs::Metadata,
+        limit: u64,
+    ) -> Result<(String, u64)> {
+        ensure!(expected.is_file(), "Registry source is not a regular file");
+        ensure!(
+            expected.len() <= limit,
+            "Registry source exceeds its byte allowance"
+        );
+        let mut options = fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK);
+        }
+        let file = options.open(path)?;
+        let before = file.metadata()?;
+        ensure!(before.is_file(), "Registry content changed type");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            ensure!(
+                before.dev() == expected.dev() && before.ino() == expected.ino(),
+                "Registry content was replaced while opening"
+            );
+        }
+        let modified = before.modified()?;
+        ensure!(
+            before.len() == expected.len() && modified == expected.modified()?,
+            "Registry source changed before hashing"
+        );
+
+        let mut file = file.take(limit.saturating_add(1));
+        let mut digest = Sha256::new();
+        let mut count = 0;
+        loop {
+            let size = match file.read(&mut self.buffer) {
+                Ok(0) => break,
+                Ok(size) => size,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error.into()),
+            };
+            count += size as u64;
+            ensure!(count <= limit, "Registry source exceeds its byte allowance");
+            digest.update(&self.buffer[..size]);
+        }
+        let after = file.get_ref().metadata()?;
+        ensure!(
+            count == before.len() && count == after.len() && modified == after.modified()?,
+            "Registry source changed while hashing"
+        );
+        Ok((hex::encode(digest.finalize()), count))
+    }
+}
+
 pub(crate) fn tree(root: &Path) -> Result<String> {
     let canonical = root.canonicalize()?;
     let mut pending = vec![root.to_path_buf()];
     let mut rows = BTreeMap::new();
     let mut total = 0u64;
     let mut entries = 0usize;
+    let mut hasher = RegularFileHasher::new();
     while let Some(directory) = pending.pop() {
         ensure!(
             fs::symlink_metadata(&directory)?.is_dir(),
@@ -304,48 +374,10 @@ pub(crate) fn tree(root: &Path) -> Result<String> {
                     metadata.is_file() && metadata.len() <= 1024 * 1024 * 1024,
                     "Registry source contains an unbounded or special file"
                 );
-                let mut options = fs::OpenOptions::new();
-                options.read(true);
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::OpenOptionsExt as _;
-                    options.custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK);
-                }
-                let mut file = options.open(&path)?;
-                let before = file.metadata()?;
-                ensure!(before.is_file(), "Registry content changed type");
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::MetadataExt as _;
-                    ensure!(
-                        before.dev() == metadata.dev() && before.ino() == metadata.ino(),
-                        "Registry content was replaced while opening"
-                    );
-                }
-                let mut digest = Sha256::new();
-                let mut count = 0u64;
-                let mut buffer = vec![0u8; 65536].into_boxed_slice();
-                loop {
-                    let size = file.read(&mut buffer)?;
-                    if size == 0 {
-                        break;
-                    }
-                    count += size as u64;
-                    total += size as u64;
-                    ensure!(
-                        total <= 2 * 1024 * 1024 * 1024 && count <= 1024 * 1024 * 1024,
-                        "Registry source exceeds its byte allowance"
-                    );
-                    digest.update(&buffer[..size]);
-                }
-                let after = file.metadata()?;
-                ensure!(
-                    count == before.len()
-                        && before.len() == after.len()
-                        && before.modified()? == after.modified()?,
-                    "Registry source changed while hashing"
-                );
-                rows.insert(relative, ("file", mode, hex::encode(digest.finalize())));
+                let allowance = (2 * 1024 * 1024 * 1024 - total).min(1024 * 1024 * 1024);
+                let (digest, count) = hasher.hash(&path, &metadata, allowance)?;
+                total += count;
+                rows.insert(relative, ("file", mode, digest));
             }
         }
     }
@@ -908,6 +940,64 @@ esac
         assert_eq!(
             fs::read(destination.join("bin/fixture-tool"))?,
             b"previous reviewed tool"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn regular_file_hashes_match_digest_across_buffer_and_budget_boundaries() -> Result<()> {
+        let owner = tempfile::tempdir()?;
+        let path = owner.path().join("payload");
+        let mut hasher = RegularFileHasher::new();
+        for size in [1, 63, 64, 4095, 4096, 65_535, 65_536, 65_537] {
+            let bytes = vec![0x5a; size];
+            fs::write(&path, &bytes)?;
+            let metadata = fs::symlink_metadata(&path)?;
+            let expected = hash(&bytes);
+            for limit in [size - 1, size, size + 1, size + 2] {
+                let result = hasher.hash(&path, &metadata, limit as u64);
+                if limit >= size {
+                    assert_eq!(result?, (expected.clone(), size as u64));
+                } else {
+                    let error = result.expect_err("file larger than allowance");
+                    assert!(error.to_string().contains("byte allowance"), "{error:#}");
+                }
+            }
+        }
+        fs::write(&path, [])?;
+        assert_eq!(
+            hasher.hash(&path, &fs::symlink_metadata(&path)?, 0)?,
+            (hash(&[]), 0)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn regular_file_hash_refuses_a_replaced_entry_and_a_link() -> Result<()> {
+        let owner = tempfile::tempdir()?;
+        let path = owner.path().join("payload");
+        let replacement = owner.path().join("replacement");
+        fs::write(&path, b"same fixture bytes")?;
+        let original = fs::symlink_metadata(&path)?;
+        fs::write(&replacement, b"same fixture bytes")?;
+        fs::rename(&replacement, &path)?;
+        let mut hasher = RegularFileHasher::new();
+        let error = hasher
+            .hash(&path, &original, 32)
+            .expect_err("the observed inode was replaced");
+        assert!(
+            error.to_string().contains("replaced while opening"),
+            "{error:#}"
+        );
+
+        let link = owner.path().join("link");
+        std::os::unix::fs::symlink(&path, &link)?;
+        let error = hasher
+            .hash(&link, &fs::symlink_metadata(&link)?, 32)
+            .expect_err("a link is not an ordinary file");
+        assert!(
+            error.to_string().contains("not a regular file"),
+            "{error:#}"
         );
         Ok(())
     }
