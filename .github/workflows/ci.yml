@@ -615,7 +615,7 @@ jobs:
     if: needs.quick-gate.outputs.should-build == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group'
     runs-on: ubuntu-24.04
     timeout-minutes: ${{ matrix.platform == 'ubuntu-2604' && 75 || 60 }}
-    env:
+    env: &native-linux-env
       # Shell and upload action must use the same container path.
       FEDORA_IGNORED_EVIDENCE_DIR: /tmp/omg-fedora-ignored-${{ github.run_id }}-${{ github.run_attempt }}
       RUSTUP_DIAGNOSTICS_DIR: /tmp/rustup-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.phase }}-${{ matrix.platform }}
@@ -635,51 +635,8 @@ jobs:
       max-parallel: 5
       matrix:
         phase: [validation]
-        platform: [arch, debian, debian-trixie, ubuntu-2604, fedora]
+        platform: [debian, debian-trixie, ubuntu-2604, fedora]
         include:
-          - platform: arch
-            image: archlinux:latest@sha256:f3691b4dde62ba4c4b6f0ae2c1fbf28e8c0c8c4b9a35c7e06dc1f70e21aa29f6
-            features: arch,pgp,license
-            setup: |
-              pacman -Syu --noconfirm
-              setup_log=$(mktemp)
-              trap 'rm -f "$setup_log"' 0
-              for setup_attempt in 1 2; do
-                if pacman -S --noconfirm --needed base-devel git pkgconf openssl libarchive clang cmake curl jq python fish > "$setup_log" 2>&1; then
-                  cat "$setup_log"
-                  break
-                else
-                  setup_status=$?
-                fi
-                cat "$setup_log" || exit "$setup_status"
-                if [ "$setup_attempt" = 2 ]; then
-                  exit "$setup_status"
-                fi
-                if ! awk '
-                  { previous = last; last = $0 }
-                  END {
-                    retrieval = "error: failed to commit transaction (failed to retrieve some files)"
-                    trailer = "Errors occurred, no packages were upgraded."
-                    exit !(last == retrieval || (last == trailer && previous == retrieval))
-                  }
-                ' "$setup_log"; then
-                  exit "$setup_status"
-                fi
-                printf 'Retrying dependency retrieval after failed attempt %s/2\n' "$setup_attempt" >&2
-                sleep 2
-              done
-            rust_install: |
-              curl --proto '=https' --tlsv1.2 -fsSL \
-                https://static.rust-lang.org/rustup/archive/1.28.2/x86_64-unknown-linux-gnu/rustup-init \
-                -o /tmp/rustup-init
-              echo "20a06e644b0d9bd2fbdbfd52d42540bdde820ea7df86e92e533c073da0cdd43c  /tmp/rustup-init" | sha256sum --check
-              chmod +x /tmp/rustup-init
-              /tmp/rustup-init -y --profile minimal --default-toolchain 1.95.0
-              rm -f /tmp/rustup-init
-              echo "$HOME/.cargo/bin" >> $GITHUB_PATH
-            rust_components: |
-              "$HOME/.cargo/bin/rustup" component add clippy rustfmt
-
           - platform: debian
             image: debian:bookworm@sha256:813017f3d62be4b5891a7acca6a01bdcd4b8513daa81b1ab99d3a50385b26931
             features: debian,pgp,license
@@ -769,10 +726,10 @@ jobs:
             rust_components: |
               "$HOME/.cargo/bin/rustup" component add clippy rustfmt
 
-    container:
+    container: &native-linux-container
       image: ${{ matrix.image }}
 
-    steps:
+    steps: &native-linux-steps
       - name: Configure signed Ubuntu archive before checkout
         if: matrix.platform == 'ubuntu-2604'
         uses: omg-cli/omg/.github/actions/ubuntu-apt@84de6d880056ad0fd4eb539dbca1b45759f35c32
@@ -1495,9 +1452,69 @@ jobs:
           retention-days: 14
           if-no-files-found: error
 
+  # Give the sandbox consumer an explicit dependency on its sole producer.
+  linux-arch:
+    name: "Linux (${{ matrix.platform }})"
+    needs: quick-gate
+    if: needs.quick-gate.outputs.should-build == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env: *native-linux-env
+    strategy:
+      fail-fast: false
+      matrix:
+        phase: [validation]
+        platform: [arch]
+        include:
+          - platform: arch
+            image: archlinux:latest@sha256:f3691b4dde62ba4c4b6f0ae2c1fbf28e8c0c8c4b9a35c7e06dc1f70e21aa29f6
+            contract_platform: arch
+            features: arch,pgp,license
+            setup: |
+              pacman -Syu --noconfirm
+              setup_log=$(mktemp)
+              trap 'rm -f "$setup_log"' 0
+              for setup_attempt in 1 2; do
+                if pacman -S --noconfirm --needed base-devel git pkgconf openssl libarchive clang cmake curl jq python fish > "$setup_log" 2>&1; then
+                  cat "$setup_log"
+                  break
+                else
+                  setup_status=$?
+                fi
+                cat "$setup_log" || exit "$setup_status"
+                if [ "$setup_attempt" = 2 ]; then
+                  exit "$setup_status"
+                fi
+                if ! awk '
+                  { previous = last; last = $0 }
+                  END {
+                    retrieval = "error: failed to commit transaction (failed to retrieve some files)"
+                    trailer = "Errors occurred, no packages were upgraded."
+                    exit !(last == retrieval || (last == trailer && previous == retrieval))
+                  }
+                ' "$setup_log"; then
+                  exit "$setup_status"
+                fi
+                printf 'Retrying dependency retrieval after failed attempt %s/2\n' "$setup_attempt" >&2
+                sleep 2
+              done
+            rust_install: |
+              curl --proto '=https' --tlsv1.2 -fsSL \
+                https://static.rust-lang.org/rustup/archive/1.28.2/x86_64-unknown-linux-gnu/rustup-init \
+                -o /tmp/rustup-init
+              echo "20a06e644b0d9bd2fbdbfd52d42540bdde820ea7df86e92e533c073da0cdd43c  /tmp/rustup-init" | sha256sum --check
+              chmod +x /tmp/rustup-init
+              /tmp/rustup-init -y --profile minimal --default-toolchain 1.95.0
+              rm -f /tmp/rustup-init
+              echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+            rust_components: |
+              "$HOME/.cargo/bin/rustup" component add clippy rustfmt
+    container: *native-linux-container
+    steps: *native-linux-steps
+
   linux-clippy:
     name: Native Clippy proof
-    needs: [quick-gate, linux-matrix]
+    needs: [quick-gate, linux-matrix, linux-arch]
     if: >-
       !cancelled() && needs.quick-gate.result == 'success' &&
       (needs.quick-gate.outputs.should-build == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group')
@@ -1524,7 +1541,7 @@ jobs:
 
   sandbox-cancellation:
     name: "AUR sandbox security regressions"
-    needs: [quick-gate, linux-matrix]
+    needs: [quick-gate, linux-arch]
     if: needs.quick-gate.outputs.should-build == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -2240,7 +2257,7 @@ jobs:
 
   ci-success:
     name: "CI Success"
-    needs: [quick-gate, workflow-checks, standalone-suites, portable, portable-release, linux-matrix, linux-clippy, fedora-sqlite, sandbox-cancellation, feature-intersections, macos, macos-nextest-source, ubuntu, native-readiness, qemu, qemu-fedora, docs-audit, runtime-usage]
+    needs: [quick-gate, workflow-checks, standalone-suites, portable, portable-release, linux-matrix, linux-arch, linux-clippy, fedora-sqlite, sandbox-cancellation, feature-intersections, macos, macos-nextest-source, ubuntu, native-readiness, qemu, qemu-fedora, docs-audit, runtime-usage]
     if: always() && !cancelled()
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -2267,6 +2284,7 @@ jobs:
           PORTABLE: ${{ needs.portable.result }}
           PORTABLE_RELEASE: ${{ needs.portable-release.result }}
           LINUX_MATRIX: ${{ needs.linux-matrix.result }}
+          LINUX_ARCH: ${{ needs.linux-arch.result }}
           LINUX_CLIPPY: ${{ needs.linux-clippy.result }}
           FEDORA_SQLITE: ${{ needs.fedora-sqlite.result }}
           SANDBOX_CANCELLATION: ${{ needs.sandbox-cancellation.result }}
@@ -2291,6 +2309,7 @@ jobs:
           echo "| Portable Rust | $PORTABLE |" >> $GITHUB_STEP_SUMMARY
           echo "| Portable release | $PORTABLE_RELEASE |" >> $GITHUB_STEP_SUMMARY
           echo "| Linux Matrix | $LINUX_MATRIX |" >> $GITHUB_STEP_SUMMARY
+          echo "| Linux (arch) | $LINUX_ARCH |" >> $GITHUB_STEP_SUMMARY
           echo "| Linux Clippy | $LINUX_CLIPPY |" >> $GITHUB_STEP_SUMMARY
           echo "| Fedora SQLite supply | $FEDORA_SQLITE |" >> $GITHUB_STEP_SUMMARY
           echo "| AUR Sandbox Cancellation | $SANDBOX_CANCELLATION |" >> $GITHUB_STEP_SUMMARY
@@ -2333,6 +2352,7 @@ jobs:
             ["Portable Rust"]="$PORTABLE"
             ["Portable release"]="$PORTABLE_RELEASE"
             ["Linux Matrix"]="$LINUX_MATRIX"
+            ["Linux (arch)"]="$LINUX_ARCH"
             ["Linux Clippy"]="$LINUX_CLIPPY"
             ["Fedora SQLite supply"]="$FEDORA_SQLITE"
             ["AUR Sandbox Cancellation"]="$SANDBOX_CANCELLATION"
@@ -2352,7 +2372,7 @@ jobs:
             fi
           done
 
-          if [[ "$LINUX_MATRIX" == "success" && "$SANDBOX_CANCELLATION" != "success" ]]; then
+          if [[ "$LINUX_ARCH" == "success" && "$SANDBOX_CANCELLATION" != "success" ]]; then
             echo "::error::Arch builds completed without the required sandbox regression"
             exit 1
           fi
@@ -2363,11 +2383,12 @@ jobs:
   # Keep the full CI dispatch entry point for explicitly requested fresh builds.
   release-tag:
     name: "Tag Release"
-    needs: [quick-gate, portable, linux-matrix, sandbox-cancellation, feature-intersections, macos, ubuntu, ci-success]
+    needs: [quick-gate, portable, linux-matrix, linux-arch, sandbox-cancellation, feature-intersections, macos, ubuntu, ci-success]
     if: >-
       github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' &&
       github.run_attempt == '1' && inputs['release-candidate'] != '' &&
-      needs.linux-matrix.result == 'success' && needs.sandbox-cancellation.result == 'success' &&
+      needs.linux-matrix.result == 'success' && needs.linux-arch.result == 'success' &&
+      needs.sandbox-cancellation.result == 'success' &&
       needs.feature-intersections.result == 'success' && needs.macos.result == 'success' &&
       needs.ubuntu.result == 'success'
     permissions:
