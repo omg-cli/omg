@@ -399,11 +399,11 @@ fn try_fast_counter(args: &[String]) -> Result<bool> {
     let Some(counter) = parse_fast_counter_cmd(args) else {
         return Ok(false);
     };
-    try_print_counter(counter, false, true)
+    try_print_counter(counter, false)
 }
 
 async fn run_counter(counter: FastCounter, json: bool) -> Result<()> {
-    if try_print_counter(counter, json, false)? {
+    if try_print_counter(counter, json)? {
         return Ok(());
     }
     let manager = omg_lib::package_managers::get_package_manager()?;
@@ -433,7 +433,7 @@ async fn run_counter(counter: FastCounter, json: bool) -> Result<()> {
     Ok(())
 }
 
-fn try_print_counter(counter: FastCounter, json: bool, before_dispatch: bool) -> Result<bool> {
+fn try_print_counter(counter: FastCounter, json: bool) -> Result<bool> {
     let selected_backend = omg_lib::package_managers::resolve_backend()?;
     if counter == FastCounter::Explicit {
         packages::explicit_sync_with_json(true, json)?;
@@ -451,6 +451,18 @@ fn try_print_counter(counter: FastCounter, json: bool, before_dispatch: bool) ->
             json,
         );
         return Ok(true);
+    }
+
+    #[cfg(feature = "fedora")]
+    if selected_backend == omg_lib::package_managers::Backend::Fedora {
+        if counter == FastCounter::Total {
+            let total = omg_lib::package_managers::DnfPackageManager::new().installed_count()?;
+            print_counter_value(total.try_into()?, json);
+            return Ok(true);
+        }
+        // DNF reasons and repository metadata can change independently of
+        // RPM. Query only the selected count on the dispatched path.
+        return Ok(false);
     }
 
     if let Some(status) = omg_lib::core::fast_status::FastStatus::read_default() {
@@ -473,22 +485,6 @@ fn try_print_counter(counter: FastCounter, json: bool, before_dispatch: bool) ->
         print_fast_counter(counter, total.try_into()?, 0, orphans.try_into()?, 0, json);
         return Ok(true);
     }
-
-    #[cfg(feature = "fedora")]
-    if selected_backend == omg_lib::package_managers::Backend::Fedora {
-        if counter == FastCounter::Total {
-            let total = omg_lib::package_managers::DnfPackageManager::new().installed_count()?;
-            print_counter_value(total.try_into()?, json);
-            return Ok(true);
-        }
-        // The dispatched path owns the single daemon attempt and can run the
-        // individual asynchronous DNF query if the daemon is unavailable.
-        if before_dispatch {
-            return Ok(false);
-        }
-    }
-    #[cfg(not(feature = "fedora"))]
-    let _ = before_dispatch;
 
     #[cfg(unix)]
     if let Ok((total, explicit, orphans, updates)) = fast_status_from_daemon() {
@@ -534,10 +530,14 @@ fn try_fast_explicit_count(args: &[String]) -> bool {
     }
 
     if args.len() == 3 && args[1] == "explicit" && matches!(args[2].as_str(), "--count" | "-c") {
-        if omg_lib::package_managers::resolve_backend().is_err() {
+        let Ok(backend) = omg_lib::package_managers::resolve_backend() else {
+            return false;
+        };
+        #[cfg(feature = "fedora")]
+        if backend == omg_lib::package_managers::Backend::Fedora {
             return false;
         }
-        if omg_lib::core::paths::test_mode() {
+        if backend == omg_lib::package_managers::Backend::Mock {
             return packages::explicit_sync(true).is_ok();
         }
         if let Some(count) = omg_lib::core::fast_status::FastStatus::read_explicit_count() {

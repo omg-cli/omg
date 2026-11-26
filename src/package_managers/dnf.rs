@@ -977,12 +977,7 @@ impl DnfPackageManager {
     }
 
     async fn current_explicit_package_names(packages: &[InstalledPackage]) -> Result<Vec<String>> {
-        let mut command = tokio::process::Command::from(Self::user_installed_command()?);
-        command.stderr(std::process::Stdio::piped());
-        let user_installed = Self::query_output(command)
-            .await
-            .and_then(|output| Self::parse_user_installed_names(&output));
-        Self::explicit_package_names(packages, user_installed)
+        Self::explicit_package_names(packages, Self::read_user_installed_names().await)
     }
 
     /// Read RPM database, trying `SQLite` first then falling back to subprocess
@@ -1064,11 +1059,12 @@ impl DnfPackageManager {
     /// names concatenate into one row.
     const USER_INSTALLED_QUERY_FORMAT: &str = "%{name}\\n";
 
-    fn user_installed_command() -> Result<std::process::Command> {
+    pub(crate) async fn read_user_installed_names() -> Result<HashSet<String>> {
         // --userinstalled reads the system repo only. An unmatched repo glob
         // would reject a valid local inventory on a host with no configured repos.
-        let mut command = crate::core::privilege::system_command("dnf")?;
-        command.args([
+        let mut command =
+            tokio::process::Command::from(crate::core::privilege::system_command("dnf")?);
+        command.stderr(std::process::Stdio::piped()).args([
             "--cacheonly",
             "--setopt=disable_excludes=*",
             "repoquery",
@@ -1076,19 +1072,7 @@ impl DnfPackageManager {
             "--qf",
             Self::USER_INSTALLED_QUERY_FORMAT,
         ]);
-        Ok(command)
-    }
-
-    pub(crate) fn read_user_installed_names() -> Result<HashSet<String>> {
-        let output = Self::user_installed_command()?
-            .output()
-            .context("Failed to execute dnf repoquery --userinstalled")?;
-        if !output.status.success() {
-            let stderr =
-                crate::cli::style::sanitize_terminal_text(&String::from_utf8_lossy(&output.stderr));
-            anyhow::bail!("dnf repoquery --userinstalled failed: {}", stderr.trim());
-        }
-        Self::parse_user_installed_names(&output.stdout)
+        Self::parse_user_installed_names(&Self::query_output(command).await?)
     }
 
     fn parse_rpm_qa_line(line: &str) -> Result<InstalledPackage> {

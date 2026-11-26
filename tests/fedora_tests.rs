@@ -937,6 +937,63 @@ mod dnf_integration {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn native_fedora_counters_ignore_daemon_status_file() -> Result<()> {
+        use omg_lib::core::fast_status::FastStatus;
+
+        let runtime = tempfile::tempdir()?;
+        let stale = u32::MAX as usize;
+        FastStatus::new(stale, stale, stale, stale)
+            .write_to_file(&runtime.path().join("omg.status"))?;
+        let manager = DnfPackageManager::new();
+        let total = manager.installed_count()?;
+        let explicit = manager.list_explicit().await?.len();
+        let orphans = DnfPackageManager::orphan_count().await?;
+        for (arguments, expected) in [
+            (&["tc"][..], total),
+            (&["oc"][..], orphans),
+            (&["ec"][..], explicit),
+            (&["explicit", "--count"][..], explicit),
+        ] {
+            for json in [false, true] {
+                let mut command =
+                    tokio::process::Command::new(assert_cmd::cargo::cargo_bin!("omg"));
+                if json {
+                    command.arg("--json");
+                }
+                command
+                    .args(arguments)
+                    .env("XDG_RUNTIME_DIR", runtime.path())
+                    .env_remove("OMG_SOCKET_PATH")
+                    .env_remove("OMG_DISABLE_DAEMON")
+                    .env("OMG_DISABLE_TELEMETRY", "1")
+                    .env("OMG_TEST_MODE", "0")
+                    .env_remove("OMG_TEST_DISTRO")
+                    .env_remove("OMG_NATIVE_TEST_DATA_DIR");
+                let mut child = spawn_bounded_child(&mut command)?;
+                let output =
+                    bounded_child_output(&mut child, std::time::Duration::from_mins(1)).await?;
+                assert!(
+                    output.status.success(),
+                    "{arguments:?}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                if json {
+                    let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+                    assert_eq!(value["count"], expected);
+                } else {
+                    assert_eq!(
+                        std::str::from_utf8(&output.stdout)?
+                            .trim()
+                            .parse::<usize>()?,
+                        expected
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     fn size_cli_matches_native_installed_packages() -> Result<()> {
         let before = std::process::Command::new("rpm")
