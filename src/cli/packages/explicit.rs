@@ -87,7 +87,8 @@ pub fn explicit_sync_with_json(count: bool, json: bool) -> Result<()> {
                 | ResponseResult::Message(_)
                 | ResponseResult::DebianSearch(_)
                 | ResponseResult::Health(_)
-                | ResponseResult::ListUpdates(_) => {}
+                | ResponseResult::ListUpdates(_)
+                | ResponseResult::StatusMetadata(_) => {}
             },
             Err(error) => {
                 tracing::debug!("Daemon explicit-list call failed: {error}");

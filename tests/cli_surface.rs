@@ -651,6 +651,7 @@ fn daemon_request_inventory_matches_every_compiled_variant() {
         DebianSearch { id: 13, query: "two words".into(), limit: Some(17) },
         Health { id: 14 },
         ListUpdates { id: 15 },
+        StatusMetadata { id: 16 },
     };
     let manifest: Value = serde_json::from_str(include_str!("contracts/manifest.json")).unwrap();
     let declared: BTreeSet<_> = manifest["interfaces"]
