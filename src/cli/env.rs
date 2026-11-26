@@ -80,8 +80,16 @@ pub async fn check() -> Result<()> {
 
     let expected = EnvironmentState::load("omg.lock")?;
     let current = EnvironmentState::capture().await?;
+    report_environment_check(&expected, &current)
+}
 
-    let report = DriftReport::compare(&expected, &current);
+pub(super) fn report_environment_check(
+    expected: &EnvironmentState,
+    current: &EnvironmentState,
+) -> Result<()> {
+    use crate::cli::packages::execute_cmd;
+
+    let report = DriftReport::compare(expected, current);
 
     if report.has_drift {
         execute_cmd(Cmd::batch([

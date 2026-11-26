@@ -1363,7 +1363,7 @@ async fn handle_workspace_command(command: &omg_lib::cli::WorkspaceCommands) -> 
             ..
         } => omg_lib::cli::workspace::run(cmd, args, *parallel, filter.as_deref()).await,
         WorkspaceCommands::Diff { branch } => omg_lib::cli::workspace::diff(branch),
-        WorkspaceCommands::Check => omg_lib::cli::workspace::check(),
+        WorkspaceCommands::Check => omg_lib::cli::workspace::check().await,
         WorkspaceCommands::Status => omg_lib::cli::workspace::status(),
     }
 }

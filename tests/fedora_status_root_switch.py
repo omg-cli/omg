@@ -1538,6 +1538,175 @@ exec {shlex.quote(git)} "$@"
             concurrent("concurrent-shared-parent", "shared/a", "shared/b", "shared", [0, 0])
 
 
+    def inspect_workspace_lifecycle():
+        phase = "workspace-lifecycle"
+        with tempfile.TemporaryDirectory(prefix="workspace-lifecycle-", dir=work) as directory:
+            here = Path(directory)
+            os.chown(here, account.pw_uid, account.pw_gid)
+            isolated = dict(disabled, HOME=str(here), XDG_DATA_HOME=str(here/"data"),
+                            XDG_CONFIG_HOME=str(here/"config"), XDG_CACHE_HOME=str(here/"cache"),
+                            XDG_STATE_HOME=str(here/"state"))
+            config = here / "omg-workspace.toml"
+            guard = here / ".omg-workspace.write.lock"
+            a = here / "api"
+            b = here / "web"
+            c = here / "worker"
+            for project in (a, b, c):
+                project.mkdir()
+                os.chown(project, account.pw_uid, account.pw_gid)
+            (here/"file-project").write_text("regular file\n")
+            (a/"Makefile").write_text("test:\n\t@printf 'fixture here\\n'\n")
+
+            def run(label, args, markers=(), *, fails=False, inspect=None, binary=cli, env=isolated):
+                try:
+                    result = command([binary, "workspace", *args], env, ordinary, timeout=6)
+                except subprocess.TimeoutExpired:
+                    checks.append(dict(phase=phase, case=label, passed=False, status=None,
+                                       diagnostic="command exceeded local deadline"))
+                    return
+                output = result.stdout + result.stderr
+                okay = ((result.returncode != 0) == fails and all(marker in output for marker in markers)
+                        and (inspect is None or inspect()))
+                checks.append(dict(phase=phase, case=label, passed=okay, status=result.returncode,
+                                   diagnostic=output[-1050:]))
+
+            def projects():
+                return tomllib.loads(config.read_text())["projects"]
+
+            for action in ("list", "status", "check"):
+                run(f"{action}-before-init", (action,), ("No workspace found",),
+                    fails=True, inspect=lambda: not config.exists() and not guard.exists())
+            run("init", ("init", "fixture"), ("Created omg-workspace.toml",), inspect=lambda: projects() == {})
+            original = config.read_bytes()
+            run("init-existing", ("init", "other"), ("Workspace already exists",), fails=True,
+                inspect=lambda: config.read_bytes() == original)
+            run("add-api", ("add", "./api", "--name", "backend"), ("Added project 'backend'",))
+            run("add-web", ("add", "web"), ("Added project 'web'",))
+            saved = config.read_bytes()
+            run("add-file", ("add", "file-project"), ("Project path is not a directory",),
+                fails=True, inspect=lambda: config.read_bytes() == saved)
+            config.write_bytes(saved)
+            run("add-missing", ("add", "not-here"), ("Project path does not exist",),
+                fails=True, inspect=lambda: config.read_bytes() == saved)
+            run("add-duplicate", ("add", "api", "--name", "backend"), ("already exists",),
+                fails=True, inspect=lambda: config.read_bytes() == saved)
+            run("list-members", ("list",), ("backend", "web", "commands:"), inspect=lambda: projects()["backend"]["path"] == "./api")
+            run("status-missing-locks", ("status",), ("0 healthy, 2 need attention", "no omg.lock"))
+            run("check-missing-locks", ("check",), ("No omg.lock file found", "2 project(s) need attention, 0 failed to check"),
+                fails=True, inspect=lambda: not (a/"omg.lock").exists() and not (b/"omg.lock").exists())
+
+            capture = command([cli, "env", "capture"], dict(isolated, HOME=str(a)), ordinary)
+            assert capture.returncode == 0, capture.stderr
+            content = (a/"omg.lock").read_bytes()
+            (b/"omg.lock").write_bytes(content)
+            run("check-matching-locks", ("check",), ("All 2 project environment(s) healthy",),
+                inspect=lambda: (a/"omg.lock").read_bytes() == (b/"omg.lock").read_bytes() == content)
+            run("status-matching-locks", ("status",), ("2 healthy, 0 need attention",))
+            (b/"omg.lock").write_text("runtimes = [\n")
+            run("status-invalid-lock", ("status",), ("web - invalid omg.lock", "1 healthy, 1 need attention"))
+            run("check-invalid-lock", ("check",), ("Invalid lockfile", "1 project(s) need attention, 0 failed to check"),
+                fails=True, inspect=lambda: (b/"omg.lock").read_text() == "runtimes = [\n")
+            (b/"omg.lock").unlink()
+            (b/"omg.lock").mkdir()
+            run("status-lock-directory", ("status",), ("web - invalid omg.lock",))
+            (b/"omg.lock").rmdir()
+            (b/"omg.lock").write_bytes(content)
+            absent = here / "web-away"
+            b.rename(absent)
+            run("check-missing-member", ("check",), ("0 project(s) need attention, 1 failed to check",),
+                fails=True, inspect=lambda: not b.exists())
+            absent.rename(b)
+
+            alternate = here / "renamed-cli"
+            alternate.mkdir()
+            relocated = alternate / "workspace-cli"
+            shutil.copy2(cli, relocated)
+            run("check-relocated-cli", ("check",), ("All 2 project environment(s) healthy",), binary=relocated)
+
+            amended = saved.decode() + '\n[projects.web.commands]\nfixture = "printf workspace-task-ok"\n'
+            # Serialization already contains a commands table for every project.
+            amended = re.sub(r"(?m)^\[projects\.web\.commands\]\n", "", amended, count=1)
+            config.write_text(amended)
+            run("task-refuses-without-consent", ("run", "fixture", "--filter", "web"),
+                ("without an interactive terminal",), fails=True)
+            run("task-respects-explicit-consent", ("run", "fixture", "--filter", "web", "--yes"),
+                ("workspace-task-ok", "1 succeeded, 0 failed"))
+            config.write_bytes(saved)
+
+            for label, content_to_read, marker in (
+                ("malformed", b"name = [\n", "Failed to parse workspace file"),
+                ("invalid-utf8", b"\xff", "UTF-8"),
+                ("above-bound", saved.ljust(16 * 1024 * 1024 + 1, b" "), "Workspace file exceeds"),
+            ):
+                config.write_bytes(content_to_read)
+                run(f"file-{label}", ("list",), (marker,), fails=True,
+                    inspect=lambda: config.read_bytes() == content_to_read)
+            config.write_bytes(saved.ljust(16 * 1024 * 1024, b" "))
+            run("file-at-bound", ("list",), ("backend", "web"))
+            config.unlink()
+            adjacent = here / "workspace-reference"
+            adjacent.write_bytes(saved)
+            for label in ("directory", "symlink", "fifo"):
+                if label == "directory":
+                    config.mkdir()
+                elif label == "symlink":
+                    config.symlink_to(adjacent)
+                else:
+                    os.mkfifo(config, 0o644)
+                run(f"file-{label}", ("list",), ("Workspace file must be a regular file",),
+                    fails=True, inspect=lambda: adjacent.read_bytes() == saved)
+                if label == "directory":
+                    config.rmdir()
+                else:
+                    config.unlink()
+            config.symlink_to(here/"no-workspace")
+            run("init-preserves-dangling-link", ("init", "other"), ("Workspace already exists",),
+                fails=True, inspect=lambda: config.is_symlink() and not (here/"no-workspace").exists())
+            config.unlink()
+            config.write_bytes(saved)
+
+            run("remove-relative-path", ("remove", "api"), ("Removed project 'backend'",),
+                inspect=lambda: set(projects()) == {"web"})
+            config.write_bytes(saved)
+            run("remove-absolute-path", ("remove", str(a)), ("Removed project 'backend'",),
+                inspect=lambda: set(projects()) == {"web"})
+            config.write_bytes(saved)
+            duplicate = saved + b'\n[projects.alias]\npath = "api"\n'
+            config.write_bytes(duplicate)
+            run("remove-ambiguous-path", ("remove", "api"), ("matches multiple projects",),
+                fails=True, inspect=lambda: config.read_bytes() == duplicate)
+            config.write_bytes(saved)
+            run("remove-unknown", ("remove", "none"), ("not found in workspace",), fails=True,
+                inspect=lambda: config.read_bytes() == saved)
+
+            guard.touch()
+            os.chown(guard, account.pw_uid, account.pw_gid)
+            results = []
+            with guard.open("rb") as held:
+                fcntl.flock(held, fcntl.LOCK_EX)
+                with ExitStack() as children:
+                    for label, args in (("add", ("add", "worker")), ("remove", ("remove", "backend"))):
+                        child = children.enter_context(subprocess.Popen(
+                            [str(cli), "workspace", *args], cwd=here, env=isolated, text=True,
+                            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **ordinary))
+                        results.append((label, child))
+                    time.sleep(0.4)
+                    blocked = config.read_bytes() == saved and all(child.poll() is None for _, child in results)
+                    fcntl.flock(held, fcntl.LOCK_UN)
+                    outcomes = []
+                    for label, child in results:
+                        try:
+                            output, errors = child.communicate(timeout=8)
+                        except subprocess.TimeoutExpired:
+                            child.kill()
+                            output, errors = child.communicate()
+                        outcomes.append((label, child.returncode, output + errors))
+            updated = set(projects()) == {"web", "worker"}
+            for label, code, output in outcomes:
+                checks.append(dict(phase=phase, case=f"held-config-{label}", status=code,
+                                   passed=blocked and updated and code == 0, diagnostic=output[-1050:]))
+
+
     def inspect_environment_lockfiles():
         phase = "environment-lockfiles"
         with tempfile.TemporaryDirectory(prefix="environment-locks-", dir=work) as directory:
@@ -3238,6 +3407,7 @@ exec {shlex.quote(str(binary))} "$@"
                     inspect_team_push_publication()
                     inspect_git_workflow()
                     inspect_scaffold_publication()
+                    inspect_workspace_lifecycle()
                 config.write_text(alternate_config)
                 refresh_fixture()
                 expected = ordinary_control([dnf, "--cacheonly", "repoquery",
@@ -3555,6 +3725,6 @@ assert inventory() == before
 report = dict(binaries=binaries, checks=checks, total=len(checks),
               passed=sum(entry["passed"] for entry in checks), host_unchanged=True)
 print(json.dumps(report))
-expected_checks = 303 if consent_oracle is None else 1220
+expected_checks = 303 if consent_oracle is None else 1256
 if report["passed"] != report["total"] or report["total"] != expected_checks:
     sys.exit(4)

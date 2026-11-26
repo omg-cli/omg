@@ -8,7 +8,7 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::io::{ErrorKind, Read as _, Write as _};
+use std::io::{ErrorKind, Write as _};
 use std::path::{Path, PathBuf};
 
 use super::fingerprint::EnvironmentState;
@@ -104,44 +104,8 @@ fn current_member_id() -> String {
 
 pub(crate) const MAX_TEAM_FILE_BYTES: u64 = 16 * 1024 * 1024;
 
-/// Read a bounded snapshot from a regular team file opened without following the final link.
 pub(crate) fn read_regular_file(path: &Path, what: &str) -> Result<String> {
-    let check_type = |metadata: &std::fs::Metadata| {
-        anyhow::ensure!(
-            metadata.is_file(),
-            "{what} must be a regular file: {}",
-            path.display()
-        );
-        Ok(())
-    };
-    let inspect = || format!("Failed to inspect {what}: {}", path.display());
-    check_type(&std::fs::symlink_metadata(path).with_context(inspect)?)?;
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK | nix::libc::O_NOCTTY);
-    }
-    let read_context = || format!("Failed to read {what}: {}", path.display());
-    let file = options.open(path).with_context(read_context)?;
-    let metadata = file.metadata().with_context(inspect)?;
-    check_type(&metadata)?;
-    let check_size = |size| {
-        anyhow::ensure!(
-            size <= MAX_TEAM_FILE_BYTES,
-            "{what} exceeds the {MAX_TEAM_FILE_BYTES} byte limit: {}",
-            path.display()
-        );
-        Ok(())
-    };
-    check_size(metadata.len())?;
-    let mut content = String::with_capacity(metadata.len() as usize);
-    file.take(MAX_TEAM_FILE_BYTES + 1)
-        .read_to_string(&mut content)
-        .with_context(read_context)?;
-    check_size(content.len() as u64)?;
-    Ok(content)
+    crate::core::safe_ops::read_bounded_regular_file(path, what, MAX_TEAM_FILE_BYTES)
 }
 
 impl TeamStatus {

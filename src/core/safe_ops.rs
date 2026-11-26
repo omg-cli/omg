@@ -5,7 +5,7 @@
 //! throughout the codebase while maintaining performance and ergonomics.
 
 use anyhow::{Context, Result};
-use std::io::Write;
+use std::io::{Read as _, Write};
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 /// Create a `NonZeroU32` with a default fallback value.
@@ -183,6 +183,46 @@ pub(crate) async fn sync_parent_directory(path: PathBuf) -> Result<()> {
         .context("Parent-directory sync task failed")?
 }
 
+/// Read a bounded snapshot from a regular file opened without following the final link.
+pub(crate) fn read_bounded_regular_file(path: &Path, what: &str, limit: u64) -> Result<String> {
+    let check_type = |metadata: &std::fs::Metadata| {
+        anyhow::ensure!(
+            metadata.is_file(),
+            "{what} must be a regular file: {}",
+            path.display()
+        );
+        Ok(())
+    };
+    let inspect = || format!("Failed to inspect {what}: {}", path.display());
+    check_type(&std::fs::symlink_metadata(path).with_context(inspect)?)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK | nix::libc::O_NOCTTY);
+    }
+    let read_context = || format!("Failed to read {what}: {}", path.display());
+    let file = options.open(path).with_context(read_context)?;
+    let metadata = file.metadata().with_context(inspect)?;
+    check_type(&metadata)?;
+    let check_size = |size| {
+        anyhow::ensure!(
+            size <= limit,
+            "{what} exceeds the {limit} byte limit: {}",
+            path.display()
+        );
+        Ok(())
+    };
+    check_size(metadata.len())?;
+    let mut content = String::with_capacity(metadata.len() as usize);
+    file.take(limit.saturating_add(1))
+        .read_to_string(&mut content)
+        .with_context(read_context)?;
+    check_size(content.len() as u64)?;
+    Ok(content)
+}
+
 /// Safe file write with atomic operations
 pub async fn atomic_write_file<P: AsRef<Path>, C: AsRef<[u8]>>(path: P, contents: C) -> Result<()> {
     let path = path.as_ref().to_path_buf();
@@ -247,6 +287,21 @@ pub(crate) fn stage_atomic_write_file_sync(
     contents: &[u8],
 ) -> Result<StagedFileWrite> {
     stage_atomic_write(path, contents, false)
+}
+
+/// Publish a new owner-only file without overwriting another entry.
+pub(crate) fn atomic_write_new_private_file(path: &Path, contents: &[u8]) -> Result<bool> {
+    let StagedFileWrite { temporary, path } = stage_atomic_write(path, contents, true)?;
+    match temporary.persist_noclobber(&path) {
+        Ok(_) => {
+            sync_parent_directory_sync(&path)?;
+            Ok(true)
+        }
+        Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(error) => {
+            Err(error.error).with_context(|| format!("Failed to publish {}", path.display()))
+        }
+    }
 }
 
 fn stage_atomic_write(

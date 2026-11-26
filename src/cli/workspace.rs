@@ -9,12 +9,34 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use crate::cli::style;
+use crate::core::env::{fingerprint::EnvironmentState, lock_regular_file};
+use crate::core::safe_ops;
 
 /// Workspace configuration file name
 const WORKSPACE_FILE: &str = "omg-workspace.toml";
+const WORKSPACE_WRITE_LOCK: &str = ".omg-workspace.write.lock";
+const MAX_WORKSPACE_FILE_BYTES: u64 = 16 * 1024 * 1024;
+
+fn is_missing(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|cause| cause.kind() == ErrorKind::NotFound)
+}
+
+fn lock_existing_workspace() -> Result<fs::File> {
+    let path = Path::new(WORKSPACE_FILE);
+    match path.symlink_metadata() {
+        Ok(_) => lock_regular_file(Path::new(WORKSPACE_WRITE_LOCK)),
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            anyhow::bail!("No workspace found. Run 'omg workspace init' first.");
+        }
+        Err(error) => Err(error).context("Failed to inspect workspace file"),
+    }
+}
 
 /// Workspace configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -54,21 +76,59 @@ impl Default for Workspace {
 impl Workspace {
     /// Load workspace from file
     pub fn load() -> Result<Self> {
-        if !Path::new(WORKSPACE_FILE).exists() {
-            anyhow::bail!("No workspace found. Run 'omg workspace init' first.");
-        }
-
-        let content =
-            fs::read_to_string(WORKSPACE_FILE).context("Failed to read workspace file")?;
+        let content = safe_ops::read_bounded_regular_file(
+            Path::new(WORKSPACE_FILE),
+            "Workspace file",
+            MAX_WORKSPACE_FILE_BYTES,
+        )
+        .map_err(|error| {
+            if is_missing(&error) {
+                error.context("No workspace found. Run 'omg workspace init' first.")
+            } else {
+                error
+            }
+        })?;
         toml::from_str(&content).context("Failed to parse workspace file")
     }
 
     /// Save workspace to file
     pub fn save(&self) -> Result<()> {
-        let content = toml::to_string_pretty(self).context("Failed to serialize workspace")?;
+        let _guard = lock_regular_file(Path::new(WORKSPACE_WRITE_LOCK))?;
+        self.save_locked()
+    }
 
-        crate::core::safe_ops::atomic_write_file_sync(WORKSPACE_FILE, content)
+    fn encoded(&self) -> Result<String> {
+        let content = toml::to_string_pretty(self).context("Failed to serialize workspace")?;
+        anyhow::ensure!(
+            content.len() as u64 <= MAX_WORKSPACE_FILE_BYTES,
+            "Workspace file exceeds the {MAX_WORKSPACE_FILE_BYTES} byte limit"
+        );
+        Ok(content)
+    }
+
+    fn save_locked(&self) -> Result<()> {
+        safe_ops::atomic_write_file_sync(WORKSPACE_FILE, self.encoded()?)
             .context("Failed to write workspace file")
+    }
+
+    fn project_for_removal(&self, selector: &str) -> Result<&str> {
+        if let Some((name, _)) = self.projects.get_key_value(selector) {
+            return Ok(name);
+        }
+
+        let root = std::env::current_dir()?;
+        let requested = root.join(selector);
+        let mut matches = self.projects.iter().filter_map(|(name, project)| {
+            (root.join(&project.path) == requested).then_some(name.as_str())
+        });
+        let name = matches
+            .next()
+            .with_context(|| format!("Project '{selector}' not found in workspace"))?;
+        anyhow::ensure!(
+            matches.next().is_none(),
+            "Path '{selector}' matches multiple projects; use the project name"
+        );
+        Ok(name)
     }
 
     /// Get topologically sorted projects (respecting dependencies)
@@ -121,9 +181,14 @@ impl Workspace {
 
 /// Initialize a new workspace
 pub fn init(name: &str) -> Result<()> {
-    // Fail fast before printing any banner so errors aren't buried under it
-    if Path::new(WORKSPACE_FILE).exists() {
-        anyhow::bail!("Workspace already exists. Delete {WORKSPACE_FILE} to reinitialize.");
+    let _guard = lock_regular_file(Path::new(WORKSPACE_WRITE_LOCK))?;
+    let path = Path::new(WORKSPACE_FILE);
+    match path.symlink_metadata() {
+        Ok(_) => {
+            anyhow::bail!("Workspace already exists. Delete {WORKSPACE_FILE} to reinitialize.")
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("Failed to inspect workspace file"),
     }
 
     println!(
@@ -137,7 +202,10 @@ pub fn init(name: &str) -> Result<()> {
         ..Default::default()
     };
 
-    workspace.save()?;
+    anyhow::ensure!(
+        safe_ops::atomic_write_new_private_file(path, workspace.encoded()?.as_bytes())?,
+        "Workspace already exists. Delete {WORKSPACE_FILE} to reinitialize."
+    );
 
     println!("{} Created {}", style::success("✓"), WORKSPACE_FILE);
     println!();
@@ -150,12 +218,18 @@ pub fn init(name: &str) -> Result<()> {
 
 /// Add a project to the workspace
 pub fn add(path: &str, name: Option<&str>) -> Result<()> {
+    let _guard = lock_existing_workspace()?;
     let mut workspace = Workspace::load()?;
 
     let project_path = PathBuf::from(path);
-    if !project_path.exists() {
-        anyhow::bail!("Project path does not exist: {path}");
-    }
+    let metadata = match project_path.metadata() {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            anyhow::bail!("Project path does not exist: {path}");
+        }
+        Err(error) => return Err(error).context("Failed to inspect project path"),
+    };
+    anyhow::ensure!(metadata.is_dir(), "Project path is not a directory: {path}");
 
     // Determine project name
     let project_name = name
@@ -177,7 +251,7 @@ pub fn add(path: &str, name: Option<&str>) -> Result<()> {
     };
 
     workspace.projects.insert(project_name.clone(), project);
-    workspace.save()?;
+    workspace.save_locked()?;
 
     println!(
         "{} Added project '{project_name}' ({path})",
@@ -189,20 +263,18 @@ pub fn add(path: &str, name: Option<&str>) -> Result<()> {
 
 /// Remove a project from the workspace
 pub fn remove(project: &str) -> Result<()> {
+    let _guard = lock_existing_workspace()?;
     let mut workspace = Workspace::load()?;
+    let name = workspace.project_for_removal(project)?.to_owned();
+    workspace.projects.remove(&name);
 
-    if workspace.projects.remove(project).is_none() {
-        anyhow::bail!("Project '{project}' not found in workspace");
+    for project in workspace.projects.values_mut() {
+        project.depends_on.retain(|dependency| dependency != &name);
     }
 
-    // Remove from dependencies of other projects
-    for p in workspace.projects.values_mut() {
-        p.depends_on.retain(|d| d != project);
-    }
+    workspace.save_locked()?;
 
-    workspace.save()?;
-
-    println!("{} Removed project '{project}'", style::success("✓"));
+    println!("{} Removed project '{name}'", style::success("✓"));
 
     Ok(())
 }
@@ -521,13 +593,7 @@ fn run_project_command(
         return Ok(());
     }
 
-    // Try to detect and run via omg run
-    let mut cmd = std::process::Command::new(sibling_omg());
-    cmd.arg("run").arg(command);
-    cmd.args(args);
-    cmd.current_dir(path);
-
-    let status = cmd
+    let status = workspace_task_command(Path::new(path), command, args)?
         .status()
         .with_context(|| format!("Failed to execute 'omg run {command}' in '{path}'"))?;
 
@@ -541,10 +607,15 @@ fn run_project_command(
     Ok(())
 }
 
-/// Resolve the `omg` binary next to the running executable, falling back to
-/// PATH lookup. A PATH-shadowed `omg` must not run with workspace privileges.
-fn sibling_omg() -> std::ffi::OsString {
-    crate::core::paths::sibling_binary("omg").map_or_else(|| "omg".into(), PathBuf::into_os_string)
+fn workspace_task_command(
+    project: &Path,
+    task: &str,
+    args: &[String],
+) -> Result<std::process::Command> {
+    let binary = std::env::current_exe().context("Could not locate the running omg binary")?;
+    let mut command = std::process::Command::new(binary);
+    command.arg("run").arg(task).args(args).current_dir(project);
+    Ok(command)
 }
 
 /// Text rendered from project-controlled strings in the consent UI.
@@ -565,22 +636,14 @@ fn consent_prompt(command: &str, path: &str) -> String {
     )
 }
 
-/// Command that runs `omg env check` for one workspace project.
-///
-/// Read-only workspace commands must resolve the CLI through the binary
-/// installed next to the running executable: a PATH-resolved `omg` can be
-/// shadowed by project-controlled directories (repo `bin/`, node_modules,
-/// cargo wrappers), which would hand arbitrary project code a trusted
-/// context.
-fn env_check_command(project_path: &Path) -> Result<std::process::Command> {
-    let binary = crate::core::paths::sibling_binary("omg").ok_or_else(|| {
-        anyhow::anyhow!(
-            "Could not locate the omg binary next to the running executable; \n             refusing PATH fallback for workspace commands"
-        )
-    })?;
-    let mut command = std::process::Command::new(binary);
-    command.args(["env", "check"]).current_dir(project_path);
-    Ok(command)
+fn load_project_lock(project: &Path) -> Result<EnvironmentState> {
+    EnvironmentState::load(project.join("omg.lock")).map_err(|error| {
+        if is_missing(&error) {
+            error.context("No omg.lock file found")
+        } else {
+            error
+        }
+    })
 }
 
 /// Show environment diff across workspace
@@ -664,7 +727,7 @@ fn git_lockfile_diff(project_path: &Path, branch: &str) -> Result<Vec<u8>> {
 }
 
 /// Check all project environments without mutating them.
-pub fn check() -> Result<()> {
+pub async fn check() -> Result<()> {
     let workspace = Workspace::load()?;
 
     println!(
@@ -682,25 +745,52 @@ pub fn check() -> Result<()> {
     let mut names: Vec<&String> = workspace.projects.keys().collect();
     names.sort();
 
+    // A fingerprint describes this host and data directory. Capture it
+    // only once, and only after a project supplies a usable lockfile.
+    let mut current = None;
     for name in names {
-        let project = &workspace.projects[name];
-        println!("{} {}", style::arrow("→"), style::package(name));
+        let project = Path::new(&workspace.projects[name].path);
+        println!(
+            "{} {}",
+            style::arrow("→"),
+            style::package(&consent_text(name))
+        );
+        match project.metadata() {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => {
+                println!("  {} Project path is not a directory", style::error("✗"));
+                error_count += 1;
+                continue;
+            }
+            Err(error) => {
+                println!("  {} {error}", style::error("✗"));
+                error_count += 1;
+                continue;
+            }
+        }
 
-        let result = env_check_command(Path::new(&project.path))
-            .and_then(|mut command| command.status().map_err(anyhow::Error::from));
-
+        let result = match load_project_lock(project) {
+            Ok(expected) => {
+                let captured = match &current {
+                    Some(captured) => captured,
+                    None => current.insert(EnvironmentState::capture().await),
+                };
+                match captured {
+                    Ok(captured) => super::env::report_environment_check(&expected, captured),
+                    Err(error) => Err(anyhow::anyhow!("{error:#}")),
+                }
+            }
+            Err(error) => Err(error),
+        };
         match result {
-            Ok(status) if status.success() => {
+            Ok(()) => {
                 println!("  {}", style::success("✓ checked"));
                 ok_count += 1;
             }
-            Ok(_) => {
+            Err(error) => {
+                eprintln!("Error: {}", consent_text(&error.to_string()));
                 println!("  {}", style::warning("⚠ needs attention"));
                 attention_count += 1;
-            }
-            Err(e) => {
-                println!("  {} {}", style::error("✗"), e);
-                error_count += 1;
             }
         }
     }
@@ -748,30 +838,28 @@ pub fn status() -> Result<()> {
 
     for name in names {
         let project = &workspace.projects[name];
-        let project_path = PathBuf::from(&project.path);
-        let lock_path = project_path.join("omg.lock");
-
-        let status_icon;
-        let status_text;
-
-        if !project_path.exists() {
-            status_icon = style::error("✗");
-            status_text = "path not found";
-            needs_attention += 1;
-        } else if !lock_path.exists() {
-            status_icon = style::warning("○");
-            status_text = "no omg.lock";
-            needs_attention += 1;
-        } else {
-            status_icon = style::success("●");
-            status_text = "ok";
-            healthy += 1;
-        }
+        let path = Path::new(&project.path);
+        let (status_icon, status_text) = match path.metadata() {
+            Ok(metadata) if metadata.is_dir() => match load_project_lock(path) {
+                Ok(_) => {
+                    healthy += 1;
+                    (style::success("●"), "ok")
+                }
+                Err(error) if is_missing(&error) => (style::warning("○"), "no omg.lock"),
+                Err(_) => (style::warning("○"), "invalid omg.lock"),
+            },
+            Ok(_) => (style::error("✗"), "path is not a directory"),
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                (style::error("✗"), "path not found")
+            }
+            Err(_) => (style::error("✗"), "cannot inspect path"),
+        };
+        needs_attention += usize::from(status_text != "ok");
 
         println!(
             "    {} {} - {}",
             status_icon,
-            style::package(name),
+            style::package(&consent_text(name)),
             style::dim(status_text)
         );
     }
@@ -1023,68 +1111,17 @@ mod tests {
         }
     }
 
-    /// `workspace check` must not resolve `omg` through PATH: a project
-    /// -controlled directory can shadow the real binary. Without a sibling
-    /// binary the command refuses instead of executing an impostor.
     #[test]
-    #[serial_test::serial]
-    fn env_check_refuses_path_fallback_instead_of_running_impostors() {
-        if crate::core::paths::sibling_binary("omg").is_some() {
-            // A real sibling exists in this environment (the workspace test
-            // binary is named after a module, so this is not expected); the
-            // refusal path is skipped rather than asserting the wrong thing.
-            return;
-        }
-
-        let impostor_dir = tempfile::tempdir().expect("impostor directory");
-        let impostor = impostor_dir.path().join("omg");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::write(&impostor, "#!/bin/sh\ntouch impostor-marker\n").expect("impostor");
-            fs::set_permissions(&impostor, fs::Permissions::from_mode(0o755))
-                .expect("impostor permissions");
-        }
-
-        let project_dir = tempfile::tempdir().expect("project directory");
-        let previous_path = std::env::var("PATH").ok();
-        #[cfg(unix)]
-        {
-            // SAFETY: Test-only code, serialized by serial_test; no other
-            // thread reads PATH concurrently.
-            #[expect(unsafe_code)]
-            unsafe {
-                std::env::set_var(
-                    "PATH",
-                    format!(
-                        "{}:{}",
-                        impostor_dir.path().display(),
-                        previous_path.as_deref().unwrap_or("/usr/bin")
-                    ),
-                );
-            }
-        }
-
-        let error = env_check_command(project_dir.path())
-            .and_then(|mut command| command.status().map_err(anyhow::Error::from));
-
-        if let Some(path) = previous_path {
-            // SAFETY: see above.
-            #[expect(unsafe_code)]
-            unsafe {
-                std::env::set_var("PATH", path);
-            }
-        }
-
-        let error = error.expect_err("PATH fallback must be refused without a sibling binary");
-        assert!(
-            error.to_string().contains("refusing PATH fallback"),
-            "{error}"
+    fn workspace_task_command_uses_the_running_binary_without_a_path_lookup() -> Result<()> {
+        let project = tempfile::tempdir()?;
+        let args = ["one value".to_owned()];
+        let command = workspace_task_command(project.path(), "build", &args)?;
+        assert_eq!(command.get_program(), std::env::current_exe()?.as_os_str());
+        assert_eq!(command.get_current_dir(), Some(project.path()));
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            ["run", "build", "one value"]
         );
-        assert!(
-            !project_dir.path().join("impostor-marker").exists(),
-            "a PATH impostor must never run"
-        );
-        let _ = fs::remove_file(&impostor);
+        Ok(())
     }
 }
