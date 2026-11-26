@@ -11,10 +11,10 @@ use std::path::{Path, PathBuf};
 
 use crate::config::mise_config;
 use crate::config::mise_tools::normalize_runtime_name;
-use crate::core::paths;
+use crate::core::{paths, runtime_resolver::RuntimeVersionReq};
 use crate::runtimes::rust::{RustManager, RustToolchainSpec};
 use anyhow::{Context, Result};
-use semver::{Version, VersionReq};
+use semver::Version;
 use serde::Deserialize;
 
 /// Known version files and their corresponding runtime
@@ -824,10 +824,10 @@ fn parse_global_json_file(file_path: &Path, versions: &mut HashMap<String, Strin
 }
 
 fn resolve_installed_version_req(versions_dir: &Path, req: &str) -> Result<Option<String>> {
-    let Some(req) = normalize_version_req(req) else {
+    let Some(req) = RuntimeVersionReq::parse(req) else {
         return Ok(None);
     };
-    let mut candidates = Vec::new();
+    let mut best = None;
 
     let entries = match fs::read_dir(versions_dir) {
         Ok(entries) => entries,
@@ -848,58 +848,25 @@ fn resolve_installed_version_req(versions_dir: &Path, req: &str) -> Result<Optio
                 versions_dir.display()
             )
         })?;
-        let name = entry.file_name().to_string_lossy().to_string();
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
         if name == "current" || !crate::runtimes::common::is_valid_version_dir(&entry.path()) {
             continue;
         }
-        let ver_str = name.trim_start_matches('v');
+        let ver_str = name.strip_prefix('v').unwrap_or(&name);
         let Ok(version) = Version::parse(ver_str) else {
             continue;
         };
         if req.matches(&version) {
-            candidates.push((version, ver_str.to_string()));
+            let candidate = (version, name);
+            if best.as_ref().is_none_or(|best| &candidate > best) {
+                best = Some(candidate);
+            }
         }
     }
 
-    candidates.sort_by(|a, b| b.0.cmp(&a.0));
-    Ok(candidates.first().map(|(_, name)| name.clone()))
-}
-
-fn normalize_version_req(value: &str) -> Option<VersionReq> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-
-    let trimmed = trimmed.strip_prefix('v').unwrap_or(trimmed);
-
-    if trimmed.chars().all(|c| c.is_ascii_digit()) {
-        return VersionReq::parse(&format!("^{trimmed}.0.0")).ok();
-    }
-
-    if trimmed.chars().all(|c| c.is_ascii_digit() || c == '.') {
-        let normalized = normalize_version_number(trimmed);
-        // A bare two-component request (`3.12`) is a compatible patch-range
-        // pin (`~3.12.0`), not the exact patch-level `=3.12.0`; a full
-        // three-component request stays exact.
-        let op = if trimmed.split('.').filter(|part| !part.is_empty()).count() == 2 {
-            '~'
-        } else {
-            '='
-        };
-        return VersionReq::parse(&format!("{op}{normalized}")).ok();
-    }
-
-    VersionReq::parse(&trimmed.replace(' ', ",")).ok()
-}
-
-fn normalize_version_number(value: &str) -> String {
-    let mut parts: Vec<&str> = value.split('.').filter(|p| !p.is_empty()).collect();
-    while parts.len() < 3 {
-        parts.push("0");
-    }
-    parts.truncate(3);
-    parts.join(".")
+    Ok(best.map(|(_, name)| name))
 }
 
 fn nvm_node_bin(version: &str) -> Result<Option<PathBuf>> {
@@ -1868,22 +1835,18 @@ path = "hostile"
 
     #[test]
     fn version_request_semantics_match_compat_rules() {
-        let render = |request: &str| normalize_version_req(request).map(|req| req.to_string());
-        assert_eq!(
-            render("3.12").as_deref(),
-            Some("~3.12.0"),
-            "bare two-component request must become compatible"
-        );
-        assert_eq!(
-            render("3.12.0").as_deref(),
-            Some("=3.12.0"),
-            "full three-component request must stay exact"
-        );
-        assert_eq!(
-            render("3").as_deref(),
-            Some("^3.0.0"),
-            "major request must keep compatible-major semantics"
-        );
+        for (request, matches, misses) in [
+            ("3.12", "3.12.9", "3.13.0"),
+            ("3.12.0", "3.12.0", "3.12.9"),
+            ("3", "3.99.0", "4.0.0"),
+            ("0", "0.1.0", "1.0.0"),
+            ("24.22.4-rc.1", "24.22.4-rc.1", "24.22.4"),
+            ("24.22.4+local", "24.22.4+local", "24.22.4"),
+        ] {
+            let request = RuntimeVersionReq::parse(request).expect("valid runtime request");
+            assert!(request.matches_str(matches), "{matches}");
+            assert!(!request.matches_str(misses), "{misses}");
+        }
     }
 
     #[test]

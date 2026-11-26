@@ -2355,6 +2355,105 @@ run = '{chosen} "$@"'
                             pins=(name,), path=path, mise=mise, pin_request=request)
 
 
+    def inspect_task_version_requirements():
+        definitions = {
+            "node": ("node", "bin", ("24.22.3", "24.23.1", "24.22.4-rc.1")),
+            "bun": ("bun", ".", ("1.2.20", "1.3.1", "1.4.0-rc.1")),
+            "java": ("java", "bin", ("21",)),
+        }
+        seed = r"""
+import importlib.util, json, sys
+from pathlib import Path
+helper, home, definitions = sys.argv[1:]
+spec = importlib.util.spec_from_file_location("runtime_advisory_fixture", helper)
+fixture = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(fixture)
+home = Path(home)
+config = Path(fixture.fixture_cli_environment(home)["OMG_CONFIG_DIR"])
+for runtime, (name, bindir, versions) in json.loads(definitions).items():
+    for version in versions:
+        root = home / "data" / "versions" / runtime / version
+        program = root / bindir / name
+        program.parent.mkdir(parents=True)
+        output_version = f"v{version}" if runtime == "node" else version
+        program.write_text(f'''#!/bin/sh
+if [ "$1" = --version ]; then
+    printf '%s\\n' '{output_version}'
+    exit
+fi
+printf 'fixture runtime {runtime} {version}|<%s>\\n' "$@"
+''')
+        program.chmod(0o755)
+        fixture.seed_runtime_advisory_fixture(root, runtime, version, config)
+"""
+        phase = "task-version-requirements"
+        cases = (
+            ("node-exact", "node", "24.22.3", "24.22.3"),
+            ("node-v-exact", "node", "v24.22.3", "24.22.3"),
+            ("node-absent-exact", "node", "24.22.2", None),
+            ("node-minor", "node", "24.22", "24.22.3"),
+            ("node-absent-minor", "node", "24.21", None),
+            ("node-major", "node", "24", "24.23.1"),
+            ("node-prerelease", "node", "24.22.4-rc.1", "24.22.4-rc.1"),
+            ("node-absent-prerelease", "node", "24.22.4-rc.0", None),
+            ("node-space-range", "node", ">=24.22.0 <24.23.0", "24.22.3"),
+            ("node-comma-range", "node", ">= 24.22.0, < 24.23.0", "24.22.3"),
+            ("node-spaced-range", "node", ">= 24.22.0 < 24.23.0", "24.22.3"),
+            ("node-extra-component", "node", "24.22.3.0", None),
+            ("node-lts-requires-release-identity", "node", "lts", None),
+            ("node-named-lts-requires-release-identity", "node", "lts/krypton", None),
+            ("node-latest-stable", "node", "latest", "24.23.1"),
+            ("bun-v-exact", "bun", "v1.2.20", "1.2.20"),
+            ("bun-minor", "bun", "1.2", "1.2.20"),
+            ("bun-absent-minor", "bun", "1.1", None),
+            ("bun-latest-stable", "bun", "latest", "1.3.1"),
+            ("java-feature", "java", "21", "21"),
+            ("java-zero-minor", "java", "21.0", "21"),
+            ("java-missing-feature", "java", "22.0", None),
+            ("java-full-release", "java", "21.0.5", None),
+        )
+        with tempfile.TemporaryDirectory(prefix="task-version-requirements-", dir=work) as directory:
+            here = Path(directory)
+            os.chown(here, account.pw_uid, account.pw_gid)
+            checked([sys.executable, "-I", "-B", "-c", seed, runtime_advisory_fixture, here, json.dumps(definitions)],
+                    dict(disabled, HOME=str(here)), ordinary)
+            data = here / "data"
+            env = dict(disabled, HOME=str(here), NVM_DIR=str(here/"absent-nvm"), OMG_DATA_DIR=str(data),
+                       OMG_CONFIG_DIR=str(here/"config"/"omg"), OMG_NATIVE_TEST_DATA_DIR="1",
+                       XDG_CONFIG_HOME=str(here/"config"), XDG_DATA_HOME=str(here/"xdg-data"),
+                       XDG_CACHE_HOME=str(here/"cache"), XDG_STATE_HOME=str(here/"state"))
+            for label, runtime, request, version in cases:
+                command_name, bindir, available = definitions[runtime]
+                project = here / label
+                project.mkdir()
+                (project / f".{runtime}-version").write_text(request + "\n")
+                versions = data / "versions" / runtime
+                present = [str(versions / local / bindir) for local in available]
+                matching = present[available.index(version)] if version else None
+                # Exercise preflight even when a compatible-looking runtime is already on PATH.
+                inherited = dict(env, PATH=f"{present[0]}:{base_env['PATH']}")
+                for mode, args in (
+                    ("hook", ("hook-env", "--shell", "bash")),
+                    ("task", ("run", command_name, "--", "two words")),
+                ):
+                    result = subprocess.run([cli, *args], cwd=project, env=inherited, stdin=subprocess.DEVNULL,
+                                            capture_output=True, text=True, timeout=8, **ordinary)
+                    log = result.stdout + result.stderr
+                    runtime_output = [line for line in result.stdout.splitlines() if line.startswith("fixture runtime ")]
+                    emitted = [path for path in present if f"'{path}'" in result.stdout]
+                    if mode == "hook":
+                        passed = result.returncode == 0 and emitted == ([matching] if matching else []) and not runtime_output
+                    elif version:
+                        passed = (result.returncode == 0 and
+                                  runtime_output == [f"fixture runtime {runtime} {version}|<two words>"])
+                    else:
+                        diagnostic = ("Invalid Java version" if label == "java-full-release"
+                                      else "Interactive confirmation required:")
+                        passed = result.returncode != 0 and not runtime_output and diagnostic in result.stderr
+                    checks.append(dict(phase=phase, case=f"{label}-{mode}", status=result.returncode,
+                                       passed=passed, expected_version=version, diagnostic=log[-1100:]))
+
+
     def inspect_task_environment_bytes():
         phase = "task-environment-bytes"
         raw = b"test-\xff-value"
@@ -5054,6 +5153,7 @@ exec {shlex.quote(str(binary))} "$@"
                     inspect_task_watch()
                     runtime_advisory_fixture = stage_runtime_fixture(root)
                     inspect_task_runtime_admissions()
+                    inspect_task_version_requirements()
                     inspect_task_environment_bytes()
                     inspect_task_package_metadata()
                     inspect_mise_task_execution()
@@ -5374,6 +5474,6 @@ assert inventory() == before
 report = dict(binaries=binaries, checks=checks, total=len(checks),
               passed=sum(entry["passed"] for entry in checks), host_unchanged=True)
 print(json.dumps(report))
-expected_checks = 303 if consent_oracle is None else 1706
+expected_checks = 303 if consent_oracle is None else 1752
 if report["passed"] != report["total"] or report["total"] != expected_checks:
     sys.exit(4)

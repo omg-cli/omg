@@ -1,7 +1,6 @@
 use crate::cli::style;
 use anyhow::{Context, Result};
 use dialoguer::{Confirm, Select, theme::ColorfulTheme};
-use semver::{Version, VersionReq};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
@@ -10,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::config::mise_env::{Environment, ResolvedEnv, prepend_paths};
-use crate::core::runtime_resolver::find_in_path;
+use crate::core::runtime_resolver::{RuntimeVersionReq, find_in_path};
 use crate::hooks;
 use crate::runtimes::rust::RustManager;
 use crate::runtimes::security::{ReviewMode, RuntimeAdmission, admit_selected_path};
@@ -796,10 +795,7 @@ macro_rules! ensure_runtime_impl {
             .list_installed()
             .with_context(|| format!("Failed to list installed {} versions", $runtime_name))?;
 
-        if installed
-            .iter()
-            .any(|version| runtime_version_satisfies(version, &normalized))
-        {
+        if installed_runtime_satisfies(&installed, &normalized) {
             return Ok(normalized);
         }
 
@@ -837,7 +833,8 @@ fn ensure_ruby_runtime(version: &str) -> Result<String> {
 
 fn ensure_java_runtime(version: &str) -> Result<String> {
     let manager = crate::runtimes::JavaManager::new();
-    ensure_runtime_impl!("Java", version.trim().to_string(), manager)
+    let feature = crate::runtimes::java::java_feature_number(version)?;
+    ensure_runtime_impl!("Java", feature, manager)
 }
 
 fn read_js_manifest(current_dir: &Path) -> Result<Option<PackageJson>> {
@@ -1404,9 +1401,7 @@ fn ensure_node_runtime(version: &str) -> Result<String> {
         .context("Failed to list installed Node.js versions")?;
     // Task PATH selection prefers a matching managed installation. Consult
     // the ambient runtime only when that inventory cannot satisfy the pin.
-    if installed
-        .iter()
-        .any(|installed_version| runtime_version_satisfies(installed_version, normalized))
+    if installed_runtime_satisfies(&installed, normalized)
         || system_runtime_satisfies("node", normalized)
     {
         return Ok(normalized.to_string());
@@ -1432,9 +1427,7 @@ fn ensure_bun_runtime(version: &str) -> Result<String> {
     let installed = bun_manager
         .list_installed()
         .context("Failed to list installed Bun versions")?;
-    if installed
-        .iter()
-        .any(|installed_version| runtime_version_satisfies(installed_version, normalized))
+    if installed_runtime_satisfies(&installed, normalized)
         || system_runtime_satisfies("bun", normalized)
     {
         return Ok(normalized.to_string());
@@ -1451,6 +1444,9 @@ fn ensure_bun_runtime(version: &str) -> Result<String> {
 }
 
 fn system_runtime_satisfies(command: &str, requested: &str) -> bool {
+    let Some(requirement) = RuntimeVersionReq::parse(requested) else {
+        return false;
+    };
     let Some(executable) = which::which(command)
         .ok()
         .and_then(|path| path.canonicalize().ok())
@@ -1480,29 +1476,17 @@ fn system_runtime_satisfies(command: &str, requested: &str) -> bool {
     if !output.status.success() {
         return false;
     }
-    if is_floating_runtime_request(requested) {
-        return true;
-    }
-    let Ok(actual) = std::str::from_utf8(&output.stdout) else {
-        return false;
-    };
-    runtime_version_satisfies(actual.trim().trim_start_matches('v'), requested)
+    std::str::from_utf8(&output.stdout).is_ok_and(|actual| requirement.matches_str(actual))
 }
 
-fn is_floating_runtime_request(requested: &str) -> bool {
-    let requested = requested.trim_start_matches('v');
-    matches!(requested, "latest" | "lts") || requested.starts_with("lts/")
-}
-
-fn runtime_version_satisfies(actual: &str, requested: &str) -> bool {
-    let Ok(actual) = Version::parse(actual.trim_start_matches('v')) else {
-        return false;
-    };
-    let requested = requested.trim_start_matches('v');
-    if is_floating_runtime_request(requested) {
-        return true;
-    }
-    VersionReq::parse(requested).is_ok_and(|requirement| requirement.matches(&actual))
+fn installed_runtime_satisfies(installed: &[String], requested: &str) -> bool {
+    let requirement = RuntimeVersionReq::parse(requested);
+    installed.iter().any(|version| {
+        version == requested
+            || requirement
+                .as_ref()
+                .is_some_and(|requirement| requirement.matches_str(version))
+    })
 }
 
 fn nvm_resolve_version(version: &str) -> Result<Option<String>> {
@@ -2490,6 +2474,8 @@ pathlib.Path({}).write_text(sys.prefix + '|' + omg_local_venv_probe.VALUE)
                 assert_eq!(ensure_node_runtime("v24.22.3").unwrap(), "24.22.3");
                 assert_eq!(std::fs::read(&marker).unwrap(), b"reviewed");
                 assert!(!system_runtime_satisfies("node", "24.22.4"));
+                assert!(!system_runtime_satisfies("node", "24.22.2"));
+                assert!(!system_runtime_satisfies("node", "lts"));
                 std::fs::remove_file(&marker).unwrap();
                 std::fs::write(
                     &executable,
@@ -2884,15 +2870,25 @@ pathlib.Path({}).write_text(sys.prefix + '|' + omg_local_venv_probe.VALUE)
 
     #[test]
     fn runtime_pins_require_a_matching_semver_version() {
-        assert!(runtime_version_satisfies("20.11.1", "20"));
-        assert!(runtime_version_satisfies("20.11.1", "^20.0.0"));
-        assert!(runtime_version_satisfies("3.12.7", "3.12"));
-        assert!(runtime_version_satisfies("1.22.5", "1.22"));
-        assert!(runtime_version_satisfies("20.11.1", "lts"));
-        assert!(runtime_version_satisfies("20.11.1", "lts/iron"));
-        assert!(runtime_version_satisfies("1.2.3", "latest"));
-        assert!(!runtime_version_satisfies("18.20.0", "20"));
-        assert!(!runtime_version_satisfies("20.11.1", "not-a-version"));
+        let satisfies =
+            |actual: &str, request| installed_runtime_satisfies(&[actual.to_owned()], request);
+        assert!(satisfies("20.11.1", "20"));
+        assert!(satisfies("20.11.1", "^20.0.0"));
+        assert!(satisfies("3.12.7", "3.12"));
+        assert!(satisfies("1.22.5", "1.22"));
+        assert!(satisfies("1.2.3", "latest"));
+        assert!(satisfies("20.11.1", ">= 20.0.0 < 21.0.0"));
+        assert!(satisfies("20.11.1", ">= 20.0.0, < 21.0.0"));
+        assert!(satisfies("21", "21"));
+        assert!(!satisfies("20.11.1", "20.11.0"));
+        assert!(!satisfies("3.13.0", "3.12"));
+        assert!(!satisfies("18.20.0", "20"));
+        assert!(!satisfies("20.11.1", "lts"));
+        assert!(!satisfies("20.11.1", "lts/iron"));
+        assert!(!satisfies("20.11.1", "20.11.1.0"));
+        assert!(!satisfies("20.11.1", "not-a-version"));
+        assert!(!satisfies("20.11.1", "> = 20.0.0 < 21.0.0"));
+        assert!(!satisfies("1.2.3-rc.1", "latest"));
     }
 
     #[test]

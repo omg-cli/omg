@@ -1,9 +1,79 @@
-//! Runtime executable resolution.
+//! Runtime executable and version resolution.
 
 use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result};
+use semver::{Op, Version, VersionReq};
+
+/// An explicit version pins the whole release. Partial and comparator
+/// requests use SemVer range matching.
+pub(crate) enum RuntimeVersionReq {
+    Exact(Version),
+    Range(VersionReq),
+}
+
+impl RuntimeVersionReq {
+    pub(crate) fn parse(request: &str) -> Option<Self> {
+        let request = request.trim();
+        let request = request.strip_prefix('v').unwrap_or(request);
+        if request == "latest" {
+            return Some(Self::Range(VersionReq::STAR));
+        }
+        if let Ok(version) = Version::parse(request) {
+            return Some(Self::Exact(version));
+        }
+
+        let mut range = VersionReq::parse(request)
+            .ok()
+            .or_else(|| parse_space_separated_range(request))?;
+        if request
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || byte == b'.')
+        {
+            // Bare major and minor requests match their named components.
+            let [comparator] = range.comparators.as_mut_slice() else {
+                return None;
+            };
+            comparator.op = Op::Exact;
+        }
+        Some(Self::Range(range))
+    }
+
+    pub(crate) fn matches(&self, actual: &Version) -> bool {
+        match self {
+            Self::Exact(version) => version == actual,
+            Self::Range(range) => range.matches(actual),
+        }
+    }
+
+    pub(crate) fn matches_str(&self, actual: &str) -> bool {
+        let actual = actual.trim();
+        Version::parse(actual.strip_prefix('v').unwrap_or(actual))
+            .is_ok_and(|actual| self.matches(&actual))
+    }
+}
+
+fn parse_space_separated_range(request: &str) -> Option<VersionReq> {
+    let mut tokens = request.split_ascii_whitespace();
+    let first = tokens.next()?;
+    let mut normalized = String::with_capacity(request.len());
+    normalized.push_str(first);
+    let is_operator = |token: &str| matches!(token, "=" | ">" | ">=" | "<" | "<=" | "~" | "^");
+    let mut needs_operand = is_operator(first);
+    for token in tokens {
+        if needs_operand {
+            if token.starts_with(['=', '>', '<', '~', '^', ',']) {
+                return None;
+            }
+        } else if !normalized.ends_with(',') && !token.starts_with(',') {
+            normalized.push(',');
+        }
+        normalized.push_str(token);
+        needs_operand = is_operator(token);
+    }
+    VersionReq::parse(&normalized).ok()
+}
 
 /// Alias rejection is distinct from an I/O failure: interactive hooks may
 /// ignore unusable aliases, while task execution must report them.
