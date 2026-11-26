@@ -973,9 +973,10 @@ elif args[:2] == ['nextest', 'run']:
                            OMG_CONTRACT_SOURCE_SHA='fixture-stage-source', PYTHONDONTWRITEBYTECODE='1')
                 result = subprocess.run([bash, '--noprofile', '--norc', '-euo', 'pipefail', '-c', script],
                                         cwd=root, env=env, capture_output=True, text=True, timeout=10)
+                output = root / 'target' / 'staged-unit-tests'
+                self.assertTrue(output.is_dir(), result.stdout + result.stderr)
                 if mode == 'reused-refusal':
                     self.assertEqual(result.returncode, 0, result.stdout+result.stderr)
-                    output = root / 'staged-unit-tests'
                     evidence = ('source-tests.json', 'list.json', 'list.stderr.log', 'selection.json',
                                 'recipe.json', 'run.stdout.log', 'run.stderr.log', 'junit.xml')
                     self.assertTrue(all((output / name).is_file() for name in evidence))
@@ -1000,7 +1001,7 @@ elif args[:2] == ['nextest', 'run']:
                 calls = [json.loads(line) for line in capture.read_text().splitlines()]
                 self.assertTrue(any('--test' in args and args[args.index('--test')+1] == 'fedora_tests'
                                     for args in calls), result.stdout+result.stderr+repr(calls))
-                error = root / 'staged-unit-tests' / 'admission-error.json'
+                error = output / 'admission-error.json'
                 self.assertEqual(result.returncode, int(mode != 'intact'), result.stdout+result.stderr+
                                  (error.read_text() if error.exists() else ''))
                 if mode in ('missing-target', 'missing-library', 'missing-cli', 'missing-declaration', 'missing-body',
@@ -1014,7 +1015,7 @@ elif args[:2] == ['nextest', 'run']:
                     print('STAGED_UNIT_FIXTURE '+json.dumps(dict(workflow=label, mode=mode,
                           status=result.returncode, calls=calls, error=json.loads(error.read_text()))))
                     continue
-                observed = json.loads((root / 'staged-unit-tests' / 'selection.json').read_text())
+                observed = json.loads((output / 'selection.json').read_text())
                 self.assertEqual(observed['counts'], dict(discovered=37, selected=32, executed=32,
                                       passed=32, failed=0, skipped=5, filtered=0, retried=0) if mode == 'intact'
                                       else dict(discovered=37, selected=32, executed=31, passed=31, failed=0,

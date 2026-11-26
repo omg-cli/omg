@@ -1,19 +1,16 @@
-//! Native Ruby runtime manager - PURE RUST
+//! Native Ruby runtime manager for ruby-builder releases.
 //!
-//! Downloads pre-built Ruby binaries from ruby-builder.
-//!
-//! Features:
-//! - Pre-built binaries (no compilation required)
-//! - Compatible with Ubuntu/Debian glibc
+//! Rust selects the archive, verifies its checksum and stages its contents.
+//! A bounded version probe must succeed before the staged runtime is published.
 
-use crate::core::http::BoundedResponseExt;
 use anyhow::{Context, Result};
+#[cfg(test)]
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use super::common::{
-    GITHUB_USER_AGENT, GithubRelease, activate_version, begin_download, begin_staged_install,
-    complete_staged_install, download_with_progress, extract_tar_gz, normalize_version,
+    GithubRelease, activate_version, begin_download, begin_staged_install, complete_staged_install,
+    download_with_progress, extract_tar_gz, fetch_github_release_json, normalize_version,
     parse_sha256_digest, print_already_installed, print_installed, print_using,
     validate_download_filename, version_cmp,
 };
@@ -42,22 +39,15 @@ impl RubyManager {
         }
     }
 
-    /// List available Ruby versions from ruby-builder releases
-    pub async fn list_available(&self) -> Result<Vec<RubyVersion>> {
-        let releases: Vec<GithubRelease> = self
-            .client
-            .get(format!("{RUBY_VERSIONS_URL}?per_page=100"))
-            .header("User-Agent", GITHUB_USER_AGENT)
-            .timeout(std::time::Duration::from_secs(30))
-            .send()
+    async fn release_catalog(&self) -> Result<Vec<GithubRelease>> {
+        fetch_github_release_json(self.client, &format!("{RUBY_VERSIONS_URL}?per_page=100"))
             .await
-            .context("Failed to fetch Ruby releases from GitHub")?
-            .error_for_status()
-            .context("GitHub Ruby release-list request failed")?
-            .bounded_json()
-            .await
-            .context("Failed to parse Ruby release data")?;
+            .context("Failed to fetch Ruby releases from GitHub")
+    }
 
+    /// List available Ruby versions from ruby-builder releases.
+    pub async fn list_available(&self) -> Result<Vec<RubyVersion>> {
+        let releases = self.release_catalog().await?;
         // Tags are `ruby-X.Y.Z`, plus engine tags such as `jruby-*` and `toolcache`.
         let versions: std::collections::HashSet<_> = releases
             .iter()
@@ -72,21 +62,51 @@ impl RubyManager {
             .map(|version| RubyVersion { version })
             .collect();
 
-        result.sort_by(|a, b| version_cmp(&b.version, &a.version));
+        result.sort_by(|a, b| {
+            version_cmp(&b.version, &a.version).then_with(|| a.version.cmp(&b.version))
+        });
         Ok(result)
     }
 
-    /// Install Ruby - PURE RUST, NO SUBPROCESS
+    /// Install Ruby from a checksummed publisher release.
     pub async fn install(&self, version: &str) -> Result<()> {
-        let version = normalize_version(version);
-        let version = self.resolve_requested_version(&version).await?;
+        let requested = normalize_version(version);
+        crate::core::security::validate_runtime_version(&requested)?;
+        let (version, catalog) = if requested == "latest"
+            || super::common::is_partial_version(&requested)
+        {
+            let releases = self.release_catalog().await?;
+            let version = if requested == "latest" {
+                releases
+                    .iter()
+                    .filter(|release| !release.prerelease)
+                    .filter_map(|release| parse_ruby_release_version(&release.tag_name))
+                    .max_by(|left, right| version_cmp(left, right).then_with(|| right.cmp(left)))
+                    .context("No stable MRI Ruby releases found in the publisher catalog")?
+            } else {
+                let names: Vec<_> = releases
+                    .iter()
+                    .filter_map(|release| parse_ruby_release_version(&release.tag_name))
+                    .collect();
+                anyhow::ensure!(
+                    !names.is_empty(),
+                    "No MRI Ruby releases found. Try again later or specify a version."
+                );
+                super::resolve_version_request(&names, &requested)
+            };
+            (version, Some(releases))
+        } else {
+            (requested, None)
+        };
         crate::core::security::validate_runtime_version(&version)?;
+        let _install_lease = super::common::try_lock_runtime_install(&self.versions_dir, &version)?;
         let version_dir = self.versions_dir.join(&version);
 
         if crate::runtimes::common::is_valid_version_dir(&version_dir) {
             print_already_installed("Ruby", &version);
             return self.use_version(&version);
         }
+        super::common::require_unoccupied_install_destination(&version_dir)?;
 
         println!(
             "{} Installing Ruby {}...\n",
@@ -100,33 +120,44 @@ impl RubyManager {
             "aarch64" => "arm64",
             arch => anyhow::bail!("Unsupported architecture: {arch}"),
         };
-        let release: GithubRelease = self
-            .client
-            .get(format!("{RUBY_VERSIONS_URL}/tags/ruby-{version}"))
-            .header("User-Agent", GITHUB_USER_AGENT)
-            .timeout(std::time::Duration::from_secs(30))
-            .send()
-            .await
-            .context("Failed to fetch Ruby release metadata")?
-            .error_for_status()
-            .with_context(|| format!("Ruby {version} release metadata was not found"))?
-            .bounded_json()
-            .await
-            .context("Failed to parse Ruby release metadata")?;
         let expected_name = format!("ruby-{version}-{}-{arch}.tar.gz", ruby_platform()?);
-        let asset = release
+        let tag = format!("ruby-{version}");
+        let release: GithubRelease = if let Some(catalog) = catalog {
+            catalog
+                .into_iter()
+                .find(|release| release.tag_name == tag)
+                .with_context(|| format!("Ruby {version} release metadata was not found"))?
+        } else {
+            fetch_github_release_json(self.client, &format!("{RUBY_VERSIONS_URL}/tags/{tag}"))
+                .await
+                .with_context(|| format!("Failed to fetch Ruby {version} release metadata"))?
+        };
+        anyhow::ensure!(
+            release.tag_name == tag,
+            "GitHub release tag {} does not match requested Ruby tag {tag}",
+            release.tag_name
+        );
+        let mut matching = release
             .assets
             .iter()
-            .find(|asset| asset.name == expected_name)
-            .ok_or_else(|| anyhow::anyhow!("Ruby release asset not found: {expected_name}"))?;
+            .filter(|asset| asset.name == expected_name);
+        let asset = matching
+            .next()
+            .with_context(|| format!("Ruby release asset not found: {expected_name}"))?;
+        anyhow::ensure!(
+            matching.next().is_none(),
+            "GitHub release lists multiple matching Ruby assets named {expected_name}"
+        );
         let checksum = asset
             .digest
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("Ruby release asset has no SHA-256 digest"))
             .and_then(|digest| parse_sha256_digest(digest, "GitHub Ruby release"))?;
 
-        fs::create_dir_all(&self.versions_dir)?;
-
+        let download_url = asset
+            .browser_download_url
+            .as_deref()
+            .context("Ruby release asset has no browser download URL")?;
         println!(
             "{} Downloading pre-built Ruby {version}...",
             style::informative("→")
@@ -135,10 +166,6 @@ impl RubyManager {
         let download = begin_download(&self.versions_dir)?;
         let download_path = download.path().join(archive_name);
 
-        let download_url = asset
-            .browser_download_url
-            .as_deref()
-            .context("Ruby release asset has no browser download URL")?;
         download_with_progress(self.client, download_url, &download_path, &checksum)
             .await
             .with_context(|| {
@@ -166,34 +193,32 @@ impl RubyManager {
             super::security::record_download("ruby", version, &version_dir, download_path, url)?;
         let staging = begin_staged_install(&self.versions_dir)?;
         extract_tar_gz(download_path, staging.path(), 1).await?;
-        self.publish_install(&staging, version)?;
+        self.publish_install(&staging, version).await?;
         publisher.commit();
         Ok(())
     }
 
-    fn publish_install(&self, staging: &tempfile::TempDir, version: &str) -> Result<()> {
+    async fn publish_install(&self, staging: &tempfile::TempDir, version: &str) -> Result<()> {
         super::common::require_regular_file(&staging.path().join("bin/ruby"))?;
-        let _admission = self.security.prepare_staged(
-            "ruby",
-            version,
-            staging.path(),
-            &self.versions_dir.join(version),
-        )?;
-        complete_staged_install(staging, &self.versions_dir.join(version), version)
-    }
-
-    /// Resolve a partial version request (`3`, `3.2`) to the newest matching
-    /// ruby-builder release before any download URL is built; the tag lookup
-    /// is exact-string, so an unresolved partial would 404. Exact and
-    /// non-numeric requests pass through unchanged, preserving the
-    /// already-installed fast path and the existing not-found UX.
-    async fn resolve_requested_version(&self, version: &str) -> Result<String> {
-        if !crate::runtimes::common::is_partial_version(version) {
-            return Ok(version.to_owned());
-        }
-        let available = self.list_available().await?;
-        let names: Vec<String> = available.into_iter().map(|entry| entry.version).collect();
-        Ok(crate::runtimes::resolve_version_request(&names, version))
+        let version_dir = self.versions_dir.join(version);
+        let admission =
+            self.security
+                .prepare_staged("ruby", version, staging.path(), &version_dir)?;
+        admission.before_execution(staging.path())?;
+        let tree = staging.path().to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            let mut command = std::process::Command::new(tree.join("bin/ruby"));
+            super::common::harden_untrusted_runtime_command(&mut command, &tree);
+            command.args(["--disable=gems", "--version"]);
+            super::tool_artifacts::run_with_timeout(
+                command,
+                "Ruby smoke test",
+                std::time::Duration::from_secs(30),
+            )
+        })
+        .await
+        .context("Ruby smoke test worker stopped")??;
+        complete_staged_install(staging, &version_dir, version)
     }
 
     /// Switch to a specific version
@@ -255,10 +280,11 @@ mod tests {
         use sha2::{Digest as _, Sha256};
 
         let version = "3.4.2";
+        let launcher = b"#!/bin/sh\nprintf 'ruby 3.4.2\\n'\n";
         let archive = tar_gz_entries(
             "ruby",
             &[
-                ("bin/ruby", b"fixture launcher"),
+                ("bin/ruby", launcher),
                 ("lib/owned.data", b"complete Ruby implementation"),
             ],
         )
@@ -270,14 +296,14 @@ mod tests {
             .1;
         let filename = format!("ruby-{version}-{}-{arch}.tar.gz", ruby_platform().unwrap());
         let path = format!("/ruby/ruby-builder/releases/download/ruby-{version}/{filename}");
-        let metadata = serde_json::to_vec(&serde_json::json!({
+        let metadata = serde_json::to_vec(&serde_json::json!([{
             "tag_name":format!("ruby-{version}"), "prerelease":false,
             "assets":[{"name":filename,"browser_download_url":format!("https://github.com{path}"),"digest":format!("sha256:{}",hex::encode(Sha256::digest(&archive)))}]
-        })).unwrap();
+        }])).unwrap();
         super::super::test_https::fixed_public_routes(&[
             (
                 "api.github.com",
-                "/repos/ruby/ruby-builder/releases/tags/ruby-3.4.2",
+                "/repos/ruby/ruby-builder/releases?per_page=100",
                 &metadata,
             ),
             ("github.com", &path, &archive),
@@ -290,13 +316,13 @@ mod tests {
             client: download_client(),
         };
         manager
-            .install(version)
+            .install("3.4")
             .await
-            .expect("complete authenticated public installation");
+            .expect("complete authenticated installation using one catalog request");
         let installed = fixture.versions.join(version);
         assert_eq!(
             fs::read(fixture.versions.join("current").join("bin/ruby")).unwrap(),
-            b"fixture launcher"
+            launcher
         );
         assert_eq!(
             fs::read(installed.join("lib/owned.data")).unwrap(),
@@ -331,7 +357,7 @@ mod tests {
     async fn check_archive_publication(
         invalid: super::super::test_archive::Launcher,
     ) -> Result<()> {
-        use super::super::test_archive::{Launcher, tar_gz};
+        use super::super::test_archive::tar_gz;
         let versions = tempfile::tempdir()?;
         let manager = RubyManager {
             security: crate::runtimes::security::RuntimeSecurity::fixture(),
@@ -343,7 +369,7 @@ mod tests {
         let staging = begin_staged_install(versions.path())?;
         fs::write(&archive_path, tar_gz("runtime", "bin/ruby", invalid)?)?;
         extract_tar_gz(&archive_path, staging.path(), 1).await?;
-        let result = manager.publish_install(&staging, "3.4.10");
+        let result = manager.publish_install(&staging, "3.4.10").await;
         assert!(
             !versions.path().join("3.4.10").exists(),
             "invalid ruby archive must not be published: {result:?}"
@@ -355,9 +381,10 @@ mod tests {
         drop(staging);
 
         let staging = begin_staged_install(versions.path())?;
+        let launcher = b"#!/bin/sh\nprintf 'ruby 3.4.10\\n'\n";
         fs::write(
             &archive_path,
-            tar_gz("runtime", "bin/ruby", Launcher::Regular)?,
+            super::super::test_archive::tar_gz_entries("runtime", &[("bin/ruby", launcher)])?,
         )?;
         extract_tar_gz(&archive_path, staging.path(), 1).await?;
         crate::runtimes::security::fixture_bind_candidate(
@@ -367,7 +394,7 @@ mod tests {
             &manager.versions_dir.join("3.4.10"),
         )
         .expect("seed controlled publisher authority");
-        manager.publish_install(&staging, "3.4.10")?;
+        manager.publish_install(&staging, "3.4.10").await?;
         crate::runtimes::security::fixture_bind_candidate(
             "ruby",
             "3.4.10",
@@ -380,8 +407,66 @@ mod tests {
         assert_eq!(manager.current_version().as_deref(), Some("3.4.10"));
         assert_eq!(
             fs::read(versions.path().join("current/bin/ruby"))?,
-            b"fixture launcher"
+            launcher
         );
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn direct_install_requires_complete_metadata_for_the_exact_tag() -> Result<()> {
+        let path = "/repos/ruby/ruby-builder/releases/tags/ruby-3.4.2";
+        let arch = match std::env::consts::ARCH {
+            "x86_64" => "x64",
+            "aarch64" => "arm64",
+            other => anyhow::bail!("Unsupported native Ruby test architecture: {other}"),
+        };
+        let asset = serde_json::json!({
+            "name": format!("ruby-3.4.2-ubuntu-22.04-{arch}.tar.gz"),
+            "digest": format!("sha256:{}", "c".repeat(64))
+        });
+        let payload = |tag, assets| {
+            serde_json::to_vec(&serde_json::json!({
+                "tag_name": tag,
+                "assets": assets
+            }))
+        };
+        let fixture = super::super::test_https::HttpsFixture::new_with_statuses(
+            "api.github.com",
+            vec![
+                (path.to_owned(), 206, payload("ruby-3.4.2", vec![&asset])?),
+                (path.to_owned(), 200, payload("ruby-3.4.3", vec![&asset])?),
+                (
+                    path.to_owned(),
+                    200,
+                    payload("ruby-3.4.2", vec![&asset, &asset])?,
+                ),
+            ],
+        )
+        .await?;
+        let private = tempfile::tempdir()?;
+        let manager = RubyManager {
+            versions_dir: private.path().join("versions"),
+            client: Box::leak(Box::new(fixture.client(true)?)),
+            ..RubyManager::new()
+        };
+        let partial = manager.install("3.4.2").await;
+        let wrong_tag = manager.install("3.4.2").await;
+        let duplicate = manager.install("3.4.2").await;
+        assert_eq!(
+            fixture.finish().await?,
+            vec![format!("GET {path} HTTP/1.1"); 3]
+        );
+        for (result, expected) in [
+            (partial, "HTTP 206"),
+            (wrong_tag, "does not match requested Ruby tag"),
+            (duplicate, "multiple matching Ruby assets"),
+        ] {
+            let error = result.expect_err("invalid publisher metadata must stop before download");
+            assert!(format!("{error:#}").contains(expected), "{error:#}");
+        }
+        assert!(manager.list_installed()?.is_empty());
+        assert_eq!(manager.current_version(), None);
         Ok(())
     }
 
@@ -496,10 +581,25 @@ mod tests {
         assert!(!fixture.versions.join("3.4.2").exists());
         fixture.assert_previous();
         manager.security = super::super::security::RuntimeSecurity::fixture();
+        let error = manager
+            .publish_download(&fixture.archive, url, "3.4.2")
+            .await
+            .expect_err("a reviewed archive with a non-runnable interpreter must not publish");
+        assert!(
+            format!("{error:#}").contains("Ruby smoke test"),
+            "{error:#}"
+        );
+        assert!(!fixture.versions.join("3.4.2").exists());
+        fixture.assert_previous();
+        let launcher = b"#!/bin/sh\nprintf 'ruby 3.4.2\\n'\n";
+        fixture.write(
+            &super::super::test_archive::tar_gz_entries("runtime", &[("bin/ruby", launcher)])
+                .expect("controlled executable publisher archive"),
+        );
         manager
             .publish_download(&fixture.archive, url, "3.4.2")
             .await
-            .expect("publish complete reviewed publisher tree");
+            .expect("publish complete runnable publisher tree");
         fixture.assert_previous();
         manager
             .use_version("3.4.2")
@@ -507,7 +607,7 @@ mod tests {
         assert_eq!(
             fs::read(fixture.versions.join("current/bin/ruby"))
                 .expect("selected reviewed launcher"),
-            b"fixture launcher"
+            launcher
         );
         fs::remove_file(fixture.versions.join("current"))
             .expect("restore controlled prior selection");
