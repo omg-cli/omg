@@ -2499,6 +2499,7 @@ printf 'fixture node {directory} {version}|<%s>\\n' "$@"
                 ("lts/krypton", "v24.15.9"),
                 ("unavailable", "v28.0.0"),
                 ("external", "v26.0.5"),
+                ("vendor", "v24.15.3"),
                 ("review-cycle-one", "review-cycle-two"),
                 ("review-cycle-two", "review-cycle-one"),
             ):
@@ -2554,6 +2555,71 @@ printf 'fixture node {directory} {version}|<%s>\\n' "$@"
                         passed = result.returncode != 0 and not output and want in result.stderr
                     checks.append(dict(phase="task-node-aliases", case=f"{label}-{mode}", status=result.returncode,
                                        passed=passed, expected=want, diagnostic=(result.stdout + result.stderr)[-1100:]))
+
+            phase = "nvmrc-pin-reading"
+            cases = (
+                ("plain", "24.15.3", None, None, "24.15.3", "24.15.3"),
+                ("comments", "# node selection\n\n\tv24.15.3\t# approved\n", None, None,
+                 "24.15.3", "24.15.3"),
+                ("metadata-crlf", "track = stable # note\r\n\tv24.15.3\r\nempty=\r\nnotes=one=two\r\n",
+                 None, None, "24.15.3", "24.15.3"),
+                ("vendor-alias", "vendor\n", None, None, "vendor", "24.15.3"),
+                ("compound-range", ">=24.15.0 <24.16.0 # patch series\n", None, None,
+                 ">=24.15.0 <24.16.0", "24.15.9"),
+                ("exact-comparator", "=24.15.3 # exact comparator\n", None, None,
+                 "=24.15.3", "24.15.3"),
+                ("parent-pin", None, "# parent pin\n24.15.9\n", None, "24.15.9", "24.15.9"),
+                ("child-pin", "24.15.3 # child pin\n", "24.16.2\n", None, "24.15.3", "24.15.3"),
+                ("dedicated-pin", "24.15.3\n24.16.2\n", None, "24.15.9\n", "24.15.9", "24.15.9"),
+                ("multiple-selectors", "24.15.3\n24.15.9\n", "24.16.2\n", None, None, None),
+                ("duplicate-metadata", "track=fixture-note-first\n24.15.3\ntrack = fixture-note-second\n",
+                 "24.16.2\n", None, None, None),
+                ("reserved-node-key", "node=fixture-note-invalid\n24.15.3\n",
+                 "24.16.2\n", None, None, None),
+                ("metadata-only", "track=fixture-note-missing\n# No selector\n", "24.16.2\n",
+                 None, None, None),
+                ("empty", "", "24.16.2\n", None, None, None),
+                ("control-character", "track=note\x0btext\n24.15.3\n", "24.16.2\n",
+                 None, None, None),
+                ("malformed-ancestor", None, "24.15.3\n24.15.9\n", None, "24.16.2", "24.16.2"),
+            )
+            for label, local, parent, dedicated, selector, version in cases:
+                family = here / f"pin-{label}"
+                middle = family / "middle"
+                project = middle / "project"
+                project.mkdir(parents=True)
+                if label == "malformed-ancestor":
+                    (family / ".nvmrc").write_text("24.16.2\n")
+                if local is not None:
+                    (project / ".nvmrc").write_bytes(local.encode())
+                if parent is not None:
+                    (middle / ".nvmrc").write_bytes(parent.encode())
+                if dedicated is not None:
+                    (project / ".node-version").write_text(dedicated)
+                hook_version = version or "24.16.2"
+                hook_path = str(here / "data" / "versions/node" / hook_version / "bin")
+                for mode, args in (
+                    ("hook", ("hook-env", "--shell", "bash")),
+                    ("task", ("run", "node", "--", "two words")),
+                    ("which", ("which", "node")),
+                ):
+                    result = subprocess.run([cli, *args], cwd=project, env=env, stdin=subprocess.DEVNULL,
+                                            capture_output=True, text=True, timeout=8, **ordinary)
+                    log = result.stdout + result.stderr
+                    lines = result.stdout.splitlines()
+                    output = [line for line in lines if line.startswith("fixture node ")]
+                    if mode == "hook":
+                        emitted = [path for path in bins if f"'{path}'" in result.stdout]
+                        passed = result.returncode == 0 and emitted == [hook_path] and not output
+                    elif selector is None:
+                        passed = result.returncode != 0 and not lines and "Invalid .nvmrc" in result.stderr
+                    elif mode == "task":
+                        passed = result.returncode == 0 and output == [f"fixture node data {version}|<two words>"]
+                    else:
+                        passed = result.returncode == 0 and len(lines) == 1 and lines[0].endswith(f" {selector}")
+                    checks.append(dict(phase=phase, case=f"{label}-{mode}", status=result.returncode,
+                                       passed=passed and "fixture-note-" not in log, diagnostic=log[-1100:],
+                                       expected_selector=selector, expected_version=version))
 
 
     def inspect_task_environment_bytes():
@@ -5577,6 +5643,6 @@ assert inventory() == before
 report = dict(binaries=binaries, checks=checks, total=len(checks),
               passed=sum(entry["passed"] for entry in checks), host_unchanged=True)
 print(json.dumps(report))
-expected_checks = 303 if consent_oracle is None else 1788
+expected_checks = 303 if consent_oracle is None else 1836
 if report["passed"] != report["total"] or report["total"] != expected_checks:
     sys.exit(4)

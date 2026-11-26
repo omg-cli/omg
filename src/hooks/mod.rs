@@ -407,6 +407,49 @@ fn parse_pyproject_requires_python(
     Ok(())
 }
 
+fn parse_nvmrc(file_path: &Path, versions: &mut HashMap<String, String>) -> Result<()> {
+    let Some(content) = read_pin_file(file_path)? else {
+        return Ok(());
+    };
+    let mut selector = None;
+    let mut keys = HashSet::new();
+    let location = file_path.display();
+    for line in content.lines() {
+        anyhow::ensure!(
+            !line.chars().any(|ch| ch != '\t' && ch.is_control()),
+            "Invalid .nvmrc at {location} (contains a control character)"
+        );
+        let line = line.split_once('#').map_or(line, |(value, _)| value).trim();
+        if line.is_empty() {
+            continue;
+        }
+        // Preserve comparator requests supported by OMG's version selector.
+        if let Some((key, _)) = line.split_once('=')
+            && !(line.starts_with(['=', '<', '>', '~', '^'])
+                && RuntimeVersionReq::parse(line).is_some())
+        {
+            let key = key.trim();
+            anyhow::ensure!(
+                !key.is_empty() && key != "node" && keys.insert(key),
+                "Invalid .nvmrc at {location} (duplicate or reserved metadata key)"
+            );
+            continue;
+        }
+        anyhow::ensure!(
+            selector.replace(line).is_none(),
+            "Invalid .nvmrc at {location} (expected exactly one version or alias)"
+        );
+    }
+    let selector = selector
+        .with_context(|| format!("Invalid .nvmrc at {location} (missing version or alias)"))?;
+    let version = selector
+        .strip_prefix('v')
+        .filter(|rest| rest.as_bytes().first().is_some_and(u8::is_ascii_digit))
+        .unwrap_or(selector);
+    versions.insert("node".to_owned(), version.to_owned());
+    Ok(())
+}
+
 fn parse_simple_version_file(
     file_path: &Path,
     runtime: &str,
@@ -429,6 +472,7 @@ fn try_parse_version_file(
     versions: &mut HashMap<String, String>,
 ) -> Result<()> {
     match filename {
+        ".nvmrc" => parse_nvmrc(file_path, versions)?,
         ".tool-versions" => parse_tool_versions_file(file_path, versions)?,
         "global.json" => parse_global_json_file(file_path, versions)?,
         "rust-toolchain.toml" => parse_rust_toolchain_file(file_path, runtime, versions)?,
