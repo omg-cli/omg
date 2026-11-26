@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime
 import json
 import os
+from pathlib import Path
 import re
 import subprocess
 import sys
@@ -113,7 +114,7 @@ def require_release_evidence(repository, sha, snapshot=github_snapshot):
             for file, label in REQUIRED.items():
                 run = latest[file]
                 print(f'{label} passed for {sha} in run {run.id} attempt {run.attempt}', flush=True)
-            return
+            return latest['ci.yml']
         if pending != last_pending:
             print(f'Waiting for {", ".join(pending)} on {sha}', flush=True)
             last_pending = pending
@@ -126,9 +127,19 @@ def require_release_evidence(repository, sha, snapshot=github_snapshot):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('commit')
+    parser.add_argument('--stage-linux', type=Path)
     arguments = parser.parse_args()
     try:
-        require_release_evidence(os.environ['GITHUB_REPOSITORY'], arguments.commit)
+        ci_run = require_release_evidence(os.environ['GITHUB_REPOSITORY'], arguments.commit)
+        if arguments.stage_linux is not None:
+            subprocess.run([
+                sys.executable, str(Path(__file__).with_name('native-build-artifact.py')),
+                'stage-release', '--destination', str(arguments.stage_linux),
+                '--commit', arguments.commit, '--ci-run', str(ci_run.id), '--ci-attempt', str(ci_run.attempt),
+            ], check=True)
+        if output := os.environ.get('GITHUB_OUTPUT'):
+            with open(output, 'a', encoding='utf-8') as stream:
+                stream.write(f'ci-run={ci_run.id}\nci-attempt={ci_run.attempt}\n')
     except (KeyError, OSError, TypeError, ValueError, AttributeError, subprocess.SubprocessError) as error:
         print(f'::error::Release evidence rejected: {error}', file=sys.stderr)
         sys.exit(1)

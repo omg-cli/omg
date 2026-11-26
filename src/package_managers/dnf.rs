@@ -20,7 +20,7 @@ use std::pin::Pin;
 use anyhow::{Context, Result};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, LazyLock, Mutex, RwLock};
 
 use crate::cli::modern_ui::OutputMode;
 use crate::core::{Package, PackageSource, is_root};
@@ -1129,10 +1129,7 @@ impl DnfPackageManager {
         let mut command =
             tokio::process::Command::from(crate::core::privilege::system_command("rpm")?);
         // Exclude caller macros and preserve the system macro configuration.
-        command
-            .env("HOME", "/")
-            .env("LC_ALL", "C")
-            .stderr(std::process::Stdio::piped());
+        command.env("HOME", "/").env("LC_ALL", "C");
         Ok(command)
     }
 
@@ -1169,7 +1166,7 @@ impl DnfPackageManager {
         // would reject a valid local inventory on a host with no configured repos.
         let mut command =
             tokio::process::Command::from(crate::core::privilege::system_command("dnf")?);
-        command.stderr(std::process::Stdio::piped()).args([
+        command.args([
             "--cacheonly",
             "--setopt=disable_excludes=*",
             "repoquery",
@@ -1873,7 +1870,7 @@ impl DnfPackageManager {
         deadline: std::time::Duration,
         cancelled: Option<tokio::sync::oneshot::Receiver<()>>,
     ) -> Result<Vec<u8>> {
-        let output = Self::capture_query(program, command, deadline, cancelled).await?;
+        let output = Self::capture_query(program, command, deadline, cancelled, false).await?;
         Self::require_query_success(program, &output)?;
         Ok(output.stdout)
     }
@@ -1888,10 +1885,52 @@ impl DnfPackageManager {
             .map(str::trim)
             .rfind(|line| !line.is_empty())
         {
-            let detail = crate::cli::style::sanitize_terminal_text(detail);
+            let detail = Self::safe_query_diagnostic(detail);
             anyhow::bail!("{program} query failed: {}: {detail}", output.status);
         }
         anyhow::bail!("{program} query failed: {}", output.status);
+    }
+
+    fn safe_query_diagnostic(line: &str) -> String {
+        static URL: LazyLock<regex::Regex> = LazyLock::new(|| {
+            regex::Regex::new(r#"(?i)(?:https?|ftps?)://[^\s"<>]+"#)
+                .expect("diagnostic URL pattern")
+        });
+        let text = crate::cli::style::sanitize_terminal_text(line);
+        URL.replace_all(&text, |captures: &regex::Captures<'_>| {
+            crate::core::http::redact_url(&captures[0])
+        })
+        .into_owned()
+    }
+
+    async fn capture_query_diagnostics(
+        mut stderr: tokio::process::ChildStderr,
+        forward: bool,
+    ) -> std::io::Result<Vec<u8>> {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+
+        const MAX_DIAGNOSTIC_BYTES: u64 = 64 * 1024;
+        let mut bytes = Vec::new();
+        let mut reader = BufReader::new((&mut stderr).take(MAX_DIAGNOSTIC_BYTES));
+        loop {
+            let start = bytes.len();
+            if reader.read_until(b'\n', &mut bytes).await? == 0 {
+                break;
+            }
+            // A truncated URL may end before its '@' or '?'. Keep only
+            // complete lines when the diagnostic byte budget is exhausted.
+            if !bytes.ends_with(b"\n") && reader.get_ref().limit() == 0 {
+                bytes.truncate(start);
+                break;
+            }
+            if forward {
+                let raw = String::from_utf8_lossy(&bytes[start..]);
+                eprintln!("{}", Self::safe_query_diagnostic(raw.trim_end()));
+            }
+        }
+        drop(reader);
+        tokio::io::copy(&mut stderr, &mut tokio::io::sink()).await?;
+        Ok(bytes)
     }
 
     async fn capture_query(
@@ -1899,10 +1938,10 @@ impl DnfPackageManager {
         mut command: tokio::process::Command,
         deadline: std::time::Duration,
         mut cancelled: Option<tokio::sync::oneshot::Receiver<()>>,
+        forward_diagnostics: bool,
     ) -> Result<std::process::Output> {
         use tokio::io::AsyncReadExt;
         const MAX_OUTPUT_BYTES: u64 = 64 * 1024 * 1024;
-        const MAX_DIAGNOSTIC_BYTES: u64 = 64 * 1024;
         if let Some(cancelled) = cancelled.as_mut() {
             anyhow::ensure!(
                 matches!(
@@ -1915,6 +1954,7 @@ impl DnfPackageManager {
         let mut child = command
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
             .kill_on_drop(true)
             .spawn()
             .with_context(|| format!("Could not start {program} query"))?;
@@ -1924,7 +1964,10 @@ impl DnfPackageManager {
                     .stdout
                     .take()
                     .with_context(|| format!("{program} stdout was not captured"))?;
-                let stderr = child.stderr.take();
+                let stderr = child
+                    .stderr
+                    .take()
+                    .with_context(|| format!("{program} stderr was not captured"))?;
                 let output = async {
                     let mut bytes = Vec::new();
                     stdout
@@ -1938,15 +1981,7 @@ impl DnfPackageManager {
                     Ok(bytes)
                 };
                 let diagnostics = async {
-                    let mut bytes = Vec::new();
-                    if let Some(mut stderr) = stderr {
-                        (&mut stderr)
-                            .take(MAX_DIAGNOSTIC_BYTES)
-                            .read_to_end(&mut bytes)
-                            .await?;
-                        tokio::io::copy(&mut stderr, &mut tokio::io::sink()).await?;
-                    }
-                    Ok(bytes)
+                    Ok(Self::capture_query_diagnostics(stderr, forward_diagnostics).await?)
                 };
                 let (stdout, stderr) = tokio::try_join!(output, diagnostics)?;
                 let status = child
@@ -1995,15 +2030,19 @@ impl DnfPackageManager {
         let query_lower = query.to_lowercase();
         Box::pin(async move {
             let installed = self.load_installed_packages().await?;
-            let mut command = Self::repository_command(RepositoryQuery::Available(None))?;
-            if !progress {
-                command.stderr(std::process::Stdio::piped());
-            }
+            let command = Self::repository_command(RepositoryQuery::Available(None))?;
             let (installed, output) = tokio::try_join!(
                 Self::order_installed_search_builds(&installed),
-                Self::query_output(command)
+                Self::capture_query(
+                    "DNF",
+                    command,
+                    std::time::Duration::from_mins(1),
+                    None,
+                    progress
+                )
             )?;
-            Self::search_results(installed, &output, &query_lower)
+            Self::require_query_success("DNF", &output)?;
+            Self::search_results(installed, &output.stdout, &query_lower)
         })
     }
 
@@ -3031,15 +3070,31 @@ impl DnfPackageManager {
             tokio::process::Command::from(crate::core::privilege::system_command("dnf")?);
         command
             .env("LC_ALL", "C")
-            .stderr(std::process::Stdio::piped())
             .args(["--color=never", "--setopt=assumeyes=false", "--assumeno"])
             .args(args);
-        let output =
-            Self::capture_query("DNF", command, std::time::Duration::from_mins(1), None).await?;
+        let output = Self::capture_query(
+            "DNF",
+            command,
+            std::time::Duration::from_mins(1),
+            None,
+            false,
+        )
+        .await?;
         Self::transaction_preview_output(&output)
     }
 
     fn transaction_preview_output(output: &std::process::Output) -> Result<(String, String)> {
+        let redact = |text: &str| {
+            let mut output = String::with_capacity(text.len());
+            for line in text.split_inclusive('\n') {
+                let (line, newline) = line
+                    .strip_suffix('\n')
+                    .map_or((line, ""), |line| (line, "\n"));
+                output.push_str(&Self::safe_query_diagnostic(line));
+                output.push_str(newline);
+            }
+            output
+        };
         let plan = String::from_utf8_lossy(&output.stdout);
         let diagnostics = String::from_utf8_lossy(&output.stderr);
         // DNF5 exits 1 after displaying a nonempty plan that --assumeno declined.
@@ -3050,19 +3105,14 @@ impl DnfPackageManager {
                 .strip_suffix("Operation aborted by the user.")
             && (prefix.is_empty() || prefix.ends_with('\n'))
         {
-            return Ok((plan.into_owned(), prefix.trim_end().to_owned()));
+            return Ok((redact(&plan), redact(prefix.trim_end())));
         }
         if !output.status.success() && !diagnostics.trim().is_empty() {
-            let diagnostics = diagnostics
-                .trim()
-                .lines()
-                .map(crate::cli::style::sanitize_terminal_text)
-                .collect::<Vec<_>>()
-                .join("\n");
+            let diagnostics = redact(diagnostics.trim());
             anyhow::bail!("DNF query failed ({})\n{diagnostics}", output.status);
         }
         Self::require_query_success("DNF", output)?;
-        Ok((plan.into_owned(), diagnostics.into_owned()))
+        Ok((redact(&plan), redact(&diagnostics)))
     }
 
     pub(crate) async fn cleanup(
@@ -3102,7 +3152,8 @@ impl DnfPackageManager {
 
         let targets = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
         crate::core::security::audit::record_operation("dnf", &targets, "attempt")?;
-        let status = cmd.args(args).status()?;
+        cmd.args(args);
+        let status = Self::run_native_command(cmd)?;
         crate::core::security::audit::record_operation(
             "dnf",
             &targets,
@@ -3119,6 +3170,98 @@ impl DnfPackageManager {
         } else {
             anyhow::bail!("dnf command failed with status {status}")
         }
+    }
+
+    /// Run a foreground DNF transaction on its blocking owner. Leave the
+    /// native input and output streams connected for prompts and progress.
+    pub(crate) fn run_native_command(
+        command: std::process::Command,
+    ) -> std::io::Result<std::process::ExitStatus> {
+        std::thread::Builder::new()
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?;
+                runtime.block_on(Self::native_command_status(command.into()))
+            })?
+            .join()
+            .map_err(|_| std::io::Error::other("DNF command owner panicked"))?
+    }
+
+    async fn native_command_status(
+        mut command: tokio::process::Command,
+    ) -> std::io::Result<std::process::ExitStatus> {
+        let mut child = command.stderr(std::process::Stdio::piped()).spawn()?;
+        let stderr = child.stderr.take().expect("DNF stderr is piped");
+        #[cfg(unix)]
+        let forward = {
+            use nix::sys::signal::{SigSet, Signal};
+            // Only the relay thread blocks SIGPIPE. DNF has already spawned,
+            // and the thread exits without unblocking a pending write signal.
+            let mut signals = SigSet::empty();
+            signals.add(Signal::SIGPIPE);
+            signals.thread_block().is_ok()
+        };
+        #[cfg(not(unix))]
+        let forward = true;
+        let diagnostics = Self::forward_native_diagnostics(stderr, forward);
+        tokio::pin!(diagnostics);
+        let (status, diagnostic_result) = tokio::select! {
+            result = &mut diagnostics => (child.wait().await?, result),
+            status = child.wait() => {
+                // A descendant can inherit stderr after DNF itself has exited.
+                let result = tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    &mut diagnostics,
+                ).await.unwrap_or(Ok(()));
+                (status?, result)
+            }
+        };
+        if let Err(error) = diagnostic_result {
+            tracing::debug!(%error, "Could not forward DNF diagnostics");
+        }
+        Ok(status)
+    }
+
+    async fn forward_native_diagnostics(
+        mut stderr: tokio::process::ChildStderr,
+        forward: bool,
+    ) -> std::io::Result<()> {
+        use std::io::Write as _;
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+
+        if !forward {
+            tokio::io::copy(&mut stderr, &mut tokio::io::sink()).await?;
+            return Ok(());
+        }
+        const MAX_LINE_BYTES: u64 = 64 * 1024;
+        let mut reader = BufReader::new(stderr);
+        let mut terminal = std::io::stderr();
+        let mut line = Vec::new();
+        let mut discarding_line = false;
+        loop {
+            line.clear();
+            let count = (&mut reader)
+                .take(MAX_LINE_BYTES + 1)
+                .read_until(b'\n', &mut line)
+                .await?;
+            if count == 0 {
+                break;
+            }
+            if discarding_line || count as u64 > MAX_LINE_BYTES {
+                discarding_line = !line.ends_with(b"\n");
+                continue;
+            }
+            let raw = String::from_utf8_lossy(&line);
+            let mut safe = Self::safe_query_diagnostic(raw.trim_end_matches(['\r', '\n']));
+            safe.push('\n');
+            if terminal.write_all(safe.as_bytes()).is_err() {
+                // A closed log sink cannot interrupt a running transaction.
+                tokio::io::copy(&mut reader, &mut tokio::io::sink()).await?;
+                return Ok(());
+            }
+        }
+        terminal.flush()
     }
 }
 
@@ -5407,6 +5550,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_command_does_not_wait_for_descendants_stderr() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let pid_file = fixture.path().join("child.pid");
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .args([
+                "-c",
+                "sleep 10 & printf '%s\\n' \"$!\" > \"$1\"; exit 7",
+                "--",
+            ])
+            .arg(&pid_file);
+        let status = tokio::time::timeout(
+            std::time::Duration::from_secs(4),
+            tokio::task::spawn_blocking(move || DnfPackageManager::run_native_command(command)),
+        )
+        .await;
+        let child_pid: i32 = std::fs::read_to_string(pid_file)?.trim().parse()?;
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(child_pid),
+            nix::sys::signal::Signal::SIGTERM,
+        );
+        assert_eq!(
+            status
+                .context("DNF did not return after the owned command exited")???
+                .code(),
+            Some(7)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn captured_query_drains_diagnostics_and_preserves_failure_reason() -> Result<()> {
         let mut verbose = tokio::process::Command::new("/bin/sh");
         verbose
@@ -5425,6 +5599,30 @@ mod tests {
         ]);
         let error = DnfPackageManager::query_output(failed).await.unwrap_err();
         assert!(error.to_string().ends_with("Repository is unavailable"));
+
+        let mut authenticated_mirror = tokio::process::Command::new("/bin/sh");
+        authenticated_mirror.stderr(std::process::Stdio::piped()).args([
+            "-c",
+            "printf '%s\n' 'Failed to load repository example: \"https://fixture-user:fixture-pass@mirror.example/repo?secret=fixture-token#fixture-fragment\"' >&2; exit 7",
+        ]);
+        let error = DnfPackageManager::query_output(authenticated_mirror)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("repository example"), "{error}");
+        assert!(error.contains("https://mirror.example/repo"), "{error}");
+        assert!(!error.contains("fixture-"), "{error}");
+
+        let mut over_budget = tokio::process::Command::new("/bin/sh");
+        over_budget.args([
+            "-c",
+            "printf '%s\n%s' 'Repository example refused' 'https://fixture-user:fixture-pass' >&2; head -c 65536 /dev/zero >&2; printf '@mirror.example\n' >&2; exit 7",
+        ]);
+        let error = DnfPackageManager::query_output(over_budget)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.ends_with("Repository example refused"), "{error}");
         Ok(())
     }
 
@@ -5470,6 +5668,19 @@ mod tests {
         .to_string();
         assert!(failure.contains("No match for argument: package"));
         assert!(failure.contains("--skip-unavailable"));
+
+        let mirror = "https://fixture-user:fixture-pass@mirror.example/repo?secret=fixture-token";
+        let message = format!("Repository example ({mirror})");
+        let failed_preview = preview(&output(7, "", &message)).unwrap_err().to_string();
+        let (plan, diagnostics) = preview(&output(
+            1,
+            &format!("{message}\n"),
+            &format!("{message}\n{abort}"),
+        ))?;
+        for text in [failed_preview, plan, diagnostics] {
+            assert!(text.contains("https://mirror.example/repo"), "{text}");
+            assert!(!text.contains("fixture-"), "{text}");
+        }
         Ok(())
     }
 

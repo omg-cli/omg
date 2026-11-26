@@ -67,9 +67,10 @@ jobs:
             exit 0
           fi
 
-          # Version tags are immutable. Validate every required workflow before
-          # creating a tag, so a failed candidate cannot consume a version.
-          python3 scripts/require-release-evidence.py "$GITHUB_SHA"
+          # Version tags are immutable. Verify the required workflows and all
+          # Linux archives before creating a tag.
+          python3 scripts/require-release-evidence.py "$GITHUB_SHA" \
+            --stage-linux "$RUNNER_TEMP/release-linux-preflight"
 
           require_current_main() {
             local live_main

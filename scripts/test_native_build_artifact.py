@@ -57,6 +57,110 @@ def bundle(provenance, payload, extra=None):
     return result.getvalue()
 
 
+class NativeReleaseStaging(unittest.TestCase):
+    repository = 'omg-cli/omg'
+    source = 'a' * 40
+    run_id = 123
+    attempt = 1
+
+    def setUp(self):
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.destination = self.root / 'candidate'
+        self.run = {
+            'id': self.run_id, 'run_attempt': self.attempt, 'workflow_id': 10,
+            'event': 'push', 'head_branch': 'main', 'head_sha': self.source,
+            'path': '.github/workflows/ci.yml', 'repository': {'id': 101, 'full_name': self.repository},
+            'status': 'completed', 'conclusion': 'success',
+            'created_at': '2026-06-01T00:00:00Z', 'run_started_at': '2026-06-01T00:00:01Z',
+        }
+        identity = dict(id=self.run_id, repository_id=101, head_repository_id=101,
+                        head_branch='main', head_sha=self.source)
+        self.rows = []
+        self.downloads = {}
+        for identifier, (distro, image) in enumerate(BUILD.RELEASE_IMAGES.items(), start=201):
+            _, provenance, payload = fixture(distro)
+            features = BUILD.FEATURES[distro]
+            provenance.update(image=image, features=features.split(','),
+                              cpu='x86-64-v2' if distro == 'arch' else 'generic',
+                              build_argv=BUILD.build_command(distro, features, {})[0])
+            content = bundle(provenance, payload)
+            self.rows.append(dict(id=identifier, name=f'native-release-{distro}-1',
+                                  digest='sha256:' + BUILD.sha256(content), size_in_bytes=len(content),
+                                  workflow_run=dict(identity), expired=False, created_at='2026-06-01T00:01:00Z'))
+            self.downloads[f'repos/{self.repository}/actions/artifacts/{identifier}/zip'] = content
+        self.lookup = self.enterContext(patch.object(BUILD, 'api_json', side_effect=self.metadata))
+        self.download = self.enterContext(patch.object(BUILD, 'download_artifact', side_effect=self.downloads.__getitem__))
+        source_files = {
+            self.source + ':Cargo.toml': '[package]\nversion = "1.2.3"\n',
+            self.source + ':rust-toolchain.toml': '[toolchain]\nchannel = "1.95.0"\n',
+        }
+        self.enterContext(patch.object(BUILD, 'command_output', side_effect=lambda argv: source_files[argv[-1]]))
+
+    def metadata(self, path):
+        if path.endswith('/workflows/ci.yml'):
+            return {'path': '.github/workflows/ci.yml', 'id': 10}
+        if path.endswith('/artifacts?per_page=100'):
+            return {'total_count': len(self.rows), 'artifacts': self.rows}
+        if path.endswith(f'/runs/{self.run_id}'):
+            return copy.deepcopy(self.run)
+        raise AssertionError(f'Unexpected metadata request {path}')
+
+    def stage(self):
+        return BUILD.stage_release(self.root, self.destination, self.repository,
+                                   self.source, self.run_id, self.attempt)
+
+    def test_one_successful_main_attempt_stages_all_five_archive_pairs(self):
+        self.stage()
+        self.assertEqual(self.download.call_count, 5)
+        self.assertEqual(sum(call.args[0].endswith('/artifacts?per_page=100')
+                             for call in self.lookup.call_args_list), 1)
+        receipt = json.loads((self.destination / 'native-release-provenance.json').read_text())
+        self.assertEqual(set(receipt['archives']), {'arch', 'debian', 'debian-trixie', 'ubuntu', 'fedora'})
+        for row, distro in zip(self.rows, BUILD.RELEASE_IMAGES, strict=True):
+            directory = self.destination / f'{distro}-build'
+            archive = directory / f'omg-v1.2.3-x86_64-linux-{distro}.tar.gz'
+            self.assertTrue(archive.is_file())
+            self.assertEqual({path.name for path in directory.iterdir()},
+                             {archive.name, archive.name + '.sha256'})
+            self.assertEqual(receipt['archives'][distro]['artifact_id'], row['id'])
+            self.assertEqual(receipt['archives'][distro]['archive_sha256'], BUILD.sha256(archive.read_bytes()))
+
+    def test_rejects_in_progress_failed_foreign_or_replaced_run(self):
+        original = dict(self.run)
+        for change in ({'status': 'in_progress', 'conclusion': None}, {'conclusion': 'failure'},
+                       {'head_branch': 'other'}, {'run_attempt': 2}):
+            with self.subTest(change=change):
+                self.run = dict(original, **change)
+                with self.assertRaises(ValueError):
+                    self.stage()
+        self.download.assert_not_called()
+        self.assertFalse(self.destination.exists())
+
+    def test_failed_last_archive_never_exposes_a_partial_batch(self):
+        self.rows[-1]['digest'] = 'sha256:' + '0' * 64
+        with self.assertRaisesRegex(ValueError, 'artifact digest'):
+            self.stage()
+        self.assertEqual(self.download.call_count, 5)
+        self.assertEqual(list(self.root.iterdir()), [])
+
+    def test_refuses_foreign_artifact_or_changed_attempt_after_download(self):
+        self.rows[0]['workflow_run']['head_sha'] = 'b' * 40
+        with self.assertRaisesRegex(ValueError, 'artifact identity'):
+            self.stage()
+        self.download.assert_not_called()
+        self.rows[0]['workflow_run']['head_sha'] = self.source
+        download = self.download.side_effect
+
+        def rerun_on_download(path):
+            self.run['run_attempt'] += 1
+            return download(path)
+
+        self.download.side_effect = rerun_on_download
+        with self.assertRaisesRegex(ValueError, 'attempt'):
+            self.stage()
+        self.assertEqual(list(self.root.iterdir()), [])
+
+
 class NativeBuildAdmission(unittest.TestCase):
     def test_inconsistent_artifact_snapshot_requests_fresh_complete_metadata(self):
         url = 'repos/omg-cli/omg/actions/runs/10/artifacts?per_page=100'

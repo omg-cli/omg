@@ -124,6 +124,7 @@ class ReleaseWorkflowBoundaryTests(unittest.TestCase):
             ('missing attempt', {'GITHUB_RUN_ATTEMPT': ''}, [], False, False),
             ('invalid publish input', {'PUBLISH_RELEASE': ''}, [], False, False),
             ('failed push CI', {'PUSH_CI': 'failure'}, all_lookups, False, False),
+            ('refused native archive', {'NATIVE_STAGE': 'failure'}, all_lookups, False, False),
             ('validation with failed CI', {'PUSH_CI': 'failure', 'PUBLISH_RELEASE': 'false'},
              all_lookups, False, False),
             ('drift before tag', {'BEFORE_TAG': 'drifted'}, all_lookups, False, False),
@@ -161,7 +162,9 @@ class ReleaseWorkflowBoundaryTests(unittest.TestCase):
                     'python3': f'if [ "$1" != {EVIDENCE_SCRIPT} ]; then\n'
                                '  touch advisory-status-called; exit 1\n'
                                'fi\nprintf "%s %s\\n" "$1" "$2" >> lookups\n'
-                               'test "$PUSH_CI" = success\n',
+                               'test "$PUSH_CI" = success || exit 1\n'
+                               '[ "$3" = --stage-linux ] || exit 2\n'
+                               'test "$NATIVE_STAGE" = success\n',
                 }
                 (root / 'scripts').mkdir()
                 for name, body in fixtures.items():
@@ -171,8 +174,9 @@ class ReleaseWorkflowBoundaryTests(unittest.TestCase):
                 env = dict(os.environ, PATH=str(root) + os.pathsep + os.environ['PATH'],
                            GITHUB_EVENT_NAME='workflow_dispatch', GITHUB_REF=main, GITHUB_SHA=sha,
                            GITHUB_RUN_ATTEMPT='1', GITHUB_STEP_SUMMARY=str(root / 'summary'),
+                           RUNNER_TEMP=str(root),
                            RELEASE_CANDIDATE=approved, BEFORE_TAG='current', AFTER_TAG='current',
-                           PUSH_CI='success', PUBLISH_RELEASE='true')
+                           PUSH_CI='success', NATIVE_STAGE='success', PUBLISH_RELEASE='true')
                 env.update(overrides)
                 result = subprocess.run([BASH, '-e', '-o', 'pipefail', '-c', script], cwd=root,
                                         env=env, capture_output=True, text=True, timeout=10)
@@ -185,7 +189,8 @@ class ReleaseWorkflowBoundaryTests(unittest.TestCase):
                     self.assertIn(f'v0.1.225 at {sha}', (root / 'summary').read_text())
                 self.assertFalse((root / 'advisory-status-called').exists())
                 reads = root / 'main-reads'
-                expected_reads = [env['BEFORE_TAG']] if expected_lookups and env['PUSH_CI'] == 'success' else []
+                preflight_passed = env['PUSH_CI'] == env['NATIVE_STAGE'] == 'success'
+                expected_reads = [env['BEFORE_TAG']] if expected_lookups and preflight_passed else []
                 if tagged:
                     expected_reads.append(env['AFTER_TAG'])
                 self.assertEqual(reads.read_text().splitlines() if reads.exists() else [], expected_reads)
@@ -235,6 +240,44 @@ class ReleaseWorkflowBoundaryTests(unittest.TestCase):
             self.assertIn('branches: [main]', push[1], workflow)
             self.assertNotRegex(push[1], r'paths(?:-ignore)?:', workflow)
 
+    def test_ci_archive_smoke_requires_a_dry_run_and_a_full_sha(self):
+        release = (WORKFLOWS / 'release.yml').read_text(encoding='utf-8')
+        gate = job_block(release, 'gate-on-ci')
+        script = step_script(gate, 'Require evidence for CI archive smoke')
+        preflight = "git() { printf 'git %s\\n' \"$*\"; }\npython3() { printf 'gate %s\\n' \"$*\"; }\n"
+        sha = 'a' * 40
+        for commit, dry_run, sync, expected in (
+            (sha, 'true', '', 0), (sha, 'false', '', 1),
+            (sha, 'true', 'v1.2.3', 1), ('$(touch injected)', 'true', '', 1),
+        ):
+            with self.subTest(commit=commit, dry_run=dry_run, sync=sync):
+                env = dict(os.environ, GITHUB_EVENT_NAME='workflow_dispatch',
+                           SMOKE_CI_SHA=commit, DRY_RUN=dry_run, SYNC_EXISTING_TAG=sync)
+                result = subprocess.run([BASH, '-eu', '-o', 'pipefail', '-c', preflight + script],
+                                        env=env, capture_output=True, text=True, timeout=15)
+                self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+                expected_gate = [] if expected else [f'gate {EVIDENCE_SCRIPT} {sha}']
+                self.assertEqual([line for line in result.stdout.splitlines() if line.startswith('gate ')],
+                                 expected_gate)
+        self.assertIn("if: inputs.smoke_ci_sha == ''", job_block(release, 'build-macos'))
+        self.assertIn("inputs.smoke_ci_sha == ''", job_block(release, 'sync-r2'))
+
+    def test_reused_linux_bytes_are_matched_before_attesting(self):
+        release = (WORKFLOWS / 'release.yml').read_text(encoding='utf-8')
+        gate = job_block(release, 'gate-on-ci')
+        for distro in ('arch', 'debian', 'debian-trixie', 'ubuntu', 'fedora'):
+            self.assertIn(f'name: {distro}-build\n          path: verified-linux/{distro}-build/', gate)
+            self.assertIn("if: needs.gate-on-ci.outputs.linux-version == ''",
+                          job_block(release, f'build-{distro}'))
+        publish = job_block(release, 'release')
+        match = 'Match release bytes to verified CI archives'
+        self.assertLess(publish.index('Collect and verify exact release files'), publish.index(match))
+        self.assertLess(publish.index(match), publish.index('Attest release archives and SBOM'))
+        self.assertIn('.source_sha == $sha', step_script(publish, match))
+        self.assertIn('sha256sum --strict --check', step_script(publish, match))
+        for state in ('failure', 'cancelled', 'skipped'):
+            self.assertIn(f"!contains(needs.*.result, '{state}')", publish)
+
     def test_every_rebuilt_release_platform_is_smoked_before_publication(self):
         release = (WORKFLOWS / 'release.yml').read_text(encoding='utf-8')
         publish = job_block(release, 'release')
@@ -245,7 +288,9 @@ class ReleaseWorkflowBoundaryTests(unittest.TestCase):
             with self.subTest(distro=distro):
                 linux = job_block(release, f'smoke-{distro}')
                 other = 'fedora' if distro == 'arch' else 'arch'
-                self.assertIn(f'needs: build-{distro}', linux)
+                self.assertIn(f'needs: [gate-on-ci, build-{distro}]', linux)
+                self.assertIn("needs.gate-on-ci.result == 'success'", linux)
+                self.assertIn(f"needs.build-{distro}.result == 'success'", linux)
                 self.assertNotIn(f'build-{other}', linux)
                 self.assertIn(f'name: {distro}-build', linux)
                 self.assertIn('--staged-dir staged-release', linux)
@@ -268,11 +313,13 @@ class ReleaseWorkflowBoundaryTests(unittest.TestCase):
         ):
             with self.subTest(job=job):
                 smoke = job_block(release, job)
-                self.assertEqual(re.search(r'^    needs: (.+)$', smoke, re.M)[1], build)
+                self.assertEqual(re.search(r'^    needs: (.+)$', smoke, re.M)[1],
+                                 f'[gate-on-ci, {build}]')
+                self.assertIn(f"needs.{build}.result == 'success'", smoke)
+                self.assertIn("needs.gate-on-ci.result == 'success'", smoke)
                 self.assertIn(f'name: {artifact}', smoke)
                 self.assertIn('if: always()', smoke)
                 self.assertIn(job, publish)
-                self.assertIn(build, publish)
         for build in ('build-debian', 'build-ubuntu', 'build-debian-trixie'):
             self.assertEqual(re.search(r'^    needs: (.+)$', job_block(release, build), re.M)[1],
                              'gate-on-ci')
