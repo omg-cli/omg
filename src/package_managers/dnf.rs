@@ -667,10 +667,21 @@ impl Default for DnfPackageManager {
 
 impl DnfPackageManager {
     async fn compare_native_evrs(pairs: &[(String, String)]) -> Result<Vec<i32>> {
+        const MAX_INPUT_BYTES: usize = 64 * 1024;
         let mut results = Vec::with_capacity(pairs.len());
-        for chunk in pairs.chunks(128) {
+        let mut pairs = pairs.iter().peekable();
+        while pairs.peek().is_some() {
             let mut input = String::new();
-            for (left, right) in chunk {
+            let mut pair_count = 0;
+            while let Some((left, right)) = pairs.peek() {
+                let pair_bytes = left.len() + right.len() + 2;
+                anyhow::ensure!(
+                    pair_bytes <= MAX_INPUT_BYTES,
+                    "Native RPM comparison input exceeds limit"
+                );
+                if input.len() + pair_bytes > MAX_INPUT_BYTES {
+                    break;
+                }
                 anyhow::ensure!(
                     [left, right]
                         .iter()
@@ -681,11 +692,9 @@ impl DnfPackageManager {
                 input.push('\n');
                 input.push_str(right);
                 input.push('\n');
+                let _ = pairs.next();
+                pair_count += 1;
             }
-            anyhow::ensure!(
-                input.len() <= 64 * 1024,
-                "Native RPM comparison input exceeds limit"
-            );
             let mut command = Self::rpm_query_command()?;
             command.env("OMG_EVR_PAIRS", input).args(["--eval", r#"%{lua:local left=nil; for value in string.gmatch(os.getenv("OMG_EVR_PAIRS"), "[^\n]+") do if left then print(string.format("%d\n",rpm.vercmp(left,value))); left=nil else left=value end end; if left then error("incomplete comparison") end}"#]);
             let output = Self::controlled_query_output(
@@ -707,7 +716,7 @@ impl DnfPackageManager {
                 })
                 .collect::<Result<Vec<_>>>()?;
             anyhow::ensure!(
-                compared.len() == chunk.len(),
+                compared.len() == pair_count,
                 "Incomplete native RPM version comparisons"
             );
             results.extend(compared);
@@ -4216,6 +4225,20 @@ mod tests {
         assert_eq!(&compared[..4], &[1, -1, 0, -1]);
         assert_eq!(compared[128], -1);
         assert!(compared[4..128].iter().all(|value| *value == 0));
+
+        let version = "123456789.".repeat(52);
+        let older = format!("{version}1-1.fc44");
+        let newer = format!("{version}2-1.fc44");
+        let mut larger = vec![(older.clone(), newer.clone()); 129];
+        larger[61] = (newer.clone(), older.clone());
+        larger[62] = (newer.clone(), newer);
+        let mut expected = vec![-1; larger.len()];
+        expected[61] = 1;
+        expected[62] = 0;
+        assert_eq!(
+            DnfPackageManager::compare_native_evrs(&larger).await?,
+            expected
+        );
         assert!(
             DnfPackageManager::compare_native_evrs(&[("1.0\n2.0".into(), "3.0".into())])
                 .await

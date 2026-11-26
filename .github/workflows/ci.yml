@@ -1231,7 +1231,8 @@ jobs:
 
       - name: Run unit tests
         if: matrix.phase == 'validation'
-        run: python3 scripts/run-native-contracts.py --features ${{ matrix.features }}
+        # Debian's benchmark uses the default profile and shares its dependencies here.
+        run: python3 scripts/run-native-contracts.py --features ${{ matrix.features }} --cargo-profile ${{ matrix.platform == 'debian' && 'test' || 'ci' }}
 
       - name: Build release
         if: matrix.phase == 'validation' && matrix.platform != 'ubuntu-2604'
@@ -1298,7 +1299,7 @@ jobs:
       - name: Test emitted shell hooks
         if: matrix.phase == 'validation' && matrix.platform == 'fedora'
         env:
-          OMG_HOOK_TEST_BINARY: ${{ github.workspace }}/target/debug/omg
+          OMG_HOOK_TEST_BINARY: ${{ github.workspace }}/target/ci/omg
           OMG_HOOK_TEST_REQUIRE_SHELLS: bash,zsh,fish
         run: |
           test -x "$OMG_HOOK_TEST_BINARY"
@@ -1313,10 +1314,11 @@ jobs:
           set -euo pipefail
           if [[ '${{ matrix.platform }}' == fedora ]]; then
             cargo test --lib --bins --no-default-features --features ${{ matrix.features }} \
-              --locked --no-fail-fast --message-format=json -- --test-threads=1 \
+              --profile ci --locked --no-fail-fast --message-format=json -- --test-threads=1 \
               | tee target/fedora-serial-libtest.jsonl
           else
-            cargo test --lib --bins --no-default-features --features ${{ matrix.features }} --locked --no-fail-fast -- --test-threads=1
+            cargo test --lib --bins --no-default-features --features ${{ matrix.features }} \
+              --profile ${{ matrix.platform == 'debian' && 'test' || 'ci' }} --locked --no-fail-fast -- --test-threads=1
           fi
 
       - name: Native Fedora ignored integration fixtures
@@ -1337,7 +1339,7 @@ jobs:
           [[ "$status" == 0 ]] || exit "$status"
           timeout --kill-after=5s 140s python3 -I -B scripts/run-fedora-ignored-integrations.py \
             --artifacts target/fedora-serial-libtest.jsonl --features '${{ matrix.features }}' \
-            --evidence-dir "$FEDORA_IGNORED_EVIDENCE_DIR/fixture"
+            --cargo-profile ci --evidence-dir "$FEDORA_IGNORED_EVIDENCE_DIR/fixture"
           test -s "$FEDORA_IGNORED_EVIDENCE_DIR/fixture/receipt.json"
 
       - name: Upload native Fedora ignored integration evidence
@@ -1365,7 +1367,7 @@ jobs:
         run: |
           set -euo pipefail
           binary=$(cargo test --lib --no-run --no-default-features --features arch,pgp,license \
-            --locked --message-format=json | jq -r \
+            --profile ci --locked --message-format=json | jq -r \
             'select(.reason == "compiler-artifact" and .target.name == "omg_lib" and .profile.test) | .executable // empty')
           test -n "$binary"
           install -Dm755 "$binary" target/sandbox-test/omg-lib-tests
@@ -1435,7 +1437,7 @@ jobs:
             cargo_source=(--config "$RUNNER_TEMP/omg-alpm-source/cargo-config.toml")
           fi
           cargo clippy --all-targets --no-default-features --features ${{ matrix.features }} \
-            "${cargo_source[@]}" --locked -- -D warnings
+            "${cargo_source[@]}" --profile ${{ matrix.platform == 'debian' && 'dev' || 'ci' }} --locked -- -D warnings
 
       - name: Record native Clippy execution
         if: always()
@@ -1812,8 +1814,7 @@ jobs:
         env:
           ZSTD_CLEVEL: "6"
         with:
-          # v1 repeatedly missed restoration but could not reserve its key.
-          # Keep dependency compatibility hashes; recover in a fresh namespace.
+          # Keep the dependency optimizations required by the bounded Python fixture.
           prefix-key: "v2-macos-dependencies"
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -2097,7 +2098,7 @@ jobs:
       - name: Platform clippy
         run: |
           cargo clippy --all-targets --no-default-features --features debian,pgp,license \
-            --locked -- -D warnings
+            --profile ci --locked -- -D warnings
 
       - name: Install nextest
         uses: taiki-e/install-action@e67fa11c4b9316fa714ddf0abed07a0c3143b95b # v2.87.4
@@ -2110,10 +2111,10 @@ jobs:
         run: timeout -k 5s 180s python3 scripts/prepare-node-test-fixture.py --destination "$RUNNER_TEMP/node-test-fixture"
 
       - name: Run unit tests
-        run: python3 scripts/run-native-contracts.py --features debian,pgp,license
+        run: python3 scripts/run-native-contracts.py --features debian,pgp,license --cargo-profile ci
 
       - name: Run serial library and binary contracts
-        run: cargo test --lib --bins --no-default-features --features debian,pgp,license --locked --no-fail-fast -- --test-threads=1
+        run: cargo test --lib --bins --no-default-features --features debian,pgp,license --profile ci --locked --no-fail-fast -- --test-threads=1
 
       - name: Verify binary
         run: |

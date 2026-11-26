@@ -754,7 +754,8 @@ class LibraryIdentity(unittest.TestCase):
             try:
                 os.chdir(root)
                 with patch.dict(os.environ, environment, clear=True), \
-                        patch.object(sys, 'argv', ['run-native-contracts.py', '--features', 'fedora,pgp,license']), \
+                        patch.object(sys, 'argv', ['run-native-contracts.py', '--features', 'fedora,pgp,license',
+                                                   '--cargo-profile', 'ci']), \
                         patch.object(NATIVE.sys, 'platform', 'win32'), \
                         patch.object(NATIVE.platform, 'machine', return_value='AMD64'), \
                         patch.object(NATIVE.subprocess, 'run', side_effect=command), \
@@ -780,6 +781,9 @@ class LibraryIdentity(unittest.TestCase):
         result = self.exercise()
         self.assertEqual(result['status'], 0, result['stderr'])
         self.assertEqual(result['events'], ['list', 'run'])
+        args = result['evidence']['recipe.json']['args']
+        self.assertEqual(args[args.index('--profile') + 1], 'ci')
+        self.assertEqual(args[args.index('--cargo-profile') + 1], 'ci')
         self.assertIn('library-identity.json', result['evidence'])
         receipt = result['evidence']['library-identity.json']
         self.assertEqual(receipt.get('subject_kind'), 'nextest-library-test-harness')
