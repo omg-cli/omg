@@ -168,6 +168,14 @@ pub(crate) async fn update_official_only(
     mode: UpdateMode,
 ) -> Result<()> {
     let pm = crate::package_managers::get_package_manager()?;
+    let daemon_updates = async {
+        // DNF keeps metadata in the caller's cache. Even a same-user daemon
+        // can have a different home and therefore a different update list.
+        if pm.name() == "dnf" {
+            return None;
+        }
+        try_daemon_list_updates().await
+    };
 
     // Preview modes must not mutate repository metadata or request elevation.
     // Keep this consistent with the Arch update lane.
@@ -196,7 +204,7 @@ pub(crate) async fn update_official_only(
 
     let check_start = std::time::Instant::now();
     let official_updates = if use_cached {
-        match try_daemon_list_updates().await {
+        match daemon_updates.await {
             Some(updates) => updates,
             None => pm.list_updates().await?,
         }
@@ -210,7 +218,7 @@ pub(crate) async fn update_official_only(
         official_updates_after_sync(
             pm.as_ref(),
             refresh_daemon_index_after_sync(),
-            try_daemon_list_updates(),
+            daemon_updates,
         )
         .await?
     };

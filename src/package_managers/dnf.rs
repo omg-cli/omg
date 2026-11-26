@@ -397,6 +397,7 @@ enum RepositoryQuery<'a> {
 }
 
 const REQUIRE_ALL_REPOSITORIES: &str = "--setopt=*.skip_if_unavailable=false";
+const CACHED_UPGRADE_METADATA: &str = "--setopt=cacheonly=metadata";
 
 const UPGRADE_QUERY_ARGS: [&str; 6] = [
     "--quiet",
@@ -470,7 +471,9 @@ impl PreparedDnfRemoval {
 
 enum DnfAdmission<'a> {
     Install,
-    Upgrade,
+    Upgrade {
+        cached: bool,
+    },
     Remove {
         packages: &'a [String],
         comment: Option<&'a str>,
@@ -889,7 +892,7 @@ impl DnfPackageManager {
         .map(|_| ())
     }
     fn cached_update_args() -> Vec<String> {
-        ["--setopt=cacheonly=metadata", "upgrade", "-y"]
+        [CACHED_UPGRADE_METADATA, "upgrade", "-y"]
             .into_iter()
             .map(str::to_owned)
             .collect()
@@ -2717,7 +2720,7 @@ impl DnfPackageManager {
         }
         let cached = remaining
             .first()
-            .is_some_and(|value| value == "--setopt=cacheonly=metadata");
+            .is_some_and(|value| value == CACHED_UPGRADE_METADATA);
         if cached {
             remaining = &remaining[1..];
         }
@@ -2762,7 +2765,7 @@ impl DnfPackageManager {
         );
         Self::validate_install_selectors(packages)?;
         if action == "upgrade" {
-            Ok(DnfAdmission::Upgrade)
+            Ok(DnfAdmission::Upgrade { cached })
         } else {
             Ok(DnfAdmission::Install)
         }
@@ -2777,7 +2780,7 @@ impl DnfPackageManager {
         );
         let manager = Self::new();
         match Self::admission_request(args)? {
-            DnfAdmission::Install | DnfAdmission::Upgrade => {
+            DnfAdmission::Install | DnfAdmission::Upgrade { .. } => {
                 manager.execute_reviewed_transaction(args).await
             }
             DnfAdmission::Remove {
@@ -2804,11 +2807,20 @@ impl DnfPackageManager {
     }
 
     async fn execute_reviewed_transaction(&self, args: &[String]) -> Result<()> {
-        let action = Self::admission_request(args)?;
-        anyhow::ensure!(
-            matches!(action, DnfAdmission::Install | DnfAdmission::Upgrade),
-            "DNF install/upgrade admission requires an install or upgrade"
-        );
+        let (prepare_options, replay_options): (&[&str], &'static [&'static str]) =
+            match Self::admission_request(args)? {
+                DnfAdmission::Install => (&[], &[]),
+                DnfAdmission::Upgrade { cached: false } => {
+                    (&[REQUIRE_ALL_REPOSITORIES], &[REQUIRE_ALL_REPOSITORIES])
+                }
+                DnfAdmission::Upgrade { cached: true } => (
+                    &[REQUIRE_ALL_REPOSITORIES],
+                    &[REQUIRE_ALL_REPOSITORIES, CACHED_UPGRADE_METADATA],
+                ),
+                DnfAdmission::Remove { .. } => {
+                    anyhow::bail!("DNF install/upgrade admission requires an install or upgrade");
+                }
+            };
         crate::core::security::policy::require_native_plan_support("DNF")?;
         anyhow::ensure!(
             is_root(),
@@ -2816,10 +2828,8 @@ impl DnfPackageManager {
         );
         let directory = Self::removal_preview_directory()?;
         let mut command: tokio::process::Command = Self::native_package_command("dnf")?.into();
-        if matches!(action, DnfAdmission::Upgrade) {
-            command.arg(REQUIRE_ALL_REPOSITORIES);
-        }
         command
+            .args(prepare_options)
             .args(args)
             .arg(format!("--store={}", directory.path().display()));
         let Some((directory, bytes)) =
@@ -2857,7 +2867,7 @@ impl DnfPackageManager {
             .first()
             .filter(|value| value.starts_with("--comment=omg-"))
             .cloned();
-        self.replay_stored_transaction(directory, &[], comment)
+        self.replay_stored_transaction(directory, replay_options, comment)
             .await
     }
 
