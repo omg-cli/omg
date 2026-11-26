@@ -83,7 +83,13 @@ pub(crate) async fn review_fedora_removal(
 ) -> Result<Option<crate::package_managers::dnf::PreparedDnfRemoval>> {
     use crate::package_managers::DnfPackageManager;
 
-    let plan = DnfPackageManager::prepare_removal(packages).await?;
+    let Some(plan) = DnfPackageManager::prepare_removal(packages)
+        .await?
+        .filter(|plan| !plan.packages().is_empty())
+    else {
+        crate::cli::modern_ui::print_info("DNF reported no packages to remove");
+        return Ok(None);
+    };
     generic::report_preview(plan.packages(), true, dry_run);
     if dry_run {
         return Ok(None);

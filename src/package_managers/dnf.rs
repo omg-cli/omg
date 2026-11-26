@@ -766,10 +766,12 @@ impl DnfPackageManager {
     }
 
     async fn simulate_removal(packages: &[String]) -> Result<Vec<super::types::RemovalPackage>> {
-        Ok(Self::prepare_removal(packages).await?.packages)
+        Ok(Self::prepare_removal(packages)
+            .await?
+            .map_or_else(Vec::new, |plan| plan.packages))
     }
 
-    pub(crate) async fn prepare_removal(packages: &[String]) -> Result<PreparedDnfRemoval> {
+    pub(crate) async fn prepare_removal(packages: &[String]) -> Result<Option<PreparedDnfRemoval>> {
         Self::validate_package_selectors(packages)?;
         let directory = Self::removal_preview_directory()?;
         let mut command =
@@ -784,15 +786,18 @@ impl DnfPackageManager {
                 format!("--store={}", directory.path().display()),
             ])
             .args(packages);
-        let (directory, bytes) =
+        let Some((directory, bytes)) =
             Self::owned_stored_transaction(command, directory, std::time::Duration::from_mins(1))
                 .await
-                .context("Could not simulate removal with DNF5 --store")?;
+                .context("Could not simulate removal with DNF5 --store")?
+        else {
+            return Ok(None);
+        };
         let packages = Self::parse_removal_plan(&bytes)?;
-        Ok(PreparedDnfRemoval {
+        Ok(Some(PreparedDnfRemoval {
             directory,
             packages,
-        })
+        }))
     }
 
     pub(crate) async fn replay_removal(
@@ -1920,15 +1925,16 @@ impl DnfPackageManager {
     }
 
     async fn owned_stored_transaction(
-        command: tokio::process::Command,
+        mut command: tokio::process::Command,
         directory: tempfile::TempDir,
         deadline: std::time::Duration,
-    ) -> Result<(tempfile::TempDir, Vec<u8>)> {
+    ) -> Result<Option<(tempfile::TempDir, Vec<u8>)>> {
         let (cancel, cancelled) = tokio::sync::oneshot::channel();
         let _cancel_on_drop = CancelStoredQuery(Some(cancel));
+        command.env("LC_ALL", "C");
         tokio::task::spawn_blocking(move || -> Result<_> {
             use std::io::Read;
-            tokio::runtime::Builder::new_current_thread()
+            let output = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()?
                 .block_on(Self::controlled_query_output(
@@ -1937,19 +1943,31 @@ impl DnfPackageManager {
                     deadline,
                     Some(cancelled),
                 ))?;
-            let file = std::fs::File::open(directory.path().join("transaction.json"))
-                .context("DNF5 did not store a transaction")?;
+            let path = directory.path().join("transaction.json");
+            let metadata = match path.symlink_metadata() {
+                // DNF returns before storing a manifest when the solver's
+                // transaction is empty. Other missing manifests are errors.
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::NotFound
+                        && output.trim_ascii() == b"Nothing to do." =>
+                {
+                    return Ok(None);
+                }
+                result => result.context("DNF5 did not store a transaction")?,
+            };
             anyhow::ensure!(
-                file.metadata()?.is_file(),
+                metadata.is_file(),
                 "DNF stored transaction is not a regular file"
             );
+            let file =
+                std::fs::File::open(path).context("Cannot read the stored DNF transaction")?;
             let mut bytes = Vec::new();
             file.take(64 * 1024 * 1024 + 1).read_to_end(&mut bytes)?;
             anyhow::ensure!(
                 bytes.len() <= 64 * 1024 * 1024,
                 "DNF stored transaction exceeds 64 MiB"
             );
-            Ok((directory, bytes))
+            Ok(Some((directory, bytes)))
         })
         .await
         .context("DNF stored transaction owner failed")?
@@ -2479,10 +2497,14 @@ impl DnfPackageManager {
         command
             .args(args)
             .arg(format!("--store={}", directory.path().display()));
-        let (directory, bytes) =
+        let Some((directory, bytes)) =
             Self::owned_stored_transaction(command, directory, std::time::Duration::from_mins(30))
                 .await
-                .context("Could not prepare a stored DNF5 installation transaction")?;
+                .context("Could not prepare a stored DNF5 installation transaction")?
+        else {
+            crate::cli::modern_ui::print_info("DNF reported no package changes");
+            return Ok(());
+        };
         let inventory = Self::proposed_inventory(&bytes)?;
         if inventory.is_empty() {
             return Ok(());
@@ -5321,6 +5343,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stored_query_accepts_a_missing_manifest_only_for_native_noop() -> Result<()> {
+        for (script, no_changes) in [
+            ("printf 'Nothing to do.\\n'", true),
+            ("printf 'Preparing transaction\\n'", false),
+            ("printf 'Nothing to do.\\n'; exit 1", false),
+            (
+                "mkdir \"$1/transaction.json\"; printf 'Nothing to do.\\n'",
+                false,
+            ),
+        ] {
+            let directory = tempfile::tempdir()?;
+            let path = directory.path().to_owned();
+            let mut command = tokio::process::Command::new("/bin/sh");
+            command.args(["-c", script, "--"]).arg(&path);
+            let result = DnfPackageManager::owned_stored_transaction(
+                command,
+                directory,
+                std::time::Duration::from_secs(5),
+            )
+            .await;
+            if no_changes {
+                assert!(result?.is_none());
+            } else {
+                assert!(result.is_err(), "{script}");
+            }
+            assert!(!path.exists(), "{script}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn stored_query_returns_owned_namespace_and_exact_manifest_after_child_exit() -> Result<()>
     {
         let directory = tempfile::tempdir()?;
@@ -5338,7 +5391,8 @@ mod tests {
             directory,
             std::time::Duration::from_secs(5),
         )
-        .await?;
+        .await?
+        .context("expected a stored transaction")?;
         assert_eq!(bytes, b"stored bytes");
         assert!(path.is_dir());
         drop(directory);

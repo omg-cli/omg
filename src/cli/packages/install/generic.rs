@@ -53,7 +53,7 @@ pub async fn install(packages: &[String]) -> Result<()> {
 
     modern_ui::print_success_with_packages(
         &format!(
-            "Installed {} {}",
+            "Install request complete for {} {}",
             packages.len(),
             if packages.len() == 1 {
                 "package"
