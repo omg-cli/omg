@@ -9,10 +9,11 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
-#[cfg(feature = "arch")]
-use crate::cli::security::LicenseCategory;
-use crate::cli::security::spreadsheet_safe_cell;
+use crate::cli::security::{LicenseCategory, spreadsheet_safe_cell};
+use crate::cli::style::sanitize_terminal_text;
+use crate::core::env::distro::Distro;
 use crate::core::license;
+use crate::package_managers::types::SecurityPackage;
 
 fn artifact_stamp() -> String {
     format!(
@@ -35,9 +36,9 @@ impl LocalCommandRunner for EnterpriseCommands {
                 framework,
                 period,
                 output,
-            } => audit_export(framework.as_str(), period.as_deref(), output, ctx),
+            } => audit_export(framework.as_str(), period.as_deref(), output, ctx).await,
             EnterpriseCommands::LicenseScan { export } => {
-                license_scan(export.as_ref().map(|value| value.as_str()), ctx)
+                license_scan(export.as_ref().map(|value| value.as_str()), ctx).await
             }
         }
     }
@@ -87,7 +88,7 @@ pub async fn reports(report_type: &str, _ctx: &CliContext) -> Result<()> {
 }
 
 /// Export audit evidence for compliance
-pub fn audit_export(
+pub async fn audit_export(
     format: &str,
     period: Option<&str>,
     output: &str,
@@ -109,14 +110,20 @@ pub fn audit_export(
     )))?;
 
     let period_str = period.unwrap_or("current");
-    // Resolve every source before creating the export directory. An
-    // unsupported backend must not leave a misleading empty evidence path.
+    // Generate both inventory documents from the same installed package observation.
+    let (distro, inventory) = collect_compliance_inventory().await?;
+    let sbom = crate::core::security::sbom::from_installed_inventory(&inventory, distro)?;
+    let inventory_csv =
+        serialize_installed_packages_csv_rows(inventory.into_iter().map(|package| {
+            let name = inventory_package_name(&package, distro);
+            (name, package.version, package.description)
+        }))?;
     let files = vec![
         ("limitations.json", generate_audit_export_limitations()?),
         ("change-log.json", generate_change_log_json()?),
         ("policy-enforcement.json", generate_policy_json()?),
-        ("installed-packages.csv", generate_installed_packages_csv()?),
-        ("sbom-inventory.json", generate_sbom_json()?),
+        ("installed-packages.csv", inventory_csv),
+        ("sbom-inventory.json", serde_json::to_string_pretty(&sbom)?),
     ];
     fs::create_dir_all(output)?;
 
@@ -150,7 +157,7 @@ pub fn audit_export(
 }
 
 /// Scan for license compliance issues
-pub fn license_scan(export: Option<&str>, _ctx: &CliContext) -> Result<()> {
+pub async fn license_scan(export: Option<&str>, _ctx: &CliContext) -> Result<()> {
     use crate::cli::packages::execute_cmd;
 
     if let Some(fmt) = export {
@@ -161,7 +168,8 @@ pub fn license_scan(export: Option<&str>, _ctx: &CliContext) -> Result<()> {
         }
     }
 
-    let scan = perform_license_scan()?;
+    let (distro, inventory) = collect_compliance_inventory().await?;
+    let scan = perform_license_scan(inventory, distro);
 
     // Display results. Percentages are license assignments over all observed
     // assignments, not packages: a package may legitimately declare more than
@@ -170,12 +178,16 @@ pub fn license_scan(export: Option<&str>, _ctx: &CliContext) -> Result<()> {
 
     let mut violations = vec![];
     for violation in &scan.violations {
-        violations.push(format!("{} - {}", violation.package, violation.reason));
+        violations.push(format!(
+            "{} - {}",
+            sanitize_terminal_text(&violation.package),
+            violation.reason
+        ));
     }
 
     let mut unknown = vec![];
     for pkg in scan.unknown.iter().take(5) {
-        unknown.push(pkg.clone());
+        unknown.push(sanitize_terminal_text(pkg));
     }
     if scan.unknown.len() > 5 {
         unknown.push(format!("... and {} more", scan.unknown.len() - 5));
@@ -217,7 +229,7 @@ pub fn license_scan(export: Option<&str>, _ctx: &CliContext) -> Result<()> {
                 } else {
                     serde_json::to_string_pretty(&scan)?
                 };
-                crate::core::safe_ops::atomic_write_file_sync(&filename, content)?;
+                crate::core::safe_ops::atomic_write_file_sync_private(&filename, content)?;
                 Cmd::success(format!("Exported to {filename}"))
             }])
         } else {
@@ -375,7 +387,6 @@ fn generate_policy_json() -> Result<String> {
     serde_json::to_string_pretty(&policy).context("Failed to serialize security policy")
 }
 
-#[cfg(any(feature = "arch", test))]
 fn serialize_installed_packages_csv_rows(
     rows: impl IntoIterator<Item = (String, String, String)>,
 ) -> Result<String> {
@@ -393,52 +404,34 @@ fn serialize_installed_packages_csv_rows(
     String::from_utf8(bytes).context("Installed-package CSV was not UTF-8")
 }
 
-fn generate_installed_packages_csv() -> Result<String> {
-    #[cfg(feature = "arch")]
-    {
-        let packages = crate::package_managers::list_installed_fast()
-            .context("Failed to list installed packages for enterprise export")?;
-        serialize_installed_packages_csv_rows(packages.into_iter().map(|package| {
-            (
-                package.name,
-                package.version.to_string(),
-                package.description,
-            )
-        }))
-    }
+async fn collect_compliance_inventory() -> Result<(Distro, Vec<SecurityPackage>)> {
+    #[cfg(any(feature = "arch", feature = "fedora"))]
+    use crate::package_managers::Backend;
 
-    #[cfg(not(feature = "arch"))]
-    {
-        anyhow::bail!("Installed-package export requires the Arch package backend");
-    }
+    tokio::task::spawn_blocking(|| match crate::package_managers::resolve_backend()? {
+        #[cfg(feature = "fedora")]
+        Backend::Fedora => Ok((
+            Distro::Fedora,
+            crate::package_managers::DnfPackageManager::new().installed_compliance_inventory()?,
+        )),
+        #[cfg(feature = "arch")]
+        Backend::Arch | Backend::Mock => Ok((
+            Distro::Arch,
+            crate::package_managers::alpm_direct::security_inventory()?,
+        )),
+        backend => {
+            anyhow::bail!("Native installed compliance inventory is unavailable for {backend:?}")
+        }
+    })
+    .await
+    .context("Installed inventory worker failed")?
 }
 
-fn generate_sbom_json() -> Result<String> {
-    #[cfg(feature = "arch")]
-    {
-        let packages = crate::package_managers::list_installed_fast()
-            .context("Failed to list installed packages for SBOM export")?;
-        let components: Vec<serde_json::Value> = packages
-            .into_iter()
-            .map(|pkg| {
-                serde_json::json!({
-                    "type": "library",
-                    "name": pkg.name,
-                    "version": pkg.version.to_string(),
-                    "description": pkg.description,
-                })
-            })
-            .collect();
-        serde_json::to_string_pretty(&serde_json::json!({
-            "bomFormat": "CycloneDX",
-            "specVersion": "1.5",
-            "version": 1,
-            "components": components,
-        }))
-        .context("Failed to serialize SBOM inventory")
+fn inventory_package_name(package: &SecurityPackage, distro: Distro) -> String {
+    match (distro, package.architecture.as_deref()) {
+        (Distro::Fedora, Some(architecture)) => format!("{}.{architecture}", package.name),
+        _ => package.name.clone(),
     }
-    #[cfg(not(feature = "arch"))]
-    anyhow::bail!("SBOM inventory export requires the Arch package backend")
 }
 
 #[derive(Debug, Serialize)]
@@ -463,22 +456,7 @@ struct LicenseViolation {
     reason: String,
 }
 
-/// Reason text for a license that needs legal review, or `None` when the
-/// license does not require review.
-///
-/// This deliberately shares `LicenseCategory::from_license` with `omg audit`
-/// (src/cli/security.rs) so both commands agree on what counts as copyleft.
-/// A previous `"GPL" in <uppercase>` substring test misreported three ways: it
-/// understated AGPL as plain copyleft, missed MPL-2.0 entirely because "MPL"
-/// has no "GPL" substring, and only caught LGPL by accident because "GPL" is a
-/// substring of "LGPL-2.1" while still naming GPL in the reason.
-///
-/// `scripts/qemu-license-oracle.py` mirrors this mapping.
-///
-/// Gated to the `arch` feature because its only caller is the ALPM-backed
-/// scan below; without this the function is dead code on every other backend
-/// and `clippy -D warnings` fails the debian, fedora and macOS lanes.
-#[cfg(feature = "arch")]
+/// Keep license classification consistent with the audit command.
 fn enterprise_license_review_reason(license: &str) -> Option<&'static str> {
     match LicenseCategory::from_license(license) {
         LicenseCategory::StrongCopyleft => {
@@ -489,58 +467,39 @@ fn enterprise_license_review_reason(license: &str) -> Option<&'static str> {
     }
 }
 
-fn perform_license_scan() -> Result<LicenseScan> {
-    #[cfg(not(feature = "arch"))]
-    anyhow::bail!("Enterprise license scan requires the Arch package backend");
-
-    #[cfg(feature = "arch")]
-    {
-        anyhow::ensure!(
-            matches!(
-                crate::package_managers::resolve_backend()?,
-                crate::package_managers::Backend::Arch | crate::package_managers::Backend::Mock
-            ),
-            "Enterprise license scanning through ALPM requires an Arch host"
-        );
-        let packages = crate::package_managers::pacman_db::list_local_cached()
-            .context("Failed to list installed packages for license scan")?;
-        let mut by_license: HashMap<String, usize> = HashMap::new();
-        let mut violations: Vec<LicenseViolation> = Vec::new();
-        let mut unknown: Vec<String> = Vec::new();
-        let mut unresolved_review = Vec::new();
-        let total = packages.len();
-        for pkg in packages {
-            if pkg.licenses.is_empty() {
-                unknown.push(pkg.name.clone());
-            } else {
-                for lic in &pkg.licenses {
-                    *by_license.entry(lic.clone()).or_insert(0) += 1;
-                    if crate::core::security::policy::assess_license_expression(lic)
-                        .unresolved_review
-                    {
-                        unresolved_review.push(LicenseReview {
-                            package: pkg.name.clone(),
-                            license: lic.clone(),
-                        });
-                    }
-                    if let Some(reason) = enterprise_license_review_reason(lic) {
-                        violations.push(LicenseViolation {
-                            package: pkg.name.clone(),
-                            license: lic.clone(),
-                            reason: reason.to_string(),
-                        });
-                    }
-                }
-            }
+fn perform_license_scan(packages: Vec<SecurityPackage>, distro: Distro) -> LicenseScan {
+    let mut scan = LicenseScan {
+        total: packages.len(),
+        by_license: HashMap::new(),
+        violations: Vec::new(),
+        unknown: Vec::new(),
+        unresolved_review: Vec::new(),
+    };
+    for package in packages {
+        let name = inventory_package_name(&package, distro);
+        if package.licenses.is_empty() {
+            scan.unknown.push(name);
+            continue;
         }
-        Ok(LicenseScan {
-            total,
-            by_license,
-            violations,
-            unknown,
-            unresolved_review,
-        })
+        for license in package.licenses {
+            if crate::core::security::policy::assess_license_expression(&license).unresolved_review
+            {
+                scan.unresolved_review.push(LicenseReview {
+                    package: name.clone(),
+                    license: license.clone(),
+                });
+            }
+            if let Some(reason) = enterprise_license_review_reason(&license) {
+                scan.violations.push(LicenseViolation {
+                    package: name.clone(),
+                    license: license.clone(),
+                    reason: reason.to_owned(),
+                });
+            }
+            *scan.by_license.entry(license).or_default() += 1;
+        }
     }
+    scan
 }
 
 fn license_inventory_rows(scan: &LicenseScan) -> Vec<String> {
@@ -561,6 +520,7 @@ fn license_inventory_rows(scan: &LicenseScan) -> Vec<String> {
             } else {
                 ""
             };
+            let license = sanitize_terminal_text(license);
             format!("{license}: {count} assignments ({percentage:.0}%){review}")
         })
         .collect::<Vec<_>>();
@@ -725,7 +685,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "arch")]
     fn enterprise_review_reason_classifies_the_copyleft_family() {
         // The three cases a "GPL" substring test got wrong.
         assert_eq!(
@@ -746,7 +705,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "arch")]
     fn enterprise_review_reason_matches_the_audit_classifier() {
         // AGPL and ordinary copyleft must agree with `omg audit`, and
         // permissive or unknown licenses must not be flagged for review.
@@ -810,6 +768,25 @@ mod tests {
         let csv = generate_license_csv(&scan).unwrap();
         assert!(csv.contains("license,count,unresolved_review"));
         assert!(csv.contains("MIT AND LicenseRef-private,2,true"));
+    }
+
+    #[test]
+    fn license_inventory_display_sanitizes_metadata_and_retains_evidence() {
+        let license = "MIT\u{202e}";
+        let scan = LicenseScan {
+            total: 1,
+            by_license: HashMap::from([(license.to_owned(), 1)]),
+            violations: Vec::new(),
+            unknown: Vec::new(),
+            unresolved_review: Vec::new(),
+        };
+
+        let rows = license_inventory_rows(&scan);
+        assert!(rows[0].starts_with("MIT: 1 assignments"), "{rows:?}");
+        assert_eq!(
+            serde_json::to_value(&scan).unwrap()["by_license"][license],
+            1
+        );
     }
 
     #[test]

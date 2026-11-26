@@ -209,6 +209,14 @@ pub struct SbomVulnAffects {
     pub affects_ref: String,
 }
 
+/// Compose an inventory-only BOM from packages already collected for evidence.
+pub(crate) fn from_installed_inventory(
+    installed: &[crate::package_managers::types::SecurityPackage],
+    distro: crate::core::env::distro::Distro,
+) -> anyhow::Result<Sbom> {
+    super::sbom_shared::compose(installed, None, distro)
+}
+
 /// SBOM Generator for enterprise compliance
 pub struct SbomGenerator {
     include_vulns: bool,

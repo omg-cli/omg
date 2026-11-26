@@ -105,6 +105,8 @@ mod rpm_tags {
     pub const RELEASE: u32 = 1002;
     pub const EPOCH: u32 = 1003;
     pub const SUMMARY: u32 = 1004;
+    pub const DESCRIPTION: u32 = 1005;
+    pub const LICENSE: u32 = 1014;
     pub const SIZE: u32 = 1009;
     pub const LONGSIZE: u32 = 5009;
     pub const ARCH: u32 = 1022;
@@ -1344,6 +1346,13 @@ impl DnfPackageManager {
     /// Database blobs omit the magic/reserved prefix used in RPM archive headers.
     /// All entries are validated, but only the package fields are retained.
     fn parse_rpm_header(blob: &[u8]) -> Result<HashMap<u32, &[u8]>> {
+        Self::parse_rpm_header_with_compliance_metadata(blob, false)
+    }
+
+    fn parse_rpm_header_with_compliance_metadata(
+        blob: &[u8],
+        include_compliance_metadata: bool,
+    ) -> Result<HashMap<u32, &[u8]>> {
         const MAX_HEADER_ENTRIES: u32 = 100_000;
 
         #[derive(FromBytes, KnownLayout, Immutable)]
@@ -1414,6 +1423,18 @@ impl DnfPackageManager {
                 );
             }
 
+            let compliance_tag = include_compliance_metadata
+                && matches!(tag, rpm_tags::DESCRIPTION | rpm_tags::LICENSE);
+            if compliance_tag {
+                anyhow::ensure!(
+                    matches!(
+                        (tag, tag_type),
+                        (rpm_tags::DESCRIPTION, 6 | 9) | (rpm_tags::LICENSE, 6)
+                    ),
+                    "RPM compliance tag {tag} has unexpected type {tag_type}"
+                );
+            }
+
             anyhow::ensure!(
                 (1..=9).contains(&tag_type),
                 "RPM tag {tag} has unsupported type {tag_type}"
@@ -1465,7 +1486,8 @@ impl DnfPackageManager {
                     | rpm_tags::SIZE
                     | rpm_tags::LONGSIZE
                     | rpm_tags::ARCH
-            ) {
+            ) || compliance_tag
+            {
                 tags.insert(tag, &payload[base..abs_end]);
             }
         }
@@ -1537,6 +1559,13 @@ impl DnfPackageManager {
     }
 
     fn read_rpm_sqlite_connection(conn: &Connection) -> Result<Vec<InstalledPackage>> {
+        Self::read_rpm_sqlite_rows(conn, Self::parse_package_from_blob)
+    }
+
+    fn read_rpm_sqlite_rows<T>(
+        conn: &Connection,
+        parse: impl Fn(&[u8]) -> Result<T>,
+    ) -> Result<Vec<T>> {
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
 
         let mut stmt = conn.prepare("SELECT blob FROM Packages")?;
@@ -1545,7 +1574,7 @@ impl DnfPackageManager {
         let mut rows = stmt.query([])?;
         while let Some(row) = rows.next()? {
             let blob = row.get_ref(0)?.as_blob()?;
-            let pkg = Self::parse_package_from_blob(blob).with_context(|| {
+            let pkg = parse(blob).with_context(|| {
                 format!(
                     "Malformed RPM header in Packages table (row {}, {} packages decoded before the failure)",
                     packages.len() + 1,
@@ -1661,37 +1690,78 @@ impl DnfPackageManager {
         let location = RpmDatabase::detect(&self.rpm_db_path)?;
         Self::read_rpm_sqlite(&location.sqlite)?
             .into_iter()
-            // Architecture-less gpg-pubkey records represent RPM trust keys.
-            .filter(|package| package.name != "gpg-pubkey" || !package.architecture.is_empty())
-            .map(|package| {
-                anyhow::ensure!(
-                    [
-                        &package.name,
-                        &package.version,
-                        &package.release,
-                        &package.architecture,
-                    ]
-                    .into_iter()
-                    .all(|field| !field.is_empty()
-                        && !field
-                            .chars()
-                            .any(|ch| ch.is_whitespace() || ch.is_control() || ch == '\u{fffd}')),
-                    "Incomplete installed RPM security identity"
-                );
-
-                let epoch = if package.version.contains(':') {
-                    ""
-                } else {
-                    "0:"
-                };
-                let version = format!("{epoch}{}-{}", package.version, package.release);
-                Ok(Self::distribution_security_package(
-                    package.name,
-                    package.architecture,
-                    version,
-                ))
-            })
+            .filter(|package| !Self::is_rpm_trust_key(package))
+            .map(Self::security_package_from_installed)
             .collect()
+    }
+
+    /// Read the installed metadata required by compliance reports from one
+    /// SQLite statement. A failed read cannot become incomplete evidence via
+    /// the identity-only fallback used for advisory matching.
+    pub(crate) fn installed_compliance_inventory(&self) -> Result<Vec<SecurityPackage>> {
+        let location = RpmDatabase::detect(&self.rpm_db_path)?;
+        let connection = Self::open_rpm_sqlite(&location.sqlite)?;
+        Ok(
+            Self::read_rpm_sqlite_rows(&connection, Self::parse_compliance_package)?
+                .into_iter()
+                .flatten()
+                .collect(),
+        )
+    }
+
+    fn parse_compliance_package(blob: &[u8]) -> Result<Option<SecurityPackage>> {
+        let tags = Self::parse_rpm_header_with_compliance_metadata(blob, true)?;
+        let package = Self::parse_package_from_tags(&tags)?;
+        if Self::is_rpm_trust_key(&package) {
+            return Ok(None);
+        }
+        let mut result = Self::security_package_from_installed(package)?;
+        let text = |tag: u32| {
+            tags.get(&tag)
+                .and_then(|data| data.split(|&byte| byte == 0).next())
+                .map(std::str::from_utf8)
+                .transpose()
+                .with_context(|| format!("RPM metadata tag {tag} is not UTF-8"))
+        };
+        if let Some(description) = text(rpm_tags::DESCRIPTION)? {
+            description.clone_into(&mut result.description);
+        }
+        if let Some(license) = text(rpm_tags::LICENSE)?.filter(|value| !value.trim().is_empty()) {
+            result.licenses.push(license.to_owned());
+        }
+        Ok(Some(result))
+    }
+
+    fn is_rpm_trust_key(package: &InstalledPackage) -> bool {
+        package.name == "gpg-pubkey" && package.architecture.is_empty()
+    }
+
+    fn security_package_from_installed(package: InstalledPackage) -> Result<SecurityPackage> {
+        anyhow::ensure!(
+            [
+                &package.name,
+                &package.version,
+                &package.release,
+                &package.architecture
+            ]
+            .into_iter()
+            .all(|field| !field.is_empty()
+                && !field
+                    .chars()
+                    .any(|ch| ch.is_whitespace() || ch.is_control() || ch == '\u{fffd}')),
+            "Incomplete installed RPM security identity"
+        );
+        let epoch = if package.version.contains(':') {
+            ""
+        } else {
+            "0:"
+        };
+        let version = format!("{epoch}{}-{}", package.version, package.release);
+        Ok(Self::distribution_security_package(
+            package.name,
+            package.architecture,
+            version,
+        ))
     }
 
     fn distribution_security_package(
@@ -5482,6 +5552,51 @@ mod tests {
                 "RPM macros needed when source packages that need GNAT are built",
             )]
         );
+    }
+
+    #[test]
+    fn compliance_projection_keeps_native_identity_and_complete_text() {
+        let fields: [(u32, u32, &[u8], u32); 7] = [
+            (rpm_tags::NAME, 6, b"evidence-fixture\0", 1),
+            (rpm_tags::VERSION, 6, b"2.0\0", 1),
+            (rpm_tags::RELEASE, 6, b"3.fc44\0", 1),
+            (rpm_tags::ARCH, 6, b"i686\0", 1),
+            (rpm_tags::EPOCH, 4, &[0, 0, 0, 5], 1),
+            (
+                rpm_tags::DESCRIPTION,
+                9,
+                b"First line\nSecond line\0Other locale\0",
+                2,
+            ),
+            (rpm_tags::LICENSE, 6, b"MIT OR Apache-2.0\0", 1),
+        ];
+        let mut entries = Vec::new();
+        let mut payload = Vec::new();
+        for (tag, kind, bytes, count) in fields {
+            entries.push((tag, kind, i32::try_from(payload.len()).unwrap(), count));
+            payload.extend_from_slice(bytes);
+        }
+        let blob = strict_header(&entries, &payload);
+        let package = DnfPackageManager::parse_compliance_package(&blob)
+            .expect("installed RPM evidence")
+            .expect("software package");
+        assert_eq!(package.name, "evidence-fixture");
+        assert_eq!(package.version, "5:2.0-3.fc44");
+        assert_eq!(package.architecture.as_deref(), Some("i686"));
+        assert_eq!(package.description, "First line\nSecond line");
+        assert_eq!(package.licenses, ["MIT OR Apache-2.0"]);
+
+        let plain_tags = DnfPackageManager::parse_rpm_header(&blob).unwrap();
+        assert!(!plain_tags.contains_key(&rpm_tags::DESCRIPTION));
+        assert!(!plain_tags.contains_key(&rpm_tags::LICENSE));
+    }
+
+    #[test]
+    fn compliance_projection_rejects_a_non_text_license_tag() {
+        let blob = strict_header(&[(rpm_tags::LICENSE, 4, 0, 1)], &[0; 4]);
+        let error = DnfPackageManager::parse_compliance_package(&blob)
+            .expect_err("invalid metadata must fail evidence collection");
+        assert!(error.to_string().contains("unexpected type"));
     }
 
     #[test]

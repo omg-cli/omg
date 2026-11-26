@@ -7791,6 +7791,133 @@ env.OMG_FIXTURE_TASK = "changed"
                     checks.append(dict(phase=phase, case=f"{role}-{option[2:]}-ipc",
                                        passed=calls == (0, 0), value=calls))
 
+    def inspect_enterprise_inventory():
+        import csv
+
+        phase = "enterprise-native-inventory"
+        query = [rpm, "--root", alternate, "-qa", "--qf",
+                 r"%{NAME}\t%{EPOCHNUM}\t%{VERSION}-%{RELEASE}\t%{ARCH}\t%{DESCRIPTION}\t%{LICENSE}\n"]
+        native_before = checked(query)
+        name, epoch, release, architecture, description, license = native_before.rstrip("\n").split("\t")
+        version = f"{epoch}:{release}"
+        identity = f"{name}.{architecture}"
+
+        def verify(case, passed, **details):
+            checks.append(dict(phase=phase, case=case, passed=bool(passed), **details))
+
+        def json_file(path, fallback=None):
+            if path is None or not path.is_file():
+                return fallback
+            try:
+                return json.loads(path.read_text())
+            except ValueError:
+                return fallback
+
+        def csv_file(path):
+            if path is None or not path.is_file():
+                return []
+            with path.open(newline="") as stream:
+                return list(csv.reader(stream))
+
+        def private(path):
+            return path is not None and path.is_file() and path.stat().st_uid == account.pw_uid \
+                and stat.S_IMODE(path.stat().st_mode) == 0o600
+
+        with tempfile.TemporaryDirectory(prefix="enterprise-inventory-", dir=work) as directory:
+            scope = Path(directory)
+            os.chown(scope, account.pw_uid, account.pw_gid)
+            output = scope / "evidence"
+            mode = dict(disabled, HOME=str(scope))
+            with reject_native_selection("-qa", executable=rpm):
+                result = command([cli, "enterprise", "audit-export", "--output", output.name], mode, ordinary)
+                verify("export-exit", result.returncode == 0, status=result.returncode,
+                       diagnostic=result.stderr[-600:])
+                expected_files = {
+                    "limitations.json", "change-log.json", "policy-enforcement.json",
+                    "installed-packages.csv", "sbom-inventory.json",
+                }
+                files = {path.name for path in output.iterdir()} if output.is_dir() else set()
+                verify("export-file-set", files == expected_files, value=sorted(files))
+                for file in sorted(expected_files):
+                    verify(f"private-{file}", private(output / file))
+                limits = json_file(output / "limitations.json", {})
+                verify("limitations-state", any(row.get("artifact") == "access-control-matrix"
+                      for row in limits.get("unavailable_evidence", [])))
+                verify("change-log-shape", isinstance(json_file(output / "change-log.json"), list))
+                verify("policy-shape", isinstance(json_file(output / "policy-enforcement.json"), dict))
+                rows = csv_file(output / "installed-packages.csv")
+                verify("csv-header", rows[:1] == [["package", "version", "description"]])
+                verify("csv-installed-count", len(rows) == 2)
+                row = rows[1] if len(rows) == 2 else []
+                verify("csv-identity", row[:1] == [identity])
+                verify("csv-native-version", row[1:2] == [version])
+                verify("csv-native-description", row[2:] == [description])
+
+                sbom = json_file(output / "sbom-inventory.json", {})
+                components = sbom.get("components", [])
+                component = components[0] if len(components) == 1 else {}
+                verify("sbom-format", sbom.get("bomFormat") == "CycloneDX")
+                verify("sbom-installed-count", len(components) == 1)
+                verify("sbom-name", component.get("name") == name)
+                verify("sbom-native-version", component.get("version") == version)
+                verify("sbom-native-description", component.get("description") == description)
+                verify("sbom-native-purl", component.get("purl") ==
+                       f"pkg:rpm/fedora/{name}@{release}?arch={architecture}&epoch={epoch}")
+                verify("sbom-native-license", [entry.get("license", {}).get("name") for entry in
+                                              component.get("licenses", [])] == [license])
+                verify("sbom-advisory-scope", {"name": "omg:advisory-coverage", "value": "not-performed"}
+                       in component.get("properties", []))
+                verify("exports-share-inventory", row == [identity, component.get("version"), component.get("description")])
+
+                result = command([cli, "enterprise", "license-scan", "--export", "json"], mode, ordinary)
+                verify("license-json-exit", result.returncode == 0, status=result.returncode,
+                       diagnostic=result.stderr[-600:])
+                files = list(scope.glob("license-scan-*.json"))
+                verify("license-json-file", len(files) == 1)
+                artifact = files[0] if len(files) == 1 else None
+                verify("license-json-private", private(artifact))
+                scan = json_file(artifact, {})
+                verify("license-json-total", scan.get("total") == 1)
+                verify("license-json-license", scan.get("by_license") == {license: 1})
+                for key in ("violations", "unknown", "unresolved_review"):
+                    verify(f"license-json-{key}", scan.get(key) == [])
+
+                result = command([cli, "enterprise", "license-scan", "--export", "csv"], mode, ordinary)
+                verify("license-csv-exit", result.returncode == 0, status=result.returncode,
+                       diagnostic=result.stderr[-600:])
+                files = list(scope.glob("license-scan-*.csv"))
+                verify("license-csv-file", len(files) == 1)
+                artifact = files[0] if len(files) == 1 else None
+                verify("license-csv-private", private(artifact))
+                rows = csv_file(artifact)
+                verify("license-csv-header", rows[:1] == [["license", "count", "unresolved_review"]])
+                verify("license-csv-assignment", rows[1:] == [[license, "1", "false"]])
+
+                db_path = Path(checked([rpm, "--root", alternate, "--eval", "%{_dbpath}"]).strip())
+                database = alternate / db_path.relative_to("/") / "rpmdb.sqlite"
+                invalid = scope / "unreadable-inventory.sqlite"
+                with closing(sqlite3.connect(invalid)) as db:
+                    db.execute("CREATE TABLE Unrelated (name TEXT)")
+                    db.commit()
+                invalid.chmod(0o644)
+                original_reports = set(scope.glob("license-scan-*"))
+                checked(["/usr/bin/mount", "--bind", invalid, database])
+                try:
+                    for label, args in (
+                        ("export", ("audit-export", "--output", "invalid-evidence")),
+                        ("json", ("license-scan", "--export", "json")),
+                        ("csv", ("license-scan", "--export", "csv")),
+                    ):
+                        result = command([cli, "enterprise", *args], mode, ordinary)
+                        verify(f"invalid-inventory-{label}", result.returncode != 0
+                               and "no such table: Packages" in result.stderr
+                               and not (scope / "invalid-evidence").exists()
+                               and set(scope.glob("license-scan-*")) == original_reports,
+                               status=result.returncode, diagnostic=result.stderr[-600:])
+                finally:
+                    checked(["/usr/bin/umount", database])
+        verify("native-inventory-unchanged", checked(query) == native_before)
+
     def inspect_dashboard_terminal():
         import pty
         import select
@@ -8909,6 +9036,7 @@ exec {shlex.quote(str(binary))} "$@"
                 assert persisted.read_bytes() == initial_status
                 inspect("switched-alternate", 1, 1, fixture_explicit=True)
                 if consent_oracle is not None:
+                    inspect_enterprise_inventory()
                     inspect_info_attempts()
                     inspect_info_json_writes()
                     inspect_dashboard_terminal()
@@ -9241,6 +9369,6 @@ mark_progress("completed with host inventory unchanged")
 report = dict(binaries=binaries, checks=checks, total=len(checks),
               passed=sum(entry["passed"] for entry in checks), host_unchanged=True)
 print(json.dumps(report))
-expected_checks = 303 if consent_oracle is None else 2923
+expected_checks = 303 if consent_oracle is None else 2964
 if report["passed"] != report["total"] or report["total"] != expected_checks:
     sys.exit(4)
