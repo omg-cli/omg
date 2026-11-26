@@ -465,6 +465,17 @@ impl VersionedPackage {
 
 struct PlannedDnfAdvisories;
 
+enum AdvisoryLookup<'a> {
+    ArchitectureChanges,
+    Proposed(&'a [super::types::SecurityPackage]),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InstalledAdvisoryMatch {
+    Exact,
+    ArchitectureChange,
+}
+
 struct CancelStoredQuery(Option<tokio::sync::oneshot::Sender<()>>);
 
 impl Drop for CancelStoredQuery {
@@ -497,11 +508,18 @@ impl crate::core::security::vulnerability::VulnerabilitySource for PlannedDnfAdv
                 PackageAssessment, PackageCoverage, UnknownCoverage, VulnerabilityError,
             };
             let assess = async {
-                // This installed-name-filtered source is supplemental evidence only.
-                // It never establishes complete coverage for proposed dependencies.
-                let native = super::dnf_advisory::audit_result(
-                    DnfPackageManager::native_advisories().await?,
-                )?;
+                let (mut rows, mut supplemental) =
+                    DnfPackageManager::native_advisories(AdvisoryLookup::Proposed(packages))
+                        .await?;
+                let native_ids: BTreeSet<_> = rows
+                    .iter()
+                    .map(|(row, _)| (row.name.as_str(), row.nevra.as_str()))
+                    .collect();
+                supplemental.retain(|(row, _)| {
+                    !native_ids.contains(&(row.name.as_str(), row.nevra.as_str()))
+                });
+                rows.extend(supplemental);
+                let native = super::dnf_advisory::audit_result(rows)?;
                 let mut assessments = Vec::with_capacity(packages.len());
                 let mut comparisons = Vec::new();
                 let mut candidates = Vec::new();
@@ -1842,8 +1860,7 @@ impl DnfPackageManager {
         .context("DNF stored transaction owner failed")?
     }
 
-    fn advisory_command() -> Result<tokio::process::Command> {
-        let cache = crate::core::paths::cache_dir().join("dnf-security");
+    fn advisory_command(cache: &Path) -> Result<tokio::process::Command> {
         let cache = cache
             .to_str()
             .context("DNF advisory cache path is not UTF-8")?;
@@ -1862,17 +1879,18 @@ impl DnfPackageManager {
     async fn affected_installed_packages<'a>(
         rows: impl IntoIterator<Item = &'a super::dnf_advisory::ApplicableAdvisory>,
         installed: &[super::types::SecurityPackage],
+        scope: InstalledAdvisoryMatch,
     ) -> Result<BTreeMap<String, Vec<crate::core::security::scan::InstalledIdentity>>> {
         use crate::core::security::scan::InstalledIdentity;
         use std::collections::btree_map::Entry;
 
-        let mut by_identity: HashMap<_, Vec<_>> = HashMap::new();
+        let mut by_name: HashMap<_, Vec<_>> = HashMap::new();
         for package in installed {
             if let Some(architecture) = package.architecture.as_deref() {
-                by_identity
-                    .entry((package.name.as_str(), architecture))
+                by_name
+                    .entry(package.name.as_str())
                     .or_default()
-                    .push(package);
+                    .push((architecture, package));
             }
         }
 
@@ -1885,7 +1903,21 @@ impl DnfPackageManager {
             };
             let (name, architecture) = super::dnf_advisory::package_identity(&row.nevra)?;
             let evr = &row.nevra[name.len() + 1..row.nevra.len() - architecture.len() - 1];
-            for &package in by_identity.get(&(name, architecture)).into_iter().flatten() {
+            for &(installed_arch, package) in by_name.get(name).into_iter().flatten() {
+                let matches = match scope {
+                    InstalledAdvisoryMatch::Exact => installed_arch == architecture,
+                    InstalledAdvisoryMatch::ArchitectureChange => {
+                        installed_arch != architecture
+                            && (installed_arch == "noarch" || architecture == "noarch")
+                    }
+                };
+                if !matches {
+                    continue;
+                }
+                anyhow::ensure!(
+                    scope == InstalledAdvisoryMatch::Exact || comparisons.len() < 10_000,
+                    "Supplemental RPM comparisons exceed their bound"
+                );
                 comparisons.push((package.version.clone(), evr.to_owned()));
                 candidates.push((row.nevra.as_str(), package));
             }
@@ -1905,7 +1937,7 @@ impl DnfPackageManager {
             .into_iter()
             .map(|(nevra, (advisory, affected))| {
                 anyhow::ensure!(
-                    !affected.is_empty(),
+                    scope == InstalledAdvisoryMatch::ArchitectureChange || !affected.is_empty(),
                     "Advisory {advisory} has no affected installed identity: {nevra}"
                 );
                 Ok((nevra.to_owned(), affected))
@@ -1913,19 +1945,20 @@ impl DnfPackageManager {
             .collect()
     }
 
-    async fn native_advisories() -> Result<
-        Vec<(
-            super::dnf_advisory::ApplicableAdvisory,
-            super::dnf_advisory::AdvisoryDetails,
-        )>,
-    > {
+    async fn native_advisories(
+        mode: AdvisoryLookup<'_>,
+    ) -> Result<(
+        super::dnf_advisory::AdvisoryRows,
+        super::dnf_advisory::AdvisoryRows,
+    )> {
+        let cache = crate::core::paths::cache_dir().join("dnf-security");
         let mut outputs = Vec::with_capacity(2);
         for details in [false, true] {
-            let mut command = Self::advisory_command()?;
+            let mut command = Self::advisory_command(&cache)?;
             command.args(super::dnf_advisory::query_args(details));
             outputs.push(Self::query_output(command).await?);
         }
-        let mut repositories = Self::advisory_command()?;
+        let mut repositories = Self::advisory_command(&cache)?;
         repositories.args([
             "--cacheonly",
             "--setopt=*.skip_if_unavailable=false",
@@ -1934,10 +1967,70 @@ impl DnfPackageManager {
             "--enabled",
             "--json",
         ]);
-        super::dnf_advisory::require_enabled_repositories(
-            &Self::query_output(repositories).await?,
-        )?;
-        super::dnf_advisory::join_advisories(&outputs[0], &outputs[1])
+        let repository_ids =
+            super::dnf_advisory::enabled_repository_ids(&Self::query_output(repositories).await?)?;
+        let native = super::dnf_advisory::join_advisories(&outputs[0], &outputs[1])?;
+        let supplemental = Self::cached_advisory_lookup(&cache, &repository_ids, mode)
+            .await
+            .unwrap_or_else(|error| {
+                tracing::warn!("Supplemental Fedora advisory lookup unavailable: {error:#}");
+                Vec::new()
+            });
+        Ok((native, supplemental))
+    }
+
+    async fn cached_advisory_lookup(
+        cache: &Path,
+        repository_ids: &BTreeSet<String>,
+        lookup: AdvisoryLookup<'_>,
+    ) -> Result<super::dnf_advisory::AdvisoryRows> {
+        let (mode, subjects) = match lookup {
+            AdvisoryLookup::ArchitectureChanges => ("architecture-changes", Vec::new()),
+            AdvisoryLookup::Proposed(packages) => {
+                let subjects: Vec<_> = packages
+                    .iter()
+                    .filter_map(|package| {
+                        let architecture = package.architecture.as_deref()?;
+                        let epoch = if package.version.contains(':') {
+                            ""
+                        } else {
+                            "0:"
+                        };
+                        Some(format!(
+                            "{}-{epoch}{}.{architecture}",
+                            package.name, package.version
+                        ))
+                    })
+                    .collect();
+                if subjects.is_empty() {
+                    return Ok(Vec::new());
+                }
+                ("proposed", subjects)
+            }
+        };
+        anyhow::ensure!(
+            subjects.len() <= 10_000
+                && subjects.iter().map(|id| id.len() + 1).sum::<usize>() <= 512 * 1024,
+            "Supplemental advisory subjects exceed their bound"
+        );
+        for subject in &subjects {
+            Self::validate_query_selector(subject)?;
+        }
+        let repositories = serde_json::to_string(repository_ids)?;
+        anyhow::ensure!(
+            repositories.len() <= 64 * 1024,
+            "DNF repository scope exceeds its bound"
+        );
+        let mut command =
+            tokio::process::Command::from(crate::core::privilege::system_command("python3")?);
+        command
+            .args(["-I", "-B", "-c", include_str!("dnf_advisory_lookup.py")])
+            .arg(cache)
+            .args([mode, &repositories])
+            .args(subjects);
+        let output =
+            Self::query_output_with_deadline(command, std::time::Duration::from_secs(30)).await?;
+        super::dnf_advisory::cached_lookup_result(&output)
     }
 
     async fn native_history(since: Option<u64>) -> Result<Vec<NativeTransaction>> {
@@ -2305,7 +2398,7 @@ impl DnfPackageManager {
         })
         .await??;
         let context = serde_json::to_string(&("omg-native-dnf-stored-v1", args, &digest))?;
-        let gaps = vec!["DNF5's native advisory CLI filters by currently installed package names; it cannot establish complete coverage for newly selected dependencies. Vendor fixed versions do not establish introduced ranges or branch applicability. Matching native advisories below remain possible; CVE/disclosed-zero-day coverage remains unknown. https://dnf5.readthedocs.io/en/stable/commands/advisory.8.html".into()];
+        let gaps = vec!["Fedora advisory matches are possible findings. Vendor fixed versions do not establish introduced ranges or branch applicability. CVE and disclosed zero-day coverage remains unknown. https://dnf5.readthedocs.io/en/stable/commands/advisory.8.html".into()];
         let source = PlannedDnfAdvisories;
         crate::core::security::package_review::review_async(&inventory, &context, &gaps, &source)
             .await?;
@@ -2829,10 +2922,24 @@ impl PackageManager for DnfPackageManager {
         Some(Box::pin(async move {
             async {
                 let installed = self.security_inventory().await?;
-                let rows = Self::native_advisories().await?;
-                let affected =
-                    Self::affected_installed_packages(rows.iter().map(|(row, _)| row), &installed)
-                        .await?;
+                let (rows, supplemental) =
+                    Self::native_advisories(AdvisoryLookup::ArchitectureChanges).await?;
+                let affected = Self::affected_installed_packages(
+                    rows.iter().map(|(row, _)| row),
+                    &installed,
+                    InstalledAdvisoryMatch::Exact,
+                )
+                .await?;
+                let possible = Self::affected_installed_packages(
+                    supplemental.iter().map(|(row, _)| row),
+                    &installed,
+                    InstalledAdvisoryMatch::ArchitectureChange,
+                )
+                .await
+                .unwrap_or_else(|error| {
+                    tracing::warn!("Could not associate supplemental Fedora advisories: {error:#}");
+                    BTreeMap::new()
+                });
                 let mut after = self.security_inventory().await?;
                 let mut before = installed;
                 let identity = |package: &super::types::SecurityPackage| {
@@ -2862,6 +2969,11 @@ impl PackageManager for DnfPackageManager {
                             .clone();
                     }
                 }
+                super::dnf_advisory::add_architecture_findings(
+                    &mut result,
+                    supplemental,
+                    &possible,
+                )?;
                 Ok(result)
             }
             .await
@@ -3630,6 +3742,7 @@ mod tests {
         let affected = DnfPackageManager::affected_installed_packages(
             [&row, &other_architecture, &row],
             &installed,
+            InstalledAdvisoryMatch::Exact,
         )
         .await
         .unwrap();
@@ -3649,10 +3762,32 @@ mod tests {
         assert!(
             DnfPackageManager::affected_installed_packages(
                 [&other_architecture, &row],
-                &installed[1..]
+                &installed[1..],
+                InstalledAdvisoryMatch::Exact,
             )
             .await
             .is_err()
+        );
+        let cross_architecture = super::super::dnf_advisory::ApplicableAdvisory {
+            name: "FEDORA-cross-architecture".into(),
+            kind: "security".into(),
+            severity: "Important".into(),
+            nevra: "fixture-1:1.0-2.noarch".into(),
+        };
+        let possible = DnfPackageManager::affected_installed_packages(
+            [&row, &cross_architecture],
+            &installed,
+            InstalledAdvisoryMatch::ArchitectureChange,
+        )
+        .await
+        .unwrap();
+        assert!(possible[&row.nevra].is_empty());
+        assert_eq!(
+            possible[&cross_architecture.nevra],
+            [
+                InstalledIdentity::from(&installed[0]),
+                InstalledIdentity::from(&installed[3]),
+            ]
         );
     }
 
@@ -3704,11 +3839,9 @@ mod tests {
         let root = fixture.path();
         std::fs::create_dir(root.join("repos")).unwrap();
         let configure = || {
-            let mut command = DnfPackageManager::advisory_command().unwrap();
+            let mut command = DnfPackageManager::advisory_command(&root.join("cache")).unwrap();
             command.args([
                 format!("--setopt=reposdir={}", root.join("repos").display()),
-                format!("--setopt=cachedir={}", root.join("cache").display()),
-                format!("--setopt=system_cachedir={}", root.join("cache").display()),
                 format!("--setopt=persistdir={}", root.join("persist").display()),
                 format!("--setopt=logdir={}", root.join("logs").display()),
                 format!(

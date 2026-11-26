@@ -214,6 +214,7 @@ fn native_status_preserves_daemon_advisory_coverage() -> Result<()> {
         for args in [
             &["status"][..],
             &["status", "--fast"][..],
+            &["status", "--fast", "--json"][..],
             &["daemon-status"][..],
         ] {
             let requests = match args {
@@ -319,6 +320,15 @@ fn native_status_preserves_daemon_advisory_coverage() -> Result<()> {
                 !text.lines().any(|line| line == "FORGED"),
                 "runtime metadata forged a status row: {text:?}"
             );
+            if args == ["status", "--fast", "--json"] {
+                let report: serde_json::Value = serde_json::from_str(&output.stdout)?;
+                assert_eq!(report["total_packages"], 9, "{report}");
+                assert_eq!(report["explicit_packages"], 5, "{report}");
+                assert_eq!(report["orphan_packages"], 0, "{report}");
+                assert_eq!(report["updates_available"], 2, "{report}");
+                assert_eq!(report["updates_and_orphans_checked"], true, "{report}");
+                continue;
+            }
             if args == ["daemon-status"] {
                 let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
                 if let Some(unknown) = unknown.filter(|_| scanned) {

@@ -47,7 +47,7 @@ impl AdvisoryRiskReview {
         let mut records = Vec::with_capacity(unknown.len());
         let mut details = risk.as_ref().map_or_else(
             || String::from("\nSECURITY WARNING: advisory coverage for the selected transaction is unknown.\nNo clean security result was established. Accepting this gap does not mark these versions safe.\n"),
-            |review| review.details.clone(),
+            |review| format!("{}\n", review.details),
         );
         let mut displayed_sources = BTreeSet::new();
         let mut standard_arch_untracked = false;
@@ -973,6 +973,23 @@ mod tests {
             .url
             .push_str("-changed");
         assert!(!accepted.matches(&AdvisoryRiskReview::new(&changed, "native-mixed")?.unwrap()));
+        Ok(())
+    }
+
+    #[test]
+    fn mixed_review_preserves_a_standalone_advisory_link() -> anyhow::Result<()> {
+        let mut assessment = package("app");
+        assessment
+            .findings
+            .push(finding("CVE-2026-10001", FindingApplicability::Possible));
+        let review = AdvisoryRiskReview::new_with_unknown(&[assessment], "upgrade")?
+            .context("mixed advisory and coverage review")?;
+        assert!(
+            review
+                .details()
+                .lines()
+                .any(|line| line.trim() == "https://www.cve.org/CVERecord?id=CVE-2026-10001")
+        );
         Ok(())
     }
 
