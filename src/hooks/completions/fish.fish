@@ -9,7 +9,9 @@ function __omg_dynamic_complete
     end
 
     if test -n "$last"
-        omg complete --shell fish --current "$cur" --last "$last" --full "$full" 2>/dev/null
+        set -l suggestions (omg complete --shell fish --current "$cur" --last "$last" --full "$full" 2>/dev/null)
+        or return
+        string join -- \n $suggestions
     end
 end
 
@@ -18,15 +20,10 @@ function __omg_needs_command
     test (count $cmd) -le 1
 end
 
-function __omg_needs_package_suggestions
-    set -l cmd (commandline -opc)
-    if test (count $cmd) -lt 2
-        return 1
-    end
-
-    set -l last $cmd[-1]
-    switch $last
-        case install i remove r info use ls list which tool env run new
+function __omg_needs_dynamic_suggestions
+    set -l words (string match -rv -- '^-' (commandline -opc))
+    switch "$words[2]"
+        case install i remove r info use sy ls list which tool env run new completions
             return 0
     end
 
@@ -94,4 +91,4 @@ complete -c omg -f -n '__omg_needs_command' -a 'up' -d 'Alias for self-update'
 complete -c omg -f -n '__omg_needs_command' -a 'help' -d 'Show help'
 
 # Dynamic package/runtime/tool suggestions
-complete -c omg -f -n '__omg_needs_package_suggestions' -a '(__omg_dynamic_complete)'
+complete -c omg -f -n '__omg_needs_dynamic_suggestions' -a '(__omg_dynamic_complete)'

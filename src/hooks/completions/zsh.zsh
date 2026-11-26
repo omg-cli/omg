@@ -8,34 +8,15 @@ _omg() {
     local current_word="${words[$CURRENT]}"
     local full_line="${BUFFER}"
 
-    # Dynamic completion for package names and other contexts.
-    # `suggestions` resolves through zsh dynamic scoping to the caller's array.
-    _omg_dynamic_complete() {
-        local line
-        omg complete --shell zsh --current "$current_word" \
-            --last "$last_word" --full "$full_line" 2>/dev/null \
-            | while IFS= read -r line; do
-                suggestions+=("$line")
-            done
-    }
-
-    case "$last_word" in
-        install|i|remove|r|info|use|ls|list|which|tool|env|run|new)
-            _omg_dynamic_complete
-            if [[ ${#suggestions[@]} -gt 0 ]]; then
-                compadd -U -a suggestions
-                return 0
-            fi
-            ;;
-    esac
-
-    # Fallback to dynamic completion for any context beyond the first command
-    if [[ $CURRENT -gt 2 ]]; then
-        _omg_dynamic_complete
-        if [[ ${#suggestions[@]} -gt 0 ]]; then
-            compadd -U -a suggestions
-            return 0
-        fi
+    # Ask once after the subcommand and use only a successful response.
+    local response
+    if [[ $CURRENT -gt 2 ]] &&
+        response=$(omg complete --shell zsh --current "$current_word" \
+            --last "$last_word" --full "$full_line" 2>/dev/null) &&
+        [[ -n "$response" ]]; then
+        suggestions=("${(@f)response}")
+        compadd -U -a suggestions
+        return 0
     fi
 
     # Main command completion
