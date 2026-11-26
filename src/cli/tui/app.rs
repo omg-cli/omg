@@ -421,6 +421,10 @@ impl App {
         if query.is_empty() {
             return Ok(Vec::new());
         }
+        let repo = crate::package_managers::resolve_backend()
+            .ok()
+            .and_then(crate::cli::packages::common::dnf_search_label)
+            .unwrap_or("official");
 
         #[cfg(unix)]
         if let Ok(mut client) = crate::core::client::DaemonClient::connect().await
@@ -439,7 +443,7 @@ impl App {
                     name: package.name,
                     version: crate::package_managers::parse_version_or_zero(&package.version),
                     description: package.description,
-                    repo: "official".to_string(),
+                    repo: repo.to_owned(),
                     download_size: 0,
                     installed: false,
                 })
@@ -447,23 +451,25 @@ impl App {
         }
 
         let query = query.to_owned();
-        run_direct_search(async move { Self::search_packages_direct_async(&query).await }).await
+        run_direct_search(async move { Self::search_packages_direct_async(&query, repo).await })
+            .await
     }
 
     async fn search_packages_direct_async(
         query: &str,
+        repo: &str,
     ) -> Result<Vec<crate::package_managers::SyncPackage>> {
         let backend = crate::package_managers::get_package_manager()?;
         Ok(backend
             .search_quietly(query)
             .await
-            .context("Failed to search official packages")?
+            .context("Failed to search packages")?
             .into_iter()
             .map(|package| crate::package_managers::SyncPackage {
                 name: package.name,
                 version: package.version,
                 description: package.description,
-                repo: "official".to_string(),
+                repo: repo.to_owned(),
                 download_size: 0,
                 installed: package.installed,
             })
@@ -762,7 +768,7 @@ mod tests {
                 .build()
                 .expect("fixture runtime");
             let results = runtime
-                .block_on(App::search_packages_direct_async("vim-enhanced"))
+                .block_on(App::search_packages("vim-enhanced"))
                 .expect("Fedora search must have a backend");
             assert!(results.iter().any(|package| package.name == "vim-enhanced"));
             return;
@@ -777,6 +783,7 @@ mod tests {
             .env("OMG_TUI_FEDORA_SEARCH_CHILD", "1")
             .env("OMG_TEST_MODE", "1")
             .env("OMG_TEST_DISTRO", "fedora")
+            .env("OMG_DISABLE_DAEMON", "1")
             .env("OMG_DATA_DIR", directory.path())
             .output()
             .expect("isolated Fedora adapter");

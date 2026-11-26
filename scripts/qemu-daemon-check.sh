@@ -60,8 +60,9 @@ native_package_identity() {
 # BEGIN PACKAGE QUERY ORACLE
 check_package_query_outputs() {
   local name=$1 daemon_search=$2 daemon_info=$3 direct_search=$4 direct_info=$5
-  jq -e -s --arg name "$name" '
+  jq -e -s --arg name "$name" --arg distro "$ID" '
     def match_package($rows): $rows | map(select(.name == $name)) | .[0];
+    def sources: if $distro == "fedora" then ["official", "dnf"] else ["official", "apt"] end;
     def valid_search($rows):
       if ($rows | type) != "array" then false
       else ($rows | length) <= 50 and
@@ -70,7 +71,7 @@ check_package_query_outputs() {
           (.version | type) == "string" and (.version | length) > 0 and
           (.description | type) == "string" and (.description | length) > 0 and
           (.source | type) == "string" and
-          (.source as $source | (["official", "apt"] | index($source | ascii_downcase)) != null))
+          (.source as $source | (sources | index($source | ascii_downcase)) != null))
       end;
     def valid_info($record):
       ($record | type) == "object" and $record.name == $name and
@@ -82,6 +83,7 @@ check_package_query_outputs() {
      .[2] as $direct_search | .[3] as $direct_info |
      valid_search($daemon_search) and valid_search($direct_search) and
      valid_info($daemon_info) and valid_info($direct_info) and
+     ($distro != "fedora" or (match_package($daemon_search).source == match_package($direct_search).source)) and
      (match_package($daemon_search).version == $daemon_info.version) and
      (match_package($direct_search).version == $direct_info.version) and
      ($daemon_info.version == $direct_info.version))

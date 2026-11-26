@@ -198,18 +198,23 @@ fi
         function = source[begin:end]
         search = [{'name': 'bash', 'version': '5.3', 'description': 'Shell', 'source': 'Official'}]
         info = {'name': 'bash', 'version': '5.3', 'description': 'Shell', 'installed': True}
-        cases = [(search, info, search, info, True)]
+        dnf_search = [dict(search[0], source='DNF')]
+        cases = [('arch', search, info, search, info, True),
+                 ('fedora', search, info, search, info, True),
+                 ('fedora', dnf_search, info, dnf_search, info, True),
+                 ('fedora', dnf_search, info, search, info, False),
+                 ('arch', dnf_search, info, dnf_search, info, False)]
         cases += [
-            ([], info, search, info, False),
-            (search, dict(info, version='wrong'), search, info, False),
-            (search, info, search, dict(info, installed=False), False),
-            (search + search, info, search, info, False),
-            ([dict(search[0], source='AUR')], info, search, info, False),
-            (search, info, [dict(search[0], description='')], info, False),
-            (search, info, search, {'name': 'other', **{key: value for key, value in info.items() if key != 'name'}}, False),
+            ('arch', [], info, search, info, False),
+            ('arch', search, dict(info, version='wrong'), search, info, False),
+            ('arch', search, info, search, dict(info, installed=False), False),
+            ('arch', search + search, info, search, info, False),
+            ('arch', [dict(search[0], source='AUR')], info, search, info, False),
+            ('arch', search, info, [dict(search[0], description='')], info, False),
+            ('arch', search, info, search, dict(info, name='other'), False),
         ]
-        for daemon_search, daemon_info, direct_search, direct_info, passed in cases:
-            with self.subTest(daemon_search=daemon_search, daemon_info=daemon_info,
+        for distro, daemon_search, daemon_info, direct_search, direct_info, passed in cases:
+            with self.subTest(distro=distro, daemon_search=daemon_search, daemon_info=daemon_info,
                               direct_search=direct_search, direct_info=direct_info), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 for name, value in [('daemon-search', daemon_search), ('daemon-info', daemon_info),
@@ -217,7 +222,7 @@ fi
                     (root / name).write_text(json.dumps(value))
                 result = subprocess.run(
                     [BASH, '-c', function + '\ncheck_package_query_outputs bash daemon-search daemon-info direct-search direct-info'],
-                    cwd=root, capture_output=True, text=True, timeout=10)
+                    cwd=root, env=dict(os.environ, ID=distro), capture_output=True, text=True, timeout=10)
                 self.assertEqual(result.returncode == 0, passed, result.stderr)
 
     @unittest.skipIf(os.name == 'nt', 'text info oracle requires POSIX bash')

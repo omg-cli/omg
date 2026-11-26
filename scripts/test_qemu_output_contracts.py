@@ -426,12 +426,13 @@ class OutputContracts(unittest.TestCase):
                     result = self.run_oracle(assertion=f'update-{mode}-output', stdout=output)
                     self.assertNotEqual(result.returncode, 0, 'Formatting normalization cannot replace required update evidence')
 
-    def test_fedora_firefox_requires_one_exact_compatible_official_identity(self):
+    def test_fedora_firefox_requires_one_exact_compatible_native_identity(self):
         showrc = 'compatible archs : x86_64 noarch i686\n'
         header = '  | Search\n    firefox\n'
-        for name in ('firefox', 'firefox.x86_64', 'firefox.noarch', 'firefox.i686'):
-            output = header + f'  {name} 157.0.1-1.fc44  Official\n  firefox-langpacks.x86_64 157.0.1-1.fc44  Official\n'
-            with self.subTest(name=name):
+        for name, source in (('firefox', 'Official'), ('firefox.x86_64', 'DNF'),
+                             ('firefox.noarch', 'DNF'), ('firefox.i686', 'DNF')):
+            output = header + f'  {name} 157.0.1-1.fc44  {source}\n  firefox-langpacks.x86_64 157.0.1-1.fc44  {source}\n'
+            with self.subTest(name=name, source=source):
                 result = self.run_oracle(assertion='search-firefox-results', distro='fedora', stdout=output, rpm_showrc=showrc)
                 self.assertEqual(result.returncode, 0, result.stderr)
         good = header + '  firefox.x86_64 157.0.1-1.fc44  Official\n'
@@ -4431,7 +4432,7 @@ esac
         for showrc, identities in configurations:
             for identity in identities:
                 with self.subTest(identity=identity):
-                    output = f'  {identity} 2.2.1-4.fc44  Official\n  tree-sitter-cli.x86_64 0.26.11-1.fc44  Official\n'
+                    output = f'  {identity} 2.2.1-4.fc44  DNF\n  tree-sitter-cli.x86_64 0.26.11-1.fc44  DNF\n'
                     result = self.run_oracle(assertion='search-official-tree-output',
                                              stdout=output, distro='fedora', rpm_showrc=showrc)
                     self.assertEqual(result.returncode, 0, result.stderr)
@@ -4711,8 +4712,9 @@ printf '  tree.x86_64 2.2.1-4.fc44  Official\n  tree.i686 2.2.1-4.fc44  Official
         self.assertEqual(args, ['search', '--detailed', '--no-aur', '--limit', '3', 'git-'])
         self.assertEqual(self.run_oracle(assertion='search-official-limit-three', stdout=valid).returncode, 0)
         fedora = valid.replace('  git-branchless 0.11.1-2  Official\n',
-                               '  git-all 2.55.0-1.fc44  Official\n')
-        self.assertEqual(self.run_oracle(assertion='search-official-limit-three', stdout=fedora).returncode, 0)
+                               '  git-all 2.55.0-1.fc44  Official\n').replace('  Official', '  DNF')
+        self.assertEqual(self.run_oracle(assertion='search-official-limit-three', distro='fedora', stdout=fedora).returncode, 0)
+        self.assertNotEqual(self.run_oracle(assertion='search-official-limit-three', stdout=fedora).returncode, 0)
         for output in (
             '',
             '  | Search\n    git-\n',
