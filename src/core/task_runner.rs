@@ -1081,12 +1081,10 @@ fn execute_process_in(
         path_additions.push(bin_path.clone());
     }
 
-    // Auto-activate python virtual environment if present
-    // Check for .venv or venv in current directory
     let venv_path = [".venv", "venv"]
         .into_iter()
         .map(|name| current_dir.join(name))
-        .find(|path| path.exists());
+        .find(|path| path.join("bin").is_dir());
 
     let mut command = Command::new(cmd);
     command.current_dir(working_dir);
@@ -1103,26 +1101,18 @@ fn execute_process_in(
     command.args(args);
     command.args(extra_args);
 
-    // Inject virtual env
     if let Some(venv) = &venv_path {
-        let bin_path = venv.join("bin");
-        if bin_path.is_dir() {
-            let selected = selected_paths
-                .iter()
-                .find(|(runtime, _)| runtime == "python");
-            let base = validate_venv_python(venv, selected.map(|(_, bin)| bin.as_path()))?;
-            admit_task_runtime(&mut runtime_admissions, "python", &base)?;
-            if selected.is_none() {
-                selected_paths.push(("python".to_owned(), base));
-            }
-            // Prepend venv/bin to path additions (higher priority)
-            path_additions.insert(0, bin_path);
-
-            // Set VIRTUAL_ENV
-            command.env("VIRTUAL_ENV", venv);
-            // Unset PYTHONHOME if set, to ensure venv is used correctly
-            command.env_remove("PYTHONHOME");
+        let selected = selected_paths
+            .iter()
+            .find(|(runtime, _)| runtime == "python");
+        let base = validate_venv_python(venv, selected.map(|(_, bin)| bin.as_path()))?;
+        admit_task_runtime(&mut runtime_admissions, "python", &base)?;
+        if selected.is_none() {
+            selected_paths.push(("python".to_owned(), base));
         }
+        path_additions.insert(0, venv.join("bin"));
+        command.env("VIRTUAL_ENV", venv);
+        command.env_remove("PYTHONHOME");
     }
 
     // mise `[env]` parity (strict: tasks fail closed on missing files and
@@ -1144,7 +1134,7 @@ fn execute_process_in(
     )?;
     apply_resolved_environment(&mut command, &resolved);
 
-    if let Some(venv) = venv_path.as_ref().filter(|path| path.join("bin").is_dir()) {
+    if let Some(venv) = &venv_path {
         let selected = selected_paths
             .iter()
             .find(|(runtime, _)| runtime == "python");
@@ -1239,6 +1229,12 @@ fn resolve_task_runtime(
     let runtime = match name {
         "node" | "nodejs" => "node",
         "python" | "python3" => "python",
+        name if name.strip_prefix("python3.").is_some_and(|minor| {
+            !minor.is_empty() && minor.bytes().all(|byte| byte.is_ascii_digit())
+        }) =>
+        {
+            "python"
+        }
         "rustc" | "cargo" => "rust",
         "java" | "javac" => "java",
         "erl" | "erlc" => "erlang",

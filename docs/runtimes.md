@@ -90,6 +90,8 @@ OMG checks the current directory, then its parents. The nearest directory with a
 
 Python's `requires-python` uses [PEP 440 version specifiers](https://packaging.python.org/en/latest/specifications/version-specifiers/). Hooks, tasks, and `omg use python` choose the newest matching installed release, preferring stable releases unless a prerelease is requested. When setup needs a download, the Python manager uses the constraint to select the published release.
 
+For tasks, OMG uses the first project virtual environment with a `bin/` directory, checking `.venv` before `venv`. The environment must be based on a reviewed OMG Python. Running `python`, `python3`, or a versioned command such as `python3.14` uses that base interpreter with the virtual environment's packages.
+
 A `.nvmrc` holds one Node version or alias. OMG ignores blank lines, `#` comments and reserved metadata entries with unique keys. An invalid file in the current directory stops task setup and explicit version lookup. The shell hook can still use another valid pin.
 
 A `.tool-versions` file can pin several runtimes:

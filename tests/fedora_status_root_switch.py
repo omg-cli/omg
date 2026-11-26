@@ -2801,6 +2801,137 @@ printf 'fixture python {version}|<%s>\\n' "$@"
                                        diagnostic=(result.stdout + result.stderr)[-1200:]))
 
 
+    def inspect_python_virtualenv_launch():
+        phase = "python-virtualenv-launch"
+        seed = r"""
+import importlib.util, json, shutil, sys
+from pathlib import Path
+helper, directory = sys.argv[1:]
+spec = importlib.util.spec_from_file_location("runtime_advisory_fixture", helper)
+fixture = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(fixture)
+home = Path(directory)
+config = Path(fixture.fixture_cli_environment(home)["OMG_CONFIG_DIR"])
+version = ".".join(map(str, sys.version_info[:3]))
+minor = ".".join(map(str, sys.version_info[:2]))
+root = home / "data" / "versions" / "python" / version
+binary = root / "bin/python3"
+binary.parent.mkdir(parents=True)
+shutil.copy2(Path("/proc/self/exe").resolve(strict=True), binary)
+for name in ("python", f"python{minor}"):
+    (binary.parent / name).symlink_to(binary.name)
+fixture.seed_runtime_advisory_fixture(root, "python", version, config)
+print(json.dumps({"exe": str(binary), "version": version, "minor": minor}))
+"""
+        create = """
+import sys, venv
+sys._base_executable = sys.argv[1]
+venv.EnvBuilder(with_pip=False, symlinks=sys.argv[3] == "link").create(sys.argv[2])
+"""
+        program = r"""
+import json, os, sys
+from pathlib import Path
+try:
+    import omg_venv_observation
+except ModuleNotFoundError:
+    local = None
+else:
+    local = omg_venv_observation.VALUE
+print("fixture python " + json.dumps({
+    "exe": os.readlink("/proc/self/exe"),
+    "prefix": sys.prefix,
+    "venv": os.getenv("VIRTUAL_ENV"),
+    "home": os.getenv("PYTHONHOME"),
+    "local": local,
+    "args": sys.argv[1:],
+}))
+"""
+        layouts = (
+            ("base-only", None, None, None),
+            ("dot-link", ".venv", "link", None),
+            ("dot-copy", ".venv", "copy", None),
+            ("bare-link-with-dot-file", "venv", "link", "file"),
+            ("bare-copy-with-empty-dot-dir", "venv", "copy", "directory"),
+            ("both-venvs", ".venv", "copy", "other-venv"),
+        )
+        with tempfile.TemporaryDirectory(prefix="python-virtualenv-launch-", dir=work) as directory:
+            here = Path(directory)
+            os.chown(here, account.pw_uid, account.pw_gid)
+            definition = json.loads(checked(
+                [sys.executable, "-I", "-B", "-c", seed, runtime_advisory_fixture, here],
+                dict(disabled, HOME=str(here)), ordinary,
+            ))
+            binary = Path(definition["exe"])
+            version = definition["version"]
+            minor = definition["minor"]
+            environment = dict(
+                disabled, HOME=str(here), OMG_DATA_DIR=str(here/"data"),
+                OMG_CONFIG_DIR=str(here/"config"/"omg"), OMG_NATIVE_TEST_DATA_DIR="1",
+                XDG_CONFIG_HOME=str(here/"config"), XDG_DATA_HOME=str(here/"xdg-data"),
+                XDG_CACHE_HOME=str(here/"cache"), XDG_STATE_HOME=str(here/"state"),
+                PATH=f"{binary.parent}:{base_env['PATH']}",
+            )
+            probe_environment = dict(environment, PYTHONHOME=str(here/"unused-python-home"))
+            base_prefix = checked([binary, "-I", "-B", "-c", "import sys; print(sys.prefix)"],
+                                  environment, ordinary).strip()
+            original_image = hashlib.sha256(binary.read_bytes()).hexdigest()
+
+            def make_venv(path, mode):
+                checked([binary, "-I", "-B", "-c", create, binary, path, mode],
+                        environment, ordinary)
+                packages = path / "lib" / f"python{minor}" / "site-packages"
+                assert packages.is_dir(), packages
+                (packages / "omg_venv_observation.py").write_text(f"VALUE = {path.name!r}\n")
+                alias = path / "bin" / f"python{minor}"
+                assert alias.is_file(), alias
+                assert alias.samefile(binary) == (mode == "link"), alias
+
+            for label, name, layout, placeholder in layouts:
+                for pin in ("path", "constraint"):
+                    project = here / f"{label}-{pin}"
+                    project.mkdir()
+                    os.chown(project, account.pw_uid, account.pw_gid)
+                    if pin == "constraint":
+                        (project / "pyproject.toml").write_text(
+                            f'[project]\nrequires-python = "=={version}"\n'
+                        )
+                    if placeholder == "file":
+                        (project / ".venv").write_text("ordinary unactivated placeholder\n")
+                    elif placeholder == "directory":
+                        (project / ".venv").mkdir()
+                    elif placeholder == "other-venv":
+                        make_venv(project / "venv", "link")
+                    venv = project / name if name else None
+                    if venv:
+                        make_venv(venv, layout)
+                    expected = {
+                        "exe": str(binary),
+                        "prefix": str(venv) if venv else base_prefix,
+                        "venv": str(venv) if venv else None,
+                        "home": None if venv else probe_environment["PYTHONHOME"],
+                        "local": name,
+                        "args": ["two words", "--literal"],
+                    }
+                    for command_name in ("python", "python3", f"python{minor}"):
+                        case = f"{label}-{pin}-{command_name}"
+                        result = subprocess.run(
+                            [cli, "run", command_name, "--", "-I", "-B", "-c",
+                             program, *expected["args"]],
+                            cwd=project, env=probe_environment, stdin=subprocess.DEVNULL,
+                            capture_output=True, text=True, timeout=8, **ordinary,
+                        )
+                        output = [json.loads(line.removeprefix("fixture python "))
+                                  for line in result.stdout.splitlines()
+                                  if line.startswith("fixture python ")]
+                        checks.append(dict(
+                            phase=phase, case=case, status=result.returncode,
+                            passed=result.returncode == 0 and output == [expected],
+                            observed=output, expected=expected,
+                            diagnostic=(result.stdout + result.stderr)[-1100:],
+                        ))
+            assert hashlib.sha256(binary.read_bytes()).hexdigest() == original_image
+
+
     def inspect_task_environment_bytes():
         phase = "task-environment-bytes"
         raw = b"test-\xff-value"
@@ -5503,6 +5634,7 @@ exec {shlex.quote(str(binary))} "$@"
                     inspect_task_version_requirements()
                     inspect_node_alias_selection()
                     inspect_python_project_constraints()
+                    inspect_python_virtualenv_launch()
                     inspect_task_environment_bytes()
                     inspect_task_package_metadata()
                     inspect_mise_task_execution()
@@ -5823,6 +5955,6 @@ assert inventory() == before
 report = dict(binaries=binaries, checks=checks, total=len(checks),
               passed=sum(entry["passed"] for entry in checks), host_unchanged=True)
 print(json.dumps(report))
-expected_checks = 303 if consent_oracle is None else 1908
+expected_checks = 303 if consent_oracle is None else 1944
 if report["passed"] != report["total"] or report["total"] != expected_checks:
     sys.exit(4)
