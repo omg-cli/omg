@@ -940,11 +940,20 @@ mod dnf_integration {
     #[tokio::test]
     async fn native_fedora_counters_ignore_daemon_status_file() -> Result<()> {
         use omg_lib::core::fast_status::FastStatus;
+        use std::os::unix::fs::PermissionsExt as _;
 
-        let runtime = tempfile::tempdir()?;
+        let runtime = tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()?;
         let stale = u32::MAX as usize;
-        FastStatus::new(stale, stale, stale, stale)
-            .write_to_file(&runtime.path().join("omg.status"))?;
+        let status = runtime.path().join("omg.status");
+        FastStatus::new(stale, stale, stale, stale).write_to_file(&status)?;
+        assert_eq!(
+            FastStatus::read_validated(&status)
+                .context("status fixture must be trusted")?
+                .total_packages,
+            u32::MAX
+        );
         let manager = DnfPackageManager::new();
         let total = manager.installed_count()?;
         let explicit = manager.list_explicit().await?.len();
