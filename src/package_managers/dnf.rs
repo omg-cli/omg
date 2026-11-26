@@ -651,10 +651,15 @@ impl DnfPackageManager {
                 input.len() <= 64 * 1024,
                 "Native RPM comparison input exceeds limit"
             );
-            let mut command =
-                tokio::process::Command::from(crate::core::privilege::system_command("rpm")?);
+            let mut command = Self::rpm_query_command()?;
             command.env("OMG_EVR_PAIRS", input).args(["--eval", r#"%{lua:local left=nil; for value in string.gmatch(os.getenv("OMG_EVR_PAIRS"), "[^\n]+") do if left then print(string.format("%d\n",rpm.vercmp(left,value))); left=nil else left=value end end; if left then error("incomplete comparison") end}"#]);
-            let output = Self::query_output(command).await?;
+            let output = Self::controlled_query_output(
+                "RPM",
+                command,
+                std::time::Duration::from_mins(1),
+                None,
+            )
+            .await?;
             let compared = std::str::from_utf8(&output)?
                 .split_whitespace()
                 .map(|value| match value {
@@ -1095,23 +1100,26 @@ impl DnfPackageManager {
         Ok(packages)
     }
 
-    fn rpm_query<const N: usize>(
-        arguments: [&str; N],
-        deadline: std::time::Duration,
-    ) -> Result<Vec<u8>> {
+    fn rpm_query_command() -> Result<tokio::process::Command> {
         let mut command =
             tokio::process::Command::from(crate::core::privilege::system_command("rpm")?);
         // Exclude caller macros and preserve the system macro configuration.
         command
             .env("HOME", "/")
             .env("LC_ALL", "C")
-            .stderr(std::process::Stdio::piped())
-            .args(arguments);
-        crate::cli::tea::run_blocking_future(async move {
-            let output = Self::capture_query("RPM", command, deadline, None).await?;
-            Self::require_query_success("RPM", &output)?;
-            Ok(output.stdout)
-        })?
+            .stderr(std::process::Stdio::piped());
+        Ok(command)
+    }
+
+    fn rpm_query<const N: usize>(
+        arguments: [&str; N],
+        deadline: std::time::Duration,
+    ) -> Result<Vec<u8>> {
+        let mut command = Self::rpm_query_command()?;
+        command.args(arguments);
+        crate::cli::tea::run_blocking_future(Self::controlled_query_output(
+            "RPM", command, deadline, None,
+        ))?
     }
 
     fn parse_user_installed_names(output: &[u8]) -> Result<HashSet<String>> {
@@ -1656,9 +1664,13 @@ impl DnfPackageManager {
         ) {
             args.push("--cacheonly".to_owned());
         }
+        // Installed records describe what is on disk, including an older
+        // build excluded from repository selection. DNF still selects the
+        // upgrades using the configured policy.
         if matches!(
             query,
-            RepositoryQuery::InstalledSizes(_)
+            RepositoryQuery::Installed
+                | RepositoryQuery::InstalledSizes(_)
                 | RepositoryQuery::InstalledReasons(_)
                 | RepositoryQuery::InstalledDetails(_)
         ) {
@@ -1767,16 +1779,17 @@ impl DnfPackageManager {
         command: tokio::process::Command,
         deadline: std::time::Duration,
     ) -> Result<Vec<u8>> {
-        Self::controlled_query_output(command, deadline, None).await
+        Self::controlled_query_output("DNF", command, deadline, None).await
     }
 
     async fn controlled_query_output(
+        program: &str,
         command: tokio::process::Command,
         deadline: std::time::Duration,
         cancelled: Option<tokio::sync::oneshot::Receiver<()>>,
     ) -> Result<Vec<u8>> {
-        let output = Self::capture_query("DNF", command, deadline, cancelled).await?;
-        Self::require_query_success("DNF", &output)?;
+        let output = Self::capture_query(program, command, deadline, cancelled).await?;
+        Self::require_query_success(program, &output)?;
         Ok(output.stdout)
     }
 
@@ -1919,6 +1932,7 @@ impl DnfPackageManager {
                 .enable_all()
                 .build()?
                 .block_on(Self::controlled_query_output(
+                    "DNF",
                     command,
                     deadline,
                     Some(cancelled),
@@ -3543,11 +3557,14 @@ mod tests {
         let mut pairs = vec![("1.0-1.fc44".to_owned(), "1.0-1.fc44".to_owned()); 129];
         pairs[0] = ("2:1.0-1.fc44".into(), "1:9.9-9.fc44".into());
         pairs[1] = ("1.0~rc1-1.fc44".into(), "1.0-1.fc44".into());
+        pairs[2] = ("0:1.0-1.fc44".into(), "1.0-1.fc44".into());
+        pairs[3] = ("1.0-2.fc44".into(), "1.0-10.fc44".into());
         pairs[128] = ("1.0^git1-1.fc44".into(), "1.0.1-1.fc44".into());
         let compared = DnfPackageManager::compare_native_evrs(&pairs).await?;
         assert_eq!(compared.len(), 129);
-        assert_eq!((compared[0], compared[1], compared[128]), (1, -1, -1));
-        assert!(compared[2..128].iter().all(|value| *value == 0));
+        assert_eq!(&compared[..4], &[1, -1, 0, -1]);
+        assert_eq!(compared[128], -1);
+        assert!(compared[4..128].iter().all(|value| *value == 0));
         assert!(
             DnfPackageManager::compare_native_evrs(&[("1.0\n2.0".into(), "3.0".into())])
                 .await
@@ -4015,9 +4032,15 @@ mod tests {
         for query in [RepositoryQuery::Installed, RepositoryQuery::Unneeded] {
             let args = DnfPackageManager::repository_query_args(query).unwrap();
             assert!(args.iter().any(|arg| arg == "--cacheonly"), "{args:?}");
+            assert_eq!(
+                args.iter().any(|arg| arg == "--setopt=disable_excludes=*"),
+                query == RepositoryQuery::Installed,
+                "{args:?}"
+            );
         }
         assert!(UPGRADE_QUERY_ARGS.contains(&"--cacheonly"));
         assert!(UPGRADE_QUERY_ARGS.contains(&"--setopt=*.skip_if_unavailable=false"));
+        assert!(!UPGRADE_QUERY_ARGS.contains(&"--setopt=disable_excludes=*"));
     }
 
     #[test]
