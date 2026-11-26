@@ -177,6 +177,79 @@ class HookEnvironmentOracleTests(unittest.TestCase):
             self.check()
 
 
+@unittest.skipIf(os.name == "nt", "Runs the Linux inventory fixture")
+class WorkspaceDiffOracleTests(unittest.TestCase):
+    expected = "OMG Comparing workspace environments vs main\n\n→ fixture\n  Changes: +2 lines, -1 lines\n"
+
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory(prefix="workspace diff fixture ")
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+        previous = Path.cwd()
+        os.chdir(self.root)
+        self.addCleanup(os.chdir, previous)
+        environment = patch.dict(os.environ, {
+            "HOME": str(self.root / "home"),
+            "OMG_DATA_DIR": str(self.root / "data"),
+            "OMG_CONFIG_DIR": str(self.root / "config"),
+            "OMG_CACHE_DIR": str(self.root / "cache"),
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_NOSYSTEM": "1",
+        })
+        environment.start()
+        self.addCleanup(environment.stop)
+        for name in ("Makefile", "project/README.md", "project/Makefile"):
+            ORACLE.write(name, "preserve project fixture\n")
+        self.git("init", "--quiet", "--initial-branch=inventory-default")
+
+    def git(self, *args):
+        result = subprocess.run(["git", *args], capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout
+
+    def test_prepare_makes_the_reference_resolvable_and_uses_a_distinct_checkout(self):
+        ORACLE.prepare("workspace-diff")
+        self.assertNotEqual(self.git("rev-parse", "main"), self.git("rev-parse", "HEAD"))
+        self.assertEqual(self.git("diff", "--numstat", "main", "--", "omg.lock"), "2\t1\tomg.lock\n")
+        self.assertEqual(self.git("status", "--porcelain", "--", "omg.lock"), "")
+        ORACLE.check("workspace-diff", 0, self.expected, "")
+
+    def test_rejects_success_without_an_actual_comparison(self):
+        ORACLE.prepare("workspace-diff")
+        for report in (
+            "  No omg.lock file",
+            "  No changes",
+            "  Changes: +1 lines, -1 lines",
+            "  Changes: +2 lines, -0 lines",
+        ):
+            with self.subTest(report=report), self.assertRaisesRegex(ValueError, "selected lockfile changes"):
+                output = self.expected.replace("  Changes: +2 lines, -1 lines", report)
+                ORACLE.check("workspace-diff", 0, output, "")
+        with self.assertRaisesRegex(ValueError, "unexpected diagnostic"):
+            ORACLE.check("workspace-diff", 0, self.expected, "unrelated failure")
+
+    def test_rejects_changes_to_the_preserved_lock_and_main(self):
+        ORACLE.prepare("workspace-diff")
+        lock = self.root / "omg.lock"
+        active = lock.read_bytes()
+        lock.write_text("different active file\n")
+        with self.assertRaisesRegex(ValueError, "modified unrelated or read-only fixture"):
+            ORACLE.check("workspace-diff", 0, self.expected, "")
+        lock.write_bytes(active)
+        self.git("update-ref", "refs/heads/main", "HEAD")
+        with self.assertRaisesRegex(ValueError, "reference or checkout changed"):
+            ORACLE.check("workspace-diff", 0, self.expected, "")
+
+    def test_refuses_to_reprepare_a_repository_with_existing_history(self):
+        self.git("-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+                 "commit", "--allow-empty", "--no-gpg-sign", "--quiet", "-m", "existing history")
+        head = self.git("rev-parse", "HEAD")
+        with self.assertRaisesRegex(ValueError, "must start without branches"):
+            ORACLE.prepare("workspace-diff")
+        self.assertEqual(self.git("rev-parse", "HEAD"), head)
+        self.assertFalse((self.root / "omg.lock").exists())
+
+
 class EmbeddedRuntimeCarrierTests(unittest.TestCase):
     def resources(self):
         repository = Path(__file__).resolve().parents[1]

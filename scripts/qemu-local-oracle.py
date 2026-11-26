@@ -164,6 +164,39 @@ def history_entries():
     return entries
 
 
+def workspace_git(*args):
+    environment = {key: value for key, value in os.environ.items() if not key.startswith('GIT_')}
+    environment.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM='1', GIT_OPTIONAL_LOCKS='0')
+    result = subprocess.run(
+        ['git', '-c', 'core.hooksPath=' + os.devnull,
+         '-c', 'user.name=OMG QEMU fixture', '-c', 'user.email=fixture@example.invalid', *args],
+        env=environment, capture_output=True, text=True, timeout=10)
+    require(result.returncode == 0, f'workspace fixture Git {args[0]} failed: {result.stderr.strip()}')
+    return result.stdout
+
+
+def prepare_workspace_diff():
+    require(absent('omg.lock'), 'workspace diff fixture must start without a lock')
+    if absent('.git'):
+        workspace_git('init', '--quiet', '--initial-branch=main')
+    git_dir = Path('.git')
+    require(git_dir.is_dir() and not git_dir.is_symlink()
+            and Path(workspace_git('rev-parse', '--show-toplevel').strip()) == Path.cwd(),
+            'workspace diff fixture requires its own Git directory')
+    require(not workspace_git('for-each-ref', '--count=1'),
+            'workspace diff fixture must start without branches or other refs')
+    require(not workspace_git('ls-files', '--stage'), 'workspace diff fixture requires an empty index')
+    workspace_git('symbolic-ref', 'HEAD', 'refs/heads/main')
+    write('omg.lock', 'version = 1\nlabel = "base"\nretained = true\n')
+    workspace_git('add', '--', 'omg.lock')
+    workspace_git('commit', '--quiet', '--no-gpg-sign', '-m', 'Baseline environment')
+    workspace_git('switch', '--quiet', '--create', 'workspace-fixture')
+    write('omg.lock', 'version = 1\nlabel = "changed"\nretained = true\nextra = true\n')
+    workspace_git('add', '--', 'omg.lock')
+    workspace_git('commit', '--quiet', '--no-gpg-sign', '-m', 'Current environment')
+    return workspace_git('rev-parse', 'refs/heads/main', 'HEAD').splitlines()
+
+
 def prepare(case):
     require(case in REFUSALS or case in OUTPUTS, f'unknown local fixture: {case}')
     for name in ('OMG_DATA_DIR', 'OMG_CONFIG_DIR', 'OMG_CACHE_DIR'):
@@ -226,6 +259,7 @@ def prepare(case):
         write_golden(path, templates)
     if case in {'workspace-run', 'workspace-check', 'workspace-diff'} and absent('omg-workspace.toml'):
         write('omg-workspace.toml', 'name = "smoke"\ncreated_at = "2025-06-01T12:00:00Z"\n[projects.fixture]\npath = "."\ndepends_on = []\n[projects.fixture.commands]\nbuild = "make build"\ntest = "make test"\n')
+    workspace_refs = prepare_workspace_diff() if case == 'workspace-diff' else None
     if case.startswith('team-') and case != 'team-init' and absent('.omg/team.toml'):
         member = pwd.getpwuid(os.getuid()).pw_name
         write('.omg/team.toml', 'team_id = "smoke/team"\nname = "Smoke Team"\nmember_id = ' + json.dumps(member) + '\nauto_push = false\n')
@@ -244,6 +278,10 @@ def prepare(case):
         for path in data.rglob('*'):
             if path.is_file() and not path.is_symlink(): baseline[str(path)] = identity(path)
     before = {'case': case, 'time': int(time.time()), 'files': baseline}
+    if workspace_refs is not None:
+        before['workspace_refs'] = workspace_refs
+        for path in ('omg.lock', '.git/HEAD', '.git/index'):
+            baseline[path] = identity(path)
     if case.startswith('team-golden-'): before['golden'] = templates
     if case == 'tool-list': before['tools'] = {str(link): os.readlink(link) for link in (data / 'bin').iterdir() if link.is_symlink()}
     if case == 'init': before['packages'] = native_packages(os.environ['OMG_QEMU_DISTRO'])
@@ -311,8 +349,12 @@ def check(case, code, stdout, stderr):
             date = datetime.datetime.fromtimestamp(item['created_at'], datetime.timezone.utc).strftime('%Y-%m-%d %H:%M')
             require(re.search(re.escape(item['id']) + r'\s+' + re.escape(date) + r'\s+' + re.escape(item['hash'][:8]) + r'\s+' + re.escape(item['message']), stdout), 'snapshot list displayed wrong persisted date/hash/message mapping')
     elif case == 'workspace-diff':
-        require('Comparing workspace environments vs main' in stdout and 'fixture' in stdout and stdout.count('No omg.lock file') == 1, 'workspace diff did not identify selected missing lock')
-        require(absent('omg.lock'), 'workspace diff fabricated a lock')
+        require(not stderr, 'workspace diff reported an unexpected diagnostic')
+        require([line.strip() for line in stdout.splitlines() if line.strip()] == [
+            'OMG Comparing workspace environments vs main', '→ fixture', 'Changes: +2 lines, -1 lines',
+        ], 'workspace diff did not report the selected lockfile changes')
+        require(workspace_git('rev-parse', 'refs/heads/main', 'HEAD').splitlines() == before['workspace_refs'],
+                'workspace diff reference or checkout changed')
     elif case == 'config':
         for value in ['OMG Configuration', 'telemetry.enabled = false', 'aur.build_concurrency = 3', 'aur.enable_ccache = false', str(config / 'config.toml'), str(data)]:
             require(value in stdout, 'config disagrees with persisted private settings')

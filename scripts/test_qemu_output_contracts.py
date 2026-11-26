@@ -1570,7 +1570,12 @@ elif case=='hook-uninstall':
     if mutant!='noop':
         save(home/'.bashrc.omg-backup',text(rc));save(rc,'alias keep="echo preserved"\nexport KEEP_VALUE=42\n')
     print('Shell integration removed (rc file backed up with .omg-backup)')
-elif case=='workspace-diff': print('OMG Comparing workspace environments vs main\n→ fixture\n  No omg.lock file')
+elif case=='workspace-diff':
+    counts = subprocess.run(['git', 'diff', '--numstat', 'main', '--', 'omg.lock'],
+                            capture_output=True, check=True, text=True, timeout=10)
+    added, removed, path = counts.stdout.strip().split('\t')
+    assert path == 'omg.lock'
+    print(f'OMG Comparing workspace environments vs main\n→ fixture\n  Changes: +{added} lines, -{removed} lines')
 elif case=='config':
     print('OMG Configuration\ntelemetry.enabled = false\naur.build_concurrency = '+('99' if mutant=='count' else '3')+'\naur.enable_ccache = false\nconfig_file = '+str(config/'config.toml')+'\ndata_dir = '+str(data))
 elif case=='privacy': print('OMG Privacy Settings\nTelemetry: '+('Enabled' if mutant=='count' else 'Disabled'))
