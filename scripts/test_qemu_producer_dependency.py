@@ -53,7 +53,10 @@ class QemuProducerDependency(unittest.TestCase):
         self.assertFalse('require-workflow-success.sh qemu-matrix.yml' in ci + release,
                          'release must not wait for a removed automatic workflow')
         self.assertRegex(job_block(ci, 'release-tag'), r'needs: \[[^\]]*\bci-success\b')
-        self.assertIn('require-workflow-success.sh ci.yml', release)
+        self.assertIn('python3 scripts/require-release-evidence.py "$GITHUB_SHA"', release)
+        evidence = (ROOT / 'scripts/require-release-evidence.py').read_text(encoding='utf-8')
+        self.assertIn("'ci.yml': 'CI'", evidence)
+        self.assertNotIn('qemu-matrix.yml', evidence)
 
     def test_required_guest_failures_and_skips_fail_the_executed_ci_gate(self):
         ci = (ROOT / '.github/workflows/ci.yml').read_text(encoding='utf-8')
