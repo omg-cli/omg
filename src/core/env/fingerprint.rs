@@ -110,7 +110,9 @@ impl EnvironmentState {
         normalized.normalize();
         normalized.hash = normalized.calculate_hash();
         let content = toml::to_string_pretty(&normalized)?;
-        write_lockfile(path.as_ref(), content.as_bytes())
+        with_lockfile_write(path.as_ref(), |parent| {
+            write_lockfile(path.as_ref(), parent, content.as_bytes())
+        })
     }
 
     /// Load and verify state from an omg.lock file.
@@ -280,15 +282,29 @@ pub(crate) fn read_lockfile(path: &Path) -> Result<String> {
     String::from_utf8(bytes).with_context(|| format!("Lockfile is not UTF-8: {}", path.display()))
 }
 
-fn write_lockfile(path: &Path, content: &[u8]) -> Result<()> {
-    use std::io::Write;
-
+/// Serialize updates to the workspace lockfile without holding a guard while rendering its contents.
+pub(crate) fn with_lockfile_write<T>(
+    path: &Path,
+    write: impl FnOnce(&Path) -> Result<T>,
+) -> Result<T> {
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent)
         .with_context(|| format!("Failed to create lockfile directory {}", parent.display()))?;
+    let _guard = if path.file_name() == Some(std::ffi::OsStr::new("omg.lock")) {
+        Some(super::lock_regular_file(
+            &parent.join(".omg.lock.write.lock"),
+        )?)
+    } else {
+        None
+    };
+    write(parent)
+}
+
+fn write_lockfile(path: &Path, parent: &Path, content: &[u8]) -> Result<()> {
+    use std::io::Write as _;
 
     let mut temporary = tempfile::NamedTempFile::new_in(parent).with_context(|| {
         format!(

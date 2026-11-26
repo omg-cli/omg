@@ -8,7 +8,7 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::io::{ErrorKind, Write as _};
+use std::io::{ErrorKind, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 
 use super::fingerprint::EnvironmentState;
@@ -102,17 +102,46 @@ fn current_member_id() -> String {
     whoami::username().unwrap_or_else(|_| "unknown".to_string())
 }
 
-/// Read a durable team file after rejecting symlinks and non-regular paths.
+const MAX_TEAM_FILE_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Read a bounded snapshot from a regular team file opened without following the final link.
 fn read_regular_file(path: &Path, what: &str) -> Result<String> {
-    let metadata = std::fs::symlink_metadata(path)
-        .with_context(|| format!("Failed to inspect {what}: {}", path.display()))?;
-    anyhow::ensure!(
-        !metadata.file_type().is_symlink() && metadata.is_file(),
-        "{what} must be a regular file: {}",
-        path.display()
-    );
-    std::fs::read_to_string(path)
-        .with_context(|| format!("Failed to read {what}: {}", path.display()))
+    let check_type = |metadata: &std::fs::Metadata| {
+        anyhow::ensure!(
+            metadata.is_file(),
+            "{what} must be a regular file: {}",
+            path.display()
+        );
+        Ok(())
+    };
+    let inspect = || format!("Failed to inspect {what}: {}", path.display());
+    check_type(&std::fs::symlink_metadata(path).with_context(inspect)?)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK | nix::libc::O_NOCTTY);
+    }
+    let read_context = || format!("Failed to read {what}: {}", path.display());
+    let file = options.open(path).with_context(read_context)?;
+    let metadata = file.metadata().with_context(inspect)?;
+    check_type(&metadata)?;
+    let check_size = |size| {
+        anyhow::ensure!(
+            size <= MAX_TEAM_FILE_BYTES,
+            "{what} exceeds the {MAX_TEAM_FILE_BYTES} byte limit: {}",
+            path.display()
+        );
+        Ok(())
+    };
+    check_size(metadata.len())?;
+    let mut content = String::with_capacity(metadata.len() as usize);
+    file.take(MAX_TEAM_FILE_BYTES + 1)
+        .read_to_string(&mut content)
+        .with_context(read_context)?;
+    check_size(content.len() as u64)?;
+    Ok(content)
 }
 
 impl TeamStatus {
@@ -358,9 +387,16 @@ impl TeamWorkspace {
 
     /// Update local member status
     pub async fn update_status(&self) -> Result<TeamStatus> {
-        let config = Self::load_config(&self.root)?;
+        let root = self.root.clone();
+        let (guard, mut status) = tokio::task::spawn_blocking(move || {
+            Self::validate_config_dir(&root)?;
+            let guard = super::lock_regular_file(&root.join(".omg/team-status.lock"))?;
+            let status = Self::load_status_at(&root)?;
+            Ok::<_, anyhow::Error>((guard, status))
+        })
+        .await
+        .context("Team status read task failed")??;
 
-        // Capture current environment
         let current_env = EnvironmentState::capture().await?;
 
         // Load team lock if exists
@@ -373,7 +409,7 @@ impl TeamWorkspace {
         };
 
         let member = TeamMember {
-            id: config.member_id.clone(),
+            id: status.config.member_id.clone(),
             name: local_member_name(),
             env_hash: current_env.hash,
             last_sync: jiff::Timestamp::now().as_second(),
@@ -385,27 +421,6 @@ impl TeamWorkspace {
             },
         };
 
-        // Existing team state is durable data. Reject missing or malformed
-        // status instead of replacing it with an empty member set. Hold a
-        // cross-process flock across load-modify-save so two concurrent omg
-        // invocations cannot drop each other's member updates. Uses the std
-        // advisory file-lock API (stable since Rust 1.89):
-        // https://doc.rust-lang.org/std/fs/struct.File.html#method.lock
-        let lock_path = self.status_path().with_extension("lock");
-        let mut options = std::fs::OpenOptions::new();
-        options.create(true).read(true).write(true).truncate(false);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            options.mode(0o600).custom_flags(nix::libc::O_NOFOLLOW);
-        }
-        let lock = options
-            .open(&lock_path)
-            .with_context(|| format!("Failed to open team status lock {}", lock_path.display()))?;
-        lock.lock().context("Failed to acquire team status lock")?;
-
-        let mut status = self.load_status()?;
-
         // Update or add member
         if let Some(existing) = status.members.iter_mut().find(|m| m.id == member.id) {
             *existing = member;
@@ -416,20 +431,31 @@ impl TeamWorkspace {
         status.lock_hash = lock_hash;
         status.updated_at = jiff::Timestamp::now().as_second();
 
-        // Save status through an atomic replacement so an interruption cannot
-        // truncate durable team state.
-        self.ensure_config_dir()?;
-        let status_json = serde_json::to_vec_pretty(&status)?;
-        crate::core::safe_ops::atomic_write_file_sync(self.status_path(), status_json)?;
-
-        Ok(status)
+        let status_path = self.status_path();
+        tokio::task::spawn_blocking(move || {
+            let _guard = guard;
+            let status_json = serde_json::to_vec_pretty(&status)?;
+            anyhow::ensure!(
+                status_json.len() as u64 <= MAX_TEAM_FILE_BYTES,
+                "Team status exceeds the {MAX_TEAM_FILE_BYTES} byte limit: {}",
+                status_path.display()
+            );
+            crate::core::safe_ops::atomic_write_file_sync(status_path, status_json)?;
+            Ok(status)
+        })
+        .await
+        .context("Team status write task failed")?
     }
 
     /// Load member status and project the authoritative configuration from team.toml.
     /// Reading does not rewrite the persisted snapshot or change its update timestamp.
     pub fn load_status(&self) -> Result<TeamStatus> {
-        Self::validate_config_dir(&self.root)?;
-        let path = self.status_path();
+        Self::load_status_at(&self.root)
+    }
+
+    fn load_status_at(root: &Path) -> Result<TeamStatus> {
+        Self::validate_config_dir(root)?;
+        let path = root.join(".omg/team-status.json");
         let content = read_regular_file(&path, "Team status")?;
         let mut status: TeamStatus =
             serde_json::from_str(&content).context("Failed to parse team status")?;
@@ -440,7 +466,7 @@ impl TeamWorkspace {
                 status.format_version
             );
         }
-        let config = Self::load_config(&self.root)?;
+        let config = Self::load_config(root)?;
         anyhow::ensure!(
             status.config.team_id == config.team_id,
             "Team status belongs to a different team; refusing to reinterpret its member records"

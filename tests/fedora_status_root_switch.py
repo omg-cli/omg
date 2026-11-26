@@ -705,6 +705,167 @@ exec {shlex.quote(str(native_executable))} "$@"
 
 
 
+    def inspect_team_storage():
+        phase = "team-storage"
+        with tempfile.TemporaryDirectory(prefix="team-storage-", dir=work) as directory:
+            here = Path(directory)
+            os.chown(here, account.pw_uid, account.pw_gid)
+            isolated = dict(disabled, HOME=str(here), XDG_DATA_HOME=str(here/"data"),
+                            XDG_CONFIG_HOME=str(here/"config"), XDG_CACHE_HOME=str(here/"cache"),
+                            XDG_STATE_HOME=str(here/"state"))
+            lockfile = here / "omg.lock"
+            config = here / ".omg/team.toml"
+            stored_status = here / ".omg/team-status.json"
+            status_lock = here / ".omg/team-status.lock"
+            write_lock = here / ".omg.lock.write.lock"
+            status_args = ("team", "status")
+            limit = 16 * 1024 * 1024
+
+            def run(label, args, markers=(), *, fails=False, inspect=None,
+                    preserve_status=False, umask=-1):
+                before = stored_status.read_bytes() if preserve_status else None
+                try:
+                    result = command([cli, *args], isolated, dict(ordinary, umask=umask), timeout=8)
+                except subprocess.TimeoutExpired:
+                    checks.append(dict(phase=phase, case=label, passed=False, status=None,
+                                       diagnostic="command exceeded local deadline"))
+                    return
+                text = result.stdout + result.stderr
+                okay = ((result.returncode != 0) == fails and all(marker in text for marker in markers)
+                        and (inspect is None or inspect())
+                        and (not preserve_status or stored_status.read_bytes() == before))
+                checks.append(dict(phase=phase, case=label, passed=okay, status=result.returncode,
+                                   diagnostic=text[-1000:]))
+
+            def is_private_file(path):
+                return path.is_file() and path.stat().st_mode & 0o777 == 0o600
+
+            def reset(path):
+                try:
+                    if stat.S_ISDIR(path.lstat().st_mode):
+                        path.rmdir()
+                    else:
+                        path.unlink()
+                except FileNotFoundError:
+                    pass
+
+            def variant(path, kind, alternative):
+                reset(path)
+                if kind == "directory":
+                    path.mkdir()
+                elif kind == "symlink":
+                    path.symlink_to(alternative)
+                else:
+                    assert kind == "fifo"
+                    os.mkfifo(path)
+                    os.chown(path, account.pw_uid, account.pw_gid)
+
+            def guarded(label, args):
+                before = lockfile.read_bytes()
+                write_lock.touch()
+                write_lock.chmod(0o666)
+                with write_lock.open("rb") as guard:
+                    fcntl.flock(guard, fcntl.LOCK_EX)
+                    with subprocess.Popen([str(cli), *args], cwd=here, env=isolated, text=True,
+                                          stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                          stderr=subprocess.PIPE, **ordinary) as process:
+                        try:
+                            process.wait(timeout=0.55)
+                        except subprocess.TimeoutExpired:
+                            waited = True
+                        else:
+                            waited = False
+                        held_original = lockfile.read_bytes() == before
+                        fcntl.flock(guard, fcntl.LOCK_UN)
+                        try:
+                            output, errors = process.communicate(timeout=8)
+                        except subprocess.TimeoutExpired:
+                            process.kill()
+                            output, errors = process.communicate()
+                            waited = False
+                checks.append(dict(phase=phase, case=label,
+                                   passed=(waited and held_original and process.returncode == 0
+                                           and lockfile.stat().st_mode & 0o777 == 0o600),
+                                   status=process.returncode, waited=waited,
+                                   diagnostic=(output + errors)[-1000:]))
+
+            run("init", ("team", "init", "fixture/storage"), ("fixture/storage",))
+            run("status-without-lockfile", status_args, ("members in sync",))
+            run("capture-baseline", ("env", "capture"), ("Environment state captured",),
+                inspect=lambda: lockfile.stat().st_mode & 0o777 == 0o600)
+            run("status-with-lockfile", status_args, ("members in sync",))
+            good_config = config.read_bytes()
+            good_status = stored_status.read_bytes()
+            (here/"config-source").write_bytes(good_config)
+            (here/"status-source").write_bytes(good_status)
+            (here/"lock-source").write_bytes(b"fixture lock target\n")
+
+            config.write_text("team_id = [\n")
+            run("config-invalid-toml", status_args, ("Failed to parse team config",),
+                fails=True, preserve_status=True)
+            config.write_bytes(b"\xff")
+            run("config-invalid-utf8", status_args, ("Failed to read Team config",),
+                fails=True, preserve_status=True)
+            for kind in ("directory", "symlink", "fifo"):
+                variant(config, kind, here/"config-source")
+                run(f"config-{kind}", status_args, ("Team config must be a regular file",),
+                    fails=True, preserve_status=True,
+                    inspect=lambda: (here/"config-source").read_bytes() == good_config)
+            reset(config)
+            config.write_bytes(good_config.ljust(limit, b" "))
+            run("config-at-bound", status_args, ("members in sync",))
+            config.write_bytes(good_config.ljust(limit + 1, b" "))
+            run("config-above-bound", status_args, ("Team config exceeds",),
+                fails=True, preserve_status=True)
+            config.write_bytes(good_config)
+            run("config-restored", status_args, ("members in sync",))
+
+            stored_status.write_text("{\n")
+            run("status-invalid-json", status_args, ("Failed to parse team status",),
+                fails=True, preserve_status=True)
+            stored_status.write_bytes(b"\xff")
+            run("status-invalid-utf8", status_args, ("Failed to read Team status",),
+                fails=True, preserve_status=True)
+            for kind in ("directory", "symlink", "fifo"):
+                variant(stored_status, kind, here/"status-source")
+                run(f"status-{kind}", status_args, ("Team status must be a regular file",),
+                    fails=True, inspect=lambda: (here/"status-source").read_bytes() == good_status)
+            reset(stored_status)
+            stored_status.write_bytes(good_status.ljust(limit, b" "))
+            run("status-at-bound", status_args, ("members in sync",))
+            stored_status.write_bytes(good_status.ljust(limit + 1, b" "))
+            run("status-above-bound", status_args, ("Team status exceeds",),
+                fails=True, preserve_status=True)
+            stored_status.write_bytes(good_status)
+            run("status-restored", status_args, ("members in sync",))
+
+            for kind in ("directory", "symlink", "fifo"):
+                variant(status_lock, kind, here/"lock-source")
+                run(f"status-lock-{kind}", status_args, ("must be a regular file",),
+                    fails=True, preserve_status=True,
+                    inspect=lambda: (here/"lock-source").read_bytes() == b"fixture lock target\n")
+            reset(status_lock)
+
+            for trial in range(4):
+                guarded(f"capture-waits-{trial}", ("env", "capture"))
+            for trial in range(3):
+                guarded(f"team-push-waits-{trial}", ("team", "push"))
+
+            for kind in ("directory", "symlink", "fifo"):
+                variant(write_lock, kind, here/"lock-source")
+                retained = lockfile.read_bytes()
+                run(f"write-lock-{kind}", ("env", "capture"), ("must be a regular file",),
+                    fails=True, inspect=lambda: lockfile.read_bytes() == retained
+                    and (here/"lock-source").read_bytes() == b"fixture lock target\n")
+            reset(write_lock)
+            run("capture-restored", ("env", "capture"), ("Environment state captured",), umask=0o777,
+                inspect=lambda: is_private_file(write_lock) and is_private_file(lockfile))
+            reset(status_lock)
+            run("status-lock-created", status_args, ("members in sync",), umask=0o777,
+                inspect=lambda: is_private_file(status_lock))
+            run("status-lock-reused", status_args, ("members in sync",), umask=0o777,
+                inspect=lambda: is_private_file(status_lock) and status_lock.read_bytes() == b"")
+
     def inspect_environment_lockfiles():
         phase = "environment-lockfiles"
         with tempfile.TemporaryDirectory(prefix="environment-locks-", dir=work) as directory:
@@ -2400,6 +2561,7 @@ exec {shlex.quote(str(binary))} "$@"
                     inspect_secret_scan()
                     inspect_artifact_signature_inputs()
                     inspect_environment_lockfiles()
+                    inspect_team_storage()
                 config.write_text(alternate_config)
                 refresh_fixture()
                 expected = ordinary_control([dnf, "--cacheonly", "repoquery",
@@ -2717,6 +2879,6 @@ assert inventory() == before
 report = dict(binaries=binaries, checks=checks, total=len(checks),
               passed=sum(entry["passed"] for entry in checks), host_unchanged=True)
 print(json.dumps(report))
-expected_checks = 303 if consent_oracle is None else 1047
+expected_checks = 303 if consent_oracle is None else 1083
 if report["passed"] != report["total"] or report["total"] != expected_checks:
     sys.exit(4)

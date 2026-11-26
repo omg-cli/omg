@@ -1,7 +1,7 @@
 use crate::cli::components::Components;
 use crate::cli::tea::Cmd;
 use crate::cli::{CliContext, EnvCommands, LocalCommandRunner};
-use crate::core::env::fingerprint::{DriftReport, EnvironmentState};
+use crate::core::env::fingerprint::{DriftReport, EnvironmentState, with_lockfile_write};
 use crate::core::http::{BoundedResponseExt, shared_client};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -301,17 +301,17 @@ async fn sync_lockfile_with_api_base(url_or_id: &str, root: &Path, api_base: &st
     // Gist metadata and raw lockfile content are remote input: cap both
     // before allocation so a huge response cannot exhaust memory
     // (csf_08340651, csf_4fe23b28).
-    let gist_resp: GistResponse = response
+    let mut gist_resp: GistResponse = response
         .bounded_json()
         .await
         .context("Failed to read gist response (is it larger than the 16 MiB limit?)")?;
     let file = gist_resp
         .files
-        .get("omg.lock")
+        .remove("omg.lock")
         .context("Gist does not contain omg.lock")?;
     // GitHub includes a partial `content` field when `truncated` is true.
-    let content = if let (Some(content), false) = (&file.content, file.truncated) {
-        content.clone()
+    let content = if let (Some(content), false) = (file.content, file.truncated) {
+        content
     } else {
         client
             .get(&file.raw_url)
@@ -322,12 +322,19 @@ async fn sync_lockfile_with_api_base(url_or_id: &str, root: &Path, api_base: &st
             .await?
     };
 
-    EnvironmentState::parse_lockfile(&content)
-        .context("Downloaded Gist contains an invalid omg.lock")?;
-    backup_replaced_lock(root, &content)?;
-    crate::core::safe_ops::atomic_write_file_sync(root.join("omg.lock"), content)
-        .context("Failed to write omg.lock from Gist")?;
-    Ok(())
+    let root = root.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        EnvironmentState::parse_lockfile(&content)
+            .context("Downloaded Gist contains an invalid omg.lock")?;
+        let lockfile = root.join("omg.lock");
+        with_lockfile_write(&lockfile, |_| {
+            backup_replaced_lock(&root, &content)?;
+            crate::core::safe_ops::atomic_write_file_sync_private(&lockfile, &content)
+                .context("Failed to write omg.lock from Gist")
+        })
+    })
+    .await
+    .context("Environment lockfile import task failed")?
 }
 
 /// Preserve the local lock before a pull overwrites it with the team
@@ -352,7 +359,7 @@ fn backup_replaced_lock(root: &Path, incoming: &str) -> Result<bool> {
         return Ok(false);
     }
     let backup = root.join("omg.lock.backup");
-    crate::core::safe_ops::atomic_write_file_sync(&backup, existing)
+    crate::core::safe_ops::atomic_write_file_sync_private(&backup, existing)
         .context("Failed to back up local omg.lock before pull")?;
     tracing::info!(
         "Replaced local omg.lock with the team version; previous copy kept at {}",
@@ -423,6 +430,96 @@ mod tests {
             .expect("gist fixture completed")
             .expect("gist fixture passed");
         result
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sync_publishes_owner_only_lock_and_backup() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let workspace = tempfile::tempdir().expect("isolated workspace");
+        let lock = workspace.path().join("omg.lock");
+        let backup = workspace.path().join("omg.lock.backup");
+        let previous = lockfile_with_package("local-package");
+        let incoming = lockfile_with_package("remote-package");
+        std::fs::write(&lock, &previous).expect("seed predecessor");
+        std::fs::write(&backup, "older backup").expect("seed earlier backup");
+        for path in [&lock, &backup] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644))
+                .expect("pre-existing readable mode");
+        }
+
+        sync_from_inline_gist_fixture(workspace.path(), &incoming)
+            .await
+            .expect("import lockfile");
+
+        assert_eq!(
+            std::fs::read_to_string(&lock).expect("read published lock"),
+            incoming
+        );
+        assert_eq!(
+            std::fs::read_to_string(&backup).expect("read predecessor backup"),
+            previous
+        );
+        for path in [lock, backup] {
+            assert_eq!(
+                std::fs::metadata(&path)
+                    .expect("inspect published mode")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600,
+                "imported lock and backup must be private: {}",
+                path.display()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sync_waits_for_the_workspace_lock_before_backing_up() {
+        use std::time::Duration;
+
+        let workspace = tempfile::tempdir().expect("isolated workspace");
+        let lock = workspace.path().join("omg.lock");
+        let backup = workspace.path().join("omg.lock.backup");
+        let guard = std::fs::File::create(workspace.path().join(".omg.lock.write.lock"))
+            .expect("open writer test guard");
+        guard.lock().expect("hold writer guard");
+        let previous = lockfile_with_package("local-package");
+        let incoming = lockfile_with_package("remote-package");
+        std::fs::write(&lock, &previous).expect("seed current lock");
+        let root = workspace.path().to_path_buf();
+        let imported = incoming.clone();
+        let mut task =
+            tokio::spawn(async move { sync_from_inline_gist_fixture(&root, &imported).await });
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(250), &mut task)
+                .await
+                .is_err(),
+            "Gist import must wait for the existing writer"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&lock).expect("read published lock"),
+            previous
+        );
+        assert!(!backup.exists());
+        guard.unlock().expect("release writer guard");
+
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("released import finishes")
+            .expect("import task completes")
+            .expect("import commits");
+        assert_eq!(
+            std::fs::read_to_string(&lock).expect("read published lock"),
+            incoming
+        );
+        assert_eq!(
+            std::fs::read_to_string(&backup).expect("read predecessor backup"),
+            previous
+        );
     }
 
     #[cfg(unix)]
