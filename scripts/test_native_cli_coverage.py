@@ -16,6 +16,7 @@ import tarfile
 import tempfile
 import time
 import unittest
+from contextlib import redirect_stdout
 from unittest.mock import patch
 
 
@@ -2218,6 +2219,20 @@ class FreshAdmissionFixture(unittest.TestCase):
                 row, = [item for item in candidate['cases'] if item['name'] == 'repository-decline-signing-key']
                 row.update(change)
                 PRODUCER.validate_fresh_admission(candidate, 'a' * 64)
+
+    def test_failed_native_matrix_publishes_receipt_and_keeps_nonzero_exit(self):
+        receipt = fresh_admission_receipt()
+        receipt['status'] = 'FAIL'
+        receipt['cases'][0]['status'] = 'FAIL'
+        receipt['cases'][0]['failure'] = 'Prepared repository state differed'
+        output = io.StringIO()
+        arguments = ['native-cli-coverage.py', 'fresh-admission-fixture',
+                     '--owner', '/opt/omg-coverage-fresh-test', '--cli', '/omg-extra-bin/cli']
+        with patch.object(PRODUCER.sys, 'argv', arguments), redirect_stdout(output), \
+             patch.object(PRODUCER, 'run_fresh_admission_fixture', return_value=receipt):
+            with self.assertRaisesRegex(ValueError, 'Native fresh admission matrix failed'):
+                PRODUCER.main()
+        self.assertEqual(json.loads(output.getvalue()), receipt)
 
     def test_native_matrix_refuses_an_ordinary_process_before_creating_fixtures(self):
         with patch.object(PRODUCER.os, 'geteuid', return_value=1000), \

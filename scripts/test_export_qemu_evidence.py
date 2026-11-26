@@ -577,11 +577,13 @@ class DescriptorTests(unittest.TestCase):
                     'omarchy-dev-config-unreadable.log', 'omarchy-aur-unavailable-native-state.json',
                     'omarchy-aur-unavailable-unknown.json', 'omarchy-platform-keyring.log',
                     'omarchy-platform-keyring-unreadable-platform-keyrings.txt',
-                    'test-01.log', 'verification.json')
+                    'test-01.log', 'verification.json', 'fresh-admission.json',
+                    'signed-decoders.json')
         for name in included:
             self.fixture(prefix + name, b'actual captured case evidence')
         for name in ('credentials.json', 'private/verification.json', 'config/config.toml',
-                     'omarchy-dev-config-unreadable.conf', 'omarchy-aur-unavailable-profile.profraw'):
+                     'omarchy-dev-config-unreadable.conf', 'omarchy-aur-unavailable-profile.profraw',
+                     'fresh-admission.json.bak', 'private/signed-decoders.json'):
             self.fixture(prefix + name, b'private neighbor')
         status, report = self.run_export()
         self.assertEqual(status, 0, report)

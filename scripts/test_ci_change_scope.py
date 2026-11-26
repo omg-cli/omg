@@ -72,6 +72,55 @@ class ScopeTests(unittest.TestCase):
             self.assertTrue(scope.requires_build(event, {}))
             self.assertEqual(scope.classify_scope(event, {}), (True, True))
 
+    def test_distro_push_requires_native_inputs_and_defaults_to_running(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+
+            def git(*args):
+                return subprocess.check_output(['git', '-c', 'user.name=Test', '-c',
+                    'user.email=test@example.invalid', *args], cwd=root, text=True).strip()
+
+            def commit(message):
+                git('add', '-A')
+                git('commit', '-qm', message)
+                return git('rev-parse', 'HEAD')
+
+            git('init', '-q')
+            (root / 'src').mkdir()
+            (root / 'src/lib.rs').write_text('pub const VALUE: u8 = 1;\n')
+            base = commit('native source')
+            cloud = root / 'services/advisories/wrangler.pg.jsonc'
+            cloud.parent.mkdir(parents=True)
+            cloud.write_text('{}\n')
+            (root / 'README.md').write_text('Updated docs\n')
+            service_head = commit('advisory service and docs')
+            event = {'before': base, 'after': service_head}
+            self.assertFalse(scope.distro_e2e_required('push', event, root))
+            self.assertTrue(scope.requires_build('push', event, root))
+            for name in ('pull_request', 'merge_group', 'schedule', 'workflow_dispatch'):
+                with self.subTest(event=name):
+                    self.assertTrue(scope.distro_e2e_required(name, event, root))
+            for before in (base[:8], 'f' * 40, '0' * 40, service_head, None):
+                with self.subTest(before=before):
+                    self.assertTrue(scope.distro_e2e_required('push', {'before': before, 'after': service_head}, root))
+            docs = root / 'docs'
+            docs.mkdir()
+            for index in range(301):
+                (docs / f'{index:03}.md').write_text('Docs\n')
+            git('mv', 'src/lib.rs', 'docs/moved.md')
+            moved = commit('move native source into docs')
+            self.assertTrue(scope.distro_e2e_required('push', {'before': service_head, 'after': moved}, root))
+
+    def test_distro_workflow_only_skips_after_successful_push_classification(self):
+        workflow = (Path(__file__).resolve().parents[1] / '.github/workflows/distro-e2e.yml').read_text()
+        classifier = workflow.split('\n  scope:\n', 1)[1].split('\n  container-e2e:\n', 1)[0]
+        self.assertIn("if: github.event_name == 'push'", classifier)
+        self.assertIn('python3 scripts/ci-change-scope.py --distro-e2e', classifier)
+        for job in ('container-e2e', 'systemd-daemon-e2e'):
+            header = workflow.split(f'\n  {job}:\n', 1)[1].split('    steps:\n', 1)[0]
+            self.assertIn('needs: scope', header)
+            self.assertIn("!cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.required != 'false')", header)
+
     def test_malformed_identity_fails(self):
         with self.assertRaises(ValueError):
             scope.requires_build('pull_request', {'pull_request': {

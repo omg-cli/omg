@@ -896,7 +896,6 @@ def run_fresh_admission_fixture(owner, cli, names=None, profiles=None, decoder_c
         real_guest_database_unchanged=unchanged,
         complete_matrix=len(selected) == len(cases), coverage_acceptance=False)
     (owner / 'receipt.json').write_text(json.dumps(result, indent=2) + '\n')
-    require(result['status'] == 'PASS', 'Native fresh admission matrix failed; inspect per-case receipts')
     return result
 
 
@@ -2928,7 +2927,9 @@ def main():
                               unknown_app_signer=args.unknown_app_signer, foreign_package=args.foreign_package,
                               platform_keyring=args.platform_keyring)
     elif args.operation == 'fresh-admission-fixture':
-        print(json.dumps(run_fresh_admission_fixture(args.owner, args.cli, args.case, args.profiles, args.decoder_cases)))
+        receipt = run_fresh_admission_fixture(args.owner, args.cli, args.case, args.profiles, args.decoder_cases)
+        print(json.dumps(receipt))
+        require(receipt['status'] == 'PASS', 'Native fresh admission matrix failed; inspect per-case receipts')
     elif args.operation == 'verify-signed-fixture':
         print(json.dumps(verify_signed_fixture(args.owner, args.phase)))
     elif args.operation == 'verify-machine-identity-fixture':
