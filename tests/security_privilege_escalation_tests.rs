@@ -681,14 +681,20 @@ install_from_release
             .split_once("Upload latest-version marker")
             .expect("latest-version marker step must exist");
 
+        let upload = release_workflow_script("Upload release artifacts to R2")
+            .expect("archive and sidecar upload step");
+        assert!(upload.contains(r#"archives=(release/omg-v"$VERSION"-*.tar.gz)"#));
+        assert!(upload.contains(r#"sync_object "$artifact" application/octet-stream &&"#));
+        assert!(upload.contains(r#"sync_object "$artifact.sha256" text/plain"#));
+        let (_, put) = upload
+            .split_once(r#"r2 object put "omg-releases/$name" --remote"#)
+            .expect("shared archive and sidecar upload");
+        let (put, _) = put
+            .split_once("r2 object get")
+            .expect("readback follows the shared upload");
         assert!(
-            archives_region.contains("release/omg-v*.tar.gz")
-                && archives_region.contains("release/omg-v*.sha256"),
-            "both archive and sidecar uploads must be covered by the immutable policy"
-        );
-        assert!(
-            archives_region.matches(immutable).count() >= 2,
-            "every archive and sidecar upload must be marked immutable"
+            put.contains(immutable),
+            "the shared upload must mark both archives and sidecars immutable"
         );
         assert!(
             !archives_region.contains(no_store),
@@ -1039,15 +1045,31 @@ install_from_release
             r2_job.contains("environment: production"),
             "R2 promotion must pass through the protected production environment"
         );
-        let round_trip = r2_job
-            .find("Verify round-trip integrity of uploaded objects")
-            .expect("R2 uploads must be verified after publication");
+        let archive_step = r2_job
+            .find("Upload release artifacts to R2")
+            .expect("archive and sidecar upload step");
         let latest_marker = r2_job
             .find("Upload latest-version marker")
             .expect("R2 promotion marker step must exist");
         assert!(
-            round_trip < latest_marker,
+            archive_step < latest_marker,
             "clients must not discover an R2 release before its objects are verified"
+        );
+        let upload = release_workflow_script("Upload release artifacts to R2")
+            .expect("archive and sidecar upload step");
+        let (_, uploaded) = upload.split_once("r2 object put").expect("upload archives");
+        let (_, downloaded) = uploaded
+            .split_once("r2 object get")
+            .expect("download archives");
+        let (_, verified) = downloaded
+            .split_once(r#"cmp -s "$artifact" "$artifact_verify_dir/$name""#)
+            .expect("compare each downloaded archive and sidecar against the submitted bytes");
+        let (_, joined) = verified
+            .split_once(r#"wait "$pid" || failed=1"#)
+            .expect("wait for every archive verification worker");
+        assert!(
+            joined.contains("if (( failed != 0 )); then\n    exit 1"),
+            "any worker failure must prevent publishing the marker"
         );
         let r2_cli: Vec<&str> = r2_job
             .lines()

@@ -625,6 +625,112 @@ mod boundary_matrix {
         dashboard_pty("action")
     }
 
+    #[cfg(all(target_os = "linux", debug_assertions, feature = "arch"))]
+    #[test]
+    fn search_picker_uses_local_details_when_the_daemon_disconnects() -> anyhow::Result<()> {
+        use omg_lib::core::env::distro::{Distro, detect_distro};
+        use omg_lib::daemon::protocol::{
+            PackageInfo, Request, Response, ResponseResult, SearchResult, WirePackageSource,
+            encode_frame, read_frame, split_frame,
+        };
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::os::unix::net::UnixListener;
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+
+        if omg_lib::core::is_root() || detect_distro() != Distro::Arch {
+            return Ok(());
+        }
+        for (package, expected) in [
+            ("bash", "Installed"),
+            ("omg invalid picker name", "Failed to show package details"),
+        ] {
+            let home = tempfile::Builder::new()
+                .permissions(std::fs::Permissions::from_mode(0o700))
+                .tempdir_in("/var/tmp")?;
+            let socket = home.path().join("omg.sock");
+            omg_lib::core::client::validate_socket_with_context(&socket)?;
+            let listener = UnixListener::bind(&socket)?;
+            listener.set_nonblocking(true)?;
+            let mut command = Command::new("/usr/bin/python3");
+            command
+                .args([
+                    "-I",
+                    "-c",
+                    include_str!("fixtures/search_picker_pty.py"),
+                    env!("CARGO_BIN_EXE_omg"),
+                    expected,
+                ])
+                .env_clear()
+                .env("HOME", home.path())
+                .env("OMG_DATA_DIR", home.path().join("data"))
+                .env("OMG_SOCKET_PATH", &socket)
+                .env("OMG_DISABLE_TELEMETRY", "1")
+                .env("OMG_NO_UPDATE_CHECK", "1")
+                .env("NO_COLOR", "1")
+                .env("TERM", "xterm-256color")
+                .env("PATH", "/usr/bin:/bin")
+                .current_dir(home.path())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            for key in ["LLVM_PROFILE_FILE", "LD_LIBRARY_PATH"] {
+                if let Some(value) = std::env::var_os(key) {
+                    command.env(key, value);
+                }
+            }
+            let child = command.spawn()?;
+            let result = (|| -> anyhow::Result<()> {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            anyhow::ensure!(Instant::now() < deadline, "no search request");
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
+                };
+                stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+                stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+                let frame = read_frame(&mut stream)?;
+                let (_, payload) = split_frame(&frame)?;
+                let Request::Search { id, query, .. } = bitcode::deserialize(payload)? else {
+                    anyhow::bail!("expected a daemon search request");
+                };
+                assert_eq!(query, "omg-native-picker");
+                drop(listener);
+                std::fs::remove_file(&socket)?;
+                let response = encode_frame(&Response::Success {
+                    id,
+                    result: ResponseResult::Search(SearchResult {
+                        packages: vec![PackageInfo {
+                            name: package.into(),
+                            version: "1-1".into(),
+                            description: "Search result".into(),
+                            source: WirePackageSource::Official,
+                        }],
+                        total: 1,
+                    }),
+                })?;
+                stream.write_all(&u32::try_from(response.len())?.to_be_bytes())?;
+                stream.write_all(&response)?;
+                Ok(())
+            })();
+            let output = child.wait_with_output()?;
+            result.map_err(|error| {
+                anyhow::anyhow!("{error:#}\n{}", String::from_utf8_lossy(&output.stderr))
+            })?;
+            anyhow::ensure!(
+                output.status.success(),
+                "search picker for {package} failed:\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        Ok(())
+    }
+
     #[cfg(all(target_os = "linux", debug_assertions))]
     fn dashboard_pty(mode: &str) -> anyhow::Result<()> {
         let home = tempfile::tempdir_in("/var/tmp")?;

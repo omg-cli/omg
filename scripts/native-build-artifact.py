@@ -5,6 +5,7 @@ Server artifact digests and the expected run/recipe are supplied by the caller.
 An adjacent checksum or self-reported provenance alone never authorizes reuse.
 """
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import io
 import json
@@ -575,7 +576,9 @@ def stage_release(root, destination, repository, source, run_id, attempt, *, inc
     receipt = dict(repository=repository, source_sha=source, run_id=run_id, run_attempt=attempt, archives={})
     with tempfile.TemporaryDirectory(prefix='native-release-', dir=destination.parent) as scratch:
         stage = Path(scratch) / 'verified'
-        for distro, (artifact, artifact_attempt) in candidates.items():
+
+        def stage_archive(candidate):
+            distro, (artifact, artifact_attempt) = candidate
             expected = bundle_identity(repository, source, run_id, artifact_attempt, distro,
                                        images[distro], version, toolchain)
             content = download_artifact(f'{path}/artifacts/{artifact["id"]}/zip')
@@ -584,8 +587,11 @@ def stage_release(root, destination, repository, source, run_id, attempt, *, inc
             package.mkdir(parents=True)
             for name, data in files.items():
                 (package / name).write_bytes(data)
-            receipt['archives'][distro] = dict(provenance, artifact_id=artifact['id'],
-                                               artifact_attempt=artifact_attempt, artifact_digest=artifact['digest'])
+            return distro, dict(provenance, artifact_id=artifact['id'],
+                                artifact_attempt=artifact_attempt, artifact_digest=artifact['digest'])
+
+        with ThreadPoolExecutor(max_workers=3) as workers:
+            receipt['archives'].update(workers.map(stage_archive, candidates.items()))
         successful_run()
         (stage / 'native-release-provenance.json').write_text(json.dumps(receipt, indent=2) + '\n', encoding='utf-8')
         require(not destination.exists() and not destination.is_symlink(), 'release staging destination exists')

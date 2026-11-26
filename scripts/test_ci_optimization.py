@@ -36,6 +36,37 @@ def coverage_report_script(name):
 
 
 class OptimizationContracts(unittest.TestCase):
+    def test_macos_native_tests_share_the_independent_nextest_runner(self):
+        workflow = (WORKFLOWS / 'ci.yml').read_text(encoding='utf-8')
+        release = job_block(workflow, 'macos')
+        native = job_block(workflow, 'macos-nextest-source')
+        for job in (release, native):
+            self.assertIn('needs: quick-gate\n', job)
+            self.assertIn('runs-on: macos-15\n', job)
+        for check in (
+            'Install nextest',
+            'Preserve nextest installer receipts',
+            'Install Fish unit test dependency',
+            'Provision relocatable Python virtualenv fixture',
+            'Run unit tests',
+            'Run macOS platform integration tests',
+            'Preserve compiled parser surfaces',
+        ):
+            with self.subTest(check=check):
+                self.assertIn(f'      - name: {check}\n', native)
+                self.assertNotIn(f'      - name: {check}\n', release)
+        self.assertIn('name: native-release-macos-', release)
+        self.assertIn('scripts/verify-macos-doctor.py target/release/omg', release)
+        self.assertIn('GITHUB_PATH= python3 scripts/install-nextest-macos.py --source-only', native)
+        self.assertIn('name: nextest-source-contract-macos\n', native)
+        self.assertIn('OMG_CONTRACT_PLATFORM: macos\n', native)
+        self.assertIn('name: cli-surfaces-macos\n', native)
+        self.assertIn('prefix-key: macos-tests-v1', native)
+        self.assertIn("save-if: ${{ github.ref == 'refs/heads/main' }}", native)
+        gate = job_block(workflow, 'ci-success')
+        self.assertIn('MACOS: ${{ needs.macos.result }}', gate)
+        self.assertIn('MACOS_NEXTEST_SOURCE: ${{ needs.macos-nextest-source.result }}', gate)
+
     def test_native_qemu_cache_identity_binds_the_exact_reviewed_image(self):
         script = step_script('coverage.yml', 'Identify pinned native QEMU image cache')
         manifest = json.loads((ROOT / 'tests/qemu-image-provenance/manifest.json').read_text())
@@ -91,11 +122,18 @@ class OptimizationContracts(unittest.TestCase):
         configure = workflow.split('      - name: Configure signed Ubuntu archive\n', 1)[1]
         archive_step, install = configure.split('      - name: Install Python workflow test dependencies\n', 1)
         install_step = install.split('      - name:', 1)[0]
-        gate = "if: github.event_name == 'push' || needs.quick-gate.outputs.checks-required == 'true'"
+        gate = "if: matrix.shard == 0 && (github.event_name == 'push' || needs.quick-gate.outputs.checks-required == 'true')"
         self.assertIn('uses: ./.github/actions/ubuntu-apt', archive_step)
         self.assertIn(gate, archive_step)
         self.assertIn(gate, install_step)
         self.assertIn('sudo apt-get install -y --no-install-recommends python3-venv', install_step)
+        rust_step = workflow.split('      - name: Install Rust\n', 1)[1].split('\n      - name:', 1)[0]
+        self.assertIn(gate, rust_step)
+        checkout = workflow.split('    steps:\n', 1)[1].split('\n      - name:', 1)[0]
+        self.assertIn("fetch-depth: ${{ matrix.shard == 0 && '0' || '1' }}", checkout)
+        execute = workflow.split('      - name: Execute complete helper shard\n', 1)[1].split('\n      - name:', 1)[0]
+        self.assertIn("if: github.event_name == 'push' || needs.quick-gate.outputs.checks-required == 'true'", execute)
+        self.assertIn('--shard "${{ matrix.shard }}" --shards 2', execute)
 
     @unittest.skipUnless(os.name != 'nt' and shutil.which('jq'), 'Hosted Inspector proof uses Bash and jq')
     def test_inspector_contracts_require_the_event_checkout_before_running(self):

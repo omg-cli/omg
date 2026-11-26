@@ -131,7 +131,7 @@ class RequiredResultsTests(unittest.TestCase):
 
     def test_binary_unit_targets_in_every_unit_lane(self):
         text = CI_YML.read_text(encoding="utf-8")
-        for job in ("portable", "linux-matrix", "macos", "ubuntu"):
+        for job in ("portable", "linux-matrix", "macos-nextest-source", "ubuntu"):
             self.assertIn("python3 scripts/run-native-contracts.py --features", job_block(text, job))
         for feature in ('pgp,license', 'arch,pgp,license', 'debian,pgp,license',
                         'fedora,pgp,license', 'macos,pgp,license'):
