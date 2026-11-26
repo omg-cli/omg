@@ -3,7 +3,7 @@
 use anyhow::Result;
 
 use crate::cli::tea::Cmd;
-use crate::core::history::{HistoryManager, TransactionType};
+use crate::core::history::{HistoryManager, PackageChange, TransactionType};
 
 #[cfg(any(feature = "arch", feature = "debian", feature = "debian-pure"))]
 const REVERSE_DEPENDENCY_DISPLAY_LIMIT: usize = 20;
@@ -56,8 +56,12 @@ async fn build_blame_fedora(package: &str) -> Result<Cmd<()>> {
     .await?;
     dependents.retain(|entry| entry.identity != root.identity);
     dependents.sort_by(|left, right| left.identity.cmp(&right.identity));
+    let (_, architecture) = root
+        .identity
+        .rsplit_once('.')
+        .context("Missing RPM architecture")?;
     let mut commands = vec![
-        Cmd::header("Package History", root.identity),
+        Cmd::header("Package History", &root.identity),
         Components::kv_list(
             Some("Native Package Information"),
             vec![
@@ -67,10 +71,10 @@ async fn build_blame_fedora(package: &str) -> Result<Cmd<()>> {
             ],
         ),
     ];
-    commands.extend(transaction_history(&root.name)?);
-    commands.push(Cmd::info(
-        "OMG history is matched by package name, not by installed build or architecture.",
-    ));
+    commands.extend(transaction_history(HistorySubject {
+        name: &root.name,
+        architecture: Some(architecture),
+    })?);
     if dependents.is_empty() {
         commands.push(Cmd::info(
             "No other installed packages directly require this package.",
@@ -84,9 +88,25 @@ async fn build_blame_fedora(package: &str) -> Result<Cmd<()>> {
     Ok(Cmd::batch(commands))
 }
 
+#[derive(Clone, Copy)]
+struct HistorySubject<'a> {
+    name: &'a str,
+    architecture: Option<&'a str>,
+}
+
+impl HistorySubject<'_> {
+    fn matches(self, change: &PackageChange) -> bool {
+        change.name == self.name
+            && self
+                .architecture
+                .zip(change.architecture.as_deref())
+                .is_none_or(|(requested, recorded)| requested == recorded)
+    }
+}
+
 fn newest_transactions_for_package<'a>(
     transactions: &'a [crate::core::history::Transaction],
-    package: &str,
+    subject: HistorySubject<'_>,
 ) -> Vec<&'a crate::core::history::Transaction> {
     let mut relevant: Vec<_> = transactions
         .iter()
@@ -94,7 +114,7 @@ fn newest_transactions_for_package<'a>(
             transaction
                 .changes
                 .iter()
-                .any(|change| change.name == package)
+                .any(|change| subject.matches(change))
         })
         .collect();
     relevant.sort_by_key(|entry| std::cmp::Reverse(entry.timestamp));
@@ -123,23 +143,26 @@ fn build_blame_output(package: &str) -> Result<Cmd<()>> {
         ],
     ));
 
-    commands.extend(transaction_history(package)?);
+    commands.extend(transaction_history(HistorySubject {
+        name: package,
+        architecture: None,
+    })?);
     commands.push(Cmd::spacer());
     commands.push(show_required_by(package)?);
     Ok(Cmd::batch(commands))
 }
 
-fn transaction_history(package: &str) -> Result<Vec<Cmd<()>>> {
+fn transaction_history(subject: HistorySubject<'_>) -> Result<Vec<Cmd<()>>> {
     let transactions = HistoryManager::load_existing()?;
-    Ok(history_report(&transactions, package))
+    Ok(history_report(&transactions, subject))
 }
 
 fn history_report(
     transactions: &[crate::core::history::Transaction],
-    package: &str,
+    subject: HistorySubject<'_>,
 ) -> Vec<Cmd<()>> {
     let mut commands = Vec::new();
-    let relevant = newest_transactions_for_package(transactions, package);
+    let relevant = newest_transactions_for_package(transactions, subject);
 
     if relevant.is_empty() {
         use crate::cli::tea::{StyledTextConfig, TextStyle};
@@ -167,7 +190,7 @@ fn history_report(
                 let time = format_timestamp(txn.timestamp.as_second());
                 txn.changes
                     .iter()
-                    .filter(move |change| change.name == package)
+                    .filter(move |change| subject.matches(change))
                     .map(move |change| {
                         let version_info = match (&change.old_version, &change.new_version) {
                             (None, Some(new)) => format!("→ {new}"),
@@ -175,7 +198,16 @@ fn history_report(
                             (Some(old), None) => format!("{old} → (removed)"),
                             (None, None) => String::new(),
                         };
-                        format!("{} {} {} ({})", time, action, version_info, change.source)
+                        let legacy =
+                            if subject.architecture.is_some() && change.architecture.is_none() {
+                                ", architecture unrecorded"
+                            } else {
+                                ""
+                            };
+                        format!(
+                            "{} {} {} ({}{legacy})",
+                            time, action, version_info, change.source
+                        )
                     })
             })
             .collect();
@@ -330,6 +362,7 @@ mod ordering_tests {
             timestamp: timestamp.parse().expect("timestamp"),
             transaction_type: TransactionType::Install,
             changes: vec![PackageChange {
+                architecture: None,
                 name: package.to_string(),
                 old_version: None,
                 new_version: Some("1.0".to_string()),
@@ -347,7 +380,13 @@ mod ordering_tests {
             transaction("old", "2026-01-01T00:00:00Z", "vim"),
         ];
 
-        let relevant = newest_transactions_for_package(&history, "vim");
+        let relevant = newest_transactions_for_package(
+            &history,
+            HistorySubject {
+                name: "vim",
+                architecture: None,
+            },
+        );
         assert_eq!(
             relevant
                 .iter()
@@ -366,18 +405,21 @@ mod ordering_tests {
         entry.changes[0].new_version = Some("3.0".into());
         entry.changes.extend([
             PackageChange {
+                architecture: None,
                 name: "glibc".into(),
                 old_version: Some("1.0".into()),
                 new_version: Some("2.0".into()),
                 source: "dnf".into(),
             },
             PackageChange {
+                architecture: None,
                 name: "glibc".into(),
                 old_version: Some("1.1".into()),
                 new_version: None,
                 source: "dnf".into(),
             },
             PackageChange {
+                architecture: None,
                 name: "glibc".into(),
                 old_version: None,
                 new_version: None,
@@ -388,7 +430,13 @@ mod ordering_tests {
                 .remove(0),
         ]);
 
-        let report = history_report(&[entry], "glibc");
+        let report = history_report(
+            std::slice::from_ref(&entry),
+            HistorySubject {
+                name: "glibc",
+                architecture: None,
+            },
+        );
         assert_eq!(report.len(), 2);
         assert!(matches!(report.first(), Some(Cmd::View(View::Spacer))));
         let (title, rows) = report
@@ -404,6 +452,27 @@ mod ordering_tests {
         assert!(rows[1].contains("1.0 → 2.0"));
         assert!(rows[2].contains("1.1 → (removed)"));
         assert!(rows[3].ends_with("(unknown-version)"));
+
+        entry.changes[0].architecture = Some("x86_64".into());
+        entry.changes[1].architecture = Some("i686".into());
+        let filtered = history_report(
+            &[entry],
+            HistorySubject {
+                name: "glibc",
+                architecture: Some("x86_64"),
+            },
+        );
+        let rows = filtered
+            .iter()
+            .find_map(|command| match command {
+                Cmd::View(View::Card(_, rows)) => Some(rows),
+                _ => None,
+            })
+            .expect("expected one history card");
+        assert_eq!(rows.len(), 3);
+        assert!(rows[0].ends_with("→ 3.0 (test)"));
+        assert!(rows[1].ends_with("1.1 → (removed) (dnf, architecture unrecorded)"));
+        assert!(rows[2].ends_with("(unknown-version, architecture unrecorded)"));
     }
 }
 

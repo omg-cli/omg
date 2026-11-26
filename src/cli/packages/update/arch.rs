@@ -219,6 +219,7 @@ fn history_changes(updates: &[UpdateInfo]) -> Vec<crate::core::history::PackageC
     updates
         .iter()
         .map(|update| crate::core::history::PackageChange {
+            architecture: None,
             name: update.name.clone(),
             old_version: Some(update.old_version.clone()),
             new_version: Some(update.new_version.clone()),
@@ -618,6 +619,7 @@ mod tests {
         let expected =
             [("linux", "core"), ("firefox", "extra"), ("paru", "aur")].map(|(name, source)| {
                 crate::core::history::PackageChange {
+                    architecture: None,
                     name: name.to_string(),
                     old_version: Some("1.0".to_string()),
                     new_version: Some("2.0".to_string()),
@@ -667,6 +669,7 @@ mod tests {
 
         let expected = [("linux", "core"), ("paru", "aur")].map(|(name, source)| {
             crate::core::history::PackageChange {
+                architecture: None,
                 name: name.to_string(),
                 old_version: Some("1.0".to_string()),
                 new_version: Some("2.0".to_string()),

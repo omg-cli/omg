@@ -1167,7 +1167,7 @@ fn draw_activity(f: &mut Frame, area: Rect, app: &App) {
                 if j > 0 {
                     changes.push_str(", ");
                 }
-                changes.push_str(&c.name);
+                changes.push_str(&sanitize_control_chars(&c.display_name()));
             }
 
             let style = if index == app.selected_index {
@@ -1943,6 +1943,7 @@ mod tests {
                 timestamp: jiff::Timestamp::from_second(0).expect("fixture timestamp"),
                 transaction_type: TransactionType::Install,
                 changes: vec![PackageChange {
+                    architecture: None,
                     name: format!("history-{index:02}"),
                     old_version: None,
                     new_version: Some("1.0".to_string()),

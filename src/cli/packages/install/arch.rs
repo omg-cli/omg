@@ -178,6 +178,7 @@ fn parent_install_changes(
         .iter()
         .filter(|package| !aur_packages.contains(*package))
         .map(|package| PackageChange {
+            architecture: None,
             name: history_package_name(package),
             old_version: None,
             new_version: None,
@@ -573,6 +574,7 @@ fn record_aur_history(
 ) -> Result<()> {
     use crate::core::history::{HistoryManager, PackageChange, TransactionType};
     let change = PackageChange {
+        architecture: None,
         name: name.to_string(),
         old_version: None,
         new_version: installed_version,
@@ -1309,6 +1311,7 @@ mod tests {
         let aur = vec!["aur-only".to_string()];
         let expected =
             ["official-a", "official-b"].map(|name| crate::core::history::PackageChange {
+                architecture: None,
                 name: name.to_string(),
                 old_version: None,
                 new_version: None,
@@ -1319,6 +1322,39 @@ mod tests {
             packages_excluding(&mixed, &aur),
             ["official-a", "official-b"]
         );
+    }
+
+    #[test]
+    fn cancelled_aur_install_keeps_a_failed_history_entry() -> Result<()> {
+        const CASE: &str = "cli::packages::install::arch::tests::cancelled_aur_install_keeps_a_failed_history_entry";
+        if crate::config::Settings::rerun_test_unprivileged(CASE)
+            || crate::core::testing::run_isolated_test(CASE)
+        {
+            return Ok(());
+        }
+        let data = tempfile::tempdir()?;
+        temp_env::with_var("OMG_DATA_DIR", Some(data.path()), || -> Result<()> {
+            let result = record_aur_history(
+                "history-fixture",
+                None,
+                Err(anyhow::anyhow!("Installation cancelled by user")),
+            );
+            assert_eq!(
+                result.unwrap_err().to_string(),
+                "Installation cancelled by user"
+            );
+
+            let history = crate::core::history::HistoryManager::load_existing()?;
+            assert_eq!(history.len(), 1);
+            let attempt = &history[0];
+            assert!(!attempt.success);
+            assert_eq!(attempt.changes.len(), 1);
+            let change = &attempt.changes[0];
+            assert_eq!(change.name, "history-fixture");
+            assert_eq!(change.source, "aur");
+            assert!(change.architecture.is_none() && change.new_version.is_none());
+            Ok(())
+        })
     }
 
     #[test]

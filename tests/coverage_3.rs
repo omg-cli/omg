@@ -80,6 +80,30 @@ fn seed_history(project: &TestProject, entries: &[String]) {
     .unwrap();
 }
 
+#[test]
+fn history_search_keeps_other_packages_in_the_matching_transaction() {
+    let project = TestProject::for_distro("arch");
+    let qualified = change_json("example", None, "dnf").replace(
+        "\"name\": \"example\"",
+        "\"name\": \"example\", \"architecture\": \"x86_64\"",
+    );
+    let sibling = change_json("dependency", None, "dnf");
+    seed_history(
+        &project,
+        &[txn_json(
+            INSTALL_TXN_ID,
+            "Install",
+            true,
+            &format!("{qualified},{sibling}"),
+        )],
+    );
+
+    let result = project.run(&["history", "--search", "example.x86_64"]);
+    result.assert_success();
+    result.assert_stdout_contains("example.x86_64");
+    result.assert_stdout_contains("dependency");
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // rollback_action partition logic, exercised through the real binary
 // ═══════════════════════════════════════════════════════════════════════════
@@ -376,9 +400,8 @@ fn rollback_install_refuses_unproven_removal_without_changing_state() {
 // ═════════════════════════════════════════════════════════════════════
 // find_cached_arch_package / _in miss + fail-closed paths through the CLI.
 //
-// OMG_PACMAN_ROOT points at an empty temp root, so every path here ends at a
-// refusal BEFORE ArchPackageManager::install would ever run — no privileged
-// operation is reachable from these tests.
+// OMG_PACMAN_ROOT points at a private temp root. Cache selection and
+// archive admission fail before any privileged operation can run.
 //
 // Cache misses and invalid matching archives have distinct diagnostics. Both
 // paths must refuse BEFORE any install is attempted and name the affected
@@ -517,6 +540,36 @@ mod arch_cache_contracts {
         let result = project.run(&["rollback", OFFICIAL_UPDATE_ID, "--yes"]);
 
         assert_invalid_cache_refusal(&result);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rollback_records_a_failed_attempt_when_a_matching_archive_is_untrusted() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        require_arch!();
+        let project = TestProject::for_distro("arch");
+        let archive = cache_dir(&project).join("example-1.0-1-x86_64.pkg.tar.gz");
+        write_archive(&archive, Some("pkgname = example\npkgver = 1.0-1\n"));
+        std::fs::set_permissions(&archive, std::fs::Permissions::from_mode(0o666)).unwrap();
+        seed_official_update_txn(&project, OFFICIAL_UPDATE_ID);
+
+        let result = project.run(&["rollback", OFFICIAL_UPDATE_ID, "--yes"]);
+        result.assert_failure();
+        result.assert_stderr_contains("local package archive must not be group/world writable");
+        let data = std::fs::read(project.data_dir.path().join("history.json")).unwrap();
+        let recorded: Vec<omg_lib::core::history::Transaction> =
+            serde_json::from_slice(&data).unwrap();
+        assert_eq!(recorded.len(), 2);
+        let attempt = &recorded[1];
+        assert!(!attempt.success);
+        let [change] = attempt.changes.as_slice() else {
+            panic!("expected one rollback package");
+        };
+        assert_eq!(change.name, "example");
+        assert_eq!(change.new_version.as_deref(), Some("1.0-1"));
+        assert_eq!(change.source, "rollback");
+        assert!(change.architecture.is_none());
     }
 }
 

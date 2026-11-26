@@ -188,7 +188,11 @@ impl App {
     }
 
     pub fn new() -> Result<Self> {
-        let mut app = Self::initial(true);
+        Self::new_for_tab(Tab::Dashboard)
+    }
+
+    pub(super) fn new_for_tab(tab: Tab) -> Result<Self> {
+        let mut app = Self::initial(true).with_tab(tab);
         app.refresh()?;
         Ok(app)
     }
@@ -213,7 +217,9 @@ impl App {
 
         self.security_policy = Some(crate::core::security::SecurityPolicy::load_default());
 
-        self.update_system_metrics();
+        if self.current_tab == Tab::Dashboard {
+            self.update_system_metrics();
+        }
 
         // Refresh local team state. Remote member data is fetched by the
         // event loop on a background task only while the Team tab is visible.
@@ -223,7 +229,7 @@ impl App {
     }
 
     pub(super) fn read_recent_history() -> Result<Vec<Transaction>> {
-        let entries = crate::core::history::HistoryManager::new()?.load()?;
+        let entries = crate::core::history::HistoryManager::load_existing()?;
         Ok(entries.into_iter().rev().take(50).collect())
     }
 
@@ -308,6 +314,7 @@ impl App {
             network_rx,
             network_tx,
         };
+        self.last_update = Instant::now();
     }
 
     /// Read the cumulative `cpu` line of `/proc/stat` as `(total, idle)`.
@@ -342,7 +349,7 @@ impl App {
                 let d_total = sample.0.saturating_sub(prev_total);
                 let d_idle = sample.1.saturating_sub(prev_idle);
                 if d_total > 0 {
-                    (d_total - d_idle) as f32 / d_total as f32 * 100.0
+                    d_total.saturating_sub(d_idle) as f32 / d_total as f32 * 100.0
                 } else {
                     0.0
                 }
@@ -546,10 +553,14 @@ impl App {
     /// Switch tabs, resetting transient list/search state so a stale
     /// selection or armed search mode cannot leak across tabs.
     pub fn switch_tab(&mut self, tab: Tab) {
+        let entering_dashboard = self.current_tab != Tab::Dashboard && tab == Tab::Dashboard;
         self.current_tab = tab;
         self.selected_index = 0;
         self.search_mode = false;
         self.pending_confirmation = None;
+        if entering_dashboard && self.external_refresh_enabled {
+            self.update_system_metrics();
+        }
     }
 
     /// Record a search-query mutation and invalidate results for the old query.
@@ -568,10 +579,10 @@ impl App {
 
         // Update metrics more frequently
         if self.external_refresh_enabled
+            && self.current_tab == Tab::Dashboard
             && self.last_update.elapsed() >= std::time::Duration::from_secs(1)
         {
             self.update_system_metrics();
-            self.last_update = Instant::now();
         }
 
         Ok(())
@@ -736,6 +747,25 @@ impl App {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[test]
+    fn recent_history_reads_empty_state_without_creating_the_store() -> Result<()> {
+        const CASE: &str =
+            "cli::tui::app::tests::recent_history_reads_empty_state_without_creating_the_store";
+        if crate::config::Settings::rerun_test_unprivileged(CASE)
+            || crate::core::testing::run_isolated_test(CASE)
+        {
+            return Ok(());
+        }
+        let fixture = tempfile::tempdir()?;
+        let store = fixture.path().join("missing-history");
+        temp_env::with_var("OMG_DATA_DIR", Some(&store), || -> Result<()> {
+            assert!(App::read_recent_history()?.is_empty());
+            assert!(!store.exists());
+            Ok(())
+        })
+    }
+
     #[test]
     fn cache_button_requests_only_cache_on_supported_backends() {
         use crate::package_managers::Backend;
@@ -885,6 +915,39 @@ mod tests {
 
         let steady = App::cpu_usage_delta(&mut previous, Some((140, 70)));
         assert!(steady.abs() < f32::EPSILON);
+
+        let corrected = App::cpu_usage_delta(&mut previous, Some((145, 78)));
+        assert!(corrected.abs() < f32::EPSILON);
+        let recovered = App::cpu_usage_delta(&mut previous, Some((165, 88)));
+        assert!((recovered - 50.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn system_metrics_follow_dashboard_visibility() {
+        let mut app = App::new_for_tab(Tab::Runtimes).unwrap();
+        app.handle_key(KeyCode::Char('r'));
+        app.last_update -= std::time::Duration::from_secs(2);
+        app.tick().unwrap();
+        assert!(
+            app.prev_cpu_sample.is_none(),
+            "Runtimes sampled CPU counters"
+        );
+
+        app.handle_key(KeyCode::Char('1'));
+        assert!(
+            app.prev_cpu_sample.is_some(),
+            "Dashboard did not sample CPU counters"
+        );
+
+        app.handle_key(KeyCode::Char('3'));
+        app.last_update -= std::time::Duration::from_secs(2);
+        let hidden_sample = app.last_update;
+        app.tick().unwrap();
+        assert_eq!(app.last_update, hidden_sample);
+
+        app.handle_key(KeyCode::Char('1'));
+        assert!(app.last_update > hidden_sample);
     }
 
     #[test]
