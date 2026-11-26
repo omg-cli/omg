@@ -915,6 +915,8 @@ are limited to 8 MiB and 64 KiB respectively. Overlapping processes merge their
 events into the local queue. One process drains the saved queue at a time.
 Events added during a send stay queued for the next batch. A first-run install
 ping also requires runtime consent and is attempted by one process at a time.
+Dashboard usage sync requires both active telemetry consent and a valid linked
+account. OMG records local usage counters independently of telemetry consent.
 
 ---
 

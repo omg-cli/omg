@@ -125,24 +125,59 @@ pub struct BatchPayload {
     pub machine_id: String,
 }
 
+struct PayloadMetadata {
+    timestamp: String,
+    machine_id: String,
+    version: String,
+    platform: String,
+    license_key: Option<String>,
+}
+
+impl PayloadMetadata {
+    fn load() -> Self {
+        use sha2::Digest as _;
+
+        Self {
+            timestamp: super::telemetry::now_iso8601_ms(),
+            machine_id: get_machine_id(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            platform: super::telemetry::get_platform(),
+            license_key: super::license::load_license().map(|license| {
+                hex::encode(sha2::Sha256::digest(license.key.as_bytes()))[..16].to_string()
+            }),
+        }
+    }
+
+    fn event(&self, event: TelemetryEvent) -> TelemetryPayload {
+        TelemetryPayload {
+            event,
+            timestamp: self.timestamp.clone(),
+            machine_id: self.machine_id.clone(),
+            version: self.version.clone(),
+            platform: self.platform.clone(),
+            license_key: self.license_key.clone(),
+        }
+    }
+}
+
 impl TelemetryPayload {
     /// Create a new telemetry payload
     #[must_use]
     pub fn new(event: TelemetryEvent) -> Self {
-        let license = crate::core::license::load_license();
+        PayloadMetadata::load().event(event)
+    }
+}
 
+impl BatchPayload {
+    fn from_events(events: Vec<TelemetryEvent>) -> Self {
+        let metadata = PayloadMetadata::load();
         Self {
-            event,
-            timestamp: jiff::Timestamp::now()
-                .strftime("%Y-%m-%dT%H:%M:%S%.3fZ")
-                .to_string(),
-            machine_id: get_machine_id(),
-            version: env!("CARGO_PKG_VERSION").to_string(),
-            platform: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
-            license_key: license.map(|l| {
-                use sha2::Digest as _;
-                hex::encode(sha2::Sha256::digest(l.key.as_bytes()))[..16].to_string()
-            }),
+            events: events
+                .into_iter()
+                .map(|event| metadata.event(event))
+                .collect(),
+            batch_timestamp: metadata.timestamp,
+            machine_id: metadata.machine_id,
         }
     }
 }
@@ -282,15 +317,7 @@ pub async fn send_batch(events: Vec<TelemetryEvent>) -> Result<()> {
     // the single-flight slot if this future is cancelled at the await point.
     let _probe_guard = probe_guard;
 
-    let payloads: Vec<TelemetryPayload> = events.into_iter().map(TelemetryPayload::new).collect();
-
-    let batch = BatchPayload {
-        events: payloads,
-        batch_timestamp: jiff::Timestamp::now()
-            .strftime("%Y-%m-%dT%H:%M:%S%.3fZ")
-            .to_string(),
-        machine_id: get_machine_id(),
-    };
+    let batch = BatchPayload::from_events(events);
 
     let client = crate::core::http::shared_client();
 
@@ -327,6 +354,36 @@ pub async fn send_batch(events: Vec<TelemetryEvent>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn batch_preserves_event_order_and_uses_one_metadata_snapshot() {
+        let batch = BatchPayload::from_events(
+            [23, 11]
+                .map(|duration_ms| {
+                    TelemetryEvent::Performance(PerformanceEvent {
+                        metric_type: "queue-fixture".into(),
+                        duration_ms,
+                    })
+                })
+                .into(),
+        );
+        let values: Vec<_> = batch
+            .events
+            .iter()
+            .map(|payload| {
+                assert_eq!(payload.timestamp, batch.batch_timestamp);
+                assert_eq!(payload.machine_id, batch.machine_id);
+                assert_eq!(payload.version, env!("CARGO_PKG_VERSION"));
+                assert_eq!(payload.platform, super::super::telemetry::get_platform());
+                let TelemetryEvent::Performance(event) = &payload.event else {
+                    panic!("unexpected event");
+                };
+                assert_eq!(event.metric_type, "queue-fixture");
+                event.duration_ms
+            })
+            .collect();
+        assert_eq!(values, [23, 11]);
+    }
 
     #[test]
     fn payload_creation_fills_metadata() {

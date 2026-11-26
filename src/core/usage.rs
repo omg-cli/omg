@@ -9,6 +9,7 @@
 //! explicit feature toggles through the canonical telemetry boundary.
 
 use std::collections::HashMap;
+use std::fs::File;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -447,7 +448,18 @@ impl UsageStats {
         }
     }
 
+    /// Sync a nonempty snapshot while runtime telemetry and a linked account are active.
     pub async fn sync(&mut self) -> Result<()> {
+        if self.total_commands == 0 {
+            return Ok(());
+        }
+        let Some(_consent) = dashboard_sync_consent() else {
+            return Ok(());
+        };
+        self.send_usage().await
+    }
+
+    async fn send_usage(&mut self) -> Result<()> {
         let payload = self.sync_payload();
         let client = crate::core::http::shared_client();
         client
@@ -727,34 +739,22 @@ pub fn track_remove_result(success: bool) {
     maybe_sync_background();
 }
 
-/// Load the stored account only when its token is valid, so expired or
-/// unverifiable tokens stop attributing usage to the dashboard.
-fn licensed_for_sync() -> Option<crate::core::license::StoredLicense> {
-    crate::core::license::load_license().filter(super::license::StoredLicense::is_token_valid)
+fn dashboard_sync_consent() -> Option<File> {
+    let consent = super::telemetry::runtime_dispatch_lease()?;
+    super::license::load_license()
+        .is_some_and(|account| account.is_token_valid())
+        .then_some(consent)
 }
 
-/// Remote dashboard sync posts only when telemetry is enabled AND an account
-/// is linked. Local usage counters are independent of this decision.
-fn sync_decision(effective_telemetry_enabled: bool, license_valid: bool) -> bool {
-    effective_telemetry_enabled && license_valid
-}
-
-fn sync_candidate() -> Option<UsageStats> {
-    if crate::core::paths::test_mode() {
-        return None;
-    }
-    if !sync_decision(
-        !crate::core::telemetry::is_telemetry_opt_out(),
-        licensed_for_sync().is_some(),
-    ) {
-        return None;
-    }
-    load_for_tracking()
+fn sync_candidate() -> Option<(File, UsageStats)> {
+    let consent = dashboard_sync_consent()?;
+    let stats = load_for_tracking()?;
+    (stats.total_commands != 0).then_some((consent, stats))
 }
 
 /// Sync usage in background if needed
 pub fn maybe_sync_background() {
-    let Some(mut stats) = sync_candidate() else {
+    let Some((consent, mut stats)) = sync_candidate() else {
         return;
     };
     if stats.needs_sync() || stats.needs_immediate_sync() {
@@ -763,8 +763,9 @@ pub fn maybe_sync_background() {
             return;
         };
         runtime.spawn(async move {
-            if let Err(e) = stats.sync().await {
-                tracing::debug!("Usage sync failed: {e}");
+            let _consent = consent;
+            if let Err(error) = stats.send_usage().await {
+                tracing::debug!("Usage sync failed: {error}");
             }
         });
     }
@@ -772,14 +773,11 @@ pub fn maybe_sync_background() {
 
 /// Sync usage now (awaitable, for end of CLI commands)
 pub async fn sync_usage_now() {
-    let Some(mut stats) = sync_candidate() else {
+    let Some((_consent, mut stats)) = sync_candidate() else {
         return;
     };
-    if stats.total_commands == 0 {
-        return;
-    }
-    if let Err(e) = stats.sync().await {
-        tracing::debug!("Usage sync failed: {e}");
+    if let Err(error) = stats.send_usage().await {
+        tracing::debug!("Usage sync failed: {error}");
     }
 }
 
@@ -1006,18 +1004,63 @@ mod tests {
         drop(lock);
     }
 
-    #[test]
-    fn usage_sync_refuses_to_post_when_telemetry_is_disabled() {
-        // W8-B-02 regression: a valid account must not bypass the telemetry
-        // opt-out; dashboard usage sync posts only when BOTH conditions hold.
-        assert!(!sync_decision(false, true));
-        assert!(!sync_decision(false, false));
+    fn assert_usage_sync_stays_local(test: &str, enabled: bool) -> Result<()> {
+        if crate::core::testing::run_isolated_test(test)
+            || crate::config::Settings::rerun_test_unprivileged(test)
+        {
+            return Ok(());
+        }
+
+        let directory = tempfile::tempdir()?;
+        let path = directory.path();
+        std::fs::write(
+            path.join("config.toml"),
+            format!("telemetry_enabled = {enabled}\n"),
+        )?;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let mut stats = UsageStats {
+            total_commands: 7,
+            last_sync: 100,
+            ..UsageStats::default()
+        };
+        temp_env::with_vars(
+            [
+                ("HOME", Some(path.as_os_str())),
+                ("OMG_CONFIG_DIR", Some(path.as_os_str())),
+                ("OMG_DATA_DIR", Some(path.as_os_str())),
+                ("OMG_TELEMETRY", None),
+                ("OMG_DISABLE_TELEMETRY", None),
+                ("OMG_TEST_MODE", None),
+            ],
+            || {
+                assert_eq!(
+                    super::super::telemetry::is_enhanced_telemetry_enabled(),
+                    enabled
+                );
+                runtime.block_on(stats.sync())
+            },
+        )?;
+        assert_eq!(stats.last_sync, 100);
+        assert!(!path.join("usage.json").exists());
+        Ok(())
     }
 
     #[test]
-    fn usage_sync_requires_both_telemetry_and_linked_account() {
-        assert!(!sync_decision(true, false));
-        assert!(sync_decision(true, true));
+    fn usage_sync_refuses_to_post_when_telemetry_is_disabled() -> Result<()> {
+        assert_usage_sync_stays_local(
+            "core::usage::tests::usage_sync_refuses_to_post_when_telemetry_is_disabled",
+            false,
+        )
+    }
+
+    #[test]
+    fn usage_sync_refuses_to_post_without_a_linked_account() -> Result<()> {
+        assert_usage_sync_stays_local(
+            "core::usage::tests::usage_sync_refuses_to_post_without_a_linked_account",
+            true,
+        )
     }
 
     #[test]

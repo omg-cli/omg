@@ -250,6 +250,11 @@ fn capture_consent() -> Option<&'static CaptureConsent> {
     if opted_out { None } else { captured.as_ref() }
 }
 
+/// Hold runtime consent through a remote telemetry request.
+pub(super) fn runtime_dispatch_lease() -> Option<File> {
+    capture_consent()?.try_lease()
+}
+
 fn read_saved_telemetry(path: &Path, kind: &str, limit: u64) -> Result<Option<String>> {
     match crate::core::safe_ops::read_bounded_regular_file(path, kind, limit) {
         Ok(content) => Ok(Some(content)),
@@ -277,7 +282,7 @@ pub fn is_first_run() -> bool {
 }
 
 /// Get platform string (e.g., "linux-x86_64")
-fn get_platform() -> String {
+pub(super) fn get_platform() -> String {
     format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
 }
 
@@ -287,7 +292,7 @@ fn get_platform() -> String {
 /// one canonical format.
 /// https://docs.rs/jiff/latest/jiff/fmt/strtime/index.html#supported-directives
 /// (`%.3fZ` always emits exactly three fractional digits).
-fn now_iso8601_ms() -> String {
+pub(super) fn now_iso8601_ms() -> String {
     jiff::Timestamp::now()
         .strftime("%Y-%m-%dT%H:%M:%S%.3fZ")
         .to_string()
@@ -360,7 +365,7 @@ fn create_marker(path: &Path, install_id: &str) -> Result<()> {
 
 /// Ping install telemetry endpoint
 pub async fn ping_install() -> Result<()> {
-    let Some(_consent) = capture_consent().and_then(CaptureConsent::try_lease) else {
+    let Some(_consent) = runtime_dispatch_lease() else {
         return Ok(());
     };
     let marker = super::paths::installed_marker_path();

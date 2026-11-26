@@ -5217,6 +5217,92 @@ fresh:
                                                                  contents is not None,dispatches,actual_flag)))
 
 
+    def inspect_usage_dispatch_admission():
+        phase = "fedora-usage-dispatch"
+        operations = (
+            ("privacy", "status"), ("config", "get", "telemetry.enabled"),
+            ("run", "probe"), ("config", "list"), ("privacy", "status"),
+        )
+        for scenario, enabled, env_override, held, license_contents, warnings in (
+            ("local-off", False, False, False, b"{", 0),
+            ("environment-off", True, True, False, b"{", 0),
+            ("settings-held", True, False, True, b"{", 0),
+            ("enabled-malformed", True, False, False, b"{", 2),
+            ("enabled-unlinked", True, False, False, None, 0),
+            ("off-unlinked", False, False, False, None, 0),
+        ):
+            with tempfile.TemporaryDirectory(prefix="usage-dispatch-", dir=work) as directory:
+                home = Path(directory)
+                data, config = home/"data", home/"config"
+                for path in (home, data, config):
+                    path.mkdir(exist_ok=True)
+                    path.chmod(0o700)
+                    os.chown(path, account.pw_uid, account.pw_gid)
+
+                def write(path, value):
+                    path.write_bytes(value)
+                    path.chmod(0o600)
+                    os.chown(path, account.pw_uid, account.pw_gid)
+
+                write(config/"config.toml", f"telemetry_enabled = {str(enabled).lower()}\n".encode())
+                write(config/"config.lock", b"")
+                write(data/".installed", b"{}")
+                write(home/"Makefile", b"probe:\n\t@printf 'usage dispatch probe finished\\n'\n")
+                license_path = data/"license.json"
+                if license_contents is not None:
+                    write(license_path, license_contents)
+
+                stats = data/"usage.json"
+                usage = json.dumps({
+                    "total_commands":7, "commands":{"search":7}, "time_saved_ms":889,
+                    "queries_today":7, "queries_this_month":7, "last_query_date":"2026-11-25",
+                    "last_month":"2026-11", "achievements":["FirstStep"],
+                })
+                write(stats, usage.encode())
+                prior = json.dumps({"format_version":1,"events":[
+                    {"type":"performance","metric_type":"usage-dispatch-fixture","duration_ms":n}
+                    for n in range(12)]}).encode()
+                queue = data/"telemetry_queue.json"
+                write(queue, prior)
+                chosen = {name:value for name,value in disabled.items() if name != "OMG_DISABLE_TELEMETRY"}
+                chosen.update(HOME=str(home), OMG_DATA_DIR=str(data), OMG_CONFIG_DIR=str(config),
+                              XDG_CONFIG_HOME=str(home/"xdg-config"), XDG_DATA_HOME=str(home/"xdg-data"),
+                              XDG_STATE_HOME=str(home/"state"), XDG_CACHE_HOME=str(home/"cache"),
+                              CI="1", OMG_NO_UPDATE_CHECK="1", RUST_LOG="warn")
+                if env_override:
+                    chosen["OMG_DISABLE_TELEMETRY"]="1"
+                effective = enabled and not env_override
+                with (config/"config.lock").open("r+b") as lock:
+                    if held:
+                        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    for index, args in enumerate(operations, 1):
+                        queue.write_bytes(prior)
+                        result = command([cli, *args], chosen, ordinary, timeout=12)
+                        markers = {
+                            ("privacy","status"):f"Telemetry: {'Enabled' if effective else 'Disabled'}",
+                            ("config","get"):str(enabled).lower(),
+                            ("run","probe"):"usage dispatch probe finished",
+                            ("config","list"):f"telemetry.enabled = {str(enabled).lower()}",
+                        }
+                        count = result.stderr.count("Discarding malformed license file")
+                        remains = queue.read_bytes()
+                        events = json.loads(remains)["events"]
+                        logged = sum(row.get("type")=="command" for row in events)
+                        retained = [row["duration_ms"] for row in events
+                                    if row.get("metric_type")=="usage-dispatch-fixture"]
+                        durable = (logged==1 and retained==list(range(12)) if effective and not held
+                                   else remains==prior)
+                        untouched = stats.read_bytes()==usage.encode() and (
+                            not license_path.exists() if license_contents is None
+                            else license_path.read_bytes()==license_contents)
+                        checks.append(dict(phase=phase, case=f"{scenario}-{index}",
+                            passed=bool(result.returncode==0 and markers[args[:2]] in result.stdout
+                                        and count==warnings and durable and untouched),
+                            status=result.returncode,
+                            diagnostic=(result.stdout[-250:],result.stderr[-430:],
+                                        count,logged,len(retained),untouched)))
+
+
     def inspect_task_environment_bytes():
         phase = "task-environment-bytes"
         raw = b"test-\xff-value"
@@ -7956,6 +8042,7 @@ exec {shlex.quote(str(binary))} "$@"
                     inspect_telemetry_queue_overlap()
                     inspect_telemetry_consent_transitions()
                     inspect_install_telemetry_admission()
+                    inspect_usage_dispatch_admission()
                 config.write_text(host_config)
                 inspect("returned-host", host_count, host_explicit, host=True)
                 mark_progress("root switch and return")
@@ -8267,6 +8354,6 @@ mark_progress("completed with host inventory unchanged")
 report = dict(binaries=binaries, checks=checks, total=len(checks),
               passed=sum(entry["passed"] for entry in checks), host_unchanged=True)
 print(json.dumps(report))
-expected_checks = 303 if consent_oracle is None else 2592
+expected_checks = 303 if consent_oracle is None else 2622
 if report["passed"] != report["total"] or report["total"] != expected_checks:
     sys.exit(4)
