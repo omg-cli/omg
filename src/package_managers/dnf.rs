@@ -2152,34 +2152,34 @@ impl DnfPackageManager {
         anyhow::bail!("{program} query failed: {}", output.status);
     }
 
+    const MAX_NATIVE_LINE_BYTES: usize = 64 * 1024;
+
     async fn capture_query_diagnostics(
-        mut stderr: tokio::process::ChildStderr,
+        stderr: tokio::process::ChildStderr,
         forward: bool,
     ) -> std::io::Result<Vec<u8>> {
-        use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
-
-        const MAX_DIAGNOSTIC_BYTES: u64 = 64 * 1024;
-        let mut bytes = Vec::new();
-        let mut reader = BufReader::new((&mut stderr).take(MAX_DIAGNOSTIC_BYTES));
-        loop {
-            let start = bytes.len();
-            if reader.read_until(b'\n', &mut bytes).await? == 0 {
-                break;
-            }
-            // A truncated URL may end before its '@' or '?'. Keep only
-            // complete lines when the diagnostic byte budget is exhausted.
-            if !bytes.ends_with(b"\n") && reader.get_ref().limit() == 0 {
-                bytes.truncate(start);
-                break;
-            }
-            if forward {
-                let raw = String::from_utf8_lossy(&bytes[start..]);
+        let limit = Self::MAX_NATIVE_LINE_BYTES;
+        let mut bytes = std::collections::VecDeque::new();
+        let mut forward_budget = if forward { limit } else { 0 };
+        Self::read_native_lines(stderr, |line| {
+            if line.len() <= forward_budget {
+                let raw = String::from_utf8_lossy(line);
                 eprintln!("{}", sanitize_terminal_diagnostic(raw.trim_end()));
             }
-        }
-        drop(reader);
-        tokio::io::copy(&mut stderr, &mut tokio::io::sink()).await?;
-        Ok(bytes)
+            forward_budget = forward_budget.saturating_sub(line.len());
+            // DNF puts the final error or preview outcome after progress.
+            // Evict complete lines so a URL cannot be clipped before redaction.
+            while bytes.len() + line.len() > limit {
+                let oldest_line_bytes = bytes
+                    .iter()
+                    .position(|&byte| byte == b'\n')
+                    .map_or(bytes.len(), |index| index + 1);
+                bytes.drain(..oldest_line_bytes);
+            }
+            bytes.extend(line);
+        })
+        .await?;
+        Ok(bytes.into())
     }
 
     async fn capture_query(
@@ -3255,6 +3255,7 @@ impl DnfPackageManager {
                 "DNF upgrade has an unchanged version"
             );
             updates.push(UpdateInfo {
+                architecture: Some(candidate.architecture.clone()),
                 name: candidate.name.clone(),
                 old_version: old.version.clone(),
                 new_version: candidate.version.clone(),
@@ -3503,18 +3504,23 @@ impl DnfPackageManager {
                     let result = tokio::time::timeout(
                         std::time::Duration::from_secs(1),
                         &mut diagnostics,
-                    ).await.unwrap_or(Ok(()));
+                    ).await.unwrap_or_else(|_| Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "Timed out reading DNF diagnostics",
+                    )));
                     (status?, result)
                 }
             }
         };
-        if let Err(error) = diagnostic_result {
+        if cache_cleanup && status.success() {
+            if removal_failed || repository_failed {
+                return Err(std::io::Error::other(
+                    "DNF reported package cache cleanup errors",
+                ));
+            }
+            diagnostic_result?;
+        } else if let Err(error) = diagnostic_result {
             tracing::debug!(%error, "Could not forward DNF diagnostics");
-        }
-        if cache_cleanup && status.success() && (removal_failed || repository_failed) {
-            return Err(std::io::Error::other(
-                "DNF reported package cache cleanup errors",
-            ));
         }
         Ok(status)
     }
@@ -3528,32 +3534,41 @@ impl DnfPackageManager {
             .is_some_and(|count| count != 0)
     }
 
-    async fn forward_native_lines(
+    async fn read_native_lines(
         input: impl tokio::io::AsyncRead + Unpin,
-        mut terminal: impl std::io::Write,
-        mut forward: bool,
-        mut inspect_line: impl FnMut(&str),
+        mut inspect_line: impl FnMut(&[u8]),
     ) -> std::io::Result<()> {
         use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 
-        const MAX_LINE_BYTES: u64 = 64 * 1024;
         let mut reader = BufReader::new(input);
         let mut line = Vec::new();
         let mut discarding_line = false;
         loop {
             line.clear();
             let count = (&mut reader)
-                .take(MAX_LINE_BYTES + 1)
+                .take(Self::MAX_NATIVE_LINE_BYTES as u64 + 1)
                 .read_until(b'\n', &mut line)
                 .await?;
             if count == 0 {
                 break;
             }
-            if discarding_line || count as u64 > MAX_LINE_BYTES {
+            if discarding_line || count > Self::MAX_NATIVE_LINE_BYTES {
                 discarding_line = !line.ends_with(b"\n");
                 continue;
             }
-            let raw = String::from_utf8_lossy(&line);
+            inspect_line(&line);
+        }
+        Ok(())
+    }
+
+    async fn forward_native_lines(
+        input: impl tokio::io::AsyncRead + Unpin,
+        mut terminal: impl std::io::Write,
+        mut forward: bool,
+        mut inspect_line: impl FnMut(&str),
+    ) -> std::io::Result<()> {
+        Self::read_native_lines(input, |line| {
+            let raw = String::from_utf8_lossy(line);
             let raw = raw.trim_end_matches(['\r', '\n']);
             inspect_line(raw);
             if forward {
@@ -3562,9 +3577,10 @@ impl DnfPackageManager {
                 // Continue inspecting after a log reader closes its pipe.
                 forward = terminal.write_all(safe.as_bytes()).is_ok();
             }
-        }
-        if forward {
-            terminal.flush()?;
+        })
+        .await?;
+        if forward && let Err(error) = terminal.flush() {
+            tracing::debug!(%error, "Could not flush DNF diagnostics to terminal");
         }
         Ok(())
     }
@@ -4955,6 +4971,10 @@ mod tests {
         assert_eq!(updates.len(), candidates.len());
         for (update, candidate) in updates.iter().zip(&candidates) {
             assert_eq!(update.name, candidate.name);
+            assert_eq!(
+                update.architecture.as_deref(),
+                Some(candidate.architecture.as_str())
+            );
             assert_eq!(update.new_version, candidate.version);
             assert_eq!(update.repo, candidate.repository);
         }
@@ -4974,6 +4994,8 @@ mod tests {
             .await
             .expect("matched upgrades");
         assert_eq!(updates.len(), 2);
+        assert_eq!(updates[0].architecture.as_deref(), Some("x86_64"));
+        assert_eq!(updates[1].architecture.as_deref(), Some("i686"));
         assert_eq!(updates[0].old_version, "1:2-1");
         assert_eq!(updates[1].old_version, "1:1-1");
         assert_eq!(updates[0].new_version, "1:4-1");
@@ -6105,6 +6127,11 @@ mod tests {
             .success()
         );
         assert_eq!(run(&format!("{repository}; exit 7"), true)?.code(), Some(7));
+
+        let incomplete = "(sleep 2) & exit 0";
+        let error =
+            run(incomplete, true).expect_err("cleanup requires complete native diagnostics");
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
         Ok(())
     }
 
@@ -6123,10 +6150,24 @@ mod tests {
         let mut failed = tokio::process::Command::new("/bin/sh");
         failed.stderr(std::process::Stdio::piped()).args([
             "-c",
-            "printf 'Loading repositories\nRepository is unavailable\n' >&2; exit 7",
+            "yes 'Loading repositories' | head -n 4000 >&2; \
+             printf 'Repository is unavailable\n' >&2; exit 7",
         ]);
         let error = DnfPackageManager::query_output(failed).await.unwrap_err();
         assert!(error.to_string().ends_with("Repository is unavailable"));
+
+        let mut preview = tokio::process::Command::new("/bin/sh");
+        preview.args([
+            "-c",
+            "printf 'Removing:\n leaf noarch 0:1-1\n'; \
+             yes 'Loading repositories' | head -n 4000 >&2; \
+             printf 'Operation aborted by the user.\n' >&2; exit 1",
+        ]);
+        let preview =
+            DnfPackageManager::capture_query("DNF", preview, deadline, None, false).await?;
+        assert!(preview.stderr.len() <= 64 * 1024);
+        let (plan, _) = DnfPackageManager::transaction_preview_output(&preview)?;
+        assert_eq!(plan, "Removing:\n leaf noarch 0:1-1\n");
 
         let mut authenticated_mirror = tokio::process::Command::new("/bin/sh");
         authenticated_mirror.stderr(std::process::Stdio::piped()).args([

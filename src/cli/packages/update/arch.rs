@@ -400,6 +400,7 @@ async fn update_packages(
                 screen_aur_updates_against_policy(&policy, raw);
             for (name, old_ver, new_ver) in &allowed {
                 all_updates.push(UpdateInfo {
+                    architecture: None,
                     name: name.clone(),
                     old_version: old_ver.to_string(),
                     new_version: new_ver.to_string(),
@@ -596,6 +597,7 @@ mod tests {
 
     fn update_info(name: &str, repo: &str) -> UpdateInfo {
         UpdateInfo {
+            architecture: None,
             name: name.to_string(),
             old_version: "1.0".to_string(),
             new_version: "2.0".to_string(),
@@ -762,6 +764,7 @@ mod tests {
     #[test]
     fn update_history_preserves_versions_and_sources() {
         let changes = history_changes(&[UpdateInfo {
+            architecture: None,
             name: "example".to_string(),
             old_version: "1.0".to_string(),
             new_version: "2.0".to_string(),

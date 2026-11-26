@@ -93,6 +93,7 @@ async fn test_update_with_available_updates() {
 async fn test_update_execution() {
     let pm = Arc::new(TestPackageManager::with_defaults());
     pm.set_updates(vec![UpdateInfo {
+        architecture: None,
         name: "firefox".to_string(),
         old_version: "121.0-1".to_string(),
         new_version: "122.0-1".to_string(),

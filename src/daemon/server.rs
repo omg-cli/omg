@@ -1230,6 +1230,7 @@ mod tests {
             }),
             ResponseResult::ListUpdates(vec![
                 UpdateEntry {
+                    architecture: None,
                     name: "p".repeat(MAX_RESPONSE_SIZE / 2 + 1024),
                     old_version: "1".into(),
                     new_version: "2".into(),
@@ -1286,6 +1287,7 @@ mod tests {
                 packages: vec!["package".into()],
             }),
             ResponseResult::ListUpdates(vec![UpdateEntry {
+                architecture: None,
                 name: "package".into(),
                 old_version: "1".into(),
                 new_version: "2".into(),

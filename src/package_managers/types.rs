@@ -1,5 +1,7 @@
 //! Shared package manager types
 
+use std::borrow::Cow;
+
 #[derive(Debug, PartialEq, Eq)]
 pub struct PackageStatus {
     pub total: usize,
@@ -920,7 +922,17 @@ pub struct PackageInfo {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct UpdateInfo {
     pub name: String,
+    /// Architecture of the available build when the backend supplies it.
+    #[serde(default)]
+    pub architecture: Option<String>,
     pub old_version: String,
     pub new_version: String,
     pub repo: String,
+}
+
+pub(crate) fn update_package_name<'a>(name: &'a str, architecture: Option<&str>) -> Cow<'a, str> {
+    match architecture {
+        Some(architecture) => Cow::Owned(format!("{name}.{architecture}")),
+        None => Cow::Borrowed(name),
+    }
 }

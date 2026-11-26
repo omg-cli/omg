@@ -14,8 +14,7 @@ use super::index::PackageIndex;
 use super::protocol::StatusAdvisorySummary;
 use super::protocol::{
     DetailedPackageInfo, ExplicitResult, HealthStatus, PackageInfo, Request, RequestId, Response,
-    ResponseResult, SearchResult, StatusMetadata, StatusResult, UpdateEntry, WirePackageSource,
-    error_codes,
+    ResponseResult, SearchResult, StatusMetadata, StatusResult, WirePackageSource, error_codes,
 };
 use crate::core::metrics::GLOBAL_METRICS;
 use crate::core::security::{AuditEventType, AuditSeverity, audit_log_nonblocking};
@@ -1789,17 +1788,7 @@ async fn handle_list_updates(state: Arc<DaemonState>, id: RequestId) -> Response
 
             Response::Success {
                 id,
-                result: ResponseResult::ListUpdates(
-                    updates
-                        .into_iter()
-                        .map(|update| UpdateEntry {
-                            name: update.name,
-                            old_version: update.old_version,
-                            new_version: update.new_version,
-                            repo: update.repo,
-                        })
-                        .collect(),
-                ),
+                result: ResponseResult::ListUpdates(updates),
             }
         }
         Err(error) => internal_error(id, format!("Failed to list updates: {error}")),
@@ -4120,8 +4109,9 @@ pub(super) mod tests {
     }
 
     #[cfg(feature = "arch")]
-    fn update_entry(name: &str) -> UpdateEntry {
-        UpdateEntry {
+    fn update_entry(name: &str) -> crate::daemon::protocol::UpdateEntry {
+        crate::daemon::protocol::UpdateEntry {
+            architecture: None,
             name: name.to_string(),
             old_version: "1.0".to_string(),
             new_version: "2.0".to_string(),

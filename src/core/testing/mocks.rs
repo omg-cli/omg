@@ -87,12 +87,14 @@ impl TestPackageManager {
         let pm = Self::with_defaults();
         pm.set_updates(vec![
             UpdateInfo {
+                architecture: None,
                 name: "firefox".to_string(),
                 old_version: "121.0-1".to_string(),
                 new_version: "122.0-1".to_string(),
                 repo: "extra".to_string(),
             },
             UpdateInfo {
+                architecture: None,
                 name: "vim".to_string(),
                 old_version: "8.0-1".to_string(),
                 new_version: "9.0.0-1".to_string(),

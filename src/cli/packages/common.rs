@@ -47,18 +47,7 @@ pub fn is_valid_search_query(query: &str) -> bool {
 #[cfg(unix)]
 pub(crate) async fn try_daemon_list_updates() -> Option<Vec<UpdateInfo>> {
     let mut client = DaemonClient::connect().await.ok()?;
-    let entries = client.list_updates().await.ok()?;
-    Some(
-        entries
-            .into_iter()
-            .map(|e| UpdateInfo {
-                name: e.name,
-                old_version: e.old_version,
-                new_version: e.new_version,
-                repo: e.repo,
-            })
-            .collect(),
-    )
+    client.list_updates().await.ok()
 }
 
 /// Non-Unix stub preserving the asynchronous command interface.
@@ -458,6 +447,85 @@ pub(crate) async fn report_removal(
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[test]
+    fn daemon_update_probe_preserves_multilib_identity_over_a_private_socket() -> Result<()> {
+        use crate::daemon::protocol::{
+            Request, Response, ResponseResult, encode_frame, split_frame,
+        };
+        use anyhow::Context as _;
+        use futures::{SinkExt, StreamExt};
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::time::Duration;
+        use tokio_util::codec::{Framed, LengthDelimitedCodec};
+
+        const CASE: &str = "cli::packages::common::tests::daemon_update_probe_preserves_multilib_identity_over_a_private_socket";
+        if crate::core::testing::run_isolated_test(CASE) {
+            return Ok(());
+        }
+        let directory = tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir_in("/tmp")?;
+        let runtime_dir = directory.path().to_str().context("UTF-8 runtime path")?;
+        temp_env::with_vars(
+            [
+                ("XDG_RUNTIME_DIR", Some(runtime_dir)),
+                ("OMG_SOCKET_PATH", None),
+                ("OMG_TEST_MODE", None),
+                ("OMG_DISABLE_DAEMON", None),
+            ],
+            || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?
+                    .block_on(async {
+                        let socket = directory.path().join("omg.sock");
+                        assert_eq!(crate::core::client::default_socket_path(), socket);
+                        crate::core::client::validate_socket_with_context(&socket)?;
+                        let listener = tokio::net::UnixListener::bind(socket)?;
+                        let serve = async {
+                            let (stream, _) = listener.accept().await?;
+                            let mut frames = Framed::new(stream, LengthDelimitedCodec::new());
+                            let frame = frames.next().await.context("missing daemon request")??;
+                            let (_, payload) = split_frame(&frame)?;
+                            let request: Request = bitcode::deserialize(payload)?;
+                            assert!(
+                                matches!(request, Request::ListUpdates { .. }),
+                                "unexpected daemon request {request:?}"
+                            );
+                            let id = request.id();
+                            let result = ResponseResult::ListUpdates(vec![UpdateInfo {
+                                name: "lib".into(),
+                                architecture: Some("i686".into()),
+                                old_version: "1-1".into(),
+                                new_version: "2-1".into(),
+                                repo: "updates".into(),
+                            }]);
+                            frames
+                                .send(encode_frame(&Response::Success { id, result })?.into())
+                                .await?;
+                            Ok::<_, anyhow::Error>(())
+                        };
+                        let probe = async {
+                            try_daemon_list_updates()
+                                .await
+                                .context("private daemon update response")
+                        };
+                        let ((), updates) = tokio::time::timeout(Duration::from_secs(5), async {
+                            tokio::try_join!(serve, probe)
+                        })
+                        .await??;
+                        assert_eq!(updates.len(), 1, "unexpected daemon updates {updates:?}");
+                        let update = &updates[0];
+                        assert_eq!(update.name, "lib");
+                        assert_eq!(update.architecture.as_deref(), Some("i686"));
+                        assert_eq!(update.new_version, "2-1");
+                        Ok(())
+                    })
+            },
+        )
+    }
+
     #[test]
     fn standard_updates_select_cached_or_refreshable_native_upgrade() {
         for (no_sync, expected) in [(true, "cached plan"), (false, "refreshable plan")] {
@@ -593,6 +661,7 @@ mod tests {
         let flag = std::sync::Arc::clone(&refreshed);
 
         let daemon_updates = vec![UpdateInfo {
+            architecture: None,
             name: "curl".to_string(),
             old_version: "1.0".to_string(),
             new_version: "2.0".to_string(),
@@ -625,6 +694,7 @@ mod tests {
     fn dry_run_preview_reports_unknown_download_size() {
         // The preview must never fabricate download sizes it did not resolve.
         let updates = vec![crate::package_managers::types::UpdateInfo {
+            architecture: None,
             name: "example".to_string(),
             old_version: "1.0".to_string(),
             new_version: "2.0".to_string(),

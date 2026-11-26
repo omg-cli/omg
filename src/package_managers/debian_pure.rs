@@ -460,6 +460,7 @@ fn compute_updates() -> Result<Vec<UpdateInfo>> {
                 return Ok(updates
                     .into_iter()
                     .map(|(name, old_version, new_version)| UpdateInfo {
+                        architecture: None,
                         name,
                         old_version,
                         new_version,
@@ -507,6 +508,7 @@ fn compute_updates() -> Result<Vec<UpdateInfo>> {
     Ok(debian_db::db::best_update_versions(candidates)
         .into_iter()
         .map(|(name, old_version, new_version)| UpdateInfo {
+            architecture: None,
             name,
             old_version,
             new_version,

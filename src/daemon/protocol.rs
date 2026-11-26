@@ -5,12 +5,14 @@
 
 use serde::{Deserialize, Serialize};
 
+pub use crate::package_managers::types::UpdateInfo as UpdateEntry;
+
 /// Wire-protocol version. Bump on any change to `Request`/`Response` shape.
 ///
 /// Every frame is `[u32 LE version][bitcode payload]`. Peers reject frames
 /// whose version differs instead of attempting a decode that could
 /// silently mis-map same-shaped variants.
-pub const PROTOCOL_VERSION: u32 = 6;
+pub const PROTOCOL_VERSION: u32 = 7;
 
 /// Frame layout error for [`encode_frame`] / [`split_frame`].
 #[derive(Debug, thiserror::Error)]
@@ -575,15 +577,6 @@ pub struct HealthStatus {
     pub background_worker_failures: u64,
 }
 
-/// Update entry for IPC (matches `UpdateInfo` from `package_managers::types`)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UpdateEntry {
-    pub name: String,
-    pub old_version: String,
-    pub new_version: String,
-    pub repo: String,
-}
-
 // ═══════════════════════════════════════════════════════════════════════════
 // Synchronous framing helpers
 // ═══════════════════════════════════════════════════════════════════════════
@@ -638,6 +631,43 @@ pub fn read_frame<R: std::io::Read>(reader: &mut R) -> std::io::Result<Vec<u8>> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn update_architectures_survive_the_versioned_wire_format() {
+        let response = Response::Success {
+            id: 9,
+            result: ResponseResult::ListUpdates(
+                [Some("x86_64"), Some("i686"), None]
+                    .into_iter()
+                    .map(|architecture| UpdateEntry {
+                        name: "lib".into(),
+                        architecture: architecture.map(str::to_owned),
+                        old_version: "1".into(),
+                        new_version: "2".into(),
+                        repo: "updates".into(),
+                    })
+                    .collect(),
+            ),
+        };
+        let frame = encode_frame(&response).expect("versioned update response");
+        let (_, payload) = split_frame(&frame).expect("valid frame header");
+        let decoded = bitcode::deserialize(payload).expect("update response payload");
+        let expected = [
+            ("lib", Some("x86_64")),
+            ("lib", Some("i686")),
+            ("lib", None),
+        ];
+        assert!(
+            matches!(
+                &decoded,
+                Response::Success { id: 9, result: ResponseResult::ListUpdates(updates) }
+                    if updates.iter()
+                        .map(|update| (update.name.as_str(), update.architecture.as_deref()))
+                        .eq(expected)
+            ),
+            "unexpected update response: {decoded:?}"
+        );
+    }
 
     #[test]
     fn every_package_source_round_trips_through_the_versioned_wire_format() {

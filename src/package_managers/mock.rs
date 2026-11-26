@@ -482,6 +482,7 @@ impl PackageManager for MockPackageManager {
 
                     if is_update_needed {
                         updates.push(UpdateInfo {
+                            architecture: None,
                             name: pkg_name.clone(),
                             old_version: installed_ver.clone(),
                             new_version: available_ver.clone(),

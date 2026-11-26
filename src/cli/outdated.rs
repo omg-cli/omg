@@ -6,14 +6,23 @@ use serde::Serialize;
 use crate::cli::tea::{Cmd, UpdateType};
 use crate::core::packages::PackageService;
 use crate::package_managers::get_package_manager;
+use crate::package_managers::types::update_package_name;
 
 #[derive(Debug, Serialize)]
 pub struct OutdatedPackage {
     pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub architecture: Option<String>,
     pub current_version: String,
     pub new_version: String,
     pub update_type: UpdateType,
     pub repo: String,
+}
+
+impl OutdatedPackage {
+    fn package_label(&self) -> std::borrow::Cow<'_, str> {
+        update_package_name(&self.name, self.architecture.as_deref())
+    }
 }
 
 struct UpdateGroups<'a> {
@@ -74,13 +83,14 @@ pub async fn run(json: bool) -> Result<()> {
         .map(|u| OutdatedPackage {
             update_type: classify_update(&u.old_version, &u.new_version),
             name: u.name,
+            architecture: u.architecture,
             current_version: u.old_version,
             new_version: u.new_version,
             repo: u.repo,
         })
         .collect();
 
-    outdated.sort_by(|a, b| a.name.cmp(&b.name));
+    outdated.sort_by(|a, b| (&a.name, &a.architecture).cmp(&(&b.name, &b.architecture)));
 
     if json {
         println!("{}", serde_json::to_string_pretty(&outdated)?);
@@ -109,7 +119,10 @@ pub async fn run(json: bool) -> Result<()> {
                 .map(|p| {
                     format!(
                         "{} {} → {} ({})",
-                        p.name, p.current_version, p.new_version, p.repo
+                        p.package_label(),
+                        p.current_version,
+                        p.new_version,
+                        p.repo
                     )
                 })
                 .collect(),
@@ -133,7 +146,14 @@ pub async fn run(json: bool) -> Result<()> {
                 .minor
                 .iter()
                 .take(minor_count)
-                .map(|p| format!("{} {} → {}", p.name, p.current_version, p.new_version))
+                .map(|p| {
+                    format!(
+                        "{} {} → {}",
+                        p.package_label(),
+                        p.current_version,
+                        p.new_version
+                    )
+                })
                 .collect(),
         ));
 
@@ -156,7 +176,14 @@ pub async fn run(json: bool) -> Result<()> {
                 .patch
                 .iter()
                 .take(patch_count)
-                .map(|p| format!("{} {} → {}", p.name, p.current_version, p.new_version))
+                .map(|p| {
+                    format!(
+                        "{} {} → {}",
+                        p.package_label(),
+                        p.current_version,
+                        p.new_version
+                    )
+                })
                 .collect(),
         ));
 
@@ -181,7 +208,10 @@ pub async fn run(json: bool) -> Result<()> {
                 .map(|package| {
                     format!(
                         "{} {} → {} ({})",
-                        package.name, package.current_version, package.new_version, package.repo
+                        package.package_label(),
+                        package.current_version,
+                        package.new_version,
+                        package.repo
                     )
                 })
                 .collect(),
@@ -230,6 +260,7 @@ mod tests {
     fn unknown_versions_remain_visible_in_output_groups() {
         let packages = vec![OutdatedPackage {
             name: "rolling-package".to_string(),
+            architecture: None,
             current_version: "release-a".to_string(),
             new_version: "release-b".to_string(),
             update_type: UpdateType::Unknown,
@@ -240,6 +271,31 @@ mod tests {
 
         assert_eq!(groups.unknown.len(), 1);
         assert_eq!(groups.total(), packages.len());
+        assert_eq!(groups.unknown[0].package_label(), "rolling-package");
+        assert!(
+            serde_json::to_value(groups.unknown[0])
+                .expect("JSON package without an architecture")
+                .get("architecture")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn multilib_rows_keep_their_names_in_json_and_distinct_terminal_labels() {
+        for (architecture, label) in [("i686", "lib.i686"), ("x86_64", "lib.x86_64")] {
+            let package = OutdatedPackage {
+                name: "lib".into(),
+                architecture: Some(architecture.into()),
+                current_version: "1-1".into(),
+                new_version: "2-1".into(),
+                update_type: UpdateType::Unknown,
+                repo: "updates".into(),
+            };
+            assert_eq!(package.package_label(), label);
+            let row = serde_json::to_value(package).expect("multilib update row");
+            assert_eq!(row["name"], "lib");
+            assert_eq!(row["architecture"], architecture);
+        }
     }
 
     #[test]

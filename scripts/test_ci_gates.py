@@ -785,9 +785,9 @@ class NormalPrOriginalOwners(unittest.TestCase):
     EXPECTED = {
         "portable": [
             ["cargo", "test", "--test", "distro_override", "--no-default-features",
-             "--features", "pgp,license", "--locked"],
+             "--features", "pgp,license", "--locked", "--profile", "$OMG_PORTABLE_CARGO_PROFILE"],
             ["cargo", "test", "--doc", "--no-default-features", "--features",
-             "pgp,license", "--locked"],
+             "pgp,license", "--locked", "--profile", "$OMG_PORTABLE_CARGO_PROFILE"],
         ],
         "portable-release": [
             ["cargo", "test", "--release", "--test", "distro_override",
@@ -842,19 +842,25 @@ class NormalPrOriginalOwners(unittest.TestCase):
             cargo.chmod(0o755)
             log = root / "rows.jsonl"
             bash = "C:/Program Files/Git/bin/bash.exe" if os.name == "nt" else "bash"
-            for job, commands in owners.items():
+            for job, profile in (("portable", "test"), ("portable", "ci"), ("portable-release", "test")):
+                commands = owners[job]
+                expected = [
+                    [profile if arg == "$OMG_PORTABLE_CARGO_PROFILE" else arg for arg in argv]
+                    for argv in self.EXPECTED[job]
+                ]
                 for failed in range(len(commands) + 1):
-                    with self.subTest(job=job, failed=failed):
+                    with self.subTest(job=job, profile=profile, failed=failed):
                         log.unlink(missing_ok=True)
                         result = subprocess.run(
                             [bash, "-e", "-c", "\n".join(x[1] for x in commands)],
                             env=dict(os.environ, PATH=str(root) + os.pathsep + os.environ["PATH"],
-                                     OWNER_LOG=str(log), FAIL_OWNER=str(failed)),
+                                     OWNER_LOG=str(log), FAIL_OWNER=str(failed),
+                                     OMG_PORTABLE_CARGO_PROFILE=profile),
                             capture_output=True, timeout=10,
                         )
                         self.assertEqual(result.returncode, 0 if failed == 0 else 23, result.stderr)
                         self.assertEqual([json.loads(x) for x in log.read_text().splitlines()],
-                                         self.EXPECTED[job][:failed or len(commands)])
+                                         expected[:failed or len(commands)])
 
     def test_missing_each_named_owner_refuses_even_when_other_owners_succeed(self) -> None:
         text = CI_YML.read_text(encoding="utf-8")
@@ -916,7 +922,7 @@ class NormalPrOriginalOwners(unittest.TestCase):
                     self.assertEqual(scope.changed_paths(event, root), [name])
                     self.assertEqual(
                         scope.classify_scope("pull_request", event, root),
-                        (expected, expected),
+                        (expected, expected, False),
                     )
 
 

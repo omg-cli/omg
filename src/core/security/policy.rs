@@ -1924,6 +1924,7 @@ mod tests {
     ) -> anyhow::Result<crate::core::packages::PackageService> {
         let backend = std::sync::Arc::new(crate::core::testing::TestPackageManager::new());
         backend.set_updates(vec![crate::package_managers::types::UpdateInfo {
+            architecture: None,
             name: "candidate".into(),
             old_version: "0.9".into(),
             new_version: "1.0.0".into(),

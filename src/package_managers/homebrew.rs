@@ -1329,6 +1329,7 @@ impl PackageManager for HomebrewPackageManager {
 
                     if available > current {
                         updates.push(UpdateInfo {
+                            architecture: None,
                             name: pkg.name.clone(),
                             old_version: pkg.version.clone(),
                             new_version: available_version,

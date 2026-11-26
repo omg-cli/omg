@@ -298,6 +298,7 @@ impl crate::package_managers::PackageManager for AptPackageManager {
                 .into_iter()
                 .map(
                     |(name, old_ver, new_ver)| crate::package_managers::types::UpdateInfo {
+                        architecture: None,
                         name,
                         old_version: old_ver,
                         new_version: new_ver,
