@@ -803,6 +803,19 @@ fn try_fast_hooks(args: &[String]) -> bool {
 }
 
 fn try_fast_paths(args: &[String]) -> Result<bool> {
+    #[cfg(all(unix, feature = "fedora"))]
+    if args.len() == 2
+        && args[1] == "status"
+        && matches!(
+            omg_lib::package_managers::resolve_backend(),
+            Ok(omg_lib::package_managers::Backend::Fedora)
+        )
+    {
+        // Fedora status owns the daemon request and direct fallback.
+        commands::status_sync()?;
+        return Ok(true);
+    }
+
     if try_fast_counter(args)?
         || try_fast_explicit_count(args)
         || try_fast_search(args)

@@ -756,6 +756,96 @@ mod dnf_integration {
     }
 
     #[test]
+    fn full_status_accepts_a_live_fedora_daemon_reply_after_half_a_second() -> Result<()> {
+        use omg_lib::daemon::protocol::{
+            Request, Response, ResponseResult, StatusResult, encode_frame, read_frame, split_frame,
+            write_frame,
+        };
+        use std::os::unix::{fs::PermissionsExt as _, net::UnixListener};
+        use std::time::{Duration, Instant};
+
+        for args in [&["status", "--json"][..], &["status"][..]] {
+            let home = tempfile::Builder::new()
+                .permissions(std::fs::Permissions::from_mode(0o700))
+                .tempdir_in("/tmp")?;
+            let socket = home.path().join("status.sock");
+            let listener = UnixListener::bind(&socket)?;
+            listener.set_nonblocking(true)?;
+            let (output, sent) = std::thread::scope(|scope| -> Result<_> {
+                let run = scope.spawn(|| {
+                    std::process::Command::new("/usr/bin/timeout")
+                        .args(["--kill-after=1s", "8s"])
+                        .arg(assert_cmd::cargo::cargo_bin!("omg"))
+                        .args(args)
+                        .current_dir(home.path())
+                        .env_clear()
+                        .env("PATH", "/usr/bin:/bin")
+                        .env("HOME", home.path())
+                        .env("OMG_SOCKET_PATH", &socket)
+                        .env("OMG_DISABLE_TELEMETRY", "1")
+                        .env("NO_COLOR", "1")
+                        .output()
+                });
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            anyhow::ensure!(
+                                Instant::now() < deadline,
+                                "status never contacted daemon"
+                            );
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
+                };
+                stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+                let frame = read_frame(&mut stream)?;
+                let (_, body) = split_frame(&frame)?;
+                let request: Request = bitcode::deserialize(body)?;
+                assert!(matches!(request, Request::Status { .. }), "{request:?}");
+                std::thread::sleep(Duration::from_millis(700));
+                let frame = encode_frame(&Response::Success {
+                    id: request.id(),
+                    result: ResponseResult::Status(StatusResult {
+                        total_packages: 31_415,
+                        explicit_packages: 76,
+                        orphan_packages: 4,
+                        updates_available: 7,
+                        security_vulnerabilities: 1,
+                        vulnerabilities_scanned: true,
+                        security_unknown_packages: Some(2),
+                        runtime_versions: vec![("node".into(), "24.25.0".into())],
+                    }),
+                })?;
+                stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+                let sent = write_frame(&mut stream, &frame);
+                drop(listener);
+                Ok((run.join().expect("status process thread panicked")?, sent))
+            })?;
+            let stdout = std::str::from_utf8(&output.stdout)?;
+            assert!(
+                output.status.success(),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            if args.contains(&"--json") {
+                let status: serde_json::Value = serde_json::from_str(stdout)?;
+                assert_eq!(status["total_packages"], 31_415, "{status}");
+                assert_eq!(status["updates_available"], 7, "{status}");
+            } else {
+                assert!(stdout.contains("31415 packages installed"), "{stdout}");
+                assert!(stdout.contains("1 findings"), "{stdout}");
+                assert!(stdout.contains("24.25.0"), "{stdout}");
+                assert!(stdout.contains("Running"), "{stdout}");
+            }
+            sent.context("live daemon reply was discarded")?;
+        }
+        Ok(())
+    }
+
+    #[test]
     fn cli_json_info_resolves_native_full_nevra() -> Result<()> {
         let (selector, name, version) = installed_bash_full_nevra()?;
         let output = std::process::Command::new(assert_cmd::cargo::cargo_bin!("omg"))
