@@ -305,6 +305,50 @@ class HostedProducer(unittest.TestCase):
                                  stage + '\t0\n' for stage in PRODUCER.SIGNED_DECODER_STAGES))
             self.assertEqual(result.stderr, '')
 
+    @unittest.skipUnless(sys.platform == 'linux', 'Requires POSIX Bash background jobs')
+    def test_fresh_admission_overlaps_native_harness_and_keeps_its_exit_status(self):
+        artifacts = {role: {'sha256': 'a' * 64} for role in PRODUCER.ROLES}
+        script = PRODUCER.guest_script(artifacts, '/workspace/target/debug/omg')
+        registry = script.index('for role in ' + ' '.join(PRODUCER.HARNESSES) + '; do')
+        start = script.index('\ndone\n', registry) + len('\ndone\n')
+        harness = script.index("while IFS=$'\\t' read -r stage role name; do", start)
+        end_harness = script.index('done < /evidence/cli/expected-tests.tsv\n', harness)
+        end_harness += len('done < /evidence/cli/expected-tests.tsv\n')
+        end = script.index('for flags in q v vv vvv;', end_harness)
+        fake_harness = r'''
+for ((attempt=0; attempt<100; attempt++)); do
+  if test -f "$SYNC/started"; then break; fi
+  sleep .01
+done
+test -f "$SYNC/started" || { echo 'admission did not overlap the harness' >&2; exit 41; }
+: > "$SYNC/harness-ran"
+'''
+        segment = script[start:harness] + fake_harness + script[end_harness:end]
+        for status in (0, 23):
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as directory:
+                stub = r'''
+unshare() {
+  : > "$SYNC/started"
+  for ((attempt=0; attempt<100; attempt++)); do
+    if test -f "$SYNC/harness-ran"; then break; fi
+    sleep .01
+  done
+  test -f "$SYNC/harness-ran" || exit 42
+  : > "$SYNC/admission-finished"
+  exit "$ADMISSION_STATUS"
+}
+'''
+                result = subprocess.run(
+                    [BASH, '-euo', 'pipefail', '-c',
+                     stub + segment.replace('/evidence/cli/fresh-admission.json',
+                                            '"$SYNC/admission.json"')
+                     + 'test -f "$SYNC/admission-finished"\n: > "$SYNC/later-phase"\n'],
+                    env=dict(os.environ, SYNC=directory, ADMISSION_STATUS=str(status)),
+                    capture_output=True, text=True, timeout=5)
+                self.assertEqual(result.returncode, status, result.stderr)
+                self.assertTrue((Path(directory) / 'admission-finished').exists())
+                self.assertEqual((Path(directory) / 'later-phase').exists(), status == 0)
+
     def test_generated_cli_identity_preserves_literal_template_words(self):
         artifacts = {role: {'sha256': 'a' * 64} for role in PRODUCER.ROLES}
         compiled = '/workspace/RECEIPT/ARTIFACTS/SELECTION/COMPILED_CLI/NATIVE_PREFLIGHT_TEST/@@ARTIFACTS@@/omg'
