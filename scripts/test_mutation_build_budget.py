@@ -41,6 +41,23 @@ fn main() {
 
 
 class MutationBuildBudget(unittest.TestCase):
+    def test_selected_pr_baseline_reuses_portable_compilation(self):
+        ci = (ROOT / '.github/workflows/ci.yml').read_text(encoding='utf-8')
+        mutation = (ROOT / '.github/workflows/mutation.yml').read_text(encoding='utf-8')
+        self.assertNotIn('\n  pull_request:', mutation)
+        quick_gate = ci.split('\n  quick-gate:', 1)[1].split('\n  workflow-checks:', 1)[0]
+        self.assertIn('mutation-baseline-required: ${{ steps.changes.outputs.mutation_baseline_required }}', quick_gate)
+        portable = ci.split('\n  portable:', 1)[1].split('\n  portable-release:', 1)[0]
+        self.assertIn("OMG_PORTABLE_CARGO_PROFILE: ${{ needs.quick-gate.outputs.mutation-baseline-required == 'true' && 'ci' || 'test' }}", portable)
+        self.assertIn('run-native-contracts.py --features pgp,license --cargo-profile "$OMG_PORTABLE_CARGO_PROFILE"', portable)
+        marker = '      - name: Validate portable mutation baseline\n'
+        baseline = portable.split(marker, 1)[1].split('      - name:', 1)[0]
+        self.assertIn("if: needs.quick-gate.outputs.mutation-baseline-required == 'true'", baseline)
+        manual = mutation.split(marker, 1)[1].split('      - name:', 1)[0]
+        self.assertEqual(baseline.split('        run: ', 1)[1].splitlines()[0],
+                         manual.split('        run: ', 1)[1].splitlines()[0])
+        self.assertNotIn('continue-on-error', baseline)
+
     def test_portable_baseline_uses_ci_profile_with_complete_target_selection(self):
         workflow = (ROOT / '.github/workflows/mutation.yml').read_text(encoding='utf-8')
         _, baseline = workflow.split('      - name: Validate portable mutation baseline\n', 1)

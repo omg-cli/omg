@@ -5,6 +5,7 @@ import subprocess
 import tempfile
 import textwrap
 import unittest
+from unittest.mock import patch
 
 spec = importlib.util.spec_from_file_location('ci_scope', Path(__file__).with_name('ci-change-scope.py'))
 scope = importlib.util.module_from_spec(spec)
@@ -12,6 +13,27 @@ spec.loader.exec_module(scope)
 
 
 class ScopeTests(unittest.TestCase):
+    def test_portable_mutation_baseline_covers_existing_pr_paths(self):
+        selected = (
+            'tests/exhaustive_cli_matrix.rs', 'tests/integration_suite.rs',
+            'tests/property_tests.rs', 'tests/property_tests.proptest-regressions',
+            'tests/metrics_tests.rs', 'tests/security_tests.rs',
+            'src/cli/tea/status_model.rs', 'tests/coverage_15.rs',
+            'tests/coverage_4.rs', 'tests/coverage_5.rs', 'tests/common/nested/mod.rs',
+            'src/core/archive.rs', 'src/core/runtime_resolver.rs', 'src/core/http.rs',
+            'src/core/security/nested/example.rs', 'scripts/check-mutation-results.py',
+            'scripts/test_mutation_reports.py', 'scripts/observe-mutation-runner.py',
+            'scripts/test_mutation_runner_observer.py', 'scripts/test_mutation_build_budget.py',
+            '.github/workflows/mutation.yml',
+        )
+        for path in selected:
+            with self.subTest(path=path), patch.object(scope, 'changed_paths', return_value=[path]):
+                self.assertEqual(scope.classify_scope('pull_request', {}), (True, True, True))
+        for path, build in [('docs/notes.md', False), ('src/core/security.rs', True),
+                            ('tests/commonplace.rs', True), ('src/package_managers/dnf.rs', True)]:
+            with self.subTest(path=path), patch.object(scope, 'changed_paths', return_value=[path]):
+                self.assertEqual(scope.classify_scope('pull_request', {}), (build, build, False))
+
     def test_coverage_aggregate_rejects_missing_failed_or_cancelled_work(self):
         workflow = (Path(__file__).resolve().parents[1] / '.github/workflows/coverage.yml').read_text(encoding='utf-8')
         block = workflow.split('      - name: Require selected coverage\n')[1]
@@ -70,7 +92,7 @@ class ScopeTests(unittest.TestCase):
     def test_non_pr_events_always_build(self):
         for event in ('push', 'merge_group', 'schedule', 'workflow_dispatch', 'unknown'):
             self.assertTrue(scope.requires_build(event, {}))
-            self.assertEqual(scope.classify_scope(event, {}), (True, True))
+            self.assertEqual(scope.classify_scope(event, {}), (True, True, False))
 
     def test_distro_push_requires_native_inputs_and_defaults_to_running(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -144,13 +166,13 @@ class ScopeTests(unittest.TestCase):
                 return {'pull_request': {'base': {'sha': base}, 'head': {'sha': head}}}
             self.assertFalse(scope.requires_build('pull_request', event(git('rev-parse', 'HEAD')), root))
             self.assertEqual(scope.classify_scope('pull_request',
-                event(git('rev-parse', 'HEAD')), root), (False, False))
+                event(git('rev-parse', 'HEAD')), root), (False, False, False))
             (root / 'scripts').mkdir()
             (root / 'scripts/qemu-daemon-check.sh').write_text('test harness')
             git('add', '.')
             git('commit', '-qm', 'QEMU harness')
             self.assertEqual(scope.classify_scope('pull_request',
-                event(git('rev-parse', 'HEAD')), root), (True, False))
+                event(git('rev-parse', 'HEAD')), root), (True, False, False))
             (root / '.github/workflows').mkdir(parents=True)
             (root / 'tests').mkdir()
             (root / '.github/workflows/qemu-report.yml').write_text('reporter')
@@ -158,17 +180,17 @@ class ScopeTests(unittest.TestCase):
             git('add', '.')
             git('commit', '-qm', 'QEMU reporter and policy')
             self.assertEqual(scope.classify_scope('pull_request',
-                event(git('rev-parse', 'HEAD')), root), (True, False))
+                event(git('rev-parse', 'HEAD')), root), (True, False, False))
             (root / 'tests/cli_behavior_inventory.tsv').write_text('behavior')
             git('add', '.')
             git('commit', '-qm', 'Rust-consumed inventory')
             self.assertEqual(scope.classify_scope('pull_request',
-                event(git('rev-parse', 'HEAD')), root), (True, True))
+                event(git('rev-parse', 'HEAD')), root), (True, True, False))
             (root / 'docs').mkdir()
             git('mv', 'source.rs', 'docs/renamed.md')
             git('commit', '-qm', 'rename code')
             self.assertEqual(scope.classify_scope('pull_request',
-                event(git('rev-parse', 'HEAD')), root), (True, True))
+                event(git('rev-parse', 'HEAD')), root), (True, True, False))
             with self.assertRaises(subprocess.CalledProcessError):
                 scope.requires_build('pull_request', event('f' * 40), root)
 
@@ -195,11 +217,11 @@ class ScopeTests(unittest.TestCase):
             def event():
                 return {'pull_request': {'base': {'sha': base},
                                          'head': {'sha': git('rev-parse', 'HEAD')}}}
-            self.assertEqual(scope.classify_scope('pull_request', event(), root), (True, False))
+            self.assertEqual(scope.classify_scope('pull_request', event(), root), (True, False, False))
 
             (root / 'src/lib.rs').write_text('pub fn value() -> u8 { 2 }\n')
             git('commit', '-qam', 'Rust change')
-            self.assertEqual(scope.classify_scope('pull_request', event(), root), (True, True))
+            self.assertEqual(scope.classify_scope('pull_request', event(), root), (True, True, False))
 
 
 if __name__ == '__main__':

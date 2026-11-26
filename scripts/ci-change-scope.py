@@ -35,6 +35,28 @@ QEMU_COVERAGE_IRRELEVANT = {
     'tests/qemu-inventory-policy.json',
 }
 
+MUTATION_BASELINE_PATHS = {
+    'tests/exhaustive_cli_matrix.rs',
+    'tests/integration_suite.rs',
+    'tests/property_tests.rs',
+    'tests/property_tests.proptest-regressions',
+    'tests/metrics_tests.rs',
+    'tests/security_tests.rs',
+    'src/cli/tea/status_model.rs',
+    'tests/coverage_15.rs',
+    'tests/coverage_4.rs',
+    'tests/coverage_5.rs',
+    'src/core/archive.rs',
+    'src/core/runtime_resolver.rs',
+    'src/core/http.rs',
+    'scripts/check-mutation-results.py',
+    'scripts/test_mutation_reports.py',
+    'scripts/observe-mutation-runner.py',
+    'scripts/test_mutation_runner_observer.py',
+    'scripts/test_mutation_build_budget.py',
+    '.github/workflows/mutation.yml',
+}
+
 
 def coverage_irrelevant(paths):
     """QEMU harness changes need QEMU checks, not Rust instrumentation."""
@@ -72,9 +94,13 @@ def git_diff_paths(base, head, separator, cwd):
 def classify_scope(event_name, event, cwd=None):
     # Exact-commit coverage is required for main, merge queues, and manual runs.
     if event_name != 'pull_request':
-        return True, True
+        return True, True, False
     paths = changed_paths(event, cwd)
-    return not documentation_only(paths), not coverage_irrelevant(paths)
+    mutation_baseline = any(
+        path in MUTATION_BASELINE_PATHS or path.startswith(('tests/common/', 'src/core/security/'))
+        for path in paths
+    )
+    return not documentation_only(paths), not coverage_irrelevant(paths), mutation_baseline
 
 
 def requires_build(event_name, event, cwd=None):
@@ -109,7 +135,9 @@ if __name__ == '__main__':
             output.write(f'required={str(required).lower()}\n')
             print(f'Distro E2E required: {required}')
         else:
-            required, coverage_required = classify_scope(event_name, event)
+            required, coverage_required, mutation_baseline = classify_scope(event_name, event)
             output.write(f'required={str(required).lower()}\n')
             output.write(f'coverage_required={str(coverage_required).lower()}\n')
-            print(f'Build required: {required}; instrumented Rust coverage required: {coverage_required}')
+            output.write(f'mutation_baseline_required={str(mutation_baseline).lower()}\n')
+            print(f'Build required: {required}; instrumented Rust coverage required: {coverage_required}; '
+                  f'portable mutation baseline required: {mutation_baseline}')

@@ -64,6 +64,7 @@ jobs:
     outputs:
       should-build: ${{ github.event_name == 'push' || steps.changes.outputs.required == 'true' }}
       checks-required: ${{ steps.changes.outputs.required }}
+      mutation-baseline-required: ${{ steps.changes.outputs.mutation_baseline_required }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -313,6 +314,7 @@ jobs:
       OMG_CONTRACT_SURFACE_OUT: target/contract-surfaces
       OMG_CONTRACT_SOURCE_SHA: ${{ github.sha }}
       OMG_CONTRACT_PLATFORM: portable
+      OMG_PORTABLE_CARGO_PROFILE: ${{ needs.quick-gate.outputs.mutation-baseline-required == 'true' && 'ci' || 'test' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -399,6 +401,7 @@ jobs:
         # Share Cargo dependency artifacts with the portable test suite below.
         run: |
           cargo test --lib --no-default-features --features license --locked \
+            --profile "$OMG_PORTABLE_CARGO_PROFILE" \
             runtimes::node::tests::node_install_without_pgp_refuses_before_contacting_the_publisher \
             -- --exact --nocapture
 
@@ -423,13 +426,17 @@ jobs:
           tool: nextest
 
       - name: Run portable tests
-        run: python3 scripts/run-native-contracts.py --features pgp,license
+        run: python3 scripts/run-native-contracts.py --features pgp,license --cargo-profile "$OMG_PORTABLE_CARGO_PROFILE"
+
+      - name: Validate portable mutation baseline
+        if: needs.quick-gate.outputs.mutation-baseline-required == 'true'
+        run: cargo test --package omg --no-default-features --features pgp,license --locked --no-fail-fast --profile ci
 
       - name: Test isolated distro override harness
-        run: cargo test --test distro_override --no-default-features --features pgp,license --locked
+        run: cargo test --test distro_override --no-default-features --features pgp,license --locked --profile "$OMG_PORTABLE_CARGO_PROFILE"
 
       - name: Test root library documentation contracts
-        run: cargo test --doc --no-default-features --features pgp,license --locked
+        run: cargo test --doc --no-default-features --features pgp,license --locked --profile "$OMG_PORTABLE_CARGO_PROFILE"
 
       - name: Prepare genuine Node activation fixture
         run: timeout -k 5s 180s python3 scripts/prepare-node-test-fixture.py --destination "$RUNNER_TEMP/node-test-fixture"
@@ -438,7 +445,7 @@ jobs:
         env:
           OMG_CONTRACT_SURFACE_OUT: target/contract-surfaces/debian-pure
           OMG_CONTRACT_PLATFORM: debian-pure
-        run: python3 scripts/run-native-contracts.py --features debian-pure
+        run: python3 scripts/run-native-contracts.py --features debian-pure --cargo-profile "$OMG_PORTABLE_CARGO_PROFILE"
 
       - name: Preserve compiled parser surfaces
         if: always()
@@ -450,7 +457,7 @@ jobs:
           if-no-files-found: error
 
       - name: Verify portable environment CLI round-trip
-        run: cargo nextest run --test env_portability_cli --no-default-features --features pgp,license --locked --profile ci
+        run: cargo nextest run --test env_portability_cli --no-default-features --features pgp,license --locked --profile ci --cargo-profile "$OMG_PORTABLE_CARGO_PROFILE"
 
       - name: Report portable compiler cache
         if: always() && (steps.r2-cache.outputs.enabled == 'true' || steps.r2-pr-cache.outputs.enabled == 'true')

@@ -1110,7 +1110,7 @@ git() { printf '%040d\\n' 1; }
         text = (WORKFLOWS / 'mutation.yml').read_text()
         self.assertIn('cargo test --package omg --no-default-features --features pgp,license --locked --no-fail-fast', text)
         self.assertIn('exit "$mutants_exit"', text)
-        full_condition = "if: github.event_name != 'pull_request' && inputs.baseline-only != true"
+        full_condition = "if: inputs.baseline-only != true"
         for name in ('Install cargo-mutants', 'Run mutation testing',
                      'Download all mutation shards', 'Require complete mutation coverage and score'):
             block = text.split(f'      - name: {name}\n', 1)[1].split('\n      - ', 1)[0]
