@@ -621,6 +621,63 @@ exec {shlex.quote(str(native_executable))} "$@"
             finally:
                 checked(["/usr/bin/umount", target])
 
+    @contextmanager
+    def stall_native_report(executable, option):
+        target = Path(executable).resolve(strict=True)
+        with tempfile.TemporaryDirectory(prefix="native-report-", dir=root) as directory:
+            fixture = Path(directory)
+            fixture.chmod(0o755)
+            native_executable = fixture / target.name
+            shutil.copy2(target, native_executable)
+            pid = fixture / "pid"
+            pid.touch()
+            os.chown(pid, account.pw_uid, account.pw_gid)
+            wrapper = fixture / "delay-report"
+            wrapper.write_text(f"""#!/usr/bin/bash
+for argument in "$@"; do
+    if [[ "$argument" == {shlex.quote(option)} ]]; then
+        printf '%s\\n' "$$" > {shlex.quote(str(pid))}
+        exec /usr/bin/sleep 8
+    fi
+done
+exec {shlex.quote(str(native_executable))} "$@"
+""")
+            wrapper.chmod(0o755)
+            checked(["/usr/bin/mount", "--bind", wrapper, target])
+            try:
+                yield pid
+            finally:
+                checked(["/usr/bin/umount", target])
+
+    def inspect_native_report_deadlines():
+        identity = f"{package}.noarch"
+        cases = (
+            ("dnf-config-native-fallback", dnf, "--dump-main-config", host_config, True),
+            ("rpm-macro-query-refusal", rpm, "--eval", alternate_config, False),
+        )
+        for label, executable, option, settings, available in cases:
+            config.write_text(settings)
+            try:
+                with stall_native_report(executable, option) as child_pid:
+                    started = time.monotonic()
+                    result = command([cli, "--json", "search", "--limit", "1", package], disabled, ordinary)
+                    elapsed = time.monotonic() - started
+                    recorded = child_pid.read_text().strip()
+                    reaped = recorded.isdecimal() and not Path(f"/proc/{recorded}").exists()
+                    try:
+                        matched = result.returncode == 0 and [row["name"] for row in json.loads(result.stdout)] == [identity]
+                    except (KeyError, TypeError, ValueError):
+                        matched = False
+                    if not available:
+                        matched = (result.returncode != 0 and not result.stdout.strip()
+                                   and "Native package query timed out" in result.stderr)
+                    checks.append(dict(phase="native-report-deadline", case=label,
+                                       passed=matched and reaped and 2.5 <= elapsed < 6,
+                                       elapsed_seconds=elapsed, child_reaped=reaped, status=result.returncode,
+                                       diagnostic=(result.stderr or result.stdout)[-800:]))
+            finally:
+                config.write_text(host_config)
+
     def inspect_update_query_refusal(phase, blocked_option, expected_empty):
         operations = [
             ("count", ["uc"], lambda value: value == {"count": 0}),
@@ -8567,6 +8624,7 @@ exec {shlex.quote(str(binary))} "$@"
                 refresh_fixture()
                 inspect_repository("repository-metadata-restored", True)
                 if consent_oracle is not None:
+                    inspect_native_report_deadlines()
                     inspect_multiline_summary(original_manifest)
                     inspect_expired_catalog("repository-expiry", original_manifest, work/"custom-dnf-cache")
 
@@ -8834,6 +8892,6 @@ mark_progress("completed with host inventory unchanged")
 report = dict(binaries=binaries, checks=checks, total=len(checks),
               passed=sum(entry["passed"] for entry in checks), host_unchanged=True)
 print(json.dumps(report))
-expected_checks = 303 if consent_oracle is None else 2751
+expected_checks = 303 if consent_oracle is None else 2753
 if report["passed"] != report["total"] or report["total"] != expected_checks:
     sys.exit(4)

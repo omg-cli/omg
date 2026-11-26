@@ -32,6 +32,7 @@ mod catalog_cache;
 mod install_reasons;
 #[cfg(unix)]
 mod native_journal;
+mod native_query;
 mod rpm_database;
 use super::rpm_evr;
 
@@ -1070,19 +1071,12 @@ impl DnfPackageManager {
         &self,
         timeout: std::time::Duration,
     ) -> Result<bool> {
-        let runtime = tokio::runtime::Handle::current();
-        let deadline = tokio::time::Instant::now() + timeout;
+        let deadline = std::time::Instant::now() + timeout;
         let database = self.rpm_db_path.clone();
         tokio::task::spawn_blocking(move || {
-            let run = |command: std::process::Command| {
-                runtime.block_on(async {
-                    let mut command = tokio::process::Command::from(command);
-                    command.kill_on_drop(true);
-                    tokio::time::timeout_at(deadline, command.output())
-                        .await
-                        .context("RPM installed package query timed out")?
-                        .context("Cannot execute RPM inventory query")
-                })
+            let run = |command| {
+                native_query::capture(command, deadline)
+                    .context("Cannot execute RPM inventory query")
             };
             let location = RpmDatabase::detect_with_query_runner(&database, &run)?;
             match Self::count_rpm_sqlite(&location.sqlite) {
@@ -1239,16 +1233,17 @@ impl DnfPackageManager {
     ///
     /// Fallback for systems without `SQLite` RPM database (`BerkeleyDB`, `NDB`).
     fn read_rpm_via_query(root: &Path) -> Result<Vec<InstalledPackage>> {
-        let output = crate::core::privilege::system_command("rpm")?
-            .arg("--root")
-            .arg(root)
-            .args([
-                "-qa",
-                "--queryformat",
-                "%{NAME}\t%{VERSION}\t%{RELEASE}\t%{SUMMARY}\t%{EPOCHNUM}\t%{ARCH}\n",
-            ])
-            .output()
-            .context("Failed to execute rpm -qa")?;
+        let mut command = crate::core::privilege::system_command("rpm")?;
+        command.arg("--root").arg(root).args([
+            "-qa",
+            "--queryformat",
+            "%{NAME}\t%{VERSION}\t%{RELEASE}\t%{SUMMARY}\t%{EPOCHNUM}\t%{ARCH}\n",
+        ]);
+        let output = native_query::capture(
+            command,
+            std::time::Instant::now() + native_query::INVENTORY_TIMEOUT,
+        )
+        .context("Failed to execute rpm -qa")?;
 
         if !output.status.success() {
             anyhow::bail!("rpm command failed: {}", output.status);
@@ -1298,17 +1293,20 @@ impl DnfPackageManager {
     fn read_native_user_installed_names() -> Result<HashSet<String>> {
         // The user-installed filter loads only the installed repository, even
         // when the system has no available repositories configured.
-        let output = crate::core::privilege::system_command("dnf")?
-            .args([
-                "--cacheonly",
-                "--setopt=disable_excludes=*",
-                "repoquery",
-                "--userinstalled",
-                "--qf",
-                Self::USER_INSTALLED_QUERY_FORMAT,
-            ])
-            .output()
-            .context("Failed to execute dnf repoquery --userinstalled")?;
+        let mut command = crate::core::privilege::system_command("dnf")?;
+        command.args([
+            "--cacheonly",
+            "--setopt=disable_excludes=*",
+            "repoquery",
+            "--userinstalled",
+            "--qf",
+            Self::USER_INSTALLED_QUERY_FORMAT,
+        ]);
+        let output = native_query::capture(
+            command,
+            std::time::Instant::now() + native_query::INVENTORY_TIMEOUT,
+        )
+        .context("Failed to execute dnf repoquery --userinstalled")?;
         if !output.status.success() {
             let stderr =
                 crate::cli::style::sanitize_terminal_text(&String::from_utf8_lossy(&output.stderr));

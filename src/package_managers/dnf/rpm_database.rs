@@ -176,8 +176,11 @@ pub(super) fn read_dnf_settings(options: &[&str]) -> Result<String> {
     read_dnf_settings_with(options, &run_query)
 }
 
-fn run_query(mut command: Command) -> Result<Output> {
-    Ok(command.output()?)
+fn run_query(command: Command) -> Result<Output> {
+    super::native_query::capture(
+        command,
+        std::time::Instant::now() + super::native_query::SETTINGS_TIMEOUT,
+    )
 }
 
 fn read_dnf_settings_with(
