@@ -3,6 +3,7 @@ name: Release Smoke
 on:
   pull_request:
     paths:
+      - ".github/actions/ubuntu-apt/setup.sh"
       - ".github/workflows/release-smoke.yml"
       - "scripts/release-smoke.sh"
       - "scripts/qemu-runtime-advisory-oracle.py"

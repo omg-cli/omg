@@ -37,7 +37,8 @@ struct PackageManager {
 			);
 		}
 
-		pkgAcquire::RunResult result = acquire.Run(archive_progress.callback->pulse_interval());
+		const auto pulse_interval = archive_progress.callback->pulse_interval();
+		const auto result = pulse_interval == 0 ? acquire.Run() : acquire.Run(pulse_interval);
 
 		if (result != pkgAcquire::Continue) {
 			// The other variants are either Failed or Cancelled
