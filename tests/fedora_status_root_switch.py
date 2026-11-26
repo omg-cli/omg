@@ -4208,6 +4208,219 @@ exec {shlex.quote(str(native))} "$@"
                 config.write_text(original_config)
 
 
+    def inspect_snapshots():
+        phase = "fedora-snapshots"
+        with tempfile.TemporaryDirectory(prefix="snapshots-", dir=work) as directory:
+            data = Path(directory)
+            os.chown(data, account.pw_uid, account.pw_gid)
+            snapshots = data / "snapshots"
+            index = snapshots / "index.json"
+            settings = data / "config/omg"
+            snapshot_env = dict(disabled, OMG_DATA_DIR=str(data), OMG_CONFIG_DIR=str(settings),
+                                OMG_NATIVE_TEST_DATA_DIR="1")
+            node = data / "versions/node"
+            versions = ("22.0.0", "24.0.0")
+            seed = """
+import importlib.util, pathlib, sys
+helper, directory, *versions = sys.argv[1:]
+spec = importlib.util.spec_from_file_location("runtime_advisory_fixture", helper)
+fixture = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(fixture)
+data = pathlib.Path(directory)
+config = pathlib.Path(fixture.fixture_cli_environment(data)["OMG_CONFIG_DIR"])
+for version in versions:
+    release = data / "versions/node" / version
+    launcher = release / "bin/node"
+    launcher.parent.mkdir(parents=True)
+    launcher.write_text(f"#!/bin/sh\\nprintf '%s\\\\n' 'v{version}'\\n")
+    launcher.chmod(0o755)
+    fixture.seed_runtime_advisory_fixture(release, "node", version, config)
+"""
+            checked([sys.executable, "-I", "-B", "-c", seed, runtime_advisory_fixture, data, *versions],
+                    snapshot_env, ordinary)
+            current = node / "current"
+            current.symlink_to(versions[0])
+
+            def run(label, args, verify):
+                result = command([cli, "snapshot", *args], snapshot_env, ordinary, timeout=12)
+                checks.append(dict(phase=phase, case=label, passed=verify(result),
+                                   status=result.returncode, diagnostic=(result.stdout[-950:],
+                                                                          result.stderr[-950:])))
+
+            def succeeded(result, message):
+                return result.returncode == 0 and message in result.stdout and not result.stderr
+
+            def refused(result, message):
+                return (result.returncode != 0 and message.lower() in result.stderr.lower()
+                        and "Changes to apply:" not in result.stdout
+                        and "Applying changes..." not in result.stdout)
+
+            def state_hash(state):
+                result = hashlib.sha256()
+                for name, version in sorted(state["runtimes"].items()):
+                    result.update(f"{name}:{version};".encode())
+                for name in sorted(set(state["packages"])):
+                    result.update(f"{name};".encode())
+                return result.hexdigest()
+
+            query = [dnf, "--cacheonly", "--setopt=disable_excludes=*",
+                     "repoquery", "--userinstalled", "--qf", r"%{name}\n"]
+            config.write_text(alternate_config)
+            try:
+                expected = sorted(set(ordinary_control(query).splitlines()))
+                assert expected == [package], expected
+                run("list-empty", ["list"], lambda result: succeeded(result, "No snapshots found")
+                    and not snapshots.exists())
+
+                def created(result, message, count):
+                    if not succeeded(result, "Snapshot created!") or not index.is_file():
+                        return False
+                    rows = json.loads(index.read_bytes())["snapshots"]
+                    if len(rows) != count:
+                        return False
+                    latest = rows[-1]
+                    path = snapshots / f'{latest["id"]}.json'
+                    record = json.loads(path.read_bytes())
+                    return (record["id"] == latest["id"] and record["id"] in result.stdout
+                            and record["message"] == message == latest["message"]
+                            and record["created_at"] == latest["created_at"]
+                            and record["state"]["schema_version"] == 1
+                            and record["state"]["packages"] == expected
+                            and record["state"]["runtimes"] == {"node": versions[0]}
+                            and record["state"]["hash"] == state_hash(record["state"]) == latest["hash"]
+                            and stat.S_IMODE(path.stat().st_mode) == 0o600)
+
+                run("create-native-state", ["create", "-m", "native state"],
+                    lambda result: created(result, "native state", 1))
+                first = json.loads(index.read_bytes())["snapshots"][0]["id"]
+                saved = snapshots / f"{first}.json"
+                original = saved.read_bytes()
+                run("create-without-message", ["create"], lambda result: created(result, None, 2))
+                second = json.loads(index.read_bytes())["snapshots"][-1]["id"]
+                run("list-newest-first", ["list"], lambda result: succeeded(result, "2 snapshots total")
+                    and first in result.stdout and second in result.stdout
+                    and result.stdout.index(second) < result.stdout.index(first))
+                run("create-message-limit", ["create", "-m", "a" * 1001],
+                    lambda result: refused(result, "message too long"))
+                run("restore-matching", ["restore", first, "--dry-run"],
+                    lambda result: succeeded(result, "Environment already matches snapshot"))
+                index_bytes = index.read_bytes()
+                with (snapshots / ".index.lock").open("r+b") as lock:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    run("create-held-lock", ["create"], lambda result: refused(result, "mutation is running"))
+                    run("delete-held-lock", ["delete", first], lambda result: refused(result, "mutation is running"))
+                assert index.read_bytes() == index_bytes and saved.read_bytes() == original
+
+                def replace_active(version):
+                    current.unlink()
+                    current.symlink_to(version)
+
+                replace_active(versions[1])
+                run("preview-runtime-diff", ["restore", first, "--dry-run"],
+                    lambda result: succeeded(result, f"node {versions[1]} → {versions[0]}")
+                    and "No changes made" in result.stdout and current.readlink().name == versions[1])
+                run("apply-installed-runtime", ["restore", first],
+                    lambda result: succeeded(result, "Snapshot restore complete")
+                    and current.resolve() == node / versions[0])
+                run("repeat-runtime-restore", ["restore", first],
+                    lambda result: succeeded(result, "Environment already matches snapshot"))
+
+                mark("dependency")
+                try:
+                    assert ordinary_control(query).splitlines() == []
+                    run("preview-native-install", ["restore", first, "--dry-run"],
+                        lambda result: succeeded(result, "Packages to install (1)") and package in result.stdout
+                        and "No changes made" in result.stdout)
+                    run("unattended-native-install", ["restore", first],
+                        lambda result: result.returncode != 0 and "--yes" in result.stderr
+                        and "Applying changes..." not in result.stdout)
+                    run("create-dependency-only-inventory", ["create", "-m", "no explicitly installed packages"],
+                        lambda result: succeeded(result, "Packages: 0"))
+                    dependency_id = json.loads(index.read_bytes())["snapshots"][-1]["id"]
+                    dependency_snapshot = snapshots / f"{dependency_id}.json"
+                    assert checks[-1]["passed"], checks[-1]
+                    assert json.loads(dependency_snapshot.read_bytes())["state"]["packages"] == []
+                finally:
+                    mark("user")
+                run("preview-native-removal", ["restore", dependency_id, "--dry-run"],
+                    lambda result: succeeded(result, "Packages to remove (1)") and package in result.stdout
+                    and "No changes made" in result.stdout)
+                run("unattended-native-removal", ["restore", dependency_id],
+                    lambda result: result.returncode != 0 and "--yes" in result.stderr
+                    and "Applying changes..." not in result.stdout)
+                assert sorted(set(ordinary_control(query).splitlines())) == expected
+
+                def edit_record(change, *, rehash=False):
+                    value = json.loads(original)
+                    change(value)
+                    if rehash:
+                        value["state"]["hash"] = state_hash(value["state"])
+                    saved.write_bytes(json.dumps(value).encode())
+
+                for label, change, rehash, expected_error in (
+                    ("snapshot-id-mismatch", lambda value: value.update(id=second), False, "snapshot ID"),
+                    ("future-state-version", lambda value: value["state"].update(schema_version=2), False,
+                     "schema version 2"),
+                    ("inventory-hash-mismatch", lambda value: value["state"].update(packages=[]), False,
+                     "integrity check failed"),
+                    ("unknown-runtime", lambda value: value["state"]["runtimes"].update(
+                        {"unknown-example-runtime": "1.0"}), True, "unsupported runtime"),
+                    ("blank-runtime-version", lambda value: value["state"]["runtimes"].update(node=""),
+                     True, "invalid version"),
+                    ("invalid-package-name", lambda value: value["state"].update(packages=["two words"]),
+                     True, "package"),
+                ):
+                    edit_record(change, rehash=rehash)
+                    run(label, ["restore", first, "--dry-run"],
+                        lambda result: refused(result, expected_error))
+                edit_record(lambda value: value["state"].pop("schema_version"))
+                run("legacy-state-without-version", ["restore", first, "--dry-run"],
+                    lambda result: succeeded(result, "Environment already matches snapshot"))
+                candidates = [f"snapshot-example-{n:02d}" for n in range(12)]
+                edit_record(lambda value: value["state"].update(packages=expected + candidates[::-1]), rehash=True)
+                for attempt in range(3):
+                    run(f"ordered-preview-{attempt}", ["restore", first, "--dry-run"],
+                        lambda result: succeeded(result, "Packages to install (12)")
+                        and [line.strip()[2:] for line in result.stdout.splitlines()
+                             if line.strip().startswith("+ ")] == candidates[:10]
+                        and "and 2 more" in result.stdout)
+                saved.write_bytes(original)
+                with saved.open("ab") as output:
+                    for _ in range(16):
+                        output.write(b" " * (1024 * 1024))
+                run("oversized-state", ["restore", first, "--dry-run"], lambda result: refused(result, "byte limit"))
+                saved.write_bytes(b'{"id":')
+                run("invalid-state-json", ["restore", first, "--dry-run"],
+                    lambda result: refused(result, "parse snapshot"))
+                saved.write_bytes(original)
+                before_damage = index.read_bytes()
+                index.write_bytes(b'{"snapshots":')
+                run("invalid-index-list", ["list"], lambda result: refused(result, "parse snapshot index"))
+                run("invalid-index-delete", ["delete", first], lambda result: refused(result, "parse snapshot index")
+                    and saved.read_bytes() == original)
+                index.write_bytes(before_damage)
+                with index.open("ab") as output:
+                    for _ in range(16):
+                        output.write(b" " * (1024 * 1024))
+                run("oversized-index-list", ["list"], lambda result: refused(result, "byte limit"))
+                index.write_bytes(before_damage)
+                run("delete-other-snapshot", ["delete", second], lambda result: succeeded(result, f"Deleted snapshot {second}")
+                    and not (snapshots / f"{second}.json").exists() and saved.read_bytes() == original)
+                run("delete-dependency-only-snapshot", ["delete", dependency_id],
+                    lambda result: succeeded(result, f"Deleted snapshot {dependency_id}") and not dependency_snapshot.exists())
+                run("list-preserved-snapshot", ["list"], lambda result: succeeded(result, "1 snapshots total")
+                    and first in result.stdout and second not in result.stdout and dependency_id not in result.stdout)
+                run("restore-deleted-snapshot", ["restore", second, "--dry-run"],
+                    lambda result: refused(result, "not found"))
+                run("delete-unknown-snapshot", ["delete", "unknown-snapshot"],
+                    lambda result: refused(result, "not found"))
+                run("delete-final-snapshot", ["delete", first], lambda result: succeeded(result, f"Deleted snapshot {first}")
+                    and not saved.exists() and json.loads(index.read_bytes()) == {"snapshots": []})
+                assert sorted(set(ordinary_control(query).splitlines())) == expected
+            finally:
+                config.write_text(alternate_config)
+
+
     def inspect_task_environment_bytes():
         phase = "task-environment-bytes"
         raw = b"test-\xff-value"
@@ -6940,6 +7153,7 @@ exec {shlex.quote(str(binary))} "$@"
                 if consent_oracle is not None:
                     inspect_info_attempts()
                     inspect_migration()
+                    inspect_snapshots()
                 config.write_text(host_config)
                 inspect("returned-host", host_count, host_explicit, host=True)
                 mark_progress("root switch and return")
@@ -7251,6 +7465,6 @@ mark_progress("completed with host inventory unchanged")
 report = dict(binaries=binaries, checks=checks, total=len(checks),
               passed=sum(entry["passed"] for entry in checks), host_unchanged=True)
 print(json.dumps(report))
-expected_checks = 303 if consent_oracle is None else 2357
+expected_checks = 303 if consent_oracle is None else 2394
 if report["passed"] != report["total"] or report["total"] != expected_checks:
     sys.exit(4)

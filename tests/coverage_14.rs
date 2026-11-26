@@ -472,6 +472,33 @@ mod why_contracts {
 mod snapshot_contracts {
     use super::*;
 
+    fn snapshot_with_pending_install(
+        project: &TestProject,
+        message: &str,
+    ) -> (String, std::path::PathBuf) {
+        let id = create_snapshot(project, message);
+        let directory = project.data_dir.path().join("snapshots");
+        let path = directory.join(format!("{id}.json"));
+        let mut snapshot: omg_lib::cli::snapshot::Snapshot =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        snapshot.state.packages = vec![FAKE_PKG.to_string()];
+        snapshot.state.hash = snapshot.state.calculate_hash();
+        fs::write(&path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+
+        let index_path = directory.join("index.json");
+        let mut index: serde_json::Value =
+            serde_json::from_slice(&fs::read(&index_path).unwrap()).unwrap();
+        let entry = index["snapshots"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|entry| entry["id"] == id)
+            .unwrap();
+        entry["hash"] = serde_json::json!(snapshot.state.hash);
+        fs::write(index_path, serde_json::to_vec(&index).unwrap()).unwrap();
+        (id, path)
+    }
+
     #[test]
     fn held_index_lock_blocks_snapshot_mutations() -> anyhow::Result<()> {
         let project = TestProject::new();
@@ -645,16 +672,8 @@ mod snapshot_contracts {
     fn restore_dry_run_reports_plan_without_applying() {
         let project = TestProject::new();
         project.mock_available(FAKE_PKG, "1.0").expect("seed mock");
-        let id = create_snapshot(&project, "base");
-        let snap_path = project.data_dir.path().join(format!("snapshots/{id}.json"));
+        let (id, snap_path) = snapshot_with_pending_install(&project, "base");
 
-        // Rewrite the captured state so restoring would need one install.
-        let mut snap: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(&snap_path).expect("snapshot readable"))
-                .expect("valid snapshot JSON");
-        snap["state"]["packages"] = serde_json::json!([FAKE_PKG]);
-        fs::write(&snap_path, serde_json::to_string_pretty(&snap).unwrap())
-            .expect("rewrite snapshot");
         let before = fs::read_to_string(&snap_path).expect("snapshot readable");
 
         let result = project.run(&["snapshot", "restore", &id, "--dry-run"]);
@@ -695,13 +714,7 @@ mod snapshot_contracts {
     fn restore_requires_yes_in_non_interactive_mode() {
         let project = TestProject::new();
         project.mock_available(FAKE_PKG, "1.0").expect("seed mock");
-        let id = create_snapshot(&project, "base");
-        let snap_path = project.data_dir.path().join(format!("snapshots/{id}.json"));
-        let mut snap: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(&snap_path).expect("readable")).expect("json");
-        snap["state"]["packages"] = serde_json::json!([FAKE_PKG]);
-        fs::write(&snap_path, serde_json::to_string_pretty(&snap).unwrap()).expect("rewrite");
-
+        let (id, _) = snapshot_with_pending_install(&project, "base");
         // The harness always pipes stdin, which console::user_attended()
         // treats as non-interactive; spawn the child with the same isolated
         // env the harness would set and close stdin immediately (EOF).
@@ -747,13 +760,7 @@ mod snapshot_contracts {
     fn restore_yes_applies_missing_package_install() {
         let project = TestProject::new();
         project.mock_available(FAKE_PKG, "7.1").expect("seed mock");
-        let id = create_snapshot(&project, "with fake pkg");
-        let snap_path = project.data_dir.path().join(format!("snapshots/{id}.json"));
-        let mut snap: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(&snap_path).expect("readable")).expect("json");
-        snap["state"]["packages"] = serde_json::json!([FAKE_PKG]);
-        fs::write(&snap_path, serde_json::to_string_pretty(&snap).unwrap()).expect("rewrite");
-
+        let (id, _) = snapshot_with_pending_install(&project, "with fake pkg");
         let result = project.run(&["snapshot", "restore", &id, "--yes"]);
 
         result.assert_success();

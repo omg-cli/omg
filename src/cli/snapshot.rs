@@ -3,11 +3,13 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::cli::style;
 use crate::core::env::fingerprint::EnvironmentState;
-use crate::core::paths;
+use crate::core::{paths, safe_ops};
+
+const MAX_SNAPSHOT_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Snapshot {
@@ -41,7 +43,11 @@ fn index_path() -> PathBuf {
 fn load_index() -> Result<SnapshotIndex> {
     let path = index_path();
     match fs::symlink_metadata(&path) {
-        Ok(_) => {}
+        Ok(metadata) => anyhow::ensure!(
+            !metadata.file_type().is_symlink(),
+            "Refusing to read snapshot index that is a symlink: {}",
+            path.display()
+        ),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Ok(SnapshotIndex::default());
         }
@@ -50,24 +56,10 @@ fn load_index() -> Result<SnapshotIndex> {
                 .with_context(|| format!("Failed to inspect snapshot index: {}", path.display()));
         }
     }
-    let content = read_snapshot_file(&path)
-        .with_context(|| format!("Failed to read snapshot index: {}", path.display()))?;
+    let content = safe_ops::read_bounded_regular_file(&path, "Snapshot index", MAX_SNAPSHOT_BYTES)
+        .map_err(|error| anyhow::anyhow!("Failed to read snapshot index: {error:#}"))?;
     serde_json::from_str(&content)
         .with_context(|| format!("Failed to parse snapshot index: {}", path.display()))
-}
-
-/// Read a snapshot-sidecar file, refusing symlinks so a planted link
-/// cannot redirect the read outside the snapshots directory.
-fn read_snapshot_file(path: &PathBuf) -> Result<String> {
-    let is_symlink =
-        std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink());
-    if is_symlink {
-        anyhow::bail!(
-            "Refusing to read snapshot file that is a symlink: {}",
-            path.display()
-        );
-    }
-    Ok(fs::read_to_string(path)?)
 }
 
 fn load_index_for_update() -> Result<(fs::File, SnapshotIndex)> {
@@ -98,10 +90,34 @@ fn load_index_for_update() -> Result<(fs::File, SnapshotIndex)> {
     Ok((lock, index))
 }
 
-fn save_index(index: &SnapshotIndex) -> Result<()> {
-    let path = index_path();
-    crate::core::safe_ops::atomic_write_file_sync(&path, serde_json::to_string_pretty(index)?)
-        .with_context(|| format!("Failed to write snapshot index: {}", path.display()))
+fn encode_snapshot_file(value: &impl Serialize, kind: &str) -> Result<Vec<u8>> {
+    let content = serde_json::to_vec_pretty(value)?;
+    anyhow::ensure!(
+        content.len() as u64 <= MAX_SNAPSHOT_BYTES,
+        "{kind} exceeds the {MAX_SNAPSHOT_BYTES} byte limit"
+    );
+    Ok(content)
+}
+
+fn stage_index(index: &SnapshotIndex) -> Result<safe_ops::StagedFileWrite> {
+    let content = encode_snapshot_file(index, "Snapshot index")?;
+    safe_ops::stage_atomic_write_file_sync(&index_path(), &content)
+        .context("Failed to stage snapshot index")
+}
+
+fn load_snapshot(path: &Path, id: &str) -> Result<EnvironmentState> {
+    if let Err(error) = fs::symlink_metadata(path) {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            anyhow::bail!("Snapshot '{id}' not found");
+        }
+        return Err(error)
+            .with_context(|| format!("Failed to inspect snapshot: {}", path.display()));
+    }
+    let content = safe_ops::read_bounded_regular_file(path, "Snapshot file", MAX_SNAPSHOT_BYTES)?;
+    let snapshot: Snapshot = serde_json::from_str(&content)
+        .with_context(|| format!("Failed to parse snapshot: {}", path.display()))?;
+    anyhow::ensure!(snapshot.id == id, "Snapshot ID does not match '{id}'");
+    snapshot.state.verify_saved_inventory("Snapshot")
 }
 
 /// Create a new snapshot
@@ -118,15 +134,8 @@ pub async fn create(message: Option<String>) -> Result<()> {
     let state = EnvironmentState::capture().await?;
     let (_index_lock, mut index) = load_index_for_update()?;
 
-    // UUID-backed IDs make collisions practically impossible; still refuse to
-    // overwrite an existing snapshot instead of silently replacing it.
     let id = generate_snapshot_id();
     let snapshot_path = snapshots_dir().join(format!("{id}.json"));
-    anyhow::ensure!(
-        !snapshot_path.exists(),
-        "Snapshot '{id}' already exists; refusing to overwrite it"
-    );
-
     let snapshot = Snapshot {
         id: id.clone(),
         message: message.clone(),
@@ -134,45 +143,26 @@ pub async fn create(message: Option<String>) -> Result<()> {
         state,
     };
 
-    // Save snapshot file. Claim the path with a hard link instead of
-    // `persist` rename: link fails with AlreadyExists when another `create`
-    // wins the race, so the non-overwrite guarantee holds atomically.
-    // The temp file is fully synced before linking, so no torn file lands.
-    {
-        use std::io::Write as _;
-        let dir = snapshots_dir();
-        let mut temp = tempfile::NamedTempFile::new_in(&dir)
-            .with_context(|| format!("Failed to stage snapshot in {}", dir.display()))?;
-        temp.write_all(serde_json::to_string_pretty(&snapshot)?.as_bytes())
-            .with_context(|| format!("Failed to write snapshot: {}", snapshot_path.display()))?;
-        temp.as_file()
-            .sync_all()
-            .with_context(|| format!("Failed to sync snapshot: {}", snapshot_path.display()))?;
-        match std::fs::hard_link(temp.path(), &snapshot_path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                anyhow::bail!("Snapshot '{id}' already exists; refusing to overwrite it")
-            }
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!("Failed to write snapshot: {}", snapshot_path.display())
-                });
-            }
-        }
-    }
-
     index.snapshots.push(SnapshotMeta {
         id: id.clone(),
         message: message.clone(),
         created_at: snapshot.created_at,
         hash: snapshot.state.hash.clone(),
     });
-    save_index(&index)?;
+    let content = encode_snapshot_file(&snapshot, "Snapshot file")?;
+    let index_write = stage_index(&index)?;
+    anyhow::ensure!(
+        safe_ops::atomic_write_new_private_file(&snapshot_path, &content)?,
+        "Snapshot '{id}' already exists; refusing to overwrite it"
+    );
+    index_write
+        .publish()
+        .context("Failed to publish snapshot index")?;
 
     println!("  {} Snapshot created!", style::positive("✓"));
     println!("  ID: {}", style::accent(&id));
     if let Some(msg) = &message {
-        println!("  Message: {msg}");
+        println!("  Message: {}", style::sanitize_terminal_text(msg));
     }
     println!("  Runtimes: {}", snapshot.state.runtimes.len());
     println!("  Packages: {}", snapshot.state.packages.len());
@@ -217,10 +207,10 @@ pub fn list() -> Result<()> {
 
         println!(
             "  {} {} {} {}",
-            style::accent(&snap.id),
+            style::accent(&style::sanitize_terminal_text(&snap.id)),
             style::dim(&date),
-            style::dim(&short_hash),
-            msg
+            style::dim(&style::sanitize_terminal_text(&short_hash)),
+            style::sanitize_terminal_text(msg)
         );
     }
 
@@ -233,9 +223,14 @@ pub fn list() -> Result<()> {
 /// Restore a snapshot
 pub async fn restore(id: &str, dry_run: bool, yes: bool) -> Result<()> {
     // SECURITY: Validate snapshot ID
-    if id.chars().any(|c| !c.is_ascii_alphanumeric() && c != '-') {
-        anyhow::bail!("Invalid snapshot ID: {id}");
-    }
+    anyhow::ensure!(
+        !id.is_empty()
+            && id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-'),
+        "Invalid snapshot ID: {}",
+        style::sanitize_terminal_text(id)
+    );
 
     println!(
         "{} {} snapshot {}\n",
@@ -248,37 +243,43 @@ pub async fn restore(id: &str, dry_run: bool, yes: bool) -> Result<()> {
         style::caution(id)
     );
 
-    // Load snapshot
     let snapshot_path = snapshots_dir().join(format!("{id}.json"));
-    if !snapshot_path.exists() {
-        anyhow::bail!("Snapshot '{id}' not found");
-    }
-
-    let content = read_snapshot_file(&snapshot_path)
-        .with_context(|| format!("Failed to read snapshot file: {}", snapshot_path.display()))?;
-    let snapshot: Snapshot = serde_json::from_str(&content)
-        .with_context(|| format!("Failed to parse snapshot: {}", snapshot_path.display()))?;
-
-    // Capture current state
+    let target = tokio::task::spawn_blocking({
+        let id = id.to_owned();
+        move || load_snapshot(&snapshot_path, &id)
+    })
+    .await
+    .context("Snapshot reader task failed")??;
     let current = EnvironmentState::capture().await?;
 
-    // Calculate diff
-    println!("  {}", style::emphasis("Changes to apply:"));
-    println!();
-
-    // Runtime changes
     let mut runtime_changes = Vec::new();
-    for (runtime, target_ver) in &snapshot.state.runtimes {
+    for (runtime, target_ver) in &target.runtimes {
         let current_ver = current.runtimes.get(runtime);
         if current_ver != Some(target_ver) {
-            runtime_changes.push((runtime.clone(), current_ver.cloned(), target_ver.clone()));
+            crate::cli::runtimes::validate_restore_request(runtime, target_ver)?;
+            runtime_changes.push((runtime, current_ver.map(String::as_str), target_ver));
         }
     }
+
+    let crate::cli::diff::PackageDiff {
+        added: to_install,
+        removed: to_remove,
+    } = crate::cli::diff::diff_packages(&current.packages, &target.packages);
+    crate::core::security::ensure_local_archive_consent(&to_install, false)?;
+    crate::cli::packages::validate_install_target_syntax(
+        &to_install,
+        crate::core::env::distro::detect_distro(),
+    )
+    .map_err(|error| anyhow::anyhow!("Invalid snapshot package targets: {error}"))?;
+    crate::core::security::validate_package_names(&to_remove)?;
+
+    println!("  {}", style::emphasis("Changes to apply:"));
+    println!();
 
     if !runtime_changes.is_empty() {
         println!("  Runtimes:");
         for (runtime, from, to) in &runtime_changes {
-            let from_str = from.as_deref().unwrap_or("(none)");
+            let from_str = from.unwrap_or("(none)");
             println!(
                 "    {} {} → {}",
                 style::caution(&style::sanitize_terminal_text(runtime)),
@@ -288,19 +289,6 @@ pub async fn restore(id: &str, dry_run: bool, yes: bool) -> Result<()> {
         }
         println!();
     }
-
-    // Package changes
-    let current_pkgs: std::collections::HashSet<_> = current.packages.iter().collect();
-    let target_pkgs: std::collections::HashSet<_> = snapshot.state.packages.iter().collect();
-
-    let to_install: Vec<String> = target_pkgs
-        .difference(&current_pkgs)
-        .map(|s| (*s).clone())
-        .collect();
-    let to_remove: Vec<String> = current_pkgs
-        .difference(&target_pkgs)
-        .map(|s| (*s).clone())
-        .collect();
 
     if !to_install.is_empty() {
         println!("  Packages to install ({}):", to_install.len());
@@ -411,9 +399,14 @@ fn short_hash(hash: &str) -> String {
 /// Delete a snapshot
 pub fn delete(id: &str) -> Result<()> {
     // SECURITY: Validate snapshot ID
-    if id.chars().any(|c| !c.is_ascii_alphanumeric() && c != '-') {
-        anyhow::bail!("Invalid snapshot ID: {id}");
-    }
+    anyhow::ensure!(
+        !id.is_empty()
+            && id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-'),
+        "Invalid snapshot ID: {}",
+        style::sanitize_terminal_text(id)
+    );
 
     let (_index_lock, mut index) = load_index_for_update()?;
     let snapshot_path = snapshots_dir().join(format!("{id}.json"));
@@ -422,9 +415,12 @@ pub fn delete(id: &str) -> Result<()> {
         anyhow::bail!("Snapshot '{id}' not found");
     }
 
-    fs::remove_file(&snapshot_path)?;
     index.snapshots.retain(|s| s.id != id);
-    save_index(&index)?;
+    let index_write = stage_index(&index)?;
+    fs::remove_file(&snapshot_path)?;
+    index_write
+        .publish()
+        .context("Failed to publish snapshot index")?;
 
     println!(
         "{} Deleted snapshot {}",

@@ -1472,9 +1472,11 @@ omg snapshot delete abc123
 ```
 
 Creation and deletion share a persistent `.index.lock` in the snapshots directory.
-A competing mutation fails with a retry message. Both commands validate the index
-before changing snapshot files. This does not make the snapshot file and index a
-crash-atomic pair.
+A competing mutation fails with a retry message. Both commands stage the updated
+index before changing snapshot files. The index and each snapshot have a 16 MiB
+size limit. Restore checks the snapshot ID, state schema, and inventory checksum
+before planning changes. Preview lists package changes in name order. A crash
+between snapshot and index publication can require recovery.
 
 ---
 

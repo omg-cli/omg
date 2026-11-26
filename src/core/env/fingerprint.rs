@@ -153,13 +153,23 @@ impl EnvironmentState {
             );
         }
 
-        let mut state = parsed.context("Failed to parse lockfile")?;
-        state.normalize();
+        parsed
+            .context("Failed to parse lockfile")?
+            .verify_saved_inventory("Lockfile")
+    }
+
+    pub(crate) fn verify_saved_inventory(mut self, kind: &str) -> Result<Self> {
+        let schema_version = self.schema_version;
         anyhow::ensure!(
-            state.hash == state.calculate_hash(),
-            "Lockfile integrity check failed: stored hash does not match contents"
+            schema_version <= Self::SCHEMA_VERSION,
+            "{kind} was written by a newer omg (schema version {schema_version}). Upgrade omg to read it."
         );
-        Ok(state)
+        self.normalize();
+        anyhow::ensure!(
+            self.hash == self.calculate_hash(),
+            "{kind} integrity check failed: stored hash does not match contents"
+        );
+        Ok(self)
     }
 
     fn normalize(&mut self) {

@@ -186,12 +186,16 @@ fn diff_runtimes(from: &BTreeMap<String, String>, to: &BTreeMap<String, String>)
     changes
 }
 
-struct PackageDiff {
-    added: Vec<String>,
-    removed: Vec<String>,
+#[derive(Default)]
+pub(crate) struct PackageDiff {
+    pub(crate) added: Vec<String>,
+    pub(crate) removed: Vec<String>,
 }
 
-fn diff_packages(from: &[String], to: &[String]) -> PackageDiff {
+pub(crate) fn diff_packages(from: &[String], to: &[String]) -> PackageDiff {
+    if from == to {
+        return PackageDiff::default();
+    }
     // Lock files record package names only, so a name-set difference is the
     // entire honest comparison; per-package version changes cannot be derived.
     let from_set: HashSet<&str> = from.iter().map(String::as_str).collect();
