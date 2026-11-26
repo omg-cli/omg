@@ -4,8 +4,11 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use jiff::Timestamp;
+#[cfg(test)]
+use nucleo_matcher::Utf32String;
 use nucleo_matcher::{
-    Config, Matcher, Utf32String,
+    Config, Matcher, Utf32Str,
+    chars::graphemes,
     pattern::{CaseMatching, Normalization, Pattern},
 };
 
@@ -91,20 +94,35 @@ impl CompletionEngine {
             .collect()
     }
 
-    pub(crate) fn fuzzy_indices(pattern: &str, candidates: &[String], limit: usize) -> Vec<usize> {
+    pub(crate) fn fuzzy_indices(
+        pattern: &str,
+        candidates: &[impl AsRef<str>],
+        limit: usize,
+    ) -> Vec<usize> {
+        if limit == 0 {
+            return Vec::new();
+        }
         if pattern.is_empty() {
             return (0..candidates.len()).take(limit).collect();
         }
 
         let mut matcher = Matcher::new(Config::DEFAULT);
         let pat = Pattern::parse(pattern, CaseMatching::Ignore, Normalization::Smart);
+        let mut unicode = Vec::new();
 
         let mut matches: Vec<(usize, u32, bool)> = candidates
             .iter()
             .enumerate()
             .filter_map(|(index, candidate)| {
-                let haystack = Utf32String::from(candidate.as_str());
-                let score = pat.score(haystack.slice(..), &mut matcher)?;
+                let candidate = candidate.as_ref();
+                let haystack = if candidate.is_ascii() {
+                    Utf32Str::Ascii(candidate.as_bytes())
+                } else {
+                    unicode.clear();
+                    unicode.extend(graphemes(candidate));
+                    Utf32Str::Unicode(&unicode)
+                };
+                let score = pat.score(haystack, &mut matcher)?;
                 // Prefix preference is ASCII-only, unlike nucleo's scoring.
                 // Compare bytes so a short UTF-8 prefix need not be a str boundary.
                 let prefix = candidate
@@ -118,18 +136,19 @@ impl CompletionEngine {
         matches.sort_by(|a, b| {
             let a_prefix = a.2;
             let b_prefix = b.2;
-            b_prefix.cmp(&a_prefix).then_with(|| {
-                if a_prefix && b_prefix {
-                    candidates[a.0]
-                        .len()
-                        .cmp(&candidates[b.0].len())
-                        .then_with(|| candidates[a.0].cmp(&candidates[b.0]))
-                } else {
-                    b.1.cmp(&a.1)
-                        .then_with(|| candidates[a.0].len().cmp(&candidates[b.0].len()))
-                        .then_with(|| candidates[a.0].cmp(&candidates[b.0]))
-                }
-            })
+            let a_name = candidates[a.0].as_ref();
+            let b_name = candidates[b.0].as_ref();
+            b_prefix
+                .cmp(&a_prefix)
+                .then_with(|| {
+                    if a_prefix && b_prefix {
+                        std::cmp::Ordering::Equal
+                    } else {
+                        b.1.cmp(&a.1)
+                    }
+                })
+                .then_with(|| a_name.len().cmp(&b_name.len()))
+                .then_with(|| a_name.cmp(b_name))
         });
 
         matches
@@ -523,6 +542,8 @@ mod tests {
             "Épkg",
             "pkg-é",
             "pkg-É",
+            "pkg-e\u{301}",
+            "e\u{301}pkg",
             "猫pkg",
             "p猫kg",
             "é",
@@ -536,7 +557,8 @@ mod tests {
         .map(String::from)
         .collect();
         for pattern in [
-            "pkg", "PKG", "p", "é", "É", "猫", "p猫", "absent", "", "^pkg", "pkg$", "!pkg",
+            "pkg", "PKG", "p", "é", "É", "e\u{301}", "猫", "p猫", "absent", "", "^pkg", "pkg$",
+            "!pkg",
         ] {
             for limit in [0, 1, 3, 16, usize::MAX] {
                 for _ in 0..candidates.len() {
