@@ -21,6 +21,8 @@ use crate::core::http::BoundedResponseExt;
 
 const LICENSE_TOKEN_ISSUER: &str = super::service_api::ORIGIN;
 const LICENSE_TOKEN_AUDIENCE: &str = "omg-cli";
+const MAX_LICENSE_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_LICENSE_CLOCK_BYTES: u64 = 64;
 
 /// Production Ed25519 public key used for offline license-token verification.
 ///
@@ -442,15 +444,24 @@ fn override_watermark_path(path: PathBuf) -> WatermarkPathGuard {
 /// use; unreadable or malformed state is rejected so clock rollback protection
 /// cannot silently reset.
 fn load_clock_watermark(path: &Path) -> Result<Option<i64>> {
-    match std::fs::read_to_string(path) {
+    match super::safe_ops::read_bounded_regular_file(
+        path,
+        "License clock watermark",
+        MAX_LICENSE_CLOCK_BYTES,
+    ) {
         Ok(content) => content
             .trim()
             .parse::<i64>()
             .map(Some)
             .with_context(|| format!("Malformed license clock watermark: {}", path.display())),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error)
-            .with_context(|| format!("Failed to read license clock watermark: {}", path.display())),
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|cause| cause.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -474,11 +485,18 @@ fn license_clock_floor_with(path: &Path, now: i64) -> Result<i64> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
-        options.mode(0o600).custom_flags(nix::libc::O_NOFOLLOW);
+        options
+            .mode(0o600)
+            .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK | nix::libc::O_NOCTTY);
     }
     let lock = options
         .open(&lock_path)
         .with_context(|| format!("Failed to open license clock lock: {}", lock_path.display()))?;
+    anyhow::ensure!(
+        lock.metadata()?.is_file(),
+        "License clock lock must be a regular file: {}",
+        lock_path.display()
+    );
     lock.lock()
         .with_context(|| format!("Failed to lock license clock: {}", lock_path.display()))?;
 
@@ -486,8 +504,11 @@ fn license_clock_floor_with(path: &Path, now: i64) -> Result<i64> {
         let stored = load_clock_watermark(path)?;
         let floor = stored.unwrap_or(now).max(now);
         if stored != Some(floor) {
-            crate::core::safe_ops::atomic_write_file_sync(path, floor.to_string().as_bytes())
-                .context("Failed to persist license clock watermark")?;
+            crate::core::safe_ops::atomic_write_file_sync_private(
+                path,
+                floor.to_string().as_bytes(),
+            )
+            .context("Failed to persist license clock watermark")?;
         }
         Ok(floor)
     })();
@@ -654,14 +675,21 @@ pub fn load_license() -> Option<StoredLicense> {
             return None;
         }
     };
-    let content = match std::fs::read_to_string(&path) {
+    let content = match super::safe_ops::read_bounded_regular_file(
+        &path,
+        "license file",
+        MAX_LICENSE_BYTES,
+    ) {
         Ok(content) => content,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|cause| cause.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            return None;
+        }
         Err(error) => {
-            tracing::warn!(
-                "Failed to read license file {}: treating as no license ({error})",
-                path.display()
-            );
+            tracing::warn!("{error:#}");
             return None;
         }
     };
@@ -708,16 +736,24 @@ fn write_private_file(path: &Path, contents: &[u8]) -> Result<()> {
 pub fn save_license(license: &StoredLicense) -> Result<()> {
     let path = license_path()?;
     let content = serde_json::to_vec_pretty(license)?;
+    anyhow::ensure!(
+        content.len() as u64 <= MAX_LICENSE_BYTES,
+        "License file exceeds the {MAX_LICENSE_BYTES} byte limit: {}",
+        path.display()
+    );
     write_private_file(&path, &content)
 }
 
 /// Remove stored license
 pub fn remove_license() -> Result<()> {
     let path = license_path()?;
-    if path.exists() {
-        std::fs::remove_file(path)?;
+    match std::fs::remove_file(&path) {
+        Ok(()) => super::safe_ops::sync_parent_directory_sync(&path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => {
+            Err(error).with_context(|| format!("Failed to unlink license file {}", path.display()))
+        }
     }
-    Ok(())
 }
 
 /// Redact a license key for logging. Only a short prefix of plain-ASCII
@@ -1394,6 +1430,44 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn oversized_license_save_preserves_the_previous_record() -> Result<()> {
+        const NAME: &str =
+            "core::license::tests::oversized_license_save_preserves_the_previous_record";
+        if crate::core::testing::run_isolated_test(NAME)
+            || crate::config::Settings::rerun_test_unprivileged(NAME)
+        {
+            return Ok(());
+        }
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("license.json");
+        std::fs::write(&path, b"previous credential")?;
+        let stored = StoredLicense {
+            key: "synthetic-test-key".into(),
+            tier: "free".into(),
+            features: vec!["a".repeat(MAX_LICENSE_BYTES as usize)],
+            customer: None,
+            expires_at: None,
+            validated_at: 0,
+            token: None,
+            machine_id: None,
+        };
+        temp_env::with_vars(
+            [
+                ("HOME", Some(directory.path().as_os_str())),
+                ("OMG_DATA_DIR", Some(directory.path().as_os_str())),
+            ],
+            || {
+                assert_eq!(license_path().unwrap(), path);
+                let error =
+                    save_license(&stored).expect_err("oversized credential must be rejected");
+                assert!(error.to_string().contains("byte limit"));
+            },
+        );
+        assert_eq!(std::fs::read(path)?, b"previous credential");
+        Ok(())
     }
 
     #[test]

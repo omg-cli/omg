@@ -5446,6 +5446,124 @@ fixture["seed_runtime_advisory_fixture"](root, "node", version, config)
                     passed=bool(acquired and updated), diagnostic=(result.stdout[-400:],result.stderr[-650:],detail)))
 
 
+    def inspect_account_storage():
+        phase = "fedora-account-storage"
+        limit = 16 * 1024 * 1024
+        for case in ("missing", "tokenless", "malformed", "invalid-utf8", "credential-symlink",
+                     "dangling-symlink", "directory", "size-boundary", "size-excess",
+                     "clock-current", "clock-advances", "clock-malformed", "clock-excess",
+                     "clock-symlink", "clock-lock-directory"):
+            with tempfile.TemporaryDirectory(prefix="account-storage-", dir=work) as directory:
+                home = Path(directory)
+                data, config = home/"data", home/"config"
+                for path in (home,data,config):
+                    path.mkdir(exist_ok=True)
+                    path.chmod(0o700)
+                    os.chown(path, account.pw_uid, account.pw_gid)
+
+                def write(path, value):
+                    path.write_bytes(value)
+                    path.chmod(0o600)
+                    os.chown(path, account.pw_uid, account.pw_gid)
+
+                write(config/"config.toml", b"telemetry_enabled = false\n")
+                credential = data/"license.json"
+                target = data/"separate-account.json"
+                clock = data/"license-clock.highwater"
+                clock_target = data/"separate-clock"
+                clock_lock = data/"license-clock.lock"
+                clock_before = None
+                credentials = {"key":"synthetic-unlinked-record","tier":"free","features":[],"validated_at":0}
+                now = int(time.time())
+                if case.startswith("clock-"):
+                    credentials["token"] = "invalid-local-token-fixture"
+                    value = str(now + 600).encode()
+                    if case=="clock-advances":
+                        value = b"1"
+                    elif case=="clock-malformed":
+                        value = b"no timestamp"
+                    elif case=="clock-excess":
+                        value = value.ljust(65)
+                    elif case=="clock-symlink":
+                        write(clock_target, value)
+                        clock.symlink_to(clock_target.name)
+                    if case=="clock-lock-directory":
+                        clock_lock.mkdir()
+                        os.chown(clock_lock, account.pw_uid, account.pw_gid)
+                    if not clock.is_symlink():
+                        write(clock, value)
+                    clock_before = value
+
+                raw = json.dumps(credentials).encode()
+                if case=="malformed":
+                    raw = b"{"
+                elif case=="invalid-utf8":
+                    raw = b"\xff"
+                elif case in ("size-boundary","size-excess"):
+                    raw = raw.ljust(limit + int(case=="size-excess"))
+                if case=="credential-symlink":
+                    write(target, raw)
+                    credential.symlink_to(target.name)
+                elif case=="dangling-symlink":
+                    credential.symlink_to(target.name)
+                elif case=="directory":
+                    credential.mkdir()
+                    os.chown(credential, account.pw_uid, account.pw_gid)
+                elif case!="missing":
+                    write(credential, raw)
+
+                env = dict(disabled, HOME=str(home), OMG_DATA_DIR=str(data), OMG_CONFIG_DIR=str(config),
+                           XDG_CONFIG_HOME=str(home/"xdg-config"), XDG_DATA_HOME=str(home/"xdg-data"),
+                           XDG_STATE_HOME=str(home/"state"), XDG_CACHE_HOME=str(home/"cache"),
+                           CI="1", OMG_NO_UPDATE_CHECK="1", RUST_LOG="warn")
+                status = command([cli,"account","status"], env, ordinary, timeout=8)
+                absent = {"missing","malformed","invalid-utf8","credential-symlink","dangling-symlink","directory","size-excess"}
+                warning = {
+                    "malformed":"Discarding malformed license file",
+                    "invalid-utf8":"Failed to read license file",
+                    "credential-symlink":"regular file",
+                    "dangling-symlink":"regular file",
+                    "directory":"regular file",
+                    "size-excess":"byte limit",
+                    "clock-malformed":"Malformed license clock watermark",
+                    "clock-excess":"byte limit",
+                    "clock-symlink":"regular file",
+                    "clock-lock-directory":"Failed to open license clock lock",
+                }.get(case)
+                status_text = "Status: Not linked" if case in absent else "Status: Stored token is invalid or expired"
+                clock_ok = (int(clock.read_text()) >= now if case=="clock-advances"
+                            else clock.read_bytes()==clock_before if clock_before is not None
+                            else not clock.exists())
+                valid = (status.returncode==0 and status_text in status.stdout
+                         and (warning in status.stderr if warning else not status.stderr)
+                         and clock_ok and "synthetic-unlinked-record" not in status.stdout+status.stderr
+                         and "invalid-local-token-fixture" not in status.stdout+status.stderr)
+                if case=="credential-symlink":
+                    valid = valid and credential.is_symlink() and target.read_bytes()==raw
+                elif case=="dangling-symlink":
+                    valid = valid and credential.is_symlink() and not target.exists()
+                elif case not in ("missing","directory"):
+                    valid = valid and credential.read_bytes()==raw
+                if case=="clock-symlink":
+                    valid = valid and clock.is_symlink() and clock_target.read_bytes()==clock_before
+                checks.append(dict(phase=phase, case=f"{case}-status",status=status.returncode,
+                    passed=bool(valid),diagnostic=(status.stdout[-480:],status.stderr[-580:],clock_ok)))
+
+                preserved_clock = clock.read_bytes() if clock.is_file() else None
+                unlink = command([cli,"account","unlink"], env, ordinary, timeout=8)
+                if case=="directory":
+                    removed = unlink.returncode!=0 and credential.is_dir() and "unlinked." not in unlink.stdout
+                else:
+                    removed = (unlink.returncode==0 and "Dashboard account unlinked." in unlink.stdout
+                               and not credential.exists() and not credential.is_symlink())
+                if case=="credential-symlink":
+                    removed = removed and target.read_bytes()==raw
+                if preserved_clock is not None:
+                    removed = removed and clock.read_bytes()==preserved_clock
+                checks.append(dict(phase=phase,case=f"{case}-unlink",status=unlink.returncode,
+                    passed=bool(removed),diagnostic=(unlink.stdout[-380:],unlink.stderr[-550:])))
+
+
     def inspect_task_environment_bytes():
         phase = "task-environment-bytes"
         raw = b"test-\xff-value"
@@ -8187,6 +8305,7 @@ exec {shlex.quote(str(binary))} "$@"
                     inspect_install_telemetry_admission()
                     inspect_usage_dispatch_admission()
                     inspect_saved_usage_stats()
+                    inspect_account_storage()
                 config.write_text(host_config)
                 inspect("returned-host", host_count, host_explicit, host=True)
                 mark_progress("root switch and return")
@@ -8498,6 +8617,6 @@ mark_progress("completed with host inventory unchanged")
 report = dict(binaries=binaries, checks=checks, total=len(checks),
               passed=sum(entry["passed"] for entry in checks), host_unchanged=True)
 print(json.dumps(report))
-expected_checks = 303 if consent_oracle is None else 2652
+expected_checks = 303 if consent_oracle is None else 2682
 if report["passed"] != report["total"] or report["total"] != expected_checks:
     sys.exit(4)

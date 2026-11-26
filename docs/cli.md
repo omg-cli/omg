@@ -1988,6 +1988,10 @@ omg account <SUBCOMMAND>
 | `status` | Show whether this machine is linked |
 | `unlink` | Remove the local dashboard identity |
 
+OMG reads the local credential and its clock watermark from regular files.
+The credential is limited to 16 MiB. If you keep it behind a symlink, run
+`omg account link --token-stdin` to recreate the local credential file.
+
 ### omg daemon
 
 Start the background daemon (Unix only). It takes no subcommands — for daemon
