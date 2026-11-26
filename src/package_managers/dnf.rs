@@ -54,8 +54,6 @@ mod rpm_tags {
 pub struct DnfPackageManager {
     /// Path to RPM `SQLite` database
     rpm_db_path: PathBuf,
-    /// Path to yum repository configuration (used by the `dnf` CLI)
-    repos_dir: PathBuf,
     /// Complete RPM inventory bound to database/WAL identity and SQLite commits.
     /// Install reasons belong to DNF's separate state and are queried on demand.
     installed_cache: Arc<RwLock<Option<InstalledSnapshot>>>,
@@ -829,7 +827,6 @@ impl DnfPackageManager {
     pub fn new() -> Self {
         Self {
             rpm_db_path: PathBuf::from("/var/lib/rpm/rpmdb.sqlite"),
-            repos_dir: PathBuf::from("/etc/yum.repos.d"),
             installed_cache: Arc::new(RwLock::new(None)),
         }
     }
@@ -1017,10 +1014,13 @@ impl DnfPackageManager {
     /// Fallback for systems without `SQLite` RPM database (`BerkeleyDB`, `NDB`).
     fn read_rpm_via_query() -> Result<Vec<InstalledPackage>> {
         let output = crate::core::privilege::system_command("rpm")?
+            // Match the system inventory used by the direct database reader.
+            .env("HOME", "/")
+            .env("LC_ALL", "C")
             .args([
                 "-qa",
                 "--queryformat",
-                "%{NAME}\t%{VERSION}\t%{RELEASE}\t%{SUMMARY}\t%{EPOCHNUM}\t%{ARCH}\n",
+                "%{NAME}\t%{VERSION}\t%{RELEASE}\t%{EPOCHNUM}\t%{ARCH}\t%{SUMMARY}\n",
             ])
             .output()
             .context("Failed to execute rpm -qa")?;
@@ -1076,7 +1076,8 @@ impl DnfPackageManager {
     }
 
     fn parse_rpm_qa_line(line: &str) -> Result<InstalledPackage> {
-        let fields: Vec<&str> = line.split('\t').collect();
+        // The free-form summary can contain tabs, so keep the final field intact.
+        let fields: Vec<&str> = line.splitn(6, '\t').collect();
         if fields.len() != 6 {
             anyhow::bail!(
                 "malformed rpm -qa output: expected 6 fields, got {}",
@@ -1084,17 +1085,17 @@ impl DnfPackageManager {
             );
         }
 
-        let epoch: u32 = fields[4].parse().context("Malformed RPM epoch")?;
+        let epoch: u32 = fields[3].parse().context("Malformed RPM epoch")?;
         let missing = |value: &str| value.is_empty() || value == "(none)";
         anyhow::ensure!(
             ![fields[0], fields[1], fields[2]].into_iter().any(missing),
             "Incomplete package identity in rpm -qa output"
         );
-        let architecture = if missing(fields[5]) {
+        let architecture = if missing(fields[4]) {
             anyhow::ensure!(fields[0] == "gpg-pubkey", "RPM architecture is missing");
             String::new()
         } else {
-            fields[5].to_owned()
+            fields[4].to_owned()
         };
         Ok(InstalledPackage {
             name: fields[0].to_string(),
@@ -1105,7 +1106,7 @@ impl DnfPackageManager {
             },
             release: fields[2].to_string(),
             architecture,
-            summary: fields[3].to_string(),
+            summary: fields[5].to_owned(),
         })
     }
 
@@ -2775,7 +2776,6 @@ impl DnfPackageManager {
     fn cache_handle(&self) -> Self {
         Self {
             rpm_db_path: self.rpm_db_path.clone(),
-            repos_dir: self.repos_dir.clone(),
             installed_cache: Arc::clone(&self.installed_cache),
         }
     }
@@ -5849,12 +5849,13 @@ mod tests {
     #[test]
     fn test_parse_rpm_qa_line_reads_installed_package() {
         let pkg = DnfPackageManager::parse_rpm_qa_line(
-            "bash\t5.2.15\t1.fc39\tThe GNU Bourne Again shell\t0\tx86_64",
+            "bash\t5.2.15\t1.fc39\t0\tx86_64\tThe GNU Bourne Again shell\twith completion",
         )
         .expect("valid rpm -qa line");
         assert_eq!(pkg.name, "bash");
         assert_eq!(pkg.version, "5.2.15");
         assert_eq!(pkg.architecture, "x86_64");
+        assert_eq!(pkg.summary, "The GNU Bourne Again shell\twith completion");
     }
 
     #[test]
@@ -5876,8 +5877,8 @@ mod tests {
 
     #[test]
     fn rpm_query_rejects_incomplete_installed_identity() {
-        let complete = ["bash", "5.2.15", "1.fc39", "GNU shell", "0", "x86_64"];
-        for field in [0, 1, 2, 5] {
+        let complete = ["bash", "5.2.15", "1.fc39", "0", "x86_64", "GNU shell"];
+        for field in [0, 1, 2, 4] {
             for missing in ["", "(none)"] {
                 let mut fields = complete;
                 fields[field] = missing;
@@ -5916,7 +5917,7 @@ mod tests {
         ]);
         let stored_key = DnfPackageManager::parse_package_from_blob(&header)?;
         let queried_key = DnfPackageManager::parse_rpm_qa_line(
-            "gpg-pubkey\t3b94a80e\t6665a2fc\tOpenPGP key\t0\t(none)",
+            "gpg-pubkey\t3b94a80e\t6665a2fc\t0\t(none)\tOpenPGP key",
         )?;
         for key in [stored_key, queried_key] {
             assert_eq!(key.identity(), "gpg-pubkey");
@@ -6076,6 +6077,6 @@ mod tests {
 #[test]
 fn ordinary_rpm_inventory_preserves_epoch() {
     let package =
-        DnfPackageManager::parse_rpm_qa_line("example\t1.0\t1.fc44\tsummary\t2\tx86_64").unwrap();
+        DnfPackageManager::parse_rpm_qa_line("example\t1.0\t1.fc44\t2\tx86_64\tsummary").unwrap();
     assert_eq!(package.version, "2:1.0");
 }
