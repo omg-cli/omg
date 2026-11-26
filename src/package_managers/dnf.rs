@@ -443,7 +443,6 @@ enum DnfAdmission<'a> {
         packages: &'a [String],
         comment: Option<&'a str>,
         yes: bool,
-        dry_run: bool,
         output: OutputMode,
     },
 }
@@ -766,10 +765,12 @@ impl DnfPackageManager {
     }
 
     async fn simulate_removal(packages: &[String]) -> Result<Vec<super::types::RemovalPackage>> {
-        Ok(Self::prepare_removal(packages).await?.packages)
+        Ok(Self::prepare_removal(packages)
+            .await?
+            .map_or_else(Vec::new, |plan| plan.packages))
     }
 
-    pub(crate) async fn prepare_removal(packages: &[String]) -> Result<PreparedDnfRemoval> {
+    pub(crate) async fn prepare_removal(packages: &[String]) -> Result<Option<PreparedDnfRemoval>> {
         Self::validate_package_selectors(packages)?;
         let directory = Self::removal_preview_directory()?;
         let mut command =
@@ -784,15 +785,18 @@ impl DnfPackageManager {
                 format!("--store={}", directory.path().display()),
             ])
             .args(packages);
-        let (directory, bytes) =
+        let Some((directory, bytes)) =
             Self::owned_stored_transaction(command, directory, std::time::Duration::from_mins(1))
                 .await
-                .context("Could not simulate removal with DNF5 --store")?;
+                .context("Could not simulate removal with DNF5 --store")?
+        else {
+            return Ok(None);
+        };
         let packages = Self::parse_removal_plan(&bytes)?;
-        Ok(PreparedDnfRemoval {
+        Ok(Some(PreparedDnfRemoval {
             directory,
             packages,
-        })
+        }))
     }
 
     pub(crate) async fn replay_removal(
@@ -830,18 +834,8 @@ impl DnfPackageManager {
             .await
     }
 
-    pub(crate) async fn remove_with_elevation(
-        packages: &[String],
-        yes: bool,
-        dry_run: bool,
-    ) -> Result<()> {
-        let mode = if dry_run {
-            "--dry-run"
-        } else if yes {
-            "-y"
-        } else {
-            "--confirm"
-        };
+    pub(crate) async fn remove_with_elevation(packages: &[String], yes: bool) -> Result<()> {
+        let mode = if yes { "-y" } else { "--confirm" };
         let output = match crate::cli::modern_ui::output_mode() {
             OutputMode::Quiet => Some("--quiet"),
             OutputMode::Verbose => Some("--verbose"),
@@ -854,9 +848,6 @@ impl DnfPackageManager {
             args.extend_from_slice(packages);
             crate::core::privilege::run_privileged_dnf(&args).await
         };
-        if dry_run {
-            return operation(None).await;
-        }
         let history = crate::core::history::HistoryManager::new()?;
         Self::record_native_mutation(
             crate::core::history::TransactionType::Remove,
@@ -1920,15 +1911,16 @@ impl DnfPackageManager {
     }
 
     async fn owned_stored_transaction(
-        command: tokio::process::Command,
+        mut command: tokio::process::Command,
         directory: tempfile::TempDir,
         deadline: std::time::Duration,
-    ) -> Result<(tempfile::TempDir, Vec<u8>)> {
+    ) -> Result<Option<(tempfile::TempDir, Vec<u8>)>> {
         let (cancel, cancelled) = tokio::sync::oneshot::channel();
         let _cancel_on_drop = CancelStoredQuery(Some(cancel));
+        command.env("LC_ALL", "C");
         tokio::task::spawn_blocking(move || -> Result<_> {
             use std::io::Read;
-            tokio::runtime::Builder::new_current_thread()
+            let output = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()?
                 .block_on(Self::controlled_query_output(
@@ -1937,19 +1929,31 @@ impl DnfPackageManager {
                     deadline,
                     Some(cancelled),
                 ))?;
-            let file = std::fs::File::open(directory.path().join("transaction.json"))
-                .context("DNF5 did not store a transaction")?;
+            let path = directory.path().join("transaction.json");
+            let metadata = match path.symlink_metadata() {
+                // DNF returns before storing a manifest when the solver's
+                // transaction is empty. Other missing manifests are errors.
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::NotFound
+                        && output.trim_ascii() == b"Nothing to do." =>
+                {
+                    return Ok(None);
+                }
+                result => result.context("DNF5 did not store a transaction")?,
+            };
             anyhow::ensure!(
-                file.metadata()?.is_file(),
+                metadata.is_file(),
                 "DNF stored transaction is not a regular file"
             );
+            let file =
+                std::fs::File::open(path).context("Cannot read the stored DNF transaction")?;
             let mut bytes = Vec::new();
             file.take(64 * 1024 * 1024 + 1).read_to_end(&mut bytes)?;
             anyhow::ensure!(
                 bytes.len() <= 64 * 1024 * 1024,
                 "DNF stored transaction exceeds 64 MiB"
             );
-            Ok((directory, bytes))
+            Ok(Some((directory, bytes)))
         })
         .await
         .context("DNF stored transaction owner failed")?
@@ -2394,10 +2398,9 @@ impl DnfPackageManager {
                 _ => (OutputMode::Plain, packages),
             };
             anyhow::ensure!(!packages.is_empty(), "Remove requires package operands");
-            let (yes, dry_run) = match mode.as_str() {
-                "-y" => (true, false),
-                "--confirm" => (false, false),
-                "--dry-run" if correlation.is_none() => (false, true),
+            let yes = match mode.as_str() {
+                "-y" => true,
+                "--confirm" => false,
                 _ => anyhow::bail!("Unsupported DNF removal mode"),
             };
             Self::validate_package_selectors(packages)?;
@@ -2405,7 +2408,6 @@ impl DnfPackageManager {
                 packages,
                 comment: correlation,
                 yes,
-                dry_run,
                 output,
             });
         }
@@ -2439,15 +2441,13 @@ impl DnfPackageManager {
                 packages,
                 comment,
                 yes,
-                dry_run,
                 output,
             } => {
                 crate::cli::modern_ui::configure_output(
                     u8::from(output == OutputMode::Verbose),
                     output == OutputMode::Quiet,
                 );
-                let Some(plan) =
-                    crate::cli::packages::review_fedora_removal(packages, yes, dry_run).await?
+                let Some(plan) = crate::cli::packages::review_fedora_removal(packages, yes).await?
                 else {
                     return Ok(());
                 };
@@ -2479,10 +2479,14 @@ impl DnfPackageManager {
         command
             .args(args)
             .arg(format!("--store={}", directory.path().display()));
-        let (directory, bytes) =
+        let Some((directory, bytes)) =
             Self::owned_stored_transaction(command, directory, std::time::Duration::from_mins(30))
                 .await
-                .context("Could not prepare a stored DNF5 installation transaction")?;
+                .context("Could not prepare a stored DNF5 installation transaction")?
+        else {
+            crate::cli::modern_ui::print_info("DNF reported no package changes");
+            return Ok(());
+        };
         let inventory = Self::proposed_inventory(&bytes)?;
         if inventory.is_empty() {
             return Ok(());
@@ -2895,24 +2899,47 @@ impl DnfPackageManager {
     }
 
     pub(crate) async fn preview_orphan_cleanup() -> Result<(String, String)> {
+        Self::preview_declined_transaction(["--cacheonly", "autoremove"]).await
+    }
+
+    pub(crate) async fn preview_cached_upgrade() -> Result<(String, String)> {
+        Self::preview_declined_transaction(["--cacheonly", "upgrade"]).await
+    }
+
+    pub(crate) async fn preview_removal(packages: &[String]) -> Result<(String, String)> {
+        Self::validate_package_selectors(packages)?;
+        Self::preview_declined_transaction(
+            ["--cacheonly", "remove"]
+                .into_iter()
+                .chain(packages.iter().map(String::as_str)),
+        )
+        .await
+    }
+
+    pub(crate) async fn preview_install(packages: &[String]) -> Result<(String, String)> {
+        Self::validate_install_selectors(packages)?;
+        Self::preview_declined_transaction(
+            std::iter::once("install").chain(packages.iter().map(String::as_str)),
+        )
+        .await
+    }
+
+    async fn preview_declined_transaction<'a>(
+        args: impl IntoIterator<Item = &'a str>,
+    ) -> Result<(String, String)> {
         let mut command =
             tokio::process::Command::from(crate::core::privilege::system_command("dnf")?);
         command
             .env("LC_ALL", "C")
             .stderr(std::process::Stdio::piped())
-            .args([
-                "--cacheonly",
-                "--color=never",
-                "--setopt=assumeyes=false",
-                "--assumeno",
-                "autoremove",
-            ]);
+            .args(["--color=never", "--setopt=assumeyes=false", "--assumeno"])
+            .args(args);
         let output =
             Self::capture_query("DNF", command, std::time::Duration::from_mins(1), None).await?;
-        Self::orphan_cleanup_preview_output(&output)
+        Self::transaction_preview_output(&output)
     }
 
-    fn orphan_cleanup_preview_output(output: &std::process::Output) -> Result<(String, String)> {
+    fn transaction_preview_output(output: &std::process::Output) -> Result<(String, String)> {
         let plan = String::from_utf8_lossy(&output.stdout);
         let diagnostics = String::from_utf8_lossy(&output.stderr);
         // DNF5 exits 1 after displaying a nonempty plan that --assumeno declined.
@@ -2924,6 +2951,15 @@ impl DnfPackageManager {
             && (prefix.is_empty() || prefix.ends_with('\n'))
         {
             return Ok((plan.into_owned(), prefix.trim_end().to_owned()));
+        }
+        if !output.status.success() && !diagnostics.trim().is_empty() {
+            let diagnostics = diagnostics
+                .trim()
+                .lines()
+                .map(crate::cli::style::sanitize_terminal_text)
+                .collect::<Vec<_>>()
+                .join("\n");
+            anyhow::bail!("DNF query failed ({})\n{diagnostics}", output.status);
         }
         Self::require_query_success("DNF", output)?;
         Ok((plan.into_owned(), diagnostics.into_owned()))
@@ -3501,8 +3537,6 @@ mod tests {
         for values in [
             vec!["install", "-y", "example"],
             vec!["install", "-y", "example-2:1.0~rc1-1.fc44.x86_64"],
-            vec!["remove", "--dry-run", "example"],
-            vec!["remove", "--dry-run", "--quiet", "example"],
             vec!["remove", "--confirm", "example"],
             vec!["remove", "--confirm", "--verbose", "example"],
             vec!["remove", "-y", "example"],
@@ -3535,6 +3569,8 @@ mod tests {
             vec!["remove", "-y", "--quiet"],
             vec!["remove", "-y", "--quiet", "--verbose", "example"],
             vec!["remove", "--confirm", "/tmp/caller-plan"],
+            vec!["remove", "--dry-run", "example"],
+            vec!["remove", "--dry-run", "--quiet", "example"],
             vec!["remove", "--dry-run", "--installroot=/tmp/root"],
             vec!["--setopt=cacheonly=metadata", "remove", "-y", "example"],
             vec![
@@ -5223,7 +5259,7 @@ mod tests {
             stdout: stdout.as_bytes().to_vec(),
             stderr: stderr.as_bytes().to_vec(),
         };
-        let preview = DnfPackageManager::orphan_cleanup_preview_output;
+        let preview = DnfPackageManager::transaction_preview_output;
         let protected = "Unneeded protected package: leaf-0:1-1.noarch";
         assert_eq!(
             preview(&output(0, "Nothing to do.\n", protected))?,
@@ -5246,6 +5282,15 @@ mod tests {
         ] {
             assert!(preview(&failure).is_err());
         }
+        let failure = preview(&output(
+            1,
+            "",
+            "Failed to resolve the transaction\nNo match for argument: package\n  --skip-unavailable to skip unavailable packages\n",
+        ))
+        .expect_err("an unresolved request must fail the preview")
+        .to_string();
+        assert!(failure.contains("No match for argument: package"));
+        assert!(failure.contains("--skip-unavailable"));
         Ok(())
     }
 
@@ -5321,6 +5366,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stored_query_accepts_a_missing_manifest_only_for_native_noop() -> Result<()> {
+        for (script, no_changes) in [
+            ("printf 'Nothing to do.\\n'", true),
+            ("printf 'Preparing transaction\\n'", false),
+            ("printf 'Nothing to do.\\n'; exit 1", false),
+            (
+                "mkdir \"$1/transaction.json\"; printf 'Nothing to do.\\n'",
+                false,
+            ),
+        ] {
+            let directory = tempfile::tempdir()?;
+            let path = directory.path().to_owned();
+            let mut command = tokio::process::Command::new("/bin/sh");
+            command.args(["-c", script, "--"]).arg(&path);
+            let result = DnfPackageManager::owned_stored_transaction(
+                command,
+                directory,
+                std::time::Duration::from_secs(5),
+            )
+            .await;
+            if no_changes {
+                assert!(result?.is_none());
+            } else {
+                assert!(result.is_err(), "{script}");
+            }
+            assert!(!path.exists(), "{script}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn stored_query_returns_owned_namespace_and_exact_manifest_after_child_exit() -> Result<()>
     {
         let directory = tempfile::tempdir()?;
@@ -5338,7 +5414,8 @@ mod tests {
             directory,
             std::time::Duration::from_secs(5),
         )
-        .await?;
+        .await?
+        .context("expected a stored transaction")?;
         assert_eq!(bytes, b"stored bytes");
         assert!(path.is_dir());
         drop(directory);

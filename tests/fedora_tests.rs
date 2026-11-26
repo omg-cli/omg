@@ -409,7 +409,14 @@ mod dnf_integration {
     }
 
     fn uninstalled_repository_package() -> Result<&'static str> {
-        for candidate in ["tree", "htop", "nano", "rsync", "jq"] {
+        for candidate in [
+            "omg-observer-fixture",
+            "tree",
+            "htop",
+            "nano",
+            "rsync",
+            "jq",
+        ] {
             let installed = std::process::Command::new("rpm")
                 .args(["-q", candidate])
                 .output()?;
@@ -612,11 +619,16 @@ mod dnf_integration {
             String::from_utf8_lossy(&output.stderr)
         );
         let stdout = std::str::from_utf8(&output.stdout)?;
+        let stderr = std::str::from_utf8(&output.stderr)?;
+        let (package, arch) = name.rsplit_once('.').context("Native bash architecture")?;
         assert!(
-            stdout.contains(&name) && stdout.contains(&version),
-            "{stdout}"
+            stderr.contains(&format!(
+                "Package \"{package}-{version}.{arch}\" is already installed."
+            )),
+            "{stderr}"
         );
-        assert!(stdout.contains("No changes will be made"), "{stdout}");
+        assert!(stdout.contains("Nothing to do."), "{stdout}");
+        assert!(stdout.contains("No changes made (dry run)"), "{stdout}");
         assert_eq!(installed_bash_full_nevra()?, (selector, name, version));
         Ok(())
     }
@@ -1425,20 +1437,62 @@ mod dnf_integration {
             .prefix("omg-fedora-transaction-")
             .tempdir_in("/tmp")?;
         let history = HistoryManager::new_in(fixture.path().join("history.json"))?;
-        let run = |arguments: &[&str]| {
-            std::process::Command::new(assert_cmd::cargo::cargo_bin!("omg"))
+        let binary = assert_cmd::cargo::cargo_bin!("omg");
+        let prepare = |command: &mut std::process::Command| {
+            command
                 .env("OMG_NATIVE_TEST_DATA_DIR", "1")
                 .env("OMG_DATA_DIR", fixture.path())
                 .env("NO_COLOR", "1")
-                .stdin(std::process::Stdio::null())
-                .args(arguments)
-                .output()
+                .stdin(std::process::Stdio::null());
+        };
+        let run = |arguments: &[&str]| {
+            let mut command = std::process::Command::new(binary);
+            prepare(&mut command);
+            command.args(arguments).output()
         };
         let verified = (|| -> Result<()> {
-            let install = run(&["install", package, "--yes"])?;
+            let native_preview = std::process::Command::new("dnf")
+                .env("LC_ALL", "C")
+                .args([
+                    "--color=never",
+                    "--setopt=assumeyes=false",
+                    "--assumeno",
+                    "install",
+                    package,
+                ])
+                .output()?;
+            assert_eq!(native_preview.status.code(), Some(1));
+            let native_plan = std::str::from_utf8(&native_preview.stdout)?.trim_end();
+            assert!(native_plan.contains("Transaction Summary:"));
+            let preview = run(&["install", package, "--dry-run", "--yes"])?;
+            assert!(
+                preview.status.success(),
+                "{}",
+                String::from_utf8_lossy(&preview.stderr)
+            );
+            let stdout = std::str::from_utf8(&preview.stdout)?;
+            assert!(stdout.contains(native_plan), "{stdout}");
+            assert!(stdout.contains("No changes made (dry run)"), "{stdout}");
+            assert_eq!(snapshot()?, before);
+            assert!(history.load()?.is_empty());
+
+            let mut attended = std::process::Command::new("python3");
+            prepare(&mut attended);
+            let install = attended
+                .arg(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/scripts/attend-unknown-fixture.py"
+                ))
+                .arg("--receipt")
+                .arg(fixture.path().join("install-review.json"))
+                .arg("--")
+                .arg(binary)
+                .args(["install", package, "--yes"])
+                .output()?;
             anyhow::ensure!(
                 install.status.success(),
-                "Install failed: {}",
+                "Attended install failed: {}\n{}",
+                String::from_utf8_lossy(&install.stdout),
                 String::from_utf8_lossy(&install.stderr)
             );
             let records = history.load()?;
@@ -1466,7 +1520,15 @@ mod dnf_integration {
                 "Recorded version differs from RPM"
             );
             let noop = run(&["install", package, "--yes"])?;
-            anyhow::ensure!(noop.status.success(), "No-op install failed");
+            anyhow::ensure!(
+                noop.status.success(),
+                "No-op install failed: {}",
+                String::from_utf8_lossy(&noop.stderr)
+            );
+            anyhow::ensure!(
+                String::from_utf8(noop.stdout)?.contains("Install request complete"),
+                "No-op install did not report the request outcome"
+            );
             anyhow::ensure!(history.load()?.len() == 1, "No-op invented a transaction");
             let blame = run(&["blame", package])?;
             anyhow::ensure!(
@@ -1474,6 +1536,19 @@ mod dnf_integration {
                     && String::from_utf8(blame.stdout)?.contains("OMG Transaction History (1)"),
                 "blame did not find real installation history"
             );
+            let installed = snapshot()?;
+            let removal_preview = run(&["remove", package, "--dry-run", "--yes"])?;
+            assert!(
+                removal_preview.status.success(),
+                "{}",
+                String::from_utf8_lossy(&removal_preview.stderr)
+            );
+            let plan = std::str::from_utf8(&removal_preview.stdout)?;
+            assert!(plan.contains("Removing:\n"), "{plan}");
+            assert!(plan.contains("Transaction Summary:"), "{plan}");
+            assert!(plan.contains("No changes made (dry run)"), "{plan}");
+            assert_eq!(snapshot()?, installed);
+            assert_eq!(history.load()?.len(), 1);
             Ok(())
         })();
         let present = std::process::Command::new("rpm")
@@ -1852,6 +1927,40 @@ mod dnf_integration {
             .collect::<Result<Vec<_>>>()?;
         cli.sort();
         assert_eq!(cli, expected, "CLI outdated JSON differs from native DNF");
+
+        let native_preview = std::process::Command::new("dnf")
+            .env("LC_ALL", "C")
+            .args([
+                "--cacheonly",
+                "--color=never",
+                "--setopt=assumeyes=false",
+                "--assumeno",
+                "upgrade",
+            ])
+            .output()?;
+        let native_plan = std::str::from_utf8(&native_preview.stdout)?.trim_end();
+        let diagnostics = std::str::from_utf8(&native_preview.stderr)?;
+        anyhow::ensure!(
+            native_preview.status.success()
+                || native_preview.status.code() == Some(1)
+                    && diagnostics
+                        .trim_end()
+                        .ends_with("Operation aborted by the user."),
+            "native DNF upgrade preview failed: {diagnostics}"
+        );
+        anyhow::ensure!(!native_plan.is_empty(), "native DNF upgrade plan is empty");
+        let preview = std::process::Command::new(assert_cmd::cargo::cargo_bin!("omg"))
+            .args(["update", "--dry-run", "--yes"])
+            .env("NO_COLOR", "1")
+            .output()?;
+        assert!(
+            preview.status.success(),
+            "{}",
+            String::from_utf8_lossy(&preview.stderr)
+        );
+        let stdout = std::str::from_utf8(&preview.stdout)?;
+        assert!(stdout.contains(native_plan), "{stdout}");
+        assert!(stdout.contains("No changes made (dry run)"), "{stdout}");
         Ok(())
     }
 

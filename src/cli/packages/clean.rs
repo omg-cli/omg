@@ -420,12 +420,7 @@ async fn handle_fedora_clean(
     if orphans || all {
         if dry_run {
             let (plan, diagnostics) = DnfPackageManager::preview_orphan_cleanup().await?;
-            for line in plan.lines() {
-                println!("{}", style::sanitize_terminal_text(line));
-            }
-            for line in diagnostics.lines() {
-                eprintln!("{}", style::sanitize_terminal_text(line));
-            }
+            super::common::print_dnf_preview(&plan, &diagnostics);
         } else {
             let history = crate::core::history::HistoryManager::new()?;
             manager

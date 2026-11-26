@@ -7,6 +7,15 @@ use super::enforce_install_policy;
 
 pub async fn install(packages: &[String]) -> Result<()> {
     let pm = get_package_manager()?;
+    let summary = "Installed";
+    #[cfg(feature = "fedora")]
+    let summary = if crate::package_managers::resolve_backend()?
+        == crate::package_managers::Backend::Fedora
+    {
+        "Install request complete for"
+    } else {
+        summary
+    };
     let policy =
         crate::core::security::SecurityPolicy::load_default().map_err(anyhow::Error::from)?;
     let vulnerability_scanner = crate::core::security::vulnerability::VulnerabilityScanner::new();
@@ -53,7 +62,7 @@ pub async fn install(packages: &[String]) -> Result<()> {
 
     modern_ui::print_success_with_packages(
         &format!(
-            "Installed {} {}",
+            "{summary} {} {}",
             packages.len(),
             if packages.len() == 1 {
                 "package"
@@ -71,13 +80,6 @@ async fn preview_packages(
     pm: &dyn crate::package_managers::PackageManager,
     packages: &[String],
 ) -> Result<Vec<crate::core::Package>> {
-    #[cfg(feature = "fedora")]
-    if pm.name() == "dnf" {
-        crate::package_managers::DnfPackageManager::validate_install_selectors(packages)?;
-    } else {
-        crate::core::security::validate_package_names(packages)?;
-    }
-    #[cfg(not(feature = "fedora"))]
     crate::core::security::validate_package_names(packages)?;
     let mut preview = Vec::with_capacity(packages.len());
     for package in packages {

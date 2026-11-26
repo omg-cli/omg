@@ -44,6 +44,18 @@ pub async fn update(
         // lane is disabled, and development-mode elevation fails closed.
         return arch::update(check_only, yes, dry_run, no_sync, aur_only).await;
     }
+    #[cfg(feature = "fedora")]
+    if dry_run
+        && crate::package_managers::resolve_backend()? == crate::package_managers::Backend::Fedora
+    {
+        anyhow::ensure!(!aur_only, "--aur-only is supported only on Arch Linux");
+        let (plan, diagnostics) =
+            crate::package_managers::DnfPackageManager::preview_cached_upgrade().await?;
+        crate::cli::modern_ui::print_phase_header("🔄", "Update", "Dry run · cached");
+        super::common::print_dnf_preview(&plan, &diagnostics);
+        crate::cli::ui::print_dry_run_footer();
+        return Ok(());
+    }
     dispatch_backend! {
         debian: {
             if aur_only { anyhow::bail!("--aur-only is supported only on Arch Linux"); }
