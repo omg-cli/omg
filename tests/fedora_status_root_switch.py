@@ -1979,6 +1979,178 @@ if [ "$OMG_FIXTURE_TASK_FAIL" = {manager} ]; then exit 17; fi
             composer.write_text(composer_source)
             run("restored-config", ("build",), inspect=lambda: records("make|1|build"))
 
+    def inspect_task_watch():
+        phase = "task-watch"
+        with tempfile.TemporaryDirectory(prefix="task-watch-", dir=work) as directory:
+            here = Path(directory)
+            here.chmod(0o755)
+            bin_dir = here / "bin"
+            bin_dir.mkdir()
+            stub = bin_dir / "fixture-watch"
+            stub.write_text("""#!/bin/sh
+printf 'watch fixture started\\n'
+if [ -n "$OMG_WATCH_INITIAL_GATE" ] && [ ! -e "$OMG_WATCH_INITIAL_ONCE" ]; then
+    touch "$OMG_WATCH_INITIAL_ONCE"
+    while [ ! -e "$OMG_WATCH_INITIAL_GATE" ]; do sleep 0.025; done
+fi
+if [ -n "$OMG_WATCH_FAIL_ONCE" ] && [ ! -e "$OMG_WATCH_FAIL_ONCE" ]; then
+    touch "$OMG_WATCH_FAIL_ONCE"
+    exit 17
+fi
+printf 'watch fixture completed\\n'
+""")
+            stub.chmod(0o755)
+
+            def change(path):
+                path.write_text("changed\n")
+
+            def run(label, action, *, parent=None, scope="src", generated=None, expected=2,
+                    initial_gate=False, fail_first=False, expected_while_editing=False):
+                case = here / label
+                case.mkdir()
+                os.chown(case, account.pw_uid, account.pw_gid)
+                project = case / parent / "project" if parent else case / "project"
+                project.mkdir(parents=True)
+                os.chown(project, account.pw_uid, account.pw_gid)
+                source = project / "src" if scope == "src" else project
+                source.mkdir(exist_ok=True)
+                if scope == "src-file":
+                    (project / "src").write_text("ordinary file\n")
+                item = source / "source.txt"
+                item.write_text("original\n")
+                (project / "notes.txt").write_text("notes\n")
+                if generated:
+                    subtree = source / generated
+                    subtree.mkdir()
+                    (subtree / "artifact").write_text("generated\n")
+
+                output = case / "output"
+                gate = case / "initial-gate"
+                launch = dict(disabled, HOME=str(case), PATH=f"{bin_dir}:{base_env['PATH']}",
+                              XDG_DATA_HOME=str(case/"data"), XDG_CONFIG_HOME=str(case/"config"),
+                              XDG_CACHE_HOME=str(case/"cache"), XDG_STATE_HOME=str(case/"state"))
+                if initial_gate:
+                    launch.update(OMG_WATCH_INITIAL_GATE=str(gate),
+                                  OMG_WATCH_INITIAL_ONCE=str(case/"gate-once"))
+                if fail_first:
+                    launch["OMG_WATCH_FAIL_ONCE"] = str(case/"fail-once")
+
+                with output.open("wb") as sink:
+                    process = subprocess.Popen([cli, "run", "fixture-watch", "--watch"], cwd=project,
+                                               stdin=subprocess.DEVNULL, stdout=sink, stderr=sink,
+                                               env=launch, start_new_session=True, **ordinary)
+                try:
+                    def await_condition(condition, limit=3):
+                        deadline = time.monotonic() + limit
+                        while process.poll() is None and time.monotonic() < deadline:
+                            if condition(output.read_bytes()):
+                                return True
+                            time.sleep(0.02)
+                        return False
+
+                    ready = b"watch fixture started" if initial_gate else b"Watching for changes"
+                    assert await_condition(lambda log: ready in log), "watch did not start"
+                    if not initial_gate:
+                        marker = b"Task failed" if fail_first else b"watch fixture completed"
+                        assert await_condition(lambda log: marker in log), "initial result missing"
+                    overlap = action(project, source, item, output)
+                    if initial_gate:
+                        gate.touch()
+                    if expected_while_editing:
+                        assert overlap, "no rerun while writes continued"
+                        assert await_condition(lambda log: log.count(b"watch fixture completed") >= expected)
+                    elif expected > 1 or fail_first:
+                        assert await_condition(lambda log: log.count(b"watch fixture completed") >= expected), \
+                            "expected rerun did not finish"
+
+                    time.sleep(0.52)
+                    found = output.read_bytes().count(b"watch fixture completed")
+                    if expected_while_editing:
+                        assert expected <= found <= expected + 2, f"unexpected execution count {found}"
+                    else:
+                        assert found == expected, f"expected {expected} executions, observed {found}"
+                    assert process.poll() is None, "watch terminated early"
+                    checks.append(dict(phase=phase, case=label, passed=True, status=None,
+                                       diagnostic=f"{found} completed executions"))
+                except AssertionError as error:
+                    data = output.read_bytes().decode(errors="replace")
+                    checks.append(dict(phase=phase, case=label, passed=False, status=process.poll(),
+                                       diagnostic=f"{error}\n{data[-1100:]}"))
+                finally:
+                    try:
+                        os.killpg(process.pid, signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
+                    process.wait(timeout=6)
+
+            def append(path):
+                with path.open("a") as stream:
+                    stream.write("appended\n")
+
+            def replace_atomically(path):
+                temporary = path.with_suffix(".next-save")
+                temporary.write_text("updated\n")
+                temporary.replace(path)
+
+            def add_nested_file(source, output):
+                nested = source / "new-directory"
+                nested.mkdir()
+                deadline = time.monotonic() + 3
+                while time.monotonic() < deadline:
+                    if output.read_bytes().count(b"watch fixture completed") >= 2:
+                        change(nested / "new-source")
+                        return
+                    time.sleep(0.02)
+                raise AssertionError("new directory did not trigger first rerun")
+
+            def sustained_writes(path, output):
+                before = time.monotonic()
+                triggered_during_writes = False
+                for index in range(42):
+                    path.write_text(f"{index}\n")
+                    if time.monotonic() - before >= 0.3:
+                        triggered_during_writes |= output.read_bytes().count(b"watch fixture completed") >= 2
+                    time.sleep(0.045)
+                return triggered_during_writes
+
+            def open_for_write_without_changes(path):
+                os.close(os.open(path, os.O_WRONLY))
+
+            def burst(path):
+                for index in range(14):
+                    path.write_text(f"{index}\n")
+
+            run("ordinary-edit", lambda p, s, f, o: change(f))
+            run("append", lambda p, s, f, o: append(f))
+            run("create", lambda p, s, f, o: change(s / "new.txt"))
+            run("delete", lambda p, s, f, o: f.unlink())
+            run("rename", lambda p, s, f, o: f.rename(s / "renamed.txt"))
+            run("permission-change", lambda p, s, f, o: f.chmod(0o600))
+            run("atomic-replace", lambda p, s, f, o: replace_atomically(f))
+            run("new-nested-folder-and-file", lambda p, s, f, o: add_nested_file(s, o), expected=3)
+            run("root-fallback", lambda p, s, f, o: change(f), scope="root")
+            run("regular-src-file-keeps-root-fallback", lambda p, s, f, o: change(p / "notes.txt"), scope="src-file")
+            for parent in ("build", "target", "node_modules"):
+                run(f"project-below-{parent}", lambda p, s, f, o: change(f), parent=parent)
+            run("read-file", lambda p, s, f, o: f.read_bytes(), expected=1)
+            run("read-directory", lambda p, s, f, o: list(s.iterdir()), expected=1)
+            run("open-write-without-change", lambda p, s, f, o: open_for_write_without_changes(f), expected=1)
+            for subtree in ("target", "node_modules", ".git", "dist", "build", "out", ".next", "coverage", "__pycache__"):
+                run(f"ignore-root-{subtree}", lambda p, s, f, o: change(s / subtree / "artifact"),
+                    scope="root", generated=subtree, expected=1)
+            run("ignore-nested-generated", lambda p, s, f, o: change(s / "target" / "artifact"),
+                generated="target", expected=1)
+            run("move-source-into-generated", lambda p, s, f, o: f.rename(s / "target" / "renamed"),
+                generated="target")
+            run("move-generated-into-source", lambda p, s, f, o: (s / "target" / "artifact").rename(s / "restored"),
+                generated="target")
+            run("conventional-directory-scope", lambda p, s, f, o: change(p / "notes.txt"), expected=1)
+            run("edit-during-first-execution", lambda p, s, f, o: change(f), initial_gate=True)
+            run("recover-after-first-execution-fails", lambda p, s, f, o: change(f), fail_first=True, expected=1)
+            run("sustained-writes", lambda p, s, f, o: sustained_writes(f, o), expected_while_editing=True)
+            run("short-burst-one-rerun", lambda p, s, f, o: burst(f))
+
+
     def inspect_environment_lockfiles():
         phase = "environment-lockfiles"
         with tempfile.TemporaryDirectory(prefix="environment-locks-", dir=work) as directory:
@@ -3682,6 +3854,7 @@ exec {shlex.quote(str(binary))} "$@"
                     inspect_workspace_lifecycle()
                     inspect_workspace_graph_and_diff()
                     inspect_task_selection()
+                    inspect_task_watch()
                 config.write_text(alternate_config)
                 refresh_fixture()
                 expected = ordinary_control([dnf, "--cacheonly", "repoquery",
@@ -3999,6 +4172,6 @@ assert inventory() == before
 report = dict(binaries=binaries, checks=checks, total=len(checks),
               passed=sum(entry["passed"] for entry in checks), host_unchanged=True)
 print(json.dumps(report))
-expected_checks = 303 if consent_oracle is None else 1320
+expected_checks = 303 if consent_oracle is None else 1353
 if report["passed"] != report["total"] or report["total"] != expected_checks:
     sys.exit(4)

@@ -92,7 +92,7 @@ The field selects the manager name. OMG does not pin or install the exact `@9.0.
 omg run test --watch
 ```
 
-Watch mode reruns a single task when watched files change. Stop it with Ctrl+C.
+Watch mode runs a task once and reruns it on changes under `src`, `lib`, `app`, `pages`, `components`, or `tests`. If none of those directories can be watched, it watches the project directory. It skips access events such as opening a file for reading and changes inside generated trees such as `target` and `node_modules`. Edits during a task run can trigger a follow-up run. Stop watch mode with Ctrl+C.
 
 ```bash
 omg run build,test --parallel

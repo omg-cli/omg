@@ -1637,7 +1637,7 @@ fn is_ignored_watch_path(path: &Path) -> bool {
 /// Synchronous and blocking by design: the process lives in the watch loop.
 pub fn run_task_watch(task_name: &str, extra_args: &[String]) -> Result<()> {
     use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
-    use std::sync::mpsc::channel;
+    use std::sync::mpsc::sync_channel;
     use std::time::Duration;
 
     validate_task_name(task_name)?;
@@ -1648,41 +1648,32 @@ pub fn run_task_watch(task_name: &str, extra_args: &[String]) -> Result<()> {
         style::package(task_name)
     );
 
-    // Initial run; surface failures in watch mode instead of discarding them.
-    if let Err(error) = run_task(task_name, extra_args) {
-        eprintln!("{} Task failed: {error}", style::caution("!"));
-    }
-
-    // Set up file watcher. Events under build-artifact/VCS directories are
-    // dropped: without this filter, watching a project root turns `target/`
-    // writes from the triggered task itself into an event storm and a
-    // self-sustaining rebuild loop.
-    let (tx, rx) = channel();
+    let current_dir = std::env::current_dir()?;
+    let watch_root = current_dir.clone();
+    // Multiple changes can share one pending rerun.
+    let (tx, rx) = sync_channel(1);
     let mut watcher = RecommendedWatcher::new(
-        move |res: std::result::Result<notify::Event, notify::Error>| {
-            if let Ok(event) = res {
-                // Mixed-path events (for example a rename from source into an
-                // output directory) still matter when any path is outside the
-                // ignored trees.
-                let ignored = !event.paths.is_empty()
-                    && event.paths.iter().all(|path| is_ignored_watch_path(path));
-                if !ignored {
-                    let _ = tx.send(event);
-                }
+        move |result: notify::Result<notify::Event>| {
+            if let Ok(event) = result
+                && !event.kind.is_access()
+                && (event.need_rescan()
+                    || event.paths.is_empty()
+                    || event.paths.iter().any(|path| {
+                        path.strip_prefix(&watch_root)
+                            .is_ok_and(|relative| !is_ignored_watch_path(relative))
+                    }))
+            {
+                let _ = tx.try_send(());
             }
         },
         Config::default().with_poll_interval(Duration::from_millis(500)),
     )?;
 
-    let current_dir = std::env::current_dir()?;
-
-    // Watch conventional source directories. Only when none exist do we fall
-    // back to the project root (with the noise filter above as protection).
     let watch_dirs = ["src", "lib", "app", "pages", "components", "tests"];
     let mut watched_any = false;
     for dir in watch_dirs {
         let path = current_dir.join(dir);
-        if !path.exists() {
+        if !path.is_dir() {
             continue;
         }
         match watcher.watch(&path, RecursiveMode::Recursive) {
@@ -1699,39 +1690,42 @@ pub fn run_task_watch(task_name: &str, extra_args: &[String]) -> Result<()> {
     if !watched_any {
         watcher
             .watch(&current_dir, RecursiveMode::Recursive)
-            .map_err(|error| {
-                anyhow::anyhow!("Failed to watch {}: {error}", current_dir.display())
-            })?;
+            .with_context(|| format!("Failed to watch {}", current_dir.display()))?;
+    }
+
+    // Register before starting so edits made during the first run queue a rerun.
+    if let Err(error) = run_task(task_name, extra_args) {
+        eprintln!("{} Task failed: {error}", style::caution("!"));
     }
 
     println!("  {} Watching for changes...\n", style::dim("→"));
 
-    process_watch_events(&rx, Duration::from_millis(300), || {
-        rerun_task_in_watch(task_name, extra_args);
-    });
+    process_watch_events(
+        &rx,
+        Duration::from_millis(300),
+        Duration::from_millis(1200),
+        || {
+            rerun_task_in_watch(task_name, extra_args);
+        },
+    );
     Ok(())
 }
 
-fn process_watch_events<T>(
-    receiver: &std::sync::mpsc::Receiver<T>,
+fn process_watch_events(
+    receiver: &std::sync::mpsc::Receiver<()>,
     debounce: std::time::Duration,
+    max_delay: std::time::Duration,
     mut rerun: impl FnMut(),
 ) {
     while receiver.recv().is_ok() {
-        // Wait for a quiet debounce window, resetting it for every new event.
-        // Events queued while the task runs become one subsequent batch rather
-        // than one rerun per stale event.
-        let disconnected = loop {
-            match receiver.recv_timeout(debounce) {
-                Ok(_) => {}
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break false,
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break true,
+        let deadline = std::time::Instant::now() + max_delay;
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() || receiver.recv_timeout(debounce.min(remaining)).is_err() {
+                break;
             }
-        };
-        rerun();
-        if disconnected {
-            break;
         }
+        rerun();
     }
 }
 
@@ -3033,16 +3027,21 @@ pathlib.Path({}).write_text(sys.prefix + '|' + omg_local_venv_probe.VALUE)
         let mut sender_during_run = Some(sender);
         let mut runs = 0;
 
-        process_watch_events(&receiver, std::time::Duration::from_millis(1), || {
-            runs += 1;
-            if runs == 1 {
-                let sender = sender_during_run.take().unwrap();
-                for _ in 0..8 {
-                    sender.send(()).unwrap();
+        process_watch_events(
+            &receiver,
+            std::time::Duration::from_millis(1),
+            std::time::Duration::from_secs(1),
+            || {
+                runs += 1;
+                if runs == 1 {
+                    let sender = sender_during_run.take().unwrap();
+                    for _ in 0..8 {
+                        sender.send(()).unwrap();
+                    }
+                    drop(sender);
                 }
-                drop(sender);
-            }
-        });
+            },
+        );
 
         assert_eq!(runs, 2, "events during one run require one follow-up run");
     }
@@ -3056,7 +3055,12 @@ pathlib.Path({}).write_text(sys.prefix + '|' + omg_local_venv_probe.VALUE)
         drop(sender);
         let mut runs = 0;
 
-        process_watch_events(&receiver, std::time::Duration::from_millis(1), || runs += 1);
+        process_watch_events(
+            &receiver,
+            std::time::Duration::from_millis(1),
+            std::time::Duration::from_secs(1),
+            || runs += 1,
+        );
 
         assert_eq!(runs, 1);
     }
