@@ -23,9 +23,7 @@ pub(crate) fn resolve_active_version_in(
     if let Some(version) = versions.get(&runtime) {
         return Ok(Some(version.clone()));
     }
-    if SUPPORTED_RUNTIMES.contains(&runtime.as_str())
-        || crate::runtimes::tool_registry::is_registry_tool(&runtime)
-    {
+    if is_managed_runtime(&runtime) {
         return Ok(match data_dir {
             Some(data_dir) => crate::runtimes::probe_version_in(&runtime, data_dir),
             None => crate::runtimes::probe_version(&runtime),
@@ -159,6 +157,21 @@ fn validate_requested_version(runtime: &str, version: &str) -> Result<()> {
     };
     crate::core::security::validate_runtime_version(version)?;
     Ok(())
+}
+
+fn is_managed_runtime(runtime: &str) -> bool {
+    SUPPORTED_RUNTIMES.contains(&runtime)
+        || crate::runtimes::tool_registry::is_registry_tool(runtime)
+}
+
+pub(crate) fn validate_restore_version(runtime: &str, version: &str) -> Result<()> {
+    crate::core::security::validate_package_name(runtime)?;
+    let runtime = canonical_runtime_name(runtime);
+    anyhow::ensure!(
+        is_managed_runtime(&runtime),
+        "Unsupported runtime '{runtime}'"
+    );
+    validate_requested_version(&runtime, version)
 }
 
 pub async fn use_version(runtime: &str, version: Option<&str>) -> Result<()> {
@@ -302,9 +315,7 @@ pub fn uninstall_version(runtime: &str, version: &str) -> Result<()> {
 /// Read the local inventory without initializing a downloader.
 fn native_version_info(runtime: &str) -> Option<(Result<Vec<String>>, Option<String>)> {
     let runtime = canonical_runtime_name(runtime);
-    (SUPPORTED_RUNTIMES.contains(&runtime.as_str())
-        || crate::runtimes::tool_registry::is_registry_tool(&runtime))
-    .then(|| crate::runtimes::installed_version_info(&runtime))
+    is_managed_runtime(&runtime).then(|| crate::runtimes::installed_version_info(&runtime))
 }
 
 fn print_installed_versions(installed: Vec<String>, current: Option<&str>) {

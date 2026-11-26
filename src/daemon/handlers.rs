@@ -10,9 +10,12 @@ use governor::{Quota, RateLimiter};
 
 use super::cache::PackageCache;
 use super::index::PackageIndex;
+#[cfg(feature = "fedora")]
+use super::protocol::StatusAdvisorySummary;
 use super::protocol::{
     DetailedPackageInfo, ExplicitResult, HealthStatus, PackageInfo, Request, RequestId, Response,
-    ResponseResult, SearchResult, StatusResult, UpdateEntry, WirePackageSource, error_codes,
+    ResponseResult, SearchResult, StatusMetadata, StatusResult, UpdateEntry, WirePackageSource,
+    error_codes,
 };
 use crate::core::metrics::GLOBAL_METRICS;
 use crate::core::security::{AuditEventType, AuditSeverity, audit_log_nonblocking};
@@ -459,6 +462,19 @@ impl DaemonState {
         }
     }
 
+    #[cfg(feature = "fedora")]
+    async fn observed_rpm_status_is_current(
+        &self,
+        status: &Arc<StatusResult>,
+        observation: Arc<dyn InstalledCatalogObservation>,
+    ) -> bool {
+        self.status_rpm_catalog_is_current(observation).await
+            && self
+                .cache
+                .get_status()
+                .is_some_and(|entry| Arc::ptr_eq(&entry, status))
+    }
+
     /// Rebuild the published index and reincarnate libalpm while owning refresh
     /// serialization through native work and index publication.
     async fn rebuild_production_index(
@@ -848,13 +864,30 @@ pub async fn handle_request(state: Arc<DaemonState>, request: Request) -> Respon
         };
     }
 
-    if let Request::Search { query, .. } | Request::Suggest { query, .. } = &request {
+    if let Request::Search { id, query, .. } | Request::Suggest { id, query, .. } = &request {
         if query.len() > MAX_QUERY_LENGTH {
             let message = match &request {
                 Request::Suggest { .. } => "Query too long".to_string(),
                 _ => format!("Query too long (max {MAX_QUERY_LENGTH} characters)"),
             };
             return validation_error(request.id(), message);
+        }
+        // These responses are independent of the installed and repository catalogs.
+        let empty_result = match &request {
+            Request::Search { .. } if query.is_empty() => {
+                GLOBAL_METRICS.inc_search_requests();
+                Some(ResponseResult::Search(SearchResult {
+                    packages: Vec::new(),
+                    total: 0,
+                }))
+            }
+            Request::Suggest { limit, .. } if query.is_empty() || *limit == Some(0) => {
+                Some(ResponseResult::Suggest(Vec::new()))
+            }
+            _ => None,
+        };
+        if let Some(result) = empty_result {
+            return Response::Success { id: *id, result };
         }
         if let Err(error) = state.heal_rpm_index_if_changed().await {
             return internal_error(
@@ -910,6 +943,7 @@ pub async fn handle_request(state: Arc<DaemonState>, request: Request) -> Respon
         }
         Request::Health { id } => handle_health(&state, id),
         Request::ListUpdates { id } => handle_list_updates(state, id).await,
+        Request::StatusMetadata { id } => handle_status_metadata(&state, id).await,
     }
 }
 
@@ -1462,11 +1496,9 @@ async fn handle_status(state: Arc<DaemonState>, id: RequestId) -> Response {
             #[cfg(feature = "fedora")]
             let res = if let Some((cached, observation)) = observed_status
                 && total == cached.total_packages
-                && state.status_rpm_catalog_is_current(observation).await
                 && state
-                    .cache
-                    .get_status()
-                    .is_some_and(|entry| Arc::ptr_eq(&entry, &cached))
+                    .observed_rpm_status_is_current(&cached, observation)
+                    .await
             {
                 StatusResult {
                     security_vulnerabilities: cached.security_vulnerabilities,
@@ -1484,6 +1516,48 @@ async fn handle_status(state: Arc<DaemonState>, id: RequestId) -> Response {
             }
         }
         Err(error) => internal_error(id, format!("Failed to get system status: {error}")),
+    }
+}
+
+#[cfg_attr(
+    not(feature = "fedora"),
+    allow(
+        clippy::unused_async,
+        reason = "RPM observation validation is asynchronous"
+    )
+)]
+async fn handle_status_metadata(state: &DaemonState, id: RequestId) -> Response {
+    GLOBAL_METRICS.inc_status_requests();
+    #[cfg(feature = "fedora")]
+    let rpm_advisories = if state.uses_rpm_catalog()
+        && let Some((cached, observation)) = state.cache.observed_status()
+        && let Some((findings, unknown_packages)) = cached.scanned_vulnerability_summary()
+        && state
+            .observed_rpm_status_is_current(&cached, observation)
+            .await
+    {
+        Some(StatusAdvisorySummary {
+            installed_packages: cached.total_packages,
+            findings,
+            unknown_packages,
+        })
+    } else {
+        None
+    };
+    #[cfg(not(feature = "fedora"))]
+    let rpm_advisories = None;
+
+    let runtime_versions = state
+        .runtime_versions
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    Response::Success {
+        id,
+        result: ResponseResult::StatusMetadata(StatusMetadata {
+            runtime_versions,
+            rpm_advisories,
+        }),
     }
 }
 
@@ -2219,6 +2293,15 @@ pub(super) mod tests {
     #[tokio::test]
     async fn fedora_status_drops_scope_when_inventory_changes() -> anyhow::Result<()> {
         let (_directory, state, _, revision, _, _) = mutable_fedora_catalog(true, None)?;
+        let metadata = |state: Arc<DaemonState>| async move {
+            match handle_request(state, Request::StatusMetadata { id: 3 }).await {
+                Response::Success {
+                    id: 3,
+                    result: ResponseResult::StatusMetadata(metadata),
+                } => Ok(metadata),
+                other => anyhow::bail!("Unexpected status metadata response: {other:?}"),
+            }
+        };
         state
             .package_manager
             .install(&["retired-tool.x86_64".to_owned()])
@@ -2252,6 +2335,18 @@ pub(super) mod tests {
         assert_eq!(current.orphan_packages, orphans);
         assert_eq!(current.updates_available, updates);
         assert_eq!(current.scanned_vulnerability_summary(), Some((5, 2)));
+        let advisory = metadata(Arc::clone(&state))
+            .await?
+            .rpm_advisories
+            .context("current inventory should carry its advisory summary")?;
+        assert_eq!(
+            (
+                advisory.installed_packages,
+                advisory.findings,
+                advisory.unknown_packages
+            ),
+            (total, 5, 2)
+        );
 
         revision.fetch_add(1, Ordering::AcqRel);
         let response = handle_request(Arc::clone(&state), Request::Status { id: 2 }).await;
@@ -2264,6 +2359,7 @@ pub(super) mod tests {
         };
         assert_eq!(current.total_packages, total);
         assert_eq!(current.scanned_vulnerability_summary(), None);
+        assert!(metadata(Arc::clone(&state)).await?.rpm_advisories.is_none());
 
         state.cache.clear();
         state
@@ -2685,6 +2781,41 @@ pub(super) mod tests {
                 ..
             }
         ));
+        let Response::Success {
+            result: ResponseResult::Search(empty),
+            ..
+        } = handle_request(
+            Arc::clone(&state),
+            Request::Search {
+                id: 4,
+                query: String::new(),
+                limit: None,
+            },
+        )
+        .await
+        else {
+            panic!("empty search should succeed without reading the package catalog");
+        };
+        assert_eq!(empty.total, 0);
+        assert!(empty.packages.is_empty());
+        for (query, limit) in [("", None), ("retired", Some(0))] {
+            let Response::Success {
+                result: ResponseResult::Suggest(empty),
+                ..
+            } = handle_request(
+                Arc::clone(&state),
+                Request::Suggest {
+                    id: 5,
+                    query: query.into(),
+                    limit,
+                },
+            )
+            .await
+            else {
+                panic!("empty suggestions should succeed without reading the package catalog");
+            };
+            assert!(empty.is_empty());
+        }
         for request in [
             Request::Search {
                 id: 2,

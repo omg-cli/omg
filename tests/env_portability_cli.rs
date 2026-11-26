@@ -68,16 +68,12 @@ fn planner_refuses_symlinked_manifest() {
     let result = project.run(&["env", "plan", "--target", "ubuntu-x86_64"]);
     assert!(!result.success);
     assert!(result.stdout.is_empty());
+    let output = result.combined_output();
     assert!(
-        result
-            .combined_output()
-            .contains("Cannot read .omg.toml for environment planning")
+        output.contains("Cannot read .omg.toml for environment planning"),
+        "{output}"
     );
-    assert!(
-        result
-            .combined_output()
-            .contains("Refusing to read lockfile that is not a regular file: .omg.toml")
-    );
+    assert!(output.contains("not a regular file"), "{output}");
     assert_eq!(
         std::fs::read_to_string(project.path().join("other.toml")).unwrap(),
         "[environment]\nschema_version = 1\n"

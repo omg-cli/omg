@@ -312,6 +312,57 @@ fn push_writes_valid_lockfile_and_records_lock_hash_in_status() {
     );
 }
 
+#[test]
+#[serial]
+#[cfg(any(feature = "arch", feature = "debian", feature = "debian-pure"))]
+fn push_keeps_the_existing_lock_when_team_status_is_malformed() {
+    let project = TestProject::new();
+    craft_workspace(&project);
+    let lock_path = project.path().join("omg.lock");
+    let previous = EnvironmentState {
+        schema_version: EnvironmentState::SCHEMA_VERSION,
+        packages: vec!["previous-package".to_string()],
+        runtimes: std::collections::BTreeMap::new(),
+        timestamp: 1,
+        hash: String::new(),
+    };
+    previous.save(&lock_path).unwrap();
+    let before = fs::read(&lock_path).unwrap();
+
+    let status_path = project.path().join(".omg/team-status.json");
+    fs::write(&status_path, b"{invalid").unwrap();
+    let result = project.run(&["team", "push"]);
+    result.assert_failure();
+    result.assert_stderr_contains("Failed to parse team status");
+    assert_eq!(fs::read(lock_path).unwrap(), before);
+    assert_eq!(fs::read(status_path).unwrap(), b"{invalid");
+}
+
+#[test]
+#[serial]
+#[cfg(any(feature = "arch", feature = "debian", feature = "debian-pure"))]
+fn team_status_checks_the_size_of_config_and_status() {
+    const LIMIT: usize = 16 * 1024 * 1024;
+    let project = TestProject::new();
+    craft_workspace(&project);
+    for source in [".omg/team.toml", ".omg/team-status.json"] {
+        let path = project.path().join(source);
+        let original = fs::read(&path).unwrap();
+        let mut padded = original.clone();
+        padded.resize(LIMIT, b' ');
+        fs::write(&path, &padded).unwrap();
+        project.run(&["team", "status"]).assert_success();
+
+        padded.push(b' ');
+        fs::write(&path, &padded).unwrap();
+        let result = project.run(&["team", "status"]);
+        result.assert_failure();
+        result.assert_stderr_contains("16777216 byte limit");
+        assert_eq!(fs::read(&path).unwrap(), padded);
+        fs::write(path, original).unwrap();
+    }
+}
+
 /// Contract: after a successful push, `pull` (no remote configured) compares
 /// purely local state and reports in-sync with a zero exit code.
 #[test]

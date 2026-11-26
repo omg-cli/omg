@@ -17,6 +17,61 @@ use std::fs;
 
 const FAKE_PKG: &str = "omg-contract-fake-pkg";
 
+#[cfg(target_os = "linux")]
+#[test]
+fn generic_upgrade_decline_preserves_packages_and_history() {
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+
+    let project = TestProject::for_distro("fedora");
+    project.mock_install(FAKE_PKG, "1.0-1").unwrap();
+    project.mock_available(FAKE_PKG, "2.0-1").unwrap();
+    let state = project.data_dir.path().join("mock_state_dnf.json");
+    let before = fs::read(&state).unwrap();
+    let mut terminal = Command::new("/usr/bin/timeout")
+        .args([
+            "--kill-after=2s",
+            "15s",
+            "/usr/bin/script",
+            "--quiet",
+            "--return",
+            "--echo",
+            "never",
+            "-c",
+            "exec \"$OMG_FIXTURE_CLI\" update --no-sync",
+            "/dev/null",
+        ])
+        .current_dir(project.path())
+        .env("OMG_FIXTURE_CLI", common::fixture_cli_path())
+        .env("OMG_TEST_MODE", "1")
+        .env("OMG_TEST_DISTRO", "fedora")
+        .env("OMG_DISABLE_DAEMON", "1")
+        .env("OMG_DISABLE_TELEMETRY", "1")
+        .env("OMG_DATA_DIR", project.data_dir.path())
+        .env("OMG_CONFIG_DIR", project.config_dir.path())
+        .env("HOME", project.home_dir.path())
+        .env("SHELL", "/bin/sh")
+        .env("TERM", "xterm")
+        .env("NO_COLOR", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    terminal.stdin.take().unwrap().write_all(b"n\n").unwrap();
+    let output = terminal.wait_with_output().unwrap();
+    let transcript = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "{transcript}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(transcript.contains("Proceed with upgrade?"), "{transcript}");
+    assert!(transcript.contains("Upgrade cancelled"), "{transcript}");
+    assert_eq!(fs::read(&state).unwrap(), before);
+    assert!(!project.data_dir.path().join("history.json").exists());
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -473,6 +528,102 @@ mod snapshot_contracts {
     use super::*;
 
     #[test]
+    fn oversized_inventory_cannot_publish_a_manifest_or_snapshot() {
+        let project = TestProject::new();
+        let id = create_snapshot(&project, "before oversized inventory");
+        let directory = project.data_dir.path().join("snapshots");
+        let index = directory.join("index.json");
+        let snapshot = directory.join(format!("{id}.json"));
+        let before = (fs::read(&index).unwrap(), fs::read(&snapshot).unwrap());
+
+        project
+            .mock_install(&"x".repeat(16 * 1024 * 1024), "1-1")
+            .unwrap();
+        for (arguments, artifact) in [
+            (
+                &["migrate", "export", "--output", "migration.json"][..],
+                "migration manifest",
+            ),
+            (&["snapshot", "create"][..], "snapshot file"),
+        ] {
+            let rejected = project.run(arguments);
+            rejected.assert_failure();
+            assert!(
+                rejected
+                    .stderr
+                    .contains(&format!("{artifact} exceeds the 16777216 byte limit")),
+                "{}",
+                rejected.stderr
+            );
+        }
+        assert!(!project.file_exists("migration.json"));
+        assert_eq!(fs::read(&index).unwrap(), before.0);
+        assert_eq!(fs::read(&snapshot).unwrap(), before.1);
+        assert_eq!(
+            fs::read_dir(&directory)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "json"))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn saved_environment_commands_enforce_the_file_limit() {
+        const LIMIT: usize = 16 * 1024 * 1024;
+        let project = TestProject::new();
+        let id = create_snapshot(&project, "bounded files");
+        let directory = project.data_dir.path().join("snapshots");
+        let snapshot = directory.join(format!("{id}.json"));
+        let index = directory.join("index.json");
+        let manifest = project.dir.path().join("migration.json");
+        fs::write(
+            &manifest,
+            r#"{"version":"1.0","source_distro":"arch","created_at":0,"runtimes":{},"packages":[]}"#,
+        )
+        .expect("write migration fixture");
+
+        let snapshot_bytes = fs::read(&snapshot).expect("snapshot fixture");
+        for (path, args) in [
+            (&snapshot, vec!["snapshot", "restore", &id, "--dry-run"]),
+            (&index, vec!["snapshot", "list"]),
+            (
+                &manifest,
+                vec!["migrate", "import", "migration.json", "--dry-run"],
+            ),
+        ] {
+            let mut content = fs::read(path).expect("environment fixture");
+            content.resize(LIMIT, b' ');
+            fs::write(path, &content).expect("write exact-limit fixture");
+            project.run(&args).assert_success();
+            content.push(b' ');
+            fs::write(path, content).expect("write oversized fixture");
+            let rejected = project.run(&args);
+            rejected.assert_failure();
+            assert!(
+                rejected.stderr.contains("16777216 byte limit"),
+                "{}",
+                rejected.stderr
+            );
+            if path == &snapshot {
+                fs::write(path, &snapshot_bytes).expect("restore original fixture");
+            }
+        }
+
+        let rejected = project.run(&["snapshot", "delete", &id]);
+        rejected.assert_failure();
+        assert!(rejected.stderr.contains("16777216 byte limit"));
+        assert_eq!(
+            fs::read(snapshot).expect("snapshot must remain"),
+            snapshot_bytes
+        );
+    }
+
+    #[test]
     fn held_index_lock_blocks_snapshot_mutations() -> anyhow::Result<()> {
         let project = TestProject::new();
         let id = create_snapshot(&project, "original");
@@ -687,6 +838,39 @@ mod snapshot_contracts {
         );
         let after = fs::read_to_string(&snap_path).expect("snapshot readable after dry run");
         assert_eq!(before, after, "dry run must not rewrite the snapshot file");
+    }
+
+    #[test]
+    fn restore_rejects_invalid_plan_entries_before_applying() {
+        let project = TestProject::new();
+        let id = create_snapshot(&project, "base");
+        let path = project.data_dir.path().join(format!("snapshots/{id}.json"));
+        let clean: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).expect("snapshot bytes")).expect("snapshot");
+
+        for (key, value, diagnostic) in [
+            (
+                "packages",
+                serde_json::json!(["two words"]),
+                "Invalid snapshot package targets",
+            ),
+            (
+                "runtimes",
+                serde_json::json!({"unknown-tool": "1.2.3"}),
+                "Unsupported runtime 'unknown-tool'",
+            ),
+        ] {
+            let mut snapshot = clean.clone();
+            snapshot["state"][key] = value;
+            fs::write(&path, serde_json::to_string(&snapshot).unwrap()).expect("write snapshot");
+
+            for flag in ["--dry-run", "--yes"] {
+                let result = project.run(&["snapshot", "restore", &id, flag]);
+                result.assert_failure();
+                assert!(result.stderr.contains(diagnostic), "{}", result.stderr);
+                assert!(!result.stdout.contains("Applying changes"));
+            }
+        }
     }
 
     /// Contract: a non-interactive restore with pending package changes

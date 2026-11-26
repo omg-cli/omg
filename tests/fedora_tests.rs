@@ -770,12 +770,20 @@ mod dnf_integration {
     #[test]
     fn full_status_accepts_a_live_fedora_daemon_reply_after_half_a_second() -> Result<()> {
         use omg_lib::daemon::protocol::{
-            Request, Response, ResponseResult, StatusResult, encode_frame, read_frame, split_frame,
-            write_frame,
+            Request, Response, ResponseResult, StatusAdvisorySummary, StatusMetadata, encode_frame,
+            read_frame, split_frame, write_frame,
         };
         use std::os::unix::{fs::PermissionsExt as _, net::UnixListener};
         use std::time::{Duration, Instant};
 
+        let rpm = std::process::Command::new("/usr/bin/rpm")
+            .args(["-qa", "--queryformat", "%{NAME}\n"])
+            .output()?;
+        anyhow::ensure!(
+            rpm.status.success(),
+            "native installed package query failed"
+        );
+        let installed_count = std::str::from_utf8(&rpm.stdout)?.lines().count();
         for args in [&["status", "--json"][..], &["status"][..]] {
             let home = tempfile::Builder::new()
                 .permissions(std::fs::Permissions::from_mode(0o700))
@@ -783,21 +791,36 @@ mod dnf_integration {
             let socket = home.path().join("omg.sock");
             let listener = UnixListener::bind(&socket)?;
             listener.set_nonblocking(true)?;
+            let mut command = std::process::Command::new("/usr/bin/timeout");
+            command
+                .args(["--kill-after=1s", "8s"])
+                .arg(assert_cmd::cargo::cargo_bin!("omg"))
+                .args(args)
+                .current_dir(home.path())
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("HOME", home.path())
+                .env("XDG_RUNTIME_DIR", home.path())
+                .env("OMG_DISABLE_TELEMETRY", "1")
+                .env("NO_COLOR", "1");
+            if args.contains(&"--json") {
+                let output = command.output()?;
+                anyhow::ensure!(
+                    output.status.success(),
+                    "Fedora status JSON failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                let status: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+                assert_eq!(status["total_packages"], installed_count, "{status}");
+                assert_eq!(status["updates_and_orphans_checked"], true, "{status}");
+                assert!(matches!(
+                    listener.accept(),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+                ));
+                continue;
+            }
             let (output, sent) = std::thread::scope(|scope| -> Result<_> {
-                let run = scope.spawn(|| {
-                    std::process::Command::new("/usr/bin/timeout")
-                        .args(["--kill-after=1s", "8s"])
-                        .arg(assert_cmd::cargo::cargo_bin!("omg"))
-                        .args(args)
-                        .current_dir(home.path())
-                        .env_clear()
-                        .env("PATH", "/usr/bin:/bin")
-                        .env("HOME", home.path())
-                        .env("XDG_RUNTIME_DIR", home.path())
-                        .env("OMG_DISABLE_TELEMETRY", "1")
-                        .env("NO_COLOR", "1")
-                        .output()
-                });
+                let run = scope.spawn(move || command.output());
                 let deadline = Instant::now() + Duration::from_secs(5);
                 let mut stream = loop {
                     match listener.accept() {
@@ -816,19 +839,20 @@ mod dnf_integration {
                 let frame = read_frame(&mut stream)?;
                 let (_, body) = split_frame(&frame)?;
                 let request: Request = bitcode::deserialize(body)?;
-                assert!(matches!(request, Request::Status { .. }), "{request:?}");
+                assert!(
+                    matches!(request, Request::StatusMetadata { .. }),
+                    "{request:?}"
+                );
                 std::thread::sleep(Duration::from_millis(700));
                 let frame = encode_frame(&Response::Success {
                     id: request.id(),
-                    result: ResponseResult::Status(StatusResult {
-                        total_packages: 31_415,
-                        explicit_packages: 76,
-                        orphan_packages: 4,
-                        updates_available: 7,
-                        security_vulnerabilities: 1,
-                        vulnerabilities_scanned: true,
-                        security_unknown_packages: Some(2),
+                    result: ResponseResult::StatusMetadata(StatusMetadata {
                         runtime_versions: vec![("node".into(), "24.25.0".into())],
+                        rpm_advisories: Some(StatusAdvisorySummary {
+                            installed_packages: installed_count,
+                            findings: 1,
+                            unknown_packages: 2,
+                        }),
                     }),
                 })?;
                 stream.set_write_timeout(Some(Duration::from_secs(2)))?;
@@ -842,16 +866,11 @@ mod dnf_integration {
                 "{args:?}: {}",
                 String::from_utf8_lossy(&output.stderr)
             );
-            if args.contains(&"--json") {
-                let status: serde_json::Value = serde_json::from_str(stdout)?;
-                assert_eq!(status["total_packages"], 31_415, "{status}");
-                assert_eq!(status["updates_available"], 7, "{status}");
-            } else {
-                assert!(stdout.contains("31415 packages installed"), "{stdout}");
-                assert!(stdout.contains("1 findings"), "{stdout}");
-                assert!(stdout.contains("24.25.0"), "{stdout}");
-                assert!(stdout.contains("Running"), "{stdout}");
-            }
+            let installed = format!("{installed_count} packages installed");
+            assert!(stdout.contains(&installed), "{stdout}");
+            assert!(stdout.contains("1 findings"), "{stdout}");
+            assert!(stdout.contains("24.25.0"), "{stdout}");
+            assert!(stdout.contains("Running"), "{stdout}");
             sent.context("live daemon reply was discarded")?;
         }
         Ok(())
@@ -1010,45 +1029,54 @@ mod dnf_integration {
     }
 
     #[tokio::test]
-    async fn explicit_cli_matches_native_backend_without_a_daemon() -> Result<()> {
+    async fn explicit_cli_reads_native_reasons_without_waiting_for_daemon() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+
         let mut expected = DnfPackageManager::new().list_explicit().await?;
         expected.sort();
         expected.dedup();
-        let binary = assert_cmd::cargo::cargo_bin!("omg");
-        let mut listing = tokio::process::Command::new(binary);
-        listing
-            .args(["--json", "explicit"])
-            .env("OMG_DISABLE_DAEMON", "1")
-            .env("OMG_DISABLE_TELEMETRY", "1")
-            .env("OMG_TEST_MODE", "0")
-            .env_remove("OMG_TEST_DISTRO")
-            .env_remove("OMG_NATIVE_TEST_DATA_DIR");
-        let mut child = spawn_bounded_child(&mut listing)?;
-        let listing = bounded_child_output(&mut child, std::time::Duration::from_mins(1)).await?;
-        assert!(
-            listing.status.success(),
-            "{}",
-            String::from_utf8_lossy(&listing.stderr)
-        );
-        let listing: serde_json::Value = serde_json::from_slice(&listing.stdout)?;
-        assert_eq!(listing["packages"], serde_json::json!(expected));
-        let mut count = tokio::process::Command::new(binary);
-        count
-            .args(["--json", "explicit", "--count"])
-            .env("OMG_DISABLE_DAEMON", "1")
-            .env("OMG_DISABLE_TELEMETRY", "1")
-            .env("OMG_TEST_MODE", "0")
-            .env_remove("OMG_TEST_DISTRO")
-            .env_remove("OMG_NATIVE_TEST_DATA_DIR");
-        let mut child = spawn_bounded_child(&mut count)?;
-        let count = bounded_child_output(&mut child, std::time::Duration::from_mins(1)).await?;
-        assert!(
-            count.status.success(),
-            "{}",
-            String::from_utf8_lossy(&count.stderr)
-        );
-        let count: serde_json::Value = serde_json::from_slice(&count.stdout)?;
-        assert_eq!(count["count"], serde_json::json!(expected.len()));
+        let runtime = tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()?;
+        let listener = tokio::net::UnixListener::bind(runtime.path().join("omg.sock"))?;
+        let count = serde_json::json!({ "count": expected.len() });
+        for (arguments, wanted) in [
+            (
+                &["--json", "explicit"][..],
+                serde_json::json!({ "count": expected.len(), "packages": expected }),
+            ),
+            (&["--json", "explicit", "--count"][..], count.clone()),
+            (&["--json", "ec"][..], count),
+            (&["ec"][..], serde_json::json!(expected.len())),
+        ] {
+            let mut command = tokio::process::Command::new(assert_cmd::cargo::cargo_bin!("omg"));
+            command
+                .args(arguments)
+                .env("XDG_RUNTIME_DIR", runtime.path())
+                .env_remove("OMG_SOCKET_PATH")
+                .env_remove("OMG_DISABLE_DAEMON")
+                .env("OMG_DISABLE_TELEMETRY", "1")
+                .env("OMG_TEST_MODE", "0")
+                .env_remove("OMG_TEST_DISTRO")
+                .env_remove("OMG_NATIVE_TEST_DATA_DIR");
+            let mut child = spawn_bounded_child(&mut command)?;
+            let output = tokio::select! {
+                biased;
+                connected = listener.accept() => {
+                    let (_connection, _) = connected?;
+                    child.kill().await?;
+                    anyhow::bail!("{arguments:?} contacted the daemon for native DNF reasons");
+                }
+                output = bounded_child_output(&mut child, std::time::Duration::from_mins(1)) => output?,
+            };
+            assert!(
+                output.status.success(),
+                "{arguments:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+            assert_eq!(value, wanted, "{arguments:?}");
+        }
         Ok(())
     }
 
@@ -1279,6 +1307,50 @@ mod dnf_integration {
             );
         }
         fixture.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn why_cli_uses_system_inventory_with_a_separate_user_rpm_database() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let database = home.path().join("rpmdb");
+        let user_config = home.path().join(".config");
+        let user_macros = user_config.join("rpm");
+        std::fs::create_dir(&database)?;
+        std::fs::create_dir_all(&user_macros)?;
+        let initialized = std::process::Command::new("rpm")
+            .arg("--dbpath")
+            .arg(&database)
+            .arg("--initdb")
+            .output()?;
+        assert!(initialized.status.success());
+        let macros = format!("%_dbpath {}\n", database.display());
+        std::fs::write(home.path().join(".rpmmacros"), &macros)?;
+        std::fs::write(user_macros.join("macros"), macros)?;
+        let selector = format!("glibc.{}", std::env::consts::ARCH);
+        let command = |program: &std::ffi::OsStr| {
+            let mut command = std::process::Command::new(program);
+            command
+                .env("HOME", home.path())
+                .env("XDG_CONFIG_HOME", &user_config)
+                .env("XDG_STATE_HOME", home.path().join(".local/state"))
+                .env("OMG_DISABLE_DAEMON", "1")
+                .env("NO_COLOR", "1");
+            command
+        };
+        let native = command("rpm".as_ref()).args(["-qa"]).output()?;
+        assert!(native.status.success());
+        assert!(native.stdout.is_empty(), "the user RPM database is empty");
+        let omg = assert_cmd::cargo::cargo_bin!("omg");
+        let result = command(omg.as_os_str()).args(["why", &selector]).output()?;
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let output = std::str::from_utf8(&result.stdout)?;
+        assert!(output.contains("glibc-"));
+        assert!(output.contains("Reason:"));
         Ok(())
     }
 

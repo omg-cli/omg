@@ -73,6 +73,7 @@ The request enum in `src/daemon/protocol.rs` is the authority for the current su
 | `Search`, `Suggest` | Package search and completion candidates |
 | `Info` | Details for one package |
 | `Status`, `Health`, `Metrics` | System status, health probe, and metrics |
+| `StatusMetadata` | Runtime versions and validated RPM advisory coverage for caller-owned Fedora status |
 | `Explicit`, `ExplicitCount` | Explicitly installed packages and their count |
 | `ListUpdates` | Packages with a newer version available |
 | `SecurityAudit` | Vulnerability and policy scan work |

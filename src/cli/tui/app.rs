@@ -229,6 +229,11 @@ impl App {
 
     #[cfg(unix)]
     pub(crate) async fn fetch_daemon_status() -> (bool, Option<StatusResult>) {
+        #[cfg(feature = "fedora")]
+        if crate::cli::packages::uses_fedora_status() {
+            let (connected, status) = crate::cli::packages::fedora_status_with_daemon().await;
+            return (connected, status.ok());
+        }
         let Ok(mut client) = crate::core::client::DaemonClient::connect().await else {
             return (false, None);
         };
