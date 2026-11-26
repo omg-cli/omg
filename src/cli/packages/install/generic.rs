@@ -1,47 +1,40 @@
 use anyhow::{Context, Result};
 
 use crate::cli::{modern_ui, style};
-use crate::package_managers::get_package_manager;
+use crate::package_managers::{PackageManager, get_package_manager};
 
 use super::enforce_install_policy;
 
 pub async fn install(packages: &[String]) -> Result<()> {
     let pm = get_package_manager()?;
-    #[cfg(not(feature = "fedora"))]
-    let native_dnf = false;
     #[cfg(feature = "fedora")]
-    let native_dnf =
-        crate::package_managers::resolve_backend()? == crate::package_managers::Backend::Fedora;
-    let summary = "Installed";
-    #[cfg(feature = "fedora")]
-    let summary = if native_dnf {
-        "Install request complete for"
-    } else {
-        summary
-    };
-    // DNF reviews the complete stored transaction, including capability providers.
-    if !native_dnf {
-        let policy =
-            crate::core::security::SecurityPolicy::load_default().map_err(anyhow::Error::from)?;
-        let vulnerability_scanner =
-            crate::core::security::vulnerability::VulnerabilityScanner::new();
-        for package in packages {
-            let info = pm
-                .info(package)
-                .await?
-                .with_context(|| format!("Package not found: {package}"))?;
-            enforce_install_policy(
-                &policy,
-                &vulnerability_scanner,
-                &info.name,
-                &info.version,
-                crate::package_managers::types::SecurityOrigin::Unknown,
-                None,
-            )
-            .await?;
-        }
+    if crate::package_managers::resolve_backend()? == crate::package_managers::Backend::Fedora {
+        // DNF reviews the complete stored transaction, including capability providers.
+        return apply_install(pm.as_ref(), packages, "Install request complete for").await;
     }
 
+    let policy =
+        crate::core::security::SecurityPolicy::load_default().map_err(anyhow::Error::from)?;
+    let vulnerability_scanner = crate::core::security::vulnerability::VulnerabilityScanner::new();
+    for package in packages {
+        let info = pm
+            .info(package)
+            .await?
+            .with_context(|| format!("Package not found: {package}"))?;
+        enforce_install_policy(
+            &policy,
+            &vulnerability_scanner,
+            &info.name,
+            &info.version,
+            crate::package_managers::types::SecurityOrigin::Unknown,
+            None,
+        )
+        .await?;
+    }
+    apply_install(pm.as_ref(), packages, "Installed").await
+}
+
+async fn apply_install(pm: &dyn PackageManager, packages: &[String], summary: &str) -> Result<()> {
     modern_ui::print_phase_header(
         "📦",
         "Install",
@@ -84,7 +77,7 @@ pub async fn install(packages: &[String]) -> Result<()> {
 }
 
 async fn preview_packages(
-    pm: &dyn crate::package_managers::PackageManager,
+    pm: &dyn PackageManager,
     packages: &[String],
 ) -> Result<Vec<crate::core::Package>> {
     crate::core::security::validate_package_names(packages)?;
