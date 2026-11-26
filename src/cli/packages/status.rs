@@ -33,6 +33,10 @@ pub async fn status_with_json(fast: bool, json: bool) -> Result<()> {
     if fast {
         return status_fallback(true).await;
     }
+    #[cfg(all(unix, feature = "fedora"))]
+    if uses_fedora_status() {
+        return status_fallback(false).await;
+    }
 
     if let Err(e) = run_status_elm(false) {
         if e.kind() == std::io::ErrorKind::Other {
@@ -83,20 +87,30 @@ async fn status_json(fast: bool) -> Result<()> {
     Ok(())
 }
 
+#[cfg(all(unix, feature = "fedora"))]
+fn uses_fedora_status() -> bool {
+    matches!(
+        crate::package_managers::resolve_backend(),
+        Ok(crate::package_managers::Backend::Fedora)
+    )
+}
+
 #[cfg(unix)]
 async fn query_daemon_status(fast: bool) -> Option<StatusResult> {
     #[cfg(not(feature = "fedora"))]
     let _ = fast;
+    let timeout = std::time::Duration::from_millis(500);
     #[cfg(feature = "fedora")]
-    if fast
-        && matches!(
-            crate::package_managers::resolve_backend(),
-            Ok(crate::package_managers::Backend::Fedora)
-        )
-    {
-        return None;
-    }
-    tokio::time::timeout(std::time::Duration::from_millis(500), async {
+    let timeout = if uses_fedora_status() {
+        if fast {
+            return None;
+        }
+        // Fedora computes maintenance counts live, even with a warm daemon.
+        std::time::Duration::from_secs(2)
+    } else {
+        timeout
+    };
+    tokio::time::timeout(timeout, async {
         let mut client = DaemonClient::connect().await.ok()?;
         match client.call(Request::Status { id: 0 }).await.ok()? {
             ResponseResult::Status(status) => Some(status),
@@ -117,6 +131,23 @@ async fn status_fallback(fast: bool) -> Result<()> {
 
     #[cfg(unix)]
     if let Some(status) = query_daemon_status(fast).await {
+        #[cfg(feature = "fedora")]
+        if uses_fedora_status() {
+            crate::cli::commands::print_system_status(
+                &StatusData {
+                    total_packages: status.total_packages,
+                    explicit_packages: status.explicit_packages,
+                    orphan_packages: status.orphan_packages,
+                    updates_available: status.updates_available,
+                    advisory_coverage: status.scanned_vulnerability_summary(),
+                    duration_ms: start.elapsed().as_secs_f64() * 1000.0,
+                    fast_mode: fast,
+                },
+                Some(status.runtime_versions),
+                true,
+            );
+            return Ok(());
+        }
         display_status_report(
             status.total_packages,
             status.explicit_packages,

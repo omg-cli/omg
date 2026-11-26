@@ -2,6 +2,7 @@
 import os
 from pathlib import Path
 import re
+import runpy
 import subprocess
 import tempfile
 import textwrap
@@ -12,6 +13,8 @@ from test_ci_gates import job_block
 ROOT = Path(__file__).resolve().parent.parent
 WORKFLOWS = ROOT / '.github/workflows'
 BASH = 'C:/Program Files/Git/bin/bash.exe' if os.name == 'nt' else 'bash'
+EVIDENCE_SCRIPT = 'scripts/require-release-evidence.py'
+EVIDENCE_GATE = f'python3 {EVIDENCE_SCRIPT} "$GITHUB_SHA"'
 
 
 def step_script(block, name):
@@ -85,10 +88,7 @@ class ReleaseWorkflowBoundaryTests(unittest.TestCase):
             self.assertIn(f"needs.{platform}.result == 'success'", legacy)
         self.assertRegex(ci, r'(?m)^      release-candidate:\n        description: [^\n]+\n'
                              r'        type: string\n        default: ""$')
-        self.assertIn("--event push", (ROOT / 'scripts/require-workflow-success.sh').read_text())
-        for workflow in ('ci.yml', 'benchmark.yml', 'audit.yml', 'secrets.yml', 'codeql.yml',
-                         'coverage.yml', 'docker-e2e.yml'):
-            self.assertLess(block.index(f'scripts/require-workflow-success.sh {workflow}'), tag)
+        self.assertLess(block.index(EVIDENCE_GATE), tag)
 
     def test_release_concurrency_cannot_collide_with_pr_branch_name(self):
         ci = (WORKFLOWS / 'ci.yml').read_text()
@@ -109,8 +109,7 @@ class ReleaseWorkflowBoundaryTests(unittest.TestCase):
         sha = 'a' * 40
         approved = f'v0.1.225@{sha}'
         main = 'refs/heads/main'
-        all_lookups = ['ci.yml', 'benchmark.yml', 'audit.yml', 'secrets.yml', 'codeql.yml',
-                       'coverage.yml', 'docker-e2e.yml']
+        all_lookups = [EVIDENCE_SCRIPT]
         for label, overrides, expected_lookups, tagged, dispatched in (
             ('push', {'GITHUB_EVENT_NAME': 'push'}, [], False, False),
             ('pull request', {'GITHUB_EVENT_NAME': 'pull_request', 'GITHUB_REF': 'refs/pull/1/merge'},
@@ -124,9 +123,9 @@ class ReleaseWorkflowBoundaryTests(unittest.TestCase):
             ('replay', {'GITHUB_RUN_ATTEMPT': '2'}, [], False, False),
             ('missing attempt', {'GITHUB_RUN_ATTEMPT': ''}, [], False, False),
             ('invalid publish input', {'PUBLISH_RELEASE': ''}, [], False, False),
-            ('failed push CI', {'PUSH_CI': 'failure'}, ['ci.yml'], False, False),
+            ('failed push CI', {'PUSH_CI': 'failure'}, all_lookups, False, False),
             ('validation with failed CI', {'PUSH_CI': 'failure', 'PUBLISH_RELEASE': 'false'},
-             ['ci.yml'], False, False),
+             all_lookups, False, False),
             ('drift before tag', {'BEFORE_TAG': 'drifted'}, all_lookups, False, False),
             ('validation with drift', {'BEFORE_TAG': 'drifted', 'PUBLISH_RELEASE': 'false'},
              all_lookups, False, False),
@@ -159,9 +158,10 @@ class ReleaseWorkflowBoundaryTests(unittest.TestCase):
                            '  *) exit 99;;\n'
                            'esac\n',
                     'gh': 'printf "%s\\n" "$*" > dispatched\n',
-                    'python3': 'touch advisory-status-called\nexit 1\n',
-                    'scripts/require-workflow-success.sh': 'printf "%s %s\\n" "$1" "$2" >> lookups\n'
-                                                           'test "$1" != ci.yml || test "$PUSH_CI" = success\n',
+                    'python3': f'if [ "$1" != {EVIDENCE_SCRIPT} ]; then\n'
+                               '  touch advisory-status-called; exit 1\n'
+                               'fi\nprintf "%s %s\\n" "$1" "$2" >> lookups\n'
+                               'test "$PUSH_CI" = success\n',
                 }
                 (root / 'scripts').mkdir()
                 for name, body in fixtures.items():
@@ -185,7 +185,7 @@ class ReleaseWorkflowBoundaryTests(unittest.TestCase):
                     self.assertIn(f'v0.1.225 at {sha}', (root / 'summary').read_text())
                 self.assertFalse((root / 'advisory-status-called').exists())
                 reads = root / 'main-reads'
-                expected_reads = [env['BEFORE_TAG']] if expected_lookups == all_lookups else []
+                expected_reads = [env['BEFORE_TAG']] if expected_lookups and env['PUSH_CI'] == 'success' else []
                 if tagged:
                     expected_reads.append(env['AFTER_TAG'])
                 self.assertEqual(reads.read_text().splitlines() if reads.exists() else [], expected_reads)
@@ -204,21 +204,16 @@ class ReleaseWorkflowBoundaryTests(unittest.TestCase):
         release = (WORKFLOWS / 'release.yml').read_text(encoding='utf-8')
         script = step_script(job_block(release, 'gate-on-ci'),
                              'Require successful CI and benchmark runs for this commit')
-        expected = [
-            'ci.yml fixture-commit CI', 'benchmark.yml fixture-commit Benchmark',
-            'audit.yml fixture-commit Security Audit', 'secrets.yml fixture-commit Secret Scanning',
-            'codeql.yml fixture-commit CodeQL', 'coverage.yml fixture-commit Coverage',
-            'docker-e2e.yml fixture-commit Docker E2E',
-        ]
+        expected = [f'{EVIDENCE_SCRIPT} fixture-commit']
         for value in ('true', 'false', '$(touch injected)'):
             with self.subTest(value=value), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
-                gate = root / 'scripts/require-workflow-success.sh'
-                gate.parent.mkdir()
+                gate = root / 'python3'
                 gate.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> gate-calls\n')
                 gate.chmod(0o700)
                 env = dict(os.environ, GITHUB_EVENT_NAME='workflow_dispatch',
-                           GITHUB_SHA='fixture-commit', GITHUB_REF='refs/tags/v1.2.3', DRY_RUN=value)
+                           GITHUB_SHA='fixture-commit', GITHUB_REF='refs/tags/v1.2.3', DRY_RUN=value,
+                           PATH=str(root) + os.pathsep + os.environ['PATH'])
                 result = subprocess.run([BASH, '--noprofile', '--norc', '-e', '-o', 'pipefail', '-c', script],
                                         cwd=root, env=env, capture_output=True, text=True, timeout=15)
                 self.assertEqual(result.returncode, 0, result.stderr)
@@ -229,9 +224,11 @@ class ReleaseWorkflowBoundaryTests(unittest.TestCase):
     def test_release_requires_all_security_and_guest_prerequisites(self):
         release = (WORKFLOWS / 'release.yml').read_text(encoding='utf-8')
         gate = job_block(release, 'gate-on-ci')
-        for workflow in ('ci.yml', 'benchmark.yml', 'audit.yml', 'secrets.yml',
-                         'codeql.yml', 'coverage.yml', 'docker-e2e.yml'):
-            self.assertIn(f'scripts/require-workflow-success.sh {workflow} "$GITHUB_SHA"', gate)
+        expected = {'ci.yml', 'benchmark.yml', 'audit.yml', 'secrets.yml',
+                    'codeql.yml', 'coverage.yml', 'docker-e2e.yml'}
+        self.assertIn(EVIDENCE_GATE, gate)
+        self.assertEqual(set(runpy.run_path(str(ROOT / EVIDENCE_SCRIPT))['REQUIRED']), expected)
+        for workflow in expected:
             source = (WORKFLOWS / workflow).read_text(encoding='utf-8')
             push = re.search(r'^  push:\n((?:    .*\n)+)', source, re.M)
             self.assertIsNotNone(push, workflow)
@@ -434,8 +431,7 @@ class ReleaseWorkflowBoundaryTests(unittest.TestCase):
         for filename in ('authorize-release.yml', 'release.yml'):
             with self.subTest(workflow=filename):
                 gate = (WORKFLOWS / filename).read_text(encoding='utf-8')
-                for workflow in ('ci.yml', 'benchmark.yml'):
-                    self.assertIn(f'scripts/require-workflow-success.sh {workflow} "$GITHUB_SHA"', gate)
+                self.assertIn(EVIDENCE_GATE, gate)
 
     def test_benchmark_uses_the_job_release_pair_without_rebuilding(self):
         workflow = (WORKFLOWS / 'benchmark.yml').read_text(encoding='utf-8')
@@ -470,7 +466,7 @@ class ReleaseWorkflowBoundaryTests(unittest.TestCase):
     def test_publication_requires_tag_but_branch_dry_run_remains_valid(self):
         text = (WORKFLOWS / 'release.yml').read_text(encoding='utf-8')
         script = step_script(job_block(text, 'gate-on-ci'), 'Require successful CI and benchmark runs for this commit')
-        script = script.split('scripts/require-workflow-success.sh', 1)[0]
+        script = script.split(EVIDENCE_GATE, 1)[0]
         for dry_run, ref, expected in [('true', 'refs/heads/review', 0), ('false', 'refs/heads/main', 1), ('false', 'refs/tags/v1.2.3', 0)]:
             with self.subTest(dry_run=dry_run, ref=ref):
                 env = dict(os.environ, GITHUB_EVENT_NAME='workflow_dispatch', DRY_RUN=dry_run, GITHUB_REF=ref)
