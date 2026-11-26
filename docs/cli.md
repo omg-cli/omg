@@ -1560,6 +1560,8 @@ omg env sync https://gist.github.com/user/abc123
 
 Team workspace management.
 
+Team configuration and status files each have a 16 MiB limit.
+
 ```bash
 omg team <SUBCOMMAND>
 ```
