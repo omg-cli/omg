@@ -979,19 +979,24 @@ fn merge_chain(accumulated: &mut ResolvedEnv, next: ResolvedEnv) {
 ///
 /// `base` is the process environment snapshot. Production callers use
 /// [`Strictness::Strict`] and fail closed on missing required inputs.
+#[cfg(test)]
 pub(crate) fn load_mise_env_chain(
     start: &Path,
     base: &Environment,
     strict: Strictness,
 ) -> Result<ResolvedEnv> {
-    let mut selection = HashMap::new();
-    if let Some(value) = base.get(OsStr::new("MISE_ENV")) {
-        let value = value
-            .to_str()
-            .context("Environment variable MISE_ENV is not UTF-8")?;
-        selection.insert("MISE_ENV".to_owned(), value.to_owned());
-    }
+    let selection = super::mise_config::environment_selection(
+        base.get(OsStr::new("MISE_ENV")).map(OsString::as_os_str),
+    )?;
     let documents = super::mise_config::load(start, &selection)?;
+    resolve_mise_env_chain(&documents, base, strict)
+}
+
+pub(crate) fn resolve_mise_env_chain(
+    documents: &[super::mise_config::Document],
+    base: &Environment,
+    strict: Strictness,
+) -> Result<ResolvedEnv> {
     let mut merged = ResolvedEnv::default();
     if documents.is_empty() {
         return Ok(merged);

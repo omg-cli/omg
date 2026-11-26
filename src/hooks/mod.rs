@@ -5,10 +5,11 @@
 
 pub mod completions;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::config::mise_config;
 use crate::config::mise_tools::normalize_runtime_name;
 use crate::core::paths;
 use crate::runtimes::rust::{RustManager, RustToolchainSpec};
@@ -458,11 +459,10 @@ fn detect_versions_with_env(
     detect_version_pins(start, selection, PinPolicy::Explicit).map(|pins| pins.versions)
 }
 
-pub(crate) fn detect_task_versions(
-    start: &Path,
-) -> Result<(HashMap<String, String>, Option<ProjectPackageMetadata>)> {
-    let pins = detect_version_pins(start, &mise_environment(), PinPolicy::Task)?;
-    Ok((pins.versions, pins.project_package))
+pub(crate) fn detect_task_versions(start: &Path) -> Result<VersionPins> {
+    let environment = std::env::var_os("MISE_ENV");
+    let selection = mise_config::environment_selection(environment.as_deref())?;
+    detect_version_pins(start, &selection, PinPolicy::Task)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -472,9 +472,10 @@ enum PinPolicy {
     Task,
 }
 
-struct VersionPins {
-    versions: HashMap<String, String>,
-    project_package: Option<ProjectPackageMetadata>,
+pub(crate) struct VersionPins {
+    pub(crate) versions: HashMap<String, String>,
+    pub(crate) project_package: Option<ProjectPackageMetadata>,
+    pub(crate) mise_documents: Vec<mise_config::Document>,
 }
 
 fn detect_version_pins(
@@ -485,10 +486,10 @@ fn detect_version_pins(
     let mut mise_documents_read = 0;
     let mut versions = HashMap::new();
     let mut project_package = None;
-    let mut current = Some(start.to_path_buf());
-    let mut is_start_directory = true;
+    let mut mise_layers = Vec::new();
 
-    while let Some(dir) = current {
+    for (index, dir) in start.ancestors().enumerate() {
+        let is_start_directory = index == 0;
         let reject_bad_pin = is_start_directory && policy != PinPolicy::ShellHook;
         for (filename, runtime) in VERSION_FILES {
             if versions.contains_key(*runtime) {
@@ -530,10 +531,10 @@ fn detect_version_pins(
         // Each directory's dedicated pins win over its mise layers. Processing
         // directories nearest-first also preserves child mise pins over parent
         // dedicated files, while aliases are merged inside the layer resolver.
-        match crate::config::mise_config::load_directory(&dir, selection) {
+        match mise_config::load_directory(dir, selection) {
             Ok(documents) => {
                 mise_documents_read += documents.len();
-                if mise_documents_read > crate::config::mise_config::MAX_CONFIG_FILES {
+                if mise_documents_read > mise_config::MAX_CONFIG_FILES {
                     if policy != PinPolicy::ShellHook {
                         anyhow::bail!("Too many mise configuration files");
                     }
@@ -545,20 +546,30 @@ fn detect_version_pins(
                 for (runtime, version) in crate::config::mise_tools::native_pins(&documents) {
                     versions.entry(runtime).or_insert(version);
                 }
+                if policy == PinPolicy::Task && !documents.is_empty() {
+                    mise_layers.push(documents);
+                }
             }
-            Err(error) if reject_bad_pin => return Err(error),
+            Err(error) if reject_bad_pin || policy == PinPolicy::Task => return Err(error),
             Err(error) => {
                 tracing::warn!("Ignoring invalid mise pins in {}: {error:#}", dir.display());
             }
         }
-
-        current = dir.parent().map(std::path::Path::to_path_buf);
-        is_start_directory = false;
     }
 
+    // Environment layers apply parent-first. Where a path belongs to two
+    // directory scopes, its parent occurrence supplies the directive root.
+    let mut seen = HashSet::new();
+    let mise_documents = mise_layers
+        .into_iter()
+        .rev()
+        .flatten()
+        .filter(|document| seen.insert(document.path.clone()))
+        .collect();
     Ok(VersionPins {
         versions,
         project_package,
+        mise_documents,
     })
 }
 

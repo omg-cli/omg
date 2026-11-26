@@ -2,6 +2,7 @@
 
 use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 pub(crate) const MAX_CONFIG_FILES: usize = 256;
@@ -12,6 +13,17 @@ pub(crate) struct Document {
     /// Declaring configuration root, preserving mise's grouped-file semantics.
     pub root: PathBuf,
     pub value: toml::Value,
+}
+
+pub(crate) fn environment_selection(value: Option<&OsStr>) -> Result<HashMap<String, String>> {
+    let mut selection = HashMap::new();
+    if let Some(value) = value {
+        let value = value
+            .to_str()
+            .context("Environment variable MISE_ENV is not UTF-8")?;
+        selection.insert("MISE_ENV".to_owned(), value.to_owned());
+    }
+    Ok(selection)
 }
 
 fn selected_environments(env: &HashMap<String, String>) -> Result<Vec<String>> {

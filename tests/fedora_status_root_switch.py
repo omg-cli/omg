@@ -83,6 +83,26 @@ def checked(args, env=base_env, identity=None):
     assert result.returncode == 0, (list(map(str, args)), result.stdout[-1200:], result.stderr[-1600:])
     return result.stdout
 
+def stage_runtime_fixture(directory):
+    source = Path(__file__).with_name("runtime_advisory_fixture.py")
+    if not source.is_file():
+        source = fixture.parents[1] / "runtime_advisory_fixture.py"
+    payload = source.read_bytes()
+    staged = directory / source.name
+    staged.write_bytes(payload)
+    staged.chmod(0o644)
+    digest = hashlib.sha256(payload).hexdigest()
+    result = command([sys.executable, "-I", "-B", "-c",
+                      "import hashlib, pathlib, sys; print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())",
+                      staged], identity=ordinary)
+    mode = staged.stat()
+    checks.append(dict(phase="task-runtime-fixture", case="ordinary-worker-reads-staged-helper",
+                       status=result.returncode,
+                       passed=(result.returncode == 0 and result.stdout.strip() == digest
+                               and mode.st_uid == 0 and stat.S_IMODE(mode.st_mode) == 0o644),
+                       diagnostic=result.stderr[-1000:]))
+    return staged
+
 def inventory():
     installed = sorted(checked([rpm, "-qa", "--qf", "%{NAME}-%{EPOCHNUM}:%{VERSION}-%{RELEASE}.%{ARCH}\n"]).splitlines())
     state = Path("/usr/lib/sysimage/libdnf5")
@@ -2156,9 +2176,7 @@ printf 'watch fixture completed\\n'
         import struct
 
         phase = "task-runtime-admissions"
-        helper = Path(__file__).with_name("runtime_advisory_fixture.py")
-        if not helper.is_file():
-            helper = fixture.parents[1] / "runtime_advisory_fixture.py"
+        helper = runtime_advisory_fixture
         assert helper.is_file(), helper
         with tempfile.TemporaryDirectory(prefix="task-runtime-admissions-", dir=work) as directory:
             here = Path(directory)
@@ -2352,12 +2370,52 @@ run = 'fixture-environment "$@"'
             task_env = "[tasks.fixture.env]\n"
             task_source = "[tasks.fixture.env._]\nsource = 'source.sh'\n"
 
+            def observe_config_opens(args, project, env, requested):
+                import ctypes
+                import struct
+
+                def execute():
+                    return subprocess.run(args, cwd=project, env=env, stdin=subprocess.DEVNULL,
+                                          capture_output=True, timeout=8, **ordinary)
+
+                if requested is None:
+                    return execute(), {}
+                libc = ctypes.CDLL(None, use_errno=True)
+                libc.inotify_init1.argtypes = [ctypes.c_int]
+                libc.inotify_add_watch.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_uint32]
+                in_open, in_close_nowrite = 0x20, 0x10
+                notice = struct.Struct("iIII")
+                fd = libc.inotify_init1(os.O_CLOEXEC | os.O_NONBLOCK)
+                assert fd >= 0, ctypes.get_errno()
+                try:
+                    watched = {}
+                    counts = dict.fromkeys(requested, 0)
+                    for name in requested:
+                        path = project / name
+                        watch = libc.inotify_add_watch(fd, os.fsencode(path), in_open | in_close_nowrite)
+                        assert watch >= 0 and watch not in watched, (name, ctypes.get_errno())
+                        watched[watch] = name
+                    result = execute()
+                    try:
+                        events = os.read(fd, 65536)
+                    except BlockingIOError:
+                        events = b""
+                    offset = 0
+                    while offset < len(events):
+                        watch, flags, _, length = notice.unpack_from(events, offset)
+                        counts[watched[watch]] += bool(flags & in_open)
+                        offset += notice.size + length
+                    return result, counts
+                finally:
+                    os.close(fd)
+
             def run(label, *, env=None, conf=None, files=(), parent_conf=None, parent_files=(),
-                    expected=None, error=None, opaque_root=False, native_task=False, local_tool=False):
+                    expected=None, error=None, opaque_root=False, native_task=False, local_tool=False,
+                    child_name="project", writable=(), reads=None):
                 parent = here / label
                 parent.mkdir()
                 os.chown(parent, account.pw_uid, account.pw_gid)
-                name = os.fsdecode(b"project-\xff") if opaque_root else "project"
+                name = os.fsdecode(b"project-\xff") if opaque_root else child_name
                 project = parent / name
                 project.mkdir()
                 if conf is not None:
@@ -2366,7 +2424,11 @@ run = 'fixture-environment "$@"'
                     (parent / "mise.toml").write_text(parent_conf)
                 for root, inputs in ((project, files), (parent, parent_files)):
                     for filename, value in inputs:
-                        (root / filename).write_text(value)
+                        path = root / filename
+                        path.parent.mkdir(parents=True, exist_ok=True)
+                        path.write_text(value)
+                for filename in writable:
+                    os.chown(project / filename, account.pw_uid, account.pw_gid)
                 if local_tool:
                     (project / "tooling").mkdir()
                     os.link(tool, project / "tooling" / tool.name)
@@ -2382,10 +2444,8 @@ run = 'fixture-environment "$@"'
                     else:
                         launch[key] = value
                 try:
-                    result = subprocess.run([cli, "run", "fixture" if native_task else tool.name,
-                                             "--", "one value", "--flag"], cwd=project, env=launch,
-                                            stdin=subprocess.DEVNULL, capture_output=True, timeout=8,
-                                            **ordinary)
+                    args = [cli, "run", "fixture" if native_task else tool.name, "--", "one value", "--flag"]
+                    result, opened = observe_config_opens(args, project, launch, reads)
                     output = result.stdout.decode(errors="replace")
                     diagnostic = result.stderr.decode(errors="replace")
                     marker = "fixture environment "
@@ -2399,7 +2459,10 @@ run = 'fixture-environment "$@"'
                         passed = (result.returncode == 0 and payload.get("args") == ["one value", "--flag"]
                                   and all(values.get(key.hex()) == (value.hex() if value is not None else None)
                                           for key, value in wanted.items()))
+                    behavior_ok = passed
+                    passed &= reads is None or opened == reads
                     checks.append(dict(phase=phase, case=label, passed=passed, status=result.returncode,
+                                       behavior_ok=behavior_ok, reported_reads=opened, expected_reads=reads,
                                        diagnostic=(output + diagnostic)[-1300:]))
                 except subprocess.TimeoutExpired:
                     checks.append(dict(phase=phase, case=label, passed=False, status=None,
@@ -2481,6 +2544,80 @@ run = 'fixture-environment "$@"'
             run("native-task-finds-opaque-path", native_task=True, env={path_key: opaque_path}, conf=task,
                 expected={path_key: opaque_path})
 
+            phase = "task-mise-documents"
+            value = "[env]\nOMG_FIXTURE_OUT = 'ready'\n"
+            older = "[env]\nOMG_FIXTURE_OUT = 'older'\n"
+            chosen = {result_key: b"ready"}
+            root_value = "[env]\nOMG_FIXTURE_OUT = '{{config_root}}'\n"
+            for index, filename in enumerate((
+                "mise.toml", ".mise.toml", "mise/config.toml", ".mise/config.toml",
+                ".config/mise/config.toml", ".config/mise/mise.toml", ".config/mise.toml",
+                ".config/mise/conf.d/main.toml", ".mise/conf.d/main.toml", "mise/conf.d/main.toml",
+            )):
+                run(f"base-location-{index}", files=((filename, value),), expected=chosen, reads={filename: 2})
+            run("fragments-sort-within-layer",
+                files=(("mise/conf.d/90-final.toml", value), ("mise/conf.d/10-base.toml", older)),
+                expected=chosen, reads={"mise/conf.d/10-base.toml": 2, "mise/conf.d/90-final.toml": 2})
+            for index, filename in enumerate(("mise.local.toml", ".mise.local.toml",
+                                               "mise/config.local.toml", ".config/mise/mise.local.toml")):
+                plain = filename.replace(".local.toml", ".toml")
+                run(f"local-over-default-{index}", files=((plain, older), (filename, value)),
+                    expected=chosen, reads={plain: 2, filename: 2})
+            run("selected-overlay", env={b"MISE_ENV": b"dev"}, conf=older,
+                files=(("mise.dev.toml", value),), expected=chosen, reads={"mise.toml": 2, "mise.dev.toml": 2})
+            run("selected-local-overlay", env={b"MISE_ENV": b"dev"},
+                files=((".mise.dev.toml", older), (".mise.dev.local.toml", value)),
+                expected=chosen, reads={".mise.dev.toml": 2, ".mise.dev.local.toml": 2})
+            run("last-selected-overlay-wins", env={b"MISE_ENV": b"dev,stage"},
+                files=(("mise.dev.toml", older), ("mise.stage.toml", value)), expected=chosen,
+                reads={"mise.dev.toml": 2, "mise.stage.toml": 2})
+            run("unselected-overlay-is-never-opened", conf=value, files=(("mise.dev.toml", older),),
+                expected=chosen, reads={"mise.toml": 2, "mise.dev.toml": 0})
+            run("parent-only-configuration", parent_conf=value,
+                expected=chosen, reads={"../mise.toml": 2})
+            run("child-after-parent", conf=value, parent_conf=older,
+                expected=chosen, reads={"mise.toml": 2, "../mise.toml": 2})
+            run("parent-env-expands-in-child",
+                parent_conf="[env]\nOMG_FIXTURE_RAW = 'ready'\n",
+                conf="[env]\nOMG_FIXTURE_OUT = '{{env.OMG_FIXTURE_RAW}}'\n",
+                expected={**chosen, raw_key: b"ready"}, reads={"mise.toml": 2, "../mise.toml": 2})
+            run("selected-parent-before-child", env={b"MISE_ENV": b"stage"}, conf=value,
+                parent_files=((".mise.stage.toml", older),), expected=chosen,
+                reads={"mise.toml": 2, "../.mise.stage.toml": 2})
+            run("grouped-dotenv-declaring-root", files=(
+                    (".config/mise/config.toml", "[env._]\nfile = 'fixture.env'\n"),
+                    ("fixture.env", "OMG_FIXTURE_OUT=ready\n"),
+                ), expected=chosen, reads={".config/mise/config.toml": 2})
+            run("legacy-dotenv-declaring-root", files=(
+                    (".config/mise/mise.toml", "[env._]\nfile = 'fixture.env'\n"),
+                    (".config/mise/fixture.env", "OMG_FIXTURE_OUT=ready\n"),
+                ), expected=chosen, reads={".config/mise/mise.toml": 2})
+            run("legacy-config-root-template", files=((".config/mise/mise.toml", root_value),),
+                expected=lambda cwd: {result_key: os.fsencode(cwd/".config/mise")},
+                reads={".config/mise/mise.toml": 2})
+            run("overlapping-layer-uses-parent-source-once", child_name=".config", files=(
+                    ("mise/config.toml", source_config),
+                ), parent_files=(
+                    ("source.sh", 'export OMG_FIXTURE_OUT="${OMG_FIXTURE_OUT-}once"\n'),
+                ), expected={result_key: b"once"}, reads={"mise/config.toml": 3})
+            run("native-mise-base", native_task=True, conf=task + value,
+                expected=chosen, reads={"mise.toml": 3})
+            run("native-mise-selected", native_task=True, env={b"MISE_ENV": b"stage"}, conf=task + older,
+                files=(("mise.stage.toml", value),), expected=chosen,
+                reads={"mise.toml": 3, "mise.stage.toml": 3})
+            run("native-mise-parent-env", native_task=True, conf=task, parent_conf=value,
+                expected=chosen, reads={"mise.toml": 3, "../mise.toml": 3})
+            refresh = task + """depends = ["prepare"]
+[tasks.prepare]
+run = "cp next.toml mise.local.toml"
+"""
+            run("native-mise-refreshes-project-env", native_task=True, conf=refresh,
+                files=(("mise.local.toml", older), ("next.toml", value)),
+                writable=("mise.local.toml",), expected=chosen)
+            run("native-mise-rejects-malformed-refreshed-config", native_task=True, conf=refresh,
+                files=(("mise.local.toml", older), ("next.toml", "[env")),
+                writable=("mise.local.toml",), error="Failed to parse mise configuration")
+
 
     def inspect_task_package_metadata():
         import ctypes
@@ -2488,9 +2625,7 @@ run = 'fixture-environment "$@"'
         import time
 
         phase = "task-package-metadata"
-        helper = Path(__file__).with_name("runtime_advisory_fixture.py")
-        if not helper.is_file():
-            helper = fixture.parents[1] / "runtime_advisory_fixture.py"
+        helper = runtime_advisory_fixture
         versions = {"node": ("24.22.3", "24.23.5"), "bun": ("1.2.20", "1.2.21")}
         with tempfile.TemporaryDirectory(prefix="task-package-metadata-", dir=work) as directory:
             home = Path(directory)
@@ -2557,10 +2692,11 @@ run = 'node "$@"'
                 return json.dumps(manifest) if isinstance(manifest, dict) else manifest
 
             def run(label, *, metadata=provided, parent=None, pins=(), markers=(), mise=None,
-                    replacement=None, manager="npm", version=node, error=None, opens=2):
+                    replacement=None, manager="npm", version=node, error=None, opens=2,
+                    project_name="project", files=(), parent_files=(), writable=(), initial_args=()):
                 outer = home / label
                 outer.mkdir()
-                project = outer / "project"
+                project = outer / project_name
                 project.mkdir()
                 os.chown(project, account.pw_uid, account.pw_gid)
                 manifest = project / "package.json"
@@ -2581,6 +2717,11 @@ run = 'node "$@"'
                 if replacement is not None:
                     os.chown(manifest, account.pw_uid, account.pw_gid)
                     (project / "replacement.json").write_text(encoded(replacement))
+                for root, items in ((project, files), (outer, parent_files)):
+                    for filename, value in items:
+                        (root / filename).write_text(value)
+                for filename in writable:
+                    os.chown(project / filename, account.pw_uid, account.pw_gid)
                 fd = libc.inotify_init1(os.O_CLOEXEC | os.O_NONBLOCK)
                 assert fd >= 0, ctypes.get_errno()
                 try:
@@ -2602,7 +2743,7 @@ run = 'node "$@"'
                         reads += bool(kind & in_open)
                         offset += notice.size + length
                     lines = [line for line in result.stdout.splitlines() if line.startswith("fixture package ")]
-                    values = ["two words", "--literal"]
+                    values = [*initial_args, "two words", "--literal"]
                     if mise is None:
                         values[:0] = ["run", "fixture-js"] + (["--"] if manager in ("npm", "pnpm", "yarn") else [])
                     reported = version if manager == "bun" else f"v{version}"
@@ -2667,6 +2808,27 @@ run = 'node "$@"'
 run = "cp replacement.json package.json"
 """, metadata={"engines": {"node": node}},
                 replacement={"engines": {"node": next_node}, "scripts": script})
+
+            phase = "task-mise-runtime-coherence"
+            run("overlapping-mise-pins-keep-nearest-precedence", metadata=None, manager="node", opens=0,
+                project_name=".config", parent_files=((".node-version", node),), version=next_node,
+                mise=f"[tools]\nnode = '{next_node}'\n" + task)
+            graph = '''[tasks.fixture]
+depends = ["prepare"]
+run = 'node "$OMG_FIXTURE_OUT" "$OMG_FIXTURE_TASK" "$@"'
+env.OMG_FIXTURE_TASK = "planned"
+[tasks.prepare]
+run = "cp next.toml mise.local.toml"
+'''
+            old_settings = f"[tools]\nnode = '{node}'\n[env]\nOMG_FIXTURE_OUT = 'older'\n"
+            new_settings = f"[tools]\nnode = '{next_node}'\n[env]\nOMG_FIXTURE_OUT = 'ready'\n"
+            new_settings += '''[tasks.fixture]
+run = "node unexpected"
+env.OMG_FIXTURE_TASK = "changed"
+'''
+            run("fresh-mise-pins-and-env-keep-planned-command", metadata=None, manager="node", opens=0,
+                mise=graph, files=(("mise.local.toml", old_settings), ("next.toml", new_settings)),
+                writable=("mise.local.toml",), initial_args=("ready", "planned"), version=next_node)
 
 
     def inspect_environment_lockfiles():
@@ -4373,6 +4535,7 @@ exec {shlex.quote(str(binary))} "$@"
                     inspect_workspace_graph_and_diff()
                     inspect_task_selection()
                     inspect_task_watch()
+                    runtime_advisory_fixture = stage_runtime_fixture(root)
                     inspect_task_runtime_admissions()
                     inspect_task_environment_bytes()
                     inspect_task_package_metadata()
@@ -4693,6 +4856,6 @@ assert inventory() == before
 report = dict(binaries=binaries, checks=checks, total=len(checks),
               passed=sum(entry["passed"] for entry in checks), host_unchanged=True)
 print(json.dumps(report))
-expected_checks = 303 if consent_oracle is None else 1451
+expected_checks = 303 if consent_oracle is None else 1486
 if report["passed"] != report["total"] or report["total"] != expected_checks:
     sys.exit(4)

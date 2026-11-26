@@ -1023,8 +1023,12 @@ fn execute_process_in(
         // Runtime selection below still requires reviewed managed bytes when
         // rustup owns PATH; do not silently install a competing toolchain here.
     }
-    let (mut versions, package) = hooks::detect_task_versions(current_dir)?;
-    if let Some(package) = package {
+    let hooks::VersionPins {
+        mut versions,
+        project_package,
+        mise_documents,
+    } = hooks::detect_task_versions(current_dir)?;
+    if let Some(package) = project_package {
         let (runtime, default_version) = js_runtime_for(current_dir, &package)?;
         versions
             .entry(runtime.to_owned())
@@ -1120,8 +1124,8 @@ fn execute_process_in(
         command.env("PATH", &path);
         environment.insert("PATH".into(), path);
     }
-    let mise_env = crate::config::mise_env::load_mise_env_chain(
-        current_dir,
+    let mise_env = crate::config::mise_env::resolve_mise_env_chain(
+        &mise_documents,
         &environment,
         crate::config::mise_env::Strictness::Strict,
     )?;
@@ -2926,7 +2930,9 @@ pathlib.Path({}).write_text(sys.prefix + '|' + omg_local_venv_probe.VALUE)
             r#"{"packageManager":"./repo-script","scripts":{}}"#,
         )
         .unwrap();
-        let (_, package) = hooks::detect_task_versions(project.path()).unwrap();
+        let package = hooks::detect_task_versions(project.path())
+            .unwrap()
+            .project_package;
         let error = js_runtime_for(project.path(), &package.unwrap())
             .expect_err("repo-controlled executable path must fail");
         assert!(error.to_string().contains("Unsupported packageManager"));
@@ -2937,7 +2943,9 @@ pathlib.Path({}).write_text(sys.prefix + '|' + omg_local_venv_probe.VALUE)
         let project = TempDir::new().unwrap();
         fs::write(project.path().join("package.json"), r#"{"scripts":{}}"#).unwrap();
 
-        let (_, package) = hooks::detect_task_versions(project.path()).unwrap();
+        let package = hooks::detect_task_versions(project.path())
+            .unwrap()
+            .project_package;
         let package = package.unwrap();
         assert_eq!(
             js_package_manager_for(project.path(), package.package_manager.as_deref()).unwrap(),
