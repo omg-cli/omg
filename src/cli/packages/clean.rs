@@ -408,7 +408,7 @@ async fn handle_fedora_clean(
     if !orphans && !cache && !all {
         let packages = DnfPackageManager::orphan_packages().await?;
         println!(
-            "{} orphan packages can be removed (omg clean --orphans)",
+            "DNF found {} unneeded packages (omg clean --orphans --dry-run to preview removals)",
             packages.len()
         );
         println!("To clear downloaded package archives: omg clean --cache");
@@ -419,10 +419,12 @@ async fn handle_fedora_clean(
     // explicit confirmation to the native transaction instead.
     if orphans || all {
         if dry_run {
-            let packages = DnfPackageManager::orphan_builds().await?;
-            println!("Would remove {} orphan packages:", packages.len());
-            for package in packages {
-                println!("  {package}");
+            let (plan, diagnostics) = DnfPackageManager::preview_orphan_cleanup().await?;
+            for line in plan.lines() {
+                println!("{}", style::sanitize_terminal_text(line));
+            }
+            for line in diagnostics.lines() {
+                eprintln!("{}", style::sanitize_terminal_text(line));
             }
         } else {
             let history = crate::core::history::HistoryManager::new()?;

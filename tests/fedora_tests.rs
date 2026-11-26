@@ -1859,13 +1859,14 @@ mod dnf_operations {
                     "-q",
                     "tree",
                     "--qf",
-                    "%{EPOCHNUM}:%{VERSION}-%{RELEASE}\t%{NAME}-%{EPOCHNUM}:%{VERSION}-%{RELEASE}.%{ARCH}",
+                    "%{NAME}\t%{ARCH}\t%{EPOCHNUM}:%{VERSION}-%{RELEASE}",
                 ])
                 .output()?;
             anyhow::ensure!(native.status.success(), "Cannot read fixture version");
             let native = std::str::from_utf8(&native.stdout)?;
-            let (version, full_identity) =
-                native.split_once('\t').context("Native RPM identity")?;
+            let [name, architecture, version] = native.split('\t').collect::<Vec<_>>()[..] else {
+                anyhow::bail!("Invalid native RPM identity: {native}");
+            };
             let mark = std::process::Command::new("sudo")
                 .args(["-n", "dnf", "-y", "mark", "dependency", "tree"])
                 .stdin(std::process::Stdio::null())
@@ -1888,8 +1889,13 @@ mod dnf_operations {
             anyhow::ensure!(
                 preview_stdout
                     .lines()
-                    .any(|line| line.trim() == full_identity),
-                "Preview omitted the full RPM identity: {preview_stdout}"
+                    .any(|line| line.trim() == "Removing:")
+                    && preview_stdout.lines().any(|line| {
+                        line.split_ascii_whitespace()
+                            .take(3)
+                            .eq([name, architecture, version])
+                    }),
+                "Preview omitted the exact native removal row: {preview_stdout}"
             );
             let decline = run(&["clean", "--orphans"], b"n\n")?;
             anyhow::ensure!(
