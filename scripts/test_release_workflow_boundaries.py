@@ -164,6 +164,7 @@ class ReleaseWorkflowBoundaryTests(unittest.TestCase):
                                'fi\nprintf "%s %s\\n" "$1" "$2" >> lookups\n'
                                'test "$PUSH_CI" = success || exit 1\n'
                                '[ "$3" = --stage-linux ] || exit 2\n'
+                               '[ "$5" = --include-macos ] || exit 2\n'
                                'test "$NATIVE_STAGE" = success\n',
                 }
                 (root / 'scripts').mkdir()
@@ -261,22 +262,52 @@ class ReleaseWorkflowBoundaryTests(unittest.TestCase):
                                  expected_gate)
         self.assertIn("if: inputs.smoke_ci_sha == ''", job_block(release, 'build-macos'))
         self.assertIn("inputs.smoke_ci_sha == ''", job_block(release, 'sync-r2'))
+        self.assertIn("inputs.smoke_ci_macos != true", job_block(release, 'sync-r2'))
 
     def test_reused_linux_bytes_are_matched_before_attesting(self):
         release = (WORKFLOWS / 'release.yml').read_text(encoding='utf-8')
         gate = job_block(release, 'gate-on-ci')
         for distro in ('arch', 'debian', 'debian-trixie', 'ubuntu', 'fedora'):
-            self.assertIn(f'name: {distro}-build\n          path: verified-linux/{distro}-build/', gate)
-            self.assertIn("if: needs.gate-on-ci.outputs.linux-version == ''",
+            self.assertIn(f'name: {distro}-build\n          path: verified-native/{distro}-build/', gate)
+            self.assertIn("if: needs.gate-on-ci.outputs.staged-version == ''",
                           job_block(release, f'build-{distro}'))
         publish = job_block(release, 'release')
         match = 'Match release bytes to verified CI archives'
         self.assertLess(publish.index('Collect and verify exact release files'), publish.index(match))
         self.assertLess(publish.index(match), publish.index('Attest release archives and SBOM'))
         self.assertIn('.source_sha == $sha', step_script(publish, match))
+        self.assertIn('["arch", "debian", "debian-trixie", "fedora", "macos", "ubuntu"]',
+                      step_script(publish, match))
         self.assertIn('sha256sum --strict --check', step_script(publish, match))
         for state in ('failure', 'cancelled', 'skipped'):
             self.assertIn(f"!contains(needs.*.result, '{state}')", publish)
+
+    def test_archive_stage_requires_macos_for_publication_and_explicit_smoke(self):
+        release = (WORKFLOWS / 'release.yml').read_text(encoding='utf-8')
+        script = step_script(job_block(release, 'gate-on-ci'), 'Stage verified native archives')
+        commands = (
+            'python3() { printf "%s\\n" "$@" > arguments; }\n'
+            'jq() { case "$2" in *fedora*) echo 1.2.3;; *) echo "$MACOS_DIGEST";; esac; }\n'
+        )
+        sha, digest = 'a' * 40, 'b' * 64
+        for smoke, include, value, expected, status in (
+            ('', 'false', digest, True, 0), (sha, 'true', digest, True, 0),
+            (sha, 'false', '', False, 0), ('', 'false', '', True, 1),
+        ):
+            with self.subTest(smoke=smoke, include=include, status=status), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                output = root / 'output'
+                env = dict(os.environ, SOURCE_SHA=sha, CI_RUN='123', CI_ATTEMPT='1',
+                           SMOKE_CI_SHA=smoke, SMOKE_CI_MACOS=include, MACOS_DIGEST=value,
+                           GITHUB_OUTPUT=str(output))
+                result = subprocess.run([BASH, '-eu', '-o', 'pipefail', '-c', commands + script],
+                                        cwd=root, env=env, capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, status, result.stdout + result.stderr)
+                self.assertEqual('--include-macos' in (root / 'arguments').read_text().splitlines(), expected)
+                if status:
+                    self.assertFalse(output.exists())
+                else:
+                    self.assertEqual(output.read_text().splitlines(), ['version=1.2.3', 'macos-sha256=' + value])
 
     def test_every_rebuilt_release_platform_is_smoked_before_publication(self):
         release = (WORKFLOWS / 'release.yml').read_text(encoding='utf-8')
@@ -298,6 +329,10 @@ class ReleaseWorkflowBoundaryTests(unittest.TestCase):
                 self.assertIn(f'name: staged-linux-smoke-{distro}', linux)
         macos = job_block(release, 'smoke-macos')
         self.assertIn('name: macos-build', macos)
+        self.assertIn('needs: [gate-on-ci, build-macos]', macos)
+        self.assertIn("needs.gate-on-ci.result == 'success'", macos)
+        self.assertIn("needs.gate-on-ci.outputs.macos-sha256 != '' && needs.build-macos.result == 'skipped'", macos)
+        self.assertIn("needs.build-macos.result == 'success'", macos)
         self.assertIn('needs.build-macos.outputs.archive_sha256', macos)
         self.assertIn('test "$actual" = "$ARCHIVE_SHA256"', macos)
         self.assertIn('--staged-dir staged-release', macos)

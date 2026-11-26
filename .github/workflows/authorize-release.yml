@@ -68,9 +68,9 @@ jobs:
           fi
 
           # Version tags are immutable. Verify the required workflows and all
-          # Linux archives before creating a tag.
+          # native archives before creating a tag.
           python3 scripts/require-release-evidence.py "$GITHUB_SHA" \
-            --stage-linux "$RUNNER_TEMP/release-linux-preflight"
+            --stage-linux "$RUNNER_TEMP/release-native-preflight" --include-macos
 
           require_current_main() {
             local live_main
