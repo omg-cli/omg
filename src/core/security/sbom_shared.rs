@@ -31,20 +31,7 @@ pub(super) async fn generate(include_vulns: bool) -> Result<Sbom, SbomError> {
             .sbom_inventory()
             .await
             .context("Failed to list packages")?;
-        let compare = |left: &SbomPackage, right: &SbomPackage| {
-            let (left, right) = (&left.package, &right.package);
-            (&left.name, &left.version, &left.architecture).cmp(&(
-                &right.name,
-                &right.version,
-                &right.architecture,
-            ))
-        };
-        installed.sort_unstable_by(compare);
-        after.sort_unstable_by(compare);
-        anyhow::ensure!(
-            installed == after,
-            "Installed inventory changed during SBOM generation"
-        );
+        verify_inventory(&mut installed, &mut after)?;
         compose(
             &installed,
             audit.as_ref(),
@@ -55,6 +42,27 @@ pub(super) async fn generate(include_vulns: bool) -> Result<Sbom, SbomError> {
     result.map_err(|source| SbomError::Audit {
         source: super::vulnerability::PackageSource(source),
     })
+}
+
+fn verify_inventory(
+    installed: &mut [SbomPackage],
+    after: &mut [SbomPackage],
+) -> anyhow::Result<()> {
+    let compare = |left: &SbomPackage, right: &SbomPackage| {
+        let (left, right) = (&left.package, &right.package);
+        (&left.name, &left.version, &left.architecture).cmp(&(
+            &right.name,
+            &right.version,
+            &right.architecture,
+        ))
+    };
+    installed.sort_unstable_by(compare);
+    after.sort_unstable_by(compare);
+    anyhow::ensure!(
+        installed == after,
+        "Installed inventory changed during SBOM generation"
+    );
+    Ok(())
 }
 
 fn purl(record: &SbomPackage, distro: Distro) -> anyhow::Result<Option<String>> {
@@ -494,6 +502,36 @@ mod tests {
             })
             .collect();
         super::compose(&records, audit, distro)
+    }
+
+    #[test]
+    fn inventory_reconciliation_accepts_reordering_and_refuses_rpm_metadata_changes()
+    -> anyhow::Result<()> {
+        let record = |arch: &str| SbomPackage {
+            package: SecurityPackage {
+                origin: crate::package_managers::types::SecurityOrigin::DistributionPackage,
+                name: "example".into(),
+                version: "2:1-4".into(),
+                advisory_source: None,
+                architecture: Some(arch.into()),
+                description: String::new(),
+                licenses: vec!["MIT".into()],
+            },
+            rpm_vendor: Some("Example Vendor".into()),
+        };
+        let mut installed = [record("x86_64"), record("i686")];
+        let mut after = [record("i686"), record("x86_64")];
+
+        verify_inventory(&mut installed, &mut after)?;
+        assert_eq!(installed[0].package.architecture.as_deref(), Some("i686"));
+
+        after[0].rpm_vendor = None;
+        assert!(verify_inventory(&mut installed, &mut after).is_err());
+
+        after[0] = record("i686");
+        after[0].package.licenses = vec!["Apache-2.0".into()];
+        assert!(verify_inventory(&mut installed, &mut after).is_err());
+        Ok(())
     }
 
     #[test]
