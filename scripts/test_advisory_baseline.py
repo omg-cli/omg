@@ -318,8 +318,9 @@ class AdvisoryReleaseBoundaryTests(unittest.TestCase):
                            '*) test -f pushed;; esac;;\n'
                            'tag) touch tag-created;; push) touch pushed;; esac\n',
                 "bin/gh": "#!/bin/sh\nexit 0\n",
-                "bin/python3": "#!/bin/sh\ntouch readiness-called\nexit 1\n",
-                "scripts/require-workflow-success.sh": "#!/bin/sh\nexit 0\n",
+                "bin/python3": '#!/bin/sh\n'
+                               'if [ "$1" = scripts/require-release-evidence.py ]; then exit 0; fi\n'
+                               'touch readiness-called\nexit 1\n',
             }
             for name, text in fixtures.items():
                 path = root / name

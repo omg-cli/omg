@@ -454,9 +454,7 @@ fn read_status_snapshot() -> Result<StatusSnapshot> {
     // ULTRA FAST: Try binary status file first (zero IPC, sub-ms). The path is
     // environment-selected, so read through the same parent-directory
     // validation the daemon applies before binding (csf_fdd4999c).
-    if backend != crate::package_managers::Backend::Fedora
-        && let Some(fast) = crate::core::fast_status::FastStatus::read_default()
-    {
+    if let Some(fast) = crate::core::fast_status::FastStatus::read_default() {
         return Ok((
             fast.total_packages as usize,
             fast.explicit_packages as usize,
@@ -481,17 +479,7 @@ fn read_status_snapshot() -> Result<StatusSnapshot> {
 
     // Try the daemon on Unix, then fall back to the platform's direct query.
     #[cfg(unix)]
-    let daemon = match backend {
-        #[cfg(feature = "fedora")]
-        crate::package_managers::Backend::Fedora => {
-            crate::core::client::SyncDaemonClient::acquire_with_timeout(
-                std::time::Duration::from_millis(500),
-            )
-        }
-        _ => crate::core::client::SyncDaemonClient::acquire(),
-    };
-    #[cfg(unix)]
-    if let Ok(mut client) = daemon
+    if let Ok(mut client) = crate::core::client::SyncDaemonClient::acquire()
         && let Ok(crate::daemon::protocol::ResponseResult::Status(res)) =
             client.call(&crate::daemon::protocol::Request::Status { id: 0 })
     {
@@ -504,12 +492,6 @@ fn read_status_snapshot() -> Result<StatusSnapshot> {
             Some(res.runtime_versions),
         ));
     }
-
-    #[cfg(feature = "fedora")]
-    anyhow::ensure!(
-        backend != crate::package_managers::Backend::Fedora,
-        "Fedora status requires a live DNF query"
-    );
 
     #[cfg(any(feature = "debian", feature = "debian-pure"))]
     if crate::core::env::distro::is_debian_like() {
@@ -545,6 +527,16 @@ fn status_requires_backend() -> Result<StatusSnapshot> {
 }
 
 pub fn status_sync() -> Result<()> {
+    #[cfg(all(unix, feature = "fedora"))]
+    if matches!(
+        crate::package_managers::resolve_backend(),
+        Ok(crate::package_managers::Backend::Fedora)
+    ) {
+        return crate::cli::tea::async_bridge::run_blocking_future(crate::cli::packages::status(
+            false,
+        ))?;
+    }
+
     let (total, explicit, orphans, updates, security_vulnerabilities, cached_runtimes) =
         read_status_snapshot()?;
 
@@ -556,14 +548,29 @@ pub fn status_sync() -> Result<()> {
         advisory_coverage: security_vulnerabilities,
         ..crate::cli::tea::StatusData::default()
     };
+    print_system_status(
+        &report,
+        cached_runtimes,
+        #[cfg(unix)]
+        false,
+    );
+    Ok(())
+}
+
+pub(super) fn print_system_status(
+    report: &crate::cli::tea::StatusData,
+    cached_runtimes: Option<Vec<(String, String)>>,
+    #[cfg(unix)] confirmed_running: bool,
+) {
     print!("{}", report.render());
 
     // Daemon status: a stale socket node is not a running daemon.
     #[cfg(unix)]
     {
-        let running = crate::core::client::SyncDaemonClient::acquire()
-            .and_then(|mut client| client.ping())
-            .is_ok();
+        let running = confirmed_running
+            || crate::core::client::SyncDaemonClient::acquire()
+                .and_then(|mut client| client.ping())
+                .is_ok();
         if running {
             println!(
                 "  {} {}",
@@ -599,7 +606,10 @@ pub fn status_sync() -> Result<()> {
         }
     }
 
-    if security_vulnerabilities != Some((0, 0)) {
+    #[cfg(not(unix))]
+    let _ = cached_runtimes;
+
+    if report.advisory_coverage != Some((0, 0)) {
         println!(
             "\n  Check vulnerabilities with {}",
             style::accent("omg audit")
@@ -607,7 +617,6 @@ pub fn status_sync() -> Result<()> {
     }
 
     println!();
-    Ok(())
 }
 
 /// Show system metrics in Prometheus format
