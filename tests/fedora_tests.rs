@@ -768,7 +768,7 @@ mod dnf_integration {
             let home = tempfile::Builder::new()
                 .permissions(std::fs::Permissions::from_mode(0o700))
                 .tempdir_in("/tmp")?;
-            let socket = home.path().join("status.sock");
+            let socket = home.path().join("omg.sock");
             let listener = UnixListener::bind(&socket)?;
             listener.set_nonblocking(true)?;
             let (output, sent) = std::thread::scope(|scope| -> Result<_> {
@@ -781,7 +781,7 @@ mod dnf_integration {
                         .env_clear()
                         .env("PATH", "/usr/bin:/bin")
                         .env("HOME", home.path())
-                        .env("OMG_SOCKET_PATH", &socket)
+                        .env("XDG_RUNTIME_DIR", home.path())
                         .env("OMG_DISABLE_TELEMETRY", "1")
                         .env("NO_COLOR", "1")
                         .output()
