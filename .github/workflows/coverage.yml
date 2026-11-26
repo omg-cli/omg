@@ -581,26 +581,29 @@ jobs:
           while IFS=$'\t' read -r role artifact; do
             install -m 755 "$artifact" "$staging/bin/$role"
           done < <(jq -r '.artifacts | to_entries[] | [.key, .value.path] | @tsv' "$evidence_dir/cli-manifest.json")
+
+          # The container and VM write independent profiles. Join both before admission.
+          (timeout --kill-after=5s 780s docker start --attach "$container" 2>&1 | tee "$evidence_dir/tests.log") &
+          sandbox_pid=$!
+          qemu_status=0
           bash scripts/benchmark-qemu.sh --distro arch --arch x86_64 \
             --image-cache "$NATIVE_IMAGE_CACHE" \
             --image-policy tests/qemu-image-provenance/manifest.json \
             --staged-dir "$staging" --native-cli-coverage-dir "$staging" \
-            --evidence-dir "$RUNNER_TEMP/native-cli-qemu"
+            --evidence-dir "$RUNNER_TEMP/native-cli-qemu" || qemu_status=$?
+          run_status=0
+          wait "$sandbox_pid" || run_status=$?
+          collection_status=0
+          docker cp "$container:/evidence/." "$evidence_dir/" || collection_status=$?
+          docker cp "$container:/profiles/." "$profile_dir/" || collection_status=$?
+          if [ "$qemu_status" -ne 0 ]; then exit "$qemu_status"; fi
+          if [ "$run_status" -ne 0 ]; then exit "$run_status"; fi
+          test "$collection_status" -eq 0
           mapfile -t native_returns < <(find "$RUNNER_TEMP/native-cli-qemu" -type d -name native-evidence)
           test "${#native_returns[@]}" = 1
           cp -a "${native_returns[0]}/cli" "$evidence_dir/cli"
           native_profiles="${native_returns[0]%/native-evidence}/native-profiles"
           find "$native_profiles" -maxdepth 1 -type f -name 'omg-extra-*.profraw' -exec cp -t "$profile_dir" {} +
-          if timeout --kill-after=5s 780s docker start --attach "$container" 2>&1 | tee "$evidence_dir/tests.log"; then
-            run_status=0
-          else
-            run_status=$?
-          fi
-          collection_status=0
-          docker cp "$container:/evidence/." "$evidence_dir/" || collection_status=$?
-          docker cp "$container:/profiles/." "$profile_dir/" || collection_status=$?
-          if [ "$run_status" -ne 0 ]; then exit "$run_status"; fi
-          test "$collection_status" -eq 0
           python3 scripts/native-cli-coverage.py verify --manifest "$evidence_dir/cli-manifest.json" \
             --evidence "$evidence_dir/cli" --profiles "$profile_dir"
           python3 - "$binary" "$profile_dir" "$evidence_dir" "$(git rev-parse HEAD)" <<'PY'

@@ -6,6 +6,13 @@ import test_ci_required_results
 
 
 class ParallelChecksTests(unittest.TestCase):
+    def test_portable_checks_the_locked_fuzz_graph_before_application_compiles(self):
+        portable = job_block(CI_YML.read_text(encoding='utf-8'), 'portable')
+        fuzz = 'cargo check --manifest-path fuzz/Cargo.toml --all-targets --locked'
+        self.assertEqual(portable.count(fuzz), 1)
+        self.assertLess(portable.index(fuzz), portable.index('cargo clippy'))
+        self.assertLess(portable.index(fuzz), portable.index('cargo test'))
+
     def test_standalone_suites_share_the_required_mac_runtime_runner(self):
         source = CI_YML.read_text(encoding='utf-8')
         linux = job_block(source, 'standalone-suites')
