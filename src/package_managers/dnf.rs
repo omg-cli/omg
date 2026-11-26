@@ -396,21 +396,21 @@ enum RepositoryQuery<'a> {
     InstalledDetails(&'a str),
 }
 
+const REQUIRE_ALL_REPOSITORIES: &str = "--setopt=*.skip_if_unavailable=false";
+
 const UPGRADE_QUERY_ARGS: [&str; 6] = [
     "--quiet",
     "--color=never",
     "--cacheonly",
-    "--setopt=*.skip_if_unavailable=false",
+    REQUIRE_ALL_REPOSITORIES,
     "list",
     "--upgrades",
 ];
 
-const REPOSITORY_REFRESH_ARGS: [&str; 4] = [
-    "--refresh",
-    "--setopt=*.skip_if_unavailable=false",
-    "makecache",
-    "-y",
-];
+const CACHED_UPGRADE_PREVIEW_ARGS: [&str; 3] = ["--cacheonly", REQUIRE_ALL_REPOSITORIES, "upgrade"];
+
+const REPOSITORY_REFRESH_ARGS: [&str; 4] =
+    ["--refresh", REQUIRE_ALL_REPOSITORIES, "makecache", "-y"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum InstalledSizeQuery<'a> {
@@ -469,7 +469,8 @@ impl PreparedDnfRemoval {
 }
 
 enum DnfAdmission<'a> {
-    InstallOrUpgrade,
+    Install,
+    Upgrade,
     Remove {
         packages: &'a [String],
         comment: Option<&'a str>,
@@ -2399,7 +2400,7 @@ impl DnfPackageManager {
         let mut repositories = Self::advisory_command(&cache)?;
         repositories.args([
             "--cacheonly",
-            "--setopt=*.skip_if_unavailable=false",
+            REQUIRE_ALL_REPOSITORIES,
             "repo",
             "info",
             "--enabled",
@@ -2760,7 +2761,11 @@ impl DnfPackageManager {
             "Install requires package operands"
         );
         Self::validate_install_selectors(packages)?;
-        Ok(DnfAdmission::InstallOrUpgrade)
+        if action == "upgrade" {
+            Ok(DnfAdmission::Upgrade)
+        } else {
+            Ok(DnfAdmission::Install)
+        }
     }
 
     #[doc(hidden)]
@@ -2772,7 +2777,9 @@ impl DnfPackageManager {
         );
         let manager = Self::new();
         match Self::admission_request(args)? {
-            DnfAdmission::InstallOrUpgrade => manager.execute_reviewed_transaction(args).await,
+            DnfAdmission::Install | DnfAdmission::Upgrade => {
+                manager.execute_reviewed_transaction(args).await
+            }
             DnfAdmission::Remove {
                 packages,
                 comment,
@@ -2797,11 +2804,9 @@ impl DnfPackageManager {
     }
 
     async fn execute_reviewed_transaction(&self, args: &[String]) -> Result<()> {
+        let action = Self::admission_request(args)?;
         anyhow::ensure!(
-            matches!(
-                Self::admission_request(args)?,
-                DnfAdmission::InstallOrUpgrade
-            ),
+            matches!(action, DnfAdmission::Install | DnfAdmission::Upgrade),
             "DNF install/upgrade admission requires an install or upgrade"
         );
         crate::core::security::policy::require_native_plan_support("DNF")?;
@@ -2811,6 +2816,9 @@ impl DnfPackageManager {
         );
         let directory = Self::removal_preview_directory()?;
         let mut command: tokio::process::Command = Self::native_package_command("dnf")?.into();
+        if matches!(action, DnfAdmission::Upgrade) {
+            command.arg(REQUIRE_ALL_REPOSITORIES);
+        }
         command
             .args(args)
             .arg(format!("--store={}", directory.path().display()));
@@ -3238,7 +3246,7 @@ impl DnfPackageManager {
     }
 
     pub(crate) async fn preview_cached_upgrade() -> Result<(String, String)> {
-        Self::preview_declined_transaction(["--cacheonly", "upgrade"]).await
+        Self::preview_declined_transaction(CACHED_UPGRADE_PREVIEW_ARGS).await
     }
 
     pub(crate) async fn preview_removal(packages: &[String]) -> Result<(String, String)> {
@@ -4604,6 +4612,23 @@ mod tests {
         upgrades.env("LC_ALL", "C").args(UPGRADE_QUERY_ARGS);
         let error = DnfPackageManager::query_output(upgrades).await.unwrap_err();
         assert!(error.to_string().contains("DNF query failed"), "{error:#}");
+
+        let mut preview = configure();
+        preview
+            .env("LC_ALL", "C")
+            .args(["--color=never", "--assumeno"])
+            .args(CACHED_UPGRADE_PREVIEW_ARGS);
+        let output = DnfPackageManager::capture_query(
+            "DNF",
+            preview,
+            std::time::Duration::from_secs(5),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+        let error = DnfPackageManager::transaction_preview_output(&output).unwrap_err();
+        assert!(error.to_string().contains("omg-fault"), "{error:#}");
 
         let path = root.to_owned();
         fixture.close().unwrap();
