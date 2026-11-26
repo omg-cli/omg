@@ -819,14 +819,16 @@ pub fn remove_license() -> Result<()> {
     }
 }
 
-/// Redact a license key for logging. Only a short prefix of plain-ASCII
-/// keys is kept; any other input degrades to a fixed placeholder so
-/// logging can never panic on multi-byte keys or leak their shape.
-fn redact_key(key: &str) -> String {
-    match key.get(..8) {
-        Some(prefix) if key.len() > 8 && prefix.is_ascii() => format!("{prefix}..."),
-        _ => "***".to_string(),
-    }
+pub(crate) fn check_dashboard_token(key: &str) -> Result<()> {
+    anyhow::ensure!(!key.is_empty(), "Dashboard token is empty");
+    anyhow::ensure!(
+        key.len() <= 128
+            && key
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-'),
+        "Invalid dashboard token format"
+    );
+    Ok(())
 }
 
 /// Validate a license key with optional user info for team identification
@@ -835,6 +837,7 @@ pub async fn validate_license_with_user(
     user_name: Option<&str>,
     user_email: Option<&str>,
 ) -> Result<LicenseResponse> {
+    check_dashboard_token(key)?;
     let machine_id = get_machine_id();
 
     let payload = serde_json::json!({
@@ -844,14 +847,10 @@ pub async fn validate_license_with_user(
         "user_email": user_email,
     });
 
-    // Redact key and PII
-    let redacted_key = redact_key(key);
     tracing::debug!(
-        "Validating license. Key: {}, MachineID: {}, HasUser: {}, HasEmail: {}",
-        redacted_key,
-        machine_id,
-        user_name.is_some(),  // Log presence only, not value
-        user_email.is_some()  // Log presence only, not value
+        has_user = user_name.is_some(),
+        has_email = user_email.is_some(),
+        "Validating dashboard token"
     );
 
     let response = crate::core::http::shared_client()
@@ -869,30 +868,36 @@ pub async fn validate_license_with_user(
         .await
         .context("Failed to read license response body (or it exceeded the 16 MiB limit)")?;
 
-    // Parse response first
-    let mut resp: LicenseResponse = serde_json::from_str(&response_text).context(format!(
-        "Failed to parse license response. Status: {status}"
-    ))?;
+    parse_validation_response(status, &response_text, key)
+}
 
-    // Log only safe fields
-    tracing::debug!(
-        "License API response: valid={}, tier={:?}, has_token={}, error={:?}",
-        resp.valid,
-        resp.tier,
-        resp.token.is_some(),
-        resp.error
+fn parse_validation_response(
+    status: reqwest::StatusCode,
+    body: &str,
+    key: &str,
+) -> Result<LicenseResponse> {
+    let mut response: LicenseResponse = serde_json::from_str(body)
+        .map_err(|_| anyhow::anyhow!("Invalid dashboard validation response (HTTP {status})"))?;
+    anyhow::ensure!(
+        status.is_success() || !response.valid,
+        "Dashboard validation returned HTTP {status}"
     );
 
-    // Remote error text is echoed to the terminal by the caller via
-    // anyhow; strip terminal control sequences at the trust boundary
-    // (csf_861ca461).
-    resp.error = resp
-        .error
-        .take()
-        .map(|error| sanitize_terminal_text(&error));
-    resp.tier = resp.tier.take().map(|tier| sanitize_terminal_text(&tier));
-
-    Ok(resp)
+    tracing::debug!(
+        %status,
+        valid = response.valid,
+        has_token = response.token.is_some(),
+        "Received dashboard validation response"
+    );
+    let sanitize = |text: Option<String>| {
+        text.map(|value| sanitize_terminal_text(&value))
+            .filter(|text| !text.trim().is_empty() && !text.contains(key))
+    };
+    response.error = sanitize(response.error.take());
+    response.tier = sanitize(response.tier.take());
+    response.customer = sanitize(response.customer.take());
+    response.expires_at = sanitize(response.expires_at.take());
+    Ok(response)
 }
 
 /// Load the stored account or fail with the link hint.
@@ -1415,15 +1420,40 @@ mod tests {
     }
 
     #[test]
-    fn key_redaction_never_panics_on_multibyte_input() {
-        // Regression: slicing &key[..8] panicked when byte 8 was not a
-        // char boundary (e.g. multi-byte license keys).
-        assert_eq!(redact_key("abcdefgh12345678"), "abcdefgh...");
-        assert_eq!(redact_key("short"), "***");
-        // 3-byte CJK characters straddling byte 8 must not panic.
-        assert_eq!(redact_key("\u{4e2d}\u{65ad}\u{6d4b}\u{8bd5}key"), "***");
-        assert_eq!(redact_key("\u{4e2d}\u{65ad}\u{6d4b}key-more"), "***");
-        assert_eq!(redact_key(""), "***");
+    fn dashboard_validation_rejects_http_errors_that_claim_success() {
+        let body = r#"{"valid":true,"token":"opaque-token-fixture","tier":"free"}"#;
+        let result = parse_validation_response(reqwest::StatusCode::OK, body, "synthetic-fixture")
+            .expect("a successful response is passed to signature verification");
+        assert!(result.valid);
+        assert_eq!(result.token.as_deref(), Some("opaque-token-fixture"));
+
+        let error =
+            parse_validation_response(reqwest::StatusCode::FORBIDDEN, body, "synthetic-fixture")
+                .expect_err("HTTP errors cannot activate an account");
+        assert!(error.to_string().contains("HTTP 403"));
+        assert!(!error.to_string().contains("opaque-token-fixture"));
+    }
+
+    #[test]
+    fn dashboard_validation_errors_do_not_echo_credentials_or_parser_input() {
+        let key = "synthetic-fixture";
+        let status = reqwest::StatusCode::UNAUTHORIZED;
+        let body = r#"{"valid":false,"error":"revoked"}"#;
+        let rejected = parse_validation_response(status, body, key).expect("standard rejection");
+        assert_eq!(rejected.error.as_deref(), Some("revoked"));
+
+        let body = r#"{"valid":false,"error":"credential synthetic-fixture rejected","customer":"synthetic-fixture","expires_at":"2030-01-01"}"#;
+        let rejected = parse_validation_response(status, body, key).expect("credential rejection");
+        assert!(!rejected.valid);
+        assert!(rejected.error.is_none());
+        assert!(rejected.customer.is_none());
+        assert_eq!(rejected.expires_at.as_deref(), Some("2030-01-01"));
+
+        let body = r#"{"valid":"synthetic-fixture"}"#;
+        let error =
+            parse_validation_response(status, body, key).expect_err("invalid response shape");
+        assert!(format!("{error:#}").contains("Invalid dashboard validation response"));
+        assert!(!format!("{error:#}").contains(key));
     }
 
     #[test]

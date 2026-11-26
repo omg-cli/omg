@@ -5681,6 +5681,79 @@ fixture["seed_runtime_advisory_fixture"](root, "node", version, config)
                     checked(["/usr/bin/umount",system_path])
 
 
+    def inspect_dashboard_token_admission():
+        phase = "fedora-dashboard-token-admission"
+        token = b"QZ7FixtureKey-48F"
+        cases = (
+            ("ordinary",token,"transport"),
+            ("short",b"QZ7","transport"),
+            ("maximum",token.ljust(128,b"X"),"transport"),
+            ("newline",token+b"\r\n","transport"),
+            ("trailing-whitespace",token+b" \t\n","transport"),
+            ("input-boundary",token.ljust(16384,b" "),"transport"),
+            ("empty",b"","empty"),
+            ("whitespace-only",b" \t\n","empty"),
+            ("leading-whitespace",b" "+token,"format"),
+            ("embedded-whitespace",token[:8]+b" "+token[8:],"format"),
+            ("non-ascii",token+b"\xc3\xa9","format"),
+            ("punctuation",token+b"/","format"),
+            ("overlong-token",token.ljust(129,b"X"),"format"),
+            ("input-limit",token.ljust(16385,b" "),"limit"),
+            ("invalid-utf8",token+b"\xff","encoding"),
+        )
+        reasons = {"empty":"Dashboard token is empty","format":"Invalid dashboard token format",
+                   "limit":"Dashboard token exceeds the input limit"}
+        for name, raw, expectation in cases:
+            with tempfile.TemporaryDirectory(prefix="dashboard-token-", dir=work) as directory:
+                home = Path(directory)
+                data, config = home/"data", home/"config"
+                for path in (home,data,config):
+                    path.mkdir(exist_ok=True)
+                    path.chmod(0o700)
+                    os.chown(path,account.pw_uid,account.pw_gid)
+                settings = config/"config.toml"
+                settings.write_bytes(b"telemetry_enabled = false\n")
+                saved = data/"license.json"
+                prior = b'{"key":"previous-credential-fixture","tier":"free","features":[],"validated_at":0}'
+                saved.write_bytes(prior)
+                for path in (settings,saved):
+                    path.chmod(0o600)
+                    os.chown(path,account.pw_uid,account.pw_gid)
+                env = dict(disabled,HOME=str(home),OMG_DATA_DIR=str(data),OMG_CONFIG_DIR=str(config),
+                           XDG_CONFIG_HOME=str(home/"xdg-config"),XDG_DATA_HOME=str(home/"xdg-data"),
+                           XDG_STATE_HOME=str(home/"state"),XDG_CACHE_HOME=str(home/"cache"),
+                           CI="1",OMG_NO_UPDATE_CHECK="1",RUST_LOG="omg_lib::core::license=debug")
+                for mode in ("stdin","environment"):
+                    chosen = env.copy()
+                    args = [str(cli),"account","link"]
+                    if mode=="stdin":
+                        args += ["--token-stdin"]
+                        input_data = raw
+                    else:
+                        chosen["OMG_DASHBOARD_TOKEN"] = os.fsdecode(raw)
+                        input_data = b""
+                    result = subprocess.run(args,cwd=home,env=chosen,input=input_data,
+                                            capture_output=True,timeout=12,**ordinary)
+                    output = result.stdout.decode(errors="replace")
+                    errors = result.stderr.decode(errors="replace")
+                    log = output+errors
+                    surfaced_secret = any(piece in log for piece in ("QZ7Fixture","QZ7Fixtu","QZ7"))
+                    entered = "Validating token..." in output
+                    offline = "Failed to connect to dashboard" in errors
+                    if expectation=="transport":
+                        gate = entered and offline
+                    elif expectation=="encoding":
+                        gate = not entered and not offline and "UTF-8" in errors if mode=="stdin" else (
+                            not entered and not offline and "unicode" in errors.lower())
+                    else:
+                        gate = not entered and not offline and reasons[expectation] in errors
+                    preserved = saved.read_bytes()==prior and "Dashboard account linked." not in output
+                    checks.append(dict(phase=phase,case=f"{name}-{mode}",status=result.returncode,
+                        passed=bool(result.returncode==1 and gate and not surfaced_secret and preserved),
+                        diagnostic=(expectation,entered,offline,surfaced_secret,preserved,
+                                    "input limit" in errors,"format" in errors,"empty" in errors)))
+
+
     def inspect_task_environment_bytes():
         phase = "task-environment-bytes"
         raw = b"test-\xff-value"
@@ -8424,6 +8497,7 @@ exec {shlex.quote(str(binary))} "$@"
                     inspect_saved_usage_stats()
                     inspect_account_storage()
                     inspect_machine_identity()
+                    inspect_dashboard_token_admission()
                 config.write_text(host_config)
                 inspect("returned-host", host_count, host_explicit, host=True)
                 mark_progress("root switch and return")
@@ -8735,6 +8809,6 @@ mark_progress("completed with host inventory unchanged")
 report = dict(binaries=binaries, checks=checks, total=len(checks),
               passed=sum(entry["passed"] for entry in checks), host_unchanged=True)
 print(json.dumps(report))
-expected_checks = 303 if consent_oracle is None else 2714
+expected_checks = 303 if consent_oracle is None else 2744
 if report["passed"] != report["total"] or report["total"] != expected_checks:
     sys.exit(4)

@@ -8,8 +8,6 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-#[cfg(feature = "license")]
-use anyhow::Context;
 use anyhow::Result;
 use clap::Parser;
 
@@ -1452,21 +1450,31 @@ async fn handle_license_command(command: &AccountCommands) -> Result<()> {
     use omg_lib::cli::license;
     match command {
         AccountCommands::Link { token_stdin } => {
-            let token = if *token_stdin {
-                use std::io::Read;
-                let mut token = String::new();
-                std::io::stdin().take(16385).read_to_string(&mut token)?;
-                anyhow::ensure!(
-                    token.len() <= 16384,
-                    "Dashboard token exceeds the input limit"
-                );
-                token.trim_end().to_owned()
+            const MAX_TOKEN_INPUT_BYTES: usize = 16 * 1024;
+            let raw = if *token_stdin {
+                use std::io::Read as _;
+
+                let mut raw = String::new();
+                std::io::stdin()
+                    .take((MAX_TOKEN_INPUT_BYTES + 1) as u64)
+                    .read_to_string(&mut raw)?;
+                raw
             } else {
-                std::env::var("OMG_DASHBOARD_TOKEN")
-                    .context("Set OMG_DASHBOARD_TOKEN or use --token-stdin")?
+                match std::env::var("OMG_DASHBOARD_TOKEN") {
+                    Ok(token) => token,
+                    Err(std::env::VarError::NotPresent) => {
+                        anyhow::bail!("Set OMG_DASHBOARD_TOKEN or use --token-stdin");
+                    }
+                    Err(std::env::VarError::NotUnicode(_)) => {
+                        anyhow::bail!("Dashboard token environment variable is not valid Unicode");
+                    }
+                }
             };
-            anyhow::ensure!(!token.is_empty(), "Dashboard token is empty");
-            license::activate(&token).await
+            anyhow::ensure!(
+                raw.len() <= MAX_TOKEN_INPUT_BYTES,
+                "Dashboard token exceeds the input limit"
+            );
+            license::activate(raw.trim_end()).await
         }
         AccountCommands::Status => license::status(),
         AccountCommands::Unlink => license::deactivate(),

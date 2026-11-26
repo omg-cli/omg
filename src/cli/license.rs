@@ -23,9 +23,7 @@ fn prompt(message: &str) -> String {
 /// Returns an error when the token format is invalid or the link
 /// request fails (network, server rejection, or persistence failure).
 pub async fn activate(key: &str) -> Result<()> {
-    if key.len() > 128 || key.chars().any(|c| !c.is_ascii_alphanumeric() && c != '-') {
-        anyhow::bail!("Invalid dashboard token format");
-    }
+    license::check_dashboard_token(key)?;
 
     println!("{} Linking dashboard account...\n", style::runtime("OMG"));
 
