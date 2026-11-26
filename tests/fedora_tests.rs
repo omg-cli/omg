@@ -2197,17 +2197,22 @@ mod dnf_operations {
                     }),
                 "Preview omitted the exact native removal row: {preview_stdout}"
             );
-            let decline = run(&["clean", "--orphans"], b"n\n")?;
-            anyhow::ensure!(
-                decline.status.code() == Some(1) && installed()?,
-                "Native decline did not preserve the fixture"
-            );
-            let declined = history.load()?;
-            anyhow::ensure!(
-                declined.len() == 1 && !declined[0].success && declined[0].changes.is_empty(),
-                "Unexpected decline history: {declined:?}; stderr: {}",
-                String::from_utf8_lossy(&decline.stderr)
-            );
+            for (attempt, answer) in [b"n\n".as_slice(), b"\n"].into_iter().enumerate() {
+                let decline = run(&["clean", "--orphans"], answer)?;
+                anyhow::ensure!(
+                    decline.status.code() == Some(1) && installed()?,
+                    "Native decline did not preserve the fixture for input {answer:?}"
+                );
+                let declined = history.load()?;
+                anyhow::ensure!(
+                    declined.len() == attempt + 1
+                        && declined
+                            .iter()
+                            .all(|entry| !entry.success && entry.changes.is_empty()),
+                    "Unexpected decline history: {declined:?}; stderr: {}",
+                    String::from_utf8_lossy(&decline.stderr)
+                );
+            }
             let accepted = run(&["clean", "--orphans"], b"y\n")?;
             anyhow::ensure!(
                 accepted.status.success() && !installed()?,
@@ -2215,16 +2220,16 @@ mod dnf_operations {
             );
             let records = history.load()?;
             anyhow::ensure!(
-                records.len() == 2
-                    && records[1].success
-                    && records[1].transaction_type == TransactionType::Remove,
+                records.len() == 3
+                    && records[2].success
+                    && records[2].transaction_type == TransactionType::Remove,
                 "Missing cleanup history"
             );
             anyhow::ensure!(
-                records[1].changes.len() == 1
-                    && records[1].changes[0].name == "tree"
-                    && records[1].changes[0].old_version.as_deref() == Some(version)
-                    && records[1].changes[0].new_version.is_none(),
+                records[2].changes.len() == 1
+                    && records[2].changes[0].name == "tree"
+                    && records[2].changes[0].old_version.as_deref() == Some(version)
+                    && records[2].changes[0].new_version.is_none(),
                 "Cleanup history differs from native removal"
             );
             anyhow::ensure!(
@@ -2236,7 +2241,7 @@ mod dnf_operations {
                 "Cache cleanup failed"
             );
             anyhow::ensure!(
-                history.load()?.len() == 2,
+                history.load()?.len() == 3,
                 "Empty or cache cleanup invented package history"
             );
             Ok(())

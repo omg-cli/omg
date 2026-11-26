@@ -3125,6 +3125,13 @@ impl DnfPackageManager {
                 let mut arguments = vec!["autoremove".to_owned()];
                 if yes {
                     arguments.push("--assumeyes".to_owned());
+                } else {
+                    // The CLI owns opt-in. DNF's config may skip the prompt or
+                    // select yes when the user's answer is blank.
+                    arguments.extend(
+                        ["--setopt=assumeyes=false", "--setopt=defaultyes=false"]
+                            .map(str::to_owned),
+                    );
                 }
                 self.recorded_mutation(
                     crate::core::history::TransactionType::Remove,
