@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::config::mise_env::{Environment, ResolvedEnv, prepend_paths};
-use crate::core::runtime_resolver::{RuntimeVersionReq, find_in_path};
+use crate::core::runtime_resolver::{RuntimeVersionReq, find_in_path, version_directory_name};
 use crate::hooks::{self, NodeSelection, NodeSelectionMode};
 
 #[cfg(test)]
@@ -816,12 +816,19 @@ macro_rules! ensure_runtime_impl {
 }
 
 fn ensure_python_runtime(version: &str) -> Result<String> {
+    let version = version.trim_start_matches('v');
+    let data_dir = crate::core::paths::data_dir();
+    if let Some(bin) = hooks::resolve_runtime_bin_dir(&data_dir, "python", version)? {
+        return Ok(version_directory_name(&bin)?.to_owned());
+    }
+
+    let prompt = format!("Python '{version}' is missing. Install now?");
+    if !confirm_interactively(&prompt)? {
+        anyhow::bail!("Python setup cancelled");
+    }
     let manager = crate::runtimes::PythonManager::new();
-    ensure_runtime_impl!(
-        "Python",
-        version.trim_start_matches('v').to_string(),
-        manager
-    )
+    run_async(manager.install(version))?;
+    Ok(version.to_owned())
 }
 
 fn ensure_go_runtime(version: &str) -> Result<String> {

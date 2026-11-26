@@ -394,14 +394,16 @@ fn parse_pyproject_requires_python(
     };
     let pyproject: PyProjectToml = toml::from_str(&content)
         .with_context(|| format!("Failed to parse {}", file_path.display()))?;
-    // Keep the specifier raw (`>=3.12`, `~=3.12.1`, …): it is a version
-    // request, not an exact pin, and the PATH resolver maps it against the
-    // installed version tree.
     if let Some(requires_python) = pyproject
         .project
         .and_then(|project| project.requires_python)
         && !requires_python.trim().is_empty()
     {
+        anyhow::ensure!(
+            crate::runtimes::python::PythonVersionSpec::parse(&requires_python).is_some(),
+            "Invalid requires-python in {}",
+            file_path.display()
+        );
         versions.insert("python".to_string(), requires_python);
     }
     Ok(())
@@ -843,9 +845,9 @@ fn node_version_bin_path(versions_dir: &Path, version: &str) -> Option<PathBuf> 
 /// One generic resolver for the runtimes whose pins come straight from
 /// repo-supplied files: the request is mapped onto
 /// `<data_dir>/versions/<runtime>/<version>/bin`, first by a safe exact
-/// lookup and then by the newest installed semver match. Nothing that fails
+/// lookup and then by the newest matching installed release. Nothing that fails
 /// validation or does not exist is ever returned.
-fn resolve_runtime_bin_dir(
+pub(crate) fn resolve_runtime_bin_dir(
     data_dir: &Path,
     runtime: &str,
     raw_request: &str,
@@ -870,10 +872,14 @@ fn resolve_runtime_bin_dir(
     }
 
     let versions_dir = data_dir.join("versions").join(runtime);
-    let Some(resolved) = resolve_installed_version_req(&versions_dir, &request)? else {
-        return Ok(None);
+    let resolved = if runtime == "python"
+        && let Some(specifier) = crate::runtimes::python::PythonVersionSpec::parse(&request)
+    {
+        resolve_installed_matching_version(&versions_dir, |name| specifier.match_rank(name))?
+    } else {
+        resolve_installed_version_req(&versions_dir, &request)?
     };
-    Ok(validated_runtime_bin_dir(data_dir, runtime, &resolved))
+    Ok(resolved.and_then(|resolved| validated_runtime_bin_dir(data_dir, runtime, &resolved)))
 }
 
 /// Resolve `<data_dir>/versions/<runtime>/<version>/bin` for the runtimes whose
@@ -944,6 +950,16 @@ fn resolve_installed_version_req(versions_dir: &Path, req: &str) -> Result<Optio
     let Some(req) = RuntimeVersionReq::parse(req) else {
         return Ok(None);
     };
+    resolve_installed_matching_version(versions_dir, |name| {
+        let version = Version::parse(name.strip_prefix('v').unwrap_or(name)).ok()?;
+        req.matches(&version).then_some(version)
+    })
+}
+
+fn resolve_installed_matching_version<T: Ord>(
+    versions_dir: &Path,
+    match_version: impl Fn(&str) -> Option<T>,
+) -> Result<Option<String>> {
     let mut best = None;
 
     let entries = match fs::read_dir(versions_dir) {
@@ -971,11 +987,7 @@ fn resolve_installed_version_req(versions_dir: &Path, req: &str) -> Result<Optio
         if name == "current" || !crate::runtimes::common::is_valid_version_dir(&entry.path()) {
             continue;
         }
-        let ver_str = name.strip_prefix('v').unwrap_or(&name);
-        let Ok(version) = Version::parse(ver_str) else {
-            continue;
-        };
-        if req.matches(&version) {
+        if let Some(version) = match_version(&name) {
             let candidate = (version, name);
             if best.as_ref().is_none_or(|best| &candidate > best) {
                 best = Some(candidate);

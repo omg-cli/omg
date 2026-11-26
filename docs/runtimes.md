@@ -88,6 +88,8 @@ Install the [shell hook](./shell-integration.md) to update the terminal's comman
 
 OMG checks the current directory, then its parents. The nearest directory with a pin for a runtime wins. Within one directory, dedicated files are read before `.tool-versions`, `package.json`, and mise layers. For Node, that means `.node-version` takes priority over `.nvmrc`, then `.tool-versions`, then `package.json`. Within `package.json`, `engines` takes priority over `volta`. For Python, `.python-version` takes priority over `pyproject.toml`'s `[project]` `requires-python`.
 
+Python's `requires-python` uses [PEP 440 version specifiers](https://packaging.python.org/en/latest/specifications/version-specifiers/). Hooks, tasks, and `omg use python` choose the newest matching installed release, preferring stable releases unless a prerelease is requested. When setup needs a download, the Python manager uses the constraint to select the published release.
+
 A `.nvmrc` holds one Node version or alias. OMG ignores blank lines, `#` comments and reserved metadata entries with unique keys. An invalid file in the current directory stops task setup and explicit version lookup. The shell hook can still use another valid pin.
 
 A `.tool-versions` file can pin several runtimes:

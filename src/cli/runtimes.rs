@@ -109,7 +109,6 @@ macro_rules! impl_runtime_install_use {
 }
 
 impl_runtime_install_use!(
-    PythonManager,
     GoManager,
     RubyManager,
     JavaManager,
@@ -151,6 +150,9 @@ fn canonical_runtime_name(runtime: &str) -> String {
 }
 
 fn validate_requested_version(runtime: &str, version: &str) -> Result<()> {
+    if runtime == "python" && crate::runtimes::python::PythonVersionSpec::parse(version).is_some() {
+        return Ok(());
+    }
     if runtime == "node"
         && version.len() <= crate::core::security::validation::MAX_VERSION_LENGTH
         && !version.chars().any(char::is_control)
@@ -213,18 +215,25 @@ async fn select_version(runtime: &str, version: Option<&str>, restoring: bool) -
             let manager = NodeManager::new();
             match selection {
                 crate::hooks::NodeSelection::Installed(path) => {
-                    let directory_version = path
-                        .parent()
-                        .and_then(std::path::Path::file_name)
-                        .and_then(std::ffi::OsStr::to_str)
-                        .context("Selected Node installation has no version directory")?;
+                    let directory_version =
+                        crate::core::runtime_resolver::version_directory_name(&path)?;
                     manager.activate_installed(directory_version)?;
                 }
                 crate::hooks::NodeSelection::Missing(request) => manager.install(&request).await?,
             }
         }
         "python" => {
-            install_or_use(&PythonManager::new(), strip_version_prefix(&version)).await?;
+            let data_dir = crate::core::paths::data_dir();
+            let request = strip_version_prefix(&version);
+            let manager = PythonManager::new();
+            if let Some(bin) = crate::hooks::resolve_runtime_bin_dir(&data_dir, "python", request)?
+            {
+                manager.activate_installed(
+                    crate::core::runtime_resolver::version_directory_name(&bin)?,
+                )?;
+            } else {
+                manager.install(request).await?;
+            }
         }
         "rust" => {
             // Rust manager handles toolchains internally; always delegates to install

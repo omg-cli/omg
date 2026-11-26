@@ -2696,6 +2696,111 @@ printf 'fixture node {directory} {version}|<%s>\\n' "$@"
                                    diagnostic=(result.stdout + result.stderr)[-1300:]))
 
 
+    def inspect_python_project_constraints():
+        releases = ("3.11.9", "3.12.0", "3.12.7", "3.12.9", "3.13.0", "3.13.8", "3.14.1")
+        seed = r"""
+import importlib.util, json, sys
+from pathlib import Path
+helper, directory, releases = sys.argv[1:]
+spec = importlib.util.spec_from_file_location("runtime_advisory_fixture", helper)
+fixture = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(fixture)
+home = Path(directory)
+config = Path(fixture.fixture_cli_environment(home)["OMG_CONFIG_DIR"])
+for version in json.loads(releases):
+    root = home / "data" / "versions/python" / version
+    executable = root / "bin/python3"
+    executable.parent.mkdir(parents=True)
+    executable.write_text(f'''#!/bin/sh
+if [ "$1" = --version ]; then
+    printf '%s\\n' 'Python {version}'
+    exit
+fi
+printf 'fixture python {version}|<%s>\\n' "$@"
+''')
+    executable.chmod(0o755)
+    fixture.seed_runtime_advisory_fixture(root, "python", version, config)
+"""
+        phase = "python-project-constraints"
+        cases = (
+            ("bounded", ">=3.12,<3.13", None, None, "3.12.9"),
+            ("compatible-minor", "~=3.12.5", None, None, "3.12.9"),
+            ("compatible-major", "~=3.12", None, None, "3.14.1"),
+            ("equal-wildcard", "==3.12.*", None, None, "3.12.9"),
+            ("equal-padding", "== 3.12", None, None, "3.12.0"),
+            ("exclude-patch", ">=3.12,<3.13,!=3.12.9", None, None, "3.12.7"),
+            ("exclude-series", ">=3.12,<3.14,!=3.13.*", None, None, "3.12.9"),
+            ("exclusive", ">3.12.7, <3.13", None, None, "3.12.9"),
+            ("parent-project", None, ("pyproject.toml", "~=3.12.5"), None, "3.12.9"),
+            ("nearest-project", "~=3.12.5", (".python-version", "3.14.1"), None, "3.12.9"),
+            ("dedicated-pin", ">=,3.12", None, "3.11.9", "3.11.9"),
+            ("invalid-specifier", ">=,3.12", (".python-version", "3.14.1"), None, None),
+            ("unavailable", ">=4", None, None, None),
+        )
+        with tempfile.TemporaryDirectory(prefix="python-project-constraints-", dir=work) as directory:
+            here = Path(directory)
+            os.chown(here, account.pw_uid, account.pw_gid)
+            checked([sys.executable, "-I", "-B", "-c", seed, runtime_advisory_fixture, here, json.dumps(releases)],
+                    dict(disabled, HOME=str(here)), ordinary)
+            data = here / "data"
+            env = dict(disabled, HOME=str(here), OMG_DATA_DIR=str(data),
+                       OMG_CONFIG_DIR=str(here/"config"/"omg"), OMG_NATIVE_TEST_DATA_DIR="1",
+                       XDG_CONFIG_HOME=str(here/"config"), XDG_DATA_HOME=str(here/"xdg-data"),
+                       XDG_CACHE_HOME=str(here/"cache"), XDG_STATE_HOME=str(here/"state"))
+            versions = data / "versions/python"
+            current = versions / "current"
+            initial = versions / "3.11.9"
+            paths = [str(versions / release / "bin") for release in releases]
+
+            def write_pin(folder, filename, value):
+                text = f"[project]\nrequires-python = {json.dumps(value)}\n" if filename == "pyproject.toml" else value
+                (folder / filename).write_text(text)
+
+            for label, constraint, parent, dedicated, expected in cases:
+                family = here / label
+                project = family / "project"
+                project.mkdir(parents=True)
+                if constraint is not None:
+                    write_pin(project, "pyproject.toml", constraint)
+                if parent is not None:
+                    write_pin(family, *parent)
+                if dedicated is not None:
+                    write_pin(project, ".python-version", dedicated)
+                if current.is_symlink():
+                    current.unlink()
+                current.symlink_to(initial)
+                os.lchown(current, account.pw_uid, account.pw_gid)
+                for mode, args in (
+                    ("hook", ("hook-env", "--shell", "bash")),
+                    ("task", ("run", "python3", "--", "two words")),
+                    ("use", ("use", "python")),
+                ):
+                    result = subprocess.run([cli, *args], cwd=project, env=env, stdin=subprocess.DEVNULL,
+                                            capture_output=True, text=True, timeout=8, **ordinary)
+                    active = current.resolve(strict=True)
+                    output = [line for line in result.stdout.splitlines() if line.startswith("fixture python ")]
+                    if mode == "hook":
+                        hook_release = "3.14.1" if label == "invalid-specifier" else expected
+                        matching = str(versions / hook_release / "bin") if hook_release else None
+                        emitted = [path for path in paths if f"'{path}'" in result.stdout]
+                        passed = result.returncode == 0 and emitted == ([matching] if matching else []) and active == initial
+                    elif label == "invalid-specifier":
+                        passed = (result.returncode != 0 and not output and active == initial
+                                  and "Invalid requires-python" in result.stderr)
+                    elif label == "unavailable":
+                        diagnostic = "Interactive confirmation required:" if mode == "task" else "Failed to fetch"
+                        passed = result.returncode != 0 and not output and active == initial and diagnostic in result.stderr
+                    elif mode == "task":
+                        passed = (result.returncode == 0 and active == initial
+                                  and output == [f"fixture python {expected}|<two words>"])
+                    else:
+                        passed = (result.returncode == 0 and active == versions / expected
+                                  and "Now using Python" in result.stdout and "Downloading" not in result.stdout)
+                    checks.append(dict(phase=phase, case=f"{label}-{mode}", status=result.returncode,
+                                       passed=passed, active=active.name, expected=expected,
+                                       diagnostic=(result.stdout + result.stderr)[-1200:]))
+
+
     def inspect_task_environment_bytes():
         phase = "task-environment-bytes"
         raw = b"test-\xff-value"
@@ -5397,6 +5502,7 @@ exec {shlex.quote(str(binary))} "$@"
                     inspect_task_runtime_admissions()
                     inspect_task_version_requirements()
                     inspect_node_alias_selection()
+                    inspect_python_project_constraints()
                     inspect_task_environment_bytes()
                     inspect_task_package_metadata()
                     inspect_mise_task_execution()
@@ -5717,6 +5823,6 @@ assert inventory() == before
 report = dict(binaries=binaries, checks=checks, total=len(checks),
               passed=sum(entry["passed"] for entry in checks), host_unchanged=True)
 print(json.dumps(report))
-expected_checks = 303 if consent_oracle is None else 1869
+expected_checks = 303 if consent_oracle is None else 1908
 if report["passed"] != report["total"] or report["total"] != expected_checks:
     sys.exit(4)

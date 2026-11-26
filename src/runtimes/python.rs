@@ -8,6 +8,7 @@
 //! - Virtual environment support
 
 use anyhow::{Context, Result};
+use pep440_rs::{Operator, Version, VersionSpecifiers};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -35,6 +36,44 @@ const PBS_INSTALL_MAX_PAGES: u32 = 40;
 pub(crate) struct PythonVersion {
     pub version: String,
     pub prerelease: bool,
+}
+
+/// A PEP 440 constraint with a stable-release preference unless it names a prerelease.
+pub(crate) struct PythonVersionSpec {
+    specifiers: VersionSpecifiers,
+    allow_prereleases: bool,
+}
+
+impl PythonVersionSpec {
+    pub(crate) fn parse(request: &str) -> Option<Self> {
+        let request = request.trim();
+        if !request.starts_with(['<', '>', '~', '=', '!'])
+            || request
+                .chars()
+                .any(|character| character.is_control() && character != '\t')
+        {
+            return None;
+        }
+        let specifiers = request.parse::<VersionSpecifiers>().ok()?;
+        let allow_prereleases = specifiers.iter().any(|specifier| {
+            specifier.any_prerelease()
+                && !matches!(
+                    specifier.operator(),
+                    Operator::NotEqual | Operator::NotEqualStar
+                )
+        });
+        Some(Self {
+            specifiers,
+            allow_prereleases,
+        })
+    }
+
+    pub(crate) fn match_rank(&self, release: &str) -> Option<(bool, Version)> {
+        let version = release.parse::<Version>().ok()?;
+        self.specifiers
+            .contains(&version)
+            .then(|| (self.allow_prereleases || !version.any_prerelease(), version))
+    }
 }
 
 pub(crate) struct PythonManager {
@@ -209,14 +248,15 @@ impl PythonManager {
     /// Install Python - PURE RUST, NO SUBPROCESS
     pub async fn install(&self, version: &str) -> Result<()> {
         let version = normalize_version(version);
-        // A partial request needs the catalog for resolution. Keep that same
+        // Partial requests and constraints use the catalog for resolution. Keep that same
         // response for installation so the selected version and artifact agree.
-        let mut downloads =
-            if super::common::is_partial_version(&version) && !crate::core::paths::test_mode() {
-                Some(catalog::fetch(self.client, &python_target()?).await?)
-            } else {
-                None
-            };
+        let needs_catalog = super::common::is_partial_version(&version)
+            || PythonVersionSpec::parse(&version).is_some();
+        let mut downloads = if needs_catalog && !crate::core::paths::test_mode() {
+            Some(catalog::fetch(self.client, &python_target()?).await?)
+        } else {
+            None
+        };
         let version = self
             .resolve_requested_version(&version, downloads.as_deref())
             .await?;
@@ -367,24 +407,33 @@ impl PythonManager {
         complete_staged_install(staging, &self.versions_dir.join(version), version)
     }
 
-    /// Resolve a partial version request (`3`, `3.12`) to the newest matching
-    /// stable python-build-standalone version before any download URL is
-    /// built; `asset_matches_version` requires exact string equality, so an
-    /// unresolved partial would never match an asset. Prerelease entries are
-    /// ignored, exact and non-numeric requests pass through unchanged, and
-    /// exact prerelease requests may install.
+    /// Resolve a partial request or PEP 440 specifier against published releases
+    /// before selecting the exact download asset.
     async fn resolve_requested_version(
         &self,
         version: &str,
         downloads: Option<&[catalog::Download]>,
     ) -> Result<String> {
-        if !crate::runtimes::common::is_partial_version(version) {
+        let specifier = PythonVersionSpec::parse(version);
+        if specifier.is_none() && !crate::runtimes::common::is_partial_version(version) {
             return Ok(version.to_owned());
         }
         let available = match downloads {
             Some(downloads) => Self::catalog_versions(downloads),
             None => self.list_available().await?,
         };
+        if let Some(specifier) = specifier {
+            return available
+                .into_iter()
+                .filter_map(|entry| {
+                    specifier
+                        .match_rank(&entry.version)
+                        .map(|rank| (rank, entry.version))
+                })
+                .max()
+                .map(|(_, version)| version)
+                .with_context(|| format!("No published Python release matches {version:?}"));
+        }
         let names: Vec<String> = available
             .into_iter()
             .filter(|entry| !entry.prerelease)
@@ -400,24 +449,23 @@ impl PythonManager {
 
     /// Switch to a specific version
     pub fn use_version(&self, version: &str) -> Result<()> {
-        let version = normalize_version(version);
-        crate::core::security::validate_runtime_version(&version)?;
+        self.activate_installed(&normalize_version(version))
+    }
+
+    pub(crate) fn activate_installed(&self, version: &str) -> Result<()> {
+        crate::core::security::validate_runtime_version(version)?;
         super::common::require_internal_runtime_binary(
-            &self.versions_dir.join(&version),
+            &self.versions_dir.join(version),
             Path::new("bin/python3"),
         )?;
         let admission = self.security.installed(
             "python",
-            &self.versions_dir.join(&version),
+            &self.versions_dir.join(version),
             super::security::ReviewMode::FreshAttended,
         )?;
-        admission.verify(&self.versions_dir.join(&version))?;
-        activate_version_with_linked_binary(
-            &self.versions_dir,
-            &version,
-            Path::new("bin/python3"),
-        )?;
-        print_using("Python", &version, &self.versions_dir.join("current/bin"));
+        admission.verify(&self.versions_dir.join(version))?;
+        activate_version_with_linked_binary(&self.versions_dir, version, Path::new("bin/python3"))?;
+        print_using("Python", version, &self.versions_dir.join("current/bin"));
         Ok(())
     }
 
@@ -428,8 +476,12 @@ impl PythonManager {
     }
 }
 
-// Generate common runtime manager methods (list_installed, current_version)
-crate::runtimes::common::impl_runtime_common!(PythonManager);
+impl PythonManager {
+    #[must_use]
+    pub fn current_version(&self) -> Option<String> {
+        super::common::get_current_version(&self.versions_dir)
+    }
+}
 
 fn begin_python_mock_install(versions_dir: &Path, version_dir: &Path) -> Result<()> {
     fs::create_dir_all(versions_dir)?;
@@ -573,7 +625,7 @@ mod tests {
                 .is_file()
         );
         assert!(!interrupted.join("bin").exists());
-        assert!(manager.list_installed()?.is_empty());
+        assert!(super::super::common::list_installed_versions(&manager.versions_dir)?.is_empty());
         assert!(!versions.join("current").exists());
         Ok(())
     }
@@ -606,6 +658,27 @@ mod tests {
         assert_eq!(
             manager.resolve_requested_version("3.15.0rc2", None).await?,
             "3.15.0rc2"
+        );
+        for (request, expected) in [
+            ("~=3.12.0, !=3.12.14", "3.12.13"),
+            ("==3.12.*", "3.12.14"),
+            (">=3.12, !=3.15.0rc1", "3.14.7"),
+            (">=3.15.0rc1", "3.15.0rc2"),
+            ("==3.15.*", "3.15.0rc2"),
+        ] {
+            assert_eq!(
+                manager
+                    .resolve_requested_version(request, Some(&downloads))
+                    .await?,
+                expected,
+                "{request}",
+            );
+        }
+        assert!(
+            manager
+                .resolve_requested_version(">=4", Some(&downloads))
+                .await
+                .is_err()
         );
         assert!(
             manager
@@ -847,7 +920,10 @@ mod tests {
             || {
                 let mgr = PythonManager::new();
                 assert!(mgr.versions_dir.ends_with("python"));
-                Ok((mgr.list_installed()?, mgr.current_version()))
+                Ok((
+                    super::super::common::list_installed_versions(&mgr.versions_dir)?,
+                    mgr.current_version(),
+                ))
             },
         )
     }
@@ -1149,7 +1225,7 @@ mod tests {
         let staging = begin_staged_install(directory.path())?;
         assert!(manager.publish_install(&staging, "3.12.0").is_err());
         assert!(!directory.path().join("3.12.0").exists());
-        assert!(manager.list_installed()?.is_empty());
+        assert!(super::super::common::list_installed_versions(&manager.versions_dir)?.is_empty());
 
         fs::create_dir(staging.path().join("bin"))?;
         let outside = directory.path().join("outside-python");
@@ -1178,7 +1254,10 @@ mod tests {
         )
         .expect("seed controlled publisher authority");
         manager.use_version("3.12.0")?;
-        assert_eq!(manager.list_installed()?, vec!["3.12.0"]);
+        assert_eq!(
+            super::super::common::list_installed_versions(&manager.versions_dir)?,
+            vec!["3.12.0"]
+        );
         Ok(())
     }
 

@@ -161,6 +161,15 @@ pub(crate) fn resolve_nvm_alias(nvm_dir: &Path, alias: &str) -> Result<Option<St
     }
 }
 
+/// The managed version name for a binary directory immediately below it.
+pub(crate) fn version_directory_name(binary_dir: &Path) -> Result<&str> {
+    binary_dir
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(std::ffi::OsStr::to_str)
+        .context("Selected installation has no version directory name")
+}
+
 /// Find an executable in the system `PATH`.
 pub fn find_in_path(binary: &str) -> Option<PathBuf> {
     which::which(binary).ok()
