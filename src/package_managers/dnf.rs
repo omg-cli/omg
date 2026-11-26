@@ -3453,22 +3453,18 @@ impl PackageManager for DnfPackageManager {
         Box::pin(async move {
             let installed = self.load_installed_packages().await?;
             let total = installed.len();
-            let explicit = Self::current_explicit_package_names(&installed)
-                .await?
-                .len();
-
-            let maintenance = if fast {
-                None
+            let reasons = Self::current_explicit_package_names(&installed);
+            let (explicit, maintenance) = if fast {
+                (reasons.await?, None)
             } else {
-                Some((
-                    Self::orphan_count().await?,
-                    self.list_updates().await?.len(),
-                ))
+                let (explicit, orphans, updates) =
+                    tokio::try_join!(reasons, Self::orphan_count(), self.list_updates())?;
+                (explicit, Some((orphans, updates.len())))
             };
 
             Ok(PackageStatus {
                 total,
-                explicit,
+                explicit: explicit.len(),
                 maintenance,
             })
         })
@@ -3483,12 +3479,14 @@ impl PackageManager for DnfPackageManager {
 
     fn list_updates(&self) -> Pin<Box<dyn Future<Output = Result<Vec<UpdateInfo>>> + Send + '_>> {
         Box::pin(async move {
-            let installed = Self::repository_output(RepositoryQuery::Installed).await?;
             let mut command =
                 tokio::process::Command::from(crate::core::privilege::system_command("dnf")?);
             // list honors repository priority. JSON for list requires DNF5 5.4.
             command.env("LC_ALL", "C").args(UPGRADE_QUERY_ARGS);
-            let upgrades = Self::query_output(command).await?;
+            let (installed, upgrades) = tokio::try_join!(
+                Self::repository_output(RepositoryQuery::Installed),
+                Self::query_output(command)
+            )?;
             Self::match_updates(
                 &Self::parse_versioned_packages(&installed)?,
                 &Self::parse_available_upgrades(&upgrades)?,
