@@ -797,8 +797,7 @@ impl DnfPackageManager {
     pub(crate) async fn prepare_removal(packages: &[String]) -> Result<Option<PreparedDnfRemoval>> {
         Self::validate_package_selectors(packages)?;
         let directory = Self::removal_preview_directory()?;
-        let mut command =
-            tokio::process::Command::from(crate::core::privilege::system_command("dnf")?);
+        let mut command: tokio::process::Command = Self::native_package_command("dnf")?.into();
         command
             .env("LC_ALL", "C")
             .args([
@@ -844,8 +843,7 @@ impl DnfPackageManager {
     ) -> Result<()> {
         // Replay normally loads available repositories. Removal uses only
         // installed packages, and DNF rejects a disable glob with no matches.
-        let mut command =
-            tokio::process::Command::from(crate::core::privilege::system_command("dnf")?);
+        let mut command: tokio::process::Command = Self::native_package_command("dnf")?.into();
         command.args(["repo", "list", "--all", "--json"]);
         let output = Self::query_output(command).await?;
         let repositories: Vec<serde::de::IgnoredAny> =
@@ -1132,6 +1130,26 @@ impl DnfPackageManager {
         Ok(packages)
     }
 
+    fn native_package_command(program: &str) -> Result<std::process::Command> {
+        let mut command = crate::core::privilege::system_command(program)?;
+        // Libdnf loads RPM macros too. Use the same system database as RPM
+        // queries, while retaining DNF's writable user cache and log paths.
+        command.env("HOME", "/").env_remove("XDG_STATE_HOME");
+        if !is_root() {
+            let home = home::home_dir()
+                .filter(|path| path.is_absolute())
+                .context("DNF requires an absolute home directory for user cache and state")?;
+            let state = std::env::var_os("XDG_STATE_HOME")
+                .map(PathBuf::from)
+                .filter(|path| path.is_absolute())
+                .unwrap_or_else(|| home.join(".local/state"));
+            command
+                .env("XDG_CACHE_HOME", home.join(".cache"))
+                .env("XDG_STATE_HOME", state);
+        }
+        Ok(command)
+    }
+
     fn rpm_query_command() -> Result<tokio::process::Command> {
         let mut command =
             tokio::process::Command::from(crate::core::privilege::system_command("rpm")?);
@@ -1171,8 +1189,7 @@ impl DnfPackageManager {
     pub(crate) async fn read_user_installed_names() -> Result<HashSet<String>> {
         // --userinstalled reads the system repo only. An unmatched repo glob
         // would reject a valid local inventory on a host with no configured repos.
-        let mut command =
-            tokio::process::Command::from(crate::core::privilege::system_command("dnf")?);
+        let mut command: tokio::process::Command = Self::native_package_command("dnf")?.into();
         command.args([
             "--cacheonly",
             "--setopt=disable_excludes=*",
@@ -1498,8 +1515,7 @@ impl DnfPackageManager {
     fn search_repository_paths() -> Result<(catalog::RepositoryPaths, catalog::Stamps)> {
         let mut paths = catalog::RepositoryPaths::default();
         let before = paths.configuration_stamps()?;
-        let mut command =
-            tokio::process::Command::from(crate::core::privilege::system_command("dnf")?);
+        let mut command: tokio::process::Command = Self::native_package_command("dnf")?.into();
         command.env("LC_ALL", "C").arg("--dump-main-config");
         let config = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1520,8 +1536,7 @@ impl DnfPackageManager {
     async fn search_repository_metadata(
         cache_only: bool,
     ) -> Result<Vec<catalog::RepositoryMetadata>> {
-        let mut command =
-            tokio::process::Command::from(crate::core::privilege::system_command("dnf")?);
+        let mut command: tokio::process::Command = Self::native_package_command("dnf")?.into();
         command.env("LC_ALL", "C");
         if cache_only {
             command.arg("--cacheonly");
@@ -1552,8 +1567,7 @@ impl DnfPackageManager {
         // Normal DNF can skip an expired, unavailable repo whose stale
         // metadata is still readable with --cacheonly. Admit only repositories
         // that the normal query actually loaded.
-        let mut command =
-            tokio::process::Command::from(crate::core::privilege::system_command("dnf")?);
+        let mut command: tokio::process::Command = Self::native_package_command("dnf")?.into();
         command.args(["--cacheonly", &format!("--repo={}", ids.join(","))]);
         command.args(Self::repository_query_args(RepositoryQuery::Available(
             None,
@@ -1817,8 +1831,7 @@ impl DnfPackageManager {
 
     fn repository_command(query: RepositoryQuery<'_>) -> Result<tokio::process::Command> {
         let args = Self::repository_query_args(query)?;
-        let mut command =
-            tokio::process::Command::from(crate::core::privilege::system_command("dnf")?);
+        let mut command: tokio::process::Command = Self::native_package_command("dnf")?.into();
         command.args(args);
         Ok(command)
     }
@@ -2195,8 +2208,7 @@ impl DnfPackageManager {
         let cache = cache
             .to_str()
             .context("DNF advisory cache path is not UTF-8")?;
-        let mut command =
-            tokio::process::Command::from(crate::core::privilege::system_command("dnf")?);
+        let mut command: tokio::process::Command = Self::native_package_command("dnf")?.into();
         // A fresh user's cache can otherwise be populated from root's stale
         // cache even with --refresh. Use one audit-owned cache for both paths.
         command.args([
@@ -2352,8 +2364,7 @@ impl DnfPackageManager {
             repositories.len() <= 64 * 1024,
             "DNF repository scope exceeds its bound"
         );
-        let mut command =
-            tokio::process::Command::from(crate::core::privilege::system_command("python3")?);
+        let mut command: tokio::process::Command = Self::native_package_command("python3")?.into();
         command
             .args(["-I", "-B", "-c", include_str!("dnf_advisory_lookup.py")])
             .arg(cache)
@@ -2381,8 +2392,7 @@ impl DnfPackageManager {
         {
             return Ok(Vec::new());
         }
-        let mut command =
-            tokio::process::Command::from(crate::core::privilege::system_command("dnf")?);
+        let mut command: tokio::process::Command = Self::native_package_command("dnf")?.into();
         command.args(["history", "info", "--json", &range]);
         let output = match Self::query_output(command).await {
             Err(_)
@@ -2406,8 +2416,7 @@ impl DnfPackageManager {
     }
 
     async fn native_history_is_missing() -> Result<bool> {
-        let mut command =
-            tokio::process::Command::from(crate::core::privilege::system_command("dnf")?);
+        let mut command: tokio::process::Command = Self::native_package_command("dnf")?.into();
         command.arg("--dump-main-config");
         let config = Self::query_output(command).await?;
         Self::history_is_missing(std::str::from_utf8(&config)?)
@@ -2706,8 +2715,7 @@ impl DnfPackageManager {
             "DNF stored transaction must be prepared by its root owner"
         );
         let directory = Self::removal_preview_directory()?;
-        let mut command =
-            tokio::process::Command::from(crate::core::privilege::system_command("dnf")?);
+        let mut command: tokio::process::Command = Self::native_package_command("dnf")?.into();
         command
             .args(args)
             .arg(format!("--store={}", directory.path().display()));
@@ -3162,8 +3170,7 @@ impl DnfPackageManager {
     async fn preview_declined_transaction<'a>(
         args: impl IntoIterator<Item = &'a str>,
     ) -> Result<(String, String)> {
-        let mut command =
-            tokio::process::Command::from(crate::core::privilege::system_command("dnf")?);
+        let mut command: tokio::process::Command = Self::native_package_command("dnf")?.into();
         command
             .env("LC_ALL", "C")
             .args(["--color=never", "--setopt=assumeyes=false", "--assumeno"])
@@ -3251,7 +3258,7 @@ impl DnfPackageManager {
         {
             crate::core::security::policy::require_native_plan_support("DNF")?;
         }
-        let mut cmd = crate::core::privilege::system_command("dnf")?;
+        let mut cmd = Self::native_package_command("dnf")?;
 
         let targets = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
         crate::core::security::audit::record_operation("dnf", &targets, "attempt")?;
@@ -3500,8 +3507,7 @@ impl PackageManager for DnfPackageManager {
         &self,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<super::types::SecurityPackage>>> + Send + '_>> {
         Box::pin(async {
-            let mut command =
-                tokio::process::Command::from(crate::core::privilege::system_command("dnf")?);
+            let mut command: tokio::process::Command = Self::native_package_command("dnf")?.into();
             // Query every installed version and architecture, even excluded
             // packages. Installed inventory needs no repository metadata.
             command.args([
@@ -3808,8 +3814,7 @@ impl PackageManager for DnfPackageManager {
 
     fn list_updates(&self) -> Pin<Box<dyn Future<Output = Result<Vec<UpdateInfo>>> + Send + '_>> {
         Box::pin(async move {
-            let mut command =
-                tokio::process::Command::from(crate::core::privilege::system_command("dnf")?);
+            let mut command: tokio::process::Command = Self::native_package_command("dnf")?.into();
             // list honors repository priority. JSON for list requires DNF5 5.4.
             command.env("LC_ALL", "C").args(UPGRADE_QUERY_ARGS);
             let (installed, upgrades) = tokio::try_join!(
@@ -4426,8 +4431,7 @@ mod tests {
 
     #[tokio::test]
     async fn security_inventory_preserves_every_native_rpm_identity() {
-        let mut reference =
-            tokio::process::Command::from(crate::core::privilege::system_command("rpm").unwrap());
+        let mut reference = DnfPackageManager::rpm_query_command().unwrap();
         reference.args([
             "-qa",
             "--qf",
