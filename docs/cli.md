@@ -1481,6 +1481,8 @@ A competing mutation fails with a retry message. Both commands validate the inde
 before changing snapshot files. This does not make the snapshot file and index a
 crash-atomic pair.
 
+A snapshot and its index each have a 16 MiB file limit.
+
 ---
 
 ### omg diff
@@ -1734,6 +1736,8 @@ omg migrate import my-setup.json
 ```
 
 The manifest records names of explicitly installed system packages and versions of active OMG-managed runtimes. Import shows known package renames and keeps the original name for other packages. The dry run validates runtime identifiers and package selectors. The target package manager resolves availability and versions during installation.
+
+Migration manifests have a 16 MiB file limit.
 
 ---
 

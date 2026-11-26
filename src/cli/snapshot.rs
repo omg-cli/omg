@@ -4,9 +4,10 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::cli::style;
+use crate::core::env::files::{self, Symlinks};
 use crate::core::env::fingerprint::EnvironmentState;
 use crate::core::paths;
 
@@ -51,24 +52,9 @@ fn load_index() -> Result<SnapshotIndex> {
                 .with_context(|| format!("Failed to inspect snapshot index: {}", path.display()));
         }
     }
-    let content = read_snapshot_file(&path)
-        .with_context(|| format!("Failed to read snapshot index: {}", path.display()))?;
+    let content = files::read_utf8(&path, "snapshot index", Symlinks::Refuse)?;
     serde_json::from_str(&content)
         .with_context(|| format!("Failed to parse snapshot index: {}", path.display()))
-}
-
-/// Read a snapshot-sidecar file, refusing symlinks so a planted link
-/// cannot redirect the read outside the snapshots directory.
-fn read_snapshot_file(path: &PathBuf) -> Result<String> {
-    let is_symlink =
-        std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink());
-    if is_symlink {
-        anyhow::bail!(
-            "Refusing to read snapshot file that is a symlink: {}",
-            path.display()
-        );
-    }
-    Ok(fs::read_to_string(path)?)
 }
 
 fn load_index_for_update() -> Result<(fs::File, SnapshotIndex)> {
@@ -99,9 +85,14 @@ fn load_index_for_update() -> Result<(fs::File, SnapshotIndex)> {
     Ok((lock, index))
 }
 
-fn save_index(index: &SnapshotIndex) -> Result<()> {
-    let path = index_path();
-    crate::core::safe_ops::atomic_write_file_sync(&path, serde_json::to_string_pretty(index)?)
+fn encode_index(index: &SnapshotIndex, path: &Path) -> Result<String> {
+    let content = serde_json::to_string_pretty(index)?;
+    files::ensure_size(content.len() as u64, "snapshot index", path)?;
+    Ok(content)
+}
+
+fn save_index(path: &Path, content: String) -> Result<()> {
+    crate::core::safe_ops::atomic_write_file_sync(path, content)
         .with_context(|| format!("Failed to write snapshot index: {}", path.display()))
 }
 
@@ -135,6 +126,21 @@ pub async fn create(message: Option<String>) -> Result<()> {
         state,
     };
 
+    let snapshot_content = serde_json::to_string_pretty(&snapshot)?;
+    files::ensure_size(
+        snapshot_content.len() as u64,
+        "snapshot file",
+        &snapshot_path,
+    )?;
+    index.snapshots.push(SnapshotMeta {
+        id: id.clone(),
+        message: message.clone(),
+        created_at: snapshot.created_at,
+        hash: snapshot.state.hash.clone(),
+    });
+    let index_path = index_path();
+    let index_content = encode_index(&index, &index_path)?;
+
     // Save snapshot file. Claim the path with a hard link instead of
     // `persist` rename: link fails with AlreadyExists when another `create`
     // wins the race, so the non-overwrite guarantee holds atomically.
@@ -144,7 +150,7 @@ pub async fn create(message: Option<String>) -> Result<()> {
         let dir = snapshots_dir();
         let mut temp = tempfile::NamedTempFile::new_in(&dir)
             .with_context(|| format!("Failed to stage snapshot in {}", dir.display()))?;
-        temp.write_all(serde_json::to_string_pretty(&snapshot)?.as_bytes())
+        temp.write_all(snapshot_content.as_bytes())
             .with_context(|| format!("Failed to write snapshot: {}", snapshot_path.display()))?;
         temp.as_file()
             .sync_all()
@@ -162,13 +168,7 @@ pub async fn create(message: Option<String>) -> Result<()> {
         }
     }
 
-    index.snapshots.push(SnapshotMeta {
-        id: id.clone(),
-        message: message.clone(),
-        created_at: snapshot.created_at,
-        hash: snapshot.state.hash.clone(),
-    });
-    save_index(&index)?;
+    save_index(&index_path, index_content)?;
 
     println!("  {} Snapshot created!", style::positive("✓"));
     println!("  ID: {}", style::accent(&id));
@@ -255,8 +255,7 @@ pub async fn restore(id: &str, dry_run: bool, yes: bool) -> Result<()> {
         anyhow::bail!("Snapshot '{id}' not found");
     }
 
-    let content = read_snapshot_file(&snapshot_path)
-        .with_context(|| format!("Failed to read snapshot file: {}", snapshot_path.display()))?;
+    let content = files::read_utf8(&snapshot_path, "snapshot file", Symlinks::Refuse)?;
     let snapshot: Snapshot = serde_json::from_str(&content)
         .with_context(|| format!("Failed to parse snapshot: {}", snapshot_path.display()))?;
 
@@ -427,9 +426,11 @@ pub fn delete(id: &str) -> Result<()> {
         anyhow::bail!("Snapshot '{id}' not found");
     }
 
-    fs::remove_file(&snapshot_path)?;
     index.snapshots.retain(|s| s.id != id);
-    save_index(&index)?;
+    let index_path = index_path();
+    let index_content = encode_index(&index, &index_path)?;
+    fs::remove_file(&snapshot_path)?;
+    save_index(&index_path, index_content)?;
 
     println!(
         "{} Deleted snapshot {}",

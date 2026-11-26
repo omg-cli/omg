@@ -473,6 +473,57 @@ mod snapshot_contracts {
     use super::*;
 
     #[test]
+    fn saved_environment_commands_enforce_the_file_limit() {
+        const LIMIT: usize = 16 * 1024 * 1024;
+        let project = TestProject::new();
+        let id = create_snapshot(&project, "bounded files");
+        let directory = project.data_dir.path().join("snapshots");
+        let snapshot = directory.join(format!("{id}.json"));
+        let index = directory.join("index.json");
+        let manifest = project.dir.path().join("migration.json");
+        fs::write(
+            &manifest,
+            r#"{"version":"1.0","source_distro":"arch","created_at":0,"runtimes":{},"packages":[]}"#,
+        )
+        .expect("write migration fixture");
+
+        let snapshot_bytes = fs::read(&snapshot).expect("snapshot fixture");
+        for (path, args) in [
+            (&snapshot, vec!["snapshot", "restore", &id, "--dry-run"]),
+            (&index, vec!["snapshot", "list"]),
+            (
+                &manifest,
+                vec!["migrate", "import", "migration.json", "--dry-run"],
+            ),
+        ] {
+            let mut content = fs::read(path).expect("environment fixture");
+            content.resize(LIMIT, b' ');
+            fs::write(path, &content).expect("write exact-limit fixture");
+            project.run(&args).assert_success();
+            content.push(b' ');
+            fs::write(path, content).expect("write oversized fixture");
+            let rejected = project.run(&args);
+            rejected.assert_failure();
+            assert!(
+                rejected.stderr.contains("16777216 byte limit"),
+                "{}",
+                rejected.stderr
+            );
+            if path == &snapshot {
+                fs::write(path, &snapshot_bytes).expect("restore original fixture");
+            }
+        }
+
+        let rejected = project.run(&["snapshot", "delete", &id]);
+        rejected.assert_failure();
+        assert!(rejected.stderr.contains("16777216 byte limit"));
+        assert_eq!(
+            fs::read(snapshot).expect("snapshot must remain"),
+            snapshot_bytes
+        );
+    }
+
+    #[test]
     fn held_index_lock_blocks_snapshot_mutations() -> anyhow::Result<()> {
         let project = TestProject::new();
         let id = create_snapshot(&project, "original");

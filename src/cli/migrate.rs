@@ -2,10 +2,13 @@ use anyhow::{Context, Result};
 use owo_colors::OwoColorize;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+#[cfg(test)]
 use std::fs;
+use std::path::Path;
 
 use crate::cli::style;
 use crate::core::env::distro::detect_distro;
+use crate::core::env::files::{self, Symlinks};
 use crate::core::env::fingerprint::EnvironmentState;
 
 const MANIFEST_FORMAT_VERSION: &str = "1.0";
@@ -50,6 +53,11 @@ pub async fn export(output: &str) -> Result<()> {
     };
 
     let content = serde_json::to_string_pretty(&manifest)?;
+    files::ensure_size(
+        content.len() as u64,
+        "migration manifest",
+        Path::new(output),
+    )?;
     crate::core::safe_ops::atomic_write_file_sync(output, content)?;
 
     println!(
@@ -89,7 +97,7 @@ pub async fn import(manifest_path: &str, dry_run: bool) -> Result<()> {
         if dry_run { "Previewing" } else { "Importing" }
     );
 
-    let content = fs::read_to_string(&manifest_path)?;
+    let content = files::read_utf8(&manifest_path, "migration manifest", Symlinks::Follow)?;
     let manifest: MigrationManifest = serde_json::from_str(&content)?;
 
     validate_manifest_version(&manifest)?;
