@@ -438,59 +438,86 @@ async fn check_fedora_installed_db(command: std::process::Command, deadline: Dur
 }
 
 async fn check_fedora_package_db(command: std::process::Command, deadline: Duration) -> usize {
+    match fedora_package_db_output(command, deadline).await {
+        Ok(output) if output.status.success() => {
+            println!("  {}", style::success("DNF local package database healthy"));
+            0
+        }
+        Ok(output) => {
+            println!(
+                "  {} DNF local package database check failed ({})",
+                style::error("✗"),
+                output.status
+            );
+            for detail in dnf_check_details(&output.stdout, &output.stderr) {
+                println!("    {detail}");
+            }
+            1
+        }
+        Err(error) => {
+            println!("  {} {error:#}", style::error("✗"));
+            1
+        }
+    }
+}
+
+async fn fedora_package_db_output(
+    command: std::process::Command,
+    deadline: Duration,
+) -> Result<std::process::Output> {
     // DNF5 checks the local RPM database without loading available repos, and
     // rejects a repo-disable glob when there are no configured repos.
     let dnf5 = command.get_program().to_string_lossy().ends_with("dnf5");
+    let mut scratch = tempfile::Builder::new();
+    scratch.prefix("omg-doctor-");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        scratch.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    let scratch = scratch
+        .tempdir_in("/tmp")
+        .context("Could not prepare isolated DNF check state")?;
     let mut command = tokio::process::Command::from(command);
-    command.arg("--cacheonly");
+    // Match the system RPM inventory probe. DNF5 still needs writable XDG
+    // state with HOME set to /, even when no repositories are loaded.
+    command
+        .env("HOME", "/")
+        .env_remove("XDG_CONFIG_HOME")
+        .env("XDG_STATE_HOME", scratch.path().join("state"))
+        .env("XDG_CACHE_HOME", scratch.path().join("cache"))
+        .arg("--cacheonly");
     if !dnf5 {
         command.arg("--disablerepo=*");
     }
     command.arg("check").kill_on_drop(true);
-    match tokio::time::timeout(deadline, command.output()).await {
-        Ok(Ok(output)) if output.status.success() => {
-            println!("  {}", style::success("DNF local package database healthy"));
-            0
-        }
-        Ok(Ok(output)) => {
-            let detail = if output.stderr.is_empty() {
-                &output.stdout
-            } else {
-                &output.stderr
-            };
-            let detail = String::from_utf8_lossy(detail);
-            let detail = detail
-                .lines()
-                .find(|line| !line.trim().is_empty())
-                .map(|line| {
-                    style::sanitize_terminal_text(line)
-                        .chars()
-                        .take(160)
-                        .collect::<String>()
-                });
-            println!(
-                "  {} DNF local package database check failed ({}){}",
-                style::error("✗"),
-                output.status,
-                detail.map(|line| format!(": {line}")).unwrap_or_default()
+    tokio::time::timeout(deadline, command.output())
+        .await
+        .context("DNF local package database check timed out")?
+        .context("DNF local package database check failed")
+}
+
+fn dnf_check_details(stdout: &[u8], stderr: &[u8]) -> Vec<String> {
+    // DNF5 prints the summary on stderr and package identities and problems
+    // on stdout. Keep enough detail for one package without flooding Doctor.
+    let mut details = Vec::new();
+    for (bytes, limit) in [(stderr, 1), (stdout, 2)] {
+        let text = String::from_utf8_lossy(bytes);
+        for line in text
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .take(limit)
+        {
+            details.push(
+                style::sanitize_terminal_text(line)
+                    .chars()
+                    .take(160)
+                    .collect(),
             );
-            1
-        }
-        Ok(Err(error)) => {
-            println!(
-                "  {} DNF local package database check failed: {error}",
-                style::error("✗")
-            );
-            1
-        }
-        Err(_) => {
-            println!(
-                "  {} DNF local package database check timed out",
-                style::error("✗")
-            );
-            1
         }
     }
+    details
 }
 
 /// Check the same Homebrew installation that the package backend reads and
@@ -2723,7 +2750,12 @@ mod tests {
             let script = fixture.path().join(format!("{name}.sh"));
             std::fs::write(
                 &script,
-                format!("#!/bin/sh\n[ \"$1\" = --cacheonly ] && {remaining_arguments}\n"),
+                format!(
+                    "#!/bin/sh\n\
+                     [ \"$HOME\" = / ] && [ -z \"${{XDG_CONFIG_HOME+x}}\" ] && \
+                     [ -d \"${{XDG_STATE_HOME%/*}}\" ] && [ -d \"${{XDG_CACHE_HOME%/*}}\" ] && \
+                     [ \"$1\" = --cacheonly ] && {remaining_arguments}\n"
+                ),
             )
             .expect("DNF fixture");
             symlink("/bin/sh", &program).expect("immutable named fixture interpreter");
@@ -2734,7 +2766,10 @@ mod tests {
                 .open(&script)
                 .expect("retain fixture writer through native launch");
             let mut command = std::process::Command::new(&program);
-            command.arg(&script);
+            command
+                .env("HOME", fixture.path())
+                .env("XDG_CONFIG_HOME", fixture.path())
+                .arg(&script);
             assert_eq!(
                 check_fedora_package_db(command, Duration::from_secs(2)).await,
                 0,
@@ -2752,6 +2787,40 @@ mod tests {
         assert_eq!(doctor_issues, 1);
         let error = finish_doctor(doctor_issues, 0).expect_err("failed DNF must fail doctor");
         assert!(error.to_string().contains("1 health issue"));
+
+        let missing = std::process::Command::new(fixture.path().join("missing-dnf5"));
+        assert_eq!(
+            check_fedora_package_db(missing, Duration::from_secs(2)).await,
+            1
+        );
+
+        let mut slow = std::process::Command::new(&program);
+        slow.args(["-c", "exec sleep 5"]);
+        let error = fedora_package_db_output(slow, Duration::from_millis(25))
+            .await
+            .expect_err("slow DNF probe must time out");
+        assert!(
+            error
+                .to_string()
+                .contains("local package database check timed out")
+        );
+    }
+
+    #[test]
+    fn dnf_health_diagnostics_show_summary_package_and_first_problem() {
+        let long = "x".repeat(200);
+        let stdout =
+            format!("\nfixture-0:1-1.noarch\n missing require \"{long}\"\n another package\n");
+        let details = dnf_check_details(
+            stdout.as_bytes(),
+            b"\nCheck discovered 2 problem(s)\x1b\nextra setup message\n",
+        );
+
+        assert_eq!(details[0], "Check discovered 2 problem(s)");
+        assert_eq!(details[1], "fixture-0:1-1.noarch");
+        assert!(details[2].starts_with("missing require"));
+        assert_eq!(details[2].chars().count(), 160);
+        assert_eq!(details.len(), 3);
     }
 
     #[cfg(target_os = "linux")]

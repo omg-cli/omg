@@ -1035,6 +1035,7 @@ omg doctor [OPTIONS]
 - Daemon connectivity
 - Mirror availability
 - Package index health (on Debian/Ubuntu, compressed `*_Packages.lz4`/`.gz`/`.xz` indexes count as healthy)
+- On Fedora, the system RPM inventory and DNF's local dependency and consistency checks
 - PGP keyring status
 - Runtime integrity
 
@@ -1481,6 +1482,8 @@ A competing mutation fails with a retry message. Both commands validate the inde
 before changing snapshot files. This does not make the snapshot file and index a
 crash-atomic pair.
 
+A snapshot and its index each have a 16 MiB file limit.
+
 ---
 
 ### omg diff
@@ -1557,6 +1560,8 @@ omg env sync https://gist.github.com/user/abc123
 ### omg team
 
 Team workspace management.
+
+Team configuration and status files each have a 16 MiB limit.
 
 ```bash
 omg team <SUBCOMMAND>
@@ -1733,12 +1738,9 @@ omg migrate import my-setup.json --dry-run
 omg migrate import my-setup.json
 ```
 
-**Manifest includes:**
+The manifest records names of explicitly installed system packages and versions of active OMG-managed runtimes. Import shows known package renames and keeps the original name for other packages. The dry run validates runtime identifiers and package selectors. The target package manager resolves availability and versions during installation.
 
-- All installed packages with versions
-- Runtime versions
-- Configuration settings
-- Automatic package name mapping between distros
+Migration manifests have a 16 MiB file limit.
 
 ---
 

@@ -2282,6 +2282,53 @@
       ]
     },
     {
+      "id": "omgd.status-metadata.server-fixture",
+      "source": "src/daemon/protocol.rs",
+      "binary": "omgd",
+      "surface": "ipc:StatusMetadata",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ],
+      "requires": [
+        "success",
+        "state"
+      ],
+      "critical": true,
+      "assertions": {
+        "success": [
+          "metadata-served-with-request-id-while-package-counts-fail",
+          "unobserved-rpm-coverage-unreported"
+        ],
+        "state": [
+          "corrupt-backend-preserved-and-status-recovers"
+        ]
+      },
+      "scope": "Production server::run over real Unix sockets with an injected corrupt package backend, followed by full status recovery and fixture cleanup; not native package transactions",
+      "tests": [
+        {
+          "lane": "native-daemon-fixture",
+          "id": "omg::coverage_18::status_reports_backend_corruption_without_cached_success_and_recovers_over_real_ipc",
+          "evidence": [
+            "success",
+            "state"
+          ],
+          "assertions": [
+            "metadata-served-with-request-id-while-package-counts-fail",
+            "unobserved-rpm-coverage-unreported",
+            "corrupt-backend-preserved-and-status-recovers",
+            "fixture-cleanup"
+          ]
+        }
+      ]
+    },
+    {
       "id": "omgd.updates.server-fixture",
       "source": "src/daemon/protocol.rs",
       "binary": "omgd",
@@ -3970,6 +4017,21 @@
     },
     {
       "id": "ipc:ListUpdates",
+      "binary": "omgd",
+      "source": "src/daemon/protocol.rs",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ]
+    },
+    {
+      "id": "ipc:StatusMetadata",
       "binary": "omgd",
       "source": "src/daemon/protocol.rs",
       "platforms": [

@@ -1283,6 +1283,50 @@ mod dnf_integration {
     }
 
     #[test]
+    fn why_cli_uses_system_inventory_with_a_separate_user_rpm_database() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let database = home.path().join("rpmdb");
+        let user_config = home.path().join(".config");
+        let user_macros = user_config.join("rpm");
+        std::fs::create_dir(&database)?;
+        std::fs::create_dir_all(&user_macros)?;
+        let initialized = std::process::Command::new("rpm")
+            .arg("--dbpath")
+            .arg(&database)
+            .arg("--initdb")
+            .output()?;
+        assert!(initialized.status.success());
+        let macros = format!("%_dbpath {}\n", database.display());
+        std::fs::write(home.path().join(".rpmmacros"), &macros)?;
+        std::fs::write(user_macros.join("macros"), macros)?;
+        let selector = format!("glibc.{}", std::env::consts::ARCH);
+        let command = |program: &std::ffi::OsStr| {
+            let mut command = std::process::Command::new(program);
+            command
+                .env("HOME", home.path())
+                .env("XDG_CONFIG_HOME", &user_config)
+                .env("XDG_STATE_HOME", home.path().join(".local/state"))
+                .env("OMG_DISABLE_DAEMON", "1")
+                .env("NO_COLOR", "1");
+            command
+        };
+        let native = command("rpm".as_ref()).args(["-qa"]).output()?;
+        assert!(native.status.success());
+        assert!(native.stdout.is_empty(), "the user RPM database is empty");
+        let omg = assert_cmd::cargo::cargo_bin!("omg");
+        let result = command(omg.as_os_str()).args(["why", &selector]).output()?;
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let output = std::str::from_utf8(&result.stdout)?;
+        assert!(output.contains("glibc-"));
+        assert!(output.contains("Reason:"));
+        Ok(())
+    }
+
+    #[test]
     fn why_cli_matches_native_reasons_and_reverse_requirements() -> Result<()> {
         let selector = format!("glibc.{}", std::env::consts::ARCH);
         #[expect(

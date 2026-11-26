@@ -1,11 +1,14 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use owo_colors::OwoColorize;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+#[cfg(test)]
 use std::fs;
+use std::path::Path;
 
 use crate::cli::style;
 use crate::core::env::distro::detect_distro;
+use crate::core::env::files::{self, Symlinks};
 use crate::core::env::fingerprint::EnvironmentState;
 
 const MANIFEST_FORMAT_VERSION: &str = "1.0";
@@ -50,6 +53,11 @@ pub async fn export(output: &str) -> Result<()> {
     };
 
     let content = serde_json::to_string_pretty(&manifest)?;
+    files::ensure_size(
+        content.len() as u64,
+        "migration manifest",
+        Path::new(output),
+    )?;
     crate::core::safe_ops::atomic_write_file_sync(output, content)?;
 
     println!(
@@ -89,7 +97,7 @@ pub async fn import(manifest_path: &str, dry_run: bool) -> Result<()> {
         if dry_run { "Previewing" } else { "Importing" }
     );
 
-    let content = fs::read_to_string(&manifest_path)?;
+    let content = files::read_utf8(&manifest_path, "migration manifest", Symlinks::Follow)?;
     let manifest: MigrationManifest = serde_json::from_str(&content)?;
 
     validate_manifest_version(&manifest)?;
@@ -98,15 +106,10 @@ pub async fn import(manifest_path: &str, dry_run: bool) -> Result<()> {
 
     println!(
         "  Source: {} → Target: {}",
-        style::path(&manifest.source_distro),
+        style::path(&style::sanitize_terminal_text(&manifest.source_distro)),
         style::maybe_color(&target_distro, |t| t.cyan().to_string())
     );
     println!();
-
-    println!(
-        "  {}",
-        style::maybe_color("Package mapping:", |t| t.bold().to_string())
-    );
 
     let import_plan = ImportPlan {
         runtimes: &manifest.runtimes,
@@ -116,7 +119,12 @@ pub async fn import(manifest_path: &str, dry_run: bool) -> Result<()> {
             &target_distro,
         ),
     };
+    import_plan.validate()?;
 
+    println!(
+        "  {}",
+        style::maybe_color("Package mapping:", |t| t.bold().to_string())
+    );
     for (original, target) in &import_plan.packages.mapped {
         println!(
             "    {} {} → {}",
@@ -259,6 +267,21 @@ struct ImportPlan<'a> {
 }
 
 impl ImportPlan<'_> {
+    fn validate(&self) -> Result<()> {
+        for (runtime, version) in self.runtimes {
+            crate::cli::runtimes::validate_restore_version(runtime, version).with_context(
+                || {
+                    format!(
+                        "Invalid migration runtime '{}'",
+                        style::sanitize_terminal_text(runtime)
+                    )
+                },
+            )?;
+        }
+        crate::cli::packages::validate_install_request(&self.packages.to_install, false)
+            .context("Invalid migration package targets")
+    }
+
     fn has_mutations(&self) -> bool {
         !self.runtimes.is_empty() || !self.packages.to_install.is_empty()
     }
@@ -653,6 +676,40 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn import_rejects_invalid_entries_before_preview_consent_or_mutation() {
+        let (_dir, path) = import_fixture();
+        let clean: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).expect("manifest bytes")).expect("manifest");
+        let state = ImportTestState::new(true, true);
+        let _guard = install_import_test_state(state.clone());
+
+        for (field, value, diagnostic) in [
+            (
+                "/runtimes/node",
+                "current",
+                "Invalid migration runtime 'node'",
+            ),
+            (
+                "/packages/0/original_name",
+                "two words",
+                "Invalid migration package targets",
+            ),
+        ] {
+            let mut manifest = clean.clone();
+            *manifest.pointer_mut(field).expect("manifest field") = serde_json::json!(value);
+            fs::write(&path, manifest.to_string()).expect("write manifest");
+
+            for dry_run in [true, false] {
+                let error = import(path.to_str().expect("UTF-8 path"), dry_run)
+                    .await
+                    .expect_err("invalid manifest entry must fail");
+                assert!(error.to_string().contains(diagnostic), "{error:#}");
+                assert!(state.events().is_empty());
+            }
+        }
     }
 
     #[test]
