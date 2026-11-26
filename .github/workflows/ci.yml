@@ -1784,8 +1784,8 @@ jobs:
         env:
           ZSTD_CLEVEL: "6"
         with:
-          # Regenerate dependencies for the Cargo CI profile.
-          prefix-key: "v3-macos"
+          # Keep the dependency optimizations required by the bounded Python fixture.
+          prefix-key: "v2-macos-dependencies"
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-bin: false
@@ -1846,7 +1846,7 @@ jobs:
           printf 'OMG_MACOS_PYTHON_FIXTURE_ARCHIVE=%s\n' "$archive" >> "$GITHUB_ENV"
 
       - name: Run unit tests
-        run: python3 scripts/run-native-contracts.py --features macos,pgp,license --cargo-profile ci
+        run: python3 scripts/run-native-contracts.py --features macos,pgp,license
 
       - name: Install Homebrew test packages
         run: |
@@ -1854,7 +1854,7 @@ jobs:
 
       - name: Run macOS platform integration tests
         run: |
-          cargo test --test macos_tests --no-default-features --features macos,pgp,license --profile ci --locked -- --test-threads=1
+          cargo test --test macos_tests --no-default-features --features macos,pgp,license --locked -- --test-threads=1
 
       - name: Verify native Homebrew doctor
         run: python3 scripts/verify-macos-doctor.py target/release/omg
