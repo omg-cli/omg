@@ -23,7 +23,10 @@ if mode == "history":
         "timestamp": "2026-01-01T00:00:00Z",
         "transaction_type": "Install",
         "success": True,
-        "changes": [{"name": package, "new_version": "1", "source": "local"}],
+        "changes": [
+            {"name": package, "architecture": architecture, "new_version": "1", "source": "dnf"}
+            for architecture in ("i686", "x86_64")
+        ],
     }]), encoding="utf-8")
 
 with (data / "history.lock").open("wb") as lock:
@@ -70,7 +73,7 @@ with (data / "history.lock").open("wb") as lock:
             time.sleep(0.25)
             fcntl.flock(lock, fcntl.LOCK_UN)
             os.write(terminal, b"5")
-            read_until(package.encode())
+            read_until(f"{package}.i686, {package}.x86_64".encode())
 
             fcntl.flock(lock, fcntl.LOCK_EX)
             os.write(terminal, b"r")

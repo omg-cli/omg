@@ -1167,7 +1167,7 @@ fn draw_activity(f: &mut Frame, area: Rect, app: &App) {
                 if j > 0 {
                     changes.push_str(", ");
                 }
-                changes.push_str(&c.name);
+                changes.push_str(&sanitize_control_chars(&c.display_name()));
             }
 
             let style = if index == app.selected_index {

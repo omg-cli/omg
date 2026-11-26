@@ -223,7 +223,7 @@ impl App {
     }
 
     pub(super) fn read_recent_history() -> Result<Vec<Transaction>> {
-        let entries = crate::core::history::HistoryManager::new()?.load()?;
+        let entries = crate::core::history::HistoryManager::load_existing()?;
         Ok(entries.into_iter().rev().take(50).collect())
     }
 
@@ -735,6 +735,25 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn recent_history_reads_empty_state_without_creating_the_store() -> Result<()> {
+        const CASE: &str =
+            "cli::tui::app::tests::recent_history_reads_empty_state_without_creating_the_store";
+        if crate::config::Settings::rerun_test_unprivileged(CASE)
+            || crate::core::testing::run_isolated_test(CASE)
+        {
+            return Ok(());
+        }
+        let fixture = tempfile::tempdir()?;
+        let store = fixture.path().join("missing-history");
+        temp_env::with_var("OMG_DATA_DIR", Some(&store), || -> Result<()> {
+            assert!(App::read_recent_history()?.is_empty());
+            assert!(!store.exists());
+            Ok(())
+        })
+    }
 
     #[test]
     fn cache_button_requests_only_cache_on_supported_backends() {
