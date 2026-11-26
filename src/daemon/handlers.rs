@@ -3163,20 +3163,9 @@ pub(super) mod tests {
             backend.started.notified(),
         )
         .await?;
-        let status = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            handle_status(Arc::clone(&state), 2),
-        )
-        .await?;
-        let Response::Success {
-            result: ResponseResult::Status(status),
-            ..
-        } = status
-        else {
-            panic!("status must remain available while the explicit lookup is pending");
-        };
-        assert_eq!(status.total_packages, 1);
-        assert_eq!(status.explicit_packages, 1);
+        let counts = tokio::time::timeout(std::time::Duration::from_secs(5), state.status_counts())
+            .await??;
+        assert_eq!(counts, (1, 1, 0, 0));
         backend.inner.remove(&["old-package".into()]).await?;
         backend.inner.set_installed_version("fresh-package", "2")?;
         state.replace_index(
@@ -3196,7 +3185,7 @@ pub(super) mod tests {
         let Response::Success {
             result: ResponseResult::Explicit(result),
             ..
-        } = handle_list_explicit(Arc::clone(&state), 3).await
+        } = handle_list_explicit(Arc::clone(&state), 2).await
         else {
             panic!("fresh lookup must succeed")
         };
