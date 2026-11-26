@@ -229,6 +229,24 @@ fn observe_native_catalog_controls(
         paths.directories.push((directory, None));
     }
 
+    paths.directories.extend(
+        standard_command_plugin_dirs()?
+            .into_iter()
+            .map(|path| (path, Some("so"))),
+    );
+    for directory in [
+        PathBuf::from("/etc/dnf/dnf5-aliases.d"),
+        PathBuf::from("/usr/share/dnf5/aliases.d"),
+    ]
+    .into_iter()
+    .chain(dirs::config_dir().map(|home| home.join("dnf5/aliases.d")))
+    {
+        paths.directories.push((directory, Some("conf")));
+    }
+    Ok(())
+}
+
+fn standard_command_plugin_dirs() -> Result<[PathBuf; 2]> {
     // These Fedora command plugins register their own commands. Third-party
     // plugins can modify DNF context and must take the native path.
     const FEDORA_COMMAND_PLUGINS: &[&str] = &[
@@ -241,9 +259,9 @@ fn observe_native_catalog_controls(
         "repomanage_cmd_plugin.so",
         "reposync_cmd_plugin.so",
     ];
-    for path in ["/usr/lib64/dnf5/plugins", "/usr/lib/dnf5/plugins"] {
-        let directory = PathBuf::from(path);
-        for entry in directory_entries(&directory)?.into_iter().flatten() {
+    let directories = ["/usr/lib64/dnf5/plugins", "/usr/lib/dnf5/plugins"].map(PathBuf::from);
+    for directory in &directories {
+        for entry in directory_entries(directory)?.into_iter().flatten() {
             let path = entry?.path();
             if path.extension().is_some_and(|value| value == "so") {
                 anyhow::ensure!(
@@ -254,18 +272,98 @@ fn observe_native_catalog_controls(
                 );
             }
         }
-        paths.directories.push((directory, Some("so")));
     }
-    for directory in [
-        PathBuf::from("/etc/dnf/dnf5-aliases.d"),
-        PathBuf::from("/usr/share/dnf5/aliases.d"),
-    ]
-    .into_iter()
-    .chain(dirs::config_dir().map(|home| home.join("dnf5/aliases.d")))
+    Ok(directories)
+}
+
+// Only establish a positive match. With no repository definition, custom
+// configuration or unknown plugins, the native repository list decides.
+pub(super) fn has_standard_repository() -> bool {
+    #[cfg(unix)]
     {
-        paths.directories.push((directory, Some("conf")));
+        standard_repository_exists()
+            .inspect_err(|error| tracing::debug!("Using native DNF repository scope: {error:#}"))
+            .unwrap_or(false)
     }
-    Ok(())
+    #[cfg(not(unix))]
+    false
+}
+
+#[cfg(unix)]
+fn standard_repository_exists() -> Result<bool> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    if !super::rpm_database::uses_default_repository_paths()
+        || std::env::var_os("DNF5_PLUGINS_DIR").is_some()
+        || !crate::core::privilege::root_controlled_program_path("dnf")?.ends_with("dnf5")
+    {
+        return Ok(false);
+    }
+    standard_command_plugin_dirs()?;
+    for path in ["/usr/lib64/libdnf5/plugins", "/usr/lib/libdnf5/plugins"] {
+        if let Some(mut entries) = directory_entries(Path::new(path))?
+            && entries.next().is_some()
+        {
+            return Ok(false);
+        }
+    }
+
+    const MAX_REPO_FILE: u64 = 1024 * 1024;
+    'repositories: for directory in [
+        "/etc/yum.repos.d",
+        "/etc/distro.repos.d",
+        "/usr/share/dnf5/repos.d",
+    ] {
+        let directory = Path::new(directory);
+        let Some(entries) = directory_entries(directory)? else {
+            continue;
+        };
+        for dir in directory.ancestors() {
+            let meta = fs::symlink_metadata(dir)?;
+            if !meta.is_dir() || meta.uid() != 0 || meta.mode() & 0o022 != 0 {
+                continue 'repositories;
+            }
+        }
+
+        for entry in entries {
+            let path = entry?.path();
+            if path.extension().is_none_or(|extension| extension != "repo") {
+                continue;
+            }
+            let meta = fs::symlink_metadata(&path)?;
+            if !meta.is_file()
+                || meta.uid() != 0
+                || meta.mode() & 0o022 != 0
+                || meta.len() > MAX_REPO_FILE
+            {
+                continue;
+            }
+            let mut config = String::new();
+            let bytes = fs::File::open(&path)?
+                .take(MAX_REPO_FILE + 1)
+                .read_to_string(&mut config)?;
+            if bytes as u64 <= MAX_REPO_FILE && has_literal_repository_section(&config) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(unix)]
+fn has_literal_repository_section(config: &str) -> bool {
+    config.lines().any(|line| {
+        line.trim_ascii_end()
+            .strip_prefix('[')
+            .and_then(|line| line.strip_suffix(']'))
+            .is_some_and(|id| {
+                !id.is_empty()
+                    && id != "main"
+                    && id
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || b"-_.:".contains(&byte))
+            })
+    })
 }
 
 struct ResolvedRepositoryPaths {
@@ -634,6 +732,31 @@ fn reported_paths(config: &str, key: &str) -> Result<Vec<PathBuf>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn literal_repository_sections_skip_comments_main_and_substitutions() {
+        for config in [
+            "",
+            "[main]\nenabled=1",
+            "# [fedora]\n; [updates]",
+            "baseurl=file:///repo/[fedora]",
+            "  [continuation]\n",
+            "[fedora-$releasever]\n",
+            "[]",
+            "[@System]",
+            "[incomplete",
+        ] {
+            assert!(!has_literal_repository_section(config), "{config:?}");
+        }
+        for config in [
+            "[fedora]\nenabled=0\n",
+            "# Comment\r\n[updates-testing.x86_64]\r\n",
+            "[family:distribution_a] \t\n",
+        ] {
+            assert!(has_literal_repository_section(config), "{config:?}");
+        }
+    }
 
     #[test]
     fn native_report_key_preserves_content_but_ignores_repository_order() {

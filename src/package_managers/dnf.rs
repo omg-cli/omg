@@ -803,18 +803,28 @@ impl DnfPackageManager {
         plan: PreparedDnfRemoval,
         history: &crate::core::history::HistoryManager,
     ) -> Result<()> {
-        // Replay normally loads available repositories. Removal uses only
-        // installed packages, and DNF rejects a disable glob with no matches.
-        let mut command =
-            tokio::process::Command::from(crate::core::privilege::system_command("dnf")?);
-        command.args(["repo", "list", "--all", "--json"]);
-        let output = Self::query_output(command).await?;
-        let repositories: Vec<serde::de::IgnoredAny> =
-            serde_json::from_slice(&output).context("Invalid DNF repository list")?;
-        let options: &'static [&'static str] = if repositories.is_empty() {
-            &[]
+        // Replay loads available repositories by default, even for removal.
+        // The wildcard can disable all live repositories once we know there
+        // is a configured match. DNF rejects the wildcard on an empty setup.
+        let configured = if tokio::task::spawn_blocking(
+            repository_observation::has_standard_repository,
+        )
+        .await?
+        {
+            true
         } else {
+            let mut command =
+                tokio::process::Command::from(crate::core::privilege::system_command("dnf")?);
+            command.args(["repo", "list", "--all", "--json"]);
+            let output = Self::query_output(command).await?;
+            let repositories: Vec<serde::de::IgnoredAny> =
+                serde_json::from_slice(&output).context("Invalid DNF repository list")?;
+            !repositories.is_empty()
+        };
+        let options: &'static [&'static str] = if configured {
             &["--disable-repo=*"]
+        } else {
+            &[]
         };
         Self::record_native_mutation(
             crate::core::history::TransactionType::Remove,

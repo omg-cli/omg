@@ -5,7 +5,7 @@ Run as root in private mount and network namespaces without network routes.
 The arguments are the inert Fedora fixture directory and the built omg and
 omgd binaries. All RPM writes go to a disposable installroot.
 """
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 import fcntl
 import gzip
 import hashlib
@@ -637,6 +637,93 @@ exec {shlex.quote(str(native_executable))} "$@"
                    (repeat.stdout + repeat.stderr)[-900:])
         finally:
             checked(["/usr/bin/umount", "/var/lib"])
+
+    def inspect_removal_replay():
+        # Fedora's default RPM database and DNF journal live under sysimage.
+        # Bind fresh state at their actual paths so DNF sees a default root.
+        removal = root / "review-removal"
+        removal.mkdir()
+        repo_dirs = (Path("/etc/yum.repos.d"), Path("/etc/distro.repos.d"),
+                     Path("/usr/share/dnf5/repos.d"))
+        offline_repo = ("[offline-fixture]\nname=Unavailable local test repository\n"
+                        "baseurl=file:///nonexistent-omg-fixture\n"
+                        "enabled=1\nskip_if_unavailable=false\n")
+        root_env = dict(base_env, HOME=str(removal), OMG_DISABLE_DAEMON="1",
+                        OMG_DISABLE_TELEMETRY="1", NO_COLOR="1")
+        main_before = config.read_bytes()
+        rpm_link = Path("/var/lib/rpm").readlink()
+        try:
+            with ExitStack() as mounts:
+                for target in (Path("/var/lib"), Path("/usr/lib/sysimage"), *repo_dirs):
+                    if target in repo_dirs and not target.exists():
+                        continue
+                    source = removal / target.name
+                    source.mkdir()
+                    checked(["/usr/bin/mount", "--bind", source, target])
+                    mounts.callback(checked, ["/usr/bin/umount", target])
+                    assert os.path.samefile(source, target), target
+                assert os.path.samefile(removal / "sysimage", "/usr/lib/sysimage")
+                assert os.path.samefile(removal / "lib", "/var/lib")
+                assert os.path.samefile(removal / "yum.repos.d", "/etc/yum.repos.d")
+                Path("/var/lib/rpm").symlink_to(rpm_link)
+                Path("/usr/lib/sysimage/rpm").mkdir()
+                Path("/usr/lib/sysimage/libdnf5").mkdir()
+                history = Path("/var/lib/omg/history.json")
+                default_repo = repo_dirs[0] / "offline-fixture.repo"
+                custom_repos = removal / "repos"
+                custom_repos.mkdir()
+                (custom_repos / default_repo.name).write_text(offline_repo)
+                for layout in ("standard", "empty", "custom"):
+                    settings = "[main]\nplugins=0\n"
+                    if layout == "standard":
+                        default_repo.write_text(offline_repo)
+                    else:
+                        default_repo.unlink(missing_ok=True)
+                    if layout == "custom":
+                        settings += f"reposdir={custom_repos}\n"
+                    config.write_text(settings)
+                    repo_options = ["--disable-repo=*"] if layout != "empty" else []
+                    checked([dnf, "--releasever=44", *repo_options, "--setopt=localpkg_gpgcheck=0",
+                             "--assumeyes", "install", fixture / "observer-fixture.rpm"], root_env)
+                    native_history = [dnf, "history", "info", "last", "--json"]
+                    baseline = checked(native_history, root_env)
+                    assert checked([rpm, "-q", package], root_env).strip() == f"{package}-1-1.noarch"
+                    invoke = [cli, "remove", "--yes", package]
+                    with reject_native_selection("list", after="repo"):
+                        result = command(invoke, root_env)
+                    blocked = "Unexpected DNF selection subprocess" in result.stderr
+                    detail = (result.stdout + result.stderr)[-1100:]
+                    if layout == "standard":
+                        probe_passed = result.returncode == 0 and not blocked
+                    else:
+                        probe_passed = (result.returncode != 0 and blocked
+                                        and checked(native_history, root_env) == baseline
+                                        and checked([rpm, "-q", package], root_env).strip() == f"{package}-1-1.noarch"
+                                        and not history.exists())
+                        result = command(invoke, root_env)
+                    checks.append(dict(phase=f"removal-{layout}", case="repository-probe",
+                                       passed=probe_passed, diagnostic=detail))
+                    finished = json.loads(checked(native_history, root_env))
+                    native_ok = (len(finished) == 1 and finished[0]["status"] == "Ok"
+                                 and (finished[0]["description"].split().count("--disable-repo=*")
+                                      == int(bool(repo_options)))
+                                 and {(row["nevra"], row["action"]) for row in finished[0]["packages"]}
+                                 == {(f"{package}-0:1-1.noarch", "Remove")})
+                    removed = command([rpm, "-q", package], root_env)
+                    checks.append(dict(phase=f"removal-{layout}", case="native-replay",
+                                       passed=result.returncode == 0 and removed.returncode == 1 and native_ok,
+                                       diagnostic=(result.stdout + result.stderr + str(finished))[-1400:]))
+                    entries = json.loads(history.read_text()) if history.exists() else []
+                    expected = dict(name=package, old_version="0:1-1", new_version=None, source="dnf")
+                    checks.append(dict(phase=f"removal-{layout}", case="omg-journal",
+                                       passed=len(entries) == 1 and entries[0]["success"] is True
+                                       and entries[0]["transaction_type"] == "Remove"
+                                       and entries[0]["changes"] == [expected], diagnostic=str(entries)[-900:]))
+                    history.unlink(missing_ok=True)
+                    if removed.returncode == 0:
+                        checked([rpm, "-e", package], root_env)
+        finally:
+            config.write_bytes(main_before)
 
     def status_during(change):
         # Pause the real counts query before libdnf5 takes any database locks.
@@ -1325,6 +1412,7 @@ exec {shlex.quote(str(binary))} "$@"
                     groups.write_bytes(initial_groups)
                     packages_state.write_bytes(initial_packages)
                 inspect_upgrade_review(old_rpm)
+            inspect_removal_replay()
             config.write_text(host_config)
             inspect_security_inventory("inventory-host")
             if consent_oracle is not None:
@@ -1343,6 +1431,6 @@ assert inventory() == before
 report = dict(binaries=binaries, checks=checks, total=len(checks),
               passed=sum(entry["passed"] for entry in checks), host_unchanged=True)
 print(json.dumps(report))
-expected_checks = 303 if consent_oracle is None else 554
+expected_checks = 312 if consent_oracle is None else 563
 if report["passed"] != report["total"] or report["total"] != expected_checks:
     sys.exit(4)

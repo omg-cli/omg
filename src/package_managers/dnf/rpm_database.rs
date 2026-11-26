@@ -97,6 +97,11 @@ pub(super) fn uses_default_journal() -> bool {
     ])
 }
 
+#[cfg(unix)]
+pub(super) fn uses_default_repository_paths() -> bool {
+    uses_default_paths(&["reposdir", "use_host_config"])
+}
+
 fn uses_default_paths(extra: &[&str]) -> bool {
     let mut candidates = CONFIG_DROP_INS.iter().map(Path::new);
     let mut plugin_configs = PLUGIN_CONFIGS.iter().map(Path::new);
