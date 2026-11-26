@@ -380,6 +380,11 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         run: python3 scripts/ci-r2-cache.py --mode pr-read
 
+      - name: Check fuzz targets
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
+        run: cargo check --manifest-path fuzz/Cargo.toml --all-targets --locked
+
       - name: Clippy
         run: |
           cargo clippy --all-targets --no-default-features --features pgp,license \
@@ -396,11 +401,6 @@ jobs:
           cargo test --lib --no-default-features --features license --locked \
             runtimes::node::tests::node_install_without_pgp_refuses_before_contacting_the_publisher \
             -- --exact --nocapture
-
-      - name: Check fuzz targets
-        env:
-          CARGO_TARGET_DIR: ${{ github.workspace }}/target
-        run: cargo check --manifest-path fuzz/Cargo.toml --all-targets --locked
 
       - name: Configure signed Ubuntu archive
         uses: ./.github/actions/ubuntu-apt

@@ -220,7 +220,7 @@ class OptimizationContracts(unittest.TestCase):
     def test_native_coverage_stages_protected_inputs_from_writable_sources(self):
         script = step_script('coverage.yml', 'Cover sandbox descendant cancellation')
         start = script.index('docker cp "$binary"')
-        end = script.index('\nbash scripts/benchmark-qemu.sh', start)
+        end = script.index('\n(timeout --kill-after', start)
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             scripts, evidence, runner = root / 'scripts', root / 'evidence', root / 'runner'
@@ -347,6 +347,13 @@ jq() { "$TEST_PYTHON" "$MANIFEST_ROWS" "$3"; }
             benchmark.write_text('''#!/usr/bin/env bash
 set -euo pipefail
 test "$1" = --distro && test "$2" = arch
+for ((attempt=0; attempt<100; attempt++)); do
+  if test -f "$RUNNER_TEMP/sandbox-started"; then break; fi
+  sleep 0.02
+done
+test -f "$RUNNER_TEMP/sandbox-started"
+touch "$RUNNER_TEMP/qemu-started"
+if test "$QEMU_STATUS" -ne 0; then exit "$QEMU_STATUS"; fi
 while test "$#" -gt 0; do
   if test "$1" = --evidence-dir; then
     mkdir -p "$2/unit-transport/native-evidence/cli" "$2/unit-transport/native-profiles"
@@ -372,7 +379,17 @@ data = sys.stdin.read() if args and args[0] == 'run' and '--interactive' in args
 with open(os.environ['TRACE'], 'a') as trace:
     trace.write(json.dumps([args, data]) + '\\n')
 if args and args[0] == 'create': print('fixture-container')
-if args[:2] == ['start', '--attach']: sys.exit(int(os.environ['START_STATUS']))
+if args[:2] == ['start', '--attach']:
+    from pathlib import Path
+    from time import monotonic, sleep
+    runner_temp = Path(os.environ['RUNNER_TEMP'])
+    (runner_temp / 'sandbox-started').touch()
+    deadline = monotonic() + 4
+    while not (runner_temp / 'qemu-started').is_file():
+        if monotonic() >= deadline:
+            sys.exit(2)
+        sleep(0.02)
+    sys.exit(int(os.environ['START_STATUS']))
 if args and args[0] == 'rm': sys.exit(int(os.environ.get('REMOVE_STATUS', '0')))
 if '--remove' in args: sys.exit(int(os.environ.get('UNLOAD_STATUS', '0')))
 ''')
@@ -382,22 +399,27 @@ sha256sum() { if [ "$1" = --check ]; then cat >/dev/null; else command sha256sum
 jq() { :; }
 git() { printf '%040d\\n' 1; }
 '''
-            for run_id, attempt, status, remove, unload, expected in [
-                    ('123', '1', 0, 0, 0, 0), ('123', '2', 23, 0, 0, 23),
-                    ('123', '3', 23, 7, 9, 23), ('123', '4', 0, 7, 0, 7),
-                    ('123', '5', 0, 0, 9, 9)]:
+            for run_id, attempt, status, qemu, remove, unload, expected in [
+                    ('123', '1', 0, 0, 0, 0, 0), ('123', '2', 23, 0, 0, 0, 23),
+                    ('123', '3', 23, 0, 7, 9, 23), ('123', '4', 0, 0, 7, 0, 7),
+                    ('123', '5', 0, 0, 0, 9, 9), ('123', '6', 0, 42, 0, 0, 42),
+                    ('123', '7', 23, 42, 0, 0, 42)]:
                 trace = root / f'trace-{attempt}'
                 runner_temp = root / ('runner-' + attempt)
                 runner_temp.mkdir()
                 result = subprocess.run([BASH, '-e', '-c', launcher + script], cwd=root,
                     env=dict(os.environ, PATH=str(root) + os.pathsep + os.environ['PATH'],
-                             TRACE=str(trace), START_STATUS=str(status), REMOVE_STATUS=str(remove),
+                             TRACE=str(trace), START_STATUS=str(status), QEMU_STATUS=str(qemu),
+                             REMOVE_STATUS=str(remove),
                              UNLOAD_STATUS=str(unload), GITHUB_RUN_ID=run_id,
                              GITHUB_RUN_ATTEMPT=attempt, GITHUB_WORKSPACE=str(root), RUNNER_TEMP=str(runner_temp),
                              NATIVE_IMAGE_CACHE=str(runner_temp / 'provided-image-cache')),
                     text=True, capture_output=True, timeout=10)
                 self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
                 calls = [json.loads(line) for line in trace.read_text().splitlines()]
+                for path in ('/evidence/.', '/profiles/.'):
+                    self.assertTrue(any(args[:2] == ['cp', 'fixture-container:' + path]
+                                        for args, _ in calls), f'Missing sandbox collection for {path}')
                 loaders = [(args, data) for args, data in calls if '--entrypoint' in args]
                 self.assertEqual(len(loaders), 1 if remove else 2)
                 name = f'omg-coverage-{run_id}-{attempt}'
