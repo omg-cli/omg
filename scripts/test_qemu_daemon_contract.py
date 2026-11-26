@@ -68,49 +68,78 @@ check_fedora_reason_refusal unused state evidence 1000 1000
             self.assertFalse(list((root / 'state').iterdir()))
             self.assertFalse(list((root / 'evidence').iterdir()))
 
+    def run_guest_provisioning(self, root, distro, benchmark, source_kind, *, install_status=0,
+                               provision_status=0):
+        source = (ROOT / 'scripts/benchmark-qemu.sh').read_text(encoding='utf-8')
+        guest = source.split('cat > "$work/guest-check.sh" <<\'GUEST\'\n', 1)[1]
+        prologue = guest.split('case "$accel"', 1)[0]
+        setup = guest[guest.index('guest_tools=('):guest.index("printf 'daemon lifecycle start")]
+        mocks = r"""
+sudo() { printf '%s\n' "$@" > evidence/install.argv; return "$FIXTURE_INSTALL_STATUS"; }
+timeout() { printf '%s\n' "$@" > evidence/provision.argv; return "$FIXTURE_PROVISION_STATUS"; }
+"""
+        (root / 'evidence').mkdir()
+        return subprocess.run(
+            [BASH, '-c', prologue + mocks + setup + '\nprintf "daemon-ready\\n"\n', '_',
+             distro, 'v0.0.0', 'digest', benchmark, 'x86_64', 'x86_64', '', 'kvm', source_kind],
+            cwd=root, env=dict(os.environ, HOME=str(root), FIXTURE_INSTALL_STATUS=str(install_status),
+                               FIXTURE_PROVISION_STATUS=str(provision_status)),
+            capture_output=True, text=True, timeout=10)
+
     @unittest.skipIf(os.name == 'nt', 'guest dependency setup requires POSIX bash')
     def test_guest_daemon_and_doctor_tools_are_installed_without_benchmark(self):
-        source = (ROOT / 'scripts/benchmark-qemu.sh').read_text(encoding='utf-8')
-        setup = source.split('guest_tools=(', 1)[1].split("printf 'daemon lifecycle start", 1)[0]
-        setup = 'guest_tools=(' + setup
         for distro in ('arch', 'debian', 'debian-trixie', 'ubuntu', 'fedora'):
             for benchmark in ('true', 'false'):
-                with self.subTest(distro=distro, benchmark=benchmark), tempfile.TemporaryDirectory() as directory:
+                for source_kind in ('published', 'staged'):
+                    with self.subTest(distro=distro, benchmark=benchmark, source_kind=source_kind), \
+                            tempfile.TemporaryDirectory() as directory:
+                        root = Path(directory)
+                        result = self.run_guest_provisioning(root, distro, benchmark, source_kind)
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        self.assertEqual(result.stdout, 'daemon-ready\n')
+                        args = (root / 'evidence/install.argv').read_text().splitlines()
+                        self.assertEqual(args.count('jq'), 1)
+                        self.assertEqual(args.count('openssl'), 1)
+                        self.assertEqual(args.count('python' if distro == 'arch' else 'python3'), 1)
+                        self.assertEqual(args.count('python3' if distro == 'arch' else 'python'), 0)
+                        self.assertEqual(args.count('hyperfine'), int(benchmark == 'true'))
+                        self.assertEqual(args.count('git'), int(distro == 'fedora' and source_kind == 'staged'))
+                        self.assertEqual(args.count('createrepo_c'), int(distro == 'fedora'))
+                        self.assertEqual(args.count('gnupg2'), int(distro == 'fedora'))
+                        rpm_or_arch = distro in ('arch', 'fedora')
+                        self.assertEqual(args.count('libcap'), int(rpm_or_arch))
+                        self.assertEqual(args.count('systemd'), int(rpm_or_arch))
+                        self.assertEqual(args.count('libcap2-bin'), int(not rpm_or_arch))
+                        self.assertEqual(args.count('systemd-coredump'), int(not rpm_or_arch))
+                        self.assertEqual((root / 'evidence/provision.argv').read_text().splitlines(),
+                                         ['--kill-after=5s', '90s', 'sudo', '-n', 'python3',
+                                          str(root / 'provision-qemu-crash-channel.py')])
+                        self.assertTrue((root / 'evidence/crash-channel-provision.json').is_file())
+
+    @unittest.skipIf(os.name == 'nt', 'guest setup requires POSIX bash')
+    def test_guest_dependency_install_failure_prevents_crash_provisioning(self):
+        managers = {'arch': 'pacman', 'debian': 'apt-get', 'debian-trixie': 'apt-get',
+                    'ubuntu': 'apt-get', 'fedora': 'dnf'}
+        for distro, manager in managers.items():
+            for source_kind in ('published', 'staged'):
+                with self.subTest(distro=distro, source_kind=source_kind), tempfile.TemporaryDirectory() as directory:
                     root = Path(directory)
-                    (root / 'evidence').mkdir()
-                    result = subprocess.run(
-                        [BASH, '-euc', 'sudo() { printf "%s\\n" "$@"; };\n'
-                         'timeout() { printf "%s\\n" "$@" > "$HOME/provision.argv"; };\n' + setup],
-                        cwd=root, env=dict(os.environ, HOME=str(root), distro=distro, benchmark=benchmark),
-                        capture_output=True, text=True, timeout=10)
-                    self.assertEqual(result.returncode, 0, result.stderr)
-                    args = result.stdout.splitlines()
-                    self.assertEqual(args.count('jq'), 1)
-                    self.assertEqual(args.count('openssl'), 1)
-                    self.assertEqual(args.count('python' if distro == 'arch' else 'python3'), 1)
-                    self.assertEqual(args.count('python3' if distro == 'arch' else 'python'), 0)
-                    self.assertEqual(args.count('hyperfine'), int(benchmark == 'true'))
-                    collector = 'systemd' if distro in ('arch', 'fedora') else 'systemd-coredump'
-                    self.assertEqual(args.count(collector), 1)
-                    self.assertEqual(args.count('libcap2-bin'), int(distro in ('debian', 'debian-trixie', 'ubuntu')))
-                    self.assertEqual((root / 'provision.argv').read_text().splitlines(),
-                                     ['--kill-after=5s', '90s', 'sudo', '-n', 'python3',
-                                      str(root / 'provision-qemu-crash-channel.py')])
-                    self.assertTrue((root / 'evidence/crash-channel-provision.json').is_file())
+                    result = self.run_guest_provisioning(root, distro, 'false', source_kind, install_status=17)
+                    self.assertEqual(result.returncode, 120, result.stderr)
+                    self.assertEqual(result.stdout, '')
+                    self.assertIn(manager, (root / 'evidence/install.argv').read_text().splitlines())
+                    self.assertFalse((root / 'evidence/provision.argv').exists())
+                    self.assertFalse((root / 'evidence/crash-channel-provision.json').exists())
 
     @unittest.skipIf(os.name == 'nt', 'guest setup requires POSIX bash')
     def test_crash_provision_failure_prevents_daemon_start(self):
-        source = (ROOT / 'scripts/benchmark-qemu.sh').read_text(encoding='utf-8')
-        setup = 'guest_tools=(' + source.split('guest_tools=(', 1)[1].split("printf 'daemon lifecycle start", 1)[0]
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            (root / 'evidence').mkdir()
-            result = subprocess.run(
-                [BASH, '-euc', 'sudo() { :; }; timeout() { return 120; };\n' + setup + '\necho daemon-started'],
-                cwd=root, env=dict(os.environ, HOME=str(root), distro='debian-trixie', benchmark='false'),
-                capture_output=True, text=True, timeout=10)
-            self.assertEqual(result.returncode, 120, result.stderr)
-            self.assertNotIn('daemon-started', result.stdout)
+        for distro, source_kind in (('debian-trixie', 'published'), ('fedora', 'published'), ('fedora', 'staged')):
+            with self.subTest(distro=distro, source_kind=source_kind), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                result = self.run_guest_provisioning(root, distro, 'false', source_kind, provision_status=17)
+                self.assertEqual(result.returncode, 120, result.stderr)
+                self.assertEqual(result.stdout, '')
+                self.assertTrue((root / 'evidence/provision.argv').is_file())
 
     def test_query_parity_receipt_is_mandatory(self):
         source = (ROOT / 'scripts/benchmark-qemu.sh').read_text(encoding='utf-8')
