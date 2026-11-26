@@ -33,7 +33,7 @@ mod install_reasons;
 #[cfg(unix)]
 mod native_journal;
 mod rpm_database;
-mod rpm_evr;
+use super::rpm_evr;
 
 mod repository_freshness;
 mod repository_observation;
@@ -191,6 +191,12 @@ impl RpmDatabaseIdentity {
         // An absent WAL is valid; an unreadable one must not validate a hit.
         let wal = RpmFileIdentity::read(Path::new(&wal_path)).ok()?;
         Some(Self { database, wal })
+    }
+
+    fn read_update_generation(path: &Path) -> Option<Self> {
+        let mut identity = Self::read(path)?;
+        identity.wal = identity.wal.filter(|wal| wal.size != 0);
+        Some(identity)
     }
 
     fn hash_inventory_generation(self, hash: &mut sha2::Sha256, include_wal_ctime: bool) {
@@ -2810,20 +2816,30 @@ impl DnfPackageManager {
         text.lines()
             .filter(|line| !line.is_empty())
             .map(|line| {
-                let fields: Vec<_> = line.split('\t').take(5).collect();
-                anyhow::ensure!(fields.len() == 4, "DNF version row must have four fields");
+                let mut fields = line.split('\t');
+                let (Some(name), Some(architecture), Some(version), Some(repository), None) = (
+                    fields.next(),
+                    fields.next(),
+                    fields.next(),
+                    fields.next(),
+                    fields.next(),
+                ) else {
+                    anyhow::bail!("DNF version row must have four fields");
+                };
                 anyhow::ensure!(
-                    fields.iter().all(|field| !field.is_empty()
-                        && !field
-                            .chars()
-                            .any(|ch| ch.is_whitespace() || ch.is_control())),
+                    [name, architecture, version, repository]
+                        .into_iter()
+                        .all(|field| !field.is_empty()
+                            && !field
+                                .chars()
+                                .any(|ch| ch.is_whitespace() || ch.is_control())),
                     "DNF version row has an invalid field"
                 );
                 Ok(VersionedPackage {
-                    name: fields[0].to_owned(),
-                    architecture: fields[1].to_owned(),
-                    version: fields[2].to_owned(),
-                    repository: fields[3].to_owned(),
+                    name: name.to_owned(),
+                    architecture: architecture.to_owned(),
+                    version: version.to_owned(),
+                    repository: repository.to_owned(),
                 })
             })
             .collect()
@@ -2833,23 +2849,43 @@ impl DnfPackageManager {
         installed: &[VersionedPackage],
         upgrades: &[VersionedPackage],
     ) -> Result<Vec<UpdateInfo>> {
-        let mut by_identity = HashMap::new();
-        for package in installed {
-            anyhow::ensure!(
-                by_identity
-                    .insert(
-                        (package.name.as_str(), package.architecture.as_str()),
-                        package
-                    )
-                    .is_none(),
-                "DNF returned duplicate installed name/architecture"
-            );
+        let installed = installed.iter().map(|row| {
+            (
+                row.name.as_str(),
+                row.architecture.as_str(),
+                std::borrow::Cow::Borrowed(row.version.as_str()),
+            )
+        });
+        Self::match_update_rows(installed, upgrades)
+    }
+
+    fn match_update_rows<'a>(
+        installed: impl Iterator<Item = (&'a str, &'a str, std::borrow::Cow<'a, str>)>,
+        upgrades: &[VersionedPackage],
+    ) -> Result<Vec<UpdateInfo>> {
+        let mut baselines: HashMap<_, Option<std::borrow::Cow<'_, str>>> = upgrades
+            .iter()
+            .map(|row| ((row.name.as_str(), row.architecture.as_str()), None))
+            .collect();
+        for (name, architecture, version) in installed {
+            let Some(current) = baselines.get_mut(&(name, architecture)) else {
+                continue;
+            };
+            // RPM retains multiple builds of install-only packages. The
+            // newest installed EVR is the baseline for the upgrade.
+            if let Some(previous) = current
+                && rpm_evr::compare(&version, previous)?.is_le()
+            {
+                continue;
+            }
+            *current = Some(version);
         }
         upgrades
             .iter()
             .map(|candidate| {
-                let old = by_identity
+                let old = baselines
                     .get(&(candidate.name.as_str(), candidate.architecture.as_str()))
+                    .and_then(Option::as_deref)
                     .with_context(|| {
                         format!(
                             "DNF upgrade {}.{} has no matching installed package",
@@ -2857,17 +2893,34 @@ impl DnfPackageManager {
                         )
                     })?;
                 anyhow::ensure!(
-                    old.version != candidate.version,
-                    "DNF upgrade has an unchanged version"
+                    rpm_evr::compare(old, &candidate.version)?.is_lt(),
+                    "DNF candidate {}.{} {} is not newer than installed {old}",
+                    candidate.name,
+                    candidate.architecture,
+                    candidate.version
                 );
                 Ok(UpdateInfo {
                     name: candidate.name.clone(),
-                    old_version: old.version.clone(),
+                    old_version: old.to_owned(),
                     new_version: candidate.version.clone(),
                     repo: candidate.repository.clone(),
                 })
             })
             .collect()
+    }
+
+    fn check_update_generation(
+        host_path: &Path,
+        location: &RpmDatabase,
+        generation: RpmDatabaseIdentity,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            RpmDatabase::detect_default(host_path).as_ref() == Some(location)
+                && RpmDatabaseIdentity::read_update_generation(&location.sqlite)
+                    .is_some_and(|current| current.same_inventory_files(generation)),
+            "RPM inventory changed during the upgrade query; retry the check"
+        );
+        Ok(())
     }
 
     /// A handle sharing this manager's caches, so blocking workers mutate
@@ -3346,13 +3399,53 @@ impl PackageManager for DnfPackageManager {
 
     fn list_updates(&self) -> Pin<Box<dyn Future<Output = Result<Vec<UpdateInfo>>> + Send + '_>> {
         Box::pin(async move {
+            let host_path = self.rpm_db_path.clone();
+            let snapshot = tokio::task::spawn_blocking({
+                let host_path = host_path.clone();
+                move || {
+                    let location = RpmDatabase::detect_default(&host_path)?;
+                    let generation = RpmDatabaseIdentity::read_update_generation(&location.sqlite)?;
+                    Some((location, generation))
+                }
+            })
+            .await
+            .context("RPM upgrade observation worker failed")?;
             let upgrades = Self::parse_versioned_packages(
                 &Self::repository_output(RepositoryQuery::Upgrades).await?,
             )?;
+            if let Some((location, generation)) = snapshot {
+                let need_versions = !upgrades.is_empty();
+                let installed = tokio::task::spawn_blocking(move || {
+                    Self::check_update_generation(&host_path, &location, generation)?;
+                    if !need_versions {
+                        return Ok(None);
+                    }
+                    let installed = Self::read_rpm_sqlite(&location.sqlite);
+                    Self::check_update_generation(&host_path, &location, generation)?;
+                    match installed {
+                        Ok(installed) => Ok(Some(installed)),
+                        Err(error) => {
+                            tracing::debug!(%error, "Direct RPM upgrade baselines unavailable");
+                            Ok::<_, anyhow::Error>(None)
+                        }
+                    }
+                })
+                .await
+                .context("RPM upgrade baseline worker failed")??;
+                if let Some(installed) = installed {
+                    let rows = installed.iter().map(|row| {
+                        (
+                            row.name.as_str(),
+                            row.architecture.as_str(),
+                            std::borrow::Cow::Owned(format!("{}-{}", row.version, row.release)),
+                        )
+                    });
+                    return Self::match_update_rows(rows, &upgrades);
+                }
+            }
             if upgrades.is_empty() {
                 return Ok(Vec::new());
             }
-
             let installed = Self::repository_output(RepositoryQuery::Installed).await?;
             Self::match_updates(&Self::parse_versioned_packages(&installed)?, &upgrades)
         })
@@ -4260,6 +4353,60 @@ mod tests {
         assert_eq!(updates[1].old_version, "1:1-1");
         assert_eq!(updates[0].new_version, "1:4-1");
         assert_eq!(updates[0].repo, "updates");
+    }
+
+    #[test]
+    fn update_matching_uses_newest_install_only_build_per_architecture() -> Result<()> {
+        let installed = DnfPackageManager::parse_versioned_packages(
+            b"kernel\tx86_64\t0:6.14.1-1.fc44\t@System\nkernel\tx86_64\t6.14.9-1.fc44\t@System\nkernel\ti686\t6.14.10-1.fc44\t@System\n",
+        )?;
+        let candidates = DnfPackageManager::parse_versioned_packages(
+            b"kernel\tx86_64\t6.14.10-1.fc44\tupdates\n",
+        )?;
+        let update = DnfPackageManager::match_updates(&installed, &candidates)?;
+        assert_eq!(update.len(), 1);
+        assert_eq!(update[0].old_version, "6.14.9-1.fc44");
+        assert_eq!(update[0].new_version, "6.14.10-1.fc44");
+        Ok(())
+    }
+
+    #[test]
+    fn update_generation_ignores_an_empty_wal_and_detects_inventory_changes() -> Result<()> {
+        let owned = tempfile::tempdir()?;
+        let database = owned.path().join("rpmdb.sqlite");
+        std::fs::write(&database, b"owned first inventory")?;
+        let location = RpmDatabase::detect(&database)?;
+        let generation = RpmDatabaseIdentity::read_update_generation(&database)
+            .context("inventory generation is available")?;
+        let wal = owned.path().join("rpmdb.sqlite-wal");
+        std::fs::write(&wal, [])?;
+        DnfPackageManager::check_update_generation(&database, &location, generation)?;
+        std::fs::write(&wal, b"owned newer inventory generation")?;
+        assert!(
+            DnfPackageManager::check_update_generation(&database, &location, generation)
+                .unwrap_err()
+                .to_string()
+                .contains("RPM inventory changed")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn update_matching_requires_a_newer_rpm_version() -> Result<()> {
+        for (installed, candidate) in [
+            ("1.0-1.fc44", "0:1.0-1.fc44"),
+            ("1.0.1-1.fc44", "1.0^git2026-1.fc44"),
+            ("2:1.0-1.fc44", "1:2.0-1.fc44"),
+        ] {
+            let current = format!("sample\tx86_64\t{installed}\t@System\n");
+            let upcoming = format!("sample\tx86_64\t{candidate}\tupdates\n");
+            let current = DnfPackageManager::parse_versioned_packages(current.as_bytes())?;
+            let upcoming = DnfPackageManager::parse_versioned_packages(upcoming.as_bytes())?;
+            let error = DnfPackageManager::match_updates(&current, &upcoming)
+                .expect_err("a DNF candidate must be newer by RPM ordering");
+            assert!(format!("{error:#}").contains("not newer"), "{error:#}");
+        }
+        Ok(())
     }
 
     #[test]

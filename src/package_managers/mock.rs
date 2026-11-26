@@ -161,24 +161,89 @@ impl MockPackageManager {
     }
 
     pub fn set_installed_version(&self, name: &str, version: &str) -> Result<()> {
-        let mut state = self.load_state()?;
-        state
-            .installed
-            .insert(name.to_string(), version.to_string());
-        state
-            .available
-            .insert(name.to_string(), version.to_string());
-        self.save_state(&state)?;
-        Ok(())
+        self.change_state(|state| {
+            state.installed.insert(name.to_owned(), version.to_owned());
+            state.available.insert(name.to_owned(), version.to_owned());
+            Ok(())
+        })
     }
 
     pub fn set_available_version(&self, name: &str, version: &str) -> Result<()> {
+        self.change_state(|state| {
+            state.available.insert(name.to_owned(), version.to_owned());
+            Ok(())
+        })
+    }
+
+    fn change_state(&self, change: impl FnOnce(&mut MockState) -> Result<()>) -> Result<()> {
+        let lock_path = self.state_path().with_extension("lock");
+        if let Some(parent) = lock_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let lock = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)?;
+        lock.lock().context("Failed to lock mock package state")?;
         let mut state = self.load_state()?;
-        state
-            .available
-            .insert(name.to_string(), version.to_string());
-        self.save_state(&state)?;
-        Ok(())
+        change(&mut state)?;
+        self.save_state(&state)
+    }
+
+    fn package_projection(
+        &self,
+        name: &str,
+        package: Option<&MockPackage>,
+        state: &MockState,
+    ) -> Option<Package> {
+        let installed = state.installed.get(name);
+        let available = state.available.get(name);
+        let catalog = package.map(|row| &row.version);
+        let version = if self.distro_name == "dnf" {
+            installed.or(available).or(catalog)
+        } else {
+            catalog.or(available)
+        }?;
+        Some(Package {
+            name: name.to_owned(),
+            version: parse_version_or_zero(version),
+            description: package.map_or_else(String::new, |row| row.description.clone()),
+            source: PackageSource::Official,
+            installed: installed.is_some(),
+        })
+    }
+
+    fn updates_for_state(&self, state: &MockState) -> Result<Vec<UpdateInfo>> {
+        let available = self
+            .db
+            .packages
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut updates = Vec::new();
+        for (name, installed_version) in &state.installed {
+            let Some(candidate) = state.available.get(name) else {
+                continue;
+            };
+            let newer = if self.distro_name == "dnf" {
+                super::rpm_evr::compare(candidate, installed_version)?.is_gt()
+            } else {
+                parse_version_or_zero(candidate) > parse_version_or_zero(installed_version)
+            };
+            if newer {
+                updates.push(UpdateInfo {
+                    name: name.clone(),
+                    old_version: installed_version.clone(),
+                    new_version: candidate.clone(),
+                    repo: available
+                        .get(name)
+                        .map_or_else(|| "unknown".to_owned(), |row| row.repo.clone()),
+                });
+            }
+        }
+        updates.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+        Ok(updates)
     }
 
     fn state_path(&self) -> PathBuf {
@@ -258,33 +323,25 @@ impl PackageManager for MockPackageManager {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let mut results: Vec<Package> = pkgs
-                .values()
-                .filter(|p| {
-                    p.name.to_lowercase().contains(&query)
-                        || p.description.to_lowercase().contains(&query)
+                .iter()
+                .filter(|(name, row)| {
+                    name.to_lowercase().contains(&query)
+                        || row.description.to_lowercase().contains(&query)
                 })
-                .map(|p| Package {
-                    name: p.name.clone(),
-                    version: parse_version_or_zero(&p.version),
-                    description: p.description.clone(),
-                    source: PackageSource::Official,
-                    installed: state.installed.contains_key(&p.name),
-                })
+                .filter_map(|(name, row)| self.package_projection(name, Some(row), &state))
                 .collect();
-            results.extend(
+            let dynamic = state.installed.keys().chain(
                 state
                     .available
-                    .iter()
-                    .filter(|(name, _)| {
+                    .keys()
+                    .filter(|name| !state.installed.contains_key(*name)),
+            );
+            results.extend(
+                dynamic
+                    .filter(|name| {
                         !pkgs.contains_key(*name) && name.to_lowercase().contains(&query)
                     })
-                    .map(|(name, version)| Package {
-                        name: name.clone(),
-                        version: parse_version_or_zero(version),
-                        description: String::new(),
-                        source: PackageSource::Official,
-                        installed: state.installed.contains_key(name),
-                    }),
+                    .filter_map(|name| self.package_projection(name, None, &state)),
             );
             results.sort_by(|left, right| left.name.cmp(&right.name));
             Ok(results)
@@ -297,49 +354,49 @@ impl PackageManager for MockPackageManager {
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
         let packages = packages.to_vec();
         Box::pin(async move {
-            let mut state = self.load_state()?;
-            let pkgs = self
-                .db
-                .packages
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-
-            for pkg in &packages {
-                let exists = state.available.contains_key(pkg) || pkgs.contains_key(pkg);
-                if !exists {
-                    anyhow::bail!("Package {pkg} not found in any repository");
+            self.change_state(|state| {
+                let available = self
+                    .db
+                    .packages
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                for name in packages {
+                    let version = state
+                        .available
+                        .get(&name)
+                        .or_else(|| available.get(&name).map(|row| &row.version))
+                        .with_context(|| format!("Package {name} not found in any repository"))?;
+                    state.installed.insert(name, version.clone());
                 }
-            }
-
-            for pkg in &packages {
-                let version = state
-                    .available
-                    .get(pkg)
-                    .or_else(|| pkgs.get(pkg).map(|p| &p.version))
-                    .cloned()
-                    .unwrap_or_else(|| "0".to_string());
-                state.installed.insert(pkg.clone(), version);
-            }
-            drop(pkgs);
-            self.save_state(&state)?;
-            Ok(())
+                Ok(())
+            })
         })
     }
 
     fn remove(&self, packages: &[String]) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
         let packages = packages.to_vec();
         Box::pin(async move {
-            let mut state = self.load_state()?;
-            for pkg in &packages {
-                state.installed.remove(pkg);
-            }
-            self.save_state(&state)?;
-            Ok(())
+            self.change_state(|state| {
+                for name in packages {
+                    state.installed.remove(&name);
+                }
+                Ok(())
+            })
         })
     }
 
     fn update(&self) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
-        Box::pin(async move { Ok(()) })
+        Box::pin(async move {
+            if self.distro_name != "dnf" {
+                return Ok(());
+            }
+            self.change_state(|state| {
+                for update in self.updates_for_state(state)? {
+                    state.installed.insert(update.name, update.new_version);
+                }
+                Ok(())
+            })
+        })
     }
 
     fn removal_plan<'a>(
@@ -380,26 +437,7 @@ impl PackageManager for MockPackageManager {
                 .packages
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            Ok(pkgs.get(&package).map_or_else(
-                || {
-                    state.available.get(&package).map(|version| Package {
-                        name: package.clone(),
-                        version: parse_version_or_zero(version),
-                        description: String::new(),
-                        source: PackageSource::Official,
-                        installed: state.installed.contains_key(&package),
-                    })
-                },
-                |p| {
-                    Some(Package {
-                        name: p.name.clone(),
-                        version: parse_version_or_zero(&p.version),
-                        description: p.description.clone(),
-                        source: PackageSource::Official,
-                        installed: state.installed.contains_key(&p.name),
-                    })
-                },
-            ))
+            Ok(self.package_projection(&package, pkgs.get(&package), &state))
         })
     }
 
@@ -440,7 +478,7 @@ impl PackageManager for MockPackageManager {
 
     fn get_status(
         &self,
-        _fast: bool,
+        fast: bool,
     ) -> Pin<Box<dyn Future<Output = Result<(usize, usize, usize, usize)>> + Send + '_>> {
         Box::pin(async move {
             let state = self.load_state()?;
@@ -448,7 +486,11 @@ impl PackageManager for MockPackageManager {
             // explicit = explicitly installed packages (in mock, all are explicit since no dependency tracking)
             let total = state.installed.len();
             let explicit = total; // All installed packages are explicit in the mock
-            let updates = self.list_updates().await?.len();
+            let updates = if fast && self.distro_name == "dnf" {
+                0
+            } else {
+                self.updates_for_state(&state)?.len()
+            };
             Ok((total, explicit, 0, updates))
         })
     }
@@ -461,38 +503,7 @@ impl PackageManager for MockPackageManager {
     }
 
     fn list_updates(&self) -> Pin<Box<dyn Future<Output = Result<Vec<UpdateInfo>>> + Send + '_>> {
-        Box::pin(async move {
-            let db = self.db.clone();
-            let state = self.load_state()?;
-            let pkgs = db
-                .packages
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let mut updates = Vec::new();
-
-            for (pkg_name, installed_ver) in &state.installed {
-                if let Some(available_ver) = state.available.get(pkg_name) {
-                    // Use repo from db if available, else "unknown"
-                    let repo = pkgs
-                        .get(pkg_name)
-                        .map_or_else(|| "unknown".to_string(), |p| p.repo.clone());
-
-                    let is_update_needed =
-                        parse_version_or_zero(available_ver) > parse_version_or_zero(installed_ver);
-
-                    if is_update_needed {
-                        updates.push(UpdateInfo {
-                            name: pkg_name.clone(),
-                            old_version: installed_ver.clone(),
-                            new_version: available_ver.clone(),
-                            repo,
-                        });
-                    }
-                }
-            }
-
-            Ok(updates)
-        })
+        Box::pin(async move { self.updates_for_state(&self.load_state()?) })
     }
 
     fn is_installed(
@@ -606,6 +617,90 @@ mod tests {
             .expect("available-only package info");
         assert_eq!(info.version.to_string(), "2.4.0");
         assert!(!info.installed);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fedora_mock_search_and_info_return_the_installed_build() -> Result<()> {
+        let directory = tempdir()?;
+        let manager = MockPackageManager::new_in("fedora", directory.path());
+        manager.set_installed_version("git", "1:2.49.0-2.fc44")?;
+        manager.set_available_version("git", "1:2.50.0-1.fc44")?;
+        let info = manager.info("git").await?.expect("installed Git fixture");
+        assert!(info.installed);
+        assert_eq!(info.version.to_string(), "1:2.49.0-2.fc44");
+        let found = manager.search("git").await?;
+        let found = found
+            .iter()
+            .find(|package| package.name == "git")
+            .expect("search result");
+        assert!(found.installed);
+        assert_eq!(found.version.to_string(), "1:2.49.0-2.fc44");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fedora_mock_orders_rpm_updates_and_fast_status_omits_them() -> Result<()> {
+        let directory = tempdir()?;
+        let manager = MockPackageManager::new_in("fedora", directory.path());
+        manager.set_installed_version("rpm-fixture", "1.0^git1-1.fc44")?;
+        manager.set_available_version("rpm-fixture", "1.0.1-1.fc44")?;
+        manager.set_installed_version("numeric-fixture", "1.9-1.fc44")?;
+        manager.set_available_version("numeric-fixture", "1.10-1.fc44")?;
+        assert_eq!(manager.get_status(true).await?, (2, 2, 0, 0));
+        let updates = manager.list_updates().await?;
+        assert_eq!(
+            updates.len(),
+            2,
+            "RPM sorts caret snapshots before the next release"
+        );
+        assert_eq!(updates[1].name, "rpm-fixture");
+        assert_eq!(updates[1].new_version, "1.0.1-1.fc44");
+        assert_eq!(manager.get_status(false).await?, (2, 2, 0, 2));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fedora_mock_update_persists_the_resolved_installed_version() -> Result<()> {
+        let directory = tempdir()?;
+        let manager = MockPackageManager::new_in("fedora", directory.path());
+        manager.set_installed_version("rpm-fixture", "1:2.0-1.fc44")?;
+        manager.set_available_version("rpm-fixture", "2:1.0-1.fc44")?;
+        manager.update().await?;
+        let reopened = MockPackageManager::new_in("fedora", directory.path());
+        let info = reopened
+            .info("rpm-fixture")
+            .await?
+            .expect("installed package");
+        assert_eq!(info.version.to_string(), "2:1.0-1.fc44");
+        assert!(reopened.list_updates().await?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn duplicate_mock_managers_preserve_concurrent_state_changes() -> Result<()> {
+        let directory = tempdir()?;
+        std::thread::scope(|scope| -> Result<()> {
+            let workers: Vec<_> = (0..16)
+                .map(|id| {
+                    let directory = directory.path();
+                    scope.spawn(move || {
+                        let manager = MockPackageManager::new_in("fedora", directory);
+                        manager.set_installed_version(&format!("fixture-{id}"), "2.0-1.fc44")
+                    })
+                })
+                .collect();
+            for worker in workers {
+                worker.join().expect("state fixture worker must finish")?;
+            }
+            Ok(())
+        })?;
+        let manager = MockPackageManager::new_in("fedora", directory.path());
+        let names = futures::executor::block_on(manager.list_explicit())?;
+        assert_eq!(names.len(), 16);
+        for id in 0..16 {
+            assert!(names.contains(&format!("fixture-{id}")));
+        }
         Ok(())
     }
 

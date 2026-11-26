@@ -25,6 +25,15 @@ pub(super) struct RpmDatabase {
 }
 
 impl RpmDatabase {
+    /// Use the host RPM database directly only when no DNF or RPM setting
+    /// can redirect it. The native installed query owns custom path handling.
+    pub(super) fn detect_default(host_sqlite: &Path) -> Option<Self> {
+        (uses_default_paths(&[]) && !has_custom_rpm_configuration()).then(|| Self {
+            root: PathBuf::from("/"),
+            sqlite: host_sqlite.to_owned(),
+        })
+    }
+
     pub(super) fn detect(host_sqlite: &Path) -> Result<Self> {
         Self::detect_with_query_runner(host_sqlite, &run_query)
     }

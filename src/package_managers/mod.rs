@@ -53,6 +53,8 @@ pub mod pacman_db;
 pub mod parallel_sync;
 #[cfg(feature = "arch")]
 pub mod pkgbuild;
+#[path = "dnf/rpm_evr.rs"]
+mod rpm_evr;
 mod traits;
 pub mod types;
 
