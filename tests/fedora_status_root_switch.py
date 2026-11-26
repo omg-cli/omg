@@ -7746,20 +7746,25 @@ env.OMG_FIXTURE_TASK = "changed"
         show = b"\x1b[?25h"
         report = b"\x1b[6n"
         cases = (
-            ("quit", (b"q",), 1, b""),
-            ("interrupt", (b"\x03",), 1, b""),
-            ("cancel-search", (b"2", b"/", b"q", b"\x1b", b"q"), 1, b""),
-            ("interrupt-search", (b"2", b"/", b"\x03"), 1, b""),
-            ("cancel-update", (b"u", b"\x1b", b"q"), 1, b"Install all available package updates"),
-            ("cancel-clean", (b"c", b"\x1b", b"q"), 1, b"Clean Package Caches"),
-            ("cancel-orphans", (b"o", b"\x1b", b"q"), 1, b"Remove every orphaned package"),
-            ("resume-after-error", (b"c", b"\r", b"q"), 2, b"clean cache failed"),
+            ("quit", (b"q",), 1, {}),
+            ("interrupt", (b"\x03",), 1, {}),
+            ("cancel-search", (b"2", b"/", b"q", b"\x1b", b"q"), 1, {}),
+            ("interrupt-search", (b"2", b"/", b"\x03"), 1, {}),
+            ("cancel-update", (b"u", b"\x1b", b"q"), 1, {0: b"Install all available package updates"}),
+            ("cancel-clean", (b"c", b"\x1b", b"q"), 1, {0: b"Clean Package Caches"}),
+            ("cancel-orphans", (b"o", b"\x1b", b"q"), 1, {0: b"Remove every orphaned package"}),
+            ("resume-after-error", (b"c", b"\r", b"q"), 2, {1: b"clean cache failed"}),
+            ("search-debounce", (b"2", b"/", b"vim-enhanced", b"\r", b"q"), 1, {2: b"Text editor"}),
+            ("search-enter", (b"2", b"/", b"git\r", b"q"), 1, {2: b"Version control"}),
+            ("search-replace", (b"2", b"/", b"vim-enhanced\r", b"/", b"git\r", b"\r", b"\x1b", b"q"), 1,
+             {2: b"Text editor", 4: b"Version control", 5: b"Install git?"}),
         )
-        for label, keys, sessions, evidence in cases:
+        for label, keys, sessions, markers in cases:
             master, slave = pty.openpty()
             code = None
             output = bytearray()
             replies = 0
+            observed = []
             attributes = None
             before = termios.tcgetattr(slave)
 
@@ -7784,7 +7789,7 @@ env.OMG_FIXTURE_TASK = "changed"
                 termios.tcsetwinsize(slave, (28, 112))
                 os.chown(os.ttyname(slave), account.pw_uid, account.pw_gid)
                 mode = dict(disabled, TERM="xterm-256color", OMG_NO_UPDATE_CHECK="1")
-                if label == "resume-after-error":
+                if label == "resume-after-error" or label.startswith("search-"):
                     mode.update(OMG_TEST_MODE="1", OMG_TEST_DISTRO="fedora")
                 with subprocess.Popen([str(cli), "dash"], cwd=work, env=mode, stdin=slave,
                                       stdout=slave, stderr=slave, start_new_session=True,
@@ -7799,12 +7804,11 @@ env.OMG_FIXTURE_TASK = "changed"
                             if index + 1 < len(keys):
                                 read_terminal(time.monotonic() + 0.24,
                                               lambda: process.poll() is not None)
-                            if label.startswith("cancel-") and evidence and index == 0:
+                            if marker := markers.get(index):
                                 read_terminal(time.monotonic() + 5,
-                                              lambda: evidence in output or process.poll() is not None)
-                            if label == "resume-after-error" and key == b"\r":
-                                read_terminal(time.monotonic() + 5,
-                                              lambda: evidence in output or process.poll() is not None)
+                                              lambda: marker in output or process.poll() is not None)
+                                if marker in output:
+                                    observed.append(marker.decode())
                         read_terminal(time.monotonic() + 8, lambda: process.poll() is not None)
                         code = process.poll()
                         read_terminal(time.monotonic() + 0.15, lambda: False)
@@ -7821,7 +7825,8 @@ env.OMG_FIXTURE_TASK = "changed"
             restored = output[last_exit + len(leave):] if last_exit >= 0 else b""
             checks.extend((
                 dict(phase="dashboard-terminal", case=f"{label}-process",
-                     passed=code == 0 and evidence in output, status=code,
+                     passed=code == 0 and len(observed) == len(markers), status=code,
+                     value=observed,
                      diagnostic=output[-500:].decode(errors="replace")),
                 dict(phase="dashboard-terminal", case=f"{label}-termios",
                      passed=attributes == before),
@@ -9108,6 +9113,6 @@ mark_progress("completed with host inventory unchanged")
 report = dict(binaries=binaries, checks=checks, total=len(checks),
               passed=sum(entry["passed"] for entry in checks), host_unchanged=True)
 print(json.dumps(report))
-expected_checks = 303 if consent_oracle is None else 2867
+expected_checks = 303 if consent_oracle is None else 2879
 if report["passed"] != report["total"] or report["total"] != expected_checks:
     sys.exit(4)

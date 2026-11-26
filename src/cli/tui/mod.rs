@@ -1,22 +1,24 @@
 use anyhow::{Context as _, Result};
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
+    event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     execute,
     terminal::{
         Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
         enable_raw_mode,
     },
 };
+use futures::StreamExt;
 use ratatui::{Terminal, backend::CrosstermBackend};
 use std::future::Future;
 use std::io;
 use std::time::{Duration, Instant};
+use tokio_util::task::AbortOnDropHandle;
 
 pub mod app;
 mod ui;
 
 // Constants for TUI behavior
-const POLL_TIMEOUT_MS: u64 = 100;
+const TICK_INTERVAL_MS: u64 = 100;
 const REFRESH_INTERVAL_SECS: u64 = 5;
 const TEAM_REFRESH_INTERVAL_SECS: u64 = 5 * 60;
 /// Minimum idle time after the last keystroke before a search is dispatched,
@@ -34,10 +36,18 @@ struct SearchCompletion {
     result: Result<Vec<crate::package_managers::SyncPackage>, String>,
 }
 
+enum BackgroundUpdate {
+    Action(ActionResult),
+    Search(SearchCompletion),
+    Team(Option<crate::core::env::team::TeamStatus>),
+    #[cfg(unix)]
+    Daemon(bool, Option<crate::daemon::protocol::StatusResult>),
+}
+
 enum SearchRequest {
     Running {
         request_id: SearchRequestId,
-        task: tokio::task::JoinHandle<()>,
+        _task: AbortOnDropHandle<()>,
     },
     Completed {
         request_id: SearchRequestId,
@@ -168,72 +178,64 @@ async fn run_app(session: &mut TerminalSession, app: &mut app::App) -> Result<()
     let mut last_search = String::new();
     let mut next_search_id = 0;
     let mut search_request = None;
-    let (action_tx, mut action_rx) = tokio::sync::mpsc::unbounded_channel::<ActionResult>();
-    let (search_tx, mut search_rx) = tokio::sync::mpsc::unbounded_channel::<SearchCompletion>();
-    let (team_tx, mut team_rx) =
-        tokio::sync::mpsc::unbounded_channel::<Option<crate::core::env::team::TeamStatus>>();
+    let (background_tx, mut background_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut events = EventStream::new();
     #[cfg(unix)]
-    let (daemon_tx, mut daemon_rx) = tokio::sync::mpsc::unbounded_channel::<(
-        bool,
-        Option<crate::daemon::protocol::StatusResult>,
-    )>();
-    #[cfg(unix)]
-    let mut daemon_refresh_in_flight = false;
+    let mut daemon_refresh = None;
     #[cfg(unix)]
     let mut last_daemon_refresh = Instant::now()
         .checked_sub(Duration::from_secs(REFRESH_INTERVAL_SECS))
         .unwrap_or_else(Instant::now);
-    let mut team_refresh_in_flight = false;
+    let mut team_refresh = None;
     let mut last_team_refresh = Instant::now()
         .checked_sub(Duration::from_secs(TEAM_REFRESH_INTERVAL_SECS))
         .unwrap_or_else(Instant::now);
 
     loop {
-        // Apply completed background actions before drawing. Messages arrive
-        // FIFO from a single in-flight action, so state updates stay ordered
-        // and never race with the render pass.
-        while let Ok((label, result)) = action_rx.try_recv() {
-            app.action_in_flight = false;
-            report_action_result(app, result, label);
-        }
-        while let Ok(completion) = search_rx.try_recv() {
-            let completed_request_id = completion.request_id;
-            if apply_search_completion(
-                app,
-                search_request.as_ref().map(SearchRequest::request_id),
-                completion,
-            ) {
-                search_request = Some(SearchRequest::Completed {
-                    request_id: completed_request_id,
-                });
-            }
-        }
-        #[cfg(unix)]
-        while let Ok((connected, status)) = daemon_rx.try_recv() {
-            daemon_refresh_in_flight = false;
-            app.daemon_connected = connected;
-            if let Some(status) = status {
-                app.status = Some(status);
-            }
-        }
-        while let Ok(remote_status) = team_rx.try_recv() {
-            team_refresh_in_flight = false;
-            if let Some(status) = remote_status
-                && (app.team_status.is_none() || app.team_status_is_remote)
-            {
-                app.team_status = Some(status);
-                app.team_status_is_remote = true;
-            }
-        }
-
-        // Draw UI
         session.terminal.draw(|f| ui::draw(f, app))?;
 
-        // Handle events with timeout for animations
+        let input = tokio::select! {
+            event = events.next() => Some(event.context("Dashboard input closed")??),
+            Some(update) = background_rx.recv() => {
+                match update {
+                    BackgroundUpdate::Action((label, result)) => {
+                        app.action_in_flight = false;
+                        report_action_result(app, result, label);
+                    }
+                    BackgroundUpdate::Search(completion) => {
+                        let request_id = completion.request_id;
+                        if apply_search_completion(
+                            app,
+                            search_request.as_ref().map(SearchRequest::request_id),
+                            completion,
+                        ) {
+                            search_request = Some(SearchRequest::Completed { request_id });
+                        }
+                    }
+                    BackgroundUpdate::Team(remote_status) => {
+                        team_refresh = None;
+                        if let Some(status) = remote_status
+                            && (app.team_status.is_none() || app.team_status_is_remote)
+                        {
+                            app.team_status = Some(status);
+                            app.team_status_is_remote = true;
+                        }
+                    }
+                    #[cfg(unix)]
+                    BackgroundUpdate::Daemon(connected, status) => {
+                        daemon_refresh = None;
+                        app.daemon_connected = connected;
+                        if let Some(status) = status {
+                            app.status = Some(status);
+                        }
+                    }
+                }
+                None
+            }
+            () = tokio::time::sleep(Duration::from_millis(TICK_INTERVAL_MS)) => None,
+        };
         let was_search_mode = app.search_mode;
-        if crossterm::event::poll(Duration::from_millis(POLL_TIMEOUT_MS))?
-            && let Event::Key(key) = event::read()?
-        {
+        if let Some(Event::Key(key)) = input {
             // Only process key press events, ignore release
             if key.kind == KeyEventKind::Press {
                 if should_quit(key, app.search_mode) {
@@ -254,7 +256,7 @@ async fn run_app(session: &mut TerminalSession, app: &mut app::App) -> Result<()
                     app.handle_key(key.code);
                     None
                 } else {
-                    handle_special_key_actions(app, key.code, &action_tx)
+                    handle_special_key_actions(app, key.code, &background_tx)
                 };
 
                 if search_session_started(was_search_mode, app.search_mode) {
@@ -283,7 +285,7 @@ async fn run_app(session: &mut TerminalSession, app: &mut app::App) -> Result<()
                     search_request = Some(dispatch_search(
                         app,
                         &last_search,
-                        &search_tx,
+                        &background_tx,
                         &mut next_search_id,
                     ));
                 }
@@ -308,7 +310,7 @@ async fn run_app(session: &mut TerminalSession, app: &mut app::App) -> Result<()
             search_request = Some(dispatch_search(
                 app,
                 &last_search,
-                &search_tx,
+                &background_tx,
                 &mut next_search_id,
             ));
         }
@@ -317,38 +319,34 @@ async fn run_app(session: &mut TerminalSession, app: &mut app::App) -> Result<()
         app.tick()?;
 
         #[cfg(unix)]
-        if should_refresh_daemon(daemon_refresh_in_flight, last_daemon_refresh.elapsed()) {
-            daemon_refresh_in_flight = true;
+        if should_refresh_daemon(daemon_refresh.is_some(), last_daemon_refresh.elapsed()) {
             last_daemon_refresh = Instant::now();
-            let sender = daemon_tx.clone();
-            tokio::spawn(async move {
-                let status = app::App::fetch_daemon_status().await;
-                let _ = sender.send(status);
-            });
+            let sender = background_tx.clone();
+            daemon_refresh = Some(AbortOnDropHandle::new(tokio::spawn(async move {
+                let (connected, status) = app::App::fetch_daemon_status().await;
+                let _ = sender.send(BackgroundUpdate::Daemon(connected, status));
+            })));
         }
 
         if should_refresh_team(
             app.current_tab,
-            team_refresh_in_flight,
+            team_refresh.is_some(),
             last_team_refresh.elapsed(),
         ) {
-            team_refresh_in_flight = true;
             last_team_refresh = Instant::now();
-            let sender = team_tx.clone();
-            tokio::spawn(async move {
+            let sender = background_tx.clone();
+            team_refresh = Some(AbortOnDropHandle::new(tokio::spawn(async move {
                 let status = app::App::fetch_remote_team_status().await;
-                let _ = sender.send(status);
-            });
+                let _ = sender.send(BackgroundUpdate::Team(status));
+            })));
         }
-
-        tokio::task::yield_now().await;
     }
 }
 
 fn dispatch_search(
     app: &mut app::App,
     query: &str,
-    sender: &tokio::sync::mpsc::UnboundedSender<SearchCompletion>,
+    sender: &tokio::sync::mpsc::UnboundedSender<BackgroundUpdate>,
     next_search_id: &mut u64,
 ) -> SearchRequest {
     app.search_results.clear();
@@ -365,15 +363,19 @@ fn dispatch_search(
         let result = app::App::search_packages(&query)
             .await
             .map_err(|error| error.to_string());
-        let _ = sender.send(SearchCompletion { request_id, result });
+        let _ = sender.send(BackgroundUpdate::Search(SearchCompletion {
+            request_id,
+            result,
+        }));
     });
-    SearchRequest::Running { request_id, task }
+    SearchRequest::Running {
+        request_id,
+        _task: AbortOnDropHandle::new(task),
+    }
 }
 
 fn cancel_search(search_request: &mut Option<SearchRequest>) {
-    if let Some(SearchRequest::Running { task, .. }) = search_request.take() {
-        task.abort();
-    }
+    *search_request = None;
 }
 
 fn apply_search_completion(
@@ -411,7 +413,7 @@ fn apply_search_completion(
 fn spawn_action(
     app: &mut app::App,
     label: &'static str,
-    action_tx: &tokio::sync::mpsc::UnboundedSender<ActionResult>,
+    action_tx: &tokio::sync::mpsc::UnboundedSender<BackgroundUpdate>,
     fut: impl Future<Output = anyhow::Result<String>> + Send + 'static,
 ) {
     if app.action_in_flight {
@@ -422,14 +424,14 @@ fn spawn_action(
     let sender = action_tx.clone();
     tokio::spawn(async move {
         let outcome = fut.await;
-        let _ = sender.send((label, outcome));
+        let _ = sender.send(BackgroundUpdate::Action((label, outcome)));
     });
 }
 
 fn handle_special_key_actions(
     app: &mut app::App,
     key_code: KeyCode,
-    action_tx: &tokio::sync::mpsc::UnboundedSender<ActionResult>,
+    action_tx: &tokio::sync::mpsc::UnboundedSender<BackgroundUpdate>,
 ) -> Option<app::ConfirmationAction> {
     if app.pending_confirmation.is_some() {
         match key_code {
@@ -531,6 +533,112 @@ fn force_refresh(app: &mut app::App) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn idle_dashboard_keeps_the_runtime_responsive() {
+        use std::fs::File;
+        use std::io::Read;
+        use std::process::{Command, Stdio};
+
+        const FIXTURE: &str = "OMG_TUI_IDLE_RUNTIME_FIXTURE";
+        if std::env::var_os(FIXTURE).is_some() {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("dashboard runtime");
+            runtime.block_on(async {
+                let ticks = std::cell::Cell::new(0);
+                let heartbeat = async {
+                    loop {
+                        tokio::time::sleep(Duration::from_millis(15)).await;
+                        ticks.set(ticks.get() + 1);
+                    }
+                };
+                let limit = tokio::time::timeout(
+                    Duration::from_millis(700),
+                    run_tui_with_app(app::App::new_detached()),
+                );
+                tokio::select! {
+                    () = heartbeat => unreachable!(),
+                    outcome = limit => assert!(outcome.is_err(), "{outcome:?}"),
+                }
+                assert!(
+                    ticks.get() >= 16,
+                    "only {} scheduled heartbeats ran",
+                    ticks.get()
+                );
+            });
+            return;
+        }
+
+        let size = nix::pty::Winsize {
+            ws_row: 10,
+            ws_col: 58,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        let pty = nix::pty::openpty(Some(&size), None).expect("private dashboard terminal");
+        for descriptor in [&pty.master, &pty.slave] {
+            nix::fcntl::fcntl(
+                descriptor,
+                nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC),
+            )
+            .expect("close private terminal descriptors on exec");
+        }
+        let timeout = crate::core::privilege::root_controlled_program_path("timeout")
+            .expect("trusted timeout utility");
+        let setsid = crate::core::privilege::root_controlled_program_path("setsid")
+            .expect("trusted terminal fixture launcher");
+        let mut master = File::from(pty.master);
+        let slave = File::from(pty.slave);
+        let capture = std::thread::spawn(move || {
+            let mut output = Vec::new();
+            let closed = master.read_to_end(&mut output);
+            assert_eq!(closed.unwrap_err().raw_os_error(), Some(nix::libc::EIO));
+            String::from_utf8_lossy(&output).into_owned()
+        });
+
+        let status = Command::new(timeout)
+            .args(["--foreground", "--kill-after=1s", "10s"])
+            .arg(setsid)
+            .args(["--ctty", "--"])
+            .arg(std::env::current_exe().expect("dashboard test executable"))
+            .args([
+                "--exact",
+                "cli::tui::tests::idle_dashboard_keeps_the_runtime_responsive",
+                "--nocapture",
+            ])
+            .env(FIXTURE, "1")
+            .env("TERM", "xterm-256color")
+            .env("OMG_DISABLE_DAEMON", "1")
+            .stdin(Stdio::from(slave.try_clone().expect("fixture input")))
+            .stdout(Stdio::from(slave.try_clone().expect("fixture output")))
+            .stderr(Stdio::from(slave))
+            .status()
+            .expect("run the dashboard on a private terminal");
+        let output = capture
+            .join()
+            .expect("capture the dashboard terminal output");
+        assert!(status.success(), "{output}");
+    }
+
+    #[tokio::test]
+    async fn dropping_the_dashboard_search_closes_its_in_flight_task() {
+        let task = tokio::spawn(std::future::pending());
+        let handle = task.abort_handle();
+        let search = SearchRequest::Running {
+            request_id: SearchRequestId(1),
+            _task: AbortOnDropHandle::new(task),
+        };
+
+        drop(search);
+        tokio::task::yield_now().await;
+
+        let stopped = handle.is_finished();
+        handle.abort();
+        assert!(stopped, "dashboard exit left a search running");
+    }
+
     #[test]
     fn daemon_refresh_runs_in_background_only_when_due() {
         let due = Duration::from_secs(REFRESH_INTERVAL_SECS);
@@ -620,7 +728,7 @@ mod tests {
         let abort_handle = task.abort_handle();
         let mut active_search = Some(SearchRequest::Running {
             request_id: SearchRequestId(1),
-            task,
+            _task: AbortOnDropHandle::new(task),
         });
 
         cancel_search(&mut active_search);
