@@ -216,7 +216,9 @@ pub async fn run(network: bool, eol: bool) -> Result<()> {
     if eol {
         println!();
         println!("{}", style::header("Runtime EOL Status"));
-        issues += check_eol_runtimes()?;
+        let (eol_issues, eol_warnings) = check_eol_runtimes()?;
+        issues += eol_issues;
+        warnings += eol_warnings;
     }
 
     finish_doctor(issues, warnings)
@@ -959,78 +961,52 @@ fn check_pacman_lock_with(
     usize::from(issue)
 }
 
-/// Check for end-of-life runtimes
-fn check_eol_runtimes() -> Result<usize> {
-    let mut issues = 0;
+/// Check the selected version of each native runtime.
+fn check_eol_runtimes() -> Result<(usize, usize)> {
+    use crate::runtimes::eol::{SupportStatus, SupportWindow};
+
+    let window = SupportWindow::new(jiff::Timestamp::now())?;
     let mut probed = 0;
+    let mut issues = 0;
     let mut unknown = 0;
-    let now = jiff::Timestamp::now();
-    let warning_ts = crate::runtimes::eol::eol_warning_cutoff(now)
-        .context("Failed to compute EOL warning window")?;
-
-    // Get installed runtime versions
-    let runtimes = [
-        "node", "python", "rust", "go", "ruby", "java", "bun", "deno",
-    ];
-
-    for runtime in &runtimes {
-        if let Some(version) = crate::runtimes::probe_version(runtime) {
-            probed += 1;
-            // Check against EOL dates. The canonical table is application
-            // data, so malformed dates are a defect and must not silently
-            // classify an unsupported runtime as healthy.
-            let mut eol_warning = None;
-
-            let components = crate::runtimes::eol::version_components(&version);
-            let Some(entry) = crate::runtimes::eol::find_eol_entry(runtime, &components) else {
+    for runtime in crate::runtimes::NATIVE_RUNTIMES {
+        let Some(version) = crate::runtimes::probe_version(runtime) else {
+            continue;
+        };
+        probed += 1;
+        let status = window.assess(runtime, &version)?;
+        let version = style::sanitize_terminal_text(&version);
+        let label = format!("{} {}", style::runtime(runtime), style::version(&version));
+        match status {
+            SupportStatus::Active(_) => println!("  {} {label}", style::success("✓")),
+            SupportStatus::MinimumSupport(month) => println!(
+                "  {} {label} - {}",
+                style::success("✓"),
+                style::dim(&format!("Support through at least {month}"))
+            ),
+            SupportStatus::Ended(end) | SupportStatus::EndingSoon(end) => {
+                let when = if matches!(status, SupportStatus::Ended(_)) {
+                    "since"
+                } else {
+                    "on"
+                };
                 println!(
-                    "  {} {} {} - {}",
+                    "  {} {label} - {}",
+                    style::warning("⚠"),
+                    style::error(&format!("EOL {when} {end}"))
+                );
+                issues += 1;
+            }
+            SupportStatus::Unknown => {
+                println!(
+                    "  {} {label} - {}",
                     style::warning("?"),
-                    style::runtime(runtime),
-                    style::version(&version),
                     style::dim("Support data unavailable")
                 );
                 unknown += 1;
-                continue;
-            };
-            let eol_date =
-                jiff::civil::Date::strptime("%Y-%m-%d", entry.eol_date).with_context(|| {
-                    format!(
-                        "Invalid EOL date {:?} for {runtime} in the canonical runtime table",
-                        entry.eol_date
-                    )
-                })?;
-            let zoned = eol_date
-                .at(0, 0, 0, 0)
-                .to_zoned(jiff::tz::TimeZone::UTC)
-                .context("Failed to convert runtime EOL date to UTC")?;
-            let eol_timestamp = zoned.timestamp();
-            if now > eol_timestamp {
-                eol_warning = Some(format!("EOL since {}", entry.eol_date));
-            } else if warning_ts > eol_timestamp {
-                eol_warning = Some(format!("EOL on {}", entry.eol_date));
-            }
-
-            if let Some(warning) = eol_warning {
-                println!(
-                    "  {} {} {} - {}",
-                    style::warning("⚠"),
-                    style::runtime(runtime),
-                    style::version(&version),
-                    style::error(&warning)
-                );
-                issues += 1;
-            } else {
-                println!(
-                    "  {} {} {}",
-                    style::success("✓"),
-                    style::runtime(runtime),
-                    style::version(&version)
-                );
             }
         }
     }
-
     if probed == 0 {
         println!("  {}", style::dim("No managed runtimes were detected."));
     } else if issues == 0 && unknown == 0 {
@@ -1039,8 +1015,7 @@ fn check_eol_runtimes() -> Result<usize> {
             style::dim("All detected runtimes are within support period.")
         );
     }
-
-    Ok(issues)
+    Ok((issues, unknown))
 }
 
 #[derive(Debug, PartialEq, Eq)]

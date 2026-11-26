@@ -2703,17 +2703,27 @@ fi
                      '&& -d "$OMG_DATA_DIR/versions/node/16.20.2" '
                      '&& $(readlink "$OMG_DATA_DIR/versions/node/current") == 16.20.2 '
                      '&& -d "$OMG_DATA_DIR/versions/python/3.12.14" '
-                     '&& $(readlink "$OMG_DATA_DIR/versions/python/current") == 3.12.14 ]] '
+                     '&& $(readlink "$OMG_DATA_DIR/versions/python/current") == 3.12.14 '
+                     '&& -f "$OMG_DATA_DIR/versions/node/14.21.3/.omg-install-complete" '
+                     '&& -f "$OMG_DATA_DIR/versions/rust/1.96.0/.omg-install-complete" '
+                     '&& ! -L "$OMG_DATA_DIR/versions/rust/current" ]] '
                      '|| exit 70\n')
         good = ('  ✗ node v16.20.2 - EOL (EOL: 2023-09-11)\n'
                 '  ✓ python v3.12.14 - Active (EOL: 2028-10-31)\n'
-                '⚠ 1 runtime(s) need attention. Consider upgrading to supported versions.\n')
+                '  ✗ node v14.21.3 - EOL (EOL: 2023-04-30)\n'
+                '  ? rust v1.96.0 - Support data unavailable\n'
+                '⚠ 2 runtime(s) need attention. Consider upgrading to supported versions.\n'
+                '? 1 installed version(s) have no support data.\n')
         for output, expected in (
             (good, 'PASS'),
             (good.replace('EOL (EOL: 2023-09-11)', 'Active (EOL: 2023-09-11)'), 'FAIL'),
             (good.replace('  ✓ python v3.12.14 - Active (EOL: 2028-10-31)\n', ''), 'FAIL'),
-            (good.replace('1 runtime(s) need attention', '0 runtime(s) need attention'), 'FAIL'),
-            (good.replace('1 runtime(s) need attention', '11 runtime(s) need attention'), 'FAIL'),
+            (good.replace('2 runtime(s) need attention', '0 runtime(s) need attention'), 'FAIL'),
+            (good.replace('2 runtime(s) need attention', '11 runtime(s) need attention'), 'FAIL'),
+            (good.replace('  ✗ node v14.21.3 - EOL (EOL: 2023-04-30)\n', ''), 'FAIL'),
+            (good.replace('  ? rust v1.96.0 - Support data unavailable\n',
+                          '  ✓ rust v1.96.0 - Active (EOL: Unknown)\n'), 'FAIL'),
+            (good.replace('? 1 installed version(s) have no support data.\n', ''), 'FAIL'),
             (good + '  ✗ node v16.20.2 - EOL (EOL: 2023-09-11)\n', 'FAIL'),
         ):
             with self.subTest(expected=expected, output=output):

@@ -43,7 +43,7 @@ use crate::cli::{
 #[cfg(unix)]
 use crate::core::client::DaemonClient;
 use crate::core::security::{AuditLogger, AuditSeverity, SbomGenerator, SecurityPolicy};
-use crate::runtimes::eol::{eol_warning_cutoff, version_components};
+use crate::runtimes::eol::{SCHEDULE_REVIEWED, SupportStatus, SupportWindow};
 
 impl LocalCommandRunner for AuditCommands {
     async fn execute(&self, ctx: &CliContext) -> Result<()> {
@@ -1562,107 +1562,88 @@ pub async fn export_compliance(
     Ok(())
 }
 
-fn parse_eol_timestamp(eol_date: &str) -> Result<jiff::Timestamp> {
-    let eol_ts = jiff::civil::Date::strptime("%Y-%m-%d", eol_date)
-        .map_err(|error| anyhow::anyhow!("Invalid EOL date '{eol_date}': {error}"))?;
-    let zoned = eol_ts
-        .at(0, 0, 0, 0)
-        .to_zoned(jiff::tz::TimeZone::UTC)
-        .with_context(|| format!("Failed to convert EOL date '{eol_date}' to UTC"))?;
-    Ok(zoned.timestamp())
-}
-
-/// Check end-of-life status for installed runtimes
+/// Check end-of-life status for every installed native runtime version.
 pub fn check_eol(_ctx: &CliContext) -> Result<()> {
     println!("{} Checking runtime EOL status...\n", style::runtime("OMG"));
 
-    let now = jiff::Timestamp::now();
-    // Loop-invariant warning window: a runtime within six calendar months of
-    // its EOL date counts as "Ending Soon".
-    let warning_ts = eol_warning_cutoff(now).context("Failed to compute EOL warning window")?;
-    let runtimes = [
-        "node", "python", "rust", "go", "ruby", "java", "bun", "deno",
-    ];
+    let window = SupportWindow::new(jiff::Timestamp::now())?;
+    let versions_dir = crate::core::paths::data_dir().join("versions");
+    let mut installed = 0;
     let mut issues = 0;
-
-    for runtime in &runtimes {
-        if let Some(version) = crate::runtimes::probe_version(runtime) {
-            let installed_components = version_components(&version);
-            let mut status = "Active";
-            let mut eol_date_str = "Unknown";
-            let mut is_eol = false;
-            let mut is_warning = false;
-
-            // Check EOL status using the shared component-prefix matcher.
-            if let Some(entry) =
-                crate::runtimes::eol::find_eol_entry(runtime, &installed_components)
-            {
-                let eol_date = entry.eol_date;
-                eol_date_str = eol_date;
-                let eol_timestamp = parse_eol_timestamp(eol_date).with_context(|| {
-                    format!(
-                        "Invalid EOL date '{eol_date}' for {runtime} {}",
-                        entry
-                            .version_prefix
-                            .iter()
-                            .map(std::string::ToString::to_string)
-                            .collect::<Vec<_>>()
-                            .join(".")
+    let mut unknown = 0;
+    for runtime in crate::runtimes::NATIVE_RUNTIMES {
+        let versions =
+            crate::runtimes::common::list_installed_versions(&versions_dir.join(runtime))
+                .with_context(|| format!("Failed to list installed {runtime} versions"))?;
+        for version in versions {
+            installed += 1;
+            let (mark, status) = match window.assess(runtime, &version)? {
+                SupportStatus::Active(end) => (
+                    style::success("✓"),
+                    style::success(&format!("Active (EOL: {end})")),
+                ),
+                SupportStatus::MinimumSupport(month) => (
+                    style::success("✓"),
+                    style::success(&format!("Support through at least {month}")),
+                ),
+                SupportStatus::EndingSoon(end) => {
+                    issues += 1;
+                    (
+                        style::warning("⚠"),
+                        style::warning(&format!("Ending Soon (EOL: {end})")),
                     )
-                })?;
-
-                if now > eol_timestamp {
-                    status = "EOL";
-                    is_eol = true;
-                    issues += 1;
-                } else if warning_ts > eol_timestamp {
-                    status = "Ending Soon";
-                    is_warning = true;
-                    issues += 1;
                 }
-            }
-
-            let status_display = if is_eol {
-                style::error(status)
-            } else if is_warning {
-                style::warning(status)
-            } else {
-                style::success(status)
+                SupportStatus::Ended(end) => {
+                    issues += 1;
+                    (
+                        style::error("✗"),
+                        style::error(&format!("EOL (EOL: {end})")),
+                    )
+                }
+                SupportStatus::Unknown => {
+                    unknown += 1;
+                    (style::warning("?"), style::dim("Support data unavailable"))
+                }
             };
-
+            let prefix = if version.starts_with(['v', 'V']) {
+                ""
+            } else {
+                "v"
+            };
+            let version = style::sanitize_terminal_text(&version);
             println!(
-                "  {} {} v{} - {} (EOL: {})",
-                if is_eol {
-                    style::error("✗")
-                } else if is_warning {
-                    style::warning("⚠")
-                } else {
-                    style::success("✓")
-                },
+                "  {mark} {} {prefix}{} - {status}",
                 style::runtime(runtime),
-                style::version(&version),
-                status_display,
-                eol_date_str
+                style::version(&version)
             );
         }
     }
 
     println!();
-    if issues == 0 {
+    if installed == 0 {
+        println!("{}", style::dim("No managed runtimes were detected."));
+    } else if issues == 0 && unknown == 0 {
         println!(
             "{} All runtimes are within support period.",
             style::success("✓")
         );
-    } else {
+    }
+    if issues > 0 {
         println!(
-            "{} {} runtime(s) need attention. Consider upgrading to supported versions.",
+            "{} {issues} runtime(s) need attention. Consider upgrading to supported versions.",
             style::warning("⚠"),
-            issues
         );
     }
-
-    println!("\n{} Data source: endoflife.date", style::dim("ℹ"));
-
+    if unknown > 0 {
+        println!(
+            "{} {unknown} installed version(s) have no support data.",
+            style::warning("?"),
+        );
+    }
+    println!(
+        "\n{} Bundled release schedules reviewed {SCHEDULE_REVIEWED}.",
+        style::dim("ℹ")
+    );
     Ok(())
 }
 
@@ -2466,40 +2447,6 @@ mod tests {
             require_audit_integrity(false).expect_err("broken audit chain must fail the command");
         assert!(err.to_string().contains("integrity FAILED"), "got: {err}");
         assert!(require_audit_integrity(true).is_ok());
-    }
-
-    #[test]
-    fn version_components_parse_numeric_prefixes_only() {
-        assert_eq!(version_components("3.13.1-1"), vec![3, 13, 1]);
-        assert_eq!(version_components("1.20"), vec![1, 20]);
-        assert_eq!(version_components("20.10.0"), vec![20, 10, 0]);
-        assert_eq!(version_components("v22"), vec![22]);
-        assert_eq!(version_components("lts/hydrogen"), Vec::<u64>::new());
-    }
-
-    #[test]
-    fn eol_prefix_match_never_confuses_component_boundaries() {
-        // Python 3.13 must not match a hypothetical [3, 1] row, and Go 1.30
-        // must not match a [1, 3] row: component-wise starts_with is exact.
-        let installed = version_components("3.13.2");
-        assert!(installed.starts_with(&[3, 13][..]));
-        assert!(!installed.starts_with(&[3, 1][..]));
-
-        let go = version_components("1.30.1");
-        assert!(go.starts_with(&[1, 30][..]));
-        assert!(!go.starts_with(&[1, 3][..]));
-    }
-
-    #[test]
-    fn parse_eol_timestamp_accepts_iso_dates() {
-        let ts = parse_eol_timestamp("2025-04-30").expect("valid EOL date");
-        assert!(ts.as_second() > 0);
-    }
-
-    #[test]
-    fn parse_eol_timestamp_rejects_garbage() {
-        let err = parse_eol_timestamp("not-a-date").expect_err("garbage must fail closed");
-        assert!(err.to_string().contains("Invalid EOL date"), "got: {err}");
     }
 
     #[test]

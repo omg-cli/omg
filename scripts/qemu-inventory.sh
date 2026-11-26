@@ -1859,12 +1859,14 @@ check_product_output() {
   if [[ "$assertion" == audit-eol-state ]]; then
     if [[ "$code" != 0 ]] \
       || ! grep -Fxq '  ✗ node v16.20.2 - EOL (EOL: 2023-09-11)' "$stdout" \
+      || ! grep -Fxq '  ✗ node v14.21.3 - EOL (EOL: 2023-04-30)' "$stdout" \
       || ! grep -Fxq '  ✓ python v3.12.14 - Active (EOL: 2028-10-31)' "$stdout" \
-      || ! grep -Fxq '⚠ 1 runtime(s) need attention. Consider upgrading to supported versions.' "$stdout" \
-      || [[ $(grep -Fc 'node v16.20.2' "$stdout") != 1 ]] \
-      || [[ $(grep -Fc 'python v3.12.14' "$stdout") != 1 ]] \
+      || ! grep -Fxq '  ? rust v1.96.0 - Support data unavailable' "$stdout" \
+      || ! grep -Fxq '⚠ 2 runtime(s) need attention. Consider upgrading to supported versions.' "$stdout" \
+      || ! grep -Fxq '? 1 installed version(s) have no support data.' "$stdout" \
+      || [[ $(grep -Ec '^  (✗|✓|\?|⚠) (node|python|rust) ' "$stdout") != 4 ]] \
       || grep -Eq 'All runtimes are within support period|No managed runtimes were detected' "$stdout"; then
-      printf 'assertion failed: audit EOL did not classify both confined runtimes and count one issue\n' >&2; return 1
+      printf 'assertion failed: audit EOL did not classify active, inactive and unknown versions in the confined inventory\n' >&2; return 1
     fi
   fi
   if [[ "$assertion" == sbom-source-failure ]]; then
@@ -2994,6 +2996,9 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   if [[ "$assertions" == doctor-eol-state || "$assertions" == audit-eol-state ]]; then
     remote+="; [[ \$(id -u) != 0 ]] || { printf 'assertion failed: EOL fixture requires an unprivileged guest user\n' >&2; exit 2; }; export OMG_CONFIG_DIR=\"\$rowdir/eol-config\" OMG_DATA_DIR=\"\$rowdir/runtime-data\" OMG_CACHE_DIR=\"\$rowdir/eol-cache\" OMG_DISABLE_DAEMON=1 OMG_TEST_MODE=0"
     remote+="; mkdir -p \"\$OMG_DATA_DIR/versions/node/16.20.2\" \"\$OMG_DATA_DIR/versions/python/3.12.14\"; ln -s 16.20.2 \"\$OMG_DATA_DIR/versions/node/current\"; ln -s 3.12.14 \"\$OMG_DATA_DIR/versions/python/current\"; printf '16.20.2\\n' > \"\$OMG_DATA_DIR/versions/node/16.20.2/.omg-install-complete\"; printf '3.12.14\\n' > \"\$OMG_DATA_DIR/versions/python/3.12.14/.omg-install-complete\""
+    if [[ "$assertions" == audit-eol-state ]]; then
+      remote+="; mkdir -p \"\$OMG_DATA_DIR/versions/node/14.21.3\" \"\$OMG_DATA_DIR/versions/rust/1.96.0\"; printf '14.21.3\\n' > \"\$OMG_DATA_DIR/versions/node/14.21.3/.omg-install-complete\"; printf '1.96.0\\n' > \"\$OMG_DATA_DIR/versions/rust/1.96.0/.omg-install-complete\""
+    fi
     if [[ "$assertions" == doctor-eol-state ]]; then remote+="; $(declare -f check_doctor_issue_delta)"; fi
   fi
   if [[ "$assertions" == doctor-network-state ]]; then
