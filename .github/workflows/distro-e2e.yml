@@ -167,8 +167,8 @@ jobs:
         uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
         with:
           key: distro-e2e-${{ matrix.distro }}-${{ matrix.arch }}
-          # PR-scoped caches compete with shared native build caches.
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          # Save the GitHub fallback when this runner has no R2 compiler cache.
+          save-if: ${{ github.ref == 'refs/heads/main' && env.RUSTC_WRAPPER != 'sccache' }}
 
       - name: Build omg for ${{ matrix.distro }} (${{ matrix.arch }})
         shell: bash
