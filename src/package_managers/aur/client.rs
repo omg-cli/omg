@@ -5058,6 +5058,46 @@ mod tests {
     }
 
     #[test]
+    fn cached_aur_upgrade_reaches_service_and_cli_update_views() -> Result<()> {
+        use crate::core::packages::PackageService;
+        use crate::package_managers::{Backend, mock::MockPackageManager};
+
+        const CASE: &str = "package_managers::aur::client::tests::cached_aur_upgrade_reaches_service_and_cli_update_views";
+        if crate::core::testing::run_isolated_test(CASE) || Settings::rerun_test_unprivileged(CASE)
+        {
+            return Ok(());
+        }
+        let fixture = S72Fixture::new(&["aur-update-demo"])?;
+        let config = fixture.directory.path().join("config");
+        let data = fixture.directory.path().join("state");
+        temp_env::with_var("OMG_CONFIG_DIR", Some(&config), || {
+            fixture.with_environment(async {
+                S72Fixture::index(&["aur-update-demo"])?;
+                let backend = Arc::new(MockPackageManager::new_in("arch", &data));
+                let service = PackageService::builder(backend)
+                    .aur_client(fixture.client())
+                    .without_history()
+                    .build()?;
+                let updates = service.list_updates().await?;
+                let update = updates
+                    .iter()
+                    .find(|update| update.repo == "aur")
+                    .context("published AUR upgrade")?;
+                assert_eq!(update.name, "aur-update-demo");
+                assert_eq!(update.old_version, "1.0-1");
+                assert_eq!(update.new_version, "2.0-1");
+                assert_eq!(update.architecture, None);
+
+                let cli = (crate::package_managers::resolve_backend().ok() == Some(Backend::Arch))
+                    .then(|| crate::cli::packages::update(true, false, false, true, true));
+                futures::future::OptionFuture::from(cli)
+                    .await
+                    .unwrap_or(Ok(()))
+            })
+        })
+    }
+
+    #[test]
     fn aur_metadata_reader_lock_failure_preserves_generation() -> Result<()> {
         const TEST: &str = "package_managers::aur::client::tests::aur_metadata_reader_lock_failure_preserves_generation";
         if crate::core::testing::run_isolated_test(TEST) || Settings::rerun_test_unprivileged(TEST)

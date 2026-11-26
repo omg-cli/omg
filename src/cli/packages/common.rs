@@ -489,9 +489,11 @@ mod tests {
                             let frame = frames.next().await.context("missing daemon request")??;
                             let (_, payload) = split_frame(&frame)?;
                             let request: Request = bitcode::deserialize(payload)?;
-                            let Request::ListUpdates { id } = request else {
-                                anyhow::bail!("unexpected daemon request {request:?}");
-                            };
+                            assert!(
+                                matches!(request, Request::ListUpdates { .. }),
+                                "unexpected daemon request {request:?}"
+                            );
+                            let id = request.id();
                             let result = ResponseResult::ListUpdates(vec![UpdateInfo {
                                 name: "lib".into(),
                                 architecture: Some("i686".into()),
@@ -513,9 +515,8 @@ mod tests {
                             tokio::try_join!(serve, probe)
                         })
                         .await??;
-                        let [update] = updates.as_slice() else {
-                            anyhow::bail!("unexpected daemon updates {updates:?}");
-                        };
+                        assert_eq!(updates.len(), 1, "unexpected daemon updates {updates:?}");
+                        let update = &updates[0];
                         assert_eq!(update.name, "lib");
                         assert_eq!(update.architecture.as_deref(), Some("i686"));
                         assert_eq!(update.new_version, "2-1");

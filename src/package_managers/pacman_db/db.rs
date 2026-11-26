@@ -2748,6 +2748,15 @@ mod tests {
                 assert_eq!(get_detailed_packages().unwrap()[0].repo, "testing");
                 assert_eq!(get_sync_package("widget").unwrap().unwrap().repo, "stable");
                 assert_eq!(check_updates_cached().unwrap()[0].repo, "stable");
+                temp_env::with_var("OMG_TEST_MODE", Some("1"), || {
+                    let projected = crate::package_managers::alpm_ops::get_update_list()
+                        .expect("cached native upgrades");
+                    assert_eq!(projected.len(), 1);
+                    assert_eq!(projected[0].name, "widget");
+                    assert_eq!(projected[0].repo, "stable");
+                    assert_eq!(projected[0].new_version, "2-1");
+                    assert_eq!(projected[0].architecture, None);
+                });
             },
         );
     }

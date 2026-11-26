@@ -652,23 +652,20 @@ mod tests {
         let frame = encode_frame(&response).expect("versioned update response");
         let (_, payload) = split_frame(&frame).expect("valid frame header");
         let decoded = bitcode::deserialize(payload).expect("update response payload");
-        let Response::Success {
-            id: 9,
-            result: ResponseResult::ListUpdates(updates),
-        } = decoded
-        else {
-            panic!("unexpected update response: {decoded:?}");
-        };
-        assert_eq!(
-            updates
-                .iter()
-                .map(|update| (update.name.as_str(), update.architecture.as_deref()))
-                .collect::<Vec<_>>(),
-            [
-                ("lib", Some("x86_64")),
-                ("lib", Some("i686")),
-                ("lib", None)
-            ]
+        let expected = [
+            ("lib", Some("x86_64")),
+            ("lib", Some("i686")),
+            ("lib", None),
+        ];
+        assert!(
+            matches!(
+                &decoded,
+                Response::Success { id: 9, result: ResponseResult::ListUpdates(updates) }
+                    if updates.iter()
+                        .map(|update| (update.name.as_str(), update.architecture.as_deref()))
+                        .eq(expected)
+            ),
+            "unexpected update response: {decoded:?}"
         );
     }
 
