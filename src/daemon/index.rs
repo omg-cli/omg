@@ -699,17 +699,17 @@ impl PackageIndex {
     }
 
     pub fn suggest(&self, query: &str, limit: usize) -> Vec<String> {
-        if query.is_empty() {
+        if query.is_empty() || limit == 0 {
             return Vec::new();
         }
-        let mut names: Vec<String> = self
+        let names: Vec<_> = self
             .items
             .iter()
-            .map(|item| self.pool.get(item.name_offset).to_string())
+            .map(|item| self.pool.get(item.name_offset))
             .collect();
         crate::core::completion::CompletionEngine::fuzzy_indices(query, &names, limit)
             .into_iter()
-            .map(|index| std::mem::take(&mut names[index]))
+            .map(|index| names[index].to_owned())
             .collect()
     }
 }
