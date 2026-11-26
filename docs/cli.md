@@ -1035,6 +1035,7 @@ omg doctor [OPTIONS]
 - Daemon connectivity
 - Mirror availability
 - Package index health (on Debian/Ubuntu, compressed `*_Packages.lz4`/`.gz`/`.xz` indexes count as healthy)
+- On Fedora, the system RPM inventory and DNF's local dependency and consistency checks
 - PGP keyring status
 - Runtime integrity
 
