@@ -11,6 +11,7 @@ use std::process::Command;
 use crate::core::runtime_resolver::find_in_path;
 use crate::hooks;
 use crate::runtimes::rust::RustManager;
+use crate::runtimes::security::{ReviewMode, RuntimeAdmission, admit_selected_path};
 use crate::runtimes::{BunManager, NodeManager};
 
 static TASK_SETUP_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -1098,11 +1099,7 @@ fn execute_process_in(
     let mut runtime_admissions = Vec::with_capacity(selected_paths.len());
     let mut path_additions = Vec::with_capacity(selected_paths.len());
     for (runtime, bin_path) in &selected_paths {
-        runtime_admissions.push(crate::runtimes::security::admit_selected_path(
-            runtime,
-            bin_path,
-            crate::runtimes::security::ReviewMode::FreshAttended,
-        )?);
+        admit_task_runtime(&mut runtime_admissions, runtime, bin_path)?;
         path_additions.push(bin_path.display().to_string());
     }
 
@@ -1136,11 +1133,7 @@ fn execute_process_in(
                 .iter()
                 .find(|(runtime, _)| runtime == "python");
             let base = validate_venv_python(venv, selected.map(|(_, bin)| bin.as_path()))?;
-            runtime_admissions.push(crate::runtimes::security::admit_selected_path(
-                "python",
-                &base,
-                crate::runtimes::security::ReviewMode::FreshAttended,
-            )?);
+            admit_task_runtime(&mut runtime_admissions, "python", &base)?;
             if selected.is_none() {
                 selected_paths.push(("python".to_owned(), base));
             }
@@ -1187,10 +1180,13 @@ fn execute_process_in(
             .find(|(runtime, _)| runtime == "python");
         validate_venv_python(venv, selected.map(|(_, bin)| bin.as_path()))?;
     }
-    if let Some((executable, argv0, admission)) =
-        admitted_runtime_for_command(&command, &selected_paths, venv_path.as_deref())?
-    {
-        let mut pinned = Command::new(executable);
+    if let Some(runtime) = resolve_task_runtime(&command, &selected_paths, venv_path.as_deref())? {
+        admit_task_runtime(&mut runtime_admissions, &runtime.name, &runtime.binary_dir)
+            .with_context(|| {
+                format!("Task runtime executable {cmd} lacks managed advisory authority")
+            })?;
+        let mut pinned = Command::new(runtime.executable);
+        let argv0 = runtime.argv0;
         #[cfg(unix)]
         if let Some(argv0) = argv0 {
             use std::os::unix::process::CommandExt as _;
@@ -1213,7 +1209,6 @@ fn execute_process_in(
             }
         }
         command = pinned;
-        runtime_admissions.push(admission);
     }
     for admission in &runtime_admissions {
         admission.verify_before_execution()?;
@@ -1230,17 +1225,39 @@ fn execute_process_in(
     Ok(())
 }
 
-fn admitted_runtime_for_command(
+fn admit_task_runtime(
+    admissions: &mut Vec<RuntimeAdmission>,
+    runtime: &str,
+    binary_dir: &Path,
+) -> Result<()> {
+    for (index, admission) in admissions.iter().enumerate() {
+        if admission.covers_selected_path(runtime, binary_dir)? {
+            // A direct runtime command is resolved last and its tree is checked last.
+            admissions[index..].rotate_left(1);
+            return Ok(());
+        }
+    }
+    admissions.push(admit_selected_path(
+        runtime,
+        binary_dir,
+        ReviewMode::FreshAttended,
+    )?);
+    Ok(())
+}
+
+#[derive(Debug)]
+struct ResolvedTaskRuntime {
+    name: String,
+    binary_dir: PathBuf,
+    executable: PathBuf,
+    argv0: Option<PathBuf>,
+}
+
+fn resolve_task_runtime(
     command: &Command,
     selected_paths: &[(String, PathBuf)],
     venv: Option<&Path>,
-) -> Result<
-    Option<(
-        PathBuf,
-        Option<PathBuf>,
-        crate::runtimes::security::RuntimeAdmission,
-    )>,
-> {
+) -> Result<Option<ResolvedTaskRuntime>> {
     let name = command
         .get_program()
         .to_str()
@@ -1317,20 +1334,14 @@ fn admitted_runtime_for_command(
         );
         binary_dir = selected.canonicalize()?;
     }
-    let admission = crate::runtimes::security::admit_selected_path(
-        runtime,
-        &binary_dir,
-        crate::runtimes::security::ReviewMode::FreshAttended,
-    )
-    .with_context(|| format!("Task runtime executable {name} lacks managed advisory authority"))?;
-    admission.verify_before_execution()?;
     // Keep virtualenv discovery in argv[0] while the kernel executes the
     // reviewed base, independently of later replacement of the venv entry.
-    Ok(Some((
+    Ok(Some(ResolvedTaskRuntime {
+        name: runtime.to_owned(),
+        binary_dir,
         executable,
-        copied_venv.then_some(resolved),
-        admission,
-    )))
+        argv0: copied_venv.then_some(resolved),
+    }))
 }
 
 fn validate_venv_python(venv: &Path, selected: Option<&Path>) -> Result<PathBuf> {
@@ -2294,19 +2305,25 @@ pathlib.Path({}).write_text(sys.prefix + '|' + omg_local_venv_probe.VALUE)
                     command
                         .current_dir(owner.path())
                         .env("PATH", venv.join("bin"));
-                    let (kernel, argv0, admission) = admitted_runtime_for_command(
+                    let resolved = resolve_task_runtime(
                         &command,
                         &[("python".into(), bin.clone())],
                         Some(&venv),
                     )
                     .unwrap()
                     .unwrap();
-                    assert_eq!(kernel, bin.join("python3").canonicalize().unwrap());
+                    assert_eq!(
+                        resolved.executable,
+                        bin.join("python3").canonicalize().unwrap()
+                    );
+                    let mut admissions = Vec::new();
+                    admit_task_runtime(&mut admissions, &resolved.name, &resolved.binary_dir)
+                        .unwrap();
                     fs::remove_file(&entry).unwrap();
                     symlink(&replacement, &entry).unwrap();
-                    admission.verify_before_execution().unwrap();
-                    let status = Command::new(kernel)
-                        .arg0(argv0.unwrap())
+                    admissions[0].verify_before_execution().unwrap();
+                    let status = Command::new(resolved.executable)
+                        .arg0(resolved.argv0.unwrap())
                         .args(["-B", "-c", &program])
                         .status()
                         .unwrap();
@@ -2708,7 +2725,7 @@ pathlib.Path({}).write_text(sys.prefix + '|' + omg_local_venv_probe.VALUE)
                     } else {
                         vec![]
                     };
-                    let error = admitted_runtime_for_command(&command, &selected, Some(&venv))
+                    let error = resolve_task_runtime(&command, &selected, Some(&venv))
                         .expect_err("same-byte external base alias cannot become a pinned kernel");
                     assert!(
                         format!("{error:#}").contains("escapes its reviewed runtime"),

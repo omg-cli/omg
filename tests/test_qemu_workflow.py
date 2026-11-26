@@ -86,6 +86,34 @@ class QemuWorkflowTests(unittest.TestCase):
             print('REQUIRED_PREPARE_OBSERVED ' + json.dumps(observed), flush=True)
             return result
 
+    def test_runtime_fixture_is_prepared_for_staged_fedora_without_inventory(self):
+        root = WORKFLOW.parents[2]
+        source = (root / 'scripts/benchmark-qemu.sh').read_text(encoding='utf-8')
+        copy = source.index('cp "$here/../tests/runtime_advisory_fixture.py"')
+        begin = source.rfind('\nif ', 0, copy) + 1
+        guard = source[begin:source.index('\n', begin)]
+        transfer = source[copy:source.index('\n', copy)]
+        command = f"{guard}\n  {transfer}\nfi\n"
+        cases = [
+            ('fedora', 'staged', '', True),
+            ('fedora', 'published', '', False),
+            ('ubuntu', 'staged', '', False),
+            ('arch', 'published', 'hermetic', True),
+        ]
+        for distro, source_kind, inventory_tiers, expected in cases:
+            with self.subTest(distro=distro, source_kind=source_kind, inventory_tiers=inventory_tiers), \
+                    tempfile.TemporaryDirectory() as directory:
+                result = subprocess.run(
+                    [self.bash, '-euo', 'pipefail', '-c', command],
+                    env=dict(os.environ, here=str(root / 'scripts'), work=directory,
+                             distro=distro, source_kind=source_kind, inventory_tiers=inventory_tiers),
+                    capture_output=True, text=True, timeout=5)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                copied = Path(directory) / 'runtime_advisory_fixture.py'
+                self.assertEqual(copied.is_file(), expected)
+                if expected:
+                    self.assertEqual(copied.read_bytes(), (root / 'tests' / copied.name).read_bytes())
+
     def test_prepare_rejects_missing_required_companion_identity(self):
         result = self._required_companion_prepare_control('partial-omission')
         self.assertEqual(result.returncode, 1, 'prepare accepted a missing required identity: ' + result.stdout + result.stderr)

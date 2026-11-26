@@ -1069,7 +1069,6 @@ if [[ -n "$inventory_tiers" ]]; then
   cp "$here/qemu-license-oracle.py" "$work/qemu-license-oracle.py"
   cp "$here/qemu-rust-install-oracle.py" "$work/qemu-rust-install-oracle.py"
   cp "$here/qemu-runtime-advisory-oracle.py" "$work/qemu-runtime-advisory-oracle.py"
-  cp "$here/../tests/runtime_advisory_fixture.py" "$work/runtime_advisory_fixture.py"
   cp "$here/qemu-arch-update-fixture.sh" "$work/qemu-arch-update-fixture.sh"
   cp "$here/qemu-run-watch-check.py" "$work/qemu-run-watch-check.py"
   cp "$here/qemu-enterprise-export-oracle.py" "$work/qemu-enterprise-export-oracle.py"
@@ -1089,6 +1088,9 @@ if [[ -n "$inventory_tiers" ]]; then
   fi
 fi
 if [[ -z "$inventory_tiers" ]]; then cp "$here/qemu-runtime-advisory-oracle.py" "$work/qemu-runtime-advisory-oracle.py"; fi
+if [[ -n "$inventory_tiers" || ( "$distro" == fedora && "$source_kind" == staged ) ]]; then
+  cp "$here/../tests/runtime_advisory_fixture.py" "$work/runtime_advisory_fixture.py"
+fi
 if [[ "$benchmark" == true ]]; then
   cp "$here/../benchmark-hyperfine.sh" "$work/benchmark-hyperfine.sh"
   cp "$here/attend-unknown-fixture.py" "$work/attend-unknown-fixture.py"
@@ -1489,7 +1491,7 @@ if [[ "$distro" == fedora ]]; then
     /work/fedora_status_root_switch.py /work/fedora-status-fixture bench@127.0.0.1:
   if [[ "$source_kind" == staged ]]; then
     timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 \
-      /work/fedora_sync_cache.py bench@127.0.0.1:
+      /work/fedora_sync_cache.py /work/runtime_advisory_fixture.py bench@127.0.0.1:
   fi
 fi
 if [[ "$distro" == arch ]]; then

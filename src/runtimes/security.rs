@@ -172,7 +172,7 @@ struct CacheRecord {
 pub(crate) struct RuntimeAdmission {
     record: CacheRecord,
     tree: PathBuf,
-    _lease: Option<super::common::RuntimeLease>,
+    use_lease: Option<super::common::RuntimeLease>,
 }
 
 impl RuntimeAdmission {
@@ -190,6 +190,14 @@ impl RuntimeAdmission {
     }
     pub(crate) fn verify_before_execution(&self) -> Result<()> {
         self.verify_tree(&self.tree)
+    }
+
+    pub(crate) fn covers_selected_path(&self, runtime: &str, binary_dir: &Path) -> Result<bool> {
+        if self.use_lease.is_none() || self.record.query.runtime != runtime {
+            return Ok(false);
+        }
+        let root = selected_runtime_root(runtime, binary_dir)?;
+        Ok(canonical_destination(root)? == self.tree)
     }
 
     pub(crate) fn before_execution(&self, tree: &Path) -> Result<()> {
@@ -361,7 +369,7 @@ fn recorded_admission(tree: &Path, destination: &Path) -> Result<RuntimeAdmissio
     Ok(RuntimeAdmission {
         record,
         tree: canonical_destination(tree)?,
-        _lease: None,
+        use_lease: None,
     })
 }
 
@@ -375,18 +383,7 @@ pub(crate) fn admit_selected_path(
     binary_dir: &Path,
     mode: ReviewMode,
 ) -> Result<RuntimeAdmission> {
-    let root = match runtime {
-        "bun" | "dotnet" => binary_dir.to_path_buf(),
-        "swift" => binary_dir
-            .parent()
-            .and_then(Path::parent)
-            .context("Swift runtime advisory root is missing")?
-            .to_path_buf(),
-        _ => binary_dir
-            .parent()
-            .context("Runtime advisory root is missing")?
-            .to_path_buf(),
-    };
+    let root = selected_runtime_root(runtime, binary_dir)?;
     let versions = root
         .parent()
         .context("Runtime advisory root has no versions parent")?;
@@ -400,15 +397,28 @@ pub(crate) fn admit_selected_path(
         "System or unversioned runtime has no managed advisory identity; install and select it with omg use {runtime} <version>"
     );
     let lease = super::common::try_lock_runtime_use(versions)?;
-    let admission = admit_installed(runtime, &root, mode)?;
+    let admission = admit_installed(runtime, root, mode)?;
     ensure!(
         admission.record.query.runtime == runtime,
         "Runtime advisory path belongs to another product"
     );
     Ok(RuntimeAdmission {
-        _lease: Some(lease),
+        use_lease: Some(lease),
         ..admission
     })
+}
+
+fn selected_runtime_root<'a>(runtime: &str, binary_dir: &'a Path) -> Result<&'a Path> {
+    match runtime {
+        "bun" | "dotnet" => Ok(binary_dir),
+        "swift" => binary_dir
+            .parent()
+            .and_then(Path::parent)
+            .context("Swift runtime advisory root is missing"),
+        _ => binary_dir
+            .parent()
+            .context("Runtime advisory root is missing"),
+    }
 }
 
 fn admit_tree(
@@ -449,7 +459,7 @@ fn admit_tree(
                 let admission = RuntimeAdmission {
                     record: record.clone(),
                     tree: canonical_destination(tree)?,
-                    _lease: None,
+                    use_lease: None,
                 };
                 admission.verify(tree)?;
                 Ok(admission)
@@ -567,7 +577,7 @@ fn admit_tree(
     let admission = RuntimeAdmission {
         record,
         tree: canonical_destination(tree)?,
-        _lease: None,
+        use_lease: None,
     };
     admission.verify_tree(tree)?;
     save_cache(&admission.record)?;

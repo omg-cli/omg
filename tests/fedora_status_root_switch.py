@@ -2151,6 +2151,164 @@ printf 'watch fixture completed\\n'
             run("short-burst-one-rerun", lambda p, s, f, o: burst(f))
 
 
+    def inspect_task_runtime_admissions():
+        import ctypes
+        import struct
+
+        phase = "task-runtime-admissions"
+        helper = Path(__file__).with_name("runtime_advisory_fixture.py")
+        if not helper.is_file():
+            helper = fixture.parents[1] / "runtime_advisory_fixture.py"
+        assert helper.is_file(), helper
+        with tempfile.TemporaryDirectory(prefix="task-runtime-admissions-", dir=work) as directory:
+            here = Path(directory)
+            os.chown(here, account.pw_uid, account.pw_gid)
+            runtimes = {
+                "node": ("24.22.3", "node", "bin"),
+                "python": ("3.13.7", "python3", "bin"),
+                "bun": ("1.2.20", "bun", "."),
+                "deno": ("2.4.5", "deno", "bin"),
+            }
+            seed = """
+import importlib.util, json, os, sys
+from pathlib import Path
+helper, home, definitions = sys.argv[1:]
+spec = importlib.util.spec_from_file_location("runtime_advisory_fixture", helper)
+fixture = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(fixture)
+home = Path(home)
+config = Path(fixture.fixture_cli_environment(home)["OMG_CONFIG_DIR"])
+for name, (version, executable, bin_dir) in json.loads(definitions).items():
+    runtime = home / "data" / "versions" / name / version
+    binary = runtime / bin_dir / executable
+    binary.parent.mkdir(parents=True)
+    payload = runtime / "fixture-payload"
+    payload.write_bytes(bytes(32768))
+    output_version = "v" + version if name == "node" else version
+    binary.write_text(f'''#!/bin/sh
+if [ "${{1:-}}" = --version ]; then
+    printf '%s\\\\n' '{output_version}'
+    exit
+fi
+printf 'fixture runtime %s' '{name}'
+printf '|<%s>' "$@"
+printf '\\\\n'
+''')
+    binary.chmod(0o755)
+    alias = {"node": "nodejs", "python": "python"}.get(name)
+    if alias:
+        (binary.parent / alias).symlink_to(executable)
+    fixture.seed_runtime_advisory_fixture(runtime, name, version, config)
+standalone = home / "bin" / "fixture-task-tool"
+standalone.parent.mkdir()
+standalone.write_text('''#!/bin/sh
+printf 'fixture runtime ordinary'
+printf '|<%s>' "$@"
+printf '\\\\n'
+''')
+standalone.chmod(0o755)
+"""
+            checked([sys.executable, "-I", "-B", "-c", seed, helper, here, json.dumps(runtimes)],
+                    dict(disabled, HOME=str(here)), ordinary)
+            roots = {name: here/"data"/"versions"/name/version
+                     for name, (version, _, _) in runtimes.items()}
+            bins = {name: roots[name]/bin_dir for name, (_, _, bin_dir) in runtimes.items()}
+            environment = dict(disabled, HOME=str(here), OMG_DATA_DIR=str(here/"data"),
+                               OMG_CONFIG_DIR=str(here/"config"/"omg"), OMG_NATIVE_TEST_DATA_DIR="1",
+                               XDG_CONFIG_HOME=str(here/"config"), XDG_DATA_HOME=str(here/"xdg-data"),
+                               XDG_CACHE_HOME=str(here/"cache"), XDG_STATE_HOME=str(here/"state"))
+            libc = ctypes.CDLL(None, use_errno=True)
+            libc.inotify_init1.argtypes = [ctypes.c_int]
+            libc.inotify_add_watch.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_uint32]
+            in_open, in_close_nowrite = 0x20, 0x10
+            notice = struct.Struct("iIII")
+
+            def run(label, executable, chosen, expected, *, pins=(), path=(), venv=None,
+                    ancestor=False, mise=False):
+                folder = here / label
+                folder.mkdir()
+                project = folder / "project" if ancestor else folder
+                project.mkdir(exist_ok=True)
+                for name in pins:
+                    (folder / f".{name}-version").write_text(runtimes[name][0] + "\n")
+                if venv:
+                    venv_home = project / ".venv"
+                    (venv_home / "bin").mkdir(parents=True)
+                    (venv_home / "pyvenv.cfg").write_text(f"home = {bins['python']}\n")
+                    interpreter = bins["python"] / "python3"
+                    entry = venv_home / "bin" / "python3"
+                    if venv == "copy":
+                        shutil.copy2(interpreter, entry)
+                    else:
+                        entry.symlink_to(interpreter)
+                if mise:
+                    (project / "mise.toml").write_text("""[tasks.fixture]
+run = 'node "$@"'
+""")
+
+                path_values = [str(bins[name]) for name in path] + [str(here/"bin"), base_env["PATH"]]
+                env = dict(environment, PATH=":".join(path_values))
+                fd = libc.inotify_init1(os.O_CLOEXEC | os.O_NONBLOCK)
+                assert fd >= 0, ctypes.get_errno()
+                log = ""
+                try:
+                    watched = {}
+                    reads = {name: 0 for name in runtimes}
+                    for name, root in roots.items():
+                        watch_id = libc.inotify_add_watch(fd, os.fsencode(root/"fixture-payload"),
+                                                        in_open | in_close_nowrite)
+                        assert watch_id >= 0, (root, ctypes.get_errno())
+                        watched[watch_id] = name
+                    result = subprocess.run([cli, "run", executable, "--", "two words", "--literal"],
+                                            cwd=project, stdin=subprocess.DEVNULL, capture_output=True,
+                                            text=True, timeout=10, env=env, **ordinary)
+                    log = result.stdout + result.stderr
+                    try:
+                        events = os.read(fd, 65536)
+                    except BlockingIOError:
+                        events = b""
+                    offset = 0
+                    while offset < len(events):
+                        watch_id, kind, _, length = notice.unpack_from(events, offset)
+                        reads[watched[watch_id]] += bool(kind & in_open)
+                        offset += notice.size + length
+                    observed = {name: total for name, total in reads.items() if total}
+                    correct_output = f"fixture runtime {chosen}|<two words>|<--literal>" in result.stdout
+                    checks.append(dict(phase=phase, case=label, status=result.returncode,
+                                       passed=result.returncode == 0 and correct_output and observed == expected,
+                                       reported_reads=observed, expected_reads=expected, diagnostic=log[-1000:]))
+                except subprocess.TimeoutExpired:
+                    checks.append(dict(phase=phase, case=label, status=None, passed=False,
+                                       diagnostic="runtime task did not finish"))
+                finally:
+                    os.close(fd)
+
+            for name, (_, executable, _) in runtimes.items():
+                run(f"{name}-selected", executable, name, {name: 3}, pins=(name,))
+                run(f"{name}-path-only", executable, name, {name: 3}, path=(name,))
+                run(f"{name}-selected-and-on-path", executable, name, {name: 6 if name in ("node", "bun") else 3},
+                    pins=(name,), path=(name,))
+                run(f"{name}-ordinary-task", "fixture-task-tool", "ordinary", {name: 3}, pins=(name,))
+            run("nodejs-alias", "nodejs", "node", {"node": 3}, pins=("node",))
+            run("python-alias", "python", "python", {"python": 3}, pins=("python",))
+
+            for mode in ("link", "copy"):
+                for pinned in (False, True):
+                    pins = ("python",) if pinned else ()
+                    kind = "pinned" if pinned else "implicit"
+                    run(f"venv-{mode}-{kind}-python", "python3", "python", {"python": 3}, pins=pins, venv=mode)
+                    run(f"venv-{mode}-{kind}-ordinary", "fixture-task-tool", "ordinary", {"python": 3},
+                        pins=pins, venv=mode)
+
+            run("node-with-deno", "node", "node", {"node": 3, "deno": 3}, pins=("node", "deno"))
+            run("bun-with-python", "bun", "bun", {"python": 3, "bun": 3}, pins=("python", "bun"))
+            run("ordinary-with-two-runtimes", "fixture-task-tool", "ordinary", {"python": 3, "deno": 3},
+                pins=("python", "deno"))
+            run("bun-with-node", "bun", "bun", {"node": 3, "bun": 3}, pins=("node", "bun"))
+            run("node-pin-from-parent", "node", "node", {"node": 3}, pins=("node",), ancestor=True)
+            run("runtime-in-mise-task", "fixture", "node", {"node": 3}, pins=("node",), mise=True)
+
+
     def inspect_environment_lockfiles():
         phase = "environment-lockfiles"
         with tempfile.TemporaryDirectory(prefix="environment-locks-", dir=work) as directory:
@@ -3855,6 +4013,7 @@ exec {shlex.quote(str(binary))} "$@"
                     inspect_workspace_graph_and_diff()
                     inspect_task_selection()
                     inspect_task_watch()
+                    inspect_task_runtime_admissions()
                 config.write_text(alternate_config)
                 refresh_fixture()
                 expected = ordinary_control([dnf, "--cacheonly", "repoquery",
@@ -4172,6 +4331,6 @@ assert inventory() == before
 report = dict(binaries=binaries, checks=checks, total=len(checks),
               passed=sum(entry["passed"] for entry in checks), host_unchanged=True)
 print(json.dumps(report))
-expected_checks = 303 if consent_oracle is None else 1353
+expected_checks = 303 if consent_oracle is None else 1385
 if report["passed"] != report["total"] or report["total"] != expected_checks:
     sys.exit(4)
