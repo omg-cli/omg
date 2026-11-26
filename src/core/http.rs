@@ -922,8 +922,14 @@ async fn fetch_metadata_text_with_limits(
                     .get(url)
                     .timeout(total)
                     .send()
-                    .await?
-                    .error_for_status()?;
+                    .await
+                    .and_then(reqwest::Response::error_for_status)
+                    .map_err(reqwest::Error::without_url)?;
+                let status = response.status();
+                anyhow::ensure!(
+                    status == reqwest::StatusCode::OK,
+                    "Metadata request returned HTTP {status}"
+                );
                 Ok::<_, anyhow::Error>(String::from_utf8(
                     bounded_metadata_body_with_limit(response, limit).await?,
                 )?)
@@ -973,7 +979,11 @@ async fn bounded_metadata_body_with_limit(
             "{limit_error}"
         );
         let mut bytes = Vec::new();
-        while let Some(chunk) = response.chunk().await? {
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(reqwest::Error::without_url)?
+        {
             anyhow::ensure!(chunk.len() <= limit - bytes.len(), "{limit_error}");
             bytes.extend_from_slice(&chunk);
         }
@@ -1026,7 +1036,14 @@ mod metadata_limit_tests {
                     }
                     let request = String::from_utf8(headers)?;
                     let line = request.lines().next().unwrap().to_owned();
-                    anyhow::ensure!(line == "GET /manifest HTTP/1.1", "unexpected request");
+                    anyhow::ensure!(
+                        matches!(
+                            line.as_str(),
+                            "GET /manifest HTTP/1.1"
+                                | "GET /manifest?fixture=metadata-query-marker HTTP/1.1"
+                        ),
+                        "unexpected request"
+                    );
                     requests.push(request);
                     if response.is_empty() {
                         let closed = stream
@@ -1169,6 +1186,66 @@ mod metadata_limit_tests {
                 assert_eq!(persistent_503.finish().await?.len(), 2);
                 Ok(())
             })
+    }
+
+    #[tokio::test]
+    async fn metadata_get_requires_a_complete_response() -> anyhow::Result<()> {
+        let client = metadata_client();
+        let mut accepted = Vec::new();
+        let mut exposed_queries = Vec::new();
+        let mut checked = 0;
+        for limit in [4, DEFAULT_METADATA_BODY_LIMIT] {
+            for status in [
+                200, 201, 202, 203, 204, 206, 300, 301, 302, 303, 304, 307, 308, 400, 404, 410,
+            ] {
+                let body = if matches!(status, 204 | 304) {
+                    ""
+                } else {
+                    "data"
+                };
+                let fixture = RetryFixture::new(
+                    vec![
+                        format!(
+                            "HTTP/1.1 {status} Fixture\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .into_bytes(),
+                    ],
+                    false,
+                )
+                .await?;
+                let url = format!("{}?fixture=metadata-query-marker", fixture.url);
+                let result = if limit == DEFAULT_METADATA_BODY_LIMIT {
+                    fetch_metadata_text(&client, &url).await
+                } else {
+                    fetch_metadata_text_limited(&client, &url, limit).await
+                };
+                if let Ok(text) = &result {
+                    accepted.push((limit, status, text.clone()));
+                } else if let Err(error) = &result {
+                    let diagnostic = format!("{error:#}");
+                    assert!(diagnostic.contains(&status.to_string()), "{diagnostic}");
+                    if diagnostic.contains("metadata-query-marker") {
+                        exposed_queries.push((limit, status));
+                    }
+                }
+                assert_eq!(fixture.finish().await?.len(), 1);
+                checked += 1;
+            }
+        }
+        println!("Checked {checked} metadata status responses");
+        assert_eq!(
+            (accepted, exposed_queries),
+            (
+                vec![
+                    (4, 200, "data".to_owned()),
+                    (DEFAULT_METADATA_BODY_LIMIT, 200, "data".to_owned())
+                ],
+                Vec::new()
+            ),
+            "only complete HTTP responses succeed and errors omit query contents"
+        );
+        Ok(())
     }
 
     #[tokio::test]
