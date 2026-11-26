@@ -53,14 +53,24 @@ async fn status_json(fast: bool) -> Result<()> {
     let start = std::time::Instant::now();
 
     #[cfg(unix)]
-    let daemon_counts = query_daemon_status(fast).await.map(|status| {
-        PackageStatus::from((
-            status.total_packages,
-            status.explicit_packages,
-            status.orphan_packages,
-            status.updates_available,
-        ))
-    });
+    let daemon_counts = {
+        #[cfg(feature = "fedora")]
+        let local_counts_only = uses_fedora_status();
+        #[cfg(not(feature = "fedora"))]
+        let local_counts_only = false;
+        if local_counts_only {
+            None
+        } else {
+            query_daemon_status(fast).await.1.map(|status| {
+                PackageStatus::from((
+                    status.total_packages,
+                    status.explicit_packages,
+                    status.orphan_packages,
+                    status.updates_available,
+                ))
+            })
+        }
+    };
     #[cfg(not(unix))]
     let daemon_counts: Option<PackageStatus> = None;
 
@@ -88,7 +98,7 @@ async fn status_json(fast: bool) -> Result<()> {
 }
 
 #[cfg(all(unix, feature = "fedora"))]
-fn uses_fedora_status() -> bool {
+pub(crate) fn uses_fedora_status() -> bool {
     matches!(
         crate::package_managers::resolve_backend(),
         Ok(crate::package_managers::Backend::Fedora)
@@ -96,14 +106,14 @@ fn uses_fedora_status() -> bool {
 }
 
 #[cfg(unix)]
-async fn query_daemon_status(fast: bool) -> Option<StatusResult> {
+async fn query_daemon_status(fast: bool) -> (bool, Option<StatusResult>) {
     #[cfg(not(feature = "fedora"))]
     let _ = fast;
     let timeout = std::time::Duration::from_millis(500);
     #[cfg(feature = "fedora")]
     let timeout = if uses_fedora_status() {
         if fast {
-            return None;
+            return (false, None);
         }
         // Fedora computes maintenance counts live, even with a warm daemon.
         std::time::Duration::from_secs(2)
@@ -111,43 +121,83 @@ async fn query_daemon_status(fast: bool) -> Option<StatusResult> {
         timeout
     };
     tokio::time::timeout(timeout, async {
-        let mut client = DaemonClient::connect().await.ok()?;
-        match client.call(Request::Status { id: 0 }).await.ok()? {
-            ResponseResult::Status(status) => Some(status),
+        let Ok(mut client) = DaemonClient::connect().await else {
+            return (false, None);
+        };
+        let status = match client.call(Request::Status { id: 0 }).await {
+            Ok(ResponseResult::Status(status)) => Some(status),
             // Any other response means the daemon answered but not for this
             // request; fall back to the direct package manager.
             other => {
-                tracing::debug!("Unexpected daemon status response: {other:?}");
+                tracing::debug!("Daemon did not provide usable status: {other:?}");
                 None
             }
-        }
+        };
+        (true, status)
     })
     .await
-    .unwrap_or(None)
+    .unwrap_or((false, None))
+}
+
+#[cfg(all(unix, feature = "fedora"))]
+pub(crate) async fn fedora_status_with_daemon() -> (bool, Result<StatusResult>) {
+    let manager = match get_package_manager() {
+        Ok(manager) => manager,
+        Err(error) => return (false, Err(error)),
+    };
+    // Package counts depend on the caller's DNF cache. Retain the daemon's
+    // separately validated advisory observation and runtime versions.
+    let (counts, (connected, daemon)) = tokio::join!(
+        manager.get_status_details(false),
+        query_daemon_status(false)
+    );
+    let status = counts.map(|counts| {
+        let (total_packages, explicit_packages, orphan_packages, updates_available) =
+            counts.into_counts();
+        let advisories = daemon
+            .as_ref()
+            .filter(|status| status.total_packages == total_packages)
+            .and_then(StatusResult::scanned_vulnerability_summary);
+        StatusResult {
+            total_packages,
+            explicit_packages,
+            orphan_packages,
+            updates_available,
+            security_vulnerabilities: advisories.map_or(0, |(findings, _)| findings),
+            vulnerabilities_scanned: advisories.is_some(),
+            security_unknown_packages: advisories.map(|(_, unknown)| unknown),
+            runtime_versions: daemon.map_or_else(Vec::new, |status| status.runtime_versions),
+        }
+    });
+    (connected, status)
 }
 
 async fn status_fallback(fast: bool) -> Result<()> {
     let start = std::time::Instant::now();
 
-    #[cfg(unix)]
-    if let Some(status) = query_daemon_status(fast).await {
-        #[cfg(feature = "fedora")]
-        if uses_fedora_status() {
-            crate::cli::commands::print_system_status(
-                &StatusData {
-                    total_packages: status.total_packages,
-                    explicit_packages: status.explicit_packages,
-                    orphan_packages: status.orphan_packages,
-                    updates_available: status.updates_available,
-                    advisory_coverage: status.scanned_vulnerability_summary(),
-                    duration_ms: start.elapsed().as_secs_f64() * 1000.0,
-                    fast_mode: fast,
-                },
-                Some(status.runtime_versions),
-                true,
-            );
-            return Ok(());
+    #[cfg(all(unix, feature = "fedora"))]
+    if !fast && uses_fedora_status() {
+        let (connected, status) = fedora_status_with_daemon().await;
+        let status = status?;
+        let report = StatusData {
+            total_packages: status.total_packages,
+            explicit_packages: status.explicit_packages,
+            orphan_packages: status.orphan_packages,
+            updates_available: status.updates_available,
+            advisory_coverage: status.scanned_vulnerability_summary(),
+            duration_ms: start.elapsed().as_secs_f64() * 1000.0,
+            fast_mode: false,
+        };
+        if connected {
+            crate::cli::commands::print_system_status(&report, Some(status.runtime_versions), true);
+        } else {
+            write_status_report(&report)?;
         }
+        return Ok(());
+    }
+
+    #[cfg(unix)]
+    if let Some(status) = query_daemon_status(fast).await.1 {
         display_status_report(
             status.total_packages,
             status.explicit_packages,
@@ -182,8 +232,6 @@ fn display_status_report(
     fast: bool,
     advisory_coverage: Option<(usize, usize)>,
 ) -> Result<()> {
-    let mut stdout = std::io::BufWriter::new(std::io::stdout());
-
     let report = StatusData {
         total_packages: total,
         explicit_packages: explicit,
@@ -193,6 +241,11 @@ fn display_status_report(
         fast_mode: fast,
         advisory_coverage,
     };
+    write_status_report(&report)
+}
+
+fn write_status_report(report: &StatusData) -> Result<()> {
+    let mut stdout = std::io::BufWriter::new(std::io::stdout());
     stdout.write_all(report.render().as_bytes())?;
 
     stdout.flush()?;

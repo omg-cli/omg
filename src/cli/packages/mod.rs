@@ -33,6 +33,8 @@ pub use remove::remove;
 #[cfg(feature = "fedora")]
 pub(crate) use remove::review_fedora_removal;
 pub use search::{search, search_sync_cli, search_sync_cli_with_limit, search_with_json};
+#[cfg(all(unix, feature = "fedora"))]
+pub(crate) use status::{fedora_status_with_daemon, uses_fedora_status};
 pub use status::{status, status_with_json};
 pub use sync_db::sync_databases as sync;
 #[cfg(feature = "arch")]
