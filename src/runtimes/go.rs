@@ -71,14 +71,22 @@ impl GoManager {
 
     /// List available Go versions from go.dev
     pub async fn list_available(&self) -> Result<Vec<GoVersion>> {
-        self.client
+        let response = self
+            .client
             .get(GO_VERSIONS_URL)
             .timeout(std::time::Duration::from_secs(30))
             .send()
             .await
             .context("Failed to fetch Go version list. Check your internet connection.")?
             .error_for_status()
-            .context("Go version-list request failed")?
+            .map_err(reqwest::Error::without_url)
+            .context("Go version-list request failed")?;
+        let status = response.status();
+        anyhow::ensure!(
+            status == reqwest::StatusCode::OK,
+            "Go version-list request returned HTTP {status}"
+        );
+        response
             .bounded_json()
             .await
             .context("Failed to parse Go version list from go.dev")
@@ -87,7 +95,14 @@ impl GoManager {
     /// Install Go - PURE RUST, NO SUBPROCESS
     pub async fn install(&self, version: &str) -> Result<()> {
         let version = normalize_version(version);
-        let version = self.resolve_requested_version(&version).await?;
+        let (version, releases) = if super::common::is_partial_version(&version) {
+            let releases = self.list_available().await?;
+            let version =
+                super::resolve_version_request(&available_version_names(&releases), &version);
+            (version, Some(releases))
+        } else {
+            (version, None)
+        };
         crate::core::security::validate_runtime_version(&version)?;
         let version_dir = self.versions_dir.join(&version);
 
@@ -105,11 +120,13 @@ impl GoManager {
         let filename = format!("go{version}.{}.tar.gz", go_platform()?);
         let url = format!("{GO_DOWNLOAD_URL}/{filename}");
 
+        // Resolve a partial request and verify its archive against the same catalog.
+        let releases = match releases {
+            Some(releases) => releases,
+            None => self.list_available().await?,
+        };
+        let checksum = checksum_for_file(&releases, &version, &filename)?;
         fs::create_dir_all(&self.versions_dir)?;
-
-        // A vendor checksum is required before installing a downloaded runtime.
-        let releases = self.list_available().await?;
-        let checksum = checksum_for_file(&releases, &filename)?;
 
         println!("{} Downloading {filename}...", style::informative("→"));
         let download = begin_download(&self.versions_dir)?;
@@ -133,24 +150,6 @@ impl GoManager {
             &self.versions_dir.join(version),
         )?;
         complete_staged_install(staging, &self.versions_dir.join(version), version)
-    }
-
-    /// Resolve a partial version request (`1`, `1.21`) to the newest matching
-    /// stable go.dev release before any download URL is built; the filename
-    /// interpolation is exact-string, so an unresolved partial would 404.
-    /// Only stable releases participate: `include=all` also lists RC tags such
-    /// as `go1.22rc1`, and a partial request must never resolve into one.
-    /// Exact and non-numeric requests pass through unchanged, preserving the
-    /// already-installed fast path and the existing not-found UX.
-    async fn resolve_requested_version(&self, version: &str) -> Result<String> {
-        if !crate::runtimes::common::is_partial_version(version) {
-            return Ok(version.to_owned());
-        }
-        let available = self.list_available().await?;
-        Ok(crate::runtimes::resolve_version_request(
-            &available_version_names(&available),
-            version,
-        ))
     }
 
     /// Switch to a specific version
@@ -208,13 +207,23 @@ fn available_version_names(versions: &[GoVersion]) -> Vec<String> {
         .collect()
 }
 
-fn checksum_for_file(releases: &[GoVersion], filename: &str) -> Result<String> {
-    let checksum = releases
+fn checksum_for_file(releases: &[GoVersion], version: &str, filename: &str) -> Result<String> {
+    let mut matching = releases
         .iter()
+        .filter(|release| release.version() == version)
         .flat_map(|release| &release.files)
-        .find(|file| file.filename == filename)
+        .filter(|file| file.filename == filename);
+    let first = matching
+        .next()
         .with_context(|| format!("Go release manifest has no checksum for {filename}"))?;
-    parse_sha256_digest(&checksum.sha256, GO_VERSIONS_URL)
+    let checksum = parse_sha256_digest(&first.sha256, GO_VERSIONS_URL)?;
+    for file in matching {
+        anyhow::ensure!(
+            parse_sha256_digest(&file.sha256, GO_VERSIONS_URL)? == checksum,
+            "Go release manifest has conflicting checksums for {filename}"
+        );
+    }
+    Ok(checksum)
 }
 
 fn go_platform() -> Result<String> {
@@ -247,10 +256,12 @@ mod tests {
             ],
         )
         .expect("complete owned Go distribution");
-        let metadata = serde_json::to_vec(&serde_json::json!([{
-            "version": format!("go{version}"), "stable": true,
-            "files": [{"filename": filename, "sha256": hex::encode(Sha256::digest(&archive))}]
-        }]))
+        let metadata = serde_json::to_vec(&serde_json::json!([
+            {"version": "go1.27rc1", "stable": false},
+            {"version": "go1.26.9", "stable": true},
+            {"version": format!("go{version}"), "stable": true,
+             "files": [{"filename": filename, "sha256": hex::encode(Sha256::digest(&archive))}]}
+        ]))
         .expect("controlled official Go checksum inventory");
         let archive_path = format!("/dl/{filename}");
         super::super::test_https::fixed_public_routes(&[
@@ -265,7 +276,7 @@ mod tests {
             client: download_client(),
         };
         manager
-            .install(version)
+            .install("1.27")
             .await
             .expect("public verified Go installation");
         let installed = fixture.versions.join(version);
@@ -403,10 +414,93 @@ mod tests {
         }];
 
         assert_eq!(
-            checksum_for_file(&releases, "go1.27.0.linux-amd64.tar.gz").unwrap(),
+            checksum_for_file(&releases, "1.27.0", "go1.27.0.linux-amd64.tar.gz").unwrap(),
             "a".repeat(64)
         );
-        assert!(checksum_for_file(&releases, "go1.27.0.darwin-amd64.tar.gz").is_err());
+        assert!(checksum_for_file(&releases, "1.27.0", "go1.27.0.darwin-amd64.tar.gz").is_err());
+    }
+
+    #[test]
+    fn checksum_requires_the_selected_release_and_agreement() -> Result<()> {
+        let filename = "go1.27.0.linux-amd64.tar.gz";
+        let correct_file = GoVersionFile {
+            filename: filename.to_owned(),
+            sha256: "a".repeat(64),
+        };
+        let unrelated = GoVersion {
+            version: "go1.27.1".to_owned(),
+            stable: true,
+            files: vec![GoVersionFile {
+                filename: filename.to_owned(),
+                sha256: "b".repeat(64),
+            }],
+        };
+        let mut selected = GoVersion {
+            version: "go1.27.0".to_owned(),
+            stable: true,
+            files: vec![correct_file.clone()],
+        };
+        assert!(
+            checksum_for_file(std::slice::from_ref(&unrelated), "1.27.0", filename).is_err(),
+            "an unrelated release cannot supply the selected digest"
+        );
+        assert_eq!(
+            checksum_for_file(&[unrelated, selected.clone()], "1.27.0", filename)?,
+            correct_file.sha256
+        );
+        selected.files.push(GoVersionFile {
+            filename: filename.to_owned(),
+            sha256: "A".repeat(64),
+        });
+        assert_eq!(
+            checksum_for_file(std::slice::from_ref(&selected), "1.27.0", filename)?,
+            correct_file.sha256
+        );
+        selected.files.push(GoVersionFile {
+            filename: filename.to_owned(),
+            sha256: "b".repeat(64),
+        });
+        let error = checksum_for_file(&[selected], "1.27.0", filename)
+            .expect_err("conflicting checksums for a selected archive must fail");
+        assert!(error.to_string().contains("conflicting checksums"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn catalog_requires_a_complete_http_response() -> Result<()> {
+        let path = "/dl/?mode=json&include=all";
+        let manifest = br#"[{"version":"go1.27.0","stable":true}]"#.to_vec();
+        let fixture = super::super::test_https::HttpsFixture::new_with_statuses(
+            "go.dev",
+            vec![
+                (path.to_owned(), 200, manifest.clone()),
+                (path.to_owned(), 206, manifest),
+                (path.to_owned(), 304, Vec::new()),
+                (path.to_owned(), 404, Vec::new()),
+            ],
+        )
+        .await?;
+        let manager = GoManager {
+            client: Box::leak(Box::new(fixture.client(true)?)),
+            ..GoManager::new()
+        };
+        let accepted = manager.list_available().await?;
+        let partial = manager.list_available().await;
+        let unchanged = manager.list_available().await;
+        let missing = manager.list_available().await;
+        assert_eq!(
+            fixture.finish().await?,
+            vec![format!("GET {path} HTTP/1.1"); 4]
+        );
+        assert_eq!(accepted[0].version(), "1.27.0");
+        for (status, result) in [(206, partial), (304, unchanged), (404, missing)] {
+            let error = result.expect_err("a catalog requires HTTP 200");
+            assert!(
+                format!("{error:#}").contains(&status.to_string()),
+                "{error:#}"
+            );
+        }
+        Ok(())
     }
 
     #[tokio::test]
