@@ -22,6 +22,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import tomllib
 from urllib.parse import parse_qs
 import xml.etree.ElementTree as ET
 
@@ -807,6 +808,61 @@ exec {shlex.quote(str(native))} "$@"
             finally:
                 checked(["/usr/bin/umount", target])
 
+    def inspect_status_inventory_scope(phase, expected_updates, state, *, native_reasons=False):
+        native_identity = ordinary_control([dnf, "--cacheonly", "repoquery", "--installed",
+                                            "--qf", r"%{name}\n"]).splitlines()
+        assert native_identity == [package]
+        assert native_explicit() == [package]
+        nevras = tomllib.loads((state / "nevras.toml").read_text())["nevras"]
+        # Empty NEVRA state also checks legacy history when the direct reader can proceed.
+        expected_dumps = 1 + int(not nevras and not native_reasons)
+        target = Path(dnf).resolve(strict=True)
+        with tempfile.TemporaryDirectory(prefix="status-inventory-", dir=root) as directory:
+            gate = Path(directory)
+            gate.chmod(0o755)
+            witness = gate / "effective-config"
+            witness.touch(mode=0o600)
+            os.chown(witness, account.pw_uid, account.pw_gid)
+            native = gate / target.name
+            shutil.copy2(target, native)
+            wrapper = gate / "track-dnf"
+            wrapper.write_text(f"""#!/usr/bin/bash
+for argument in "$@"; do
+    case "$argument" in
+        --dump-main-config) printf 'config\\n' >> {shlex.quote(str(witness))} ;;
+        --userinstalled) printf 'reasons\\n' >> {shlex.quote(str(witness))} ;;
+    esac
+done
+exec {shlex.quote(str(native))} "$@"
+""")
+            wrapper.chmod(0o755)
+            checked(["/usr/bin/mount", "--bind", wrapper, target])
+            try:
+                for label, args, updates in (
+                    ("fast-status-inventory-scope", ["--fast"], 0),
+                    ("status-inventory-scope", [], expected_updates),
+                ):
+                    count_before = len(witness.read_text().splitlines())
+                    result = command([cli, "--json", "status", *args], disabled, ordinary)
+                    probes = witness.read_text().splitlines()[count_before:]
+                    observed_dumps = probes.count("config")
+                    reason_queries = probes.count("reasons")
+                    try:
+                        value = json.loads(result.stdout)
+                        counts = tuple(value[key] for key in ("total_packages", "explicit_packages",
+                                                             "orphan_packages", "updates_available"))
+                    except (TypeError, ValueError, KeyError):
+                        counts = ()
+                    checks.append(dict(phase=phase, case=label,
+                                       passed=result.returncode == 0 and counts == (1, 1, 0, updates)
+                                       and observed_dumps == expected_dumps
+                                       and reason_queries == int(native_reasons), status=result.returncode,
+                                       config_dumps=observed_dumps, expected_dumps=expected_dumps,
+                                       native_reasons=reason_queries,
+                                       counts=counts, diagnostic=result.stderr[-900:]))
+            finally:
+                checked(["/usr/bin/umount", target])
+
     def inspect_overlapping_status(phase, expected_updates):
         native_orphans = ordinary_control([dnf, "--cacheonly", "repoquery", "--unneeded",
                                            "--qf", r"%{name}\n"]).splitlines()
@@ -1416,6 +1472,7 @@ exec {shlex.quote(str(binary))} "$@"
                     inspect_update_query_refusal("update-empty-native-installed", "--installed", True)
                     inspect_update_query_refusal("update-empty-native-upgrades", "--upgrades", False)
                     inspect_overlapping_status("status-metadata-only", 0)
+                    inspect_status_inventory_scope("status-metadata-only", 0, custom_state)
 
                 manifest.write_bytes(original_manifest)
                 sign_manifest()
@@ -1425,6 +1482,15 @@ exec {shlex.quote(str(binary))} "$@"
                 if consent_oracle is not None:
                     inspect_update_query_refusal("update-present-native-installed", "--installed", False)
                     inspect_overlapping_status("status-metadata-restored", 1)
+                    inspect_status_inventory_scope("status-metadata-restored", 1, custom_state)
+                    pending = custom_state / "omg-fixture.new"
+                    pending.touch(exist_ok=False)
+                    try:
+                        inspect_status_inventory_scope("status-inventory-native-fallback", 1, custom_state,
+                                                       native_reasons=True)
+                        assert pending.is_file()
+                    finally:
+                        pending.unlink()
                 normal_manifests = cached_manifests(normal_cache)
 
                 def disable_repository_while_counting(_handoff):
@@ -1512,6 +1578,6 @@ assert inventory() == before
 report = dict(binaries=binaries, checks=checks, total=len(checks),
               passed=sum(entry["passed"] for entry in checks), host_unchanged=True)
 print(json.dumps(report))
-expected_checks = 303 if consent_oracle is None else 576
+expected_checks = 303 if consent_oracle is None else 582
 if report["passed"] != report["total"] or report["total"] != expected_checks:
     sys.exit(4)

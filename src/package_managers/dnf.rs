@@ -1163,11 +1163,26 @@ impl DnfPackageManager {
         Ok(packages)
     }
 
-    async fn apply_current_install_reasons(packages: &mut [InstalledPackage]) -> Result<()> {
-        let user_installed = tokio::task::spawn_blocking(Self::read_user_installed_names)
-            .await
-            .context("DNF install-reason worker failed")?;
-        Self::apply_install_reasons(packages, user_installed)
+    fn installed_status_counts(&self) -> Result<(usize, usize)> {
+        let location = match RpmDatabase::detect_with_state_dir(&self.rpm_db_path) {
+            Ok((location, state)) => {
+                match install_reasons::installed_and_explicit(&location, &state) {
+                    Ok((total, explicit)) => return Ok((total, explicit.len())),
+                    Err(error) => {
+                        tracing::debug!("Direct DNF install reasons unavailable: {error:#}");
+                    }
+                }
+                location
+            }
+            Err(error) => {
+                tracing::debug!("Direct DNF install reasons unavailable: {error:#}");
+                RpmDatabase::detect(&self.rpm_db_path)?
+            }
+        };
+        let mut installed = self.load_installed_at(&location)?;
+        Self::apply_install_reasons(&mut installed, Self::read_native_user_installed_names())?;
+        let total = installed.len();
+        Ok((total, Self::explicit_package_names(installed).len()))
     }
 
     /// Read RPM database, trying `SQLite` first then falling back to subprocess
@@ -1260,6 +1275,10 @@ impl DnfPackageManager {
             Err(error) => tracing::debug!("Direct DNF install reasons unavailable: {error:#}"),
         }
 
+        Self::read_native_user_installed_names()
+    }
+
+    fn read_native_user_installed_names() -> Result<HashSet<String>> {
         // The user-installed filter loads only the installed repository, even
         // when the system has no available repositories configured.
         let output = crate::core::privilege::system_command("dnf")?
@@ -3254,10 +3273,11 @@ impl PackageManager for DnfPackageManager {
         fast: bool,
     ) -> Pin<Box<dyn Future<Output = Result<(usize, usize, usize, usize)>> + Send + '_>> {
         Box::pin(async move {
-            let mut installed = self.load_installed_packages().await?;
-            Self::apply_current_install_reasons(&mut installed).await?;
-            let total = installed.len();
-            let explicit = Self::explicit_package_names(installed).len();
+            let manager = self.cache_handle();
+            let (total, explicit) =
+                tokio::task::spawn_blocking(move || manager.installed_status_counts())
+                    .await
+                    .context("DNF installed status worker failed")??;
 
             let (orphans, updates) = if fast {
                 (0, 0)

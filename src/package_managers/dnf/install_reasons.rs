@@ -70,6 +70,13 @@ struct System {
 }
 
 pub(super) fn explicit_names(location: &RpmDatabase, state: &Path) -> Result<HashSet<String>> {
+    installed_and_explicit(location, state).map(|(_, explicit)| explicit)
+}
+
+pub(super) fn installed_and_explicit(
+    location: &RpmDatabase,
+    state: &Path,
+) -> Result<(usize, HashSet<String>)> {
     let _system_lock = lock_system_state(state)?;
     for entry in fs::read_dir(state)? {
         ensure!(
@@ -97,8 +104,10 @@ pub(super) fn explicit_names(location: &RpmDatabase, state: &Path) -> Result<Has
         .flat_map(|group| group.packages)
         .collect();
 
+    let installed = DnfPackageManager::read_rpm_sqlite(&location.sqlite)?;
+    let total = installed.len();
     let mut explicit = HashSet::new();
-    for package in DnfPackageManager::read_rpm_sqlite(&location.sqlite)? {
+    for package in installed {
         if package.name == "gpg-pubkey" && package.architecture.is_empty() {
             continue;
         }
@@ -133,7 +142,7 @@ pub(super) fn explicit_names(location: &RpmDatabase, state: &Path) -> Result<Has
         }
         explicit.insert(package.name);
     }
-    Ok(explicit)
+    Ok((total, explicit))
 }
 
 fn require_no_legacy_history(location: &RpmDatabase) -> Result<()> {
