@@ -703,6 +703,142 @@ exec {shlex.quote(str(native_executable))} "$@"
 
 
 
+    def inspect_secret_scan():
+        phase = "secret-scan"
+        with tempfile.TemporaryDirectory(prefix="secret-scan-", dir=work) as directory:
+            scope = Path(directory)
+            scope.chmod(0o755)
+            pem = "-----BEGIN PRIVATE KEY-----"
+            another_pem = "-----BEGIN ENCRYPTED PRIVATE KEY-----"
+            high_token = "npm_" + "Qw7gTR1c5p" * 3 + "B9xNK2"
+            other_high_token = "npm_" + "kcR4pW9s8m" * 3 + "TX1uz7"
+            medium_line = "password = 'fixture-value-one'"
+            other_medium_line = "password = 'fixture-value-two'"
+            placeholder = "password = 'placeholder_for_example'"
+            labels = ("CRITICAL", "HIGH", "MEDIUM")
+
+            def write(name, text):
+                path = scope / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(text if isinstance(text, bytes) else text.encode())
+                return path
+
+            def run(label, path=None, *, counts=None, lines=(), arguments=(),
+                    error=None, cwd=None, hidden=(), message=None):
+                command_env = dict(disabled, HOME=str(cwd)) if cwd else disabled
+                args = [cli, "audit", "secrets", *arguments]
+                if path is not None:
+                    args.extend(("--path", path))
+                result = command(args, command_env, ordinary)
+                output = result.stdout
+                combined = output + result.stderr
+                if error is not None:
+                    passed = (result.returncode != 0 and error.lower() in combined.lower()
+                              and "No secrets detected" not in output)
+                elif counts is None:
+                    passed = result.returncode == 0 and message in output
+                elif not sum(counts):
+                    passed = result.returncode == 0 and "No secrets detected." in output
+                else:
+                    critical = counts[0]
+                    summary = dict(zip(labels, counts, strict=True))
+                    breakdown = {name: int(count) for count, name
+                                 in re.findall(r"(?m)^\s*● (\d+) (CRITICAL|HIGH|MEDIUM)\s*$", output)}
+                    finding_lines = re.findall(r"(?m)^\s*\[(?:CRITICAL|HIGH|MEDIUM)\].*:(\d+)\s*$", output)
+                    overflow = max(sum(counts) - 20, 0)
+                    passed = (
+                        (result.returncode != 0) == bool(critical)
+                        and (f"{critical} critical secret finding(s) require remediation" in combined) == bool(critical)
+                        and f"Found {sum(counts)} potential secrets:" in output
+                        and breakdown == {name: count for name, count in summary.items() if count}
+                        and len(finding_lines) == min(sum(counts), 20)
+                        and (not lines or list(map(int, finding_lines)) == list(lines))
+                        and (f"... and {overflow} more" in output if overflow else "... and " not in output)
+                    )
+                checks.append(dict(phase=phase, case=label,
+                                   passed=passed and all(value not in combined for value in hidden),
+                                   status=result.returncode, diagnostic=combined[-1000:]))
+
+            run("clean-file", write("clean.txt", "no credentials here"), counts=(0, 0, 0))
+            default = write("default/file.txt", "no credentials here").parent
+            run("clean-default-directory", cwd=default, counts=(0, 0, 0))
+            run("empty-file", write("empty.txt", ""), counts=(0, 0, 0))
+            run("single-high", write("high.txt", high_token), counts=(0, 1, 0), lines=(1,),
+                hidden=(high_token,))
+            run("single-critical", write("critical.txt", pem), counts=(1, 0, 0), lines=(1,), hidden=(pem,))
+            run("mixed-severities", write("mixed.txt", "\n".join((pem, high_token, medium_line))),
+                counts=(1, 1, 1), lines=(1, 2, 3), hidden=(pem, high_token, "fixture-value-one"))
+
+            run("same-line-critical", write("critical-line.txt", f"{pem} {another_pem}"),
+                counts=(2, 0, 0), lines=(1, 1))
+            run("same-line-high", write("high-line.txt", f"{high_token}, {other_high_token}"),
+                counts=(0, 2, 0), lines=(1, 1), hidden=(high_token, other_high_token))
+            run("same-line-medium", write("medium-line.txt", f"{medium_line}; {other_medium_line}"),
+                counts=(0, 0, 2), lines=(1, 1))
+            run("placeholder-before-finding", write("placeholder-first.txt", f"{placeholder}; {medium_line}"),
+                counts=(0, 0, 1), lines=(1,))
+            run("placeholder-after-finding", write("placeholder-last.txt", f"{medium_line}; {placeholder}"),
+                counts=(0, 0, 1), lines=(1,))
+            run("distinct-patterns-same-line", write("multiple-patterns.txt", f"{medium_line}; {high_token}; {pem}"),
+                counts=(1, 1, 1), lines=(1, 1, 1), hidden=(pem, high_token))
+            run("separate-lines", write("separate-lines.txt", f"{pem}\nplain\n{another_pem}\n"),
+                counts=(2, 0, 0), lines=(1, 3))
+            run("repeated-credential-occurrences", write("repeat.txt", f"{medium_line}; {medium_line}"),
+                counts=(0, 0, 2), lines=(1, 1))
+
+            run("twenty-visible", write("twenty.txt", (medium_line + "\n") * 20),
+                counts=(0, 0, 20), lines=range(1, 21))
+            run("twenty-one-overflow", write("twenty-one.txt", (medium_line + "\n") * 21),
+                counts=(0, 0, 21), lines=range(1, 21))
+            run("many-critical-same-line", write("many-critical.txt", (pem + " ") * 25),
+                counts=(25, 0, 0), lines=[1] * 20, hidden=(pem,))
+            run("critical-after-display-limit", write("hidden-critical.txt", (medium_line + "\n") * 20 + pem),
+                counts=(1, 0, 20), lines=range(1, 21), hidden=(pem,))
+            unicode_value = "áéb四五六七八九十"
+            run("multibyte-redaction", write("unicode.txt", f"password = '{unicode_value}'"),
+                counts=(0, 0, 1), lines=(1,), hidden=(unicode_value,))
+            run("placeholder-only", write("placeholder.txt", placeholder), counts=(0, 0, 0))
+
+            file_limit = 10 * 1024 * 1024
+            boundary = write("boundary.txt", " " * (file_limit - len(pem) - 1) + "\n" + pem)
+            run("exact-file-limit", boundary, counts=(1, 0, 0), lines=(2,))
+            with boundary.open("ab") as file:
+                file.write(b"\n")
+            run("above-file-limit", boundary, error="exceeds the maximum secret-scan size")
+            run("invalid-utf8-file", write("non-utf8.txt", b"\xff\xfe"), error="failed to read")
+            unreadable = write("unreadable.txt", pem)
+            unreadable.chmod(0)
+            run("unreadable-file", unreadable, error="permission denied")
+            fifo = scope / "stream.txt"
+            os.mkfifo(fifo)
+            run("fifo-refused", fifo, error="not a directory")
+            run("missing-path", scope / "missing.txt", error="no such file or directory")
+
+            recursive = write("recursive/sub/deeper/find.txt", medium_line).parents[2]
+            run("nested-file", recursive, counts=(0, 0, 1), lines=(1,))
+            excluded = write("excluded/target/sample.txt", pem).parents[1]
+            write("excluded/node_modules/sample.txt", pem)
+            write("excluded/.git/sample.txt", pem)
+            run("skip-excluded-directories", excluded, counts=(0, 0, 0))
+            material = write("materials/id_ed25519", pem).parent
+            run("extensionless-key", material, counts=(1, 0, 0), lines=(1,))
+            symlinks = scope / "symlinks"
+            symlinks.mkdir()
+            linked_file = symlinks / "example.txt"
+            linked_file.symlink_to(scope / "critical.txt")
+            run("skip-child-file-symlink", symlinks, counts=(0, 0, 0))
+            linked_dir = symlinks / "examples"
+            linked_dir.symlink_to(material, target_is_directory=True)
+            run("skip-child-directory-symlink", symlinks, counts=(0, 0, 0))
+            run("refuse-directory-symlink-root", linked_dir, error="not a directory")
+
+            run("refuse-file-symlink-root", linked_file, error="not a regular file")
+            dangling = scope / "dangling.txt"
+            dangling.symlink_to(scope / "missing.txt")
+            run("dangling-symlink", dangling, error="not a directory")
+            run("path-value-required", arguments=("--path",), error="a value is required")
+            run("help", arguments=("--help",), message="Scan for leaked secrets and credentials")
+
     def inspect_daemon_audit_recovery():
         layouts = ("healthy", "archive-only", "damaged", "missing-hash", "marked-damaged", "damaged-with-archive")
 
@@ -1986,6 +2122,7 @@ exec {shlex.quote(str(binary))} "$@"
                     inspect_audit_marker_snapshot()
                     inspect_audit_record_windows()
                     inspect_daemon_audit_recovery()
+                    inspect_secret_scan()
                 config.write_text(alternate_config)
                 refresh_fixture()
                 expected = ordinary_control([dnf, "--cacheonly", "repoquery",
@@ -2303,6 +2440,6 @@ assert inventory() == before
 report = dict(binaries=binaries, checks=checks, total=len(checks),
               passed=sum(entry["passed"] for entry in checks), host_unchanged=True)
 print(json.dumps(report))
-expected_checks = 303 if consent_oracle is None else 906
+expected_checks = 303 if consent_oracle is None else 942
 if report["passed"] != report["total"] or report["total"] != expected_checks:
     sys.exit(4)

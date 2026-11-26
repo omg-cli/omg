@@ -1,13 +1,16 @@
-//! Secret detection using regex patterns and entropy analysis
-//!
-//! Scans files and content for accidentally committed secrets like API keys,
-//! tokens, private keys, and credentials across 19 secret types.
+//! Pattern-based detection of accidentally committed tokens, passwords, and keys.
 
+use std::ffi::OsStr;
+use std::fs::File;
 use std::io::{self, Read};
-use std::path::Path;
+use std::os::fd::BorrowedFd;
+use std::os::unix::ffi::OsStrExt as _;
+use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 use regex::Regex;
+use rustix::fs::{AtFlags, CWD, Dir, FileType, Mode, OFlags, openat, statat};
+use rustix::io::Errno;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -219,10 +222,21 @@ pub enum SecretError {
     },
     #[error("Refusing to scan '{path}' because it is not a regular file")]
     UnsupportedFileType { path: String },
+    #[error("Refusing to scan '{path}' because it is not a directory")]
+    UnsupportedDirectoryType { path: String },
     #[error("File '{path}' exceeds the maximum secret-scan size of {max} bytes ({size} bytes)")]
     FileTooLarge { path: String, size: u64, max: u64 },
     #[error("Directory nesting exceeds the maximum scan depth of {max} at '{path}'")]
     DepthExceeded { path: String, max: usize },
+}
+
+impl SecretError {
+    fn read(path: &Path, source: impl Into<io::Error>) -> Self {
+        Self::Read {
+            path: path.display().to_string(),
+            source: source.into(),
+        }
+    }
 }
 
 /// Secret scanner for detecting leaked credentials
@@ -239,79 +253,80 @@ impl SecretScanner {
     /// Scan a file for secrets
     pub fn scan_file<P: AsRef<Path>>(&self, path: P) -> Result<Vec<SecretFinding>, SecretError> {
         let path = path.as_ref();
-        let path_str = path.display().to_string();
-        let metadata = std::fs::symlink_metadata(path).map_err(|source| SecretError::Read {
-            path: path_str.clone(),
-            source,
-        })?;
-        if !metadata.file_type().is_file() {
-            return Err(SecretError::UnsupportedFileType { path: path_str });
-        }
-        if metadata.len() > Self::MAX_FILE_BYTES {
-            return Err(SecretError::FileTooLarge {
-                path: path_str,
-                size: metadata.len(),
-                max: Self::MAX_FILE_BYTES,
-            });
-        }
+        self.scan_file_at(CWD, path, path)
+    }
 
-        let mut options = std::fs::OpenOptions::new();
-        options.read(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            options.custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK);
+    fn scan_file_at(
+        &self,
+        parent: BorrowedFd<'_>,
+        name: &Path,
+        path: &Path,
+    ) -> Result<Vec<SecretFinding>, SecretError> {
+        let metadata = statat(parent, name, AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(|source| SecretError::read(path, source))?;
+        let unsupported = || SecretError::UnsupportedFileType {
+            path: path.display().to_string(),
+        };
+        if FileType::from_raw_mode(metadata.st_mode) != FileType::RegularFile {
+            return Err(unsupported());
         }
-        let file = options.open(path).map_err(|source| SecretError::Read {
-            path: path_str.clone(),
-            source,
-        })?;
-        if !file
+        Self::check_file_size(path, u64::try_from(metadata.st_size).unwrap_or_default())?;
+
+        let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+        let handle = openat(parent, name, flags, Mode::empty())
+            .map_err(|source| SecretError::read(path, source))?;
+        let file = File::from(handle);
+        let metadata = file
             .metadata()
-            .map_err(|source| SecretError::Read {
-                path: path_str.clone(),
-                source,
-            })?
-            .file_type()
-            .is_file()
-        {
-            return Err(SecretError::UnsupportedFileType { path: path_str });
+            .map_err(|source| SecretError::read(path, source))?;
+        if !metadata.is_file() {
+            return Err(unsupported());
         }
+        Self::check_file_size(path, metadata.len())?;
+
         let mut content = String::new();
         let bytes_read = file
             .take(Self::MAX_FILE_BYTES + 1)
             .read_to_string(&mut content)
-            .map_err(|source| SecretError::Read {
-                path: path_str.clone(),
-                source,
-            })?;
-        if bytes_read as u64 > Self::MAX_FILE_BYTES {
+            .map_err(|source| SecretError::read(path, source))?;
+        Self::check_file_size(path, bytes_read as u64)?;
+        Ok(self.scan_content(&content, &path.to_string_lossy()))
+    }
+
+    fn check_file_size(path: &Path, size: u64) -> Result<(), SecretError> {
+        if size > Self::MAX_FILE_BYTES {
             return Err(SecretError::FileTooLarge {
-                path: path_str,
-                size: bytes_read as u64,
+                path: path.display().to_string(),
+                size,
                 max: Self::MAX_FILE_BYTES,
             });
         }
-
-        Ok(self.scan_content(&content, &path_str))
+        Ok(())
     }
 
     /// Scan content for secrets
     #[must_use]
     pub fn scan_content(&self, content: &str, source: &str) -> Vec<SecretFinding> {
         let mut findings = Vec::new();
+        if content.is_empty() {
+            return findings;
+        }
+        let mut locations = PATTERNS
+            .each_ref()
+            .map(|pattern| pattern.pattern.capture_locations());
 
         for (line_num, line) in content.lines().enumerate() {
-            for pattern in &PATTERNS {
-                if let Some(captures) = pattern.pattern.captures(line) {
-                    let matched = captures.get(0).map_or("", |m| m.as_str());
-
-                    // Skip only when the captured secret value itself is an
-                    // obvious placeholder; never drop findings merely because
-                    // the value contains a placeholder-like substring.
-                    let secret_value = captures
-                        .get(captures.len() - 1)
-                        .map_or(matched, |m| m.as_str());
+            for (pattern, locations) in PATTERNS.iter().zip(&mut locations) {
+                let mut offset = 0;
+                while let Some(matched) = pattern.pattern.captures_read_at(locations, line, offset)
+                {
+                    if matched.is_empty() {
+                        break;
+                    }
+                    offset = matched.end();
+                    let secret_value = locations
+                        .get(locations.len() - 1)
+                        .map_or(matched.as_str(), |(start, end)| &line[start..end]);
                     if Self::is_placeholder(secret_value) {
                         continue;
                     }
@@ -320,7 +335,7 @@ impl SecretScanner {
                         secret_type: pattern.secret_type.clone(),
                         file_path: source.to_string(),
                         line_number: line_num + 1,
-                        redacted: Self::redact(matched),
+                        redacted: Self::redact(matched.as_str()),
                         severity: pattern.severity,
                     });
                 }
@@ -330,30 +345,41 @@ impl SecretScanner {
         findings
     }
 
-    /// Scan a directory recursively for secrets
-    ///
-    /// Symlinked directories are never followed (a cyclic symlink would
-    /// otherwise recurse forever), and nesting deeper than
-    /// [`MAX_SCAN_DEPTH`] fails closed rather than silently skipping files.
+    /// Recursively scan a real directory and skip symlink entries.
     pub fn scan_directory<P: AsRef<Path>>(
         &self,
         path: P,
     ) -> Result<Vec<SecretFinding>, SecretError> {
+        let path = path.as_ref();
+        // Give NOFOLLOW the same final component for "project", "project/" and "project/.".
+        let root: PathBuf = path.components().collect();
+        let directory = Self::open_directory(CWD, &root, path)?;
         let mut findings = Vec::new();
-
-        self.scan_directory_recursive(path.as_ref(), &mut findings, 0)?;
-
+        self.scan_directory_recursive(path, directory, &mut findings, 0)?;
         Ok(findings)
     }
 
-    /// Maximum directory nesting followed during a scan. Deep enough for
-    /// real source trees (after `node_modules`/`target` pruning) while
-    /// bounding attacker-controlled recursion work.
+    fn open_directory(
+        parent: BorrowedFd<'_>,
+        name: &Path,
+        path: &Path,
+    ) -> Result<Dir, SecretError> {
+        let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+        let handle = openat(parent, name, flags, Mode::empty()).map_err(|source| match source {
+            Errno::NOTDIR | Errno::LOOP => SecretError::UnsupportedDirectoryType {
+                path: path.display().to_string(),
+            },
+            source => SecretError::read(path, source),
+        })?;
+        Dir::new(handle).map_err(|source| SecretError::read(path, source))
+    }
+
     const MAX_SCAN_DEPTH: usize = 64;
 
     fn scan_directory_recursive(
         &self,
         path: &Path,
+        mut directory: Dir,
         findings: &mut Vec<SecretFinding>,
         depth: usize,
     ) -> Result<(), SecretError> {
@@ -363,34 +389,30 @@ impl SecretScanner {
                 max: Self::MAX_SCAN_DEPTH,
             });
         }
-        let path_str = path.display().to_string();
-        for entry in std::fs::read_dir(path).map_err(|source| SecretError::Read {
-            path: path_str.clone(),
-            source,
-        })? {
-            let entry = entry.map_err(|source| SecretError::Read {
-                path: path_str.clone(),
-                source,
-            })?;
-            let entry_path = entry.path();
-            // DirEntry::file_type does not traverse symlinks, so symlinked
-            // directories and files are skipped outright instead of being
-            // descended into via the cycle-prone `Path::is_dir`.
-            let file_type = entry.file_type().map_err(|source| SecretError::Read {
-                path: path_str.clone(),
-                source,
-            })?;
-            if file_type.is_symlink() {
+
+        while let Some(entry) = directory.read() {
+            let entry = entry.map_err(|source| SecretError::read(path, source))?;
+            let name = entry.file_name();
+            if name == c"." || name == c".." {
                 continue;
             }
 
-            // Skip common non-text directories
-            if file_type.is_dir() {
-                let dir_name = entry_path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("");
+            let name = Path::new(OsStr::from_bytes(name.to_bytes()));
+            let parent = directory
+                .fd()
+                .map_err(|source| SecretError::read(path, source))?;
+            let entry_path = path.join(name);
+            let file_type = match entry.file_type() {
+                FileType::Unknown => {
+                    let metadata = statat(parent, name, AtFlags::SYMLINK_NOFOLLOW)
+                        .map_err(|source| SecretError::read(&entry_path, source))?;
+                    FileType::from_raw_mode(metadata.st_mode)
+                }
+                file_type => file_type,
+            };
 
+            if file_type == FileType::Directory {
+                let dir_name = name.to_str().unwrap_or("");
                 if [
                     "node_modules",
                     ".git",
@@ -404,10 +426,10 @@ impl SecretScanner {
                 {
                     continue;
                 }
-
-                self.scan_directory_recursive(&entry_path, findings, depth + 1)?;
-            } else if file_type.is_file() && Self::is_scannable_file(&entry_path) {
-                findings.extend(self.scan_file(&entry_path)?);
+                let child = Self::open_directory(parent, name, &entry_path)?;
+                self.scan_directory_recursive(&entry_path, child, findings, depth + 1)?;
+            } else if file_type == FileType::RegularFile && Self::is_scannable_file(name) {
+                findings.extend(self.scan_file_at(parent, name, &entry_path)?);
             }
         }
 
@@ -906,6 +928,50 @@ mod tests {
             ),
             "got: {error}"
         );
+    }
+
+    #[test]
+    fn scan_content_reports_each_match_on_one_line() {
+        let scanner = SecretScanner::new();
+        let content = format!(
+            "password = 'placeholder_for_example'; password = 'fixture-value-one'; password = 'fixture-value-two'\n{}\n",
+            "-----BEGIN PRIVATE KEY-----".repeat(2),
+        );
+
+        let findings = scanner.scan_content(&content, "settings.env");
+
+        let cases: Vec<_> = findings
+            .iter()
+            .map(|finding| (&finding.secret_type, finding.line_number))
+            .collect();
+        assert_eq!(
+            cases,
+            [
+                (&SecretType::GenericPassword, 1),
+                (&SecretType::GenericPassword, 1),
+                (&SecretType::PrivateKey, 2),
+                (&SecretType::PrivateKey, 2),
+            ],
+        );
+    }
+
+    #[test]
+    fn scan_directory_rejects_an_explicit_symlink_root() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let target = temp.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        let link = temp.path().join("project");
+        std::os::unix::fs::symlink(target, &link).unwrap();
+
+        for path in [&link, &link.join(""), &link.join(".")] {
+            let error = SecretScanner::new()
+                .scan_directory(path)
+                .expect_err("the requested directory itself must not be a symlink");
+            assert!(matches!(
+                error,
+                SecretError::UnsupportedDirectoryType { .. }
+            ));
+        }
     }
 
     #[test]

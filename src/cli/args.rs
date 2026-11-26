@@ -1116,7 +1116,7 @@ pub enum AuditCommands {
     },
     /// Scan for leaked secrets and credentials
     Secrets {
-        /// Directory to scan (default: current directory)
+        /// File or directory to scan (default: current directory)
         #[arg(short, long)]
         path: Option<String>,
     },
