@@ -1,5 +1,6 @@
 use std::fs;
 use std::io::{self, Read as _};
+use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
@@ -137,18 +138,24 @@ fn directory_has(dir: &Path, matches: impl Fn(&Path) -> bool) -> bool {
 
 fn can_configure_paths(path: &Path, extra: &[&str]) -> bool {
     const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
-    let metadata = match fs::metadata(path) {
-        Ok(metadata) => metadata,
+    let file = match fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(file) => file,
         Err(error) => return error.kind() != io::ErrorKind::NotFound,
     };
-    if !metadata.is_file() || metadata.len() > MAX_CONFIG_BYTES {
+    if !file
+        .metadata()
+        .is_ok_and(|metadata| metadata.is_file() && metadata.len() <= MAX_CONFIG_BYTES)
+    {
         return true;
     }
     let mut contents = String::new();
-    let bytes = fs::File::open(path).and_then(|file| {
-        file.take(MAX_CONFIG_BYTES + 1)
-            .read_to_string(&mut contents)
-    });
+    let bytes = file
+        .take(MAX_CONFIG_BYTES + 1)
+        .read_to_string(&mut contents);
     if !matches!(bytes, Ok(bytes) if bytes as u64 <= MAX_CONFIG_BYTES) {
         return true;
     }
@@ -327,6 +334,34 @@ mod tests {
         assert!(can_configure_paths(&config, &["system_state_dir"]));
         fs::write(&config, [0xff])?;
         assert!(can_configure_paths(&config, &[]));
+        Ok(())
+    }
+
+    #[test]
+    fn installed_root_scan_handles_links_nonfiles_and_large_configs() -> Result<()> {
+        use nix::sys::stat::Mode;
+        use nix::unistd::mkfifo;
+        use std::os::unix::fs::symlink;
+
+        let fixture = tempfile::tempdir()?;
+        let config = fixture.path().join("dnf.conf");
+        let link = fixture.path().join("linked.conf");
+        symlink(&config, &link)?;
+        assert!(!can_configure_paths(&link, &[]));
+        fs::write(&config, "[main]\ninstallroot=/alternate\n")?;
+        assert!(can_configure_paths(&link, &[]));
+        fs::write(&config, "[main]\nreposdir=/repositories\n")?;
+        assert!(!can_configure_paths(&link, &[]));
+
+        let fifo = fixture.path().join("named-pipe.conf");
+        mkfifo(&fifo, Mode::S_IRUSR | Mode::S_IWUSR)?;
+        assert!(can_configure_paths(&fifo, &[]));
+        assert!(can_configure_paths(fixture.path(), &[]));
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&config)?
+            .set_len(1024 * 1024 + 1)?;
+        assert!(can_configure_paths(&link, &[]));
         Ok(())
     }
 

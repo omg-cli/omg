@@ -129,14 +129,12 @@ pub(super) fn installed_and_explicit(
                 matches!(entry.reason, Reason::Dependency | Reason::WeakDependency)
             })
         {
-            // Dotted names can require DNF's version-specific group lookup.
-            let prefix = package.name.split('.').next().unwrap_or(&package.name);
-            let in_group = members.contains(&package.name);
-            ensure!(
-                in_group == members.contains(prefix),
-                "DNF group membership for a dotted package name needs native resolution"
-            );
-            if !in_group {
+            // DNF uses the part before the first dot of name.arch for group lookup.
+            let group_name = package
+                .name
+                .split_once('.')
+                .map_or(package.name.as_str(), |(prefix, _)| prefix);
+            if !members.contains(group_name) {
                 continue;
             }
         }

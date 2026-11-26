@@ -7775,6 +7775,45 @@ env.OMG_FIXTURE_TASK = "changed"
                 checks.append(dict(phase=phase, case=label, passed=passed, status=result.returncode,
                                    diagnostic=(result.stderr or result.stdout)[-600:]))
 
+    def inspect_dotted_install_reasons(state):
+        prefix = "omg-observer-dotted"
+        dotted = f"{prefix}.part.extra"
+        build = root / "dotted-rpm"
+        build.mkdir()
+        spec = build / "observer.spec"
+        spec.write_text((fixture / "observer-fixture.spec").read_text().replace(package, dotted))
+        checked(["/usr/bin/rpmbuild", "--define", f"_topdir {build}", "-bb", spec])
+        checked([rpm, "--root", alternate, "-U", "--nosignature", build / f"RPMS/noarch/{dotted}-1-1.noarch.rpm"])
+        packages_state, groups_state = state / "packages.toml", state / "groups.toml"
+        saved_packages, saved_groups = packages_state.read_bytes(), groups_state.read_bytes()
+        cases = (
+            ("dependency-without-group", "Dependency", [], []),
+            ("dependency-exact-group", "Dependency", [dotted], []),
+            ("dependency-prefix-group", "Dependency", [prefix], [dotted]),
+            ("dependency-prefix-and-exact", "Dependency", [prefix, dotted], [dotted]),
+            ("weak-exact-group", "Weak Dependency", [dotted], []),
+            ("weak-prefix-group", "Weak Dependency", [prefix], [dotted]),
+            ("weak-later-prefix-group", "Weak Dependency", [f"{prefix}.part"], []),
+            ("user-exact-group", "User", [dotted], [dotted]),
+        )
+        try:
+            for label, reason, members, expected in cases:
+                packages_state.write_text(
+                    'version = "1.0"\n'
+                    f'[packages."{package}.noarch"]\nreason = "Dependency"\n'
+                    f'[packages."{dotted}.noarch"]\nreason = "{reason}"\n'
+                )
+                groups_state.write_text(
+                    'version = "1.0"\n'
+                    '[groups.omg-dotted-fixture]\nuserinstalled = false\n'
+                    f'packages = {json.dumps(members)}\npackage_types = ["mandatory"]\n'
+                )
+                inspect_explicit_without_query(f"explicit-dotted-{label}", expected)
+        finally:
+            packages_state.write_bytes(saved_packages)
+            groups_state.write_bytes(saved_groups)
+            checked([rpm, "--root", alternate, "-e", dotted])
+
     def inspect_explicit_refusal(phase, reason, expected_failure=None):
         result = command([cli, "--json", "status", "--fast"], disabled, ordinary)
         passed = (result.returncode != 0 and not result.stdout.strip()
@@ -8870,6 +8909,7 @@ exec {shlex.quote(str(binary))} "$@"
                 finally:
                     groups.write_bytes(initial_groups)
                     packages_state.write_bytes(initial_packages)
+                inspect_dotted_install_reasons(custom_state)
                 inspect_upgrade_review(old_rpm)
                 inspect_removal_replay()
                 mark_progress("native install and removal")
@@ -8892,6 +8932,6 @@ mark_progress("completed with host inventory unchanged")
 report = dict(binaries=binaries, checks=checks, total=len(checks),
               passed=sum(entry["passed"] for entry in checks), host_unchanged=True)
 print(json.dumps(report))
-expected_checks = 303 if consent_oracle is None else 2753
+expected_checks = 303 if consent_oracle is None else 2785
 if report["passed"] != report["total"] or report["total"] != expected_checks:
     sys.exit(4)
