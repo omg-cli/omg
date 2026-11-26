@@ -28,7 +28,7 @@ pub(crate) fn read_utf8(path: &Path, kind: &str, symlinks: Symlinks) -> Result<S
     .with_context(|| format!("Failed to inspect {kind} {}", path.display()))?;
     anyhow::ensure!(
         metadata.is_file(),
-        "Refusing to read {kind} that is not a regular file (symlink or special file): {}",
+        "Refusing to read {kind} that is not a regular file: {} (symlink or special file)",
         path.display()
     );
 
