@@ -128,15 +128,21 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('commit')
     parser.add_argument('--stage-linux', type=Path)
+    parser.add_argument('--include-macos', action='store_true')
     arguments = parser.parse_args()
+    if arguments.include_macos and arguments.stage_linux is None:
+        parser.error('--include-macos requires --stage-linux')
     try:
         ci_run = require_release_evidence(os.environ['GITHUB_REPOSITORY'], arguments.commit)
         if arguments.stage_linux is not None:
-            subprocess.run([
+            command = [
                 sys.executable, str(Path(__file__).with_name('native-build-artifact.py')),
                 'stage-release', '--destination', str(arguments.stage_linux),
                 '--commit', arguments.commit, '--ci-run', str(ci_run.id), '--ci-attempt', str(ci_run.attempt),
-            ], check=True)
+            ]
+            if arguments.include_macos:
+                command.append('--include-macos')
+            subprocess.run(command, check=True)
         if output := os.environ.get('GITHUB_OUTPUT'):
             with open(output, 'a', encoding='utf-8') as stream:
                 stream.write(f'ci-run={ci_run.id}\nci-attempt={ci_run.attempt}\n')

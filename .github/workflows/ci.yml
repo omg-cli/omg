@@ -1796,7 +1796,9 @@ jobs:
         run: bash tests/installer_security.sh
 
       - name: Build
-        run: cargo build --release --no-default-features --features macos,pgp,license --locked
+        run: |
+          python3 scripts/native-build-artifact.py build --distro macos --image macos-15 \
+            --features macos,pgp,license --destination "$RUNNER_TEMP/native-release"
 
       - name: Install nextest
         id: install-nextest
@@ -1861,12 +1863,14 @@ jobs:
           ./target/release/omg --version
           file ./target/release/omg
 
-      - name: Upload binary
+      - name: Upload native macOS release pair
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: omg-macos-arm64
-          path: target/release/omg
-          retention-days: 7
+          name: native-release-macos-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/native-release/
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 14
 
       - name: Preserve compiled parser surfaces
         if: always()

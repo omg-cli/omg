@@ -729,7 +729,7 @@ install_from_release
             condition.split_whitespace().collect::<Vec<_>>().join(" "),
             concat!(
                 "${{ always() && ",
-                "inputs.smoke_ci_sha == '' && ",
+                "inputs.smoke_ci_sha == '' && inputs.smoke_ci_macos != true && ",
                 "(github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.dry_run == 'false')) && ",
                 "(inputs.sync_existing_tag != '' || needs.release.result == 'success') }}"
             )
