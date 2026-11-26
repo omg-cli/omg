@@ -30,6 +30,8 @@ use crate::package_managers::types::{PackageStatus, UpdateInfo, parse_version_or
 use rusqlite::{Connection, OpenFlags};
 use zerocopy::{FromBytes, Immutable, KnownLayout, big_endian::U32};
 
+mod catalog;
+
 const DNF_HISTORY_DATABASE: &str = "transaction_history.sqlite";
 
 #[cfg(all(test, unix))]
@@ -108,7 +110,7 @@ struct InstalledSnapshot {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct RpmFileIdentity {
+struct FileIdentity {
     device: u64,
     inode: u64,
     size: u64,
@@ -116,10 +118,8 @@ struct RpmFileIdentity {
     changed: (i64, i64),
 }
 
-impl RpmFileIdentity {
+impl FileIdentity {
     fn read(path: &Path) -> std::io::Result<Option<Self>> {
-        use std::os::unix::fs::MetadataExt;
-
         let metadata = match std::fs::metadata(path) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -130,29 +130,35 @@ impl RpmFileIdentity {
                 "RPM cache input is not a regular file",
             ));
         }
-        Ok(Some(Self {
+        Ok(Some(Self::from_metadata(&metadata)))
+    }
+
+    fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt as _;
+
+        Self {
             device: metadata.dev(),
             inode: metadata.ino(),
             size: metadata.len(),
             modified: (metadata.mtime(), metadata.mtime_nsec()),
             changed: (metadata.ctime(), metadata.ctime_nsec()),
-        }))
+        }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RpmDatabaseIdentity {
-    database: RpmFileIdentity,
-    wal: Option<RpmFileIdentity>,
+    database: FileIdentity,
+    wal: Option<FileIdentity>,
 }
 
 impl RpmDatabaseIdentity {
     fn read(path: &Path) -> Option<Self> {
-        let database = RpmFileIdentity::read(path).ok()??;
+        let database = FileIdentity::read(path).ok()??;
         let mut wal_path = path.as_os_str().to_os_string();
         wal_path.push("-wal");
         // An absent WAL is valid; an unreadable one must not validate a hit.
-        let wal = RpmFileIdentity::read(Path::new(&wal_path)).ok()?;
+        let wal = FileIdentity::read(Path::new(&wal_path)).ok()?;
         Some(Self { database, wal })
     }
 
@@ -336,11 +342,15 @@ impl InstalledPackage {
     fn as_package(&self) -> Package {
         Package {
             name: self.identity(),
-            version: parse_version_or_zero(&format!("{}-{}", self.version, self.release)),
+            version: parse_version_or_zero(&self.evr()),
             description: self.summary.clone(),
             source: PackageSource::Official,
             installed: true,
         }
+    }
+
+    fn evr(&self) -> String {
+        format!("{}-{}", self.version, self.release)
     }
 }
 
@@ -379,6 +389,13 @@ const UPGRADE_QUERY_ARGS: [&str; 6] = [
     "--setopt=*.skip_if_unavailable=false",
     "list",
     "--upgrades",
+];
+
+const REPOSITORY_REFRESH_ARGS: [&str; 4] = [
+    "--refresh",
+    "--setopt=*.skip_if_unavailable=false",
+    "makecache",
+    "-y",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1474,19 +1491,79 @@ impl DnfPackageManager {
         Ok(candidates.pop())
     }
 
-    fn search_candidates(installed: &[InstalledPackage], available: Vec<Package>) -> Vec<Package> {
-        let mut candidates: Vec<_> = installed.iter().map(InstalledPackage::as_package).collect();
+    // Put the native newest build first for each installed identity. Keep
+    // older descriptions searchable in both direct and daemon paths.
+    async fn order_installed_search_builds(
+        installed: &[InstalledPackage],
+    ) -> Result<Vec<&InstalledPackage>> {
+        let mut first = HashMap::with_capacity(installed.len());
+        let mut contenders = BTreeMap::<usize, Vec<usize>>::new();
+        for (index, package) in installed.iter().enumerate() {
+            let identity = (package.name.as_str(), package.architecture.as_str());
+            let first = *first.entry(identity).or_insert(index);
+            if first != index {
+                contenders
+                    .entry(first)
+                    .or_insert_with(|| vec![first])
+                    .push(index);
+            }
+        }
+
+        // RPM compares only parallel builds. Batch a round across all
+        // identities, carrying an unpaired build into the next round.
+        while contenders.values().any(|builds| builds.len() > 1) {
+            let pairs: Vec<_> = contenders
+                .values()
+                .flat_map(|builds| builds.chunks_exact(2))
+                .map(|pair| (installed[pair[0]].evr(), installed[pair[1]].evr()))
+                .collect();
+            let mut order = Self::compare_native_evrs(&pairs).await?.into_iter();
+            for builds in contenders.values_mut() {
+                let pairs = builds.chunks_exact(2);
+                let mut winners = pairs
+                    .clone()
+                    .map(|pair| {
+                        if order.next().expect("validated RPM comparison count") < 0 {
+                            pair[1]
+                        } else {
+                            pair[0]
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                winners.extend_from_slice(pairs.remainder());
+                *builds = winners;
+            }
+        }
+
+        let mut ordered: Vec<_> = installed.iter().collect();
+        for (first, builds) in contenders {
+            ordered.swap(first, builds[0]);
+        }
+        Ok(ordered)
+    }
+
+    fn search_candidates<'a>(
+        installed: impl IntoIterator<Item = &'a InstalledPackage>,
+        available: Vec<Package>,
+    ) -> Vec<Package> {
+        let mut candidates: Vec<_> = installed
+            .into_iter()
+            .map(InstalledPackage::as_package)
+            .collect();
         candidates.extend(available);
         candidates
     }
 
-    fn search_results(
-        installed: &[InstalledPackage],
+    fn search_results<'a>(
+        installed: impl IntoIterator<Item = &'a InstalledPackage>,
         output: &[u8],
         query_lower: &str,
     ) -> Result<Vec<Package>> {
         let available = Self::available_rows(output)?.collect::<Result<Vec<_>>>()?;
-        let installed: Vec<_> = installed.iter().map(InstalledPackage::as_package).collect();
+        let installed: Vec<_> = installed
+            .into_iter()
+            .map(InstalledPackage::as_package)
+            .collect();
         let matches_query = |name: &str, summary: &str| {
             name.to_lowercase().contains(query_lower)
                 || summary.to_lowercase().contains(query_lower)
@@ -1922,8 +1999,11 @@ impl DnfPackageManager {
             if !progress {
                 command.stderr(std::process::Stdio::piped());
             }
-            let output = Self::query_output(command).await?;
-            Self::search_results(&installed, &output, &query_lower)
+            let (installed, output) = tokio::try_join!(
+                Self::order_installed_search_builds(&installed),
+                Self::query_output(command)
+            )?;
+            Self::search_results(installed, &output, &query_lower)
         })
     }
 
@@ -3058,6 +3138,33 @@ impl PackageManager for DnfPackageManager {
             database,
         })))
     }
+
+    fn package_index_observation(
+        &self,
+    ) -> Result<Option<Arc<dyn super::InstalledCatalogObservation>>> {
+        let rpm = self
+            .installed_catalog_observation()?
+            .context("Cannot observe the installed RPM search catalog")?;
+        let mut paths = catalog::RepositoryPaths::default();
+        let before = paths.snapshot()?;
+        let mut command =
+            tokio::process::Command::from(crate::core::privilege::system_command("dnf")?);
+        command.env("LC_ALL", "C").arg("--dump-main-config");
+        let config = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(Self::query_output_with_deadline(
+                command,
+                std::time::Duration::from_secs(3),
+            ))?;
+        paths.add_effective_paths(std::str::from_utf8(&config)?)?;
+        let observation = catalog::PackageCatalog::new(rpm, paths)?;
+        anyhow::ensure!(
+            before == catalog::RepositoryPaths::default().snapshot()?,
+            "DNF configuration changed while resolving repository inputs"
+        );
+        Ok(Some(Arc::new(observation)))
+    }
     fn security_inventory(
         &self,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<super::types::SecurityPackage>>> + Send + '_>> {
@@ -3224,8 +3331,11 @@ impl PackageManager for DnfPackageManager {
     fn package_index(&self) -> Pin<Box<dyn Future<Output = Result<Vec<Package>>> + Send + '_>> {
         Box::pin(async move {
             let installed = self.load_installed_packages().await?;
-            let available = Self::available_packages(None).await?;
-            Ok(Self::search_candidates(&installed, available))
+            let (installed, available) = tokio::try_join!(
+                Self::order_installed_search_builds(&installed),
+                Self::available_packages(None)
+            )?;
+            Ok(Self::search_candidates(installed, available))
         })
     }
 
@@ -3274,16 +3384,13 @@ impl PackageManager for DnfPackageManager {
 
             tokio::task::spawn_blocking({
                 let manager = self.cache_handle();
-                move || manager.run_dnf(&["--refresh", "makecache", "-y"])
+                move || manager.run_dnf(&REPOSITORY_REFRESH_ARGS)
             })
             .await??;
 
             if !is_root() {
-                crate::core::privilege::run_privileged_program(
-                    "dnf",
-                    &["--refresh", "makecache", "-y"],
-                )
-                .await?;
+                crate::core::privilege::run_privileged_program("dnf", &REPOSITORY_REFRESH_ARGS)
+                    .await?;
             }
             Ok(())
         })
@@ -3346,22 +3453,18 @@ impl PackageManager for DnfPackageManager {
         Box::pin(async move {
             let installed = self.load_installed_packages().await?;
             let total = installed.len();
-            let explicit = Self::current_explicit_package_names(&installed)
-                .await?
-                .len();
-
-            let maintenance = if fast {
-                None
+            let reasons = Self::current_explicit_package_names(&installed);
+            let (explicit, maintenance) = if fast {
+                (reasons.await?, None)
             } else {
-                Some((
-                    Self::orphan_count().await?,
-                    self.list_updates().await?.len(),
-                ))
+                let (explicit, orphans, updates) =
+                    tokio::try_join!(reasons, Self::orphan_count(), self.list_updates())?;
+                (explicit, Some((orphans, updates.len())))
             };
 
             Ok(PackageStatus {
                 total,
-                explicit,
+                explicit: explicit.len(),
                 maintenance,
             })
         })
@@ -3376,12 +3479,14 @@ impl PackageManager for DnfPackageManager {
 
     fn list_updates(&self) -> Pin<Box<dyn Future<Output = Result<Vec<UpdateInfo>>> + Send + '_>> {
         Box::pin(async move {
-            let installed = Self::repository_output(RepositoryQuery::Installed).await?;
             let mut command =
                 tokio::process::Command::from(crate::core::privilege::system_command("dnf")?);
             // list honors repository priority. JSON for list requires DNF5 5.4.
             command.env("LC_ALL", "C").args(UPGRADE_QUERY_ARGS);
-            let upgrades = Self::query_output(command).await?;
+            let (installed, upgrades) = tokio::try_join!(
+                Self::repository_output(RepositoryQuery::Installed),
+                Self::query_output(command)
+            )?;
             Self::match_updates(
                 &Self::parse_versioned_packages(&installed)?,
                 &Self::parse_available_upgrades(&upgrades)?,
@@ -3797,10 +3902,10 @@ mod tests {
             .expect("SQLite observation");
         assert!(observed.is_current()?);
         let wal = directory.path().join("rpmdb.sqlite-wal");
-        let before = RpmFileIdentity::read(&wal)?.expect("observed WAL");
+        let before = FileIdentity::read(&wal)?.expect("observed WAL");
         std::thread::sleep(std::time::Duration::from_millis(2));
         std::fs::set_permissions(&wal, std::fs::metadata(&wal)?.permissions())?;
-        let after = RpmFileIdentity::read(&wal)?.expect("WAL retained");
+        let after = FileIdentity::read(&wal)?.expect("WAL retained");
         assert_eq!(
             (after.device, after.inode, after.size, after.modified),
             (before.device, before.inode, before.size, before.modified)
@@ -4688,6 +4793,50 @@ mod tests {
 
         let malformed = "editor.noarch\t1-1\tÉditeur\nmissing-version";
         assert!(DnfPackageManager::search_results(&[], malformed.as_bytes(), "éditeur").is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn search_prefers_the_latest_installed_build_without_losing_older_descriptions()
+    -> Result<()> {
+        let installed: Vec<_> = [
+            ("x86_64", "1", "2", "Older kernel"),
+            ("i686", "2:1", "1", "Higher epoch kernel"),
+            ("x86_64", "1", "10", "Latest native kernel"),
+            ("x86_64", "1", "3", "Intermediate kernel"),
+            ("i686", "1:100", "1", "Old multilib kernel"),
+        ]
+        .into_iter()
+        .map(
+            |(architecture, version, release, summary)| InstalledPackage {
+                name: "kernel-test".into(),
+                version: version.into(),
+                release: release.into(),
+                architecture: architecture.into(),
+                summary: summary.into(),
+            },
+        )
+        .collect();
+        let ordered = DnfPackageManager::order_installed_search_builds(&installed).await?;
+        let results = DnfPackageManager::search_results(ordered.iter().copied(), b"", "kernel")?;
+        let versions = results
+            .iter()
+            .map(|package| (package.name.as_str(), package.version.to_string()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            versions,
+            [
+                ("kernel-test.i686", "2:1-1".into()),
+                ("kernel-test.x86_64", "1-10".into())
+            ]
+        );
+        let results =
+            DnfPackageManager::search_results(ordered.iter().copied(), b"", "older kernel")?;
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].version.to_string(), "1-10");
+        let candidates = DnfPackageManager::search_candidates(ordered, Vec::new());
+        assert_eq!(candidates.len(), installed.len());
+        assert_eq!(candidates[0].version.to_string(), "1-10");
         Ok(())
     }
 

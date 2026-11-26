@@ -34,21 +34,26 @@ const DAEMON_INFO_AUR_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 const REFRESH_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(1);
 const CATALOG_OBSERVATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-async fn observe_installed_catalog(
+async fn observe_catalog(
     manager: Arc<dyn PackageManager>,
     budget: Arc<tokio::sync::Semaphore>,
+    observe: impl FnOnce(
+        &dyn PackageManager,
+    ) -> anyhow::Result<Option<Arc<dyn InstalledCatalogObservation>>>
+    + Send
+    + 'static,
 ) -> anyhow::Result<Option<Arc<dyn InstalledCatalogObservation>>> {
     tokio::time::timeout(CATALOG_OBSERVATION_TIMEOUT, async move {
         let permit = budget.acquire_owned().await?;
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            manager.installed_catalog_observation()
+            observe(manager.as_ref())
         })
         .await
-        .context("Installed catalog observation task failed")?
+        .context("Package catalog observation task failed")?
     })
     .await
-    .context("Installed catalog observation exceeded its deadline")?
+    .context("Package catalog observation exceeded its deadline")?
 }
 
 async fn installed_catalog_is_current(
@@ -73,8 +78,10 @@ async fn load_observed_index(
     budget: Arc<tokio::sync::Semaphore>,
 ) -> anyhow::Result<(PackageIndex, Option<Arc<dyn InstalledCatalogObservation>>)> {
     for _ in 0..3 {
-        let observation =
-            observe_installed_catalog(Arc::clone(&manager), Arc::clone(&budget)).await?;
+        let observation = observe_catalog(Arc::clone(&manager), Arc::clone(&budget), |manager| {
+            manager.package_index_observation()
+        })
+        .await?;
         let index = PackageIndex::for_package_manager(Arc::clone(&manager)).await?;
         if let Some(observation) = &observation
             && !installed_catalog_is_current(Arc::clone(observation), Arc::clone(&budget)).await?
@@ -83,7 +90,7 @@ async fn load_observed_index(
         }
         return Ok((index, observation));
     }
-    anyhow::bail!("Installed inventory changed during three package index rebuild attempts")
+    anyhow::bail!("Package catalog inputs changed during three package index rebuild attempts")
 }
 
 #[derive(Default)]
@@ -396,9 +403,10 @@ impl DaemonState {
     pub(super) async fn observe_status_rpm_catalog(
         &self,
     ) -> anyhow::Result<Arc<dyn InstalledCatalogObservation>> {
-        observe_installed_catalog(
+        observe_catalog(
             Arc::clone(&self.package_manager),
             Arc::clone(&self.catalog_observation_budget),
+            |manager| manager.installed_catalog_observation(),
         )
         .await?
         .context("RPM status inventory observation is unavailable")
@@ -485,7 +493,7 @@ impl DaemonState {
                     Arc::clone(&self.catalog_observation_budget)
                 )
                 .await?,
-                "Installed inventory changed before package index publication"
+                "Package catalog inputs changed before index publication"
             );
         }
         let packages = self.replace_observed_index(
@@ -510,18 +518,17 @@ impl DaemonState {
                 Arc::clone(&self.catalog_observation_budget),
             )
             .await?),
-            None => Ok(observe_installed_catalog(
+            None => Ok(observe_catalog(
                 Arc::clone(&self.package_manager),
                 Arc::clone(&self.catalog_observation_budget),
+                |manager| manager.package_index_observation(),
             )
             .await?
             .is_some()),
         }
     }
 
-    /// RPM observation covers installed rows. Repository changes are admitted
-    /// by explicit refresh, since RPM alone cannot certify repository freshness.
-    async fn heal_installed_catalog_if_changed(&self) -> anyhow::Result<()> {
+    async fn heal_rpm_index_if_changed(&self) -> anyhow::Result<()> {
         if !self.uses_rpm_catalog() {
             return Ok(());
         }
@@ -836,10 +843,10 @@ pub async fn handle_request(state: Arc<DaemonState>, request: Request) -> Respon
             };
             return validation_error(request.id(), message);
         }
-        if let Err(error) = state.heal_installed_catalog_if_changed().await {
+        if let Err(error) = state.heal_rpm_index_if_changed().await {
             return internal_error(
                 request.id(),
-                format!("Failed to refresh stale installed package index: {error:#}"),
+                format!("Failed to refresh stale RPM package index: {error:#}"),
             );
         }
     }
@@ -2360,7 +2367,6 @@ pub(super) mod tests {
         Ok(())
     }
 
-    #[cfg(feature = "fedora")]
     #[tokio::test]
     async fn fedora_catalog_sequential_refresh_does_not_acknowledge_an_old_catalog()
     -> anyhow::Result<()> {
@@ -2608,7 +2614,6 @@ pub(super) mod tests {
         Ok(())
     }
 
-    #[cfg(feature = "fedora")]
     #[tokio::test]
     async fn fedora_catalog_refuses_continuous_changes_without_publishing() -> anyhow::Result<()> {
         let (_directory, state, database, _, builds, fault) = mutable_fedora_catalog(true, None)?;
