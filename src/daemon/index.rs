@@ -149,7 +149,7 @@ pub struct PackageIndex {
     pool: StringPool,
     name_to_idx: AHashMap<String, usize>,
     bloom: PackageBloomFilter,
-    trigrams: TrigramIndex,
+    trigrams: Option<TrigramIndex>,
     rpm_summary_aliases: AHashMap<usize, Vec<u32>>,
 }
 
@@ -206,14 +206,14 @@ impl RelevanceScore {
 }
 
 impl PackageIndex {
-    fn with_capacity(capacity: usize) -> Self {
+    fn with_capacity(capacity: usize, name_kind: SearchNameKind) -> Self {
         Self {
-            name_kind: SearchNameKind::Literal,
+            name_kind,
             items: Vec::with_capacity(capacity),
             pool: StringPool::default(),
             name_to_idx: AHashMap::with_capacity(capacity),
             bloom: PackageBloomFilter::new(capacity),
-            trigrams: TrigramIndex::new(capacity),
+            trigrams: (name_kind == SearchNameKind::Literal).then(|| TrigramIndex::new(capacity)),
             rpm_summary_aliases: AHashMap::new(),
         }
     }
@@ -230,7 +230,15 @@ impl PackageIndex {
         depends: &[String],
         licenses: &[String],
     ) {
-        let name_lower = name.to_ascii_lowercase();
+        let lowercase = |text: &str| {
+            if self.name_kind == SearchNameKind::RpmIdentity {
+                text.to_lowercase()
+            } else {
+                text.to_ascii_lowercase()
+            }
+        };
+        let name_lower = lowercase(name);
+        let description_lower = lowercase(description);
         let idx = self.items.len();
         self.items.push(CompactPackageInfo {
             rpm_eligible: true,
@@ -238,7 +246,7 @@ impl PackageIndex {
             name_lower_offset: self.pool.intern(&name_lower),
             version_offset: self.pool.intern(version),
             description_offset: self.pool.intern(description),
-            description_lower_offset: self.pool.intern(&description.to_ascii_lowercase()),
+            description_lower_offset: self.pool.intern(&description_lower),
             url_offset: self.pool.intern(url),
             size,
             download_size,
@@ -247,7 +255,9 @@ impl PackageIndex {
             licenses: licenses.to_vec(),
             source: WirePackageSource::Official,
         });
-        self.trigrams.insert(&name_lower, idx as u32);
+        if let Some(trigrams) = &mut self.trigrams {
+            trigrams.insert(&name_lower, idx as u32);
+        }
         self.name_to_idx.entry(name.to_owned()).or_insert(idx);
         self.bloom.insert(name);
     }
@@ -257,7 +267,7 @@ impl PackageIndex {
     /// Production startup should use [`Self::new`] so a missing or unsynced package
     /// database remains an actionable error outside hermetic test mode.
     pub fn empty() -> Self {
-        Self::with_capacity(0)
+        Self::with_capacity(0, SearchNameKind::Literal)
     }
 
     /// Build a hermetic index from explicit package records.
@@ -266,7 +276,12 @@ impl PackageIndex {
     /// reading the host package database.
     #[cfg(test)]
     pub(crate) fn from_records(records: &[(&str, &str, &str)]) -> Self {
-        let mut index = Self::with_capacity(records.len());
+        Self::from_records_with_kind(records, SearchNameKind::Literal)
+    }
+
+    #[cfg(test)]
+    fn from_records_with_kind(records: &[(&str, &str, &str)], name_kind: SearchNameKind) -> Self {
+        let mut index = Self::with_capacity(records.len(), name_kind);
         for &(name, version, description) in records {
             index.push(name, version, description, "", 0, 0, "extra", &[], &[]);
         }
@@ -275,17 +290,14 @@ impl PackageIndex {
 
     #[cfg(test)]
     pub(crate) fn from_rpm_records(records: &[(&str, &str, &str)]) -> Self {
-        let mut index = Self::from_records(records);
-        index.name_kind = SearchNameKind::RpmIdentity;
-        index
+        Self::from_records_with_kind(records, SearchNameKind::RpmIdentity)
     }
 
     pub(super) fn from_packages(
         mut packages: Vec<crate::core::Package>,
         name_kind: SearchNameKind,
     ) -> Self {
-        let mut index = Self::with_capacity(packages.len());
-        index.name_kind = name_kind;
+        let mut index = Self::with_capacity(packages.len(), name_kind);
         if name_kind == SearchNameKind::RpmIdentity {
             packages.sort_by(|a, b| a.name.cmp(&b.name));
             let mut idx = 0;
@@ -380,7 +392,7 @@ impl PackageIndex {
         #[cfg(feature = "debian")]
         if !crate::core::paths::test_mode() {
             let packages = crate::package_managers::apt::candidate_index_packages()?;
-            let mut index = Self::with_capacity(packages.len());
+            let mut index = Self::with_capacity(packages.len(), SearchNameKind::Literal);
             for pkg in packages {
                 index.push(
                     &pkg.name,
@@ -403,7 +415,7 @@ impl PackageIndex {
         debian_db::ensure_index_loaded()?;
 
         let db_packages = debian_db::get_detailed_best_candidates()?;
-        let mut index = Self::with_capacity(db_packages.len());
+        let mut index = Self::with_capacity(db_packages.len(), SearchNameKind::Literal);
         for pkg in db_packages {
             index.push(
                 &pkg.name,
@@ -424,7 +436,7 @@ impl PackageIndex {
     fn new_alpm() -> Result<Self> {
         use crate::package_managers::pacman_db;
         let db_packages = pacman_db::get_detailed_packages()?;
-        let mut index = Self::with_capacity(db_packages.len());
+        let mut index = Self::with_capacity(db_packages.len(), SearchNameKind::Literal);
         for pkg in db_packages {
             index.push(
                 &pkg.name,
@@ -459,7 +471,11 @@ impl PackageIndex {
         let mut name_match_count: usize = 0;
 
         // Use trigram index for queries >= 3 chars to narrow candidates
-        if let Some(candidates) = self.trigrams.candidates(&query_lower) {
+        if let Some(candidates) = self
+            .trigrams
+            .as_ref()
+            .and_then(|index| index.candidates(&query_lower))
+        {
             for &idx in &candidates {
                 let item = &self.items[idx as usize];
                 let name_lower = self.pool.get(item.name_lower_offset);
@@ -543,22 +559,21 @@ impl PackageIndex {
         use crate::core::packages::search::{SearchRanker, SearchScore};
 
         let query_lower = query.to_lowercase();
+        let finder = memchr::memmem::Finder::new(query_lower.as_bytes());
         let mut ranker = SearchRanker::new(query);
         let mut scored: Vec<(SearchScore, usize)> = Vec::new();
         // DNF admits name OR description substrings across the complete catalog.
         // Score every eligible row before the bounded cache prefix is selected.
         for (idx, item) in self.items.iter().enumerate() {
-            let name_lower = self.pool.get(item.name_offset).to_lowercase();
-            if !name_lower.contains(&query_lower)
-                && !self
-                    .pool
-                    .get(item.description_offset)
-                    .to_lowercase()
-                    .contains(&query_lower)
+            let name_lower = self.pool.get(item.name_lower_offset);
+            if finder.find(name_lower.as_bytes()).is_none()
+                && finder
+                    .find(self.pool.get(item.description_lower_offset).as_bytes())
+                    .is_none()
                 && !self.rpm_summary_aliases.get(&idx).is_some_and(|aliases| {
                     aliases
                         .iter()
-                        .any(|&offset| self.pool.get(offset).contains(&query_lower))
+                        .any(|&offset| finder.find(self.pool.get(offset).as_bytes()).is_some())
                 })
             {
                 continue;
@@ -568,7 +583,7 @@ impl PackageIndex {
             } else {
                 SearchNameKind::Literal
             };
-            scored.push((ranker.score(&name_lower, kind), idx));
+            scored.push((ranker.score(name_lower, kind), idx));
         }
         let compare = |a: &(SearchScore, usize), b: &(SearchScore, usize)| {
             a.0.cmp(&b.0)
@@ -978,7 +993,7 @@ mod tests {
             (
                 "widget.lib.i686",
                 "3",
-                "Different architecture",
+                "Different architecture ÅNGSTRÖM",
                 Official,
                 false,
             ),
@@ -1000,10 +1015,7 @@ mod tests {
         assert_eq!(hit[0].name, "widget.lib.x86_64");
         assert_eq!(hit[0].version, "1");
         assert_eq!(hit[0].description, "Installed summary");
-        assert_eq!(
-            index.search("different architecture", 20)[0].name,
-            "widget.lib.i686"
-        );
+        assert_eq!(index.search("ångström", 20)[0].name, "widget.lib.i686");
         assert!(index.search("summary an éclair", 20).is_empty());
         assert_eq!(index.search("mixed.noarch", 20).len(), 3);
     }
