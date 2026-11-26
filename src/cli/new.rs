@@ -13,14 +13,7 @@ fn require_command_success(status: std::process::ExitStatus, operation: &str) ->
 }
 
 fn canonical_stack(stack: &str) -> Option<ProjectStack> {
-    match stack.to_ascii_lowercase().as_str() {
-        "rs" => Some(ProjectStack::Rust),
-        "react-ts" => Some(ProjectStack::React),
-        "ts" | "typescript" => Some(ProjectStack::Node),
-        "py" => Some(ProjectStack::Python),
-        "golang" => Some(ProjectStack::Go),
-        canonical => <ProjectStack as clap::ValueEnum>::from_str(canonical, false).ok(),
-    }
+    <ProjectStack as clap::ValueEnum>::from_str(stack, true).ok()
 }
 
 fn validate_manifest_name(stack: ProjectStack, name: &str, path: &str) -> Result<()> {
@@ -81,10 +74,15 @@ pub fn run(stack: &str, name: &str) -> Result<()> {
         }
     }
 
-    let target_dir = std::env::current_dir()?.join(name);
-    if target_dir.exists() {
-        anyhow::bail!("Directory '{name}' already exists");
-    }
+    let relative = Path::new(name);
+    let canonical_stack = canonical_stack(stack).ok_or_else(|| {
+        anyhow::anyhow!("Unknown stack: {stack}. Supported: rust, react, node, python, go")
+    })?;
+    let project_name = relative
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(name);
+    validate_manifest_name(canonical_stack, project_name, name)?;
 
     println!(
         "{} Creating new {} project: {}\n",
@@ -93,44 +91,9 @@ pub fn run(stack: &str, name: &str) -> Result<()> {
         style::package(name)
     );
 
-    let canonical_stack = canonical_stack(stack).ok_or_else(|| {
-        anyhow::anyhow!("Unknown stack: {stack}. Supported: rust, react, node, python, go")
+    publish_scaffold(relative, |target_dir| {
+        populate_scaffold(target_dir, canonical_stack, project_name, name)
     })?;
-    let project_name = target_dir
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or(name);
-    validate_manifest_name(canonical_stack, project_name, name)?;
-    let parent = target_dir
-        .parent()
-        .context("Project directory needs a parent")?;
-    fs::create_dir_all(parent).context("Failed to create project parent directories")?;
-    fs::create_dir(&target_dir)?;
-    match canonical_stack {
-        ProjectStack::Rust => scaffold_rust(&target_dir, project_name)?,
-        ProjectStack::React => scaffold_react(&target_dir, project_name)?,
-        ProjectStack::Node => scaffold_node(&target_dir, project_name)?,
-        ProjectStack::Python => scaffold_python(&target_dir, project_name)?,
-        ProjectStack::Go => scaffold_go(&target_dir, name)?,
-    }
-
-    // Post-scaffold setup
-    println!("\n{}", style::header("Finalizing..."));
-
-    let tool_versions_path = target_dir.join(".tool-versions");
-    if !tool_versions_path.exists() {
-        lock_runtimes(&target_dir, canonical_stack.as_str())?;
-    }
-
-    if !target_dir.join(".git").exists() {
-        println!("  {} Initializing git...", style::dim("→"));
-        let status = Command::new("git")
-            .arg("init")
-            .current_dir(&target_dir)
-            .status()
-            .context("Failed to launch git init")?;
-        require_command_success(status, "git init")?;
-    }
 
     println!("\n{}", style::success("Project created successfully! 🚀"));
     println!("\nTo get started:");
@@ -142,6 +105,156 @@ pub fn run(stack: &str, name: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn populate_scaffold(
+    target: &Path,
+    stack: ProjectStack,
+    project_name: &str,
+    relative_name: &str,
+) -> Result<()> {
+    match stack {
+        ProjectStack::Rust => scaffold_rust(target, project_name)?,
+        ProjectStack::React => scaffold_react(target, project_name)?,
+        ProjectStack::Node => scaffold_node(target, project_name)?,
+        ProjectStack::Python => scaffold_python(target, project_name)?,
+        ProjectStack::Go => scaffold_go(target, relative_name)?,
+    }
+
+    println!("\n{}", style::header("Finalizing..."));
+    lock_runtimes(target, stack.as_str())?;
+    println!("  {} Initializing git...", style::dim("→"));
+    let status = Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(target)
+        .status()
+        .context("Failed to launch git init")?;
+    require_command_success(status, "git init")
+}
+
+#[cfg(target_os = "linux")]
+use publication::publish_scaffold;
+
+#[cfg(not(target_os = "linux"))]
+fn publish_scaffold(relative: &Path, populate: impl FnOnce(&Path) -> Result<()>) -> Result<()> {
+    let target = std::env::current_dir()?.join(relative);
+    if target.symlink_metadata().is_ok() {
+        anyhow::bail!("Directory '{}' already exists", relative.display());
+    }
+    let parent = target
+        .parent()
+        .context("Project directory needs a parent")?;
+    fs::create_dir_all(parent).context("Failed to create project parent directories")?;
+    fs::create_dir(&target)?;
+    populate(&target)
+}
+
+#[cfg(target_os = "linux")]
+mod publication {
+    use anyhow::{Context as _, Result};
+    use rustix::fd::{AsRawFd as _, OwnedFd};
+    use rustix::fs::{CWD, Mode, OFlags, RenameFlags, openat, renameat_with};
+    use rustix::io::Errno;
+    use std::ffi::OsStr;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    const DIRECTORY_FLAGS: OFlags = OFlags::PATH
+        .union(OFlags::DIRECTORY)
+        .union(OFlags::NOFOLLOW)
+        .union(OFlags::CLOEXEC);
+
+    struct Parent {
+        path: PathBuf,
+        fd: OwnedFd,
+    }
+
+    impl Parent {
+        fn child(&self, name: &OsStr) -> Result<Option<Self>> {
+            let path = self.path.join(name);
+            match openat(&self.fd, name, DIRECTORY_FLAGS, Mode::empty()) {
+                Ok(fd) => Ok(Some(Self { path, fd })),
+                Err(Errno::NOENT) => Ok(None),
+                Err(error) => Err(error).with_context(|| {
+                    format!("Project parent {} must be a real directory", path.display())
+                }),
+            }
+        }
+
+        fn access_path(&self) -> PathBuf {
+            PathBuf::from(format!("/proc/self/fd/{}", self.fd.as_raw_fd()))
+        }
+    }
+
+    pub(super) fn publish_scaffold(
+        relative: &Path,
+        populate: impl FnOnce(&Path) -> Result<()>,
+    ) -> Result<()> {
+        let mut parent = Parent {
+            path: std::env::current_dir()?,
+            fd: openat(CWD, ".", DIRECTORY_FLAGS, Mode::empty())
+                .context("Failed to open current project directory")?,
+        };
+        let components: Vec<_> = relative.iter().collect();
+        let mut missing = components.as_slice();
+        while let [first, rest @ ..] = missing {
+            if rest.is_empty() {
+                break;
+            }
+            let Some(child) = parent
+                .child(first)
+                .context("Failed to create project parent directories")?
+            else {
+                break;
+            };
+            parent = child;
+            missing = rest;
+        }
+
+        let [first, rest @ ..] = missing else {
+            anyhow::bail!("Project directory needs a name");
+        };
+        let access = parent.access_path();
+        if rest.is_empty() {
+            match fs::symlink_metadata(access.join(first)) {
+                Ok(_) => anyhow::bail!("Directory '{}' already exists", relative.display()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error).context("Failed to inspect project directory"),
+            }
+        }
+
+        let staging = tempfile::Builder::new()
+            .prefix(".omg-new-")
+            .tempdir_in(access)
+            .context("Failed to stage project beside its destination")?;
+        let target = missing
+            .iter()
+            .fold(staging.path().to_path_buf(), |path, part| path.join(part));
+        fs::create_dir_all(&target).context("Failed to create staged project directory")?;
+        populate(&target)?;
+        publish(&parent, staging.path(), missing, relative)
+    }
+
+    fn publish(parent: &Parent, staging: &Path, missing: &[&OsStr], relative: &Path) -> Result<()> {
+        let [first, rest @ ..] = missing else {
+            anyhow::bail!("Project directory needs a name");
+        };
+        let from = staging.join(first);
+        match renameat_with(CWD, &from, &parent.fd, *first, RenameFlags::NOREPLACE) {
+            Ok(()) => Ok(()),
+            Err(Errno::EXIST) if !rest.is_empty() => {
+                // A concurrent scaffold published a shared parent. The rest
+                // of our tree can still be published without replacing it.
+                let child = parent
+                    .child(first)?
+                    .context("Concurrent project parent disappeared; retry the scaffold")?;
+                publish(&child, &from, rest, relative)
+            }
+            Err(Errno::EXIST) => anyhow::bail!("Directory '{}' already exists", relative.display()),
+            Err(error) => Err(error)
+                .with_context(|| format!("Failed to publish project at {}", relative.display())),
+        }
+    }
 }
 
 enum ScaffoldEntry<'a> {

@@ -421,7 +421,7 @@ pub enum Commands {
     #[command(visible_alias = "create")]
     New {
         /// Stack template (rust, react, node, python, go)
-        #[arg(required = true, value_enum)]
+        #[arg(required = true, value_enum, ignore_case = true)]
         stack: ProjectStack,
 
         /// Project name
@@ -579,10 +579,15 @@ impl ShellKind {
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum ProjectStack {
+    #[value(alias = "rs")]
     Rust,
+    #[value(alias = "react-ts")]
     React,
+    #[value(aliases = ["ts", "typescript"])]
     Node,
+    #[value(alias = "py")]
     Python,
+    #[value(alias = "golang")]
     Go,
 }
 

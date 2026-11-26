@@ -1378,6 +1378,166 @@ exec {shlex.quote(str(native_executable))} "$@"
                 inspect=lambda: git("ls-files", "--stage", "--", "omg.lock", cwd=ignored) == "")
 
 
+    def inspect_scaffold_publication():
+        phase = "scaffold-publication"
+        git = shutil.which("git", path=base_env["PATH"])
+        assert git is not None
+        with tempfile.TemporaryDirectory(prefix="scaffold-publication-", dir=work) as directory:
+            here = Path(directory)
+            os.chown(here, account.pw_uid, account.pw_gid)
+            data = here / "data"
+            isolated = dict(disabled, HOME=str(here), OMG_DATA_DIR=str(data), GIT_CONFIG_NOSYSTEM="1",
+                            XDG_DATA_HOME=str(data), XDG_CONFIG_HOME=str(here/"config"),
+                            XDG_CACHE_HOME=str(here/"cache"), XDG_STATE_HOME=str(here/"state"))
+            bin_dir = here / "fixture-bin"
+            bin_dir.mkdir()
+            marker = here / "ambient-command"
+            signals = here / "signals"
+            signals.mkdir()
+            os.chown(signals, account.pw_uid, account.pw_gid)
+            git_fixture = bin_dir / "git"
+            git_fixture.write_text(f"""#!/bin/sh
+case "$OMG_FIXTURE_GIT_MODE" in
+  fail)
+    printf 'fixture git init failed\\n' >&2
+    exit 23
+    ;;
+  wait)
+    : > "$OMG_FIXTURE_SIGNALS/$OMG_FIXTURE_SIDE"
+    while [ ! -f "$OMG_FIXTURE_SIGNALS/release" ]; do /usr/bin/sleep 0.01; done
+    ;;
+esac
+exec {shlex.quote(git)} "$@"
+""")
+            git_fixture.chmod(0o755)
+            for program in ("node", "npm", "cargo", "rustc", "python", "go"):
+                path = bin_dir / program
+                path.write_text(f"#!/bin/sh\n: > {shlex.quote(str(marker))}\nexit 73\n")
+                path.chmod(0o755)
+            isolated = dict(isolated, PATH=f"{bin_dir}:{base_env['PATH']}",
+                            OMG_FIXTURE_SIGNALS=str(signals))
+
+            def run(label, args, markers=(), *, fails=False, inspect=None, env=None, umask=-1):
+                try:
+                    result = command([cli, *args], isolated if env is None else env,
+                                     dict(ordinary, umask=umask), timeout=8)
+                except subprocess.TimeoutExpired:
+                    checks.append(dict(phase=phase, case=label, passed=False, status=None,
+                                       diagnostic="command exceeded local deadline"))
+                    return
+                output = result.stdout + result.stderr
+                okay = ((result.returncode != 0) == fails and all(item in output for item in markers)
+                        and (inspect is None or inspect()))
+                checks.append(dict(phase=phase, case=label, passed=okay, status=result.returncode,
+                                   diagnostic=output[-1000:]))
+
+            def complete(path, manifest):
+                return ((path/manifest).is_file() and (path/".git/HEAD").is_file()
+                        and not (path/"node_modules").exists() and not marker.exists())
+
+            def clean():
+                return not any(here.rglob(".omg-new-*"))
+
+            cases = [
+                ("rust", "Cargo.toml"), ("rs", "Cargo.toml"), ("react", "package.json"),
+                ("react-ts", "package.json"), ("node", "package.json"), ("ts", "package.json"),
+                ("python", "pyproject.toml"), ("py", "pyproject.toml"), ("go", "go.mod"),
+                ("golang", "go.mod"),
+            ]
+            run("help", ("new", "--help"), ("Create",))
+            for stack, manifest in cases:
+                name = f"examples/{stack}-sample"
+                target = here / name
+                run(f"scaffold-{stack}", ("new", stack, name), ("Project created successfully",),
+                    inspect=lambda: complete(target, manifest) and clean()
+                    and (stack != "go" or (target/manifest).read_text().startswith(f"module {name}\n")))
+            for stack, name in [
+                ("rust", "bad-rust/with.dot"), ("react", "bad-react/Uppercase"),
+                ("node", "bad-node/with+plus"), ("python", "bad-python/trailing_"),
+                ("go", "bad-go@module/go-starter"),
+            ]:
+                run(f"invalid-{stack}-manifest", ("new", stack, name), ("project manifest name",),
+                    fails=True, inspect=lambda: not (here/name.split("/")[0]).exists())
+            run("invalid-stack", ("new", "unknown-stack", "unknown/project"), ("invalid value",),
+                fails=True, inspect=lambda: not (here/"unknown").exists())
+
+            (here/"old-directory").mkdir()
+            (here/"old-directory/keep").write_text("directory fixture\n")
+            (here/"old-file").write_text("file fixture\n")
+            run("occupied-target-directory", ("new", "rust", "old-directory"), ("already exists",),
+                fails=True, inspect=lambda: (here/"old-directory/keep").read_text() == "directory fixture\n")
+            run("occupied-target-file", ("new", "rust", "old-file"), ("already exists",),
+                fails=True, inspect=lambda: (here/"old-file").read_text() == "file fixture\n")
+            run("parent-is-file", ("new", "rust", "old-file/project"), fails=True,
+                inspect=lambda: (here/"old-file").read_text() == "file fixture\n")
+            adjacent = here / "sibling"
+            adjacent.mkdir()
+            os.chown(adjacent, account.pw_uid, account.pw_gid)
+            (here/"parent-link").symlink_to(adjacent)
+            run("reject-symlink-parent", ("new", "rust", "parent-link/sample"), ("must be a real directory",), fails=True,
+                inspect=lambda: not (adjacent/"sample").exists() and (here/"parent-link").is_symlink())
+
+            for stack, manifest in cases[::2]:
+                prefix = f"failed-{stack}"
+                name = f"{prefix}/layer/project"
+                target = here / name
+                run(f"git-failure-{stack}", ("new", stack, name), ("git init failed",), fails=True,
+                    env=dict(isolated, OMG_FIXTURE_GIT_MODE="fail"),
+                    inspect=lambda: not (here/prefix).exists() and clean())
+                run(f"git-retry-{stack}", ("new", stack, name), ("Project created successfully",),
+                    inspect=lambda: complete(target, manifest) and clean())
+
+            versions = data / "versions/node"
+            for version in ("1~2", "26.13.1"):
+                (versions/version).mkdir(parents=True)
+                (versions/version/".omg-install-complete").write_text(f"{version}\n")
+            current = versions / "current"
+            current.symlink_to("1~2")
+            run("invalid-runtime", ("new", "node", "runtime-collision/retry"),
+                ("unsafe for filesystem paths",), fails=True,
+                inspect=lambda: not (here/"runtime-collision").exists() and clean())
+            current.unlink()
+            current.symlink_to("26.13.1")
+            run("runtime-retry", ("new", "node", "runtime-collision/retry"), ("Locked node",),
+                inspect=lambda: complete(here/"runtime-collision/retry", "package.json")
+                and (here/"runtime-collision/retry/.tool-versions").read_text() == "node 26.13.1\n")
+            run("caller-umask", ("new", "rust", "mode-check"), ("Project created successfully",),
+                umask=0o027, inspect=lambda: (here/"mode-check").stat().st_mode & 0o777 == 0o750)
+
+            def concurrent(label, first, second, shared_path, expected_codes):
+                for entry in signals.iterdir():
+                    entry.unlink()
+                results = []
+                with ExitStack() as children:
+                    for side, name in (("first", first), ("second", second)):
+                        env = dict(isolated, OMG_FIXTURE_GIT_MODE="wait", OMG_FIXTURE_SIDE=side)
+                        process = children.enter_context(subprocess.Popen(
+                            [str(cli), "new", "rust", name], cwd=here, env=env, text=True,
+                            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **ordinary))
+                        results.append(process)
+                        deadline = time.monotonic() + 4
+                        while not (signals/side).exists() and process.poll() is None and time.monotonic() < deadline:
+                            time.sleep(0.01)
+                    unpublished = not (here/shared_path).exists()
+                    (signals/"release").touch()
+                    outputs = []
+                    for process in results:
+                        try:
+                            output, errors = process.communicate(timeout=8)
+                        except subprocess.TimeoutExpired:
+                            process.kill()
+                            output, errors = process.communicate()
+                        outputs.append((output + errors)[-450:])
+                codes = sorted(process.returncode for process in results)
+                checks.append(dict(phase=phase, case=label, passed=(
+                    unpublished and codes == expected_codes and all(complete(here/name, "Cargo.toml")
+                    for name in (first, second)) and clean()), status=codes, unpublished=unpublished,
+                    invocations=2, diagnostic=" ".join(outputs)))
+
+            concurrent("concurrent-same-target", "same/project", "same/project", "same", [0, 1])
+            concurrent("concurrent-shared-parent", "shared/a", "shared/b", "shared", [0, 0])
+
+
     def inspect_environment_lockfiles():
         phase = "environment-lockfiles"
         with tempfile.TemporaryDirectory(prefix="environment-locks-", dir=work) as directory:
@@ -3077,6 +3237,7 @@ exec {shlex.quote(str(binary))} "$@"
                     inspect_team_commands()
                     inspect_team_push_publication()
                     inspect_git_workflow()
+                    inspect_scaffold_publication()
                 config.write_text(alternate_config)
                 refresh_fixture()
                 expected = ordinary_control([dnf, "--cacheonly", "repoquery",
@@ -3394,6 +3555,6 @@ assert inventory() == before
 report = dict(binaries=binaries, checks=checks, total=len(checks),
               passed=sum(entry["passed"] for entry in checks), host_unchanged=True)
 print(json.dumps(report))
-expected_checks = 303 if consent_oracle is None else 1184
+expected_checks = 303 if consent_oracle is None else 1220
 if report["passed"] != report["total"] or report["total"] != expected_checks:
     sys.exit(4)
