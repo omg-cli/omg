@@ -16,16 +16,17 @@ import tempfile
 import time
 import zipfile
 
+from github_artifact_transport import api_json
+
 ROOT = Path(__file__).resolve().parents[1]
 SQLITE = runpy.run_path(str(ROOT/'scripts/fedora-sqlite.py'))
-NATIVE = runpy.run_path(str(ROOT/'scripts/native-build-artifact.py'))
 ORIGIN = 'https://omg-ci-artifacts.latham.workers.dev'
 PREFIX = 'dependencies/sqlite-v1/'
 WORKFLOW = 'omg-cli/omg/.github/workflows/fedora-sqlite-publish.yml'
 LIMIT = 160 * 1024 * 1024
 RECIPE_FILES = ('scripts/fedora-sqlite.py', 'scripts/fedora-sqlite-baseline.py',
     '.github/workflows/fedora-sqlite.yml', '.github/workflows/fedora-sqlite-publish.yml',
-    'scripts/native-build-artifact.py',
+    'scripts/github_artifact_transport.py',
     'tests/qemu-image-provenance/fedora-sqlite.json',
     'tests/qemu-image-provenance/fedora.gpg',
     'tests/qemu-image-provenance/sqlite-3.51.2-wal-reset.patch')
@@ -299,9 +300,8 @@ def carried_owner(admission, arch, context):
     origin = admission.get('supply_run_attempt', admission['consumer_run_attempt'])
     require(admission['consumer_run_id'] == run_id and type(origin) is int and 0 < origin < attempt,
             'carried supply belongs to a foreign run or attempt')
-    api = NATIVE['api_json']
     base = f'repos/{repository}/actions/runs/{run_id}'
-    run = api(base)
+    run = api_json(base)
     event = json.loads(Path(os.environ['GITHUB_EVENT_PATH']).read_text())
     head = event['pull_request']['head']['sha'] if os.environ['GITHUB_EVENT_NAME'] == 'pull_request' else context['source_sha']
     require(run.get('id') == int(run_id) and run.get('run_attempt') == attempt
@@ -313,11 +313,11 @@ def carried_owner(admission, arch, context):
     suffix = '/ SQLite full RPM check ('+arch+')'
     owner = None
     for number in range(origin, attempt+1):
-        metadata = api(base+'/attempts/'+str(number))
+        metadata = api_json(base+'/attempts/'+str(number))
         require(metadata.get('id') == int(run_id) and metadata.get('run_attempt') == number
                 and metadata.get('head_sha') == head and isinstance(metadata.get('run_started_at'), str),
                 'carried supply attempt differs')
-        listing = api(base+'/attempts/'+str(number)+'/jobs?per_page=100')
+        listing = api_json(base+'/attempts/'+str(number)+'/jobs?per_page=100')
         require(type(listing.get('total_count')) is int and isinstance(listing.get('jobs'), list)
                 and len(listing['jobs']) == listing['total_count'] <= 100, 'incomplete supply owner listing')
         owners = [job for job in listing['jobs'] if job.get('name', '').endswith(suffix)]
@@ -342,7 +342,7 @@ def carried_owner(admission, arch, context):
                     and (job['started_at'], job.get('completed_at')) ==
                         (owner['started_at'], owner['completed_at']),
                     'later carried supply owner failed, changed or is incomplete')
-    listing = api(base+'/artifacts?per_page=100')
+    listing = api_json(base+'/artifacts?per_page=100')
     require(type(listing.get('total_count')) is int and isinstance(listing.get('artifacts'), list)
             and len(listing['artifacts']) == listing['total_count'] <= 100, 'incomplete supply artifacts')
     artifacts = [row for row in listing['artifacts']
@@ -425,7 +425,7 @@ def readmit(directory, policy, arch, revision, context):
             artifact, origin = carried_owner(old, arch, dict(context, source_sha=revision))
             download_carried_artifact(artifact, work/'supply.zip')
             verify_zip_files(work/'supply.zip', directory, origin, arch)
-            refreshed = NATIVE['api_json']('repos/omg-cli/omg/actions/runs/'+context['run_id'])
+            refreshed = api_json('repos/omg-cli/omg/actions/runs/'+context['run_id'])
             require(refreshed.get('id') == int(context['run_id'])
                     and refreshed.get('run_attempt') == context['run_attempt'],
                     'consumer attempt changed during carried supply admission')
@@ -455,7 +455,7 @@ def pack(directory, output, arch, revision, artifact_id, artifact_digest):
             'publisher cannot relabel an earlier build attempt')
     require(re.fullmatch('[1-9][0-9]{0,19}', artifact_id or '')
             and re.fullmatch('[a-f0-9]{64}', artifact_digest or ''), 'exact source artifact identity is required')
-    artifact = NATIVE['api_json']('repos/omg-cli/omg/actions/artifacts/'+artifact_id)
+    artifact = api_json('repos/omg-cli/omg/actions/artifacts/'+artifact_id)
     require(artifact.get('id') == int(artifact_id) and artifact.get('expired') is False
             and artifact.get('name') == directory.name
             and artifact.get('digest') == 'sha256:'+artifact_digest

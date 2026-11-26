@@ -18,6 +18,11 @@ on:
         description: "Dry-run Linux smoke using a successful main CI source SHA"
         required: false
         default: ""
+      smoke_ci_macos:
+        description: "Include macOS in a CI archive smoke dry run"
+        type: boolean
+        required: false
+        default: false
 
 concurrency:
   group: release
@@ -43,7 +48,7 @@ jobs:
   # ════════════════════════════════════════════════════════════════════════════
   gate-on-ci:
     name: "Gate on CI"
-    if: github.event_name != 'workflow_dispatch' || inputs.sync_existing_tag == '' || inputs.smoke_ci_sha != ''
+    if: github.event_name != 'workflow_dispatch' || inputs.sync_existing_tag == '' || inputs.smoke_ci_sha != '' || inputs.smoke_ci_macos
     runs-on: ubuntu-24.04
     # Long enough to watch an in-progress 90-minute QEMU run to completion;
     # a tag pushed seconds after `main` lands must not miss the run.
@@ -52,7 +57,8 @@ jobs:
       contents: read
       actions: read
     outputs:
-      linux-version: ${{ steps.stage.outputs.version }}
+      staged-version: ${{ steps.stage.outputs.version }}
+      macos-sha256: ${{ steps.stage.outputs.macos-sha256 }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -64,7 +70,12 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           DRY_RUN: ${{ inputs.dry_run }}
+          SMOKE_CI_MACOS: ${{ inputs.smoke_ci_macos }}
         run: |
+          if [[ "${SMOKE_CI_MACOS:-false}" == true ]]; then
+            echo "::error::macOS CI archive smoke requires a source SHA"
+            exit 1
+          fi
           if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" && "$DRY_RUN" == "true" ]]; then
             echo "Dry run requested; publication disabled"
             exit 0
@@ -97,7 +108,7 @@ jobs:
             git fetch --no-tags --depth=1 origin "$SMOKE_CI_SHA"
           fi
 
-      - name: Stage verified Linux archives
+      - name: Stage verified native archives
         id: stage
         if: >-
           inputs.smoke_ci_sha != '' || github.event_name == 'push' || inputs.dry_run != 'true'
@@ -106,18 +117,29 @@ jobs:
           SOURCE_SHA: ${{ inputs.smoke_ci_sha || github.sha }}
           CI_RUN: ${{ steps.smoke-evidence.outputs.ci-run || steps.evidence.outputs.ci-run }}
           CI_ATTEMPT: ${{ steps.smoke-evidence.outputs.ci-attempt || steps.evidence.outputs.ci-attempt }}
+          SMOKE_CI_SHA: ${{ inputs.smoke_ci_sha }}
+          SMOKE_CI_MACOS: ${{ inputs.smoke_ci_macos }}
         run: |
-          python3 scripts/native-build-artifact.py stage-release --destination verified-linux \
-            --commit "$SOURCE_SHA" --ci-run "$CI_RUN" --ci-attempt "$CI_ATTEMPT"
-          version=$(jq -er '.archives.fedora.version' verified-linux/native-release-provenance.json)
+          extra=()
+          if [[ -z "$SMOKE_CI_SHA" || "$SMOKE_CI_MACOS" == true ]]; then
+            extra+=(--include-macos)
+          fi
+          python3 scripts/native-build-artifact.py stage-release --destination verified-native \
+            --commit "$SOURCE_SHA" --ci-run "$CI_RUN" --ci-attempt "$CI_ATTEMPT" "${extra[@]}"
+          version=$(jq -er '.archives.fedora.version' verified-native/native-release-provenance.json)
           [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          macos_digest=$(jq -er '.archives.macos.archive_sha256 // ""' verified-native/native-release-provenance.json)
+          if (( ${#extra[@]} > 0 )); then
+            [[ "$macos_digest" =~ ^[0-9a-f]{64}$ ]]
+          fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "macos-sha256=$macos_digest" >> "$GITHUB_OUTPUT"
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: steps.stage.outputs.version != ''
         with:
           name: arch-build
-          path: verified-linux/arch-build/
+          path: verified-native/arch-build/
           compression-level: 0
           if-no-files-found: error
 
@@ -125,7 +147,7 @@ jobs:
         if: steps.stage.outputs.version != ''
         with:
           name: debian-build
-          path: verified-linux/debian-build/
+          path: verified-native/debian-build/
           compression-level: 0
           if-no-files-found: error
 
@@ -133,7 +155,7 @@ jobs:
         if: steps.stage.outputs.version != ''
         with:
           name: debian-trixie-build
-          path: verified-linux/debian-trixie-build/
+          path: verified-native/debian-trixie-build/
           compression-level: 0
           if-no-files-found: error
 
@@ -141,7 +163,7 @@ jobs:
         if: steps.stage.outputs.version != ''
         with:
           name: ubuntu-build
-          path: verified-linux/ubuntu-build/
+          path: verified-native/ubuntu-build/
           compression-level: 0
           if-no-files-found: error
 
@@ -149,7 +171,15 @@ jobs:
         if: steps.stage.outputs.version != ''
         with:
           name: fedora-build
-          path: verified-linux/fedora-build/
+          path: verified-native/fedora-build/
+          compression-level: 0
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: steps.stage.outputs.macos-sha256 != ''
+        with:
+          name: macos-build
+          path: verified-native/macos-build/
           compression-level: 0
           if-no-files-found: error
 
@@ -157,7 +187,7 @@ jobs:
         if: steps.stage.outputs.version != ''
         with:
           name: native-release-provenance
-          path: verified-linux/native-release-provenance.json
+          path: verified-native/native-release-provenance.json
           if-no-files-found: error
 
   # ════════════════════════════════════════════════════════════════════════════
@@ -167,7 +197,7 @@ jobs:
   build-arch:
     name: "Build Arch"
     needs: gate-on-ci
-    if: needs.gate-on-ci.outputs.linux-version == ''
+    if: needs.gate-on-ci.outputs.staged-version == ''
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     container: archlinux:latest@sha256:f3691b4dde62ba4c4b6f0ae2c1fbf28e8c0c8c4b9a35c7e06dc1f70e21aa29f6
@@ -215,7 +245,7 @@ jobs:
   build-debian:
     name: "Build Debian"
     needs: gate-on-ci
-    if: needs.gate-on-ci.outputs.linux-version == ''
+    if: needs.gate-on-ci.outputs.staged-version == ''
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     container: debian:bookworm@sha256:813017f3d62be4b5891a7acca6a01bdcd4b8513daa81b1ab99d3a50385b26931
@@ -281,7 +311,7 @@ jobs:
   build-debian-trixie:
     name: "Build Debian Trixie"
     needs: gate-on-ci
-    if: needs.gate-on-ci.outputs.linux-version == ''
+    if: needs.gate-on-ci.outputs.staged-version == ''
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     container: debian:trixie@sha256:34cd9e9fd437c0a095ec39cb2e73422c9f30821b0d0848ed74fd0d43bae4d958
@@ -347,7 +377,7 @@ jobs:
   build-ubuntu:
     name: "Build Ubuntu"
     needs: gate-on-ci
-    if: needs.gate-on-ci.outputs.linux-version == ''
+    if: needs.gate-on-ci.outputs.staged-version == ''
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -392,7 +422,7 @@ jobs:
   build-fedora:
     name: "Build Fedora"
     needs: gate-on-ci
-    if: needs.gate-on-ci.outputs.linux-version == ''
+    if: needs.gate-on-ci.outputs.staged-version == ''
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     container:
@@ -445,7 +475,7 @@ jobs:
   build-macos:
     name: "Build macOS (ARM64)"
     needs: gate-on-ci
-    if: inputs.smoke_ci_sha == ''
+    if: inputs.smoke_ci_sha == '' && needs.gate-on-ci.outputs.macos-sha256 == ''
     runs-on: macos-15
     timeout-minutes: 30
     outputs:
@@ -491,9 +521,9 @@ jobs:
     needs: [gate-on-ci, build-debian]
     if: >-
       ${{ !cancelled() && needs.gate-on-ci.result == 'success' &&
-          (needs.gate-on-ci.outputs.linux-version != '' || needs.build-debian.result == 'success') }}
+          (needs.gate-on-ci.outputs.staged-version != '' || needs.build-debian.result == 'success') }}
     env:
-      STAGED_VERSION: ${{ needs.gate-on-ci.outputs.linux-version }}
+      STAGED_VERSION: ${{ needs.gate-on-ci.outputs.staged-version }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -528,9 +558,9 @@ jobs:
     needs: [gate-on-ci, build-ubuntu]
     if: >-
       ${{ !cancelled() && needs.gate-on-ci.result == 'success' &&
-          (needs.gate-on-ci.outputs.linux-version != '' || needs.build-ubuntu.result == 'success') }}
+          (needs.gate-on-ci.outputs.staged-version != '' || needs.build-ubuntu.result == 'success') }}
     env:
-      STAGED_VERSION: ${{ needs.gate-on-ci.outputs.linux-version }}
+      STAGED_VERSION: ${{ needs.gate-on-ci.outputs.staged-version }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -565,9 +595,9 @@ jobs:
     needs: [gate-on-ci, build-debian-trixie]
     if: >-
       ${{ !cancelled() && needs.gate-on-ci.result == 'success' &&
-          (needs.gate-on-ci.outputs.linux-version != '' || needs.build-debian-trixie.result == 'success') }}
+          (needs.gate-on-ci.outputs.staged-version != '' || needs.build-debian-trixie.result == 'success') }}
     env:
-      STAGED_VERSION: ${{ needs.gate-on-ci.outputs.linux-version }}
+      STAGED_VERSION: ${{ needs.gate-on-ci.outputs.staged-version }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     strategy:
@@ -606,9 +636,9 @@ jobs:
     needs: [gate-on-ci, build-arch]
     if: >-
       ${{ !cancelled() && needs.gate-on-ci.result == 'success' &&
-          (needs.gate-on-ci.outputs.linux-version != '' || needs.build-arch.result == 'success') }}
+          (needs.gate-on-ci.outputs.staged-version != '' || needs.build-arch.result == 'success') }}
     env:
-      STAGED_VERSION: ${{ needs.gate-on-ci.outputs.linux-version }}
+      STAGED_VERSION: ${{ needs.gate-on-ci.outputs.staged-version }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -640,9 +670,9 @@ jobs:
     needs: [gate-on-ci, build-fedora]
     if: >-
       ${{ !cancelled() && needs.gate-on-ci.result == 'success' &&
-          (needs.gate-on-ci.outputs.linux-version != '' || needs.build-fedora.result == 'success') }}
+          (needs.gate-on-ci.outputs.staged-version != '' || needs.build-fedora.result == 'success') }}
     env:
-      STAGED_VERSION: ${{ needs.gate-on-ci.outputs.linux-version }}
+      STAGED_VERSION: ${{ needs.gate-on-ci.outputs.staged-version }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -671,11 +701,16 @@ jobs:
 
   smoke-macos:
     name: "Staged macOS release smoke"
-    needs: build-macos
+    needs: [gate-on-ci, build-macos]
+    if: >-
+      ${{ !cancelled() && needs.gate-on-ci.result == 'success' &&
+          ((needs.gate-on-ci.outputs.macos-sha256 != '' && needs.build-macos.result == 'skipped') ||
+           (needs.build-macos.result == 'success' && needs.build-macos.outputs.archive_sha256 != '')) }}
     runs-on: macos-15
     timeout-minutes: 30
     env:
       HOMEBREW_NO_AUTO_UPDATE: "1"
+      STAGED_VERSION: ${{ needs.gate-on-ci.outputs.staged-version }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -688,13 +723,14 @@ jobs:
         run: |
           brew install coreutils python@3.13
           echo "$(brew --prefix python@3.13)/libexec/bin" >> "$GITHUB_PATH"
-      - name: Pin staged macOS archive to builder digest
+      - name: Pin staged macOS archive to admitted digest
         env:
-          ARCHIVE_SHA256: ${{ needs.build-macos.outputs.archive_sha256 }}
+          ARCHIVE_SHA256: ${{ needs.gate-on-ci.outputs.macos-sha256 || needs.build-macos.outputs.archive_sha256 }}
         run: |
           set -euo pipefail
           [[ "$ARCHIVE_SHA256" =~ ^[0-9a-f]{64}$ ]]
-          VERSION=$(awk -F'"' '/^version =/ {print $2; exit}' Cargo.toml)
+          VERSION="${STAGED_VERSION:-$(awk -F'"' '/^version =/ {print $2; exit}' Cargo.toml)}"
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
           archive="omg-v${VERSION}-aarch64-darwin.tar.gz"
           test -f "staged-release/$archive"
           actual=$(shasum -a 256 "staged-release/$archive" | awk '{print $1}')
@@ -705,7 +741,8 @@ jobs:
           OMG_SMOKE_DIGEST_PIN_FILE: ${{ github.workspace }}/smoke-digest-pins.txt
         run: |
           set -euo pipefail
-          VERSION=$(awk -F'"' '/^version =/ {print $2; exit}' Cargo.toml)
+          VERSION="${STAGED_VERSION:-$(awk -F'"' '/^version =/ {print $2; exit}' Cargo.toml)}"
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
           ./scripts/release-smoke.sh --release "v$VERSION" --staged-dir staged-release \
             --distro macos --executor native --evidence-dir staged-macos-smoke-evidence
       - name: Preserve staged macOS smoke evidence
@@ -721,11 +758,18 @@ jobs:
     name: "Create Release"
     runs-on: ubuntu-24.04
     timeout-minutes: 15
-    needs: [gate-on-ci, build-macos, smoke-apt-debian, smoke-apt-ubuntu, smoke-apt-trixie, smoke-arch, smoke-fedora, smoke-macos]
+    needs: [gate-on-ci, smoke-apt-debian, smoke-apt-ubuntu, smoke-apt-trixie, smoke-arch, smoke-fedora, smoke-macos]
+    # A job-level wildcard can include skipped fallback builders from the
+    # smoke jobs' dependency chains. The smoke jobs admit their own archives.
     if: >-
       ${{ !cancelled() && inputs.smoke_ci_sha == '' &&
-          !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') &&
-          !contains(needs.*.result, 'skipped') }}
+          needs.gate-on-ci.result == 'success' &&
+          needs.smoke-apt-debian.result == 'success' &&
+          needs.smoke-apt-ubuntu.result == 'success' &&
+          needs.smoke-apt-trixie.result == 'success' &&
+          needs.smoke-arch.result == 'success' &&
+          needs.smoke-fedora.result == 'success' &&
+          needs.smoke-macos.result == 'success' }}
     permissions:
       contents: write
       id-token: write
@@ -786,18 +830,18 @@ jobs:
           ./scripts/collect-release-artifacts.sh "$VERSION" artifacts release
 
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        if: needs.gate-on-ci.outputs.linux-version != ''
+        if: needs.gate-on-ci.outputs.staged-version != ''
         with:
           name: native-release-provenance
           path: native-release-evidence
 
       - name: Match release bytes to verified CI archives
-        if: needs.gate-on-ci.outputs.linux-version != ''
+        if: needs.gate-on-ci.outputs.staged-version != ''
         run: |
           set -euo pipefail
           jq -er --arg sha "$GITHUB_SHA" '
             select(.source_sha == $sha and (.archives | keys) ==
-              ["arch", "debian", "debian-trixie", "fedora", "ubuntu"]) |
+              ["arch", "debian", "debian-trixie", "fedora", "macos", "ubuntu"]) |
             .archives[] | "\(.archive_sha256)  \(.archive)"
           ' native-release-evidence/native-release-provenance.json > "$RUNNER_TEMP/native-release-digests"
           (cd release && sha256sum --strict --check "$RUNNER_TEMP/native-release-digests")
@@ -884,7 +928,7 @@ jobs:
     if: >-
       ${{
         always() &&
-        inputs.smoke_ci_sha == '' &&
+        inputs.smoke_ci_sha == '' && inputs.smoke_ci_macos != true &&
         (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.dry_run == 'false')) &&
         (inputs.sync_existing_tag != '' || needs.release.result == 'success')
       }}
@@ -1082,3 +1126,29 @@ jobs:
             --content-type="text/plain" \
             --cache-control="no-store"
           echo "✓ Updated latest-version → $VERSION"
+
+  verify-publication:
+    name: Verify publication completed
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    needs: [release, sync-r2]
+    if: >-
+      ${{ !cancelled() && inputs.smoke_ci_sha == '' && inputs.smoke_ci_macos != true &&
+          (github.event_name == 'push' ||
+           (github.event_name == 'workflow_dispatch' && inputs.dry_run == 'false')) }}
+    permissions: {}
+    steps:
+      - name: Require release and mirror completion
+        env:
+          SYNC_ONLY: ${{ inputs.sync_existing_tag != '' }}
+          PUBLISH_RESULT: ${{ needs.release.result }}
+          SYNC_RESULT: ${{ needs.sync-r2.result }}
+        run: |
+          if [[ "$SYNC_ONLY" != true && "$PUBLISH_RESULT" != success ]]; then
+            echo "::error::GitHub release publication did not complete ($PUBLISH_RESULT)"
+            exit 1
+          fi
+          if [[ "$SYNC_RESULT" != success ]]; then
+            echo "::error::Cloudflare release sync did not complete ($SYNC_RESULT)"
+            exit 1
+          fi
