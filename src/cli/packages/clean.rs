@@ -14,10 +14,7 @@ use crate::package_managers::{
     AurClient, clean_cache, clean_cache_preview, list_orphans_direct, remove_orphans,
 };
 
-#[cfg(feature = "debian")]
-use crate::package_managers::apt_remove_orphans;
-
-#[cfg(feature = "debian-pure")]
+#[cfg(all(feature = "debian-pure", not(feature = "debian")))]
 use crate::package_managers::debian_db::{clean_package_cache, list_orphans_fast};
 
 /// Clean up orphans and caches
@@ -46,6 +43,10 @@ pub async fn clean(
         backend != crate::package_managers::Backend::MacOS,
         "Package cleanup is not implemented for the Homebrew backend"
     );
+    #[cfg(feature = "fedora")]
+    if aur && backend == crate::package_managers::Backend::Fedora {
+        anyhow::bail!("AUR cleanup is not available on Fedora");
+    }
     if dry_run {
         crate::cli::modern_ui::print_phase_header("🧹", "Clean Preview", "dry run");
     } else {
@@ -60,9 +61,6 @@ pub async fn clean(
 
     #[cfg(feature = "fedora")]
     if backend == crate::package_managers::Backend::Fedora {
-        if aur {
-            anyhow::bail!("AUR cleanup is not available on Fedora");
-        }
         return handle_fedora_clean(orphans, cache, all, dry_run, yes).await;
     }
 
@@ -233,7 +231,7 @@ pub async fn clean(
                 not(feature = "debian-pure")
             ))]
             {
-                apt_remove_orphans().await?;
+                crate::package_managers::apt_remove_orphans().await?;
             }
         }
 
@@ -410,7 +408,7 @@ async fn handle_fedora_clean(
     if !orphans && !cache && !all {
         let packages = DnfPackageManager::orphan_packages().await?;
         println!(
-            "{} orphan packages can be removed (omg clean --orphans)",
+            "DNF found {} unneeded packages (omg clean --orphans --dry-run to preview removals)",
             packages.len()
         );
         println!("To clear downloaded package archives: omg clean --cache");
@@ -421,11 +419,8 @@ async fn handle_fedora_clean(
     // explicit confirmation to the native transaction instead.
     if orphans || all {
         if dry_run {
-            let packages = DnfPackageManager::orphan_packages().await?;
-            println!("Would remove {} orphan packages:", packages.len());
-            for package in packages {
-                println!("  {package}");
-            }
+            let (plan, diagnostics) = DnfPackageManager::preview_orphan_cleanup().await?;
+            super::common::print_dnf_preview(&plan, &diagnostics);
         } else {
             let history = crate::core::history::HistoryManager::new()?;
             manager
@@ -446,7 +441,7 @@ async fn handle_fedora_clean(
     Ok(())
 }
 
-#[cfg(feature = "debian-pure")]
+#[cfg(all(feature = "debian-pure", not(feature = "debian")))]
 async fn handle_debian_pure_clean(
     orphans: bool,
     cache: bool,
@@ -542,7 +537,7 @@ async fn handle_debian_pure_clean(
     Ok(())
 }
 
-#[cfg(any(test, feature = "debian-pure"))]
+#[cfg(any(test, all(feature = "debian-pure", not(feature = "debian"))))]
 fn report_cache_clean(result: Result<(usize, u64)>) -> Result<()> {
     match result {
         Ok((removed, freed)) => {
@@ -738,9 +733,7 @@ mod tests {
             Distro::Debian | Distro::Ubuntu if cfg!(feature = "debian-pure") => {
                 "The Debian indexing feature is not a live APT backend. Install the Debian/Ubuntu omg build, or rebuild with --no-default-features --features debian,pgp,license"
             }
-            Distro::Fedora if cfg!(feature = "fedora") => {
-                "AUR cleanup is not available without the Arch backend"
-            }
+            Distro::Fedora if cfg!(feature = "fedora") => "AUR cleanup is not available on Fedora",
             Distro::Arch => {
                 "This omg binary lacks the arch package backend required by Arch. Install the matching distro build, or rebuild with --no-default-features --features arch,pgp,license"
             }

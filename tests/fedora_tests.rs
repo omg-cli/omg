@@ -409,7 +409,14 @@ mod dnf_integration {
     }
 
     fn uninstalled_repository_package() -> Result<&'static str> {
-        for candidate in ["tree", "htop", "nano", "rsync", "jq"] {
+        for candidate in [
+            "omg-observer-fixture",
+            "tree",
+            "htop",
+            "nano",
+            "rsync",
+            "jq",
+        ] {
             let installed = std::process::Command::new("rpm")
                 .args(["-q", candidate])
                 .output()?;
@@ -597,6 +604,35 @@ mod dnf_integration {
         Ok(())
     }
 
+    #[test]
+    fn cli_install_preview_accepts_native_full_nevra() -> Result<()> {
+        let (selector, name, version) = installed_bash_full_nevra()?;
+        let output = std::process::Command::new(assert_cmd::cargo::cargo_bin!("omg"))
+            .args(["install", &selector, "--dry-run"])
+            .env("OMG_DISABLE_DAEMON", "1")
+            .env("OMG_TEST_MODE", "0")
+            .env_remove("OMG_TEST_DISTRO")
+            .output()?;
+        assert!(
+            output.status.success(),
+            "preview rejected native selector {selector}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = std::str::from_utf8(&output.stdout)?;
+        let stderr = std::str::from_utf8(&output.stderr)?;
+        let (package, arch) = name.rsplit_once('.').context("Native bash architecture")?;
+        assert!(
+            stderr.contains(&format!(
+                "Package \"{package}-{version}.{arch}\" is already installed."
+            )),
+            "{stderr}"
+        );
+        assert!(stdout.contains("Nothing to do."), "{stdout}");
+        assert!(stdout.contains("No changes made (dry run)"), "{stdout}");
+        assert_eq!(installed_bash_full_nevra()?, (selector, name, version));
+        Ok(())
+    }
+
     #[tokio::test]
     async fn installed_status_resolves_native_full_nevra_with_zero_epoch() -> Result<()> {
         let (selector, name, _) = installed_bash_full_nevra()?;
@@ -618,24 +654,194 @@ mod dnf_integration {
 
     #[test]
     fn cli_info_resolves_native_full_nevra() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::os::unix::net::UnixListener;
+
         let (selector, name, version) = installed_bash_full_nevra()?;
-        let output = std::process::Command::new(assert_cmd::cargo::cargo_bin!("omg"))
+        let fixture = tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o711))
+            .tempdir_in("/tmp")?;
+        let runtime = fixture.path().join("runtime");
+        std::fs::create_dir(&runtime)?;
+        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700))?;
+        let socket = runtime.join("omg.sock");
+        let listener = UnixListener::bind(&socket)?;
+        listener.set_nonblocking(true)?;
+        let cli = std::path::Path::new(assert_cmd::cargo::cargo_bin!("omg"));
+        let mut command = if omg_lib::core::is_root() {
+            let account = nix::unistd::User::from_name("nobody")?.context("native test user")?;
+            nix::unistd::chown(&socket, Some(account.uid), Some(account.gid))?;
+            nix::unistd::chown(&runtime, Some(account.uid), Some(account.gid))?;
+            let executable = fixture.path().join("omg");
+            std::fs::copy(cli, &executable)?;
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755))?;
+            let mut command = std::process::Command::new("/usr/bin/setpriv");
+            command
+                .arg(format!("--reuid={}", account.uid.as_raw()))
+                .arg(format!("--regid={}", account.gid.as_raw()))
+                .args(["--clear-groups", "--no-new-privs"])
+                .arg(executable);
+            command
+        } else {
+            std::process::Command::new(cli)
+        };
+        command
             .args(["info", &selector])
-            .env("OMG_DISABLE_DAEMON", "1")
+            .env("HOME", &runtime)
+            .env("XDG_CONFIG_HOME", runtime.join("config"))
+            .env("XDG_DATA_HOME", runtime.join("data"))
+            .env("XDG_CACHE_HOME", runtime.join("cache"))
+            .env("XDG_STATE_HOME", runtime.join("state"))
+            .env("OMG_SOCKET_PATH", &socket)
             .env("OMG_TEST_MODE", "0")
+            .env("OMG_DISABLE_TELEMETRY", "1")
+            .env_remove("OMG_DISABLE_DAEMON")
             .env_remove("OMG_TEST_DISTRO")
-            .env_remove("OMG_TEST_BACKEND")
-            .output()?;
+            .env_remove("OMG_TEST_BACKEND");
+        let (output, connections) = std::thread::scope(|scope| -> Result<_> {
+            let invocation = scope.spawn(move || command.output());
+            let mut connections = 0;
+            while !invocation.is_finished() {
+                match listener.accept() {
+                    Ok((connection, _)) => {
+                        drop(connection);
+                        connections += 1;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            let output = invocation.join().expect("info fixture panicked")?;
+            Ok((output, connections))
+        })?;
         assert!(
             output.status.success(),
             "plain CLI selector failed: {}",
             String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            connections, 1,
+            "the RPM fallback should follow one daemon attempt"
         );
         let text = String::from_utf8(output.stdout)?;
         assert!(
             text.contains(&name) && text.contains(&version),
             "native installed metadata absent: {text}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn fast_status_json_marks_fedora_package_checks_as_skipped() -> Result<()> {
+        let output = std::process::Command::new(assert_cmd::cargo::cargo_bin!("omg"))
+            .args(["status", "--fast", "--json"])
+            .env("OMG_DISABLE_DAEMON", "1")
+            .env("OMG_DISABLE_TELEMETRY", "1")
+            .env("OMG_TEST_MODE", "0")
+            .env_remove("OMG_TEST_DISTRO")
+            .env_remove("OMG_TEST_BACKEND")
+            .output()?;
+        anyhow::ensure!(
+            output.status.success(),
+            "Fedora fast status failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let counts: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+        assert_eq!(counts["updates_and_orphans_checked"], false, "{counts}");
+        assert_eq!(counts["updates_available"], 0, "{counts}");
+        assert_eq!(counts["orphan_packages"], 0, "{counts}");
+        Ok(())
+    }
+
+    #[test]
+    fn full_status_accepts_a_live_fedora_daemon_reply_after_half_a_second() -> Result<()> {
+        use omg_lib::daemon::protocol::{
+            Request, Response, ResponseResult, StatusResult, encode_frame, read_frame, split_frame,
+            write_frame,
+        };
+        use std::os::unix::{fs::PermissionsExt as _, net::UnixListener};
+        use std::time::{Duration, Instant};
+
+        for args in [&["status", "--json"][..], &["status"][..]] {
+            let home = tempfile::Builder::new()
+                .permissions(std::fs::Permissions::from_mode(0o700))
+                .tempdir_in("/tmp")?;
+            let socket = home.path().join("omg.sock");
+            let listener = UnixListener::bind(&socket)?;
+            listener.set_nonblocking(true)?;
+            let (output, sent) = std::thread::scope(|scope| -> Result<_> {
+                let run = scope.spawn(|| {
+                    std::process::Command::new("/usr/bin/timeout")
+                        .args(["--kill-after=1s", "8s"])
+                        .arg(assert_cmd::cargo::cargo_bin!("omg"))
+                        .args(args)
+                        .current_dir(home.path())
+                        .env_clear()
+                        .env("PATH", "/usr/bin:/bin")
+                        .env("HOME", home.path())
+                        .env("XDG_RUNTIME_DIR", home.path())
+                        .env("OMG_DISABLE_TELEMETRY", "1")
+                        .env("NO_COLOR", "1")
+                        .output()
+                });
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            anyhow::ensure!(
+                                Instant::now() < deadline,
+                                "status never contacted daemon"
+                            );
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
+                };
+                stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+                let frame = read_frame(&mut stream)?;
+                let (_, body) = split_frame(&frame)?;
+                let request: Request = bitcode::deserialize(body)?;
+                assert!(matches!(request, Request::Status { .. }), "{request:?}");
+                std::thread::sleep(Duration::from_millis(700));
+                let frame = encode_frame(&Response::Success {
+                    id: request.id(),
+                    result: ResponseResult::Status(StatusResult {
+                        total_packages: 31_415,
+                        explicit_packages: 76,
+                        orphan_packages: 4,
+                        updates_available: 7,
+                        security_vulnerabilities: 1,
+                        vulnerabilities_scanned: true,
+                        security_unknown_packages: Some(2),
+                        runtime_versions: vec![("node".into(), "24.25.0".into())],
+                    }),
+                })?;
+                stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+                let sent = write_frame(&mut stream, &frame);
+                drop(listener);
+                Ok((run.join().expect("status process thread panicked")?, sent))
+            })?;
+            let stdout = std::str::from_utf8(&output.stdout)?;
+            assert!(
+                output.status.success(),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            if args.contains(&"--json") {
+                let status: serde_json::Value = serde_json::from_str(stdout)?;
+                assert_eq!(status["total_packages"], 31_415, "{status}");
+                assert_eq!(status["updates_available"], 7, "{status}");
+            } else {
+                assert!(stdout.contains("31415 packages installed"), "{stdout}");
+                assert!(stdout.contains("1 findings"), "{stdout}");
+                assert!(stdout.contains("24.25.0"), "{stdout}");
+                assert!(stdout.contains("Running"), "{stdout}");
+            }
+            sent.context("live daemon reply was discarded")?;
+        }
         Ok(())
     }
 
@@ -833,6 +1039,72 @@ mod dnf_integration {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn native_fedora_counters_ignore_daemon_status_file() -> Result<()> {
+        use omg_lib::core::fast_status::FastStatus;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let runtime = tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()?;
+        let stale = u32::MAX as usize;
+        let status = runtime.path().join("omg.status");
+        FastStatus::new(stale, stale, stale, stale).write_to_file(&status)?;
+        assert_eq!(
+            FastStatus::read_validated(&status)
+                .context("status fixture must be trusted")?
+                .total_packages,
+            u32::MAX
+        );
+        let manager = DnfPackageManager::new();
+        let total = manager.installed_count()?;
+        let explicit = manager.list_explicit().await?.len();
+        let orphans = DnfPackageManager::orphan_count().await?;
+        for (arguments, expected) in [
+            (&["tc"][..], total),
+            (&["oc"][..], orphans),
+            (&["ec"][..], explicit),
+            (&["explicit", "--count"][..], explicit),
+        ] {
+            for json in [false, true] {
+                let mut command =
+                    tokio::process::Command::new(assert_cmd::cargo::cargo_bin!("omg"));
+                if json {
+                    command.arg("--json");
+                }
+                command
+                    .args(arguments)
+                    .env("XDG_RUNTIME_DIR", runtime.path())
+                    .env_remove("OMG_SOCKET_PATH")
+                    .env_remove("OMG_DISABLE_DAEMON")
+                    .env("OMG_DISABLE_TELEMETRY", "1")
+                    .env("OMG_TEST_MODE", "0")
+                    .env_remove("OMG_TEST_DISTRO")
+                    .env_remove("OMG_NATIVE_TEST_DATA_DIR");
+                let mut child = spawn_bounded_child(&mut command)?;
+                let output =
+                    bounded_child_output(&mut child, std::time::Duration::from_mins(1)).await?;
+                assert!(
+                    output.status.success(),
+                    "{arguments:?}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                if json {
+                    let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+                    assert_eq!(value["count"], expected);
+                } else {
+                    assert_eq!(
+                        std::str::from_utf8(&output.stdout)?
+                            .trim()
+                            .parse::<usize>()?,
+                        expected
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     fn size_cli_matches_native_installed_packages() -> Result<()> {
         let before = std::process::Command::new("rpm")
@@ -897,22 +1169,24 @@ mod dnf_integration {
         let root = String::from_utf8(root.stdout)?;
         let expected: std::collections::BTreeSet<_> =
             providers.lines().chain(root.lines()).collect();
-        let tree = std::process::Command::new(binary)
-            .env("NO_COLOR", "1")
-            .env("LC_ALL", "C")
-            .args(["size", "--tree", &selector, "--limit", "10000"])
-            .output()?;
-        assert!(
-            tree.status.success(),
-            "{}",
-            String::from_utf8_lossy(&tree.stderr)
-        );
-        let tree = String::from_utf8(tree.stdout)?;
-        for name in &expected {
-            assert!(tree.contains(name), "missing provider {name}");
+        for target in [&selector, root.trim_end()] {
+            let tree = std::process::Command::new(binary)
+                .env("NO_COLOR", "1")
+                .env("LC_ALL", "C")
+                .args(["size", "--tree", target, "--limit", "10000"])
+                .output()?;
+            assert!(
+                tree.status.success(),
+                "{target}: {}",
+                String::from_utf8_lossy(&tree.stderr)
+            );
+            let tree = String::from_utf8(tree.stdout)?;
+            for name in &expected {
+                assert!(tree.contains(name), "missing provider {name}");
+            }
+            assert!(tree.contains(&format!("Number of Packages: {}", expected.len())));
+            assert!(tree.contains("not a minimal dependency closure"));
         }
-        assert!(tree.contains(&format!("Number of Packages: {}", expected.len())));
-        assert!(tree.contains("not a minimal dependency closure"));
         let missing = std::process::Command::new(binary)
             .args(["size", "--tree", "omg-no-such-package"])
             .output()?;
@@ -1021,18 +1295,20 @@ mod dnf_integration {
             .split_once('\t')
             .expect("native installation reason");
         let binary = assert_cmd::cargo::cargo_bin!("omg");
-        let output = std::process::Command::new(binary)
-            .env("NO_COLOR", "1")
-            .args(["why", &selector])
-            .output()?;
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let output = String::from_utf8(output.stdout)?;
-        assert!(output.contains(identity));
-        assert!(output.contains(&format!("Reason: {reason}")));
+        for target in [&selector, identity] {
+            let output = std::process::Command::new(binary)
+                .env("NO_COLOR", "1")
+                .args(["why", target])
+                .output()?;
+            assert!(
+                output.status.success(),
+                "{target}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let output = String::from_utf8(output.stdout)?;
+            assert!(output.contains(identity));
+            assert!(output.contains(&format!("Reason: {reason}")));
+        }
         let native = std::process::Command::new("dnf")
             .args([
                 "--setopt=disable_excludes=*",
@@ -1040,7 +1316,7 @@ mod dnf_integration {
                 "--installed",
                 "--qf",
                 format,
-                &format!("--whatrequires={selector}"),
+                &format!("--whatrequires={identity}"),
             ])
             .output()?;
         assert!(native.status.success());
@@ -1050,28 +1326,30 @@ mod dnf_integration {
             .map(|line| line.split_once('\t').expect("native dependent"))
             .filter(|(name, _)| *name != identity)
             .collect();
-        let output = std::process::Command::new(binary)
-            .env("NO_COLOR", "1")
-            .args(["why", "--reverse", &selector])
-            .output()?;
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let output = String::from_utf8(output.stdout)?;
-        for (identity, reason) in &expected {
+        for target in [&selector, identity] {
+            let output = std::process::Command::new(binary)
+                .env("NO_COLOR", "1")
+                .args(["why", "--reverse", target])
+                .output()?;
             assert!(
-                output.contains(&format!("{identity}: {reason}")),
-                "missing {identity}"
+                output.status.success(),
+                "{target}: {}",
+                String::from_utf8_lossy(&output.stderr)
             );
+            let output = String::from_utf8(output.stdout)?;
+            for (identity, reason) in &expected {
+                assert!(
+                    output.contains(&format!("{identity}: {reason}")),
+                    "missing {identity}"
+                );
+            }
+            assert!(output.contains(&format!("Dependents ({})", expected.len())));
+            assert!(!output.contains("Safe to remove:"));
         }
         assert!(
             !expected.is_empty(),
             "glibc fixture must have native requiring packages"
         );
-        assert!(output.contains(&format!("Dependents ({})", expected.len())));
-        assert!(!output.contains("Safe to remove:"));
         for arguments in [
             vec!["why", "omg-no-such-package"],
             vec!["why", "--reverse", "omg-no-such-package"],
@@ -1092,15 +1370,15 @@ mod dnf_integration {
             .prefix("omg-fedora-blame-")
             .tempdir_in("/tmp")?;
         let selector = format!("glibc.{}", std::env::consts::ARCH);
-        let invoke = || {
+        let invoke = |target: &str| {
             std::process::Command::new(assert_cmd::cargo::cargo_bin!("omg"))
                 .env("OMG_NATIVE_TEST_DATA_DIR", "1")
                 .env("OMG_DATA_DIR", fixture.path())
                 .env("NO_COLOR", "1")
-                .args(["blame", &selector])
+                .args(["blame", target])
                 .output()
         };
-        let empty = invoke()?;
+        let empty = invoke(&selector)?;
         assert!(
             empty.status.success(),
             "{}",
@@ -1108,6 +1386,7 @@ mod dnf_integration {
         );
         let empty = String::from_utf8(empty.stdout)?;
         assert!(empty.contains("No OMG transaction history found"));
+        assert!(!fixture.path().join("history.lock").exists());
         let native = std::process::Command::new("dnf")
             .args([
                 "--setopt=disable_excludes=*",
@@ -1132,7 +1411,7 @@ mod dnf_integration {
                 "--installed",
                 "--qf",
                 "%{full_nevra}\n",
-                &format!("--whatrequires={selector}"),
+                &format!("--whatrequires={}", fields[2]),
             ])
             .output()?;
         assert!(requiring.status.success());
@@ -1158,28 +1437,65 @@ mod dnf_integration {
             })
         };
         let history_path = fixture.path().join("history.json");
+        let mut previous = transaction("fixture-old", "2026-01-01T00:00:00Z", true)?;
+        previous.changes.extend([
+            PackageChange {
+                name: fields[0].to_owned(),
+                old_version: None,
+                new_version: Some("fixture-second-build".to_owned()),
+                source: "qa-fixture".to_owned(),
+            },
+            PackageChange {
+                name: "unrelated-package".to_owned(),
+                old_version: None,
+                new_version: Some("fixture-unrelated-build".to_owned()),
+                source: "qa-fixture".to_owned(),
+            },
+        ]);
         HistoryManager::new_in(&history_path)?.save(&[
-            transaction("fixture-old", "2026-01-01T00:00:00Z", true)?,
+            previous,
             transaction("fixture-failed", "2026-01-02T00:00:00Z", false)?,
         ])?;
         let before = std::fs::read(&history_path)?;
-        let output = invoke()?;
+        let output = invoke(fields[2])?;
         assert!(
             output.status.success(),
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
         let output = String::from_utf8(output.stdout)?;
+        assert!(output.contains(fields[2]));
         assert!(output.contains("failed to install → fixture-failed"));
         assert!(output.contains("installed → fixture-old"));
+        assert!(output.contains("installed → fixture-second-build"));
+        assert!(!output.contains("fixture-unrelated-build"));
+        assert!(output.contains("OMG Transaction History (2)"));
         assert!(output.find("fixture-failed") < output.find("fixture-old"));
         assert!(output.contains("matched by package name"));
         assert_eq!(before, std::fs::read(&history_path)?);
         std::fs::write(&history_path, b"invalid history")?;
-        let corrupt = invoke()?;
+        let corrupt = invoke(&selector)?;
         assert!(!corrupt.status.success());
         assert!(!String::from_utf8(corrupt.stdout)?.contains("No OMG transaction history"));
         assert_eq!(std::fs::read(&history_path)?, b"invalid history");
+
+        std::fs::remove_file(&history_path)?;
+        std::fs::remove_file(fixture.path().join("history.lock"))?;
+        std::fs::write(
+            fixture.path().join("history.json.archive.jsonl"),
+            serde_json::to_vec(&transaction(
+                "archived-build",
+                "2025-12-31T00:00:00Z",
+                true,
+            )?)?,
+        )?;
+        let archived = invoke(&selector)?;
+        assert!(
+            archived.status.success(),
+            "{}",
+            String::from_utf8_lossy(&archived.stderr)
+        );
+        assert!(String::from_utf8(archived.stdout)?.contains("installed → archived-build"));
         fixture.close()?;
         Ok(())
     }
@@ -1189,6 +1505,8 @@ mod dnf_integration {
     fn native_transactions_record_install_remove_and_ignore_noops() -> Result<()> {
         use omg_lib::core::history::{HistoryManager, TransactionType};
         let package = uninstalled_repository_package()?;
+        let selector = std::env::var("OMG_FEDORA_TEST_INSTALL_SELECTOR")
+            .unwrap_or_else(|_| package.to_owned());
         let snapshot = || -> Result<Vec<String>> {
             let output = std::process::Command::new("rpm")
                 .args(["-qa", "--qf", "%{NAME}\t%{NEVRA}\n"])
@@ -1211,20 +1529,62 @@ mod dnf_integration {
             .prefix("omg-fedora-transaction-")
             .tempdir_in("/tmp")?;
         let history = HistoryManager::new_in(fixture.path().join("history.json"))?;
-        let run = |arguments: &[&str]| {
-            std::process::Command::new(assert_cmd::cargo::cargo_bin!("omg"))
+        let binary = assert_cmd::cargo::cargo_bin!("omg");
+        let prepare = |command: &mut std::process::Command| {
+            command
                 .env("OMG_NATIVE_TEST_DATA_DIR", "1")
                 .env("OMG_DATA_DIR", fixture.path())
                 .env("NO_COLOR", "1")
-                .stdin(std::process::Stdio::null())
-                .args(arguments)
-                .output()
+                .stdin(std::process::Stdio::null());
+        };
+        let run = |arguments: &[&str]| {
+            let mut command = std::process::Command::new(binary);
+            prepare(&mut command);
+            command.args(arguments).output()
         };
         let verified = (|| -> Result<()> {
-            let install = run(&["install", package, "--yes"])?;
+            let native_preview = std::process::Command::new("dnf")
+                .env("LC_ALL", "C")
+                .args([
+                    "--color=never",
+                    "--setopt=assumeyes=false",
+                    "--assumeno",
+                    "install",
+                    &selector,
+                ])
+                .output()?;
+            assert_eq!(native_preview.status.code(), Some(1));
+            let native_plan = std::str::from_utf8(&native_preview.stdout)?.trim_end();
+            assert!(native_plan.contains("Transaction Summary:"));
+            let preview = run(&["install", &selector, "--dry-run", "--yes"])?;
+            assert!(
+                preview.status.success(),
+                "{}",
+                String::from_utf8_lossy(&preview.stderr)
+            );
+            let stdout = std::str::from_utf8(&preview.stdout)?;
+            assert!(stdout.contains(native_plan), "{stdout}");
+            assert!(stdout.contains("No changes made (dry run)"), "{stdout}");
+            assert_eq!(snapshot()?, before);
+            assert!(history.load()?.is_empty());
+
+            let mut attended = std::process::Command::new("python3");
+            prepare(&mut attended);
+            let install = attended
+                .arg(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/scripts/attend-unknown-fixture.py"
+                ))
+                .arg("--receipt")
+                .arg(fixture.path().join("install-review.json"))
+                .arg("--")
+                .arg(binary)
+                .args(["install", &selector, "--yes"])
+                .output()?;
             anyhow::ensure!(
                 install.status.success(),
-                "Install failed: {}",
+                "Attended install failed: {}\n{}",
+                String::from_utf8_lossy(&install.stdout),
                 String::from_utf8_lossy(&install.stderr)
             );
             let records = history.load()?;
@@ -1251,8 +1611,16 @@ mod dnf_integration {
                     && change.new_version.as_deref() == Some(std::str::from_utf8(&native.stdout)?),
                 "Recorded version differs from RPM"
             );
-            let noop = run(&["install", package, "--yes"])?;
-            anyhow::ensure!(noop.status.success(), "No-op install failed");
+            let noop = run(&["install", &selector, "--yes"])?;
+            anyhow::ensure!(
+                noop.status.success(),
+                "No-op install failed: {}",
+                String::from_utf8_lossy(&noop.stderr)
+            );
+            anyhow::ensure!(
+                String::from_utf8(noop.stdout)?.contains("Install request complete"),
+                "No-op install did not report the request outcome"
+            );
             anyhow::ensure!(history.load()?.len() == 1, "No-op invented a transaction");
             let blame = run(&["blame", package])?;
             anyhow::ensure!(
@@ -1260,6 +1628,19 @@ mod dnf_integration {
                     && String::from_utf8(blame.stdout)?.contains("OMG Transaction History (1)"),
                 "blame did not find real installation history"
             );
+            let installed = snapshot()?;
+            let removal_preview = run(&["remove", package, "--dry-run", "--yes"])?;
+            assert!(
+                removal_preview.status.success(),
+                "{}",
+                String::from_utf8_lossy(&removal_preview.stderr)
+            );
+            let plan = std::str::from_utf8(&removal_preview.stdout)?;
+            assert!(plan.contains("Removing:\n"), "{plan}");
+            assert!(plan.contains("Transaction Summary:"), "{plan}");
+            assert!(plan.contains("No changes made (dry run)"), "{plan}");
+            assert_eq!(snapshot()?, installed);
+            assert_eq!(history.load()?.len(), 1);
             Ok(())
         })();
         let present = std::process::Command::new("rpm")
@@ -1293,6 +1674,21 @@ mod dnf_integration {
         verified?;
         let records = history.load()?;
         anyhow::ensure!(records.len() == 2, "Expected install and remove history");
+        let native_history = std::process::Command::new("dnf")
+            .args(["history", "info", "last", "--json"])
+            .output()?;
+        anyhow::ensure!(
+            native_history.status.success(),
+            "Cannot read native removal history: {}",
+            String::from_utf8_lossy(&native_history.stderr)
+        );
+        let transactions: Vec<serde_json::Value> = serde_json::from_slice(&native_history.stdout)?;
+        anyhow::ensure!(
+            matches!(transactions.as_slice(), [transaction] if transaction["description"]
+                .as_str()
+                .is_some_and(|description| description.split_whitespace().any(|word| word == "replay"))),
+            "Native removal must replay the reviewed plan"
+        );
         let removed = &records[1];
         anyhow::ensure!(
             removed.success && removed.transaction_type == TransactionType::Remove,
@@ -1623,6 +2019,40 @@ mod dnf_integration {
             .collect::<Result<Vec<_>>>()?;
         cli.sort();
         assert_eq!(cli, expected, "CLI outdated JSON differs from native DNF");
+
+        let native_preview = std::process::Command::new("dnf")
+            .env("LC_ALL", "C")
+            .args([
+                "--cacheonly",
+                "--color=never",
+                "--setopt=assumeyes=false",
+                "--assumeno",
+                "upgrade",
+            ])
+            .output()?;
+        let native_plan = std::str::from_utf8(&native_preview.stdout)?.trim_end();
+        let diagnostics = std::str::from_utf8(&native_preview.stderr)?;
+        anyhow::ensure!(
+            native_preview.status.success()
+                || native_preview.status.code() == Some(1)
+                    && diagnostics
+                        .trim_end()
+                        .ends_with("Operation aborted by the user."),
+            "native DNF upgrade preview failed: {diagnostics}"
+        );
+        anyhow::ensure!(!native_plan.is_empty(), "native DNF upgrade plan is empty");
+        let preview = std::process::Command::new(assert_cmd::cargo::cargo_bin!("omg"))
+            .args(["update", "--dry-run", "--yes"])
+            .env("NO_COLOR", "1")
+            .output()?;
+        assert!(
+            preview.status.success(),
+            "{}",
+            String::from_utf8_lossy(&preview.stderr)
+        );
+        let stdout = std::str::from_utf8(&preview.stdout)?;
+        assert!(stdout.contains(native_plan), "{stdout}");
+        assert!(stdout.contains("No changes made (dry run)"), "{stdout}");
         Ok(())
     }
 
@@ -1681,8 +2111,9 @@ mod dnf_operations {
             );
             Ok(output.status.success())
         };
+        let orphan_query = ["repoquery", "--unneeded", "--queryformat", "%{name}\n"];
         let orphans = std::process::Command::new("dnf")
-            .args(["repoquery", "--unneeded", "--queryformat", "%{name}\n"])
+            .args(orphan_query)
             .output()?;
         anyhow::ensure!(
             orphans.status.success() && orphans.stdout.is_empty(),
@@ -1711,17 +2142,25 @@ mod dnf_operations {
         manager.install(&packages).await?;
         let verified = (|| -> Result<()> {
             let native = std::process::Command::new("rpm")
-                .args(["-q", "tree", "--qf", "%{EPOCHNUM}:%{VERSION}-%{RELEASE}"])
+                .args([
+                    "-q",
+                    "tree",
+                    "--qf",
+                    "%{NAME}\t%{ARCH}\t%{EPOCHNUM}:%{VERSION}-%{RELEASE}",
+                ])
                 .output()?;
             anyhow::ensure!(native.status.success(), "Cannot read fixture version");
-            let version = String::from_utf8(native.stdout)?;
+            let native = std::str::from_utf8(&native.stdout)?;
+            let [name, architecture, version] = native.split('\t').collect::<Vec<_>>()[..] else {
+                anyhow::bail!("Invalid native RPM identity: {native}");
+            };
             let mark = std::process::Command::new("sudo")
                 .args(["-n", "dnf", "-y", "mark", "dependency", "tree"])
                 .stdin(std::process::Stdio::null())
                 .output()?;
             anyhow::ensure!(mark.status.success(), "Cannot mark fixture as dependency");
             let selected = std::process::Command::new("dnf")
-                .args(["repoquery", "--unneeded", "--queryformat", "%{name}\n"])
+                .args(orphan_query)
                 .output()?;
             anyhow::ensure!(
                 selected.status.success()
@@ -1732,6 +2171,18 @@ mod dnf_operations {
             anyhow::ensure!(
                 preview.status.success() && installed()? && history.load()?.is_empty(),
                 "Preview mutated state or history"
+            );
+            let preview_stdout = String::from_utf8_lossy(&preview.stdout);
+            anyhow::ensure!(
+                preview_stdout
+                    .lines()
+                    .any(|line| line.trim() == "Removing:")
+                    && preview_stdout.lines().any(|line| {
+                        line.split_ascii_whitespace()
+                            .take(3)
+                            .eq([name, architecture, version])
+                    }),
+                "Preview omitted the exact native removal row: {preview_stdout}"
             );
             let decline = run(&["clean", "--orphans"], b"n\n")?;
             anyhow::ensure!(
@@ -1759,7 +2210,7 @@ mod dnf_operations {
             anyhow::ensure!(
                 records[1].changes.len() == 1
                     && records[1].changes[0].name == "tree"
-                    && records[1].changes[0].old_version.as_deref() == Some(version.as_str())
+                    && records[1].changes[0].old_version.as_deref() == Some(version)
                     && records[1].changes[0].new_version.is_none(),
                 "Cleanup history differs from native removal"
             );
@@ -1829,17 +2280,32 @@ mod dnf_operations {
         let before = snapshot()?;
         let fixture = tempfile::tempdir_in(dirs::cache_dir().expect("user cache directory"))?;
         let history = HistoryManager::new_in(fixture.path().join("history.json"))?;
-        let update = || {
-            std::process::Command::new(assert_cmd::cargo::cargo_bin!("omg"))
+        let cli = assert_cmd::cargo::cargo_bin!("omg");
+        let update_args = ["update", "--yes"];
+        let prepare = |command: &mut std::process::Command| {
+            command
+                .env("OMG_NATIVE_TEST_DATA_DIR", "1")
                 .env("OMG_DATA_DIR", fixture.path())
-                .stdin(std::process::Stdio::null())
-                .args(["update", "--yes"])
-                .output()
+                .env("NO_COLOR", "1")
+                .stdin(std::process::Stdio::null());
         };
-        let applied = update()?;
+        let mut attended = std::process::Command::new("python3");
+        prepare(&mut attended);
+        let applied = attended
+            .arg(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/scripts/attend-unknown-fixture.py"
+            ))
+            .arg("--receipt")
+            .arg(fixture.path().join("update-review.json"))
+            .arg("--")
+            .arg(cli)
+            .args(update_args)
+            .output()?;
         anyhow::ensure!(
             applied.status.success(),
-            "Update failed: {}",
+            "Update failed: {}\n{}",
+            String::from_utf8_lossy(&applied.stdout),
             String::from_utf8_lossy(&applied.stderr)
         );
         let after = snapshot()?;
@@ -1853,6 +2319,15 @@ mod dnf_operations {
                 && records[0].success
                 && records[0].transaction_type == TransactionType::Update,
             "Expected one successful update record: {records:?}"
+        );
+        let count = records[0].changes.len();
+        let label = if count == 1 { "change" } else { "changes" };
+        let update_output = std::str::from_utf8(&applied.stdout)?;
+        assert!(
+            update_output.contains(&format!(
+                "System updated successfully · {count} package {label}"
+            )),
+            "{update_output}"
         );
         let mut removed: Vec<_> = before
             .difference(&after)
@@ -1900,12 +2375,15 @@ mod dnf_operations {
             added.len()
         );
         println!("OMG update record: {}", serde_json::to_string(&records)?);
-        let noop = update()?;
+        let mut command = std::process::Command::new(cli);
+        prepare(&mut command);
+        let noop = command.args(update_args).output()?;
         anyhow::ensure!(
             noop.status.success(),
             "No-op update failed: {}",
             String::from_utf8_lossy(&noop.stderr)
         );
+        assert!(!std::str::from_utf8(&noop.stdout)?.contains("System updated successfully"));
         anyhow::ensure!(
             snapshot()? == after && history.load()?.len() == 1,
             "No-op update changed package state or invented history"

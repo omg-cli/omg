@@ -71,7 +71,7 @@
 //! Program::new(model).run();
 //! ```
 
-mod async_bridge;
+pub(in crate::cli) mod async_bridge;
 pub(crate) use async_bridge::run_blocking_future;
 mod cmd;
 mod renderer;

@@ -67,15 +67,10 @@ jobs:
             exit 0
           fi
 
-          scripts/require-workflow-success.sh ci.yml "$GITHUB_SHA" CI
-          scripts/require-workflow-success.sh benchmark.yml "$GITHUB_SHA" Benchmark
-          # Version tags are immutable. Validate the other workflows BEFORE
-          # creating a tag, so a failed candidate cannot consume a version.
-          scripts/require-workflow-success.sh audit.yml "$GITHUB_SHA" "Security Audit"
-          scripts/require-workflow-success.sh secrets.yml "$GITHUB_SHA" "Secret Scanning"
-          scripts/require-workflow-success.sh codeql.yml "$GITHUB_SHA" CodeQL
-          scripts/require-workflow-success.sh coverage.yml "$GITHUB_SHA" Coverage
-          scripts/require-workflow-success.sh docker-e2e.yml "$GITHUB_SHA" "Docker E2E"
+          # Version tags are immutable. Verify the required workflows and all
+          # native archives before creating a tag.
+          python3 scripts/require-release-evidence.py "$GITHUB_SHA" \
+            --stage-linux "$RUNNER_TEMP/release-native-preflight" --include-macos
 
           require_current_main() {
             local live_main

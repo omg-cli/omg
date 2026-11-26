@@ -35,7 +35,7 @@ mod homebrew_integration {
                 drop(connection);
             }
         });
-        let run = async |args: &[&str]| -> Result<std::process::Output> {
+        let run = async |args: &[&str], daemon_disabled: bool| -> Result<std::process::Output> {
             let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_omg"));
             command
                 .args(args)
@@ -45,7 +45,10 @@ mod homebrew_integration {
                 .env("OMG_CONFIG_DIR", root.path().join("config"))
                 .env("OMG_DATA_DIR", root.path().join("data"))
                 .env("OMG_SOCKET_PATH", &socket)
-                .env("OMG_DISABLE_DAEMON", "1")
+                .env(
+                    "OMG_DISABLE_DAEMON",
+                    if daemon_disabled { "1" } else { "0" },
+                )
                 .env("OMG_DISABLE_TELEMETRY", "1")
                 .env("OMG_NO_UPDATE_CHECK", "1")
                 .env("HTTPS_PROXY", &proxy_url)
@@ -61,13 +64,13 @@ mod homebrew_integration {
         };
 
         for (command, expected) in [("tc", total), ("oc", 0)] {
-            let output = run(&[command]).await?;
+            let output = run(&[command], true).await?;
             assert!(output.status.success(), "{command}: {:?}", output);
             assert_eq!(
                 String::from_utf8(output.stdout)?.trim(),
                 expected.to_string()
             );
-            let output = run(&[command, "--json"]).await?;
+            let output = run(&[command, "--json"], true).await?;
             assert!(output.status.success(), "{command} --json: {:?}", output);
             assert_eq!(
                 serde_json::from_slice::<serde_json::Value>(&output.stdout)?,
@@ -84,7 +87,7 @@ mod homebrew_integration {
             &["uc", "--json"][..],
         ] {
             let before = attempts.load(Ordering::Relaxed);
-            let output = run(args).await?;
+            let output = run(args, true).await?;
             let stderr = String::from_utf8(output.stderr)?;
             assert_eq!(output.status.code(), Some(1), "{args:?}: {stderr}");
             assert!(
@@ -108,12 +111,20 @@ mod homebrew_integration {
         omg_lib::core::fast_status::FastStatus::new(total + 1, 0, 0, 9)
             .write_to_file(&root.path().join("omg.status"))?;
         let before = attempts.load(Ordering::Relaxed);
-        for (command, expected) in [("tc", total + 1), ("uc", 9)] {
-            let output = run(&[command, "--json"]).await?;
-            assert!(output.status.success(), "{command} --json: {output:?}");
+        for (daemon_disabled, command, expected) in [
+            (true, "tc", total),
+            (false, "tc", total + 1),
+            (false, "uc", 9),
+        ] {
+            let output = run(&[command, "--json"], daemon_disabled).await?;
+            assert!(
+                output.status.success(),
+                "{command} --json with daemon disabled={daemon_disabled}: {output:?}"
+            );
             assert_eq!(
                 serde_json::from_slice::<serde_json::Value>(&output.stdout)?,
-                serde_json::json!({"count": expected})
+                serde_json::json!({"count": expected}),
+                "{command} --json with daemon disabled={daemon_disabled}"
             );
         }
         assert_eq!(attempts.load(Ordering::Relaxed), before);

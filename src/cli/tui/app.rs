@@ -98,6 +98,7 @@ pub struct App {
     pub team_status: Option<TeamStatus>,
     pub(crate) team_status_is_remote: bool,
     pub history: Vec<Transaction>,
+    pub(super) history_loaded: bool,
     pub last_tick: Instant,
     pub current_tab: Tab,
     pub selected_index: usize,
@@ -160,6 +161,7 @@ impl App {
             team_status: None,
             team_status_is_remote: false,
             history: Vec::new(),
+            history_loaded: !external_refresh_enabled,
             last_tick: Instant::now(),
             current_tab: Tab::Dashboard,
             selected_index: 0,
@@ -211,22 +213,18 @@ impl App {
 
         self.security_policy = Some(crate::core::security::SecurityPolicy::load_default());
 
-        // 1. Fetch history. Daemon I/O is scheduled separately by the event
-        // loop so its request timeout can never freeze input or rendering.
-        if let Ok(history_mgr) = crate::core::history::HistoryManager::new()
-            && let Ok(entries) = history_mgr.load()
-        {
-            self.history = entries.into_iter().rev().take(50).collect();
-        }
-
-        // 3. Update system metrics
         self.update_system_metrics();
 
-        // 4. Refresh local team state. Remote member data is fetched by the
+        // Refresh local team state. Remote member data is fetched by the
         // event loop on a background task only while the Team tab is visible.
         self.load_local_team_status();
 
         Ok(())
+    }
+
+    pub(super) fn read_recent_history() -> Result<Vec<Transaction>> {
+        let entries = crate::core::history::HistoryManager::new()?.load()?;
+        Ok(entries.into_iter().rev().take(50).collect())
     }
 
     #[cfg(unix)]
@@ -242,6 +240,12 @@ impl App {
             _ => None,
         };
         (true, status)
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn apply_daemon_status(&mut self, connected: bool, status: Option<StatusResult>) {
+        self.daemon_connected = connected;
+        self.status = status;
     }
 
     fn load_local_team_status(&mut self) {
@@ -451,7 +455,7 @@ impl App {
     ) -> Result<Vec<crate::package_managers::SyncPackage>> {
         let backend = crate::package_managers::get_package_manager()?;
         Ok(backend
-            .search(query)
+            .search_quietly(query)
             .await
             .context("Failed to search official packages")?
             .into_iter()

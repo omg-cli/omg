@@ -729,6 +729,7 @@ install_from_release
             condition.split_whitespace().collect::<Vec<_>>().join(" "),
             concat!(
                 "${{ always() && ",
+                "inputs.smoke_ci_sha == '' && inputs.smoke_ci_macos != true && ",
                 "(github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.dry_run == 'false')) && ",
                 "(inputs.sync_existing_tag != '' || needs.release.result == 'success') }}"
             )
@@ -763,10 +764,14 @@ install_from_release
         };
         for value in ["true", "false", "$(touch injected)"] {
             let fixture = tempfile::tempdir().expect("gate fixture");
-            let gate = fixture.path().join("scripts/require-workflow-success.sh");
-            std::fs::create_dir(gate.parent().unwrap()).unwrap();
+            let gate = fixture.path().join("python3");
             std::fs::write(&gate, "#!/bin/sh\nprintf '%s\\n' \"$*\" >> gate-calls\n").unwrap();
             std::fs::set_permissions(&gate, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let path = std::env::var_os("PATH").expect("PATH");
+            let fixture_path = std::env::join_paths(
+                std::iter::once(fixture.path().to_path_buf()).chain(std::env::split_paths(&path)),
+            )
+            .expect("fixture PATH");
             let rendered = script.replace("${{ inputs.dry_run }}", value);
             let output = Command::new("bash")
                 .args([
@@ -779,7 +784,7 @@ install_from_release
                     &rendered,
                 ])
                 .env_clear()
-                .env("PATH", std::env::var_os("PATH").expect("PATH"))
+                .env("PATH", fixture_path)
                 .env("GITHUB_EVENT_NAME", "workflow_dispatch")
                 .env("GITHUB_SHA", "fixture-commit")
                 .env("GITHUB_REF", "refs/tags/v1.2.3")
@@ -801,15 +806,7 @@ install_from_release
             let expected = if value == "true" {
                 Vec::new()
             } else {
-                vec![
-                    "ci.yml fixture-commit CI",
-                    "benchmark.yml fixture-commit Benchmark",
-                    "audit.yml fixture-commit Security Audit",
-                    "secrets.yml fixture-commit Secret Scanning",
-                    "codeql.yml fixture-commit CodeQL",
-                    "coverage.yml fixture-commit Coverage",
-                    "docker-e2e.yml fixture-commit Docker E2E",
-                ]
+                vec!["scripts/require-release-evidence.py fixture-commit"]
             };
             assert_eq!(calls.lines().collect::<Vec<_>>(), expected);
         }

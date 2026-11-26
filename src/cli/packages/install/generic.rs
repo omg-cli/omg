@@ -1,12 +1,18 @@
 use anyhow::{Context, Result};
 
 use crate::cli::{modern_ui, style};
-use crate::package_managers::get_package_manager;
+use crate::package_managers::{PackageManager, get_package_manager};
 
 use super::enforce_install_policy;
 
 pub async fn install(packages: &[String]) -> Result<()> {
     let pm = get_package_manager()?;
+    #[cfg(feature = "fedora")]
+    if crate::package_managers::resolve_backend()? == crate::package_managers::Backend::Fedora {
+        // DNF reviews the complete stored transaction, including capability providers.
+        return apply_install(pm.as_ref(), packages, "Install request complete for").await;
+    }
+
     let policy =
         crate::core::security::SecurityPolicy::load_default().map_err(anyhow::Error::from)?;
     let vulnerability_scanner = crate::core::security::vulnerability::VulnerabilityScanner::new();
@@ -25,7 +31,10 @@ pub async fn install(packages: &[String]) -> Result<()> {
         )
         .await?;
     }
+    apply_install(pm.as_ref(), packages, "Installed").await
+}
 
+async fn apply_install(pm: &dyn PackageManager, packages: &[String], summary: &str) -> Result<()> {
     modern_ui::print_phase_header(
         "📦",
         "Install",
@@ -53,7 +62,7 @@ pub async fn install(packages: &[String]) -> Result<()> {
 
     modern_ui::print_success_with_packages(
         &format!(
-            "Installed {} {}",
+            "{summary} {} {}",
             packages.len(),
             if packages.len() == 1 {
                 "package"
@@ -68,7 +77,7 @@ pub async fn install(packages: &[String]) -> Result<()> {
 }
 
 async fn preview_packages(
-    pm: &dyn crate::package_managers::PackageManager,
+    pm: &dyn PackageManager,
     packages: &[String],
 ) -> Result<Vec<crate::core::Package>> {
     crate::core::security::validate_package_names(packages)?;
@@ -87,7 +96,6 @@ async fn preview_packages(
 pub async fn install_dry_run(packages: &[String]) -> Result<()> {
     use comfy_table::{Table, modifiers::UTF8_ROUND_CORNERS, presets::UTF8_FULL};
 
-    crate::core::security::validate_package_names(packages)?;
     let pm = get_package_manager()?;
     let preview = preview_packages(pm.as_ref(), packages).await?;
 

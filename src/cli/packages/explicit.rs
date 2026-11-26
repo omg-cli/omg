@@ -50,7 +50,11 @@ pub fn explicit_sync_with_json(count: bool, json: bool) -> Result<()> {
     }
 
     #[cfg(unix)]
-    if let Ok(mut client) = SyncDaemonClient::acquire() {
+    if let Ok(mut client) = if count {
+        SyncDaemonClient::acquire_with_timeout(crate::core::client::PROMPT_COUNTER_TIMEOUT)
+    } else {
+        SyncDaemonClient::acquire()
+    } {
         let request = if count {
             Request::ExplicitCount { id: 0 }
         } else {
@@ -117,11 +121,12 @@ pub fn explicit_sync_with_json(count: bool, json: bool) -> Result<()> {
 
     #[cfg(feature = "fedora")]
     if backend == crate::package_managers::Backend::Fedora {
-        let packages: Vec<String> =
-            crate::package_managers::dnf::DnfPackageManager::read_user_installed_names()
-                .context("Failed to list explicitly installed Fedora packages")?
-                .into_iter()
-                .collect();
+        let packages: Vec<String> = crate::cli::tea::run_blocking_future(
+            crate::package_managers::dnf::DnfPackageManager::read_user_installed_names(),
+        )?
+        .context("Failed to list explicitly installed Fedora packages")?
+        .into_iter()
+        .collect();
         return if count {
             print_count(packages.len(), json)
         } else {

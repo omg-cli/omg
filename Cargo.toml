@@ -1,6 +1,6 @@
 [package]
 name = "omg"
-version = "0.1.227"
+version = "0.1.229"
 edition = "2024"
 rust-version = "1.95.0"
 description = "The Fastest Unified Package Manager for Arch Linux + All Language Runtimes"
@@ -408,7 +408,7 @@ debian = ["ar", "rust-apt"]
 debian-pure = ["ar"]
 
 # Fedora/RHEL support (DNF/RPM) with bundled SQLite.
-fedora = ["rusqlite"]
+fedora = ["rusqlite", "serde_json/raw_value"]
 
 # macOS/Homebrew support.
 macos = []

@@ -536,6 +536,7 @@ fn test_status_json_output() {
     result.assert_success();
     let parsed: serde_json::Value =
         serde_json::from_str(result.stdout.trim()).expect("status --json must emit valid JSON");
+    assert_eq!(parsed["updates_and_orphans_checked"], true, "{parsed}");
     for field in [
         "total_packages",
         "explicit_packages",

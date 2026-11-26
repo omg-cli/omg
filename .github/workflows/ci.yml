@@ -103,21 +103,17 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
 
-      - name: Test debt baseline and classification guards on docs-only changes
+      - name: Test workflow guards on docs-only changes
         if: matrix.shard == 0 && github.event_name != 'push' && needs.quick-gate.outputs.checks-required != 'true'
         run: |
           python3 -m unittest discover -s scripts -p 'test_debt*.py'
           python3 -m unittest discover -s scripts -p test_ci_change_scope.py
-
-      - name: Test advisory baseline publication guards
-        if: matrix.shard == 0
-        run: python3 -m unittest discover -s scripts -p test_advisory_baseline.py
+          python3 -m unittest discover -s scripts -p test_advisory_baseline.py
+          python3 scripts/test_alpm_pins.py
 
       - name: Check Rust ALPM snapshot consistency
         if: matrix.shard == 0
-        run: |
-          python3 scripts/check-alpm-pins.py
-          python3 scripts/test_alpm_pins.py
+        run: python3 scripts/check-alpm-pins.py
 
       - name: Debt ratchet (gating)
         if: matrix.shard == 0
@@ -395,6 +391,7 @@ jobs:
             --features debian-pure --locked -- -D warnings
 
       - name: Verify Node authentication fails closed without PGP
+        # Share Cargo dependency artifacts with the portable test suite below.
         run: |
           cargo test --lib --no-default-features --features license --locked \
             runtimes::node::tests::node_install_without_pgp_refuses_before_contacting_the_publisher \
@@ -1255,6 +1252,26 @@ jobs:
         if: contains(matrix.features, 'debian')
         run: timeout -k 5s 180s python3 scripts/prepare-node-test-fixture.py --destination "$RUNNER_TEMP/node-test-fixture"
 
+      - name: Prepare pinned Rust ALPM source for Fedora
+        if: matrix.platform == 'fedora'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Nextest resolves all optional dependencies for metadata even in a Fedora build.
+          source="$RUNNER_TEMP/omg-alpm-source"
+          python3 scripts/check-alpm-pins.py --prepare-cargo-source "$source"
+          cargo_home="${CARGO_HOME:-$HOME/.cargo}"
+          mkdir -p "$cargo_home"
+          config="$cargo_home/config.toml"
+          if [[ -f "$cargo_home/config" ]]; then
+            config="$cargo_home/config"
+          fi
+          {
+            printf '\n'
+            cat "$source/cargo-config.toml"
+          } >> "$config"
+          sha256sum "$source/cargo-config.toml"
+
       - name: Run unit tests
         if: matrix.phase == 'validation'
         run: python3 scripts/run-native-contracts.py --features ${{ matrix.features }}
@@ -1428,7 +1445,7 @@ jobs:
           ./target/release/omg --help | head -20
 
       - name: Upload binary
-        if: matrix.phase == 'validation'
+        if: matrix.phase == 'validation' && matrix.platform == 'ubuntu-2604'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: omg-${{ matrix.platform }}
@@ -1779,7 +1796,9 @@ jobs:
         run: bash tests/installer_security.sh
 
       - name: Build
-        run: cargo build --release --no-default-features --features macos,pgp,license --locked
+        run: |
+          python3 scripts/native-build-artifact.py build --distro macos --image macos-15 \
+            --features macos,pgp,license --destination "$RUNNER_TEMP/native-release"
 
       - name: Install nextest
         id: install-nextest
@@ -1844,12 +1863,14 @@ jobs:
           ./target/release/omg --version
           file ./target/release/omg
 
-      - name: Upload binary
+      - name: Upload native macOS release pair
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: omg-macos-arm64
-          path: target/release/omg
-          retention-days: 7
+          name: native-release-macos-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/native-release/
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 14
 
       - name: Preserve compiled parser surfaces
         if: always()
@@ -1946,7 +1967,8 @@ jobs:
     needs: quick-gate
     if: needs.quick-gate.outputs.should-build == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group'
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    # A cold build, Clippy and both test runners can exceed 30 minutes.
+    timeout-minutes: 40
     env:
       OMG_CONTRACT_SURFACE_OUT: target/contract-surfaces
       OMG_CONTRACT_SOURCE_SHA: ${{ github.sha }}
@@ -2026,7 +2048,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: apt-daemon-catalog-ubuntu
+          name: apt-daemon-catalog-ubuntu-${{ github.run_attempt }}
           path: |
             ${{ runner.temp }}/apt-daemon-catalog/receipt.json
             ${{ runner.temp }}/apt-daemon-catalog/daemon.log
@@ -2068,19 +2090,11 @@ jobs:
           ./target/release/omg --version
           ./target/release/omg --help | head -20
 
-      - name: Upload binary
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: omg-ubuntu
-          path: target/release/omg
-          retention-days: 7
-          if-no-files-found: error
-
       - name: Preserve compiled parser surfaces
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: cli-surfaces-ubuntu
+          name: cli-surfaces-ubuntu-${{ github.run_attempt }}
           path: target/contract-surfaces/
           retention-days: 14
           if-no-files-found: error

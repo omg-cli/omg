@@ -13,16 +13,22 @@ import unittest
 import zipfile
 from unittest.mock import patch
 
+import github_artifact_transport as transport
+
 SPEC = importlib.util.spec_from_file_location(
     'native_build', Path(__file__).with_name('native-build-artifact.py'))
 BUILD = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(BUILD)
 
 
-def fixture(distro='debian'):
-    binary = b'fixture, never executed'
+def fixture(distro='debian', *, binary=None):
+    if binary is None:
+        binary = b'fixture, never executed'
+    macos = distro == 'macos'
+    target = 'aarch64-apple-darwin' if macos else 'x86_64-unknown-linux-gnu'
+    features = 'macos,pgp,license' if macos else 'debian,pgp,license'
     archive = io.BytesIO()
-    base = 'omg-v1.2.3-x86_64-linux-' + distro
+    base = 'omg-v1.2.3-aarch64-darwin' if macos else 'omg-v1.2.3-x86_64-linux-' + distro
     with tarfile.open(fileobj=archive, mode='w:gz') as stream:
         for name, content in [('omg', binary), ('omgd', binary), ('README.md', b'readme'), ('LICENSE', b'license')]:
             entry = tarfile.TarInfo(base + '/' + name)
@@ -33,14 +39,16 @@ def fixture(distro='debian'):
     expected = {
         'repository': 'omg-cli/omg', 'source_sha': 'a' * 40, 'run_id': '123', 'run_attempt': 1,
         'distro': distro, 'image': ('debian:trixie' if distro == 'debian-trixie' else 'debian:bookworm') + '@sha256:' + 'b' * 64,
-        'features': ['debian', 'license', 'pgp'], 'target': 'x86_64-unknown-linux-gnu',
+        'features': sorted(features.split(',')), 'target': target,
         'profile': 'release', 'instrumentation': 'none', 'cpu': 'generic', 'toolchain': '1.95.0',
         'workflow_path': '.github/workflows/ci.yml',
     }
+    if macos:
+        expected['image'] = 'macos-15'
     provenance = dict(expected, schema_version=1, version='1.2.3', archive=base + '.tar.gz',
-                      compiler='rustc 1.95.0 (fixture)\nhost: x86_64-unknown-linux-gnu',
+                      compiler=f'rustc 1.95.0 (fixture)\nhost: {target}',
                       build_argv=['cargo', 'build', '--timings', '--release', '--no-default-features',
-                                  '--features', 'debian,pgp,license', '--locked'],
+                                  '--features', features, '--locked'],
                       archive_sha256=hashlib.sha256(payload).hexdigest(),
                       binaries={name: hashlib.sha256(binary).hexdigest() for name in ('omg', 'omgd')})
     return expected, provenance, payload
@@ -55,6 +63,138 @@ def bundle(provenance, payload, extra=None):
         if extra:
             archive.writestr(*extra)
     return result.getvalue()
+
+
+class NativeReleaseStaging(unittest.TestCase):
+    repository = 'omg-cli/omg'
+    source = 'a' * 40
+    run_id = 123
+    attempt = 1
+
+    def setUp(self):
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.destination = self.root / 'candidate'
+        self.run = {
+            'id': self.run_id, 'run_attempt': self.attempt, 'workflow_id': 10,
+            'event': 'push', 'head_branch': 'main', 'head_sha': self.source,
+            'path': '.github/workflows/ci.yml', 'repository': {'id': 101, 'full_name': self.repository},
+            'status': 'completed', 'conclusion': 'success',
+            'created_at': '2026-06-01T00:00:00Z', 'run_started_at': '2026-06-01T00:00:01Z',
+        }
+        identity = dict(id=self.run_id, repository_id=101, head_repository_id=101,
+                        head_branch='main', head_sha=self.source)
+        self.rows = []
+        self.downloads = {}
+        for identifier, (distro, image) in enumerate(BUILD.RELEASE_IMAGES.items(), start=201):
+            _, provenance, payload = fixture(distro)
+            features = BUILD.FEATURES[distro]
+            provenance.update(image=image, features=features.split(','),
+                              cpu='x86-64-v2' if distro == 'arch' else 'generic',
+                              build_argv=BUILD.build_command(distro, features, {})[0])
+            content = bundle(provenance, payload)
+            self.rows.append(dict(id=identifier, name=f'native-release-{distro}-1',
+                                  digest='sha256:' + BUILD.sha256(content), size_in_bytes=len(content),
+                                  workflow_run=dict(identity), expired=False, created_at='2026-06-01T00:01:00Z'))
+            self.downloads[f'repos/{self.repository}/actions/artifacts/{identifier}/zip'] = content
+        self.lookup = self.enterContext(patch.object(BUILD, 'api_json', side_effect=self.metadata))
+        self.download = self.enterContext(patch.object(BUILD, 'download_artifact', side_effect=self.downloads.__getitem__))
+        source_files = {
+            self.source + ':Cargo.toml': '[package]\nversion = "1.2.3"\n',
+            self.source + ':rust-toolchain.toml': '[toolchain]\nchannel = "1.95.0"\n',
+        }
+        self.enterContext(patch.object(BUILD, 'command_output', side_effect=lambda argv: source_files[argv[-1]]))
+
+    def metadata(self, path):
+        if path.endswith('/workflows/ci.yml'):
+            return {'path': '.github/workflows/ci.yml', 'id': 10}
+        if path.endswith('/artifacts?per_page=100'):
+            return {'total_count': len(self.rows), 'artifacts': self.rows}
+        if path.endswith(f'/runs/{self.run_id}'):
+            return copy.deepcopy(self.run)
+        raise AssertionError(f'Unexpected metadata request {path}')
+
+    def stage(self):
+        return BUILD.stage_release(self.root, self.destination, self.repository,
+                                   self.source, self.run_id, self.attempt)
+
+    def test_one_successful_main_attempt_stages_all_five_archive_pairs(self):
+        self.stage()
+        self.assertEqual(self.download.call_count, 5)
+        self.assertEqual(sum(call.args[0].endswith('/artifacts?per_page=100')
+                             for call in self.lookup.call_args_list), 1)
+        receipt = json.loads((self.destination / 'native-release-provenance.json').read_text())
+        self.assertEqual(set(receipt['archives']), {'arch', 'debian', 'debian-trixie', 'ubuntu', 'fedora'})
+        for row, distro in zip(self.rows, BUILD.RELEASE_IMAGES, strict=True):
+            directory = self.destination / f'{distro}-build'
+            archive = directory / f'omg-v1.2.3-x86_64-linux-{distro}.tar.gz'
+            self.assertTrue(archive.is_file())
+            self.assertEqual({path.name for path in directory.iterdir()},
+                             {archive.name, archive.name + '.sha256'})
+            self.assertEqual(receipt['archives'][distro]['artifact_id'], row['id'])
+            self.assertEqual(receipt['archives'][distro]['archive_sha256'], BUILD.sha256(archive.read_bytes()))
+
+    def test_rejects_in_progress_failed_foreign_or_replaced_run(self):
+        original = dict(self.run)
+        for change in ({'status': 'in_progress', 'conclusion': None}, {'conclusion': 'failure'},
+                       {'head_branch': 'other'}, {'run_attempt': 2}):
+            with self.subTest(change=change):
+                self.run = dict(original, **change)
+                with self.assertRaises(ValueError):
+                    self.stage()
+        self.download.assert_not_called()
+        self.assertFalse(self.destination.exists())
+
+    def test_failed_last_archive_never_exposes_a_partial_batch(self):
+        self.rows[-1]['digest'] = 'sha256:' + '0' * 64
+        with self.assertRaisesRegex(ValueError, 'artifact digest'):
+            self.stage()
+        self.assertEqual(self.download.call_count, 5)
+        self.assertEqual(list(self.root.iterdir()), [])
+
+    def test_release_staging_requires_a_complete_macos_archive_when_requested(self):
+        def stage_all():
+            return BUILD.stage_release(self.root, self.destination, self.repository,
+                                       self.source, self.run_id, self.attempt, include_macos=True)
+
+        with self.assertRaisesRegex(ValueError, 'required macos release artifact'):
+            stage_all()
+        self.assertFalse(self.destination.exists())
+        self.download.assert_not_called()
+        arm64_macho = bytes.fromhex('cffaedfe0c0000010000000002000000') + bytes(16)
+        _, provenance, payload = fixture('macos', binary=arm64_macho)
+        content = bundle(provenance, payload)
+        self.rows.append(dict(self.rows[0], id=777, name='native-release-macos-1',
+                              digest='sha256:' + BUILD.sha256(content), size_in_bytes=len(content)))
+        self.downloads[f'repos/{self.repository}/actions/artifacts/777/zip'] = content
+        receipt = stage_all()
+        self.assertEqual(self.download.call_count, 6)
+        archive = self.destination / 'macos-build' / 'omg-v1.2.3-aarch64-darwin.tar.gz'
+        self.assertEqual(archive.read_bytes(), payload)
+        self.assertEqual(receipt['archives']['macos']['archive_sha256'], BUILD.sha256(payload))
+
+    def test_macos_archive_rejects_a_foreign_binary_even_with_matching_digests(self):
+        x86_macho = bytes.fromhex('cffaedfe070000010000000002000000') + bytes(16)
+        expected, provenance, payload = fixture('macos', binary=x86_macho)
+        content = bundle(provenance, payload)
+        with self.assertRaisesRegex(ValueError, 'not an ARM64 Mach-O executable'):
+            BUILD.validate_bundle(content, 'sha256:' + BUILD.sha256(content), expected)
+
+    def test_refuses_foreign_artifact_or_changed_attempt_after_download(self):
+        self.rows[0]['workflow_run']['head_sha'] = 'b' * 40
+        with self.assertRaisesRegex(ValueError, 'artifact identity'):
+            self.stage()
+        self.download.assert_not_called()
+        self.rows[0]['workflow_run']['head_sha'] = self.source
+        download = self.download.side_effect
+
+        def rerun_on_download(path):
+            self.run['run_attempt'] += 1
+            return download(path)
+
+        self.download.side_effect = rerun_on_download
+        with self.assertRaisesRegex(ValueError, 'attempt'):
+            self.stage()
+        self.assertEqual(list(self.root.iterdir()), [])
 
 
 class NativeBuildAdmission(unittest.TestCase):
@@ -311,8 +451,8 @@ class NativeBuildAdmission(unittest.TestCase):
         path = 'repos/omg-cli/omg/actions/artifacts/123/zip'
         timeout = subprocess.TimeoutExpired(['gh', 'api', path], 90)
         response = b'HTTP/1.1 200 OK\r\n\r\nverified bundle'
-        limit = BUILD.MAX_DOWNLOAD + BUILD.MAX_HTTP_HEADERS
-        with patch.object(BUILD, 'api', side_effect=[timeout, response]) as request, \
+        limit = BUILD.MAX_DOWNLOAD + transport.MAX_HTTP_HEADERS
+        with patch.object(transport, 'api', side_effect=[timeout, response]) as request, \
                 patch.object(BUILD.time, 'sleep') as sleep:
             self.assertEqual(BUILD.download_artifact(path), b'verified bundle')
         self.assertEqual(request.call_count, 2)
@@ -320,7 +460,7 @@ class NativeBuildAdmission(unittest.TestCase):
         self.assertTrue(request.call_args.kwargs['include_status'])
         sleep.assert_called_once_with(1)
 
-        with patch.object(BUILD, 'api', side_effect=timeout) as request, \
+        with patch.object(transport, 'api', side_effect=timeout) as request, \
                 patch.object(BUILD.time, 'sleep') as sleep:
             with self.assertRaises(subprocess.TimeoutExpired):
                 BUILD.download_artifact(path)
@@ -328,7 +468,7 @@ class NativeBuildAdmission(unittest.TestCase):
         self.assertEqual([call.args for call in sleep.call_args_list], [(1,), (2,)])
 
         rejected = subprocess.CalledProcessError(22, ['gh', 'api', path])
-        with patch.object(BUILD, 'api', side_effect=rejected) as request:
+        with patch.object(transport, 'api', side_effect=rejected) as request:
             with self.assertRaises(subprocess.CalledProcessError):
                 BUILD.download_artifact(path)
         self.assertEqual(request.call_count, 1)
@@ -508,7 +648,7 @@ class NativeBuildAdmission(unittest.TestCase):
                                GITHUB_RUN_ATTEMPT=str(run['run_attempt']))
                 event = {'number': 440, 'pull_request': {'head': {'sha': 'c'*40}}}
                 response = b'HTTP/1.1 200 OK\r\n\r\n' + data
-                with patch.object(BUILD, 'api_json', side_effect=lookup), patch.object(BUILD, 'api', return_value=response), \
+                with patch.object(BUILD, 'api_json', side_effect=lookup), patch.object(transport, 'api', return_value=response), \
                         patch.object(BUILD, 'command_output', return_value='a'*40), patch.object(BUILD.time, 'sleep'), \
                         patch.object(BUILD.time, 'monotonic', side_effect=range(0, 10000, 100)):
                     if mode in ('valid', 'in-progress', 'queued', 'queued-artifact',
@@ -633,7 +773,7 @@ class NativeBuildAdmission(unittest.TestCase):
                                GITHUB_RUN_ATTEMPT=str(selected_run['run_attempt']))
                 event = {'number': 440, 'pull_request': {'head': {'sha': 'c'*40}}}
                 response = b'HTTP/1.1 200 OK\r\n\r\n' + data
-                with patch.object(BUILD, 'api_json', side_effect=lookup), patch.object(BUILD, 'api', return_value=response), \
+                with patch.object(BUILD, 'api_json', side_effect=lookup), patch.object(transport, 'api', return_value=response), \
                         patch.object(BUILD, 'command_output', return_value='a'*40), patch.object(BUILD.time, 'sleep'), \
                         patch.object(BUILD.time, 'monotonic', side_effect=range(0, 10000, 100)):
                     if mode == 'valid':
@@ -705,6 +845,9 @@ class NativeBuildAdmission(unittest.TestCase):
             self.assertEqual(run.call_args.args[0][0:4], ['cargo', 'build', '--timings', '--release'])
             self.assertEqual(run.call_args.kwargs['env']['RUSTFLAGS'], '')
             payload = (root / 'output' / provenance['archive']).read_bytes()
+            checksum = root / 'output' / (provenance['archive'] + '.sha256')
+            self.assertEqual(checksum.read_bytes(),
+                             f"{BUILD.sha256(payload)}  {provenance['archive']}\n".encode())
             data = bundle(provenance, payload)
             expected = {key: provenance[key] for key in fixture()[0]}
             self.assertEqual(BUILD.validate_bundle(data, 'sha256:' + hashlib.sha256(data).hexdigest(), expected)[0], provenance)

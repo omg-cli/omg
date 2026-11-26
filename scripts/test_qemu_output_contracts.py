@@ -15,6 +15,7 @@ import unittest
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
+FEDORA_UPGRADE_QUERY = '--quiet --color=never --cacheonly --setopt=*.skip_if_unavailable=false list --upgrades'
 
 
 
@@ -2284,25 +2285,30 @@ esac
 """, 'dnf': "printf 'jq\tUser\n'\n"}
         preview = "[[ \"$1:$2:$3\" == remove:--dry-run:jq ]] || exit 70\n" \
                   "printf '%s\n' '  | Remove Preview' '    dry run' " \
-                  "'  → The following packages would be removed:' " \
-                  "'    ✗ jq.x86_64 1.8.1-3.fc44' " \
-                  "'    ✗ oniguruma.x86_64 6.9.10-3.fc44' " \
-                  "'  ℹ No changes made (dry run)'\n"
+                  "'Package Arch Version Repository Size' 'Removing:' " \
+                  "' jq x86_64 0:1.8.1-3.fc44 updates 1.0 MiB' " \
+                  "'Removing unused dependencies:' " \
+                  "' oniguruma x86_64 0:6.9.10-3.fc44 fedora 5.0 B' " \
+                  "'Transaction Summary:' ' Removing: 2 packages' '  ℹ No changes made (dry run)'\n"
         result, evidence, logs = self.run_inventory(preview, [row],
                                                    distro='fedora', native_commands=native)
         self.assertEqual(evidence[0]['result'], 'PASS',
                          f'{result.stdout}\n{result.stderr}\n{logs}')
-        for changed in ('jq', 'jq.i686', 'jq.x86_64 0.0-1'):
-            mutated = preview.replace('jq.x86_64 1.8.1-3.fc44',
-                                      changed if ' ' in changed else changed + ' 1.8.1-3.fc44')
+        for mutated in (
+            preview.replace('jq x86_64', 'jq i686'),
+            preview.replace('0:1.8.1-3.fc44', '0:0.0-1'),
+            preview.replace('0:1.8.1-3.fc44', '2:1.8.1-3.fc44'),
+            preview.replace("'Removing:'", "'Installing:'"),
+        ):
             result, evidence, logs = self.run_inventory(mutated, [row],
                                                        distro='fedora', native_commands=native)
             self.assertEqual(evidence[0]['result'], 'FAIL',
                              f'{result.stdout}\n{result.stderr}\n{logs}')
             self.assertIn('lacks the exact native installed package identity/version', logs['remove.log'])
         result, evidence, logs = self.run_inventory(
-            preview.replace("'    ✗ jq.x86_64 1.8.1-3.fc44'",
-                            "'    ✗ jq.x86_64 1.8.1-3.fc44' '    ✗ jq.x86_64 1.8.1-3.fc44'"),
+            preview.replace("'Removing unused dependencies:'",
+                            "' jq x86_64 0:1.8.1-3.fc44 updates 1.0 MiB' "
+                            "'Removing unused dependencies:'"),
             [row], distro='fedora', native_commands=native)
         self.assertEqual(evidence[0]['result'], 'FAIL', logs)
 
@@ -2366,7 +2372,7 @@ esac
                     trace.write_text(
                         '122 execve("/usr/bin/rpm", ["/usr/bin/rpm", "-qa"], 0x7ffd) = 0\n'
                         '123 execve("/usr/bin/dnf5", ["/usr/bin/dnf5", "--cacheonly", '
-                        '"--disable-repo=*", "check"], 0x7ffd /* 1 var */) = 0\n',
+                        '"check"], 0x7ffd /* 1 var */) = 0\n',
                         encoding='utf-8')
                     command = oracle + '\ncheck_doctor_native_backend "$1" "$2" "$3" "$4"\n'
                     def probe():
@@ -2406,7 +2412,7 @@ esac
                         output.write_text(healthy, encoding='utf-8')
                         trace.write_text(
                             '123 execve("/usr/bin/dnf5", ["/usr/bin/dnf5", "--cacheonly", '
-                            '"--disable-repo=*", "check"], 0x7ffd /* 1 var */) = 0\n',
+                            '"check"], 0x7ffd /* 1 var */) = 0\n',
                             encoding='utf-8')
                         self.assertEqual(probe().returncode, 1, 'Fedora health text without an RPM query is not proof')
                         trace.write_text('122 execve("/usr/bin/rpm", ["/usr/bin/rpm", "-qa"], 0x7ffd) = 0\n', encoding='utf-8')
@@ -2416,7 +2422,7 @@ esac
                         trace.write_text(
                             '122 execve("/usr/bin/rpm", ["/usr/bin/rpm", "-qa"], 0x7ffd) = 0\n'
                             '123 execve("/usr/bin/dnf5", ["/usr/bin/dnf5", "--cacheonly", '
-                            '"--disable-repo=*", "check"], 0x7ffd /* 1 var */) = 0\n',
+                            '"check"], 0x7ffd /* 1 var */) = 0\n',
                             encoding='utf-8')
                     output.write_text('  Arch Linux detected\n' if distro != 'arch'
                                       else '  Fedora/RHEL detected (dnf backend)\n', encoding='utf-8')
@@ -3114,7 +3120,15 @@ esac
         native = {
             'pacman': "printf 'alpha\\nbeta\\n'\n",
             'rpm': "printf 'alpha.x86_64\\nbeta.x86_64\\n'\n",
-            'dnf': "[[ \"$1\" == --cacheonly ]] || exit 19\nprintf 'alpha.x86_64\\nbeta.x86_64\\n'\n",
+            'dnf': (
+                'case " $* " in\n'
+                f'  " {FEDORA_UPGRADE_QUERY} ") [[ "$LC_ALL" == C ]] || exit 19;\n'
+                '    printf "Available upgrades\\nalpha.x86_64 2 updates\\n'
+                'alpha.x86_64 2 mirror\\nbeta.x86_64\\t3\\tupdates\\n" ;;\n'
+                '  " --cacheonly repoquery "*) printf "alpha.x86_64\\nbeta.x86_64\\n" ;;\n'
+                '  *) exit 19 ;;\n'
+                'esac\n'
+            ),
             'dpkg-query': "printf 'installed\\nconfig-files\\ninstalled\\n'\n",
             'apt-mark': "printf 'alpha\\nbeta\\n'\n",
             'apt-get': "[[ \"$1\" == -s && \"$2\" == autoremove ]] || exit 19\nprintf 'Reading lists...\\nRemv alpha [1.0]\\nRemv beta [2.0]\\n'\n",
@@ -3161,6 +3175,22 @@ esac
             self.assertEqual(evidence[0]['result'], verdict)
             self.assertEqual(result.returncode, int(verdict != 'PASS'))
 
+        fedora_updates = ['updates-shortcut\t["uc"]\tread\t0\tpass\t-\thermetic\thermetic:pass\tnative-count\ttempdir-drop']
+        for listing, verdict in (
+            ('', 'PASS'),
+            ('alpha.x86_64 2 updates\n', 'BLOCKED'),
+            ('Available upgrades\nalpha 2 updates\n', 'BLOCKED'),
+            ('Available upgrades\nalpha.x86_64 2 updates extra\n', 'BLOCKED'),
+        ):
+            with self.subTest(distro='fedora', native_listing=listing):
+                result, evidence, logs = self.run_inventory(
+                    'printf "0\\n"\n', fedora_updates,
+                    native_commands={'dnf': 'printf %s ' + shlex.quote(listing) + '\n'},
+                    distro='fedora',
+                )
+                self.assertEqual(evidence[0]['result'], verdict, logs)
+                self.assertEqual(result.returncode, int(verdict != 'PASS'), logs)
+
     @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
     def test_status_rows_require_distro_native_counts_instead_of_only_exit_zero(self):
         native = {
@@ -3170,7 +3200,14 @@ esac
             'apt-get': 'printf "Remv c [1.0]\\n"\n',
             'apt': 'printf "c/stable 2 amd64 [upgradable from: 1]\\n"\n',
             'rpm': 'printf "a.x86_64\\nb.x86_64\\nc.x86_64\\n"\n',
-            'dnf': 'case " $* " in *--userinstalled*) printf "a\\nb\\n" ;; *--unneeded*|*--upgrades*) printf "c\\n" ;; *) exit 17 ;; esac\n',
+            'dnf': (
+                'case " $* " in\n'
+                '  *" repoquery --userinstalled "*) printf "a\\nb\\n" ;;\n'
+                '  *" repoquery --unneeded "*) printf "c.x86_64\\n" ;;\n'
+                f'  " {FEDORA_UPGRADE_QUERY} ") printf "Available upgrades\\nc.x86_64 2 updates\\n" ;;\n'
+                '  *) exit 17 ;;\n'
+                'esac\n'
+            ),
         }
         rows = (
             'status\t["status","--fast"]\tread\t0\tpass\t-\thermetic\thermetic:pass\tstatus-native-fast\ttempdir-drop',
@@ -3218,7 +3255,10 @@ esac
         native = {
             'pacman': '[[ "$1" == -Quq ]] || exit 17\nprintf "c\\n"\n',
             'apt': 'printf "c/stable 2 amd64 [upgradable from: 1]\\n"\n',
-            'dnf': '[[ " $* " == *--upgrades* ]] || exit 17\nprintf "c.x86_64\\n"\n',
+            'dnf': (
+                f'[[ "$*" == "{FEDORA_UPGRADE_QUERY}" ]] || exit 17\n'
+                'printf "Available upgrades\\nc.x86_64 2 updates\\n"\n'
+            ),
         }
         rows = (
             'outdated\t["outdated"]\tread\t0\tpass\t-\thermetic\thermetic:pass\toutdated-native-count\ttempdir-drop',
@@ -3767,7 +3807,7 @@ export -f id sudo
         self.assertEqual(result.stdout, '')
 
     @unittest.skipIf(os.name == 'nt', 'Generated offline launch requires POSIX bash')
-    def test_offline_preview_launch_admits_only_the_exact_fedora_dry_run(self):
+    def test_offline_preview_launch_drops_privileges_for_fedora_dry_run(self):
         source = (ROOT / 'scripts/qemu-inventory.sh').read_text(encoding='utf-8')
         start = source.index('  if [[ "$network_scope" == offline ]]; then\n')
         launch = source[start:source.index('  budget=$(', start)]
@@ -3776,7 +3816,7 @@ export -f id sudo
                         requires='-', tier='hermetic', targets='hermetic:pass',
                         cleanup='tempdir-drop', network_scope='offline', ssh_user='fixture',
                         args_json='["remove","--dry-run","jq"]')
-        variants = [('exact native preview', {}, '0:retained')]
+        variants = [('exact native preview', {}, '1:dropped')]
         for key, value in (
             ('distro', 'arch'), ('distro', 'debian'), ('distro', 'ubuntu'), ('ssh_user', 'root'),
             ('case', 'other'), ('safety', 'package-mutation'),
@@ -3854,15 +3894,14 @@ while [[ "$1" != env ]]; do
 done
 exec "$@"
 """}
-        captured = ('sudo: The "no new privileges" flag is set, which prevents sudo from running as root.\n'
-                    'sudo: If sudo is running in a container, you may need to adjust the container configuration to disable the flag.\n')
         preview = ("[[ \"$1:$2:$3\" == remove:--dry-run:jq ]] || exit 70\n"
-                   + 'if [[ "$OMG_QEMU_TEST_NNP" == 1 ]]; then printf %s '
-                   + shlex.quote(captured) + ' >&2; exit 1; fi\n'
-                   + "printf '%s\\n' '  | Remove Preview' '    dry run' "
-                   "'  → The following packages would be removed:' "
-                   "'    ✗ jq.x86_64 1.8.1-3.fc44' "
-                   "'    ✗ oniguruma.x86_64 6.9.10-3.fc44' '  ℹ No changes made (dry run)'\n")
+                   "[[ \"$OMG_QEMU_TEST_NNP\" == 1 ]] || exit 71\n"
+                   "printf '%s\\n' '  | Remove Preview' '    dry run' "
+                   "'Package Arch Version Repository Size' 'Removing:' "
+                   "' jq x86_64 0:1.8.1-3.fc44 updates 1.0 MiB' "
+                   "'Removing unused dependencies:' "
+                   "' oniguruma x86_64 0:6.9.10-3.fc44 fedora 5.0 B' "
+                   "'Transaction Summary:' ' Removing: 2 packages' '  ℹ No changes made (dry run)'\n")
         result, evidence, logs = self.run_inventory(preview, [row], distro='fedora',
                                                    native_commands=native, isolation_scope='offline')
         self.assertEqual(result.returncode, 0, f'{result.stdout}\n{result.stderr}\n{logs}')
@@ -3873,7 +3912,7 @@ exec "$@"
              dict(native, rpm=native['rpm'].replace('-qa) ', '-qa) [[ ! -e native-state-changed ]] || { echo changed; exit 0; }; ')), 'FAIL'),
             ('native reasons changed', 'touch native-reason-changed\n' + preview,
              dict(native, dnf='[[ ! -e native-reason-changed ]] || { echo changed; exit 0; }\n' + native['dnf']), 'FAIL'),
-            ('wrong canonical identity', preview.replace('✗ jq.x86_64', '✗ jq.i686'), native, 'FAIL'),
+            ('wrong canonical identity', preview.replace('jq x86_64', 'jq i686'), native, 'FAIL'),
             ('silent product', 'exit 0\n', native, 'FAIL'),
             ('namespace setup failed', preview, dict(native, unshare='exit 73\n'), 'HARNESS_ERROR'),
         ):

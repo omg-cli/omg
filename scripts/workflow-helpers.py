@@ -25,6 +25,7 @@ import zipfile
 WORKFLOW = '.github/workflows/ci.yml'
 SHARDS = 2
 MAX_RECEIPT = 4 * 1024 * 1024
+QEMU_OUTPUT_CONTRACTS = 'scripts/test_qemu_output_contracts.py'
 PRIVILEGED_ID = 'test_qemu_health.HealthTests.test_native_systemd_collection'
 EXPORT_ID = 'test_export_qemu_evidence.DescriptorTests.test_root_owned_diagnostics_export_for_runner_without_changing_source'
 AUXILIARY = {
@@ -144,7 +145,15 @@ def discover(root):
 def selection(manifest, shard, shards):
     require(type(shard) is int and type(shards) is int and 0 <= shard < shards
             and shards in (1, SHARDS), 'invalid helper shard')
-    selected = [row for index, row in enumerate(manifest) if index % shards == shard]
+    qemu_output = [row for row in manifest if row['path'] == QEMU_OUTPUT_CONTRACTS]
+    if shards == SHARDS and qemu_output:
+        # Hosted output contracts take about 270s. Put them on the shard
+        # that does not also prepare the Worker and privileged probes.
+        selected = qemu_output if shard == 1 else [
+            row for row in manifest if row['path'] != QEMU_OUTPUT_CONTRACTS
+        ]
+    else:
+        selected = [row for index, row in enumerate(manifest) if index % shards == shard]
     require(selected, 'unexpectedly empty helper shard')
     return selected
 
@@ -482,35 +491,14 @@ class GitHub:
         self.deadline = deadline
 
     def request(self, endpoint, binary=False):
-        # Reuse the native admission transport/header parser; clip every retry
-        # to this owner's one absolute deadline instead of renewing a request budget.
         spec = importlib.util.spec_from_file_location('helper_native_transport', Path(__file__).with_name('native-build-artifact.py'))
         transport = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(transport)
-        metadata_limit = 1024 * 1024
-        for attempt in range(3):
-            remaining = self.deadline - time.monotonic()
-            require(remaining > 0, 'helper admission deadline exhausted')
-            try:
-                content = transport.api(endpoint, MAX_RECEIPT if binary else metadata_limit + transport.MAX_HTTP_HEADERS,
-                                        include_status=not binary, timeout=min(60, remaining))
-            except (subprocess.TimeoutExpired, subprocess.CalledProcessError) as error:
-                if isinstance(error, subprocess.CalledProcessError):
-                    if binary or not error.output or not error.output.startswith(b'HTTP/'):
-                        raise
-                    status, _, retry_after = transport.http_response(error.output, metadata_limit)
-                    if status not in (502, 503, 504) or retry_after:
-                        raise
-                delay = 2 ** attempt
-                if attempt == 2 or self.deadline - time.monotonic() <= delay:
-                    raise
-                time.sleep(delay)
-            else:
-                if binary:
-                    return content
-                status, content, _ = transport.http_response(content, metadata_limit)
-                require(200 <= status < 300, 'unsuccessful helper metadata response')
-                return read_json(content)
+        remaining = self.deadline - time.monotonic()
+        require(remaining > 0, 'helper admission deadline exhausted')
+        if binary:
+            return transport.request_body(endpoint, MAX_RECEIPT, remaining, 'artifact')
+        return read_json(transport.request_body(endpoint, 1024 * 1024, remaining, 'metadata'))
 
     def listing(self, endpoint, field):
         # Same complete-list semantics as coverage admission: no partial or changing pages.
@@ -594,6 +582,7 @@ def unpack_receipt(content, artifact):
 
 
 def admit_pair(api, root, repository, run, source, manifest=None, expected_ref='refs/heads/main'):
+    owners = [owner(api, repository, run, shard) for shard in range(SHARDS)]
     manifest = discover(root) if manifest is None else manifest
     remaining = getattr(api, 'deadline', time.monotonic() + 20) - time.monotonic()
     require(remaining > 0, 'helper admission deadline exhausted')
@@ -601,8 +590,7 @@ def admit_pair(api, root, repository, run, source, manifest=None, expected_ref='
                                    text=True, timeout=min(20, remaining)).strip()
     artifacts = api.listing(f'repos/{repository}/actions/runs/{run["id"]}/artifacts', 'artifacts')
     admitted = []
-    for shard in range(SHARDS):
-        attempt, producer = owner(api, repository, run, shard)
+    for shard, (attempt, producer) in enumerate(owners):
         name = f'workflow-helpers-{run["id"]}-{attempt}-{shard}-of-{SHARDS}'
         selected = [row for row in artifacts if row.get('name') == name]
         require(len(selected) == 1, 'missing or ambiguous helper artifact')

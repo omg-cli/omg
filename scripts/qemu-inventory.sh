@@ -222,7 +222,7 @@ check_native_counter() {
     fedora:tc) native=(rpm -qa --qf '%{NAME}.%{ARCH}\n') ;;
     fedora:ec) native=(dnf --cacheonly repoquery --userinstalled --qf '%{name}\n') ;;
     fedora:oc) native=(dnf --cacheonly repoquery --unneeded --qf '%{name}.%{arch}\n') ;;
-    fedora:uc) native=(dnf --cacheonly repoquery --upgrades --latest-limit=1 --qf '%{name}.%{arch}\n') ;;
+    fedora:uc) native=(env LC_ALL=C dnf --quiet --color=never --cacheonly '--setopt=*.skip_if_unavailable=false' list --upgrades) ;;
     *) return 2 ;;
   esac
   timeout --kill-after=2s 30 "${native[@]}" > native-counter.raw 2> native-counter.stderr || status=$?
@@ -239,7 +239,13 @@ check_native_counter() {
       debian:tc|debian-trixie:tc|ubuntu:tc) awk '$0 == "installed" {n++} END {print n+0}' native-counter.raw ;;
       debian:oc|debian-trixie:oc|ubuntu:oc) awk '/^Remv / {n++} END {print n+0}' native-counter.raw ;;
       debian:uc|debian-trixie:uc|ubuntu:uc) awk '$1 ~ /\// {n++} END {print n+0}' native-counter.raw ;;
-      *:ec|fedora:oc|fedora:uc) sort -u native-counter.raw | awk 'NF {n++} END {print n+0}' ;;
+      fedora:uc) LC_ALL=C awk '
+        NF == 0 { next }
+        !heading && $0 == "Available upgrades" { heading = 1; next }
+        !heading || NF != 3 || $1 !~ /.+[.][^.]+$/ || ($1 $2 $3) ~ /[[:cntrl:]]/ { invalid = 1; next }
+        !seen[$1]++ { n++ }
+        END { if (invalid) exit 1; print n+0 }' native-counter.raw ;;
+      *:ec|fedora:oc) sort -u native-counter.raw | awk 'NF {n++} END {print n+0}' ;;
       *) awk 'NF {n++} END {print n+0}' native-counter.raw ;;
     esac
   ) || { printf 'native counter reference processing failed\n' >&2; return 2; }
@@ -446,7 +452,7 @@ check_doctor_native_backend() {
           return 2
         fi
         local dnf_exec_line
-        if ! dnf_exec_line=$(grep -Em 1 'execve\("(/usr/bin|/usr/sbin)/dnf5", \["[^"]+", "--cacheonly", "--disable-repo=\*", "check"\], .*\) = 0$' "$exec_receipt"); then
+        if ! dnf_exec_line=$(grep -Em 1 'execve\("(/usr/bin|/usr/sbin)/dnf5", \["[^"]+", "--cacheonly", "check"\], .*\) = 0$' "$exec_receipt"); then
           printf 'assertion failed: doctor did not execute the trusted offline DNF5 package database check\n' >&2
           return 1
         fi
@@ -852,6 +858,16 @@ native_installed_identity() {
 check_native_remove_preview() {
   local output=$1 version=$2 identity=${3:-bash} distro=${4:-}
   awk -v version="$version" -v identity="$identity" -v distro="$distro" '
+    distro == "fedora" {
+      if (/^Removing( dependent packages| unused dependencies)?:$/) in_list = 1;
+      else if (/^[^[:space:]]/ || !NF) in_list = 0;
+      else if (in_list && $1 "." $2 == identity) {
+        found++;
+        sub(/^0:/, "", $3);
+        if (NF < 5 || $3 != version) invalid = 1;
+      }
+      next;
+    }
     /The following .*packages would be removed:/ { in_list = 1; next }
     /No changes made \(dry run\)/ { in_list = 0 }
     in_list && $1 == "✗" && $2 == identity {
@@ -3415,18 +3431,7 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
       # network namespace while running the lifecycle itself as the SSH user.
       remote="sudo -n unshare --net -- sudo -n -u '$ssh_user' env HOME=\"\$HOME\" USER='$ssh_user' LOGNAME='$ssh_user' $remote"
     else
-      # Native DNF5 stored-plan resolution requires authenticated root even
-      # for a dry run. Admit only this exact validated, prerequisite-free row;
-      # keep its initial user/group/capability drop and offline namespace.
       native_privilege=false
-      if [[ "$distro" == fedora && "$case" == remove && "$safety" == read
-            && "$assertions" == package-dry-run-remove && "${row_exit[$case]}" == 0
-            && "$expected_ux" == pass && "$requires" == - && ${#chain[@]} == 0
-            && "$tier" == hermetic && "$targets" == hermetic:pass
-            && "$cleanup" == tempdir-drop && "$ssh_user" != root ]] \
-        && jq -e '. == ["remove", "--dry-run", "jq"]' <<< "$args_json" >/dev/null; then
-        native_privilege=true
-      fi
       # Doctor must seed and remove a capability on its private exact-copy
       # executable through authenticated sudo. Keep this exception row-exact;
       # no_new_privs or a dropped bounding set prevents that native transition.

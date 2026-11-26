@@ -442,11 +442,11 @@ type StatusSnapshot = (
 /// A missing daemon or binary cache falls back to a direct query, but a failed
 /// direct query is an error rather than a fake "healthy" zero report.
 fn read_status_snapshot() -> Result<StatusSnapshot> {
-    crate::package_managers::resolve_backend()?;
+    let backend = crate::package_managers::resolve_backend()?;
     // Use the same isolated fixture as JSON and async status. Native fast
     // readers may provide their own fixed test records and must not override
     // the explicit adapter (or read a real daemon cache in root-run tests).
-    if crate::core::paths::test_mode() {
+    if backend == crate::package_managers::Backend::Mock {
         let counts = crate::package_managers::get_system_status()?;
         return Ok((counts.0, counts.1, counts.2, counts.3, None, None));
     }
@@ -527,6 +527,16 @@ fn status_requires_backend() -> Result<StatusSnapshot> {
 }
 
 pub fn status_sync() -> Result<()> {
+    #[cfg(all(unix, feature = "fedora"))]
+    if matches!(
+        crate::package_managers::resolve_backend(),
+        Ok(crate::package_managers::Backend::Fedora)
+    ) {
+        return crate::cli::tea::async_bridge::run_blocking_future(crate::cli::packages::status(
+            false,
+        ))?;
+    }
+
     let (total, explicit, orphans, updates, security_vulnerabilities, cached_runtimes) =
         read_status_snapshot()?;
 
@@ -538,14 +548,29 @@ pub fn status_sync() -> Result<()> {
         advisory_coverage: security_vulnerabilities,
         ..crate::cli::tea::StatusData::default()
     };
+    print_system_status(
+        &report,
+        cached_runtimes,
+        #[cfg(unix)]
+        false,
+    );
+    Ok(())
+}
+
+pub(super) fn print_system_status(
+    report: &crate::cli::tea::StatusData,
+    cached_runtimes: Option<Vec<(String, String)>>,
+    #[cfg(unix)] confirmed_running: bool,
+) {
     print!("{}", report.render());
 
     // Daemon status: a stale socket node is not a running daemon.
     #[cfg(unix)]
     {
-        let running = crate::core::client::SyncDaemonClient::acquire()
-            .and_then(|mut client| client.ping())
-            .is_ok();
+        let running = confirmed_running
+            || crate::core::client::SyncDaemonClient::acquire()
+                .and_then(|mut client| client.ping())
+                .is_ok();
         if running {
             println!(
                 "  {} {}",
@@ -581,7 +606,10 @@ pub fn status_sync() -> Result<()> {
         }
     }
 
-    if security_vulnerabilities != Some((0, 0)) {
+    #[cfg(not(unix))]
+    let _ = cached_runtimes;
+
+    if report.advisory_coverage != Some((0, 0)) {
         println!(
             "\n  Check vulnerabilities with {}",
             style::accent("omg audit")
@@ -589,7 +617,6 @@ pub fn status_sync() -> Result<()> {
     }
 
     println!();
-    Ok(())
 }
 
 /// Show system metrics in Prometheus format

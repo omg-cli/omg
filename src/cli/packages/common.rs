@@ -13,6 +13,16 @@ use anyhow::Result;
 
 pub(crate) use crate::core::packages::search::validate_search_query;
 
+#[cfg(feature = "fedora")]
+pub(super) fn print_dnf_preview(plan: &str, diagnostics: &str) {
+    for line in plan.lines() {
+        println!("{}", crate::cli::style::sanitize_terminal_text(line));
+    }
+    for line in diagnostics.lines() {
+        eprintln!("{}", crate::cli::style::sanitize_terminal_text(line));
+    }
+}
+
 /// Check if a search query passes validation (returns false on failure).
 ///
 /// Convenience wrapper for sync code paths that return `bool` instead of `Result`.
@@ -127,6 +137,19 @@ pub(crate) enum UpdateMode {
     Turbo,
 }
 
+fn select_native_update<T>(
+    mode: UpdateMode,
+    no_sync: bool,
+    cached: impl FnOnce() -> Option<T>,
+    standard: impl FnOnce() -> Option<T>,
+) -> Option<T> {
+    match mode {
+        UpdateMode::Turbo => cached(),
+        UpdateMode::Standard if no_sync => cached().or_else(standard),
+        UpdateMode::Standard | UpdateMode::Fast => standard(),
+    }
+}
+
 #[expect(clippy::fn_params_excessive_bools)] // Maps to --check / --yes / --dry-run / --no-sync
 pub(crate) async fn update_official_only(
     check_only: bool,
@@ -230,14 +253,36 @@ pub(crate) async fn update_official_only(
     let pb =
         crate::cli::modern_ui::modern_spinner("Upgrading", &format!("{count} official packages"));
     let history = crate::core::history::HistoryManager::new()?;
-    let native_operation = match mode {
-        UpdateMode::Turbo => pm.transact_cached_update_with_history(Some(&history)),
-        UpdateMode::Standard | UpdateMode::Fast => pm.transact_with_history(
-            crate::core::history::TransactionType::Update,
-            &[],
-            Some(&history),
-        ),
-    };
+    #[cfg(feature = "fedora")]
+    if crate::package_managers::resolve_backend()? == crate::package_managers::Backend::Fedora {
+        let cached =
+            matches!(mode, UpdateMode::Turbo) || matches!(mode, UpdateMode::Standard) && no_sync;
+        let changes = crate::package_managers::DnfPackageManager::new()
+            .update_with_history(cached, Some(&history))
+            .await;
+        pb.finish_and_clear();
+        if let Some(changes) = changes?.filter(|&count| count != 0) {
+            let label = if changes == 1 { "change" } else { "changes" };
+            crate::cli::modern_ui::print_success(&format!(
+                "System updated successfully · {changes} package {label}"
+            ));
+            crate::core::usage::track_update_result(changes, true);
+        }
+        return Ok(());
+    }
+
+    let native_operation = select_native_update(
+        mode,
+        no_sync,
+        || pm.transact_cached_update_with_history(Some(&history)),
+        || {
+            pm.transact_with_history(
+                crate::core::history::TransactionType::Update,
+                &[],
+                Some(&history),
+            )
+        },
+    );
     if let Some(operation) = native_operation {
         operation.await?;
     } else {
@@ -266,7 +311,7 @@ async fn confirm_proceed_with_upgrade() -> Result<bool> {
 ///
 /// Download sizes are unknown without resolving dependencies, so none are
 /// claimed.
-/// Also used by Fedora and Homebrew when included in an additive build.
+/// Also used by Homebrew when included in an additive build.
 pub(crate) fn update_official_only_dry_run(updates: &[UpdateInfo]) -> Result<()> {
     updates
         .iter()
@@ -341,7 +386,13 @@ pub(crate) async fn remove_with_manager(
     use crate::core::packages::PackageService;
 
     let service = PackageService::new(manager)?;
+    report_removal(packages, service.remove(packages)).await
+}
 
+pub(crate) async fn report_removal(
+    packages: &[String],
+    operation: impl Future<Output = Result<()>>,
+) -> Result<()> {
     crate::cli::modern_ui::print_phase_header(
         "🗑️",
         "Remove",
@@ -349,7 +400,7 @@ pub(crate) async fn remove_with_manager(
     );
     println!();
 
-    let result = service.remove(packages).await;
+    let result = operation.await;
 
     crate::core::usage::track_remove_result(result.is_ok());
 
@@ -359,6 +410,74 @@ pub(crate) async fn remove_with_manager(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn standard_updates_select_cached_or_refreshable_native_upgrade() {
+        for (no_sync, expected) in [(true, "cached plan"), (false, "refreshable plan")] {
+            let selected = select_native_update(
+                UpdateMode::Standard,
+                no_sync,
+                || Some("cached plan"),
+                || Some("refreshable plan"),
+            );
+            assert_eq!(selected, Some(expected));
+        }
+    }
+
+    #[test]
+    fn standard_no_sync_keeps_the_native_upgrade_when_cached_admission_is_unavailable() {
+        let selected =
+            select_native_update(UpdateMode::Standard, true, || None, || Some("native plan"));
+        assert_eq!(selected, Some("native plan"));
+    }
+
+    #[test]
+    fn fast_updates_use_the_standard_plan_and_turbo_keeps_cached_metadata() {
+        for (mode, expected) in [
+            (UpdateMode::Fast, "native plan"),
+            (UpdateMode::Turbo, "cached plan"),
+        ] {
+            assert_eq!(
+                select_native_update(mode, false, || Some("cached plan"), || Some("native plan")),
+                Some(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn no_sync_official_update_runs_with_a_backend_without_cached_admission() -> Result<()> {
+        use crate::package_managers::{Backend, PackageManager, mock::MockPackageManager};
+        use anyhow::Context;
+
+        const NAME: &str = "cli::packages::common::tests::no_sync_official_update_runs_with_a_backend_without_cached_admission";
+        if crate::core::testing::run_isolated_test(NAME) {
+            return Ok(());
+        }
+        let fixture = tempfile::tempdir()?;
+        let data = fixture.path().to_str().context("Mock package directory")?;
+        temp_env::with_vars(
+            [
+                ("OMG_TEST_MODE", Some("1")),
+                ("OMG_TEST_DISTRO", Some("debian")),
+                ("OMG_DISABLE_DAEMON", Some("1")),
+                ("OMG_NATIVE_TEST_DATA_DIR", Some("1")),
+                ("OMG_DATA_DIR", Some(data)),
+            ],
+            || {
+                assert_eq!(crate::package_managers::resolve_backend()?, Backend::Mock);
+                let manager = MockPackageManager::new_in("debian", fixture.path());
+                manager.set_installed_version("curl", "1.0.0")?;
+                manager.set_available_version("curl", "2.0.0")?;
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?
+                    .block_on(async {
+                        assert_eq!(manager.list_updates().await?.len(), 1);
+                        update_official_only(false, true, false, true, UpdateMode::Standard).await
+                    })
+            },
+        )
+    }
 
     /// The Arch update lane calls this after every sync: with no daemon it
     /// must be a quiet no-op, never a failure that aborts the update.

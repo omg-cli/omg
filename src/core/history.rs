@@ -76,7 +76,35 @@ impl HistoryManager {
     /// Creates a manager backed by the default history file in the data
     /// directory.
     pub fn new() -> Result<Self> {
-        Self::new_in(crate::core::paths::data_dir().join("history.json"))
+        Self::new_in(Self::default_log_path())
+    }
+
+    fn default_log_path() -> PathBuf {
+        crate::core::paths::data_dir().join("history.json")
+    }
+
+    /// Reads the default history without initializing a new store.
+    pub(crate) fn load_existing() -> Result<Vec<Transaction>> {
+        let manager = Self {
+            log_path: Self::default_log_path(),
+        };
+        // Writers create the lock before publishing either history file.
+        for path in [
+            &manager.lock_path(),
+            &manager.log_path,
+            &manager.archive_path(),
+        ] {
+            match path.symlink_metadata() {
+                Ok(_) => return manager.load(),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("Failed to inspect package history: {}", path.display())
+                    });
+                }
+            }
+        }
+        Ok(Vec::new())
     }
 
     /// Creates a manager backed by an explicit history file path (tests,
@@ -360,18 +388,23 @@ impl HistoryManager {
 
     /// Append retired transactions to the `<log>.archive.jsonl` file, one
     /// JSON object per line. Runs inside the history lock, so the archive
-    /// preserves global append order.
+    /// preserves global append order and can finish an interrupted retirement.
     fn archive_drained(&self, drained: &[Transaction]) -> Result<()> {
         if drained.is_empty() {
             return Ok(());
         }
-        let archive_path = self.archive_path();
-        let mut content = Vec::new();
+        let mut pending = std::collections::HashMap::with_capacity(drained.len());
         for transaction in drained {
-            serde_json::to_writer(&mut content, transaction)
-                .context("Failed to serialize archived transaction")?;
-            content.push(b'\n');
+            let previous = pending.insert(transaction.id.as_str(), (transaction, false));
+            if let Some((prior, _)) = previous {
+                anyhow::ensure!(
+                    prior == transaction,
+                    "Conflicting history records for transaction {}; original files retained for recovery",
+                    transaction.id
+                );
+            }
         }
+        let archive_path = self.archive_path();
         let mut options = fs::OpenOptions::new();
         options.create(true).read(true).append(true);
         #[cfg(unix)]
@@ -394,14 +427,30 @@ impl HistoryManager {
         for transaction in serde_json::Deserializer::from_reader(std::io::BufReader::new(&archive))
             .into_iter::<Transaction>()
         {
-            transaction.with_context(|| {
+            let transaction = transaction.with_context(|| {
                 format!(
                     "Failed to validate history archive at {}; original file retained for recovery",
                     archive_path.display()
                 )
             })?;
+            if let Some((retiring, already_archived)) = pending.get_mut(transaction.id.as_str()) {
+                anyhow::ensure!(
+                    *retiring == &transaction,
+                    "Conflicting history records for transaction {}; original files retained for recovery",
+                    transaction.id
+                );
+                *already_archived = true;
+            }
         }
-        if metadata.len() > 0 {
+        let mut content = Vec::new();
+        for transaction in drained {
+            if let Some((_, false)) = pending.remove(transaction.id.as_str()) {
+                serde_json::to_writer(&mut content, transaction)
+                    .context("Failed to serialize archived transaction")?;
+                content.push(b'\n');
+            }
+        }
+        if metadata.len() > 0 && !content.is_empty() {
             let mut last_byte = [0];
             archive
                 .seek(std::io::SeekFrom::End(-1))
@@ -432,6 +481,8 @@ impl HistoryManager {
             }
             return Err(error);
         }
+        // A previous writer may have stopped before the archive or its new
+        // directory entry reached disk. Sync again before discarding live rows.
         archive
             .sync_all()
             .context("Failed to sync retired history before replacing the live log")?;
@@ -451,8 +502,12 @@ impl HistoryManager {
         }
     }
 
+    fn lock_path(&self) -> PathBuf {
+        self.log_path.with_extension("lock")
+    }
+
     fn with_history_lock<T>(&self, op: impl FnOnce() -> Result<T>) -> Result<T> {
-        let lock_path = self.log_path.with_extension("lock");
+        let lock_path = self.lock_path();
         let mut options = fs::OpenOptions::new();
         options.create(true).read(true).write(true).truncate(false);
         #[cfg(unix)]
@@ -482,6 +537,41 @@ impl HistoryManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn reading_default_history_leaves_missing_state_untouched() -> Result<()> {
+        const NAME: &str =
+            "core::history::tests::reading_default_history_leaves_missing_state_untouched";
+        if crate::config::Settings::rerun_test_unprivileged(NAME)
+            || crate::core::testing::run_isolated_test(NAME)
+        {
+            return Ok(());
+        }
+        let directory = tempfile::tempdir()?;
+        let store = directory.path().join("state");
+        temp_env::with_var("OMG_DATA_DIR", Some(&store), || -> Result<()> {
+            assert!(HistoryManager::load_existing()?.is_empty());
+            assert!(!store.exists());
+
+            fs::write(&store, b"invalid store")?;
+            let error = HistoryManager::load_existing().expect_err("a file cannot store history");
+            assert!(
+                error
+                    .to_string()
+                    .contains("Failed to inspect package history")
+            );
+            assert_eq!(fs::read(&store)?, b"invalid store");
+            fs::remove_file(&store)?;
+
+            let manager = HistoryManager::new_in(store.join("history.json"))?;
+            manager.save(&[])?;
+            let before = fs::read(&manager.log_path)?;
+            assert!(HistoryManager::load_existing()?.is_empty());
+            assert_eq!(fs::read(&manager.log_path)?, before);
+            Ok(())
+        })
+    }
 
     #[cfg(unix)]
     #[test]
@@ -623,6 +713,8 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn failed_archive_append_restores_its_original_bytes() -> Result<()> {
+        use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
+
         const CHILD: &str = "OMG_TEST_PARTIAL_ARCHIVE_CHILD";
         if std::env::var_os(CHILD).is_none() {
             let output = std::process::Command::new("bash")
@@ -630,7 +722,7 @@ mod tests {
                     "--noprofile",
                     "--norc",
                     "-c",
-                    "trap '' XFSZ; ulimit -f 1 || exit; exec \"$@\"",
+                    "trap '' XFSZ; exec \"$@\"",
                     "archive-size-limit",
                 ])
                 .arg(std::env::current_exe()?)
@@ -640,8 +732,6 @@ mod tests {
                     "--nocapture",
                 ])
                 .env_remove("BASH_ENV")
-                // The intentional file limit must not truncate an inherited coverage profile.
-                .env("LLVM_PROFILE_FILE", "/dev/null")
                 .env(CHILD, "1")
                 .output()?;
             print!("{}", String::from_utf8_lossy(&output.stdout));
@@ -663,15 +753,30 @@ mod tests {
         let encoded = serde_json::to_vec(&transaction)?;
         let mut terminated = encoded.clone();
         terminated.push(b'\n');
+        let retiring: Vec<_> = (0..16)
+            .map(|index| Transaction {
+                id: format!("large-archive-append-{index}"),
+                ..transaction.clone()
+            })
+            .collect();
         for original in [terminated.as_slice(), encoded.as_slice(), &[]] {
             let directory = tempfile::tempdir()?;
             let manager = HistoryManager::new_in(directory.path().join("history.json"))?;
             manager.save(std::slice::from_ref(&transaction))?;
             let live = fs::read(&manager.log_path)?;
             fs::write(manager.archive_path(), original)?;
-            let error = manager
-                .with_history_lock(|| manager.archive_drained(&vec![transaction.clone(); 16]))
-                .expect_err("the file-size limit must interrupt the append");
+            let saved = getrlimit(Resource::Fsize);
+            setrlimit(
+                Resource::Fsize,
+                Rlimit {
+                    current: Some(1024),
+                    maximum: saved.maximum,
+                },
+            )
+            .expect("limit writes in the disposable archive child");
+            let append = manager.with_history_lock(|| manager.archive_drained(&retiring));
+            setrlimit(Resource::Fsize, saved).expect("restore the limit before coverage flush");
+            let error = append.expect_err("the file-size limit must interrupt the append");
             assert_eq!(
                 error
                     .downcast_ref::<std::io::Error>()
@@ -719,7 +824,11 @@ mod tests {
         let original = serde_json::to_vec(&transaction)?;
         fs::write(manager.archive_path(), &original)?;
 
-        manager.archive_drained(std::slice::from_ref(&transaction))?;
+        let next = Transaction {
+            id: uuid::Uuid::new_v4().to_string(),
+            ..transaction.clone()
+        };
+        manager.archive_drained(std::slice::from_ref(&next))?;
         let archive = fs::read_to_string(manager.archive_path())?;
         assert!(archive.as_bytes().starts_with(&original));
         assert_eq!(
@@ -727,8 +836,8 @@ mod tests {
             2,
             "append must separate JSONL records"
         );
-        for line in archive.lines() {
-            assert_eq!(serde_json::from_str::<Transaction>(line)?, transaction);
+        for (line, expected) in archive.lines().zip([transaction, next]) {
+            assert_eq!(serde_json::from_str::<Transaction>(line)?, expected);
         }
         Ok(())
     }
@@ -761,6 +870,78 @@ mod tests {
         );
         assert_eq!(fs::read(&manager.log_path)?, original_live);
         assert_eq!(fs::read(manager.archive_path())?, original_archive);
+        Ok(())
+    }
+
+    #[test]
+    fn retrying_retirement_preserves_archived_records_and_refuses_conflicts() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let manager = HistoryManager::new_in(directory.path().join("history.json"))?;
+        let history: Vec<_> = (0..MAX_HISTORY_TRANSACTIONS)
+            .map(|index| Transaction {
+                id: format!("existing-{index}"),
+                timestamp: Timestamp::now(),
+                transaction_type: TransactionType::Install,
+                changes: Vec::new(),
+                success: true,
+            })
+            .collect();
+        let oldest = &history[0];
+        let mut conflict = oldest.clone();
+        conflict.success = false;
+
+        for archived in [oldest, &conflict] {
+            manager.save(&history)?;
+            let original_live = fs::read(&manager.log_path)?;
+            let original_archive = serde_json::to_vec(archived)?;
+            fs::write(manager.archive_path(), &original_archive)?;
+
+            let result = manager.add_transaction(TransactionType::Sync, Vec::new(), true);
+            if archived == oldest {
+                result?;
+                let loaded = manager.load()?;
+                assert_eq!(loaded.len(), MAX_HISTORY_TRANSACTIONS + 1);
+                assert_eq!(&loaded[..history.len()], history.as_slice());
+                assert_eq!(
+                    loaded.last().unwrap().transaction_type,
+                    TransactionType::Sync
+                );
+            } else {
+                let error = result.expect_err("a conflicting retirement must be refused");
+                assert!(error.to_string().contains("Conflicting history records"));
+                assert_eq!(fs::read(&manager.log_path)?, original_live);
+            }
+            assert_eq!(fs::read(manager.archive_path())?, original_archive);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn retirement_deduplicates_identical_live_rows_and_refuses_conflicting_rows() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let manager = HistoryManager::new_in(directory.path().join("history.json"))?;
+        let first = Transaction {
+            id: "retired-transaction".into(),
+            timestamp: Timestamp::now(),
+            transaction_type: TransactionType::Install,
+            changes: Vec::new(),
+            success: true,
+        };
+        let mut conflict = first.clone();
+        conflict.success = false;
+
+        let error = manager
+            .with_history_lock(|| manager.archive_drained(&[first.clone(), conflict]))
+            .expect_err("conflicting live records must not open the archive");
+        assert!(error.to_string().contains("Conflicting history records"));
+        assert!(!manager.archive_path().exists());
+
+        manager.with_history_lock(|| manager.archive_drained(&[first.clone(), first.clone()]))?;
+        let archived: Vec<Transaction> = fs::read_to_string(manager.archive_path())?
+            .lines()
+            .map(serde_json::from_str)
+            .collect::<serde_json::Result<_>>()?;
+        assert_eq!(archived, vec![first]);
         Ok(())
     }
 

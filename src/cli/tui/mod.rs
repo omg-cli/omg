@@ -1,8 +1,11 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+    terminal::{
+        Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
+        enable_raw_mode,
+    },
 };
 use futures::FutureExt;
 use ratatui::{Terminal, backend::CrosstermBackend};
@@ -142,7 +145,6 @@ fn cleanup_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Re
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
-    terminal.clear()?;
     Ok(())
 }
 
@@ -155,9 +157,21 @@ fn suspend_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Re
 
 fn resume_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
     enable_raw_mode()?;
-    execute!(terminal.backend_mut(), EnterAlternateScreen)?;
+    redraw_alternate_screen(terminal)
+}
+
+fn redraw_alternate_screen(
+    terminal: &mut Terminal<CrosstermBackend<impl io::Write>>,
+) -> Result<()> {
+    execute!(
+        terminal.backend_mut(),
+        EnterAlternateScreen,
+        Clear(ClearType::All)
+    )?;
     terminal.hide_cursor()?;
-    terminal.clear()?;
+    // Reset both draw buffers to match the cleared alternate screen.
+    terminal.current_buffer_mut().reset();
+    terminal.swap_buffers();
     Ok(())
 }
 
@@ -165,6 +179,23 @@ async fn run_app(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut app::App,
 ) -> Result<()> {
+    let (poll_input, input_requests) = std::sync::mpsc::sync_channel::<()>(1);
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(1);
+    // Poll and read on one thread. Between requests, package actions own the terminal.
+    std::thread::Builder::new()
+        .name("omg-terminal-input".to_owned())
+        .spawn(move || {
+            while input_requests.recv().is_ok() {
+                let event = event::poll(Duration::from_millis(POLL_TIMEOUT_MS)).and_then(|ready| {
+                    if ready {
+                        event::read().map(Some)
+                    } else {
+                        Ok(None)
+                    }
+                });
+                let _ = event_tx.blocking_send(event);
+            }
+        })?;
     let mut last_search = String::new();
     let mut next_search_id = 0;
     let mut search_request = None;
@@ -172,6 +203,8 @@ async fn run_app(
     let (search_tx, mut search_rx) = tokio::sync::mpsc::unbounded_channel::<SearchCompletion>();
     let (team_tx, mut team_rx) =
         tokio::sync::mpsc::unbounded_channel::<Option<crate::core::env::team::TeamStatus>>();
+    let mut history_refresh = None;
+    let mut history_refresh_requested = app.external_refresh_enabled;
     #[cfg(unix)]
     let (daemon_tx, mut daemon_rx) = tokio::sync::mpsc::unbounded_channel::<(
         bool,
@@ -211,10 +244,7 @@ async fn run_app(
         #[cfg(unix)]
         while let Ok((connected, status)) = daemon_rx.try_recv() {
             daemon_refresh_in_flight = false;
-            app.daemon_connected = connected;
-            if let Some(status) = status {
-                app.status = Some(status);
-            }
+            app.apply_daemon_status(connected, status);
         }
         while let Ok(remote_status) = team_rx.try_recv() {
             team_refresh_in_flight = false;
@@ -226,14 +256,36 @@ async fn run_app(
             }
         }
 
+        if history_refresh
+            .as_ref()
+            .is_some_and(std::thread::JoinHandle::is_finished)
+            && let Some(task) = history_refresh.take()
+            && let Ok(Ok(history)) = task.join()
+        {
+            app.history = history;
+            app.history_loaded = true;
+        }
+        if history_refresh_requested && history_refresh.is_none() {
+            history_refresh_requested = false;
+            // Dropping this thread's handle lets the terminal exit even if a
+            // package transaction still holds the history lock.
+            history_refresh = std::thread::Builder::new()
+                .name("omg-history".to_owned())
+                .spawn(app::App::read_recent_history)
+                .ok();
+        }
+
         // Draw UI
         terminal.draw(|f| ui::draw(f, app))?;
 
         // Handle events with timeout for animations
         let was_search_mode = app.search_mode;
-        if crossterm::event::poll(Duration::from_millis(POLL_TIMEOUT_MS))?
-            && let Event::Key(key) = event::read()?
-        {
+        poll_input.send(())?;
+        let event = event_rx
+            .recv()
+            .await
+            .context("Terminal input worker stopped")??;
+        if let Some(Event::Key(key)) = event {
             // Only process key press events, ignore release
             if key.kind == KeyEventKind::Press {
                 if should_quit(key, app.search_mode) {
@@ -314,7 +366,9 @@ async fn run_app(
         }
 
         // Update app state
+        let last_refresh = app.last_tick;
         app.tick()?;
+        history_refresh_requested |= app.external_refresh_enabled && app.last_tick != last_refresh;
 
         #[cfg(unix)]
         if should_refresh_daemon(daemon_refresh_in_flight, last_daemon_refresh.elapsed()) {
@@ -364,7 +418,7 @@ fn dispatch_search(
     let task = tokio::spawn(async move {
         let result = app::App::search_packages(&query)
             .await
-            .map_err(|error| error.to_string());
+            .map_err(|error| crate::cli::style::sanitize_terminal_text(&format!("{error:#}")));
         let _ = sender.send(SearchCompletion { request_id, result });
     });
     SearchRequest::Running { request_id, task }
@@ -394,7 +448,6 @@ fn apply_search_completion(
             app.search_error = None;
         }
         Err(error) => {
-            tracing::error!("Search failed: {error}");
             app.search_results.clear();
             app.search_error = Some(error);
         }
@@ -529,6 +582,27 @@ fn force_refresh(app: &mut app::App) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_alternate_screen_write_preserves_the_dashboard_buffer() -> Result<()> {
+        let backend = CrosstermBackend::new(io::Cursor::new(&mut [][..]));
+        let options = ratatui::TerminalOptions {
+            viewport: ratatui::Viewport::Fixed(ratatui::layout::Rect::new(0, 0, 1, 1)),
+        };
+        let mut terminal = Terminal::with_options(backend, options)?;
+        terminal.current_buffer_mut()[(0, 0)].set_symbol("x");
+
+        let error = redraw_alternate_screen(&mut terminal).unwrap_err();
+
+        assert_eq!(
+            error.downcast::<io::Error>()?.kind(),
+            io::ErrorKind::WriteZero
+        );
+        assert_eq!(terminal.current_buffer_mut()[(0, 0)].symbol(), "x");
+        Ok(())
+    }
+
     #[test]
     fn daemon_refresh_runs_in_background_only_when_due() {
         let due = Duration::from_secs(REFRESH_INTERVAL_SECS);

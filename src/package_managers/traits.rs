@@ -5,11 +5,10 @@ use std::pin::Pin;
 
 use anyhow::Result;
 
+use super::types::PackageStatus;
 use crate::core::Package;
 
-/// A retained observation of the installed inventory used by a package index.
-///
-/// Repository metadata is outside this observation and needs explicit refresh.
+/// A retained observation of package inventory inputs.
 /// Observation checks can perform native I/O; callers must use a blocking task.
 pub trait InstalledCatalogObservation: Send + Sync {
     fn is_current(&self) -> Result<bool>;
@@ -30,6 +29,15 @@ pub trait PackageManager: Send + Sync {
         &self,
     ) -> Result<Option<std::sync::Arc<dyn InstalledCatalogObservation>>> {
         Ok(None)
+    }
+
+    /// Observe the inputs used by the search index before building it.
+    /// Backends may include repository metadata. Installed status remains
+    /// scoped to the installed observation. Call on a blocking task.
+    fn package_index_observation(
+        &self,
+    ) -> Result<Option<std::sync::Arc<dyn InstalledCatalogObservation>>> {
+        self.installed_catalog_observation()
     }
 
     /// Preserve installed package identities for security exports. Backends
@@ -76,6 +84,14 @@ pub trait PackageManager: Send + Sync {
         &self,
         query: &str,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<Package>>> + Send + '_>>;
+
+    /// Search while another renderer owns the terminal.
+    fn search_quietly(
+        &self,
+        query: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<Package>>> + Send + '_>> {
+        self.search(query)
+    }
 
     /// List every package available to a persistent search index.
     ///
@@ -150,6 +166,14 @@ pub trait PackageManager: Send + Sync {
         &self,
         fast: bool,
     ) -> Pin<Box<dyn Future<Output = Result<(usize, usize, usize, usize)>> + Send + '_>>;
+
+    /// Get package counts with explicit provenance for skipped maintenance checks.
+    fn get_status_details(
+        &self,
+        fast: bool,
+    ) -> Pin<Box<dyn Future<Output = Result<PackageStatus>> + Send + '_>> {
+        Box::pin(async move { self.get_status(fast).await.map(PackageStatus::from) })
+    }
 
     /// List explicitly installed package names
     fn list_explicit(&self) -> Pin<Box<dyn Future<Output = Result<Vec<String>>> + Send + '_>>;

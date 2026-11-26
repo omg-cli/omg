@@ -56,6 +56,15 @@ query OSV using their distribution release as the ecosystem. Missing findings ar
 proof that a package is free of vulnerabilities. Do not treat one distribution's
 advisories as coverage for another.
 
+The scan prints an advisory link beneath a finding when its ID has a known
+public record URL or the source supplies a usable HTTPS reference.
+
+On Fedora systems with `python3-libdnf5` installed, OMG also looks for
+advisories on security updates that change package architecture and on exact
+proposed RPM builds. The lookup reuses the cache refreshed by DNF. These
+matches are reported as possible, and incomplete coverage still requires
+explicit acceptance before installation.
+
 Reports separate advisory coverage from findings. Packages whose advisory applicability is unknown stay visible even when no published record matches. Current Arch installed-package metadata does not prove historical repository origin. An observed repository match is not installation provenance; tracker matches for an unproved origin are reported as possible matches. Possible matches retain their alerts and finding counts, but they are not automatic remediation targets. A legacy JSON report without coverage information is unreported, not a complete scan. The CLI and daemon must both speak IPC protocol 5; mismatched binary frames are rejected before decoding. Update the pair together. The current CLI can perform a direct native audit when an older daemon cannot answer.
 
 The default scan reports findings without failing solely because it found them. Use `--fail-on-findings` when a CI job must fail on any finding. This does not make its human-readable output a documented JSON alert interface. `omg audit fix --dry-run` previews available package updates on the Arch backend; an available update is not proof that every advisory is fixed.

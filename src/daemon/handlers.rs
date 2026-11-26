@@ -1,7 +1,7 @@
 //! Request handlers for the daemon
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use anyhow::Context;
 use governor::clock::DefaultClock;
@@ -12,7 +12,7 @@ use super::cache::PackageCache;
 use super::index::PackageIndex;
 use super::protocol::{
     DetailedPackageInfo, ExplicitResult, HealthStatus, PackageInfo, Request, RequestId, Response,
-    ResponseResult, SearchResult, UpdateEntry, WirePackageSource, error_codes,
+    ResponseResult, SearchResult, StatusResult, UpdateEntry, WirePackageSource, error_codes,
 };
 use crate::core::metrics::GLOBAL_METRICS;
 use crate::core::security::{AuditEventType, AuditSeverity, audit_log_nonblocking};
@@ -34,21 +34,26 @@ const DAEMON_INFO_AUR_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 const REFRESH_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(1);
 const CATALOG_OBSERVATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-async fn observe_installed_catalog(
+async fn observe_catalog(
     manager: Arc<dyn PackageManager>,
     budget: Arc<tokio::sync::Semaphore>,
+    observe: impl FnOnce(
+        &dyn PackageManager,
+    ) -> anyhow::Result<Option<Arc<dyn InstalledCatalogObservation>>>
+    + Send
+    + 'static,
 ) -> anyhow::Result<Option<Arc<dyn InstalledCatalogObservation>>> {
     tokio::time::timeout(CATALOG_OBSERVATION_TIMEOUT, async move {
         let permit = budget.acquire_owned().await?;
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            manager.installed_catalog_observation()
+            observe(manager.as_ref())
         })
         .await
-        .context("Installed catalog observation task failed")?
+        .context("Package catalog observation task failed")?
     })
     .await
-    .context("Installed catalog observation exceeded its deadline")?
+    .context("Package catalog observation exceeded its deadline")?
 }
 
 async fn installed_catalog_is_current(
@@ -73,8 +78,10 @@ async fn load_observed_index(
     budget: Arc<tokio::sync::Semaphore>,
 ) -> anyhow::Result<(PackageIndex, Option<Arc<dyn InstalledCatalogObservation>>)> {
     for _ in 0..3 {
-        let observation =
-            observe_installed_catalog(Arc::clone(&manager), Arc::clone(&budget)).await?;
+        let observation = observe_catalog(Arc::clone(&manager), Arc::clone(&budget), |manager| {
+            manager.package_index_observation()
+        })
+        .await?;
         let index = PackageIndex::for_package_manager(Arc::clone(&manager)).await?;
         if let Some(observation) = &observation
             && !installed_catalog_is_current(Arc::clone(observation), Arc::clone(&budget)).await?
@@ -83,7 +90,7 @@ async fn load_observed_index(
         }
         return Ok((index, observation));
     }
-    anyhow::bail!("Installed inventory changed during three package index rebuild attempts")
+    anyhow::bail!("Package catalog inputs changed during three package index rebuild attempts")
 }
 
 #[derive(Default)]
@@ -210,6 +217,7 @@ pub struct DaemonState {
     security_scan_lock: tokio::sync::Mutex<()>,
     pub(super) background_security_scans: bool,
     index: RwLock<PublishedIndex>,
+    fast_status_path: OnceLock<PathBuf>,
     /// Locked because RefreshIndex must swap in a fresh AlpmWorker: libalpm
     /// caches loaded syncdbs in memory and never revalidates them on disk, so
     /// a worker that predates `omg sync` serves a frozen update list forever.
@@ -257,6 +265,10 @@ impl DaemonState {
         true
     }
 
+    pub(super) fn remember_fast_status_path(&self, path: PathBuf) -> &Path {
+        self.fast_status_path.get_or_init(|| path).as_path()
+    }
+
     /// Atomically publish a rebuilt index and invalidate derived caches.
     #[cfg(test)]
     pub(super) fn replace_index(
@@ -292,6 +304,15 @@ impl DaemonState {
         self.index_generation.fetch_add(1, Ordering::Release);
         self.cache.clear();
         self.persistent.invalidate_status();
+        if let Some(path) = self.fast_status_path.get()
+            && let Err(error) = std::fs::remove_file(path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(
+                "Failed to invalidate fast status at {}: {error}",
+                path.display()
+            );
+        }
         package_count
     }
 
@@ -374,6 +395,59 @@ impl DaemonState {
             .is_production()
     }
 
+    pub(super) fn uses_rpm_catalog(&self) -> bool {
+        self.uses_production_backends() && self.package_manager.name() == "dnf"
+    }
+
+    #[cfg(feature = "fedora")]
+    pub(super) async fn observe_status_rpm_catalog(
+        &self,
+    ) -> anyhow::Result<Arc<dyn InstalledCatalogObservation>> {
+        observe_catalog(
+            Arc::clone(&self.package_manager),
+            Arc::clone(&self.catalog_observation_budget),
+            |manager| manager.installed_catalog_observation(),
+        )
+        .await?
+        .context("RPM status inventory observation is unavailable")
+    }
+
+    #[cfg(feature = "fedora")]
+    pub(super) async fn status_rpm_catalog_is_current(
+        &self,
+        observation: Arc<dyn InstalledCatalogObservation>,
+    ) -> bool {
+        match installed_catalog_is_current(
+            observation,
+            Arc::clone(&self.catalog_observation_budget),
+        )
+        .await
+        {
+            Ok(current) => current,
+            Err(error) => {
+                tracing::warn!("Cannot validate cached RPM status: {error:#}");
+                false
+            }
+        }
+    }
+
+    #[cfg(feature = "fedora")]
+    pub(super) async fn publish_observed_status(
+        &self,
+        index: &Arc<PackageIndex>,
+        status: Arc<StatusResult>,
+        observation: Arc<dyn InstalledCatalogObservation>,
+    ) {
+        if self
+            .status_rpm_catalog_is_current(Arc::clone(&observation))
+            .await
+        {
+            self.with_current_index(index, || {
+                self.cache.update_observed_status(status, observation);
+            });
+        }
+    }
+
     /// Rebuild the published index and reincarnate libalpm while owning refresh
     /// serialization through native work and index publication.
     async fn rebuild_production_index(
@@ -419,7 +493,7 @@ impl DaemonState {
                     Arc::clone(&self.catalog_observation_budget)
                 )
                 .await?,
-                "Installed inventory changed before package index publication"
+                "Package catalog inputs changed before index publication"
             );
         }
         let packages = self.replace_observed_index(
@@ -444,19 +518,18 @@ impl DaemonState {
                 Arc::clone(&self.catalog_observation_budget),
             )
             .await?),
-            None => Ok(observe_installed_catalog(
+            None => Ok(observe_catalog(
                 Arc::clone(&self.package_manager),
                 Arc::clone(&self.catalog_observation_budget),
+                |manager| manager.package_index_observation(),
             )
             .await?
             .is_some()),
         }
     }
 
-    /// RPM observation covers installed rows. Repository changes are admitted
-    /// by explicit refresh, since RPM alone cannot certify repository freshness.
-    async fn heal_installed_catalog_if_changed(&self) -> anyhow::Result<()> {
-        if !self.uses_production_backends() || self.package_manager.name() != "dnf" {
+    async fn heal_rpm_index_if_changed(&self) -> anyhow::Result<()> {
+        if !self.uses_rpm_catalog() {
             return Ok(());
         }
         if !self.installed_catalog_needs_heal().await? {
@@ -517,6 +590,11 @@ impl DaemonState {
 
     pub(super) async fn explicit_packages(&self) -> anyhow::Result<Vec<String>> {
         self.package_manager.list_explicit().await
+    }
+
+    pub(super) fn caches_explicit_packages(&self) -> bool {
+        // DNF can change install reasons without changing the RPM database.
+        !self.uses_rpm_catalog()
     }
 
     pub fn new() -> anyhow::Result<Self> {
@@ -685,6 +763,7 @@ impl DaemonState {
                 #[cfg(feature = "arch")]
                 epoch: index_epoch,
             }),
+            fast_status_path: OnceLock::new(),
             vulnerability_scanner: Arc::new(
                 crate::core::security::vulnerability::VulnerabilityScanner::new(),
             ),
@@ -764,10 +843,10 @@ pub async fn handle_request(state: Arc<DaemonState>, request: Request) -> Respon
             };
             return validation_error(request.id(), message);
         }
-        if let Err(error) = state.heal_installed_catalog_if_changed().await {
+        if let Err(error) = state.heal_rpm_index_if_changed().await {
             return internal_error(
                 request.id(),
-                format!("Failed to refresh stale installed package index: {error:#}"),
+                format!("Failed to refresh stale RPM package index: {error:#}"),
             );
         }
     }
@@ -1299,25 +1378,12 @@ async fn handle_info(state: Arc<DaemonState>, id: RequestId, package: String) ->
     not_found_error(id, format!("Package not found: {package}"))
 }
 
-/// Handle status request
-#[tracing::instrument(skip(state))]
-async fn handle_status(state: Arc<DaemonState>, id: RequestId) -> Response {
-    // METRICS: Track status requests
-    GLOBAL_METRICS.inc_status_requests();
-
-    // 1. Check MEMORY cache first (instant - sub-microsecond, Arc clone is cheap)
+async fn cached_status(state: &Arc<DaemonState>) -> Option<StatusResult> {
     if let Some(cached) = state.cache.get_status() {
-        // METRICS: Cache hit (memory)
-        GLOBAL_METRICS.inc_cache_hits();
-        return Response::Success {
-            id,
-            result: ResponseResult::Status(Arc::unwrap_or_clone(cached)),
-        };
+        return Some(Arc::unwrap_or_clone(cached));
     }
 
-    // 2. Check persistent cache (disk - slower)
-    // Runs in blocking thread to avoid stalling async runtime
-    let state_clone = Arc::clone(&state);
+    let state_clone = Arc::clone(state);
     let cached_result = tokio::task::spawn_blocking(move || {
         state_clone
             .persistent
@@ -1326,17 +1392,8 @@ async fn handle_status(state: Arc<DaemonState>, id: RequestId) -> Response {
     .await;
 
     match cached_result {
-        Ok(Ok(Some(cached))) => {
-            // METRICS: Cache hit (persistent)
-            GLOBAL_METRICS.inc_cache_hits();
-            // Do not restart its lifetime by promoting an old snapshot into
-            // the memory cache. Only a new backend refresh starts a new TTL.
-            return Response::Success {
-                id,
-                result: ResponseResult::Status(cached),
-            };
-        }
-        Ok(Ok(None)) => {}
+        // A disk hit does not promote the old status into a fresh memory TTL.
+        Ok(Ok(cached)) => return cached,
         Ok(Err(error)) => {
             tracing::warn!("Failed to read persisted status cache: {error}");
         }
@@ -1344,13 +1401,33 @@ async fn handle_status(state: Arc<DaemonState>, id: RequestId) -> Response {
             tracing::warn!("Status cache task failed: {error}");
         }
     }
+    None
+}
+
+/// Handle status request
+#[tracing::instrument(skip(state))]
+async fn handle_status(state: Arc<DaemonState>, id: RequestId) -> Response {
+    GLOBAL_METRICS.inc_status_requests();
+    let rpm_catalog = state.uses_rpm_catalog();
+    if !rpm_catalog && let Some(cached) = cached_status(&state).await {
+        GLOBAL_METRICS.inc_cache_hits();
+        return Response::Success {
+            id,
+            result: ResponseResult::Status(cached),
+        };
+    }
 
     // METRICS: Cache miss - need to query system
     GLOBAL_METRICS.inc_cache_misses();
 
-    // 3. Query the selected backend. Production uses the optimized native
-    // status paths; dependency-injected states stay behind the package-manager
-    // interface and never access host package databases.
+    // DNF install reasons and repository metadata can change independently of
+    // RPM inventory. Its observation can only carry forward advisory coverage.
+    #[cfg(feature = "fedora")]
+    let observed_status = if rpm_catalog {
+        state.cache.observed_status()
+    } else {
+        None
+    };
     let status_result = state.status_counts().await;
 
     match status_result {
@@ -1367,10 +1444,26 @@ async fn handle_status(state: Arc<DaemonState>, id: RequestId) -> Response {
                     .clone(),
                 None,
             );
-            debug_assert!(
-                !cacheable,
-                "package-count snapshots without a vulnerability scan must not be cached"
-            );
+            debug_assert!(!cacheable);
+
+            #[cfg(feature = "fedora")]
+            let res = if let Some((cached, observation)) = observed_status
+                && total == cached.total_packages
+                && state.status_rpm_catalog_is_current(observation).await
+                && state
+                    .cache
+                    .get_status()
+                    .is_some_and(|entry| Arc::ptr_eq(&entry, &cached))
+            {
+                StatusResult {
+                    security_vulnerabilities: cached.security_vulnerabilities,
+                    security_unknown_packages: cached.security_unknown_packages,
+                    vulnerabilities_scanned: cached.vulnerabilities_scanned,
+                    ..res
+                }
+            } else {
+                res
+            };
 
             Response::Success {
                 id,
@@ -1395,8 +1488,8 @@ async fn handle_security_audit(state: Arc<DaemonState>, id: RequestId) -> Respon
 
 /// Handle list explicit request
 async fn handle_list_explicit(state: Arc<DaemonState>, id: RequestId) -> Response {
-    // Arc clone is cheap - just pointer copy
-    if let Some(cached) = state.cache.get_explicit() {
+    let use_cache = state.caches_explicit_packages();
+    if use_cache && let Some(cached) = state.cache.get_explicit() {
         return Response::Success {
             id,
             result: ResponseResult::Explicit(ExplicitResult {
@@ -1405,20 +1498,23 @@ async fn handle_list_explicit(state: Arc<DaemonState>, id: RequestId) -> Respons
         };
     }
 
-    let index = state.index_snapshot();
+    let index = use_cache.then(|| state.index_snapshot());
     let packages_result = state.explicit_packages().await;
 
     match packages_result {
         Ok(packages) => {
-            let packages_arc = Arc::new(packages);
-            state.with_current_index(&index, || {
-                state.cache.update_explicit_arc(Arc::clone(&packages_arc));
-            });
+            let packages = if let Some(index) = index {
+                let shared = Arc::new(packages);
+                state.with_current_index(&index, || {
+                    state.cache.update_explicit_arc(Arc::clone(&shared));
+                });
+                Arc::unwrap_or_clone(shared)
+            } else {
+                packages
+            };
             Response::Success {
                 id,
-                result: ResponseResult::Explicit(ExplicitResult {
-                    packages: Arc::unwrap_or_clone(packages_arc),
-                }),
+                result: ResponseResult::Explicit(ExplicitResult { packages }),
             }
         }
         Err(error) => internal_error(id, format!("Failed to list explicit packages: {error}")),
@@ -1427,14 +1523,15 @@ async fn handle_list_explicit(state: Arc<DaemonState>, id: RequestId) -> Respons
 
 /// Handle explicit package count request
 async fn handle_explicit_count(state: Arc<DaemonState>, id: RequestId) -> Response {
-    if let Some(cached) = state.cache.get_explicit_count() {
+    let use_cache = state.caches_explicit_packages();
+    if use_cache && let Some(cached) = state.cache.get_explicit_count() {
         return Response::Success {
             id,
             result: ResponseResult::ExplicitCount(cached),
         };
     }
 
-    let index = state.index_snapshot();
+    let index = use_cache.then(|| state.index_snapshot());
     let count_result = state
         .explicit_packages()
         .await
@@ -1442,9 +1539,11 @@ async fn handle_explicit_count(state: Arc<DaemonState>, id: RequestId) -> Respon
 
     match count_result {
         Ok(count) => {
-            state.with_current_index(&index, || {
-                state.cache.update_explicit_count(count);
-            });
+            if let Some(index) = index {
+                state.with_current_index(&index, || {
+                    state.cache.update_explicit_count(count);
+                });
+            }
             Response::Success {
                 id,
                 result: ResponseResult::ExplicitCount(count),
@@ -1780,6 +1879,45 @@ pub(super) mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn malformed_status_snapshot_falls_back_to_the_backend() -> anyhow::Result<()> {
+        let (directory, state) = isolated_state();
+        let cache = directory.path().join("status-cache.json");
+        std::fs::write(&cache, b"invalid snapshot")?;
+
+        assert!(matches!(
+            handle_status(state, 84).await,
+            Response::Success {
+                result: ResponseResult::Status(result),
+                ..
+            } if result.total_packages == 0 && !result.vulnerabilities_scanned
+        ));
+        assert_eq!(std::fs::read(cache)?, b"invalid snapshot");
+        Ok(())
+    }
+
+    #[test]
+    fn index_refresh_preserves_non_file_fast_status_path() -> anyhow::Result<()> {
+        let (directory, state) = isolated_state();
+        let path = directory.path().join("fast-status");
+        std::fs::create_dir(&path)?;
+        let sentinel = path.join("sentinel");
+        std::fs::write(&sentinel, b"keep")?;
+        state.remember_fast_status_path(path);
+
+        let subscriber = tracing_subscriber::fmt().with_test_writer().finish();
+        let published = tracing::subscriber::with_default(subscriber, || {
+            state.replace_index(
+                PackageIndex::from_records(&[("fresh-package", "2", "fresh snapshot")]),
+                #[cfg(feature = "arch")]
+                crate::package_managers::pacman_db::AlpmCatalogEpoch::UNIX_EPOCH,
+            )
+        });
+        assert_eq!(published, 1);
+        assert_eq!(std::fs::read(sentinel)?, b"keep");
+        Ok(())
+    }
+
     type BackendFuture<'a, T> =
         std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<T>> + Send + 'a>>;
 
@@ -1934,7 +2072,6 @@ pub(super) mod tests {
         Ok((directory, Arc::new(state)))
     }
 
-    #[cfg(feature = "fedora")]
     fn mutable_fedora_catalog(
         observe: bool,
         gate: Option<Arc<(tokio::sync::Notify, tokio::sync::Notify)>>,
@@ -1981,6 +2118,146 @@ pub(super) mod tests {
             builds,
             fault,
         ))
+    }
+
+    #[tokio::test]
+    async fn fedora_explicit_list_and_count_read_current_dnf_reasons() -> anyhow::Result<()> {
+        let (_directory, state, _, revision, _, _) = mutable_fedora_catalog(true, None)?;
+        let package = "retired-tool.x86_64".to_owned();
+        state
+            .package_manager
+            .install(std::slice::from_ref(&package))
+            .await?;
+        state
+            .cache
+            .update_explicit(vec!["former-explicit".into(), "other".into()]);
+
+        let response = handle_request(Arc::clone(&state), Request::Explicit { id: 1 }).await;
+        assert!(
+            matches!(
+                &response,
+                Response::Success {
+                    result: ResponseResult::Explicit(result),
+                    ..
+                } if result.packages.as_slice() == std::slice::from_ref(&package)
+            ),
+            "{response:?}"
+        );
+
+        let response = handle_request(Arc::clone(&state), Request::ExplicitCount { id: 2 }).await;
+        assert!(matches!(
+            response,
+            Response::Success {
+                result: ResponseResult::ExplicitCount(1),
+                ..
+            }
+        ));
+
+        state.cache.clear();
+        let _ = handle_request(Arc::clone(&state), Request::Explicit { id: 3 }).await;
+        let _ = handle_request(Arc::clone(&state), Request::ExplicitCount { id: 4 }).await;
+        assert!(state.cache.get_explicit().is_none());
+        assert!(state.cache.get_explicit_count().is_none());
+        state.package_manager.remove(&[package]).await?;
+        assert_eq!(revision.load(Ordering::Acquire), 0);
+        let response = handle_request(state, Request::ExplicitCount { id: 5 }).await;
+        assert!(matches!(
+            response,
+            Response::Success {
+                result: ResponseResult::ExplicitCount(0),
+                ..
+            }
+        ));
+        Ok(())
+    }
+
+    #[cfg(feature = "fedora")]
+    #[tokio::test]
+    async fn fedora_status_refuses_unbound_cached_security_scope() -> anyhow::Result<()> {
+        let (_directory, state, _, revision, _, _) = mutable_fedora_catalog(true, None)?;
+        let status =
+            super::super::status_policy::status_snapshot(42, 20, 1, 2, vec![], Some((0, 0))).0;
+        state.persistent.set_status(&status)?;
+        let disk = handle_request(Arc::clone(&state), Request::Status { id: 1 }).await;
+
+        state.cache.update_status(Arc::new(status));
+        revision.fetch_add(1, Ordering::AcqRel);
+        let memory = handle_request(state, Request::Status { id: 2 }).await;
+
+        for (source, response) in [("disk", disk), ("memory", memory)] {
+            let Response::Success {
+                result: ResponseResult::Status(status),
+                ..
+            } = response
+            else {
+                anyhow::bail!("unbound {source} status should fall back to live package counts");
+            };
+            assert_ne!(status.total_packages, 42, "unbound {source} counts");
+            assert_eq!(
+                status.scanned_vulnerability_summary(),
+                None,
+                "unbound {source} status cannot attest advisory coverage"
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "fedora")]
+    #[tokio::test]
+    async fn fedora_status_drops_scope_when_inventory_changes() -> anyhow::Result<()> {
+        let (_directory, state, _, revision, _, _) = mutable_fedora_catalog(true, None)?;
+        state
+            .package_manager
+            .install(&["retired-tool.x86_64".to_owned()])
+            .await?;
+        let (total, explicit, orphans, updates) = state.status_counts().await?;
+        let observation = state.observe_status_rpm_catalog().await?;
+        let index = state.index_snapshot();
+        let status = Arc::new(
+            super::super::status_policy::status_snapshot(
+                total,
+                0,
+                orphans + 1,
+                updates + 1,
+                vec![],
+                Some((5, 2)),
+            )
+            .0,
+        );
+        state
+            .publish_observed_status(&index, Arc::clone(&status), Arc::clone(&observation))
+            .await;
+        let response = handle_request(Arc::clone(&state), Request::Status { id: 1 }).await;
+        let Response::Success {
+            result: ResponseResult::Status(current),
+            ..
+        } = response
+        else {
+            anyhow::bail!("live status should use counts from the package manager");
+        };
+        assert_eq!(current.explicit_packages, explicit);
+        assert_eq!(current.orphan_packages, orphans);
+        assert_eq!(current.updates_available, updates);
+        assert_eq!(current.scanned_vulnerability_summary(), Some((5, 2)));
+
+        revision.fetch_add(1, Ordering::AcqRel);
+        let response = handle_request(Arc::clone(&state), Request::Status { id: 2 }).await;
+        let Response::Success {
+            result: ResponseResult::Status(current),
+            ..
+        } = response
+        else {
+            anyhow::bail!("stale observed status should fall back to live package counts");
+        };
+        assert_eq!(current.total_packages, total);
+        assert_eq!(current.scanned_vulnerability_summary(), None);
+
+        state.cache.clear();
+        state
+            .publish_observed_status(&index, status, observation)
+            .await;
+        assert!(state.cache.get_status().is_none());
+        Ok(())
     }
 
     #[cfg(feature = "fedora")]
@@ -2090,7 +2367,6 @@ pub(super) mod tests {
         Ok(())
     }
 
-    #[cfg(feature = "fedora")]
     #[tokio::test]
     async fn fedora_catalog_sequential_refresh_does_not_acknowledge_an_old_catalog()
     -> anyhow::Result<()> {
@@ -2338,7 +2614,6 @@ pub(super) mod tests {
         Ok(())
     }
 
-    #[cfg(feature = "fedora")]
     #[tokio::test]
     async fn fedora_catalog_refuses_continuous_changes_without_publishing() -> anyhow::Result<()> {
         let (_directory, state, database, _, builds, fault) = mutable_fedora_catalog(true, None)?;

@@ -8,6 +8,8 @@ use moka::policy::EvictionPolicy;
 use moka::sync::Cache;
 
 use super::protocol::{DetailedPackageInfo, PackageInfo, StatusResult};
+#[cfg(feature = "fedora")]
+use crate::package_managers::InstalledCatalogObservation;
 
 /// Static cache keys (avoids String allocation on every cache access)
 const KEY_STATUS: &str = "status";
@@ -89,6 +91,13 @@ fn build_detailed_cache(max_bytes: u64, ttl: Duration) -> Cache<String, Arc<Deta
         .build()
 }
 
+#[derive(Clone)]
+struct CachedStatus {
+    result: Arc<StatusResult>,
+    #[cfg(feature = "fedora")]
+    rpm_observation: Option<Arc<dyn InstalledCatalogObservation>>,
+}
+
 /// LRU cache for package search results
 pub struct PackageCache {
     /// Search results cache: query -> packages (Arc for cheap cloning)
@@ -103,7 +112,7 @@ pub struct PackageCache {
     max_size: usize,
     status_ttl: Duration,
     /// System status cache - uses &'static str keys to avoid allocation
-    system_status: Cache<&'static str, Arc<StatusResult>>,
+    system_status: Cache<&'static str, CachedStatus>,
     /// Explicit package list cache - uses &'static str keys to avoid allocation
     explicit_packages: Cache<&'static str, Arc<Vec<String>>>,
     /// Explicit package count cache - uses &'static str keys to avoid allocation
@@ -152,7 +161,15 @@ impl PackageCache {
     #[inline]
     #[must_use]
     pub fn get_status(&self) -> Option<Arc<StatusResult>> {
-        self.system_status.get(KEY_STATUS)
+        self.system_status.get(KEY_STATUS).map(|entry| entry.result)
+    }
+
+    #[cfg(feature = "fedora")]
+    pub(super) fn observed_status(
+        &self,
+    ) -> Option<(Arc<StatusResult>, Arc<dyn InstalledCatalogObservation>)> {
+        let entry = self.system_status.get(KEY_STATUS)?;
+        Some((entry.result, entry.rpm_observation?))
     }
 
     /// Update system status cache (accepts Arc to avoid double-wrapping).
@@ -160,13 +177,33 @@ impl PackageCache {
     /// Also refreshes the explicit-count cache: both values belong to the
     /// same status-refresh epoch and are published together by the worker.
     pub fn update_status(&self, result: Arc<StatusResult>) {
+        self.store_status(CachedStatus {
+            result,
+            #[cfg(feature = "fedora")]
+            rpm_observation: None,
+        });
+    }
+
+    #[cfg(feature = "fedora")]
+    pub(super) fn update_observed_status(
+        &self,
+        result: Arc<StatusResult>,
+        rpm_observation: Arc<dyn InstalledCatalogObservation>,
+    ) {
+        self.store_status(CachedStatus {
+            result,
+            rpm_observation: Some(rpm_observation),
+        });
+    }
+
+    fn store_status(&self, entry: CachedStatus) {
         // A status refresh and an explicit-list refresh are separate backend
         // reads. Invalidate the old list before publishing the new count so
         // callers cannot observe values from different refresh epochs.
         self.explicit_packages.invalidate(KEY_EXPLICIT);
         self.explicit_count
-            .insert(KEY_EXPLICIT_COUNT, result.explicit_packages);
-        self.system_status.insert(KEY_STATUS, result);
+            .insert(KEY_EXPLICIT_COUNT, entry.result.explicit_packages);
+        self.system_status.insert(KEY_STATUS, entry);
     }
 
     /// Get cached explicit packages (Arc clone is cheap - just pointer copy)

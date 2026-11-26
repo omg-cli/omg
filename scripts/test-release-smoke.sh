@@ -290,12 +290,24 @@ make_stage "$scratch/apt7" debian-trixie
 for apt_distro in debian ubuntu; do
   export FAKE_ENGINE_ARGS="$scratch/apt7-$apt_distro-engine"
   assert_rc 0 "$runner" --release v9.9.9 --distro "$apt_distro" --apt-abi 7 \
-    --case release-package-search-tree --container-engine fake-engine \
+    --family package --container-engine fake-engine \
     --staged-dir "$scratch/apt7" --evidence-dir "$scratch/apt7-$apt_distro-evidence"
-  grep -q '"result":"PASS"' "$(results_file "$scratch/apt7-$apt_distro-evidence")" || fail 'APT 7 silently skipped the distro contract'
-  grep -q "\"distro\":\"$apt_distro\"" "$(results_file "$scratch/apt7-$apt_distro-evidence")" || fail 'APT 7 lost the inventory distro identity'
+  apt_results="$(results_file "$scratch/apt7-$apt_distro-evidence")"
+  [[ "$(grep -c '"result":"PASS"' "$apt_results")" -eq 3 ]] || fail 'APT 7 silently skipped a distro contract'
+  grep -q "\"distro\":\"$apt_distro\"" "$apt_results" || fail 'APT 7 lost the inventory distro identity'
   if [[ "$apt_distro" == debian ]]; then image_tag=debian:trixie; else image_tag=ubuntu:26.04; fi
-  grep -q "$image_tag@sha256:" "$FAKE_ENGINE_ARGS" || fail 'APT 7 used the wrong host image'
+  [[ "$(grep -c '^build$' "$FAKE_ENGINE_ARGS")" -eq 1 ]] || fail 'APT metadata seed did not run once'
+  [[ "$(grep -c '^run$' "$FAKE_ENGINE_ARGS")" -eq 3 ]] || fail 'APT cases did not use fresh containers'
+  [[ "$(grep -c '^sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa$' "$FAKE_ENGINE_ARGS")" -eq 5 ]] || fail 'APT cases did not inspect, use and clean up the exact seed image'
+  grep -Fxq 'OMG_PROBE_INDEX_CMD=apt-cache show tree >/dev/null' "$FAKE_ENGINE_ARGS" || fail 'APT cases fetched metadata instead of checking the seeded index'
+  apt_recipe="$(dirname "$apt_results")/$apt_distro-cache-seed.Dockerfile"
+  grep -q "^FROM $image_tag@sha256:" "$apt_recipe" || fail 'APT 7 used the wrong host image'
+  if [[ "$apt_distro" == ubuntu ]]; then
+    grep -Fq 'RUN bash /tmp/omg-ubuntu-apt-setup.sh' "$apt_recipe" || fail 'Ubuntu skipped the signed mirror fallback'
+    cmp "$repo_root/.github/actions/ubuntu-apt/setup.sh" "$(dirname "$apt_results")/ubuntu-cache-seed-setup.sh" || fail 'Ubuntu did not preserve its exact archive setup script'
+  else
+    grep -Fq 'apt-get "$@" update --error-on=any' "$apt_recipe" || fail 'APT metadata seed accepted a partial refresh'
+  fi
   export FAKE_RUN_EXIT=1
   assert_rc 1 "$runner" --release v9.9.9 --distro "$apt_distro" --apt-abi 7 \
     --case release-package-search-tree --container-engine fake-engine \
@@ -311,6 +323,11 @@ for apt_distro in debian ubuntu; do
   grep -q "^expected_image=$image_tag@sha256:" "$missing_metadata" || fail 'missing APT 7 evidence lost the pinned host image'
 done
 unset FAKE_ENGINE_ARGS
+FAKE_BUILD_EXIT=7 FAKE_ENGINE_ARGS="$scratch/apt-seed-error-engine" \
+  assert_rc 3 "$runner" --release v9.9.9 --distro ubuntu --apt-abi 7 --family package \
+  --container-engine fake-engine --staged-dir "$scratch/apt7" --evidence-dir "$scratch/apt-seed-error"
+[[ "$(grep -c '"result":"HARNESS_ERROR"' "$(results_file "$scratch/apt-seed-error")")" -eq 3 ]] || fail 'APT seed failure did not block all cases'
+if grep -qx run "$scratch/apt-seed-error-engine"; then fail 'APT seed failure still executed a product case'; fi
 for failure_code in 120 125 126 127; do
   export FAKE_RUN_EXIT="$failure_code"
   assert_rc 3 "$runner" "${base_args[@]}" --staged-dir "$scratch/valid" --evidence-dir "$scratch/launch-error-$failure_code"

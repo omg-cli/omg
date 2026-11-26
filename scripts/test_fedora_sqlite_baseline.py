@@ -22,6 +22,24 @@ INSTALLED = [{'name': 'gcc', 'evr': '0:16-1.fc44', 'arch': 'x86_64',
               'immutable_header_sha256': 'c'*64, 'signature_sha256': 'd'*64, 'signers': 'Key ID 6d9f90a6'}]
 
 
+class RecipeIdentityTests(unittest.TestCase):
+    def test_release_assembly_changes_do_not_invalidate_the_sqlite_recipe(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            assembly = 'scripts/native-build-artifact.py'
+            for name in set(cache.RECIPE_FILES) | {assembly}:
+                path = root / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(name, encoding='utf-8')
+            with mock.patch.object(cache, 'ROOT', root):
+                original = cache.recipe('x86_64')
+                (root / assembly).write_text('updated release assembly', encoding='utf-8')
+                self.assertEqual(cache.recipe('x86_64'), original)
+                (root / 'scripts/github_artifact_transport.py').write_text(
+                    'updated artifact reader', encoding='utf-8')
+                self.assertNotEqual(cache.recipe('x86_64'), original)
+
+
 class RuntimeAbiInventoryTests(unittest.TestCase):
     link = '/usr/lib/gcc/x86_64-redhat-linux/16/32/libgomp.so'
     declared = '../../../../libgomp.so.1.0.0'
@@ -146,6 +164,12 @@ class BaselineTests(unittest.TestCase):
         admission = json.loads((destination/'admission.json').read_bytes())
         self.assertEqual((admission['build_source_sha'], admission['consumer_sha']),
                          (fixtures.REVISION, 'e'*40))
+        cache_diagnostics = self.work/'diagnostics'/'cache'
+        self.assertTrue((cache_diagnostics/'pointer.json').is_file())
+        self.assertFalse((cache_diagnostics/'sqlite-baseline.tar').exists())
+        self.assertFalse((cache_diagnostics/'proof.json').exists())
+        self.assertEqual(fixtures.sqlite.digest(destination/'baseline.tar'), admission['archive_sha256'])
+        self.assertEqual(fixtures.sqlite.digest(destination/'baseline.sigstore.json'), admission['proof_sha256'])
         self.assertTrue(all(key.startswith(cache.prefix('x86_64', 'b'*64, self.metadata['inventory_sha256'])) for key in keys))
         context = dict(run_id='91', run_attempt=2,
                        admission_sha256=fixtures.sqlite.digest(destination/'admission.json'))
@@ -184,6 +208,16 @@ class BaselineTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     self.restore(metadata, tamper=mode == 'tampered')
                 self.assertEqual(list((self.work/'supply').iterdir()), [])
+                cache_diagnostics = self.work/'diagnostics'/'cache'
+                self.assertTrue((cache_diagnostics/'sqlite-baseline.tar').is_file())
+                self.assertTrue((cache_diagnostics/'proof.json').is_file())
+
+    def test_duplicate_cleanup_failure_preserves_a_successful_admission(self):
+        with mock.patch.object(Path, 'unlink', side_effect=PermissionError):
+            destination, _ = self.restore()
+        admission = json.loads((destination/'admission.json').read_bytes())
+        self.assertEqual(fixtures.sqlite.digest(destination/'baseline.tar'), admission['archive_sha256'])
+        self.assertTrue((self.work/'diagnostics'/'cache'/'sqlite-baseline.tar').is_file())
 
     def test_same_run_partial_rerun_revalidates_owner_bytes_age_and_recipe(self):
         import zipfile
@@ -241,7 +275,7 @@ class BaselineTests(unittest.TestCase):
             now = BUILT+86401 if mode == 'expired' else BUILT+30
             with self.subTest(mode=mode), mock.patch.dict(os.environ,
                     GITHUB_EVENT_PATH=str(event), GITHUB_EVENT_NAME='push'), \
-                    mock.patch.dict(cache.NATIVE, api_json=api), \
+                    mock.patch.object(cache, 'api_json', side_effect=api), \
                     mock.patch.object(cache, 'recipe', return_value='f'*64 if mode == 'recipe' else 'b'*64), \
                     mock.patch.object(cache, 'verify_attestation', return_value=BUILT+1), \
                     mock.patch.object(cache, 'download_carried_artifact',
@@ -415,7 +449,7 @@ class BaselineTests(unittest.TestCase):
             (diagnostics/'inventory.json').write_bytes(inventory if mode != 'changed-local-inventory' else b'changed')
             with self.subTest(mode=mode), mock.patch.dict(os.environ,GITHUB_RUN_ID='41',GITHUB_RUN_ATTEMPT='1'), \
                     mock.patch.dict(cache.SQLITE, DEFAULT_POLICY=policy), \
-                    mock.patch.dict(cache.NATIVE, api_json=mock.Mock(return_value=artifact)), \
+                    mock.patch.object(cache, 'api_json', return_value=artifact), \
                     mock.patch.object(cache, 'bounded_output', return_value=payload), \
                     mock.patch.object(cache.time,'time',return_value=BUILT+30):
                 if mode == 'valid':

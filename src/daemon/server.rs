@@ -126,7 +126,7 @@ async fn write_fast_status_async(
     let published = tokio::task::spawn_blocking(move || {
         let mut result = Ok(());
         let published = state.with_current_index(&index, || {
-            result = status.write_to_file(&path);
+            result = status.write_to_file(state.remember_fast_status_path(path));
         });
         result.map(|()| published)
     })
@@ -157,16 +157,18 @@ async fn prewarm_caches(state: &Arc<DaemonState>, shutdown: &CancellationToken) 
     // Pre-compute explicit package list for instant first query.
     // The state owns the backend choice so isolated daemons never
     // fall through to a host package database.
-    let explicit_index = state.index_snapshot();
-    match state.explicit_packages().await {
-        Ok(packages) => {
-            state.with_current_index(&explicit_index, || {
-                state.cache.update_explicit(packages);
-            });
-            tracing::debug!("Pre-warmed explicit package cache");
-        }
-        Err(error) => {
-            tracing::warn!("Failed to pre-warm explicit package cache: {error}");
+    if state.caches_explicit_packages() {
+        let explicit_index = state.index_snapshot();
+        match state.explicit_packages().await {
+            Ok(packages) => {
+                state.with_current_index(&explicit_index, || {
+                    state.cache.update_explicit(packages);
+                });
+                tracing::debug!("Pre-warmed explicit package cache");
+            }
+            Err(error) => {
+                tracing::warn!("Failed to pre-warm explicit package cache: {error}");
+            }
         }
     }
 
@@ -199,6 +201,7 @@ async fn run_with_status_path(
     socket_path: PathBuf,
     fast_status_path: PathBuf,
 ) -> Result<()> {
+    state.remember_fast_status_path(fast_status_path.clone());
     let shutdown_token = CancellationToken::new();
     let _cancel_on_drop = shutdown_token.clone().drop_guard();
     let mut workers = tokio::task::JoinSet::new();
@@ -246,6 +249,18 @@ async fn run_with_status_path(
                     tracing::error!("Runtime status task panicked: {error}");
                     return;
                 }
+            };
+            #[cfg(feature = "fedora")]
+            let rpm_observation = if state.uses_rpm_catalog() {
+                match state.observe_status_rpm_catalog().await {
+                    Ok(observation) => Some(observation),
+                    Err(error) => {
+                        tracing::warn!("Cannot observe RPM inventory before status refresh: {error:#}");
+                        return;
+                    }
+                }
+            } else {
+                None
             };
             let status = state.status_counts().await;
             state
@@ -315,6 +330,13 @@ async fn run_with_status_path(
                 res.invalidate_security_scope();
             }
             let res_arc = Arc::new(res);
+            #[cfg(feature = "fedora")]
+            if let Some(observation) = rpm_observation {
+                state
+                    .publish_observed_status(&index, res_arc, observation)
+                    .await;
+                return;
+            }
             // The in-memory cache is authoritative, so persistence is best-effort.
             state.with_current_index(&index, || {
                 if let Err(error) = state.persistent.set_status(&res_arc) {
@@ -1656,7 +1678,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn fast_status_writes_run_through_the_blocking_adapter() {
+    async fn fast_status_writes_follow_the_published_catalog() {
         let directory = tempfile::tempdir().expect("tempdir");
         let path = directory.path().join("status.bin");
         let status = crate::core::fast_status::FastStatus::new(10, 4, 1, 2);
@@ -1673,7 +1695,7 @@ mod tests {
             .expect("isolated fast-status state"),
         );
         let index = state.index_snapshot();
-        write_fast_status_async(status, path.clone(), state, index)
+        write_fast_status_async(status, path.clone(), Arc::clone(&state), Arc::clone(&index))
             .await
             .expect("write fast status");
 
@@ -1681,6 +1703,44 @@ mod tests {
             crate::core::fast_status::FastStatus::read_from_file(&path).expect("read fast status");
         assert_eq!(persisted.total_packages, 10);
         assert_eq!(persisted.updates_available, 2);
+
+        let refresh = || {
+            state.replace_index(
+                super::super::index::PackageIndex::empty(),
+                #[cfg(feature = "arch")]
+                crate::package_managers::pacman_db::AlpmCatalogEpoch::UNIX_EPOCH,
+            );
+        };
+        refresh();
+        assert!(
+            !path.exists(),
+            "replaced catalog left its fast status visible"
+        );
+        refresh();
+        assert!(
+            !write_fast_status_async(status, path.clone(), Arc::clone(&state), index)
+                .await
+                .expect("check stale writer")
+        );
+        assert!(!path.exists(), "stale writer recreated the fast status");
+        let fresh = crate::core::fast_status::FastStatus::new(11, 4, 1, 3);
+        let index = state.index_snapshot();
+        assert!(
+            write_fast_status_async(fresh, path.clone(), Arc::clone(&state), index)
+                .await
+                .expect("publish new catalog counts")
+        );
+        let persisted =
+            crate::core::fast_status::FastStatus::read_from_file(&path).expect("read fresh status");
+        assert_eq!(persisted.total_packages, 11);
+
+        std::fs::remove_file(&path).expect("clear fixture file");
+        std::fs::create_dir(&path).expect("substitute directory");
+        refresh();
+        assert!(
+            path.is_dir(),
+            "cache invalidation must preserve directories"
+        );
     }
 
     #[test]

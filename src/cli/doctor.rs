@@ -438,17 +438,15 @@ async fn check_fedora_installed_db(command: std::process::Command, deadline: Dur
 }
 
 async fn check_fedora_package_db(command: std::process::Command, deadline: Duration) -> usize {
-    // Fedora's dnf executable resolves to dnf5; RHEL-family DNF4 uses the
-    // older spelling. Both support --cacheonly and `check`.
-    let disable_repo = if command.get_program().to_string_lossy().ends_with("dnf5") {
-        "--disable-repo=*"
-    } else {
-        "--disablerepo=*"
-    };
+    // DNF5 checks the local RPM database without loading available repos, and
+    // rejects a repo-disable glob when there are no configured repos.
+    let dnf5 = command.get_program().to_string_lossy().ends_with("dnf5");
     let mut command = tokio::process::Command::from(command);
-    command
-        .args(["--cacheonly", disable_repo, "check"])
-        .kill_on_drop(true);
+    command.arg("--cacheonly");
+    if !dnf5 {
+        command.arg("--disablerepo=*");
+    }
+    command.arg("check").kill_on_drop(true);
     match tokio::time::timeout(deadline, command.output()).await {
         Ok(Ok(output)) if output.status.success() => {
             println!("  {}", style::success("DNF local package database healthy"));
@@ -2714,14 +2712,18 @@ mod tests {
 
         let fixture = tempfile::TempDir::new().expect("isolated DNF fixture");
         let program = fixture.path().join("dnf5");
-        for (name, repo_flag) in [("dnf5", "--disable-repo=*"), ("dnf", "--disablerepo=*")] {
+        for (name, remaining_arguments) in [
+            ("dnf5", "[ \"$2\" = check ] && [ \"$#\" = 2 ]"),
+            (
+                "dnf",
+                "[ \"$2\" = '--disablerepo=*' ] && [ \"$3\" = check ] && [ \"$#\" = 3 ]",
+            ),
+        ] {
             let program = fixture.path().join(name);
             let script = fixture.path().join(format!("{name}.sh"));
             std::fs::write(
                 &script,
-                format!(
-                    "#!/bin/sh\n[ \"$1\" = --cacheonly ] && [ \"$2\" = '{repo_flag}' ] && [ \"$3\" = check ] && [ \"$#\" = 3 ]\n"
-                ),
+                format!("#!/bin/sh\n[ \"$1\" = --cacheonly ] && {remaining_arguments}\n"),
             )
             .expect("DNF fixture");
             symlink("/bin/sh", &program).expect("immutable named fixture interpreter");

@@ -26,13 +26,12 @@ pub async fn run(package: &str) -> Result<()> {
         backend != crate::package_managers::Backend::Mock,
         "Package installation history is not implemented for the mock backend"
     );
-    crate::core::security::validate_package_name(package)?;
-
     #[cfg(feature = "fedora")]
     if backend == crate::package_managers::Backend::Fedora {
         crate::cli::tea::run_report(build_blame_fedora(package).await?)?;
         return Ok(());
     }
+    crate::core::security::validate_package_name(package)?;
 
     let cmd = build_blame_output(package)?;
     // Fails (non-zero exit) when the command tree contains Cmd::Error.
@@ -53,9 +52,10 @@ async fn build_blame_fedora(package: &str) -> Result<Cmd<()>> {
         "Package '{package}' matches multiple installed builds; specify a version and architecture"
     );
     let root = selected.remove(0);
-    let mut dependents =
-        DnfPackageManager::installed_package_reasons(InstalledReasonQuery::RequiredBy(package))
-            .await?;
+    let mut dependents = DnfPackageManager::installed_package_reasons(
+        InstalledReasonQuery::RequiredBy(&root.identity),
+    )
+    .await?;
     dependents.retain(|entry| entry.identity != root.identity);
     dependents.sort_by(|left, right| left.identity.cmp(&right.identity));
     let mut commands = vec![
@@ -132,11 +132,16 @@ fn build_blame_output(package: &str) -> Result<Cmd<()>> {
 }
 
 fn transaction_history(package: &str) -> Result<Vec<Cmd<()>>> {
-    let mut commands = Vec::new();
-    let history = HistoryManager::new()?;
-    let transactions = history.load()?;
+    let transactions = HistoryManager::load_existing()?;
+    Ok(history_report(&transactions, package))
+}
 
-    let relevant = newest_transactions_for_package(&transactions, package);
+fn history_report(
+    transactions: &[crate::core::history::Transaction],
+    package: &str,
+) -> Vec<Cmd<()>> {
+    let mut commands = Vec::new();
+    let relevant = newest_transactions_for_package(transactions, package);
 
     if relevant.is_empty() {
         use crate::cli::tea::{StyledTextConfig, TextStyle};
@@ -149,10 +154,7 @@ fn transaction_history(package: &str) -> Result<Vec<Cmd<()>>> {
         let txn_content: Vec<String> = relevant
             .iter()
             .take(10)
-            .filter_map(|txn| {
-                // Safe: we filtered for transactions containing this package above
-                let change = txn.changes.iter().find(|c| c.name == package)?;
-
+            .flat_map(|txn| {
                 let action = match (txn.transaction_type, txn.success) {
                     (TransactionType::Install, true) => "installed",
                     (TransactionType::Remove, true) => "removed",
@@ -164,18 +166,19 @@ fn transaction_history(package: &str) -> Result<Vec<Cmd<()>>> {
                     (TransactionType::Sync, false) => "failed to sync",
                 };
 
-                let version_info = match (&change.old_version, &change.new_version) {
-                    (None, Some(new)) => format!("→ {new}"),
-                    (Some(old), Some(new)) => format!("{old} → {new}"),
-                    (Some(old), None) => format!("{old} → (removed)"),
-                    (None, None) => String::new(),
-                };
-
                 let time = format_timestamp(txn.timestamp.as_second());
-                Some(format!(
-                    "{} {} {} ({})",
-                    time, action, version_info, change.source
-                ))
+                txn.changes
+                    .iter()
+                    .filter(move |change| change.name == package)
+                    .map(move |change| {
+                        let version_info = match (&change.old_version, &change.new_version) {
+                            (None, Some(new)) => format!("→ {new}"),
+                            (Some(old), Some(new)) => format!("{old} → {new}"),
+                            (Some(old), None) => format!("{old} → (removed)"),
+                            (None, None) => String::new(),
+                        };
+                        format!("{} {} {} ({})", time, action, version_info, change.source)
+                    })
             })
             .collect();
 
@@ -194,7 +197,7 @@ fn transaction_history(package: &str) -> Result<Vec<Cmd<()>>> {
         }
     }
 
-    Ok(commands)
+    commands
 }
 
 #[cfg(feature = "arch")]
@@ -354,6 +357,55 @@ mod ordering_tests {
                 .collect::<Vec<_>>(),
             ["new", "old"]
         );
+    }
+
+    #[test]
+    fn history_report_preserves_each_matching_change() {
+        use crate::cli::tea::View;
+
+        let mut entry = transaction("update", "2026-01-02T00:00:00Z", "glibc");
+        entry.transaction_type = TransactionType::Update;
+        entry.changes[0].new_version = Some("3.0".into());
+        entry.changes.extend([
+            PackageChange {
+                name: "glibc".into(),
+                old_version: Some("1.0".into()),
+                new_version: Some("2.0".into()),
+                source: "dnf".into(),
+            },
+            PackageChange {
+                name: "glibc".into(),
+                old_version: Some("1.1".into()),
+                new_version: None,
+                source: "dnf".into(),
+            },
+            PackageChange {
+                name: "glibc".into(),
+                old_version: None,
+                new_version: None,
+                source: "unknown-version".into(),
+            },
+            transaction("other", "2026-01-02T00:00:00Z", "bash")
+                .changes
+                .remove(0),
+        ]);
+
+        let report = history_report(&[entry], "glibc");
+        assert_eq!(report.len(), 2);
+        assert!(matches!(report.first(), Some(Cmd::View(View::Spacer))));
+        let (title, rows) = report
+            .iter()
+            .find_map(|command| match command {
+                Cmd::View(View::Card(title, rows)) => Some((title, rows)),
+                _ => None,
+            })
+            .expect("expected one history card");
+        assert_eq!(title, "OMG Transaction History (1)");
+        assert_eq!(rows.len(), 4);
+        assert!(rows[0].contains("→ 3.0"));
+        assert!(rows[1].contains("1.0 → 2.0"));
+        assert!(rows[2].contains("1.1 → (removed)"));
+        assert!(rows[3].ends_with("(unknown-version)"));
     }
 }
 

@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import re
 import stat
+import struct
 import subprocess
 import sys
 import tarfile
@@ -20,37 +21,46 @@ import time
 import tomllib
 import zipfile
 
+from github_artifact_transport import api, api_json, reject_constant, request_body, require, unique_object
+
 MAX_DOWNLOAD = 128 * 1024 * 1024
 MAX_EXPANDED = 256 * 1024 * 1024
-MAX_HTTP_HEADERS = 64 * 1024
 FEATURES = {'arch': 'arch,pgp,license', 'debian': 'debian,pgp,license',
             'debian-trixie': 'debian,pgp,license',
             'ubuntu': 'debian,pgp,license', 'fedora': 'fedora,pgp,license'}
-
-
-def require(condition, message):
-    if not condition:
-        raise ValueError(message)
-
-
-def unique_object(pairs):
-    result = {}
-    for key, value in pairs:
-        require(key not in result, 'duplicate provenance key')
-        result[key] = value
-    return result
-
-
-def reject_constant(value):
-    raise ValueError('nonfinite provenance number: ' + value)
+RELEASE_FEATURES = dict(FEATURES, macos='macos,pgp,license')
+MACOS_RELEASE_IMAGE = 'macos-15'
+RELEASE_IMAGES = {
+    'arch': 'archlinux:latest@sha256:f3691b4dde62ba4c4b6f0ae2c1fbf28e8c0c8c4b9a35c7e06dc1f70e21aa29f6',
+    'debian': 'debian:bookworm@sha256:813017f3d62be4b5891a7acca6a01bdcd4b8513daa81b1ab99d3a50385b26931',
+    'debian-trixie': 'debian:trixie@sha256:34cd9e9fd437c0a095ec39cb2e73422c9f30821b0d0848ed74fd0d43bae4d958',
+    'ubuntu': 'ubuntu-24.04',
+    'fedora': 'fedora:latest@sha256:6c75d5bf57cb0fa5aa4b92c6a83c86c791644496d9ac230de7711f5b8ec3b898',
+}
 
 
 def sha256(data):
     return hashlib.sha256(data).hexdigest()
 
 
+def native_target(distro):
+    return 'aarch64-apple-darwin' if distro == 'macos' else 'x86_64-unknown-linux-gnu'
+
+
+def archive_base(version, distro):
+    platform = 'aarch64-darwin' if distro == 'macos' else 'x86_64-linux-' + distro
+    return 'omg-v' + version + '-' + platform
+
+
+def validate_macos_binary(header):
+    require(len(header) >= 32, 'release binary is not an ARM64 Mach-O executable')
+    magic, cpu, _, kind = struct.unpack_from('<4I', header)
+    require((magic, cpu, kind) == (0xfeedfacf, 0x0100000c, 2),
+            'release binary is not an ARM64 Mach-O executable')
+
+
 def build_command(distro, features, environment):
-    require(distro in FEATURES and features == FEATURES[distro], 'unsupported native recipe')
+    require(distro in RELEASE_FEATURES and features == RELEASE_FEATURES[distro], 'unsupported native recipe')
     flags = '-C target-cpu=x86-64-v2' if distro == 'arch' else ''
     require(not any(key.startswith('CARGO_PROFILE_RELEASE_') for key in environment),
             'release profile override cannot be reused')
@@ -58,7 +68,8 @@ def build_command(distro, features, environment):
     for key in ('CARGO_ENCODED_RUSTFLAGS', 'RUSTC_WRAPPER', 'RUSTC_WORKSPACE_WRAPPER',
                 'CARGO_BUILD_TARGET', 'RUSTC', 'CARGO_BUILD_RUSTC', 'CARGO_TARGET_DIR',
                 'CARGO_BUILD_TARGET_DIR', 'CARGO_BUILD_RUSTFLAGS',
-                'CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS'):
+                'CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS',
+                'CARGO_TARGET_AARCH64_APPLE_DARWIN_RUSTFLAGS'):
         require(not environment.get(key), 'foreign build override: ' + key)
     env = dict(environment, RUSTFLAGS=flags, CARGO_INCREMENTAL='0')
     return ['cargo', 'build', '--timings', '--release', '--no-default-features',
@@ -71,8 +82,11 @@ def command_output(argv):
 
 def build_and_package(root, distro, image, features, destination, context):
     argv, environment = build_command(distro, features, context)
-    require((distro == 'ubuntu' and image == 'ubuntu-24.04') or
-            re.fullmatch(r'[^\s@]+@sha256:[0-9a-f]{64}', image), 'unpinned native build image')
+    if distro == 'macos':
+        require(image == MACOS_RELEASE_IMAGE, 'unexpected macOS release runner')
+    else:
+        require((distro == 'ubuntu' and image == 'ubuntu-24.04') or
+                re.fullmatch(r'[^\s@]+@sha256:[0-9a-f]{64}', image), 'unpinned native build image')
     source = command_output(['git', '-C', str(root), 'rev-parse', 'HEAD'])
     require(re.fullmatch('[a-f0-9]{40}', source) and source == context['GITHUB_SHA'], 'checkout identity mismatch')
     repository = context['GITHUB_REPOSITORY']
@@ -82,13 +96,14 @@ def build_and_package(root, distro, image, features, destination, context):
     require(isinstance(version, str) and re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+', version), 'invalid release version')
     channel = tomllib.loads((root / 'rust-toolchain.toml').read_text(encoding='utf-8'))['toolchain']['channel']
     compiler = command_output(['rustc', '-vV'])
+    target = native_target(distro)
     require(compiler.startswith('rustc ' + channel + ' ') and
-            'host: x86_64-unknown-linux-gnu' in compiler.splitlines(), 'native compiler identity mismatch')
+            f'host: {target}' in compiler.splitlines(), 'native compiler identity mismatch')
     run_attempt = int(context['GITHUB_RUN_ATTEMPT'])
     require(run_attempt > 0 and re.fullmatch('[0-9]+', context['GITHUB_RUN_ID']), 'invalid producer run')
     subprocess.run(argv, env=environment, cwd=root, check=True)
     destination.mkdir(parents=True, exist_ok=False)
-    base = 'omg-v' + version + '-x86_64-linux-' + distro
+    base = archive_base(version, distro)
     archive = destination / (base + '.tar.gz')
     binaries = {}
     with tarfile.open(archive, 'w:gz') as tar:
@@ -97,6 +112,8 @@ def build_and_package(root, distro, image, features, destination, context):
             require(path.is_file() and not path.is_symlink() and path.stat().st_size <= MAX_DOWNLOAD,
                     'missing or invalid release input')
             data = path.read_bytes()
+            if distro == 'macos' and name in ('omg', 'omgd'):
+                validate_macos_binary(data[:32])
             entry = tarfile.TarInfo(base + '/' + name)
             entry.size = len(data)
             entry.mode = 0o755 if name in ('omg', 'omgd') else 0o644
@@ -105,12 +122,13 @@ def build_and_package(root, distro, image, features, destination, context):
                 binaries[name] = sha256(data)
     require(archive.stat().st_size <= MAX_DOWNLOAD, 'native archive exceeds download limit')
     digest = sha256(archive.read_bytes())
-    (destination / (archive.name + '.sha256')).write_text(digest + '  ' + archive.name + '\n', encoding='utf-8')
+    (destination / (archive.name + '.sha256')).write_text(
+        digest + '  ' + archive.name + '\n', encoding='utf-8', newline='\n')
     provenance = {
         'schema_version': 1, 'repository': repository, 'source_sha': source,
         'run_id': context['GITHUB_RUN_ID'], 'run_attempt': run_attempt,
         'workflow_path': '.github/workflows/ci.yml', 'distro': distro, 'image': image,
-        'features': sorted(features.split(',')), 'target': 'x86_64-unknown-linux-gnu',
+        'features': sorted(features.split(',')), 'target': target,
         'profile': 'release', 'instrumentation': 'none',
         'cpu': 'x86-64-v2' if distro == 'arch' else 'generic',
         'toolchain': channel, 'compiler': compiler, 'build_argv': argv,
@@ -144,78 +162,6 @@ def validate_producer_run(run, expected):
             'producer was cancelled or did not complete normally')
 
 
-def api(path, limit=1024 * 1024, *, include_status=False, timeout=90):
-    command = ['gh', 'api', path]
-    if include_status:
-        command.append('--include')
-    with tempfile.TemporaryFile() as output, tempfile.TemporaryFile() as diagnostic:
-        try:
-            subprocess.run(command, stdout=output, stderr=diagnostic, check=True, timeout=timeout)
-        except subprocess.CalledProcessError as error:
-            diagnostic.seek(0)
-            error.stderr = diagnostic.read(4097)
-            if error.stderr:
-                print(error.stderr[:4096].decode(errors='replace').rstrip(), file=sys.stderr)
-            if include_status:
-                require(output.tell() <= limit, 'GitHub response exceeds limit')
-                output.seek(0)
-                error.output = output.read(limit + 1)
-            raise
-        require(output.tell() <= limit, 'GitHub response exceeds limit')
-        output.seek(0)
-        return output.read(limit + 1)
-
-
-def http_response(data, body_limit):
-    parts = re.split(rb'\r?\n\r?\n', data, maxsplit=1)
-    require(len(parts) == 2 and len(parts[0]) <= MAX_HTTP_HEADERS, 'invalid GitHub response headers')
-    headers, body = parts
-    status_line, *fields = headers.splitlines()
-    status = re.fullmatch(rb'HTTP/(?:1\.[01]|2(?:\.0)?|3(?:\.0)?) ([1-5][0-9]{2})(?: [^\r\n]*)?', status_line)
-    require(status is not None and all(b':' in field for field in fields), 'invalid GitHub response headers')
-    require(len(body) <= body_limit, 'GitHub response exceeds limit')
-    retry_after = any(field.split(b':', 1)[0].lower() == b'retry-after' for field in fields)
-    return int(status[1]), body, retry_after
-
-
-def request_body(path, body_limit, timeout, kind):
-    # Each retry starts a fresh request and cannot reuse a partial response.
-    deadline = time.monotonic() + timeout
-    for attempt in range(3):
-        remaining = deadline - time.monotonic()
-        require(remaining > 0, 'GitHub ' + kind + ' request deadline exhausted')
-        try:
-            data = api(path, body_limit + MAX_HTTP_HEADERS, include_status=True, timeout=min(remaining, 90))
-        except (subprocess.TimeoutExpired, subprocess.CalledProcessError) as error:
-            if isinstance(error, subprocess.CalledProcessError):
-                status, retry_after = None, False
-                if error.output:
-                    if not error.output.startswith(b'HTTP/'):
-                        raise
-                    status, _, retry_after = http_response(error.output, body_limit)
-                incomplete_metadata = (
-                    kind == 'metadata' and error.returncode == 1
-                    and (error.stderr or b'').strip() == b'unexpected end of JSON input'
-                    and (status is None or 200 <= status < 300)
-                )
-                # Leave rate limits and server-directed delays as explicit failures.
-                if retry_after or (status not in (502, 503, 504) and not incomplete_metadata):
-                    raise
-            delay = 2 ** attempt
-            if attempt == 2 or deadline - time.monotonic() <= delay:
-                raise
-            time.sleep(delay)
-        else:
-            status, body, _ = http_response(data, body_limit)
-            require(200 <= status < 300, 'unsuccessful GitHub ' + kind + ' response')
-            return body
-
-
-def api_json(path):
-    return json.loads(request_body(path, 1024 * 1024, 90, 'metadata'),
-                      object_pairs_hook=unique_object, parse_constant=reject_constant)
-
-
 def download_artifact(path):
     return request_body(path, MAX_DOWNLOAD, 270, 'artifact')
 
@@ -227,7 +173,7 @@ class ArtifactUnavailable(ValueError):
 def prior_successful_artifact(repository, run, expected_run, distro, artifacts, family='native-release'):
     """Admit a carried build only when this attempt did not rerun its owner."""
     current_attempt = run['run_attempt']
-    owner = f'Linux ({distro})'
+    owner = 'macOS (ARM64)' if distro == 'macos' else f'Linux ({distro})'
     jobs = api_json(f'repos/{repository}/actions/runs/{run["id"]}/attempts/{current_attempt}/jobs?per_page=100')
     require(type(jobs.get('total_count')) is int and jobs['total_count'] <= 100
             and isinstance(jobs.get('jobs'), list) and len(jobs['jobs']) == jobs['total_count'],
@@ -547,20 +493,25 @@ def verify_clippy(root, destination, context, event):
     return result
 
 
+def bundle_identity(repository, source, run_id, attempt, distro, image, version, toolchain):
+    return {
+        'repository': repository, 'source_sha': source, 'run_id': str(run_id),
+        'run_attempt': attempt, 'workflow_path': '.github/workflows/ci.yml',
+        'distro': distro, 'image': image, 'features': sorted(RELEASE_FEATURES[distro].split(',')),
+        'target': native_target(distro), 'profile': 'release', 'instrumentation': 'none',
+        'cpu': 'x86-64-v2' if distro == 'arch' else 'generic', 'toolchain': toolchain, 'version': version,
+    }
+
+
 def reuse(root, distro, image, features, destination, context, event, timeout=1500):
     build_command(distro, features, {})
     started = time.monotonic()
     artifact, run, expected_run, artifact_attempt = find_native_artifact(root, distro, context, event, timeout)
     repository, selected_id, current_attempt = expected_run['repository'], run['id'], run['run_attempt']
-    expected = {
-        'repository': repository, 'source_sha': context['GITHUB_SHA'], 'run_id': str(selected_id),
-        'run_attempt': artifact_attempt, 'workflow_path': '.github/workflows/ci.yml',
-        'distro': distro, 'image': image, 'features': sorted(features.split(',')),
-        'target': 'x86_64-unknown-linux-gnu', 'profile': 'release', 'instrumentation': 'none',
-        'cpu': 'x86-64-v2' if distro == 'arch' else 'generic',
-        'toolchain': tomllib.loads((root / 'rust-toolchain.toml').read_text(encoding='utf-8'))['toolchain']['channel'],
-        'version': tomllib.loads((root / 'Cargo.toml').read_text(encoding='utf-8'))['package']['version'],
-    }
+    toolchain = tomllib.loads((root / 'rust-toolchain.toml').read_text(encoding='utf-8'))['toolchain']['channel']
+    version = tomllib.loads((root / 'Cargo.toml').read_text(encoding='utf-8'))['package']['version']
+    expected = bundle_identity(repository, context['GITHUB_SHA'], selected_id, artifact_attempt,
+                               distro, image, version, toolchain)
     content = download_artifact(f'repos/{repository}/actions/artifacts/{artifact["id"]}/zip')
     provenance, files = validate_bundle(content, artifact.get('digest'), expected)
     refreshed = api_json(f'repos/{repository}/actions/runs/{selected_id}')
@@ -573,6 +524,73 @@ def reuse(root, distro, image, features, destination, context, event, timeout=15
     (destination / 'native-build.json').write_text(json.dumps(provenance, indent=2) + '\n', encoding='utf-8')
     print(f'Verified native CI artifact {artifact["id"]}; waited {time.monotonic() - started:.1f}s', flush=True)
     return provenance
+
+
+def stage_release(root, destination, repository, source, run_id, attempt, *, include_macos=False):
+    require(re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', repository), 'invalid repository')
+    require(re.fullmatch(r'[a-f0-9]{40}', source), 'release staging requires a full commit SHA')
+    require(all(type(value) is int and value > 0 for value in (run_id, attempt)),
+            'release staging requires a positive CI run and attempt')
+    require(not destination.exists() and not destination.is_symlink(), 'release staging destination exists')
+    manifest = command_output(['git', '-C', str(root), 'show', f'{source}:Cargo.toml'])
+    toolchain_file = command_output(['git', '-C', str(root), 'show', f'{source}:rust-toolchain.toml'])
+    version = tomllib.loads(manifest)['package']['version']
+    toolchain = tomllib.loads(toolchain_file)['toolchain']['channel']
+    path = f'repos/{repository}/actions'
+    workflow = api_json(path + '/workflows/ci.yml')
+    require(workflow.get('path') == '.github/workflows/ci.yml' and type(workflow.get('id')) is int,
+            'invalid CI workflow identity')
+    expected_run = dict(repository=repository, workflow_id=workflow['id'], event='push', head_sha=source)
+    run_path = f'{path}/runs/{run_id}'
+
+    def successful_run():
+        run = api_json(run_path)
+        validate_producer_run(run, expected_run)
+        require((run['id'], run['run_attempt']) == (run_id, attempt), 'release producer run or attempt changed')
+        require((run.get('head_branch'), run['status'], run['conclusion']) == ('main', 'completed', 'success'),
+                'release producer is not a successful main push')
+        return run
+
+    run = successful_run()
+    repo_id = run['repository']['id']
+    require(type(repo_id) is int and repo_id > 0, 'invalid producer repository ID')
+    identity = dict(id=run_id, repository_id=repo_id, head_repository_id=repo_id,
+                    head_branch='main', head_sha=source)
+    listing = read_native_artifact_listing(repository, run_id)
+    candidates = {}
+    images = dict(RELEASE_IMAGES, macos=MACOS_RELEASE_IMAGE) if include_macos else RELEASE_IMAGES
+    for distro in images:
+        selected = select_native_artifact(repository, run, expected_run, distro, listing)
+        require(selected is not None, f'CI finished without the required {distro} release artifact')
+        artifact, artifact_attempt = selected
+        owner = artifact.get('workflow_run', {})
+        require(isinstance(owner, dict) and all(type(owner.get(key)) is type(value) and owner[key] == value
+                                                for key, value in identity.items()),
+                f'{distro} release artifact identity does not match the main CI run')
+        candidates[distro] = (artifact, artifact_attempt)
+    require(len({artifact['id'] for artifact, _ in candidates.values()}) == len(candidates),
+            'duplicate release artifact IDs')
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    receipt = dict(repository=repository, source_sha=source, run_id=run_id, run_attempt=attempt, archives={})
+    with tempfile.TemporaryDirectory(prefix='native-release-', dir=destination.parent) as scratch:
+        stage = Path(scratch) / 'verified'
+        for distro, (artifact, artifact_attempt) in candidates.items():
+            expected = bundle_identity(repository, source, run_id, artifact_attempt, distro,
+                                       images[distro], version, toolchain)
+            content = download_artifact(f'{path}/artifacts/{artifact["id"]}/zip')
+            provenance, files = validate_bundle(content, artifact.get('digest'), expected)
+            package = stage / f'{distro}-build'
+            package.mkdir(parents=True)
+            for name, data in files.items():
+                (package / name).write_bytes(data)
+            receipt['archives'][distro] = dict(provenance, artifact_id=artifact['id'],
+                                               artifact_attempt=artifact_attempt, artifact_digest=artifact['digest'])
+        successful_run()
+        (stage / 'native-release-provenance.json').write_text(json.dumps(receipt, indent=2) + '\n', encoding='utf-8')
+        require(not destination.exists() and not destination.is_symlink(), 'release staging destination exists')
+        stage.rename(destination)
+    return receipt
 
 
 def validate_bundle(content, server_digest, expected):
@@ -604,18 +622,18 @@ def validate_bundle(content, server_digest, expected):
                             'build feature mismatch')
                 else:
                     require(type(actual) is type(value) and actual == value, 'build identity mismatch: ' + field)
-            require(isinstance(provenance.get('distro'), str) and provenance['distro'] in FEATURES,
-                    'invalid distro')
+            distro = provenance.get('distro')
+            require(isinstance(distro, str) and distro in RELEASE_FEATURES, 'invalid distro')
             compiler = provenance.get('compiler')
             require(isinstance(compiler, str) and isinstance(provenance.get('toolchain'), str)
                     and compiler.startswith('rustc ' + provenance['toolchain'] + ' ')
-                    and 'host: x86_64-unknown-linux-gnu' in compiler.splitlines(),
+                    and f'host: {native_target(distro)}' in compiler.splitlines(),
                     'recorded compiler does not match native recipe')
-            argv, _ = build_command(provenance['distro'], FEATURES[provenance['distro']], {})
+            argv, _ = build_command(distro, RELEASE_FEATURES[distro], {})
             require(provenance.get('build_argv') == argv, 'recorded build invocation mismatch')
             version = provenance.get('version')
             require(isinstance(version, str) and re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+', version), 'invalid version')
-            base = 'omg-v' + version + '-x86_64-linux-' + provenance['distro']
+            base = archive_base(version, distro)
             name = base + '.tar.gz'
             require(provenance.get('archive') == name, 'foreign archive name')
             require({item.filename for item in members} == {'native-build.json', name, name + '.sha256'},
@@ -648,6 +666,10 @@ def validate_bundle(content, server_digest, expected):
                     require(stream is not None, 'missing release member')
                     digest = hashlib.sha256()
                     with stream:
+                        if distro == 'macos' and leaf in binaries:
+                            header = stream.read(32)
+                            validate_macos_binary(header)
+                            digest.update(header)
                         for block in iter(lambda: stream.read(1024 * 1024), b''):
                             digest.update(block)
                     if leaf in binaries:
@@ -661,14 +683,26 @@ def validate_bundle(content, server_digest, expected):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('mode', choices=('build', 'reuse', 'wait', 'ready', 'clippy-record', 'clippy-verify'))
-    parser.add_argument('--distro', choices=tuple(FEATURES))
+    parser.add_argument('mode', choices=('build', 'reuse', 'wait', 'ready', 'clippy-record', 'clippy-verify',
+                                         'stage-release'))
+    parser.add_argument('--distro', choices=tuple(RELEASE_FEATURES))
     parser.add_argument('--platform', choices=CLIPPY_PLATFORMS)
     parser.add_argument('--image')
     parser.add_argument('--features')
     parser.add_argument('--destination', type=Path)
     parser.add_argument('--timeout', type=int, default=1500)
+    parser.add_argument('--commit')
+    parser.add_argument('--ci-run', type=int)
+    parser.add_argument('--ci-attempt', type=int)
+    parser.add_argument('--include-macos', action='store_true')
     args = parser.parse_args(argv)
+    if args.mode == 'stage-release':
+        if any(value is None for value in (args.destination, args.commit, args.ci_run, args.ci_attempt)):
+            parser.error('stage-release requires --destination, --commit, --ci-run and --ci-attempt')
+        return stage_release(Path.cwd(), args.destination, os.environ['GITHUB_REPOSITORY'],
+                             args.commit, args.ci_run, args.ci_attempt, include_macos=args.include_macos)
+    if any(value is not None for value in (args.commit, args.ci_run, args.ci_attempt)) or args.include_macos:
+        parser.error('--commit, --ci-run, --ci-attempt and --include-macos only apply to stage-release')
     if args.mode in ('clippy-record', 'clippy-verify'):
         require(args.destination is not None, 'Clippy proof destination is required')
         if args.mode == 'clippy-record':

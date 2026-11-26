@@ -4,7 +4,7 @@
 //! fast queries without CLI overhead.
 //!
 //! ## Architecture
-//! 1. Read installed packages from `/var/lib/rpm/rpmdb.sqlite`
+//! 1. Read installed packages from RPM's configured SQLite database
 //!    (`rpm -qa` subprocess fallback for BDB/NDB systems)
 //! 2. Parse RPM header blobs for metadata extraction
 //!
@@ -20,14 +20,19 @@ use std::pin::Pin;
 use anyhow::{Context, Result};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, LazyLock, Mutex, RwLock};
 
+use crate::cli::modern_ui::OutputMode;
 use crate::core::{Package, PackageSource, is_root};
 use crate::package_managers::PackageManager;
-use crate::package_managers::types::{UpdateInfo, parse_version_or_zero};
+use crate::package_managers::types::{PackageStatus, UpdateInfo, parse_version_or_zero};
 
 use rusqlite::{Connection, OpenFlags};
 use zerocopy::{FromBytes, Immutable, KnownLayout, big_endian::U32};
+
+mod catalog;
+
+const DNF_HISTORY_DATABASE: &str = "transaction_history.sqlite";
 
 #[cfg(all(test, unix))]
 pub(crate) use tests::search_parity_data;
@@ -49,23 +54,63 @@ mod rpm_tags {
 
 /// DNF Package Manager implementation
 pub struct DnfPackageManager {
-    /// Path to RPM `SQLite` database
-    rpm_db_path: PathBuf,
-    /// Path to yum repository configuration (used by the `dnf` CLI)
-    repos_dir: PathBuf,
+    rpm_database: RpmDatabaseSource,
     /// Complete RPM inventory bound to database/WAL identity and SQLite commits.
     /// Install reasons belong to DNF's separate state and are queried on demand.
     installed_cache: Arc<RwLock<Option<InstalledSnapshot>>>,
 }
 
+#[derive(Clone)]
+enum RpmDatabaseSource {
+    System,
+    #[cfg(test)]
+    Fixture(PathBuf),
+}
+
+impl RpmDatabaseSource {
+    fn sqlite_path(&self) -> Result<Option<PathBuf>> {
+        match self {
+            Self::System => {
+                // Resolve each observation against native configuration. A
+                // live daemon can outlast an administrator's macro change.
+                let output = DnfPackageManager::rpm_query(
+                    ["--eval", "%{_db_backend}\t%{_dbpath}"],
+                    std::time::Duration::from_secs(2),
+                )
+                .context("Could not read RPM database configuration")?;
+                Self::parse(&output)
+            }
+            #[cfg(test)]
+            Self::Fixture(path) => Ok(Some(path.clone())),
+        }
+    }
+
+    fn parse(output: &[u8]) -> Result<Option<PathBuf>> {
+        let (backend, directory) = std::str::from_utf8(output)
+            .context("RPM database configuration is not UTF-8")?
+            .trim_end_matches('\n')
+            .split_once('\t')
+            .context("RPM database configuration must specify backend and path")?;
+        if backend != "sqlite" {
+            return Ok(None);
+        }
+        let path = Path::new(directory);
+        anyhow::ensure!(
+            path.is_absolute() && !directory.chars().any(char::is_control),
+            "RPM database path must be an absolute path without control characters"
+        );
+        Ok(Some(path.join("rpmdb.sqlite")))
+    }
+}
+
 #[derive(Debug)]
 struct InstalledSnapshot {
     observation: RpmDatabaseObservation,
-    packages: HashMap<String, Vec<InstalledPackage>>,
+    packages: Arc<Vec<InstalledPackage>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct RpmFileIdentity {
+struct FileIdentity {
     device: u64,
     inode: u64,
     size: u64,
@@ -73,10 +118,8 @@ struct RpmFileIdentity {
     changed: (i64, i64),
 }
 
-impl RpmFileIdentity {
+impl FileIdentity {
     fn read(path: &Path) -> std::io::Result<Option<Self>> {
-        use std::os::unix::fs::MetadataExt;
-
         let metadata = match std::fs::metadata(path) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -87,29 +130,35 @@ impl RpmFileIdentity {
                 "RPM cache input is not a regular file",
             ));
         }
-        Ok(Some(Self {
+        Ok(Some(Self::from_metadata(&metadata)))
+    }
+
+    fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt as _;
+
+        Self {
             device: metadata.dev(),
             inode: metadata.ino(),
             size: metadata.len(),
             modified: (metadata.mtime(), metadata.mtime_nsec()),
             changed: (metadata.ctime(), metadata.ctime_nsec()),
-        }))
+        }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RpmDatabaseIdentity {
-    database: RpmFileIdentity,
-    wal: Option<RpmFileIdentity>,
+    database: FileIdentity,
+    wal: Option<FileIdentity>,
 }
 
 impl RpmDatabaseIdentity {
     fn read(path: &Path) -> Option<Self> {
-        let database = RpmFileIdentity::read(path).ok()??;
+        let database = FileIdentity::read(path).ok()??;
         let mut wal_path = path.as_os_str().to_os_string();
         wal_path.push("-wal");
         // An absent WAL is valid; an unreadable one must not validate a hit.
-        let wal = RpmFileIdentity::read(Path::new(&wal_path)).ok()?;
+        let wal = FileIdentity::read(Path::new(&wal_path)).ok()?;
         Some(Self { database, wal })
     }
 
@@ -153,13 +202,15 @@ struct RpmDatabaseObservation {
 }
 
 struct RpmInstalledCatalogObservation {
+    source: RpmDatabaseSource,
     path: PathBuf,
     database: RpmDatabaseObservation,
 }
 
 impl super::InstalledCatalogObservation for RpmInstalledCatalogObservation {
     fn is_current(&self) -> Result<bool> {
-        Ok(self.database.is_current(&self.path))
+        Ok(self.source.sqlite_path()?.as_ref() == Some(&self.path)
+            && self.database.is_current(&self.path))
     }
 }
 
@@ -259,7 +310,6 @@ struct InstalledPackage {
     release: String,
     architecture: String,
     summary: String,
-    reason: InstallReason,
 }
 
 impl InstalledPackage {
@@ -288,18 +338,65 @@ impl InstalledPackage {
                     self.name, self.version, self.release, self.architecture
                 ) == selector)
     }
+
+    fn as_package(&self) -> Package {
+        Package {
+            name: self.identity(),
+            version: parse_version_or_zero(&self.evr()),
+            description: self.summary.clone(),
+            source: PackageSource::Official,
+            installed: true,
+        }
+    }
+
+    fn evr(&self) -> String {
+        format!("{}-{}", self.version, self.release)
+    }
+}
+
+struct AvailablePackage<'a> {
+    name: &'a str,
+    version: &'a str,
+    summary: &'a str,
+}
+
+impl AvailablePackage<'_> {
+    fn into_package(self) -> Package {
+        Package {
+            name: self.name.to_owned(),
+            version: parse_version_or_zero(self.version),
+            description: self.summary.to_owned(),
+            source: PackageSource::Official,
+            installed: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RepositoryQuery<'a> {
     Available(Option<&'a str>),
     Installed,
-    Upgrades,
     Unneeded,
     InstalledSizes(InstalledSizeQuery<'a>),
     InstalledReasons(InstalledReasonQuery<'a>),
     InstalledDetails(&'a str),
 }
+
+const UPGRADE_QUERY_ARGS: [&str; 6] = [
+    "--quiet",
+    "--color=never",
+    "--cacheonly",
+    "--setopt=*.skip_if_unavailable=false",
+    "list",
+    "--upgrades",
+];
+
+const REPOSITORY_REFRESH_ARGS: [&str; 4] = [
+    "--refresh",
+    "--setopt=*.skip_if_unavailable=false",
+    "makecache",
+    "-y",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum InstalledSizeQuery<'a> {
@@ -344,6 +441,27 @@ struct NativeTransaction {
 struct NativeTransactionPackage {
     nevra: String,
     action: String,
+}
+
+pub(crate) struct PreparedDnfRemoval {
+    directory: tempfile::TempDir,
+    packages: Vec<super::types::RemovalPackage>,
+}
+
+impl PreparedDnfRemoval {
+    pub(crate) fn packages(&self) -> &[super::types::RemovalPackage] {
+        &self.packages
+    }
+}
+
+enum DnfAdmission<'a> {
+    InstallOrUpgrade,
+    Remove {
+        packages: &'a [String],
+        comment: Option<&'a str>,
+        yes: bool,
+        output: OutputMode,
+    },
 }
 
 #[derive(serde::Deserialize)]
@@ -393,14 +511,18 @@ struct VersionedPackage {
     repository: String,
 }
 
-/// Why a package was installed
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum InstallReason {
-    User,
-    Dependency,
+struct PlannedDnfAdvisories;
+
+enum AdvisoryLookup<'a> {
+    ArchitectureChanges,
+    Proposed(&'a [super::types::SecurityPackage]),
 }
 
-struct PlannedDnfAdvisories;
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InstalledAdvisoryMatch {
+    Exact,
+    ArchitectureChange,
+}
 
 struct CancelStoredQuery(Option<tokio::sync::oneshot::Sender<()>>);
 
@@ -434,11 +556,18 @@ impl crate::core::security::vulnerability::VulnerabilitySource for PlannedDnfAdv
                 PackageAssessment, PackageCoverage, UnknownCoverage, VulnerabilityError,
             };
             let assess = async {
-                // This installed-name-filtered source is supplemental evidence only.
-                // It never establishes complete coverage for proposed dependencies.
-                let native = super::dnf_advisory::audit_result(
-                    DnfPackageManager::native_advisories().await?,
-                )?;
+                let (mut rows, mut supplemental) =
+                    DnfPackageManager::native_advisories(AdvisoryLookup::Proposed(packages))
+                        .await?;
+                let native_ids: BTreeSet<_> = rows
+                    .iter()
+                    .map(|(row, _)| (row.name.as_str(), row.nevra.as_str()))
+                    .collect();
+                supplemental.retain(|(row, _)| {
+                    !native_ids.contains(&(row.name.as_str(), row.nevra.as_str()))
+                });
+                rows.extend(supplemental);
+                let native = super::dnf_advisory::audit_result(rows)?;
                 let mut assessments = Vec::with_capacity(packages.len());
                 let mut comparisons = Vec::new();
                 let mut candidates = Vec::new();
@@ -538,10 +667,15 @@ impl DnfPackageManager {
                 input.len() <= 64 * 1024,
                 "Native RPM comparison input exceeds limit"
             );
-            let mut command =
-                tokio::process::Command::from(crate::core::privilege::system_command("rpm")?);
+            let mut command = Self::rpm_query_command()?;
             command.env("OMG_EVR_PAIRS", input).args(["--eval", r#"%{lua:local left=nil; for value in string.gmatch(os.getenv("OMG_EVR_PAIRS"), "[^\n]+") do if left then print(string.format("%d\n",rpm.vercmp(left,value))); left=nil else left=value end end; if left then error("incomplete comparison") end}"#]);
-            let output = Self::query_output(command).await?;
+            let output = Self::controlled_query_output(
+                "RPM",
+                command,
+                std::time::Duration::from_mins(1),
+                None,
+            )
+            .await?;
             let compared = std::str::from_utf8(&output)?
                 .split_whitespace()
                 .map(|value| match value {
@@ -648,7 +782,13 @@ impl DnfPackageManager {
     }
 
     async fn simulate_removal(packages: &[String]) -> Result<Vec<super::types::RemovalPackage>> {
-        crate::core::security::validate_package_names(packages)?;
+        Ok(Self::prepare_removal(packages)
+            .await?
+            .map_or_else(Vec::new, |plan| plan.packages))
+    }
+
+    pub(crate) async fn prepare_removal(packages: &[String]) -> Result<Option<PreparedDnfRemoval>> {
+        Self::validate_package_selectors(packages)?;
         let directory = Self::removal_preview_directory()?;
         let mut command =
             tokio::process::Command::from(crate::core::privilege::system_command("dnf")?);
@@ -662,11 +802,78 @@ impl DnfPackageManager {
                 format!("--store={}", directory.path().display()),
             ])
             .args(packages);
-        let (_directory, bytes) =
+        let Some((directory, bytes)) =
             Self::owned_stored_transaction(command, directory, std::time::Duration::from_mins(1))
                 .await
-                .context("Could not simulate removal with DNF5 --store")?;
-        Self::parse_removal_plan(&bytes)
+                .context("Could not simulate removal with DNF5 --store")?
+        else {
+            return Ok(None);
+        };
+        let packages = Self::parse_removal_plan(&bytes)?;
+        Ok(Some(PreparedDnfRemoval {
+            directory,
+            packages,
+        }))
+    }
+
+    pub(crate) async fn replay_removal(
+        &self,
+        plan: PreparedDnfRemoval,
+        history: &crate::core::history::HistoryManager,
+    ) -> Result<()> {
+        Self::record_native_mutation(
+            crate::core::history::TransactionType::Remove,
+            Some(history),
+            |comment| self.replay_removal_plan(plan, comment),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    async fn replay_removal_plan(
+        &self,
+        plan: PreparedDnfRemoval,
+        comment: Option<String>,
+    ) -> Result<()> {
+        // Replay normally loads available repositories. Removal uses only
+        // installed packages, and DNF rejects a disable glob with no matches.
+        let mut command =
+            tokio::process::Command::from(crate::core::privilege::system_command("dnf")?);
+        command.args(["repo", "list", "--all", "--json"]);
+        let output = Self::query_output(command).await?;
+        let repositories: Vec<serde::de::IgnoredAny> =
+            serde_json::from_slice(&output).context("Invalid DNF repository list")?;
+        let options: &'static [&'static str] = if repositories.is_empty() {
+            &[]
+        } else {
+            &["--disable-repo=*"]
+        };
+        self.replay_stored_transaction(plan.directory, options, comment)
+            .await
+    }
+
+    pub(crate) async fn remove_with_elevation(packages: &[String], yes: bool) -> Result<()> {
+        let mode = if yes { "-y" } else { "--confirm" };
+        let output = match crate::cli::modern_ui::output_mode() {
+            OutputMode::Quiet => Some("--quiet"),
+            OutputMode::Verbose => Some("--verbose"),
+            OutputMode::Plain | OutputMode::Interactive => None,
+        };
+        let operation = |comment: Option<String>| async move {
+            let mut args: Vec<_> = comment.into_iter().collect();
+            args.extend(["remove".to_owned(), mode.to_owned()]);
+            args.extend(output.map(str::to_owned));
+            args.extend_from_slice(packages);
+            crate::core::privilege::run_privileged_dnf(&args).await
+        };
+        let history = crate::core::history::HistoryManager::new()?;
+        Self::record_native_mutation(
+            crate::core::history::TransactionType::Remove,
+            Some(&history),
+            operation,
+        )
+        .await
+        .map(|_| ())
     }
     fn cached_update_args() -> Vec<String> {
         ["--setopt=cacheonly=metadata", "upgrade", "-y"]
@@ -675,11 +882,25 @@ impl DnfPackageManager {
             .collect()
     }
 
+    /// Return the recorded package-change count when this caller owns history.
+    pub(crate) async fn update_with_history(
+        &self,
+        cached: bool,
+        history: Option<&crate::core::history::HistoryManager>,
+    ) -> Result<Option<usize>> {
+        let args = if cached {
+            Self::cached_update_args()
+        } else {
+            vec!["upgrade".to_owned(), "-y".to_owned()]
+        };
+        self.recorded_mutation(crate::core::history::TransactionType::Update, args, history)
+            .await
+    }
+
     #[must_use]
     pub fn new() -> Self {
         Self {
-            rpm_db_path: PathBuf::from("/var/lib/rpm/rpmdb.sqlite"),
-            repos_dir: PathBuf::from("/etc/yum.repos.d"),
+            rpm_database: RpmDatabaseSource::System,
             installed_cache: Arc::new(RwLock::new(None)),
         }
     }
@@ -703,123 +924,157 @@ impl DnfPackageManager {
         *self.cache_write() = None;
     }
 
-    fn cached_installed_packages(&self) -> Option<Vec<InstalledPackage>> {
+    fn cached_installed_packages(&self, path: &Path) -> Option<Arc<Vec<InstalledPackage>>> {
         self.cache_read()
             .as_ref()
-            .filter(|snapshot| snapshot.observation.is_current(&self.rpm_db_path))
-            .map(|snapshot| snapshot.packages.values().flatten().cloned().collect())
+            .filter(|snapshot| snapshot.observation.is_current(path))
+            .map(|snapshot| Arc::clone(&snapshot.packages))
     }
 
     fn publish_installed_packages(
         &self,
-        packages: &[InstalledPackage],
+        path: Option<&Path>,
+        packages: Arc<Vec<InstalledPackage>>,
         observed_identity: Option<RpmDatabaseObservation>,
     ) {
         // Never label an old read with a newer generation, or cache a CLI
         // fallback whose actual database was not observed. Empty inventories
         // are valid snapshots too.
-        let snapshot = observed_identity
-            .filter(|observation| observation.is_current(&self.rpm_db_path))
-            .map(|observation| {
-                let mut grouped: HashMap<String, Vec<InstalledPackage>> = HashMap::new();
-                for package in packages {
-                    grouped
-                        .entry(package.name.clone())
-                        .or_default()
-                        .push(package.clone());
-                }
-                InstalledSnapshot {
-                    observation,
-                    packages: grouped,
-                }
+        let snapshot = path
+            .zip(observed_identity)
+            .filter(|(path, observation)| observation.is_current(path))
+            .map(|(_, observation)| InstalledSnapshot {
+                observation,
+                packages,
             });
         *self.cache_write() = snapshot;
-    }
-
-    fn apply_install_reasons(
-        packages: &mut [InstalledPackage],
-        user_installed: Result<HashSet<String>>,
-    ) -> Result<()> {
-        let user_installed = user_installed.context("Could not load DNF install reasons")?;
-        for package in packages {
-            package.reason = if user_installed.contains(&package.name) {
-                InstallReason::User
-            } else {
-                InstallReason::Dependency
-            };
-        }
-        Ok(())
     }
 
     /// DNF reports install reasons by package name, while RPM can retain
     /// multiple installed versions of the same name (notably kernels).
     /// Explicit-package APIs are name inventories, so collapse those parallel
     /// versions before returning a listing or count.
-    fn explicit_package_names(packages: impl IntoIterator<Item = InstalledPackage>) -> Vec<String> {
-        packages
-            .into_iter()
-            .filter(|package| package.reason == InstallReason::User)
-            .map(|package| package.name)
+    fn explicit_package_names(
+        packages: &[InstalledPackage],
+        user_installed: Result<HashSet<String>>,
+    ) -> Result<Vec<String>> {
+        let user_installed = user_installed.context("Could not load DNF install reasons")?;
+        Ok(packages
+            .iter()
+            .map(|package| package.name.as_str())
+            .filter(|name| user_installed.contains(*name))
             .collect::<BTreeSet<_>>()
             .into_iter()
-            .collect()
+            .map(str::to_owned)
+            .collect())
+    }
+
+    /// Count installed RPM entries without querying DNF repositories.
+    ///
+    /// # Errors
+    /// Returns an error when the installed RPM inventory cannot be read.
+    pub fn installed_count(&self) -> Result<usize> {
+        let path = self.rpm_database.sqlite_path()?;
+        let (packages, _) = Self::read_rpm_database(path.as_deref(), false)?;
+        Ok(packages.len())
     }
 
     /// Load installed packages from RPM `SQLite` database
     ///
-    /// Reads directly from `/var/lib/rpm/rpmdb.sqlite` and parses RPM header blobs
+    /// Reads directly from the configured SQLite database and parses RPM header blobs
     /// to extract package metadata. Caches results in memory for subsequent calls.
-    async fn load_installed_packages(&self) -> Result<Vec<InstalledPackage>> {
+    async fn load_installed_packages(&self) -> Result<Arc<Vec<InstalledPackage>>> {
         let manager = self.cache_handle();
         tokio::task::spawn_blocking(move || manager.load_installed_packages_blocking()).await?
     }
 
-    fn load_installed_packages_blocking(&self) -> Result<Vec<InstalledPackage>> {
-        if let Some(cached) = self.cached_installed_packages() {
+    fn load_installed_packages_blocking(&self) -> Result<Arc<Vec<InstalledPackage>>> {
+        let path = self.rpm_database.sqlite_path()?;
+        self.load_installed_packages_at(path.as_deref())
+    }
+
+    fn load_installed_packages_at(
+        &self,
+        path: Option<&Path>,
+    ) -> Result<Arc<Vec<InstalledPackage>>> {
+        if let Some(cached) = path.and_then(|path| self.cached_installed_packages(path)) {
             return Ok(cached);
         }
-        let (packages, identity) = Self::read_rpm_database(&self.rpm_db_path)?;
-        self.publish_installed_packages(&packages, identity);
+        let (packages, identity) = Self::read_rpm_database(path, true)?;
+        let packages = Arc::new(packages);
+        self.publish_installed_packages(path, Arc::clone(&packages), identity);
         Ok(packages)
     }
 
     pub(crate) fn is_installed_fast(&self, package: &str) -> Result<bool> {
-        let cached = self
-            .cache_read()
-            .as_ref()
-            .filter(|snapshot| snapshot.observation.is_current(&self.rpm_db_path))
-            .map(|snapshot| {
-                snapshot.packages.contains_key(package)
-                    || snapshot
-                        .packages
-                        .values()
-                        .flatten()
-                        .any(|installed| installed.matches_selector(package))
-            });
-        if let Some(installed) = cached {
-            return Ok(installed);
-        }
-        Ok(self
-            .load_installed_packages_blocking()?
-            .iter()
-            .any(|installed| installed.matches_selector(package)))
+        Ok(!self.matching_installed_packages(package)?.is_empty())
     }
 
-    async fn apply_current_install_reasons(packages: &mut [InstalledPackage]) -> Result<()> {
-        let user_installed = tokio::task::spawn_blocking(Self::read_user_installed_names)
-            .await
-            .context("DNF install-reason worker failed")?;
-        Self::apply_install_reasons(packages, user_installed)
+    fn matching_installed_packages(&self, selector: &str) -> Result<Vec<InstalledPackage>> {
+        let path = self.rpm_database.sqlite_path()?;
+        if let Some(path) = &path {
+            match Self::read_rpm_name_index(path, selector) {
+                Ok(packages) if !packages.is_empty() => return Ok(packages),
+                Ok(_) => {}
+                Err(error) => tracing::debug!("RPM name lookup unavailable: {error:#}"),
+            }
+        }
+        Ok(self
+            .load_installed_packages_at(path.as_deref())?
+            .iter()
+            .filter(|package| package.matches_selector(selector))
+            .cloned()
+            .collect())
+    }
+
+    fn read_rpm_name_index(path: &Path, selector: &str) -> Result<Vec<InstalledPackage>> {
+        let connection = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        connection.busy_timeout(std::time::Duration::ZERO)?;
+        // A literal package name can also look like a qualified selector.
+        // Read every plausible name in a single snapshot before matching.
+        let name_arch = selector.rsplit_once('.').map(|(name, _)| name);
+        let nevra_name = super::dnf_advisory::package_identity(selector)
+            .ok()
+            .map(|(name, _)| name);
+        let mut statement = connection.prepare(
+            "SELECT Name.key, Name.hnum, Packages.blob
+             FROM Name LEFT JOIN Packages USING (hnum)
+             WHERE Name.key IN (?1, ?2, ?3)",
+        )?;
+        let mut rows = statement.query(rusqlite::params![selector, name_arch, nevra_name])?;
+        let mut headers = HashSet::new();
+        let mut packages = Vec::new();
+        while let Some(row) = rows.next()? {
+            let name = row.get_ref(0)?.as_str()?;
+            let header: i64 = row.get(1)?;
+            let package = Self::parse_package_from_blob(row.get_ref(2)?.as_blob()?)?;
+            anyhow::ensure!(
+                package.name == name && headers.insert(header),
+                "Inconsistent RPM name index"
+            );
+            if package.matches_selector(selector) {
+                packages.push(package);
+            }
+        }
+        Ok(packages)
+    }
+
+    async fn current_explicit_package_names(packages: &[InstalledPackage]) -> Result<Vec<String>> {
+        Self::explicit_package_names(packages, Self::read_user_installed_names().await)
     }
 
     /// Read RPM database, trying `SQLite` first then falling back to subprocess
-    #[cfg(feature = "fedora")]
     fn read_rpm_database(
-        db_path: &Path,
+        db_path: Option<&Path>,
+        observe_snapshot: bool,
     ) -> Result<(Vec<InstalledPackage>, Option<RpmDatabaseObservation>)> {
-        // Try SQLite first (Fedora 33+, RHEL 9+) - 50-100x faster
-        if db_path.exists() {
-            let identity = RpmDatabaseObservation::read(db_path);
+        if let Some(db_path) = db_path.filter(|path| path.exists()) {
+            let identity = observe_snapshot
+                .then(|| RpmDatabaseObservation::read(db_path))
+                .flatten();
             // Opening another SQLite connection can chmod the WAL and change
             // its ctime even without a commit. Read through the observer so
             // the inventory and its commit generation share one connection.
@@ -848,20 +1103,16 @@ impl DnfPackageManager {
     ///
     /// Fallback for systems without `SQLite` RPM database (`BerkeleyDB`, `NDB`).
     fn read_rpm_via_query() -> Result<Vec<InstalledPackage>> {
-        let output = crate::core::privilege::system_command("rpm")?
-            .args([
+        let output = Self::rpm_query(
+            [
                 "-qa",
                 "--queryformat",
-                "%{NAME}\t%{VERSION}\t%{RELEASE}\t%{SUMMARY}\t%{EPOCHNUM}\t%{ARCH}\n",
-            ])
-            .output()
-            .context("Failed to execute rpm -qa")?;
+                "%{NAME}\t%{VERSION}\t%{RELEASE}\t%{EPOCHNUM}\t%{ARCH}\t%{SUMMARY}\n",
+            ],
+            std::time::Duration::from_mins(1),
+        )?;
 
-        if !output.status.success() {
-            anyhow::bail!("rpm command failed: {}", output.status);
-        }
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stdout = String::from_utf8_lossy(&output);
         let mut packages = Vec::with_capacity(2048);
 
         for line in stdout.lines() {
@@ -872,6 +1123,25 @@ impl DnfPackageManager {
         }
 
         Ok(packages)
+    }
+
+    fn rpm_query_command() -> Result<tokio::process::Command> {
+        let mut command =
+            tokio::process::Command::from(crate::core::privilege::system_command("rpm")?);
+        // Exclude caller macros and preserve the system macro configuration.
+        command.env("HOME", "/").env("LC_ALL", "C");
+        Ok(command)
+    }
+
+    fn rpm_query<const N: usize>(
+        arguments: [&str; N],
+        deadline: std::time::Duration,
+    ) -> Result<Vec<u8>> {
+        let mut command = Self::rpm_query_command()?;
+        command.args(arguments);
+        crate::cli::tea::run_blocking_future(Self::controlled_query_output(
+            "RPM", command, deadline, None,
+        ))?
     }
 
     fn parse_user_installed_names(output: &[u8]) -> Result<HashSet<String>> {
@@ -891,31 +1161,25 @@ impl DnfPackageManager {
     /// names concatenate into one row.
     const USER_INSTALLED_QUERY_FORMAT: &str = "%{name}\\n";
 
-    pub(crate) fn read_user_installed_names() -> Result<HashSet<String>> {
-        // Installation reasons are local DNF state. Keep this read offline and
-        // include packages hidden by repository exclude rules.
-        let output = crate::core::privilege::system_command("dnf")?
-            .args([
-                "--cacheonly",
-                "--disable-repo=*",
-                "--setopt=disable_excludes=*",
-                "repoquery",
-                "--userinstalled",
-                "--qf",
-                Self::USER_INSTALLED_QUERY_FORMAT,
-            ])
-            .output()
-            .context("Failed to execute dnf repoquery --userinstalled")?;
-        if !output.status.success() {
-            let stderr =
-                crate::cli::style::sanitize_terminal_text(&String::from_utf8_lossy(&output.stderr));
-            anyhow::bail!("dnf repoquery --userinstalled failed: {}", stderr.trim());
-        }
-        Self::parse_user_installed_names(&output.stdout)
+    pub(crate) async fn read_user_installed_names() -> Result<HashSet<String>> {
+        // --userinstalled reads the system repo only. An unmatched repo glob
+        // would reject a valid local inventory on a host with no configured repos.
+        let mut command =
+            tokio::process::Command::from(crate::core::privilege::system_command("dnf")?);
+        command.args([
+            "--cacheonly",
+            "--setopt=disable_excludes=*",
+            "repoquery",
+            "--userinstalled",
+            "--qf",
+            Self::USER_INSTALLED_QUERY_FORMAT,
+        ]);
+        Self::parse_user_installed_names(&Self::query_output(command).await?)
     }
 
     fn parse_rpm_qa_line(line: &str) -> Result<InstalledPackage> {
-        let fields: Vec<&str> = line.split('\t').collect();
+        // The free-form summary can contain tabs, so keep the final field intact.
+        let fields: Vec<&str> = line.splitn(6, '\t').collect();
         if fields.len() != 6 {
             anyhow::bail!(
                 "malformed rpm -qa output: expected 6 fields, got {}",
@@ -923,8 +1187,18 @@ impl DnfPackageManager {
             );
         }
 
-        let epoch: u32 = fields[4].parse().context("Malformed RPM epoch")?;
-        anyhow::ensure!(!fields[5].is_empty(), "RPM architecture is missing");
+        let epoch: u32 = fields[3].parse().context("Malformed RPM epoch")?;
+        let missing = |value: &str| value.is_empty() || value == "(none)";
+        anyhow::ensure!(
+            ![fields[0], fields[1], fields[2]].into_iter().any(missing),
+            "Incomplete package identity in rpm -qa output"
+        );
+        let architecture = if missing(fields[4]) {
+            anyhow::ensure!(fields[0] == "gpg-pubkey", "RPM architecture is missing");
+            String::new()
+        } else {
+            fields[4].to_owned()
+        };
         Ok(InstalledPackage {
             name: fields[0].to_string(),
             version: if epoch == 0 {
@@ -933,15 +1207,13 @@ impl DnfPackageManager {
                 format!("{epoch}:{}", fields[1])
             },
             release: fields[2].to_string(),
-            architecture: fields[5].to_owned(),
-            summary: fields[3].to_string(),
-            // Install reasons are populated separately from DNF's state.
-            reason: InstallReason::Dependency,
+            architecture,
+            summary: fields[5].to_owned(),
         })
     }
 
     /// Database blobs omit the magic/reserved prefix used in RPM archive headers.
-    /// Tag data borrows from the validated payload rather than copying unused fields.
+    /// All entries are validated, but only the package fields are retained.
     fn parse_rpm_header(blob: &[u8]) -> Result<HashMap<u32, &[u8]>> {
         const MAX_HEADER_ENTRIES: u32 = 100_000;
 
@@ -988,7 +1260,7 @@ impl DnfPackageManager {
         );
 
         let payload = &rest[data_start..data_start + data_size];
-        let mut tags = HashMap::with_capacity(num_entries as usize);
+        let mut tags = HashMap::with_capacity(6);
         for chunk in rest[..data_start].chunks_exact(size_of::<IndexEntry>()) {
             let entry =
                 IndexEntry::ref_from_bytes(chunk).expect("chunk length checked by chunks_exact");
@@ -1038,10 +1310,7 @@ impl DnfPackageManager {
                 7 => count,
                 6 | 8 | 9 => {
                     let last = count.checked_sub(1).context("RPM string array is empty")?;
-                    payload[base..]
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(index, &byte)| (byte == 0).then_some(index))
+                    memchr::memchr_iter(0, &payload[base..])
                         .nth(last)
                         .ok_or_else(|| anyhow::anyhow!("RPM tag {tag} string missing terminator"))?
                 }
@@ -1056,7 +1325,17 @@ impl DnfPackageManager {
                 "RPM tag {tag} data region exceeds payload"
             );
 
-            tags.insert(tag, &payload[base..abs_end]);
+            if matches!(
+                tag,
+                rpm_tags::NAME
+                    | rpm_tags::VERSION
+                    | rpm_tags::RELEASE
+                    | rpm_tags::EPOCH
+                    | rpm_tags::SUMMARY
+                    | rpm_tags::ARCH
+            ) {
+                tags.insert(tag, &payload[base..abs_end]);
+            }
         }
 
         Ok(tags)
@@ -1091,6 +1370,15 @@ impl DnfPackageManager {
             .transpose()?
             .unwrap_or(0);
         let version = get_string(rpm_tags::VERSION);
+        let release = get_string(rpm_tags::RELEASE);
+        let architecture = get_string(rpm_tags::ARCH);
+        anyhow::ensure!(!version.is_empty(), "RPM header missing VERSION tag");
+        anyhow::ensure!(!release.is_empty(), "RPM header missing RELEASE tag");
+        // Legacy RPM databases store imported keys as architecture-less records.
+        anyhow::ensure!(
+            !architecture.is_empty() || name == "gpg-pubkey",
+            "RPM header missing ARCH tag"
+        );
         Ok(InstalledPackage {
             name,
             version: if epoch == 0 {
@@ -1098,16 +1386,15 @@ impl DnfPackageManager {
             } else {
                 format!("{epoch}:{version}")
             },
-            release: get_string(rpm_tags::RELEASE),
-            architecture: get_string(rpm_tags::ARCH),
+            release,
+            architecture,
             summary: get_string(rpm_tags::SUMMARY),
-            reason: InstallReason::Dependency,
         })
     }
 
     /// Read RPM database directly from `SQLite` (Fedora 33+, RHEL 9+)
     ///
-    /// Opens `/var/lib/rpm/rpmdb.sqlite` in read-only mode and parses
+    /// Opens the configured database in read-only mode and parses
     /// RPM header blobs from the `Packages` table without a subprocess.
     fn read_rpm_sqlite(db_path: &Path) -> Result<Vec<InstalledPackage>> {
         let conn = Connection::open_with_flags(
@@ -1122,17 +1409,13 @@ impl DnfPackageManager {
     fn read_rpm_sqlite_connection(conn: &Connection) -> Result<Vec<InstalledPackage>> {
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
 
-        let mut stmt = conn.prepare("SELECT blob FROM Packages")?;
+        let mut stmt = conn.prepare("SELECT blob FROM Packages ORDER BY hnum")?;
         let mut packages = Vec::with_capacity(2048);
 
-        let rows = stmt.query_map([], |row| {
-            let blob: Vec<u8> = row.get(0)?;
-            Ok(blob)
-        })?;
-
-        for row in rows {
-            let blob = row?;
-            let pkg = Self::parse_package_from_blob(&blob).with_context(|| {
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let blob = row.get_ref(0)?.as_blob()?;
+            let pkg = Self::parse_package_from_blob(blob).with_context(|| {
                 format!(
                     "Malformed RPM header in Packages table (row {}, {} packages decoded before the failure)",
                     packages.len() + 1,
@@ -1146,34 +1429,35 @@ impl DnfPackageManager {
         Ok(packages)
     }
 
-    fn parse_available_packages(output: &[u8]) -> Result<Vec<Package>> {
+    fn available_rows(output: &[u8]) -> Result<impl Iterator<Item = Result<AvailablePackage<'_>>>> {
         let text = std::str::from_utf8(output).context("DNF repository output is not UTF-8")?;
-        text.lines()
-            .filter(|line| !line.is_empty())
-            .map(|line| {
-                let mut fields = line.splitn(3, '\t');
-                let name = fields.next().context("DNF repository row has no name")?;
-                let version = fields.next().context("DNF repository row has no version")?;
-                let summary = fields.next().context("DNF repository row has no summary")?;
-                anyhow::ensure!(
-                    !name.is_empty()
-                        && name
-                            .bytes()
-                            .all(|byte| byte.is_ascii_alphanumeric() || b"+._-".contains(&byte)),
-                    "DNF repository row has invalid package name"
-                );
-                anyhow::ensure!(
-                    !version.is_empty() && !version.chars().any(char::is_whitespace),
-                    "DNF repository row has invalid version"
-                );
-                Ok(Package {
-                    name: name.to_owned(),
-                    version: parse_version_or_zero(version),
-                    description: summary.to_owned(),
-                    source: PackageSource::Official,
-                    installed: false,
-                })
+        Ok(text.lines().filter(|line| !line.is_empty()).map(|line| {
+            let mut fields = line.splitn(3, '\t');
+            let name = fields.next().context("DNF repository row has no name")?;
+            let version = fields.next().context("DNF repository row has no version")?;
+            let summary = fields.next().context("DNF repository row has no summary")?;
+            anyhow::ensure!(
+                !name.is_empty()
+                    && name
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || b"+._-".contains(&byte)),
+                "DNF repository row has invalid package name"
+            );
+            anyhow::ensure!(
+                !version.is_empty() && !version.chars().any(char::is_whitespace),
+                "DNF repository row has invalid version"
+            );
+            Ok(AvailablePackage {
+                name,
+                version,
+                summary,
             })
+        }))
+    }
+
+    fn parse_available_packages(output: &[u8]) -> Result<Vec<Package>> {
+        Self::available_rows(output)?
+            .map(|row| row.map(AvailablePackage::into_package))
             .collect()
     }
 
@@ -1182,36 +1466,131 @@ impl DnfPackageManager {
         Self::parse_available_packages(&bytes)
     }
 
-    fn search_candidates(
-        installed: Vec<InstalledPackage>,
+    fn select_available_info(
+        selector: &str,
+        mut candidates: Vec<Package>,
+    ) -> Result<Option<Package>> {
+        let preferred = |package: &Package| {
+            package
+                .name
+                .rsplit_once('.')
+                .is_some_and(|(_, arch)| arch == std::env::consts::ARCH || arch == "noarch")
+        };
+        // DNF resolves an architecture-qualified selector before returning rows.
+        // Bare names can include several architectures for the same package.
+        if candidates.iter().any(preferred) {
+            candidates.retain(preferred);
+        }
+        anyhow::ensure!(
+            candidates.len() <= 1,
+            "Package '{selector}' has multiple available builds; specify the full NEVRA"
+        );
+        Ok(candidates.pop())
+    }
+
+    // Put the native newest build first for each installed identity. Keep
+    // older descriptions searchable in both direct and daemon paths.
+    async fn order_installed_search_builds(
+        installed: &[InstalledPackage],
+    ) -> Result<Vec<&InstalledPackage>> {
+        let mut first = HashMap::with_capacity(installed.len());
+        let mut contenders = BTreeMap::<usize, Vec<usize>>::new();
+        for (index, package) in installed.iter().enumerate() {
+            let identity = (package.name.as_str(), package.architecture.as_str());
+            let first = *first.entry(identity).or_insert(index);
+            if first != index {
+                contenders
+                    .entry(first)
+                    .or_insert_with(|| vec![first])
+                    .push(index);
+            }
+        }
+
+        // RPM compares only parallel builds. Batch a round across all
+        // identities, carrying an unpaired build into the next round.
+        while contenders.values().any(|builds| builds.len() > 1) {
+            let pairs: Vec<_> = contenders
+                .values()
+                .flat_map(|builds| builds.chunks_exact(2))
+                .map(|pair| (installed[pair[0]].evr(), installed[pair[1]].evr()))
+                .collect();
+            let mut order = Self::compare_native_evrs(&pairs).await?.into_iter();
+            for builds in contenders.values_mut() {
+                let pairs = builds.chunks_exact(2);
+                let mut winners = pairs
+                    .clone()
+                    .map(|pair| {
+                        if order.next().expect("validated RPM comparison count") < 0 {
+                            pair[1]
+                        } else {
+                            pair[0]
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                winners.extend_from_slice(pairs.remainder());
+                *builds = winners;
+            }
+        }
+
+        let mut ordered: Vec<_> = installed.iter().collect();
+        for (first, builds) in contenders {
+            ordered.swap(first, builds[0]);
+        }
+        Ok(ordered)
+    }
+
+    fn search_candidates<'a>(
+        installed: impl IntoIterator<Item = &'a InstalledPackage>,
         available: Vec<Package>,
     ) -> Vec<Package> {
         let mut candidates: Vec<_> = installed
             .into_iter()
-            .map(|pkg| Package {
-                name: pkg.identity(),
-                version: parse_version_or_zero(&format!("{}-{}", pkg.version, pkg.release)),
-                description: pkg.summary,
-                source: PackageSource::Official,
-                installed: true,
-            })
+            .map(InstalledPackage::as_package)
             .collect();
         candidates.extend(available);
         candidates
     }
 
-    fn search_results(mut candidates: Vec<Package>, query_lower: &str) -> Vec<Package> {
-        let mut matching_identities: HashSet<_> = candidates
-            .iter()
-            .filter(|pkg| {
-                pkg.name.to_lowercase().contains(query_lower)
-                    || pkg.description.to_lowercase().contains(query_lower)
-            })
-            .map(|pkg| pkg.name.clone())
+    fn search_results<'a>(
+        installed: impl IntoIterator<Item = &'a InstalledPackage>,
+        output: &[u8],
+        query_lower: &str,
+    ) -> Result<Vec<Package>> {
+        let available = Self::available_rows(output)?.collect::<Result<Vec<_>>>()?;
+        let installed: Vec<_> = installed
+            .into_iter()
+            .map(InstalledPackage::as_package)
             .collect();
-        candidates.retain(|pkg| matching_identities.remove(&pkg.name));
-        candidates.sort_unstable_by(|a, b| a.name.cmp(&b.name));
-        candidates
+        let matches_query = |name: &str, summary: &str| {
+            name.to_lowercase().contains(query_lower)
+                || summary.to_lowercase().contains(query_lower)
+        };
+        // Any matching summary admits the identity. The installed row, or the
+        // first repository row for an uninstalled identity, supplies its fields.
+        let mut matching_identities: HashSet<_> = installed
+            .iter()
+            .filter(|pkg| matches_query(&pkg.name, &pkg.description))
+            .map(|pkg| pkg.name.as_str())
+            .chain(
+                available
+                    .iter()
+                    .filter(|row| matches_query(row.name, row.summary))
+                    .map(|row| row.name),
+            )
+            .collect();
+        let mut results: Vec<_> = installed
+            .iter()
+            .filter(|pkg| matching_identities.remove(pkg.name.as_str()))
+            .cloned()
+            .collect();
+        results.extend(
+            available
+                .into_iter()
+                .filter(|row| matching_identities.remove(row.name))
+                .map(AvailablePackage::into_package),
+        );
+        results.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+        Ok(results)
     }
 
     pub(crate) async fn installed_package_sizes(
@@ -1330,18 +1709,22 @@ impl DnfPackageManager {
             RepositoryQuery::InstalledSizes(_) => "%{full_nevra}\t%{installsize}\\n",
             RepositoryQuery::InstalledReasons(_) => "%{full_nevra}\t%{reason}\\n",
             RepositoryQuery::InstalledDetails(_) => "%{name}\t%{evr}\t%{full_nevra}\t%{reason}\\n",
-            RepositoryQuery::Installed | RepositoryQuery::Upgrades | RepositoryQuery::Unneeded => {
+            RepositoryQuery::Installed | RepositoryQuery::Unneeded => {
                 "%{name}\t%{arch}\t%{evr}\t%{repoid}\\n"
             }
         }
     }
 
     async fn repository_output(query: RepositoryQuery<'_>) -> Result<Vec<u8>> {
+        Self::query_output(Self::repository_command(query)?).await
+    }
+
+    fn repository_command(query: RepositoryQuery<'_>) -> Result<tokio::process::Command> {
         let args = Self::repository_query_args(query)?;
         let mut command =
             tokio::process::Command::from(crate::core::privilege::system_command("dnf")?);
         command.args(args);
-        Self::query_output(command).await
+        Ok(command)
     }
 
     fn repository_query_args(query: RepositoryQuery<'_>) -> Result<Vec<String>> {
@@ -1352,24 +1735,24 @@ impl DnfPackageManager {
             | RepositoryQuery::InstalledSizes(_)
             | RepositoryQuery::InstalledReasons(_)
             | RepositoryQuery::InstalledDetails(_) => "--installed",
-            RepositoryQuery::Upgrades => "--upgrades",
             RepositoryQuery::Unneeded => "--unneeded",
         };
         let mut args = Vec::new();
-        // Status/update/orphan queries are cached reads. Their callers own any
+        // Installed and orphan queries are cached reads. Their callers own any
         // explicit sync; repoquery must not refresh metadata behind a read.
         if matches!(
             query,
-            RepositoryQuery::Installed | RepositoryQuery::Upgrades | RepositoryQuery::Unneeded
+            RepositoryQuery::Installed | RepositoryQuery::Unneeded
         ) {
             args.push("--cacheonly".to_owned());
         }
-        if matches!(query, RepositoryQuery::Upgrades) {
-            args.push("--setopt=*.skip_if_unavailable=false".to_owned());
-        }
+        // Installed records describe what is on disk, including an older
+        // build excluded from repository selection. DNF still selects the
+        // upgrades using the configured policy.
         if matches!(
             query,
-            RepositoryQuery::InstalledSizes(_)
+            RepositoryQuery::Installed
+                | RepositoryQuery::InstalledSizes(_)
                 | RepositoryQuery::InstalledReasons(_)
                 | RepositoryQuery::InstalledDetails(_)
         ) {
@@ -1378,11 +1761,11 @@ impl DnfPackageManager {
         args.extend(["repoquery", selection, "--queryformat", query_format].map(str::to_owned));
         if matches!(
             query,
-            RepositoryQuery::Available(_) | RepositoryQuery::Installed | RepositoryQuery::Upgrades
+            RepositoryQuery::Available(_) | RepositoryQuery::Installed
         ) {
             args.push("--latest-limit=1".to_owned());
         }
-        if matches!(query, RepositoryQuery::Available(_)) {
+        if matches!(query, RepositoryQuery::Available(None)) {
             args.push(format!("--arch={},noarch", std::env::consts::ARCH));
         }
         let package = match query {
@@ -1395,12 +1778,11 @@ impl DnfPackageManager {
                 Some(package)
             }
             RepositoryQuery::InstalledReasons(InstalledReasonQuery::RequiredBy(package)) => {
-                crate::core::security::validate_package_name(package)?;
+                Self::validate_query_selector(package)?;
                 args.push(format!("--whatrequires={package}"));
                 None
             }
             RepositoryQuery::Installed
-            | RepositoryQuery::Upgrades
             | RepositoryQuery::Unneeded
             | RepositoryQuery::InstalledSizes(InstalledSizeQuery::All) => None,
         };
@@ -1411,7 +1793,7 @@ impl DnfPackageManager {
         Ok(args)
     }
 
-    /// Validate a read-only DNF package name, architecture identity, or full NEVRA.
+    /// Validate a DNF package name, architecture identity, or full NEVRA.
     /// RPM version syntax is local to this backend; generic package validators
     /// continue to reject epochs and RPM prerelease/postrelease modifiers.
     pub fn validate_query_selector(selector: &str) -> Result<()> {
@@ -1456,6 +1838,21 @@ impl DnfPackageManager {
         Ok(())
     }
 
+    /// Validate DNF install selectors without allowing unsealed local RPMs.
+    #[doc(hidden)]
+    pub fn validate_install_selectors(packages: &[String]) -> Result<()> {
+        reject_unsealed_local_rpm_targets(packages)?;
+        Self::validate_package_selectors(packages)
+    }
+
+    /// Validate operands passed to a native DNF package command.
+    #[doc(hidden)]
+    pub fn validate_package_selectors(packages: &[String]) -> Result<()> {
+        packages
+            .iter()
+            .try_for_each(|package| Self::validate_query_selector(package))
+    }
+
     async fn query_output(command: tokio::process::Command) -> Result<Vec<u8>> {
         Self::query_output_with_deadline(command, std::time::Duration::from_mins(1)).await
     }
@@ -1464,14 +1861,85 @@ impl DnfPackageManager {
         command: tokio::process::Command,
         deadline: std::time::Duration,
     ) -> Result<Vec<u8>> {
-        Self::controlled_query_output(command, deadline, None).await
+        Self::controlled_query_output("DNF", command, deadline, None).await
     }
 
     async fn controlled_query_output(
+        program: &str,
+        command: tokio::process::Command,
+        deadline: std::time::Duration,
+        cancelled: Option<tokio::sync::oneshot::Receiver<()>>,
+    ) -> Result<Vec<u8>> {
+        let output = Self::capture_query(program, command, deadline, cancelled, false).await?;
+        Self::require_query_success(program, &output)?;
+        Ok(output.stdout)
+    }
+
+    fn require_query_success(program: &str, output: &std::process::Output) -> Result<()> {
+        if output.status.success() {
+            return Ok(());
+        }
+        let diagnostics = String::from_utf8_lossy(&output.stderr);
+        if let Some(detail) = diagnostics
+            .lines()
+            .map(str::trim)
+            .rfind(|line| !line.is_empty())
+        {
+            let detail = Self::safe_query_diagnostic(detail);
+            anyhow::bail!("{program} query failed: {}: {detail}", output.status);
+        }
+        anyhow::bail!("{program} query failed: {}", output.status);
+    }
+
+    fn safe_query_diagnostic(line: &str) -> String {
+        static URL: LazyLock<regex::Regex> = LazyLock::new(|| {
+            regex::Regex::new(r#"(?i)(?:https?|ftps?)://[^\s"<>]+"#)
+                .expect("diagnostic URL pattern")
+        });
+        let text = crate::cli::style::sanitize_terminal_text(line);
+        URL.replace_all(&text, |captures: &regex::Captures<'_>| {
+            crate::core::http::redact_url(&captures[0])
+        })
+        .into_owned()
+    }
+
+    async fn capture_query_diagnostics(
+        mut stderr: tokio::process::ChildStderr,
+        forward: bool,
+    ) -> std::io::Result<Vec<u8>> {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+
+        const MAX_DIAGNOSTIC_BYTES: u64 = 64 * 1024;
+        let mut bytes = Vec::new();
+        let mut reader = BufReader::new((&mut stderr).take(MAX_DIAGNOSTIC_BYTES));
+        loop {
+            let start = bytes.len();
+            if reader.read_until(b'\n', &mut bytes).await? == 0 {
+                break;
+            }
+            // A truncated URL may end before its '@' or '?'. Keep only
+            // complete lines when the diagnostic byte budget is exhausted.
+            if !bytes.ends_with(b"\n") && reader.get_ref().limit() == 0 {
+                bytes.truncate(start);
+                break;
+            }
+            if forward {
+                let raw = String::from_utf8_lossy(&bytes[start..]);
+                eprintln!("{}", Self::safe_query_diagnostic(raw.trim_end()));
+            }
+        }
+        drop(reader);
+        tokio::io::copy(&mut stderr, &mut tokio::io::sink()).await?;
+        Ok(bytes)
+    }
+
+    async fn capture_query(
+        program: &str,
         mut command: tokio::process::Command,
         deadline: std::time::Duration,
         mut cancelled: Option<tokio::sync::oneshot::Receiver<()>>,
-    ) -> Result<Vec<u8>> {
+        forward_diagnostics: bool,
+    ) -> Result<std::process::Output> {
         use tokio::io::AsyncReadExt;
         const MAX_OUTPUT_BYTES: u64 = 64 * 1024 * 1024;
         if let Some(cancelled) = cancelled.as_mut() {
@@ -1480,31 +1948,51 @@ impl DnfPackageManager {
                     cancelled.try_recv(),
                     Err(tokio::sync::oneshot::error::TryRecvError::Empty)
                 ),
-                "DNF stored query cancelled before execution"
+                "{program} stored query cancelled before execution"
             );
         }
         let mut child = command
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::piped())
             .kill_on_drop(true)
             .spawn()
-            .context("Could not start DNF query")?;
+            .with_context(|| format!("Could not start {program} query"))?;
         let result = {
             let operation = async {
-                let stdout = child.stdout.take().context("DNF stdout was not captured")?;
-                let mut bytes = Vec::new();
-                stdout
-                    .take(MAX_OUTPUT_BYTES + 1)
-                    .read_to_end(&mut bytes)
-                    .await?;
-                anyhow::ensure!(
-                    bytes.len() as u64 <= MAX_OUTPUT_BYTES,
-                    "DNF query output exceeds 64 MiB"
-                );
-                let status = child.wait().await.context("Could not wait for DNF query")?;
-                anyhow::ensure!(status.success(), "DNF query failed: {status}");
-                Ok(bytes)
+                let stdout = child
+                    .stdout
+                    .take()
+                    .with_context(|| format!("{program} stdout was not captured"))?;
+                let stderr = child
+                    .stderr
+                    .take()
+                    .with_context(|| format!("{program} stderr was not captured"))?;
+                let output = async {
+                    let mut bytes = Vec::new();
+                    stdout
+                        .take(MAX_OUTPUT_BYTES + 1)
+                        .read_to_end(&mut bytes)
+                        .await?;
+                    anyhow::ensure!(
+                        bytes.len() as u64 <= MAX_OUTPUT_BYTES,
+                        "{program} query output exceeds 64 MiB"
+                    );
+                    Ok(bytes)
+                };
+                let diagnostics = async {
+                    Ok(Self::capture_query_diagnostics(stderr, forward_diagnostics).await?)
+                };
+                let (stdout, stderr) = tokio::try_join!(output, diagnostics)?;
+                let status = child
+                    .wait()
+                    .await
+                    .with_context(|| format!("Could not wait for {program} query"))?;
+                Ok(std::process::Output {
+                    status,
+                    stdout,
+                    stderr,
+                })
             };
             let cancellation = async {
                 match cancelled {
@@ -1517,57 +2005,97 @@ impl DnfPackageManager {
             tokio::select! {
                 result = tokio::time::timeout(deadline, operation) => match result {
                     Ok(result) => result,
-                    Err(error) => Err(anyhow::Error::new(error).context(format!("DNF query timed out after {} seconds", deadline.as_secs()))),
+                    Err(error) => Err(anyhow::Error::new(error).context(format!("{program} query timed out after {} seconds", deadline.as_secs()))),
                 },
-                () = cancellation => Err(anyhow::anyhow!("DNF stored query cancelled")),
+                () = cancellation => Err(anyhow::anyhow!("{program} stored query cancelled")),
             }
         };
         if result.is_err() {
             if let Err(error) = child.start_kill() {
-                tracing::debug!(%error, "DNF query may have exited before cancellation kill");
+                tracing::debug!(%error, %program, "Query may have exited before cancellation kill");
             }
-            child.wait().await.context("Could not reap DNF query")?;
+            child
+                .wait()
+                .await
+                .with_context(|| format!("Could not reap {program} query"))?;
         }
         result
     }
 
+    fn search_with_progress(
+        &self,
+        query: &str,
+        progress: bool,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<Package>>> + Send + '_>> {
+        let query_lower = query.to_lowercase();
+        Box::pin(async move {
+            let installed = self.load_installed_packages().await?;
+            let command = Self::repository_command(RepositoryQuery::Available(None))?;
+            let (installed, output) = tokio::try_join!(
+                Self::order_installed_search_builds(&installed),
+                Self::capture_query(
+                    "DNF",
+                    command,
+                    std::time::Duration::from_mins(1),
+                    None,
+                    progress
+                )
+            )?;
+            Self::require_query_success("DNF", &output)?;
+            Self::search_results(installed, &output.stdout, &query_lower)
+        })
+    }
+
     async fn owned_stored_transaction(
-        command: tokio::process::Command,
+        mut command: tokio::process::Command,
         directory: tempfile::TempDir,
         deadline: std::time::Duration,
-    ) -> Result<(tempfile::TempDir, Vec<u8>)> {
+    ) -> Result<Option<(tempfile::TempDir, Vec<u8>)>> {
         let (cancel, cancelled) = tokio::sync::oneshot::channel();
         let _cancel_on_drop = CancelStoredQuery(Some(cancel));
+        command.env("LC_ALL", "C");
         tokio::task::spawn_blocking(move || -> Result<_> {
             use std::io::Read;
-            tokio::runtime::Builder::new_current_thread()
+            let output = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()?
                 .block_on(Self::controlled_query_output(
+                    "DNF",
                     command,
                     deadline,
                     Some(cancelled),
                 ))?;
-            let file = std::fs::File::open(directory.path().join("transaction.json"))
-                .context("DNF5 did not store a transaction")?;
+            let path = directory.path().join("transaction.json");
+            let metadata = match path.symlink_metadata() {
+                // DNF prints the empty-transaction line after any skipped packages.
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::NotFound
+                        && output.trim_ascii_end().rsplit(|&byte| byte == b'\n').next()
+                            == Some(b"Nothing to do.".as_slice()) =>
+                {
+                    return Ok(None);
+                }
+                result => result.context("DNF5 did not store a transaction")?,
+            };
             anyhow::ensure!(
-                file.metadata()?.is_file(),
+                metadata.is_file(),
                 "DNF stored transaction is not a regular file"
             );
+            let file =
+                std::fs::File::open(path).context("Cannot read the stored DNF transaction")?;
             let mut bytes = Vec::new();
             file.take(64 * 1024 * 1024 + 1).read_to_end(&mut bytes)?;
             anyhow::ensure!(
                 bytes.len() <= 64 * 1024 * 1024,
                 "DNF stored transaction exceeds 64 MiB"
             );
-            Ok((directory, bytes))
+            Ok(Some((directory, bytes)))
         })
         .await
         .context("DNF stored transaction owner failed")?
     }
 
-    fn advisory_command() -> Result<tokio::process::Command> {
-        let cache = crate::core::paths::cache_dir().join("dnf-security");
+    fn advisory_command(cache: &Path) -> Result<tokio::process::Command> {
         let cache = cache
             .to_str()
             .context("DNF advisory cache path is not UTF-8")?;
@@ -1583,52 +2111,89 @@ impl DnfPackageManager {
         Ok(command)
     }
 
-    async fn affected_installed_packages(
-        row: &super::dnf_advisory::ApplicableAdvisory,
+    async fn affected_installed_packages<'a>(
+        rows: impl IntoIterator<Item = &'a super::dnf_advisory::ApplicableAdvisory>,
         installed: &[super::types::SecurityPackage],
-    ) -> Result<Vec<super::types::SecurityPackage>> {
-        let (name, architecture) = super::dnf_advisory::package_identity(&row.nevra)?;
-        let evr = &row.nevra[name.len() + 1..row.nevra.len() - architecture.len() - 1];
-        let mut affected = Vec::new();
-        for package in installed.iter().filter(|package| {
-            package.name == name && package.architecture.as_deref() == Some(architecture)
-        }) {
-            let mut command =
-                tokio::process::Command::from(crate::core::privilege::system_command("rpm")?);
-            // Package values are data, never interpolated into RPM macros or Lua.
-            command
-                .env("OMG_LEFT_EVR", &package.version)
-                .env("OMG_RIGHT_EVR", evr);
-            command.args(["--eval", r#"%{lua:print(rpm.vercmp(os.getenv("OMG_LEFT_EVR"), os.getenv("OMG_RIGHT_EVR")))}"#]);
-            let output = Self::query_output(command).await?;
-            match std::str::from_utf8(&output)?.trim() {
-                "-1" => affected.push(package.clone()),
-                "0" | "1" => {}
-                _ => anyhow::bail!("Invalid native RPM version comparison result"),
+        scope: InstalledAdvisoryMatch,
+    ) -> Result<BTreeMap<String, Vec<crate::core::security::scan::InstalledIdentity>>> {
+        use crate::core::security::scan::InstalledIdentity;
+        use std::collections::btree_map::Entry;
+
+        let mut by_name: HashMap<_, Vec<_>> = HashMap::new();
+        for package in installed {
+            if let Some(architecture) = package.architecture.as_deref() {
+                by_name
+                    .entry(package.name.as_str())
+                    .or_default()
+                    .push((architecture, package));
             }
         }
-        anyhow::ensure!(
-            !affected.is_empty(),
-            "Advisory {} has no affected installed identity: {}",
-            row.name,
-            row.nevra
-        );
-        Ok(affected)
+
+        let mut selected = BTreeMap::new();
+        let mut comparisons = Vec::new();
+        let mut candidates = Vec::new();
+        for row in rows {
+            let Entry::Vacant(entry) = selected.entry(row.nevra.as_str()) else {
+                continue;
+            };
+            let (name, architecture) = super::dnf_advisory::package_identity(&row.nevra)?;
+            let evr = &row.nevra[name.len() + 1..row.nevra.len() - architecture.len() - 1];
+            for &(installed_arch, package) in by_name.get(name).into_iter().flatten() {
+                let matches = match scope {
+                    InstalledAdvisoryMatch::Exact => installed_arch == architecture,
+                    InstalledAdvisoryMatch::ArchitectureChange => {
+                        installed_arch != architecture
+                            && (installed_arch == "noarch" || architecture == "noarch")
+                    }
+                };
+                if !matches {
+                    continue;
+                }
+                anyhow::ensure!(
+                    scope == InstalledAdvisoryMatch::Exact || comparisons.len() < 10_000,
+                    "Supplemental RPM comparisons exceed their bound"
+                );
+                comparisons.push((package.version.clone(), evr.to_owned()));
+                candidates.push((row.nevra.as_str(), package));
+            }
+            entry.insert((row.name.as_str(), Vec::new()));
+        }
+        let compared = Self::compare_native_evrs(&comparisons).await?;
+        for ((nevra, package), order) in candidates.into_iter().zip(compared) {
+            if order < 0 {
+                selected
+                    .get_mut(nevra)
+                    .context("Missing native advisory selection")?
+                    .1
+                    .push(InstalledIdentity::from(package));
+            }
+        }
+        selected
+            .into_iter()
+            .map(|(nevra, (advisory, affected))| {
+                anyhow::ensure!(
+                    scope == InstalledAdvisoryMatch::ArchitectureChange || !affected.is_empty(),
+                    "Advisory {advisory} has no affected installed identity: {nevra}"
+                );
+                Ok((nevra.to_owned(), affected))
+            })
+            .collect()
     }
 
-    async fn native_advisories() -> Result<
-        Vec<(
-            super::dnf_advisory::ApplicableAdvisory,
-            super::dnf_advisory::AdvisoryDetails,
-        )>,
-    > {
+    async fn native_advisories(
+        mode: AdvisoryLookup<'_>,
+    ) -> Result<(
+        super::dnf_advisory::AdvisoryRows,
+        super::dnf_advisory::AdvisoryRows,
+    )> {
+        let cache = crate::core::paths::cache_dir().join("dnf-security");
         let mut outputs = Vec::with_capacity(2);
         for details in [false, true] {
-            let mut command = Self::advisory_command()?;
+            let mut command = Self::advisory_command(&cache)?;
             command.args(super::dnf_advisory::query_args(details));
             outputs.push(Self::query_output(command).await?);
         }
-        let mut repositories = Self::advisory_command()?;
+        let mut repositories = Self::advisory_command(&cache)?;
         repositories.args([
             "--cacheonly",
             "--setopt=*.skip_if_unavailable=false",
@@ -1637,18 +2202,104 @@ impl DnfPackageManager {
             "--enabled",
             "--json",
         ]);
-        super::dnf_advisory::require_enabled_repositories(
-            &Self::query_output(repositories).await?,
-        )?;
-        super::dnf_advisory::join_advisories(&outputs[0], &outputs[1])
+        let repository_ids =
+            super::dnf_advisory::enabled_repository_ids(&Self::query_output(repositories).await?)?;
+        let native = super::dnf_advisory::join_advisories(&outputs[0], &outputs[1])?;
+        let supplemental = Self::cached_advisory_lookup(&cache, &repository_ids, mode)
+            .await
+            .unwrap_or_else(|error| {
+                tracing::warn!("Supplemental Fedora advisory lookup unavailable: {error:#}");
+                Vec::new()
+            });
+        Ok((native, supplemental))
+    }
+
+    async fn cached_advisory_lookup(
+        cache: &Path,
+        repository_ids: &BTreeSet<String>,
+        lookup: AdvisoryLookup<'_>,
+    ) -> Result<super::dnf_advisory::AdvisoryRows> {
+        let (mode, subjects) = match lookup {
+            AdvisoryLookup::ArchitectureChanges => ("architecture-changes", Vec::new()),
+            AdvisoryLookup::Proposed(packages) => {
+                let subjects: Vec<_> = packages
+                    .iter()
+                    .filter_map(|package| {
+                        let architecture = package.architecture.as_deref()?;
+                        let epoch = if package.version.contains(':') {
+                            ""
+                        } else {
+                            "0:"
+                        };
+                        Some(format!(
+                            "{}-{epoch}{}.{architecture}",
+                            package.name, package.version
+                        ))
+                    })
+                    .collect();
+                if subjects.is_empty() {
+                    return Ok(Vec::new());
+                }
+                ("proposed", subjects)
+            }
+        };
+        anyhow::ensure!(
+            subjects.len() <= 10_000
+                && subjects.iter().map(|id| id.len() + 1).sum::<usize>() <= 512 * 1024,
+            "Supplemental advisory subjects exceed their bound"
+        );
+        for subject in &subjects {
+            Self::validate_query_selector(subject)?;
+        }
+        let repositories = serde_json::to_string(repository_ids)?;
+        anyhow::ensure!(
+            repositories.len() <= 64 * 1024,
+            "DNF repository scope exceeds its bound"
+        );
+        let mut command =
+            tokio::process::Command::from(crate::core::privilege::system_command("python3")?);
+        command
+            .args(["-I", "-B", "-c", include_str!("dnf_advisory_lookup.py")])
+            .arg(cache)
+            .args([mode, &repositories])
+            .args(subjects);
+        let output =
+            Self::query_output_with_deadline(command, std::time::Duration::from_secs(30)).await?;
+        super::dnf_advisory::cached_lookup_result(&output)
     }
 
     async fn native_history(since: Option<u64>) -> Result<Vec<NativeTransaction>> {
         let range = since.map_or_else(|| "last".to_owned(), |id| format!("{}..last", id.max(1)));
+        // DNF can initialize its journal as root; an ordinary caller cannot.
+        // Avoid an error message on a fresh default installation, but still ask
+        // DNF for its effective path before deciding that there is no journal.
+        let unprivileged = !is_root();
+        let check_before_query = unprivileged
+            && !Path::new("/usr/lib/sysimage/libdnf5")
+                .join(DNF_HISTORY_DATABASE)
+                .exists();
+        if check_before_query
+            && Self::native_history_is_missing()
+                .await
+                .is_ok_and(|missing| missing)
+        {
+            return Ok(Vec::new());
+        }
         let mut command =
             tokio::process::Command::from(crate::core::privilege::system_command("dnf")?);
         command.args(["history", "info", "--json", &range]);
-        let output = Self::query_output(command).await?;
+        let output = match Self::query_output(command).await {
+            Err(_)
+                if unprivileged
+                    && !check_before_query
+                    && Self::native_history_is_missing()
+                        .await
+                        .is_ok_and(|missing| missing) =>
+            {
+                return Ok(Vec::new());
+            }
+            result => result?,
+        };
         let transactions: Vec<NativeTransaction> =
             serde_json::from_slice(&output).context("Invalid native DNF history")?;
         anyhow::ensure!(
@@ -1656,6 +2307,39 @@ impl DnfPackageManager {
             "Invalid native transaction ID"
         );
         Ok(transactions)
+    }
+
+    async fn native_history_is_missing() -> Result<bool> {
+        let mut command =
+            tokio::process::Command::from(crate::core::privilege::system_command("dnf")?);
+        command.arg("--dump-main-config");
+        let config = Self::query_output(command).await?;
+        Self::history_is_missing(std::str::from_utf8(&config)?)
+    }
+
+    fn history_is_missing(config: &str) -> Result<bool> {
+        let effective = |key: &str| -> Result<&str> {
+            let mut values = config.lines().filter_map(|line| {
+                let (name, value) = line.split_once('=')?;
+                (name.trim() == key).then(|| value.trim())
+            });
+            let value = values
+                .next()
+                .with_context(|| format!("Missing DNF {key}"))?;
+            anyhow::ensure!(values.next().is_none(), "Ambiguous DNF {key}");
+            Ok(value)
+        };
+        anyhow::ensure!(
+            effective("installroot")? == "/",
+            "Unexpected DNF install root"
+        );
+        let directory = Path::new(effective("transaction_history_dir")?);
+        anyhow::ensure!(directory.is_absolute(), "Relative DNF history directory");
+        match directory.join(DNF_HISTORY_DATABASE).symlink_metadata() {
+            Ok(_) => Ok(false),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+            Err(error) => Err(error).context("Cannot verify DNF history path"),
+        }
     }
 
     fn native_outcome(transactions: &[NativeTransaction], comment: &str) -> Result<NativeOutcome> {
@@ -1805,14 +2489,19 @@ impl DnfPackageManager {
         operation
     }
 
-    /// Only fixed install/upgrade inputs cross the same-binary elevation boundary.
+    /// Only fixed transaction modes and validated package selectors cross elevation.
     #[doc(hidden)]
     pub fn validate_admission_args(args: &[String]) -> Result<()> {
+        Self::admission_request(args).map(|_| ())
+    }
+
+    fn admission_request(args: &[String]) -> Result<DnfAdmission<'_>> {
         anyhow::ensure!(
             args.len() <= 10_004,
             "DNF transaction has too many arguments"
         );
         let mut remaining = args;
+        let mut correlation = None;
         if let Some(comment) = remaining
             .first()
             .and_then(|value| value.strip_prefix("--comment=omg-"))
@@ -1822,6 +2511,7 @@ impl DnfPackageManager {
                 id.to_string() == comment,
                 "Noncanonical DNF transaction comment"
             );
+            correlation = remaining.first().map(String::as_str);
             remaining = &remaining[1..];
         }
         let cached = remaining
@@ -1830,16 +2520,36 @@ impl DnfPackageManager {
         if cached {
             remaining = &remaining[1..];
         }
-        let [action, yes, packages @ ..] = remaining else {
+        let [action, mode, packages @ ..] = remaining else {
             anyhow::bail!("Incomplete DNF admission request");
         };
         anyhow::ensure!(
-            matches!(action.as_str(), "install" | "upgrade") && yes == "-y",
-            "Unsupported DNF admission request"
-        );
-        anyhow::ensure!(
             !cached || action == "upgrade",
             "Cached metadata mode is only supported for upgrades"
+        );
+        if action == "remove" {
+            let (output, packages) = match packages {
+                [flag, rest @ ..] if flag == "--quiet" => (OutputMode::Quiet, rest),
+                [flag, rest @ ..] if flag == "--verbose" => (OutputMode::Verbose, rest),
+                _ => (OutputMode::Plain, packages),
+            };
+            anyhow::ensure!(!packages.is_empty(), "Remove requires package operands");
+            let yes = match mode.as_str() {
+                "-y" => true,
+                "--confirm" => false,
+                _ => anyhow::bail!("Unsupported DNF removal mode"),
+            };
+            Self::validate_package_selectors(packages)?;
+            return Ok(DnfAdmission::Remove {
+                packages,
+                comment: correlation,
+                yes,
+                output,
+            });
+        }
+        anyhow::ensure!(
+            matches!(action.as_str(), "install" | "upgrade") && mode == "-y",
+            "Unsupported DNF admission request"
         );
         anyhow::ensure!(
             action != "upgrade" || packages.is_empty(),
@@ -1849,8 +2559,8 @@ impl DnfPackageManager {
             action != "install" || !packages.is_empty(),
             "Install requires package operands"
         );
-        crate::core::security::validate_package_names(packages)?;
-        reject_unsealed_local_rpm_targets(packages)
+        Self::validate_install_selectors(packages)?;
+        Ok(DnfAdmission::InstallOrUpgrade)
     }
 
     #[doc(hidden)]
@@ -1860,12 +2570,40 @@ impl DnfPackageManager {
             super::resolve_backend()? == super::Backend::Fedora,
             "Native DNF admission requires the Fedora backend"
         );
-        Self::validate_admission_args(args)?;
-        Self::new().execute_reviewed_transaction(args).await
+        let manager = Self::new();
+        match Self::admission_request(args)? {
+            DnfAdmission::InstallOrUpgrade => manager.execute_reviewed_transaction(args).await,
+            DnfAdmission::Remove {
+                packages,
+                comment,
+                yes,
+                output,
+            } => {
+                crate::cli::modern_ui::configure_output(
+                    u8::from(output == OutputMode::Verbose),
+                    output == OutputMode::Quiet,
+                );
+                let Some(plan) = crate::cli::packages::review_fedora_removal(packages, yes).await?
+                else {
+                    return Ok(());
+                };
+                crate::cli::packages::common::report_removal(
+                    packages,
+                    manager.replay_removal_plan(plan, comment.map(str::to_owned)),
+                )
+                .await
+            }
+        }
     }
 
     async fn execute_reviewed_transaction(&self, args: &[String]) -> Result<()> {
-        Self::validate_admission_args(args)?;
+        anyhow::ensure!(
+            matches!(
+                Self::admission_request(args)?,
+                DnfAdmission::InstallOrUpgrade
+            ),
+            "DNF install/upgrade admission requires an install or upgrade"
+        );
         crate::core::security::policy::require_native_plan_support("DNF")?;
         anyhow::ensure!(
             is_root(),
@@ -1877,10 +2615,14 @@ impl DnfPackageManager {
         command
             .args(args)
             .arg(format!("--store={}", directory.path().display()));
-        let (directory, bytes) =
+        let Some((directory, bytes)) =
             Self::owned_stored_transaction(command, directory, std::time::Duration::from_mins(30))
                 .await
-                .context("Could not prepare a stored DNF5 installation transaction")?;
+                .context("Could not prepare a stored DNF5 installation transaction")?
+        else {
+            crate::cli::modern_ui::print_info("DNF reported no package changes");
+            return Ok(());
+        };
         let inventory = Self::proposed_inventory(&bytes)?;
         if inventory.is_empty() {
             return Ok(());
@@ -1891,13 +2633,10 @@ impl DnfPackageManager {
         })
         .await??;
         let context = serde_json::to_string(&("omg-native-dnf-stored-v1", args, &digest))?;
-        let gaps = vec!["DNF5's native advisory CLI filters by currently installed package names; it cannot establish complete coverage for newly selected dependencies. Vendor fixed versions do not establish introduced ranges or branch applicability. Matching native advisories below remain possible; CVE/disclosed-zero-day coverage remains unknown. https://dnf5.readthedocs.io/en/stable/commands/advisory.8.html".into()];
+        let gaps = vec!["Fedora advisory matches are possible findings. Vendor fixed versions do not establish introduced ranges or branch applicability. CVE and disclosed zero-day coverage remains unknown. https://dnf5.readthedocs.io/en/stable/commands/advisory.8.html".into()];
         let source = PlannedDnfAdvisories;
-        let review = crate::core::security::package_review::review_async(
-            &inventory, &context, &gaps, &source,
-        )
-        .await?;
-        review.verify_async(&source).await?;
+        crate::core::security::package_review::review_async(&inventory, &context, &gaps, &source)
+            .await?;
         let (directory, checked) = tokio::task::spawn_blocking(move || -> Result<_> {
             let digest = Self::stored_tree_digest(directory.path())?;
             Ok((directory, digest))
@@ -1907,21 +2646,38 @@ impl DnfPackageManager {
             checked == digest,
             "DNF stored artifacts or repository evidence changed after review"
         );
-        let mut replay = vec![
-            "replay".to_owned(),
-            directory.path().to_string_lossy().into_owned(),
-            "-y".into(),
-        ];
-        if let Some(comment) = args
+        let comment = args
             .first()
             .filter(|value| value.starts_with("--comment=omg-"))
-        {
-            replay.insert(0, comment.clone());
-        }
+            .cloned();
+        self.replay_stored_transaction(directory, &[], comment)
+            .await
+    }
+
+    async fn replay_stored_transaction(
+        &self,
+        directory: tempfile::TempDir,
+        options: &'static [&'static str],
+        comment: Option<String>,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            is_root(),
+            "DNF stored transactions require their root owner"
+        );
         let manager = self.cache_handle();
         tokio::task::spawn_blocking(move || {
-            let _stored_artifacts = directory;
-            manager.run_dnf(&replay.iter().map(String::as_str).collect::<Vec<_>>())
+            let mut args = options.to_vec();
+            args.extend([
+                "replay",
+                directory.path().to_str().context("Invalid DNF plan path")?,
+                "-y",
+            ]);
+            if let Some(comment) = comment.as_deref() {
+                args.insert(0, comment);
+            }
+            let result = manager.run_dnf(&args);
+            manager.invalidate_installed_cache();
+            result
         })
         .await?
     }
@@ -2041,10 +2797,28 @@ impl DnfPackageManager {
         kind: crate::core::history::TransactionType,
         args: Vec<String>,
         history: Option<&crate::core::history::HistoryManager>,
-    ) -> Result<()> {
+    ) -> Result<Option<usize>> {
+        Self::record_native_mutation(kind, history, |comment| {
+            let mut args = args;
+            if let Some(comment) = comment {
+                args.insert(0, comment);
+            }
+            self.execute_dnf(args)
+        })
+        .await
+    }
+
+    async fn record_native_mutation<F>(
+        kind: crate::core::history::TransactionType,
+        history: Option<&crate::core::history::HistoryManager>,
+        operation: impl FnOnce(Option<String>) -> F,
+    ) -> Result<Option<usize>>
+    where
+        F: Future<Output = Result<()>>,
+    {
         let Some(history) = history.filter(|_| !crate::core::privilege::parent_owns_history())
         else {
-            return self.execute_dnf(args).await;
+            return operation(None).await.map(|()| None);
         };
         let before = Self::native_history(None)
             .await?
@@ -2053,9 +2827,7 @@ impl DnfPackageManager {
             .max()
             .unwrap_or(0);
         let comment = format!("omg-{}", uuid::Uuid::new_v4());
-        let mut command_args = vec![format!("--comment={comment}")];
-        command_args.extend(args);
-        let operation = self.execute_dnf(command_args).await;
+        let operation = operation(Some(format!("--comment={comment}"))).await;
         let observed = match Self::native_history(Some(before)).await {
             Ok(transactions) => Self::native_outcome(&transactions, &comment),
             Err(error) => Err(error),
@@ -2063,7 +2835,7 @@ impl DnfPackageManager {
         // Observing a non-terminal journal row must not initiate another
         // package mutation. A redo would need its own correlation and native
         // state proof, plus explicit confirmation/elevation/deadline policy.
-        Self::record_native_result(kind, history, operation, observed)
+        Self::record_native_result(kind, history, operation, observed).map(Some)
     }
 
     fn record_native_result(
@@ -2071,9 +2843,9 @@ impl DnfPackageManager {
         history: &crate::core::history::HistoryManager,
         operation: Result<()>,
         observed: Result<NativeOutcome>,
-    ) -> Result<()> {
+    ) -> Result<usize> {
         let persistence = match observed {
-            Ok(NativeOutcome::NoTransaction) if operation.is_ok() => Ok(()),
+            Ok(NativeOutcome::NoTransaction) if operation.is_ok() => Ok(0),
             Ok(NativeOutcome::NoTransaction | NativeOutcome::Failed) => history
                 .add_transaction(kind, Vec::new(), false)
                 .and_then(|()| {
@@ -2081,9 +2853,12 @@ impl DnfPackageManager {
                         operation.is_err(),
                         "DNF reported a failed journal transaction after command success"
                     );
-                    Ok(())
+                    Ok(0)
                 }),
-            Ok(NativeOutcome::Committed(changes)) => history.add_transaction(kind, changes, true),
+            Ok(NativeOutcome::Committed(changes)) => {
+                let count = changes.len();
+                history.add_transaction(kind, changes, true).map(|()| count)
+            }
             Ok(NativeOutcome::Interrupted {
                 id,
                 comment,
@@ -2098,8 +2873,8 @@ impl DnfPackageManager {
             Err(error) => Err(error),
         };
         match (operation, persistence) {
-            (Ok(()), Ok(())) => Ok(()),
-            (Err(error), Ok(())) => Err(error),
+            (Ok(()), Ok(count)) => Ok(count),
+            (Err(error), Ok(_)) => Err(error),
             (Ok(()), Err(error)) => {
                 Err(error.context("DNF operation succeeded but its history could not be recorded"))
             }
@@ -2116,13 +2891,7 @@ impl DnfPackageManager {
             .map(|line| {
                 let fields: Vec<_> = line.split('\t').take(5).collect();
                 anyhow::ensure!(fields.len() == 4, "DNF version row must have four fields");
-                anyhow::ensure!(
-                    fields.iter().all(|field| !field.is_empty()
-                        && !field
-                            .chars()
-                            .any(|ch| ch.is_whitespace() || ch.is_control())),
-                    "DNF version row has an invalid field"
-                );
+                Self::validate_versioned_fields(&fields)?;
                 Ok(VersionedPackage {
                     name: fields[0].to_owned(),
                     architecture: fields[1].to_owned(),
@@ -2133,45 +2902,111 @@ impl DnfPackageManager {
             .collect()
     }
 
-    fn match_updates(
-        installed: &[VersionedPackage],
-        upgrades: &[VersionedPackage],
-    ) -> Result<Vec<UpdateInfo>> {
-        let mut by_identity = HashMap::new();
-        for package in installed {
-            anyhow::ensure!(
-                by_identity
-                    .insert(
-                        (package.name.as_str(), package.architecture.as_str()),
-                        package
-                    )
-                    .is_none(),
-                "DNF returned duplicate installed name/architecture"
-            );
-        }
-        upgrades
-            .iter()
-            .map(|candidate| {
-                let old = by_identity
-                    .get(&(candidate.name.as_str(), candidate.architecture.as_str()))
-                    .with_context(|| {
-                        format!(
-                            "DNF upgrade {}.{} has no matching installed package",
-                            candidate.name, candidate.architecture
-                        )
-                    })?;
-                anyhow::ensure!(
-                    old.version != candidate.version,
-                    "DNF upgrade has an unchanged version"
-                );
-                Ok(UpdateInfo {
-                    name: candidate.name.clone(),
-                    old_version: old.version.clone(),
-                    new_version: candidate.version.clone(),
-                    repo: candidate.repository.clone(),
+    fn validate_versioned_fields(fields: &[&str]) -> Result<()> {
+        anyhow::ensure!(
+            fields.iter().all(|field| !field.is_empty()
+                && !field
+                    .chars()
+                    .any(|ch| ch.is_whitespace() || ch.is_control())),
+            "DNF version row has an invalid field"
+        );
+        Ok(())
+    }
+
+    fn parse_available_upgrades(output: &[u8]) -> Result<Vec<VersionedPackage>> {
+        let text = std::str::from_utf8(output).context("DNF upgrade listing is not UTF-8")?;
+        let mut lines = text.lines().map(str::trim).filter(|line| !line.is_empty());
+        let Some(header) = lines.next() else {
+            return Ok(Vec::new());
+        };
+        anyhow::ensure!(
+            header == "Available upgrades",
+            "Invalid DNF upgrade heading"
+        );
+        lines
+            .map(|line| {
+                let fields: Vec<_> = line.split_ascii_whitespace().take(4).collect();
+                let &[name_arch, version, repository] = fields.as_slice() else {
+                    anyhow::bail!("DNF upgrade row must have three fields");
+                };
+                let (name, architecture) = name_arch
+                    .rsplit_once('.')
+                    .context("DNF upgrade row lacks architecture")?;
+                Self::validate_versioned_fields(&[name, architecture, version, repository])?;
+                Ok(VersionedPackage {
+                    name: name.to_owned(),
+                    architecture: architecture.to_owned(),
+                    version: version.to_owned(),
+                    repository: repository.to_owned(),
                 })
             })
             .collect()
+    }
+
+    async fn match_updates(
+        installed: &[VersionedPackage],
+        upgrades: &[VersionedPackage],
+    ) -> Result<Vec<UpdateInfo>> {
+        let mut by_name: HashMap<&str, Vec<&VersionedPackage>> = HashMap::new();
+        for package in installed {
+            let installed = by_name.entry(package.name.as_str()).or_default();
+            anyhow::ensure!(
+                !installed
+                    .iter()
+                    .any(|other| other.architecture == package.architecture),
+                "DNF returned duplicate installed name/architecture"
+            );
+            installed.push(package);
+        }
+        let mut updates = Vec::with_capacity(upgrades.len());
+        let mut seen = BTreeSet::new();
+        for candidate in upgrades {
+            let arch = candidate.architecture.as_str();
+            // DNF has already filtered by repository priority and latest EVR.
+            // Tied mirrors are alternative sources for the same update.
+            if !seen.insert((candidate.name.as_str(), arch)) {
+                continue;
+            }
+            let same_name = by_name
+                .get(candidate.name.as_str())
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            let mut compatible = same_name.iter().filter(|package| {
+                let installed_arch = package.architecture.as_str();
+                installed_arch == arch
+                    || ((installed_arch == "noarch" || arch == "noarch")
+                        && !matches!(installed_arch, "src" | "nosrc")
+                        && !matches!(arch, "src" | "nosrc"))
+            });
+            let mut old = compatible.next().with_context(|| {
+                format!(
+                    "DNF upgrade {}.{arch} has no matching installed package",
+                    candidate.name
+                )
+            })?;
+            // When noarch crosses architectures, use the newest compatible
+            // installed EVR, the same version DNF compares against.
+            for package in compatible {
+                if package.version != old.version
+                    && Self::compare_native_evrs(&[(old.version.clone(), package.version.clone())])
+                        .await?[0]
+                        < 0
+                {
+                    old = package;
+                }
+            }
+            anyhow::ensure!(
+                old.version != candidate.version,
+                "DNF upgrade has an unchanged version"
+            );
+            updates.push(UpdateInfo {
+                name: candidate.name.clone(),
+                old_version: old.version.clone(),
+                new_version: candidate.version.clone(),
+                repo: candidate.repository.clone(),
+            });
+        }
+        Ok(updates)
     }
 
     /// A handle sharing this manager's caches, so blocking workers mutate
@@ -2179,18 +3014,105 @@ impl DnfPackageManager {
     #[must_use]
     fn cache_handle(&self) -> Self {
         Self {
-            rpm_db_path: self.rpm_db_path.clone(),
-            repos_dir: self.repos_dir.clone(),
+            rpm_database: self.rpm_database.clone(),
             installed_cache: Arc::clone(&self.installed_cache),
         }
     }
 
-    pub(crate) async fn orphan_packages() -> Result<Vec<String>> {
+    async fn unneeded_packages() -> Result<Vec<VersionedPackage>> {
         let output = Self::repository_output(RepositoryQuery::Unneeded).await?;
-        Ok(Self::parse_versioned_packages(&output)?
+        Self::parse_versioned_packages(&output)
+    }
+
+    #[doc(hidden)]
+    pub async fn orphan_count() -> Result<usize> {
+        Ok(Self::unneeded_packages().await?.len())
+    }
+
+    pub(crate) async fn orphan_packages() -> Result<Vec<String>> {
+        Ok(Self::unneeded_packages()
+            .await?
             .into_iter()
             .map(|package| format!("{}.{}", package.name, package.architecture))
             .collect())
+    }
+
+    pub(crate) async fn preview_orphan_cleanup() -> Result<(String, String)> {
+        Self::preview_declined_transaction(["--cacheonly", "autoremove"]).await
+    }
+
+    pub(crate) async fn preview_cached_upgrade() -> Result<(String, String)> {
+        Self::preview_declined_transaction(["--cacheonly", "upgrade"]).await
+    }
+
+    pub(crate) async fn preview_removal(packages: &[String]) -> Result<(String, String)> {
+        Self::validate_package_selectors(packages)?;
+        Self::preview_declined_transaction(
+            ["--cacheonly", "remove"]
+                .into_iter()
+                .chain(packages.iter().map(String::as_str)),
+        )
+        .await
+    }
+
+    pub(crate) async fn preview_install(packages: &[String]) -> Result<(String, String)> {
+        Self::validate_install_selectors(packages)?;
+        Self::preview_declined_transaction(
+            std::iter::once("install").chain(packages.iter().map(String::as_str)),
+        )
+        .await
+    }
+
+    async fn preview_declined_transaction<'a>(
+        args: impl IntoIterator<Item = &'a str>,
+    ) -> Result<(String, String)> {
+        let mut command =
+            tokio::process::Command::from(crate::core::privilege::system_command("dnf")?);
+        command
+            .env("LC_ALL", "C")
+            .args(["--color=never", "--setopt=assumeyes=false", "--assumeno"])
+            .args(args);
+        let output = Self::capture_query(
+            "DNF",
+            command,
+            std::time::Duration::from_mins(1),
+            None,
+            false,
+        )
+        .await?;
+        Self::transaction_preview_output(&output)
+    }
+
+    fn transaction_preview_output(output: &std::process::Output) -> Result<(String, String)> {
+        let redact = |text: &str| {
+            let mut output = String::with_capacity(text.len());
+            for line in text.split_inclusive('\n') {
+                let (line, newline) = line
+                    .strip_suffix('\n')
+                    .map_or((line, ""), |line| (line, "\n"));
+                output.push_str(&Self::safe_query_diagnostic(line));
+                output.push_str(newline);
+            }
+            output
+        };
+        let plan = String::from_utf8_lossy(&output.stdout);
+        let diagnostics = String::from_utf8_lossy(&output.stderr);
+        // DNF5 exits 1 after displaying a nonempty plan that --assumeno declined.
+        if output.status.code() == Some(1)
+            && !plan.trim().is_empty()
+            && let Some(prefix) = diagnostics
+                .trim_end()
+                .strip_suffix("Operation aborted by the user.")
+            && (prefix.is_empty() || prefix.ends_with('\n'))
+        {
+            return Ok((redact(&plan), redact(prefix.trim_end())));
+        }
+        if !output.status.success() && !diagnostics.trim().is_empty() {
+            let diagnostics = redact(diagnostics.trim());
+            anyhow::bail!("DNF query failed ({})\n{diagnostics}", output.status);
+        }
+        Self::require_query_success("DNF", output)?;
+        Ok((redact(&plan), redact(&diagnostics)))
     }
 
     pub(crate) async fn cleanup(
@@ -2210,6 +3132,7 @@ impl DnfPackageManager {
                     history,
                 )
                 .await
+                .map(|_| ())
             }
             DnfCleanup::PackageCache => {
                 self.execute_dnf(vec!["clean".to_owned(), "packages".to_owned()])
@@ -2229,7 +3152,8 @@ impl DnfPackageManager {
 
         let targets = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
         crate::core::security::audit::record_operation("dnf", &targets, "attempt")?;
-        let status = cmd.args(args).status()?;
+        cmd.args(args);
+        let status = Self::run_native_command(cmd)?;
         crate::core::security::audit::record_operation(
             "dnf",
             &targets,
@@ -2247,18 +3171,142 @@ impl DnfPackageManager {
             anyhow::bail!("dnf command failed with status {status}")
         }
     }
+
+    /// Run a foreground DNF transaction on its blocking owner. Leave the
+    /// native input and output streams connected for prompts and progress.
+    pub(crate) fn run_native_command(
+        command: std::process::Command,
+    ) -> std::io::Result<std::process::ExitStatus> {
+        std::thread::Builder::new()
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?;
+                runtime.block_on(Self::native_command_status(command.into()))
+            })?
+            .join()
+            .map_err(|_| std::io::Error::other("DNF command owner panicked"))?
+    }
+
+    async fn native_command_status(
+        mut command: tokio::process::Command,
+    ) -> std::io::Result<std::process::ExitStatus> {
+        let mut child = command.stderr(std::process::Stdio::piped()).spawn()?;
+        let stderr = child.stderr.take().expect("DNF stderr is piped");
+        #[cfg(unix)]
+        let forward = {
+            use nix::sys::signal::{SigSet, Signal};
+            // Only the relay thread blocks SIGPIPE. DNF has already spawned,
+            // and the thread exits without unblocking a pending write signal.
+            let mut signals = SigSet::empty();
+            signals.add(Signal::SIGPIPE);
+            signals.thread_block().is_ok()
+        };
+        #[cfg(not(unix))]
+        let forward = true;
+        let diagnostics = Self::forward_native_diagnostics(stderr, forward);
+        tokio::pin!(diagnostics);
+        let (status, diagnostic_result) = tokio::select! {
+            result = &mut diagnostics => (child.wait().await?, result),
+            status = child.wait() => {
+                // A descendant can inherit stderr after DNF itself has exited.
+                let result = tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    &mut diagnostics,
+                ).await.unwrap_or(Ok(()));
+                (status?, result)
+            }
+        };
+        if let Err(error) = diagnostic_result {
+            tracing::debug!(%error, "Could not forward DNF diagnostics");
+        }
+        Ok(status)
+    }
+
+    async fn forward_native_diagnostics(
+        mut stderr: tokio::process::ChildStderr,
+        forward: bool,
+    ) -> std::io::Result<()> {
+        use std::io::Write as _;
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+
+        if !forward {
+            tokio::io::copy(&mut stderr, &mut tokio::io::sink()).await?;
+            return Ok(());
+        }
+        const MAX_LINE_BYTES: u64 = 64 * 1024;
+        let mut reader = BufReader::new(stderr);
+        let mut terminal = std::io::stderr();
+        let mut line = Vec::new();
+        let mut discarding_line = false;
+        loop {
+            line.clear();
+            let count = (&mut reader)
+                .take(MAX_LINE_BYTES + 1)
+                .read_until(b'\n', &mut line)
+                .await?;
+            if count == 0 {
+                break;
+            }
+            if discarding_line || count as u64 > MAX_LINE_BYTES {
+                discarding_line = !line.ends_with(b"\n");
+                continue;
+            }
+            let raw = String::from_utf8_lossy(&line);
+            let mut safe = Self::safe_query_diagnostic(raw.trim_end_matches(['\r', '\n']));
+            safe.push('\n');
+            if terminal.write_all(safe.as_bytes()).is_err() {
+                // A closed log sink cannot interrupt a running transaction.
+                tokio::io::copy(&mut reader, &mut tokio::io::sink()).await?;
+                return Ok(());
+            }
+        }
+        terminal.flush()
+    }
 }
 
 impl PackageManager for DnfPackageManager {
     fn installed_catalog_observation(
         &self,
     ) -> Result<Option<Arc<dyn super::InstalledCatalogObservation>>> {
-        let database = RpmDatabaseObservation::read(&self.rpm_db_path)
+        let path = self
+            .rpm_database
+            .sqlite_path()?
+            .context("RPM catalog observation requires a SQLite database")?;
+        let database = RpmDatabaseObservation::read(&path)
             .context("Cannot observe RPM SQLite inventory for daemon catalog")?;
         Ok(Some(Arc::new(RpmInstalledCatalogObservation {
-            path: self.rpm_db_path.clone(),
+            source: self.rpm_database.clone(),
+            path,
             database,
         })))
+    }
+
+    fn package_index_observation(
+        &self,
+    ) -> Result<Option<Arc<dyn super::InstalledCatalogObservation>>> {
+        let rpm = self
+            .installed_catalog_observation()?
+            .context("Cannot observe the installed RPM search catalog")?;
+        let mut paths = catalog::RepositoryPaths::default();
+        let before = paths.snapshot()?;
+        let mut command =
+            tokio::process::Command::from(crate::core::privilege::system_command("dnf")?);
+        command.env("LC_ALL", "C").arg("--dump-main-config");
+        let config = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(Self::query_output_with_deadline(
+                command,
+                std::time::Duration::from_secs(3),
+            ))?;
+        paths.add_effective_paths(std::str::from_utf8(&config)?)?;
+        let observation = catalog::PackageCatalog::new(rpm, paths)?;
+        anyhow::ensure!(
+            before == catalog::RepositoryPaths::default().snapshot()?,
+            "DNF configuration changed while resolving repository inputs"
+        );
+        Ok(Some(Arc::new(observation)))
     }
     fn security_inventory(
         &self,
@@ -2270,7 +3318,6 @@ impl PackageManager for DnfPackageManager {
             // packages. Installed inventory needs no repository metadata.
             command.args([
                 "--cacheonly",
-                "--disable-repo=*",
                 "--setopt=disable_excludes=*",
                 "repoquery",
                 "--installed",
@@ -2307,18 +3354,24 @@ impl PackageManager for DnfPackageManager {
         Some(Box::pin(async move {
             async {
                 let installed = self.security_inventory().await?;
-                let rows = Self::native_advisories().await?;
-                let mut affected = std::collections::BTreeMap::new();
-                for (row, _) in &rows {
-                    let packages = Self::affected_installed_packages(row, &installed).await?;
-                    affected.insert(
-                        row.nevra.clone(),
-                        packages
-                            .iter()
-                            .map(crate::core::security::scan::InstalledIdentity::from)
-                            .collect::<Vec<_>>(),
-                    );
-                }
+                let (rows, supplemental) =
+                    Self::native_advisories(AdvisoryLookup::ArchitectureChanges).await?;
+                let affected = Self::affected_installed_packages(
+                    rows.iter().map(|(row, _)| row),
+                    &installed,
+                    InstalledAdvisoryMatch::Exact,
+                )
+                .await?;
+                let possible = Self::affected_installed_packages(
+                    supplemental.iter().map(|(row, _)| row),
+                    &installed,
+                    InstalledAdvisoryMatch::ArchitectureChange,
+                )
+                .await
+                .unwrap_or_else(|error| {
+                    tracing::warn!("Could not associate supplemental Fedora advisories: {error:#}");
+                    BTreeMap::new()
+                });
                 let mut after = self.security_inventory().await?;
                 let mut before = installed;
                 let identity = |package: &super::types::SecurityPackage| {
@@ -2335,14 +3388,7 @@ impl PackageManager for DnfPackageManager {
                     "Installed packages changed during native security audit"
                 );
                 let mut result = super::dnf_advisory::audit_result(rows)?;
-                result.coverage = crate::core::security::scan::AuditCoverage::Reported {
-                    assessed: before
-                        .iter()
-                        .map(crate::core::security::scan::InstalledIdentity::from)
-                        .collect(),
-                    unassessed: Vec::new(),
-                    sources: vec![crate::core::security::scan::AdvisoryProvenance::NativeDnf],
-                };
+                result.coverage = super::dnf_advisory::installed_coverage(&before, &affected);
                 for (_, findings) in &mut result.vulnerabilities {
                     for finding in findings {
                         let native = finding
@@ -2355,6 +3401,11 @@ impl PackageManager for DnfPackageManager {
                             .clone();
                     }
                 }
+                super::dnf_advisory::add_architecture_findings(
+                    &mut result,
+                    supplemental,
+                    &possible,
+                )?;
                 Ok(result)
             }
             .await
@@ -2384,13 +3435,16 @@ impl PackageManager for DnfPackageManager {
                 kind != TransactionType::Update || packages.is_empty(),
                 "System updates do not accept package operands"
             );
-            crate::core::security::validate_package_names(packages)?;
             if kind == TransactionType::Install {
-                reject_unsealed_local_rpm_targets(packages)?;
+                Self::validate_install_selectors(packages)?;
+            } else {
+                Self::validate_package_selectors(packages)?;
             }
             let mut args = vec![action.to_owned(), "-y".to_owned()];
             args.extend_from_slice(packages);
-            self.recorded_mutation(kind, args, history).await
+            self.recorded_mutation(kind, args, history)
+                .await
+                .map(|_| ())
         }))
     }
 
@@ -2399,12 +3453,7 @@ impl PackageManager for DnfPackageManager {
         history: Option<&'a crate::core::history::HistoryManager>,
     ) -> Option<Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>> {
         Some(Box::pin(async move {
-            self.recorded_mutation(
-                crate::core::history::TransactionType::Update,
-                Self::cached_update_args(),
-                history,
-            )
-            .await
+            self.update_with_history(true, history).await.map(|_| ())
         }))
     }
 
@@ -2412,17 +3461,23 @@ impl PackageManager for DnfPackageManager {
         &self,
         query: &str,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<Package>>> + Send + '_>> {
-        let query_lower = query.to_lowercase();
-        Box::pin(async move {
-            let candidates = self.package_index().await?;
-            Ok(Self::search_results(candidates, &query_lower))
-        })
+        self.search_with_progress(query, true)
+    }
+
+    fn search_quietly(
+        &self,
+        query: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<Package>>> + Send + '_>> {
+        self.search_with_progress(query, false)
     }
 
     fn package_index(&self) -> Pin<Box<dyn Future<Output = Result<Vec<Package>>> + Send + '_>> {
         Box::pin(async move {
             let installed = self.load_installed_packages().await?;
-            let available = Self::available_packages(None).await?;
+            let (installed, available) = tokio::try_join!(
+                Self::order_installed_search_builds(&installed),
+                Self::available_packages(None)
+            )?;
             Ok(Self::search_candidates(installed, available))
         })
     }
@@ -2433,8 +3488,7 @@ impl PackageManager for DnfPackageManager {
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
         let packages = packages.to_vec();
         Box::pin(async move {
-            crate::core::security::validate_package_names(&packages)?;
-            reject_unsealed_local_rpm_targets(&packages)?;
+            Self::validate_install_selectors(&packages)?;
 
             let mut args = vec!["install".to_owned(), "-y".to_owned()];
             args.extend(packages);
@@ -2445,7 +3499,7 @@ impl PackageManager for DnfPackageManager {
     fn remove(&self, packages: &[String]) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
         let packages = packages.to_vec();
         Box::pin(async move {
-            crate::core::security::validate_package_names(&packages)?;
+            Self::validate_package_selectors(&packages)?;
 
             let mut args = vec!["remove".to_owned(), "-y".to_owned()];
             args.extend(packages);
@@ -2473,16 +3527,13 @@ impl PackageManager for DnfPackageManager {
 
             tokio::task::spawn_blocking({
                 let manager = self.cache_handle();
-                move || manager.run_dnf(&["--refresh", "makecache", "-y"])
+                move || manager.run_dnf(&REPOSITORY_REFRESH_ARGS)
             })
             .await??;
 
             if !is_root() {
-                crate::core::privilege::run_privileged_program(
-                    "dnf",
-                    &["--refresh", "makecache", "-y"],
-                )
-                .await?;
+                crate::core::privilege::run_privileged_program("dnf", &REPOSITORY_REFRESH_ARGS)
+                    .await?;
             }
             Ok(())
         })
@@ -2495,32 +3546,27 @@ impl PackageManager for DnfPackageManager {
         let package = package.to_string();
         Box::pin(async move {
             Self::validate_query_selector(&package)?;
-            let installed = self.load_installed_packages().await?;
-
-            let matches = installed
-                .iter()
-                .filter(|p| p.matches_selector(&package))
-                .collect::<Vec<_>>();
+            let manager = self.cache_handle();
+            let selector = package.clone();
+            let mut matches =
+                tokio::task::spawn_blocking(move || manager.matching_installed_packages(&selector))
+                    .await??;
             anyhow::ensure!(
                 matches.len() <= 1,
                 "Package '{package}' has multiple installed builds; specify the full NEVRA"
             );
-            if let Some(pkg) = matches.first() {
+            if let Some(pkg) = matches.pop() {
                 return Ok(Some(Package {
                     name: pkg.identity(),
                     version: parse_version_or_zero(&format!("{}-{}", pkg.version, pkg.release)),
-                    description: pkg.summary.clone(),
+                    description: pkg.summary,
                     source: PackageSource::Official,
                     installed: true,
                 }));
             }
 
             let available = Self::available_packages(Some(&package)).await?;
-            anyhow::ensure!(
-                available.len() <= 1,
-                "Package '{package}' has multiple available builds; specify the full NEVRA"
-            );
-            Ok(available.into_iter().next())
+            Self::select_available_info(&package, available)
         })
     }
 
@@ -2528,16 +3574,7 @@ impl PackageManager for DnfPackageManager {
         Box::pin(async move {
             let installed = self.load_installed_packages().await?;
 
-            Ok(installed
-                .into_iter()
-                .map(|pkg| Package {
-                    name: pkg.identity(),
-                    version: parse_version_or_zero(&format!("{}-{}", pkg.version, pkg.release)),
-                    description: pkg.summary,
-                    source: PackageSource::Official,
-                    installed: true,
-                })
-                .collect())
+            Ok(installed.iter().map(InstalledPackage::as_package).collect())
         })
     }
 
@@ -2546,41 +3583,58 @@ impl PackageManager for DnfPackageManager {
         fast: bool,
     ) -> Pin<Box<dyn Future<Output = Result<(usize, usize, usize, usize)>> + Send + '_>> {
         Box::pin(async move {
-            let mut installed = self.load_installed_packages().await?;
-            Self::apply_current_install_reasons(&mut installed).await?;
-            let total = installed.len();
-            let explicit = Self::explicit_package_names(installed).len();
+            self.get_status_details(fast)
+                .await
+                .map(PackageStatus::into_counts)
+        })
+    }
 
-            let (orphans, updates) = if fast {
-                (0, 0)
+    fn get_status_details(
+        &self,
+        fast: bool,
+    ) -> Pin<Box<dyn Future<Output = Result<PackageStatus>> + Send + '_>> {
+        Box::pin(async move {
+            let installed = self.load_installed_packages().await?;
+            let total = installed.len();
+            let reasons = Self::current_explicit_package_names(&installed);
+            let (explicit, maintenance) = if fast {
+                (reasons.await?, None)
             } else {
-                let unneeded = Self::repository_output(RepositoryQuery::Unneeded).await?;
-                (
-                    Self::parse_versioned_packages(&unneeded)?.len(),
-                    self.list_updates().await?.len(),
-                )
+                let (explicit, orphans, updates) =
+                    tokio::try_join!(reasons, Self::orphan_count(), self.list_updates())?;
+                (explicit, Some((orphans, updates.len())))
             };
 
-            Ok((total, explicit, orphans, updates))
+            Ok(PackageStatus {
+                total,
+                explicit: explicit.len(),
+                maintenance,
+            })
         })
     }
 
     fn list_explicit(&self) -> Pin<Box<dyn Future<Output = Result<Vec<String>>> + Send + '_>> {
         Box::pin(async move {
-            let mut installed = self.load_installed_packages().await?;
-            Self::apply_current_install_reasons(&mut installed).await?;
-            Ok(Self::explicit_package_names(installed))
+            let installed = self.load_installed_packages().await?;
+            Self::current_explicit_package_names(&installed).await
         })
     }
 
     fn list_updates(&self) -> Pin<Box<dyn Future<Output = Result<Vec<UpdateInfo>>> + Send + '_>> {
         Box::pin(async move {
-            let installed = Self::repository_output(RepositoryQuery::Installed).await?;
-            let upgrades = Self::repository_output(RepositoryQuery::Upgrades).await?;
+            let mut command =
+                tokio::process::Command::from(crate::core::privilege::system_command("dnf")?);
+            // list honors repository priority. JSON for list requires DNF5 5.4.
+            command.env("LC_ALL", "C").args(UPGRADE_QUERY_ARGS);
+            let (installed, upgrades) = tokio::try_join!(
+                Self::repository_output(RepositoryQuery::Installed),
+                Self::query_output(command)
+            )?;
             Self::match_updates(
                 &Self::parse_versioned_packages(&installed)?,
-                &Self::parse_versioned_packages(&upgrades)?,
+                &Self::parse_available_upgrades(&upgrades)?,
             )
+            .await
         })
     }
 
@@ -2627,7 +3681,12 @@ mod tests {
         );
         let before = manager.security_inventory().await?;
         let plan = manager.removal_plan(&["tree".into()]).await?;
-        assert!(plan.iter().any(|package| package.name == "tree.x86_64"));
+        let tree = plan
+            .iter()
+            .find(|package| package.name == "tree.x86_64")
+            .context("tree missing from the native removal plan")?;
+        let exact = format!("tree-{}.x86_64", tree.version);
+        assert_eq!(manager.removal_plan(&[exact]).await?, plan);
         assert_eq!(manager.security_inventory().await?, before);
         Ok(())
     }
@@ -2743,6 +3802,16 @@ mod tests {
         };
         for values in [
             vec!["install", "-y", "example"],
+            vec!["install", "-y", "example-2:1.0~rc1-1.fc44.x86_64"],
+            vec!["remove", "--confirm", "example"],
+            vec!["remove", "--confirm", "--verbose", "example"],
+            vec!["remove", "-y", "example"],
+            vec![
+                "--comment=omg-550e8400-e29b-41d4-a716-446655440000",
+                "remove",
+                "-y",
+                "example",
+            ],
             vec!["--setopt=cacheonly=metadata", "upgrade", "-y"],
             vec![
                 "--comment=omg-550e8400-e29b-41d4-a716-446655440000",
@@ -2761,6 +3830,21 @@ mod tests {
             vec!["upgrade", "-y", "unexpected-package"],
             vec!["install", "-y"],
             vec!["install", "-y", "/tmp/local.rpm"],
+            vec!["install", "-y", "example-2:1.0-1.fc44.rpm"],
+            vec!["remove", "-y"],
+            vec!["remove", "-y", "--quiet"],
+            vec!["remove", "-y", "--quiet", "--verbose", "example"],
+            vec!["remove", "--confirm", "/tmp/caller-plan"],
+            vec!["remove", "--dry-run", "example"],
+            vec!["remove", "--dry-run", "--quiet", "example"],
+            vec!["remove", "--dry-run", "--installroot=/tmp/root"],
+            vec!["--setopt=cacheonly=metadata", "remove", "-y", "example"],
+            vec![
+                "--comment=omg-550e8400-e29b-41d4-a716-446655440000",
+                "remove",
+                "--dry-run",
+                "example",
+            ],
         ] {
             assert!(
                 DnfPackageManager::validate_admission_args(&args(&values)).is_err(),
@@ -2775,11 +3859,14 @@ mod tests {
         let mut pairs = vec![("1.0-1.fc44".to_owned(), "1.0-1.fc44".to_owned()); 129];
         pairs[0] = ("2:1.0-1.fc44".into(), "1:9.9-9.fc44".into());
         pairs[1] = ("1.0~rc1-1.fc44".into(), "1.0-1.fc44".into());
+        pairs[2] = ("0:1.0-1.fc44".into(), "1.0-1.fc44".into());
+        pairs[3] = ("1.0-2.fc44".into(), "1.0-10.fc44".into());
         pairs[128] = ("1.0^git1-1.fc44".into(), "1.0.1-1.fc44".into());
         let compared = DnfPackageManager::compare_native_evrs(&pairs).await?;
         assert_eq!(compared.len(), 129);
-        assert_eq!((compared[0], compared[1], compared[128]), (1, -1, -1));
-        assert!(compared[2..128].iter().all(|value| *value == 0));
+        assert_eq!(&compared[..4], &[1, -1, 0, -1]);
+        assert_eq!(compared[128], -1);
+        assert!(compared[4..128].iter().all(|value| *value == 0));
         assert!(
             DnfPackageManager::compare_native_evrs(&[("1.0\n2.0".into(), "3.0".into())])
                 .await
@@ -2821,6 +3908,23 @@ mod tests {
             br#"{"version":"2.0","rpms":[]}"#,
             br#"{"version":"1.0","groups":[{}]}"#,
         ] { assert!(DnfPackageManager::proposed_inventory(bytes).is_err()); }
+        Ok(())
+    }
+
+    #[test]
+    fn rpm_configuration_selects_only_the_configured_sqlite_database() -> Result<()> {
+        assert_eq!(
+            RpmDatabaseSource::parse(b"sqlite\t/var/lib/rpm archive\n")?,
+            Some(PathBuf::from("/var/lib/rpm archive/rpmdb.sqlite"))
+        );
+        assert!(RpmDatabaseSource::parse(b"ndb\t/var/lib/rpm\n")?.is_none());
+        for invalid in [
+            b"sqlite\trelative\n".as_slice(),
+            b"sqlite\t/one\n/another\n",
+            b"sqlite\n",
+        ] {
+            assert!(RpmDatabaseSource::parse(invalid).is_err());
+        }
         Ok(())
     }
 
@@ -2871,8 +3975,8 @@ mod tests {
         let amd64 = make_header("x86_64");
         let i686 = make_header("i686");
         let directory = write_packages_db(&[&amd64, &i686]);
-        let mut manager = DnfPackageManager::new();
-        manager.rpm_db_path = directory.path().join("rpmdb.sqlite");
+        let rpm_db_path = directory.path().join("rpmdb.sqlite");
+        let manager = manager_for_database(&rpm_db_path);
         let mut installed = manager.list_installed().await?;
         installed.sort_by(|left, right| left.name.cmp(&right.name));
         assert_eq!(
@@ -2901,8 +4005,8 @@ mod tests {
     async fn installed_catalog_observation_survives_manager_cache_republication() -> Result<()> {
         let native = include_bytes!("../../tests/data/fedora-publicsuffix.rpmhdr");
         let directory = write_packages_db(&[native.as_slice()]);
-        let mut manager = DnfPackageManager::new();
-        manager.rpm_db_path = directory.path().join("rpmdb.sqlite");
+        let rpm_db_path = directory.path().join("rpmdb.sqlite");
+        let manager = manager_for_database(&rpm_db_path);
         let observed = manager
             .installed_catalog_observation()?
             .expect("SQLite observation available");
@@ -2911,7 +4015,7 @@ mod tests {
             manager.list_installed().await?[0].name,
             "publicsuffix-list-dafsa.noarch"
         );
-        let database = Connection::open(&manager.rpm_db_path)?;
+        let database = Connection::open(&rpm_db_path)?;
         database.execute("DELETE FROM Packages", [])?;
         assert!(manager.list_installed().await?.is_empty());
         assert!(
@@ -2932,19 +4036,19 @@ mod tests {
     {
         let native = include_bytes!("../../tests/data/fedora-publicsuffix.rpmhdr");
         let directory = write_packages_db(&[native.as_slice()]);
-        let mut manager = DnfPackageManager::new();
-        manager.rpm_db_path = directory.path().join("rpmdb.sqlite");
-        let database = Connection::open(&manager.rpm_db_path)?;
+        let rpm_db_path = directory.path().join("rpmdb.sqlite");
+        let manager = manager_for_database(&rpm_db_path);
+        let database = Connection::open(&rpm_db_path)?;
         database.pragma_update(None, "journal_mode", "WAL")?;
         let observed = manager
             .installed_catalog_observation()?
             .expect("SQLite observation");
         assert!(observed.is_current()?);
         let wal = directory.path().join("rpmdb.sqlite-wal");
-        let before = RpmFileIdentity::read(&wal)?.expect("observed WAL");
+        let before = FileIdentity::read(&wal)?.expect("observed WAL");
         std::thread::sleep(std::time::Duration::from_millis(2));
         std::fs::set_permissions(&wal, std::fs::metadata(&wal)?.permissions())?;
-        let after = RpmFileIdentity::read(&wal)?.expect("WAL retained");
+        let after = FileIdentity::read(&wal)?.expect("WAL retained");
         assert_eq!(
             (after.device, after.inode, after.size, after.modified),
             (before.device, before.inode, before.size, before.modified)
@@ -2968,9 +4072,9 @@ mod tests {
     #[test]
     fn installed_catalog_observation_rejects_wal_replacement() -> Result<()> {
         let directory = write_packages_db(&[]);
-        let mut manager = DnfPackageManager::new();
-        manager.rpm_db_path = directory.path().join("rpmdb.sqlite");
-        let database = Connection::open(&manager.rpm_db_path)?;
+        let rpm_db_path = directory.path().join("rpmdb.sqlite");
+        let manager = manager_for_database(&rpm_db_path);
+        let database = Connection::open(&rpm_db_path)?;
         database.pragma_update(None, "journal_mode", "WAL")?;
         let observed = manager
             .installed_catalog_observation()?
@@ -3053,6 +4157,8 @@ mod tests {
 
     #[tokio::test]
     async fn native_advisory_identity_excludes_patched_versions_and_other_architectures() {
+        use crate::core::security::scan::InstalledIdentity;
+
         let package = |version: &str, architecture: &str| super::super::types::SecurityPackage {
             origin: crate::package_managers::types::SecurityOrigin::DistributionPackage,
             name: "fixture".into(),
@@ -3074,14 +4180,61 @@ mod tests {
             package("1:1.0-3", "x86_64"),
             package("0:99.0-1", "i686"),
         ];
-        let affected = DnfPackageManager::affected_installed_packages(&row, &installed)
-            .await
-            .unwrap();
-        assert_eq!(affected, vec![installed[0].clone()]);
+        let other_architecture = super::super::dnf_advisory::ApplicableAdvisory {
+            name: "FEDORA-other-architecture".into(),
+            kind: "security".into(),
+            severity: "Important".into(),
+            nevra: "fixture-0:99.0-2.i686".into(),
+        };
+        let affected = DnfPackageManager::affected_installed_packages(
+            [&row, &other_architecture, &row],
+            &installed,
+            InstalledAdvisoryMatch::Exact,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            affected,
+            BTreeMap::from([
+                (
+                    row.nevra.clone(),
+                    vec![InstalledIdentity::from(&installed[0])]
+                ),
+                (
+                    other_architecture.nevra.clone(),
+                    vec![InstalledIdentity::from(&installed[3])],
+                ),
+            ])
+        );
         assert!(
-            DnfPackageManager::affected_installed_packages(&row, &installed[1..])
-                .await
-                .is_err()
+            DnfPackageManager::affected_installed_packages(
+                [&other_architecture, &row],
+                &installed[1..],
+                InstalledAdvisoryMatch::Exact,
+            )
+            .await
+            .is_err()
+        );
+        let cross_architecture = super::super::dnf_advisory::ApplicableAdvisory {
+            name: "FEDORA-cross-architecture".into(),
+            kind: "security".into(),
+            severity: "Important".into(),
+            nevra: "fixture-1:1.0-2.noarch".into(),
+        };
+        let possible = DnfPackageManager::affected_installed_packages(
+            [&row, &cross_architecture],
+            &installed,
+            InstalledAdvisoryMatch::ArchitectureChange,
+        )
+        .await
+        .unwrap();
+        assert!(possible[&row.nevra].is_empty());
+        assert_eq!(
+            possible[&cross_architecture.nevra],
+            [
+                InstalledIdentity::from(&installed[0]),
+                InstalledIdentity::from(&installed[3]),
+            ]
         );
     }
 
@@ -3133,11 +4286,9 @@ mod tests {
         let root = fixture.path();
         std::fs::create_dir(root.join("repos")).unwrap();
         let configure = || {
-            let mut command = DnfPackageManager::advisory_command().unwrap();
+            let mut command = DnfPackageManager::advisory_command(&root.join("cache")).unwrap();
             command.args([
                 format!("--setopt=reposdir={}", root.join("repos").display()),
-                format!("--setopt=cachedir={}", root.join("cache").display()),
-                format!("--setopt=system_cachedir={}", root.join("cache").display()),
                 format!("--setopt=persistdir={}", root.join("persist").display()),
                 format!("--setopt=logdir={}", root.join("logs").display()),
                 format!(
@@ -3169,7 +4320,7 @@ mod tests {
         assert!(error.to_string().contains("DNF query failed"), "{error:#}");
 
         let mut upgrades = configure();
-        upgrades.args(DnfPackageManager::repository_query_args(RepositoryQuery::Upgrades).unwrap());
+        upgrades.env("LC_ALL", "C").args(UPGRADE_QUERY_ARGS);
         let error = DnfPackageManager::query_output(upgrades).await.unwrap_err();
         assert!(error.to_string().contains("DNF query failed"), "{error:#}");
 
@@ -3180,20 +4331,18 @@ mod tests {
 
     #[test]
     fn update_queries_never_refresh_repository_metadata() {
-        for (query, require_repository_metadata) in [
-            (RepositoryQuery::Installed, false),
-            (RepositoryQuery::Upgrades, true),
-            (RepositoryQuery::Unneeded, false),
-        ] {
+        for query in [RepositoryQuery::Installed, RepositoryQuery::Unneeded] {
             let args = DnfPackageManager::repository_query_args(query).unwrap();
             assert!(args.iter().any(|arg| arg == "--cacheonly"), "{args:?}");
             assert_eq!(
-                args.iter()
-                    .any(|arg| arg == "--setopt=*.skip_if_unavailable=false"),
-                require_repository_metadata,
+                args.iter().any(|arg| arg == "--setopt=disable_excludes=*"),
+                query == RepositoryQuery::Installed,
                 "{args:?}"
             );
         }
+        assert!(UPGRADE_QUERY_ARGS.contains(&"--cacheonly"));
+        assert!(UPGRADE_QUERY_ARGS.contains(&"--setopt=*.skip_if_unavailable=false"));
+        assert!(!UPGRADE_QUERY_ARGS.contains(&"--setopt=disable_excludes=*"));
     }
 
     #[test]
@@ -3362,8 +4511,8 @@ mod tests {
         assert_eq!(manager.name(), "dnf");
     }
 
-    #[test]
-    fn native_fedora_update_snapshot_has_matching_installed_versions() {
+    #[tokio::test]
+    async fn native_fedora_update_snapshot_has_matching_installed_versions() {
         let installed = DnfPackageManager::parse_versioned_packages(include_bytes!(
             "../../tests/data/fedora-installed.tsv"
         ))
@@ -3374,6 +4523,7 @@ mod tests {
         .expect("native upgrade rows");
         assert!(!candidates.is_empty());
         let updates = DnfPackageManager::match_updates(&installed, &candidates)
+            .await
             .expect("every native upgrade matches an installed identity");
         assert_eq!(updates.len(), candidates.len());
         for (update, candidate) in updates.iter().zip(&candidates) {
@@ -3383,8 +4533,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn update_matching_uses_architecture_and_preserves_native_versions() {
+    #[tokio::test]
+    async fn update_matching_uses_architecture_and_preserves_native_versions() {
         let installed = DnfPackageManager::parse_versioned_packages(
             b"lib\ti686\t1:1-1\t@System\nlib\tx86_64\t1:2-1\t@System\n",
         )
@@ -3393,8 +4543,9 @@ mod tests {
             b"lib\tx86_64\t1:4-1\tupdates\nlib\ti686\t1:3-1\tupdates\n",
         )
         .expect("upgrade records");
-        let updates =
-            DnfPackageManager::match_updates(&installed, &candidates).expect("matched upgrades");
+        let updates = DnfPackageManager::match_updates(&installed, &candidates)
+            .await
+            .expect("matched upgrades");
         assert_eq!(updates.len(), 2);
         assert_eq!(updates[0].old_version, "1:2-1");
         assert_eq!(updates[1].old_version, "1:1-1");
@@ -3402,16 +4553,55 @@ mod tests {
         assert_eq!(updates[0].repo, "updates");
     }
 
-    #[test]
-    fn update_matching_rejects_unmatched_and_unchanged_candidates() {
+    #[tokio::test]
+    async fn update_matching_accepts_noarch_transitions_and_counts_mirrors_once() -> Result<()> {
+        let installed = DnfPackageManager::parse_versioned_packages(
+            concat!(
+                "lib\tx86_64\t99-1\t@System\n",
+                "lib\ti686\t1:1~rc-1\t@System\n",
+                "tool\tnoarch\t1-1\t@System\n",
+            )
+            .as_bytes(),
+        )?;
+        let candidates = DnfPackageManager::parse_versioned_packages(
+            concat!(
+                "lib\tnoarch\t1:1-1\tupdates\n",
+                "lib\tnoarch\t1:1-1\tmirror\n",
+                "tool\tx86_64\t2-1\tupdates\n",
+            )
+            .as_bytes(),
+        )?;
+
+        let updates = DnfPackageManager::match_updates(&installed, &candidates).await?;
+
+        assert_eq!(updates.len(), 2);
+        assert_eq!(updates[0].old_version, "1:1~rc-1");
+        assert_eq!(updates[0].new_version, "1:1-1");
+        assert_eq!(updates[0].repo, "updates");
+        assert_eq!(updates[1].old_version, "1-1");
+        assert_eq!(updates[1].new_version, "2-1");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn update_matching_rejects_unmatched_and_unchanged_candidates() {
         let installed = DnfPackageManager::parse_versioned_packages(b"lib\tx86_64\t1-1\t@System\n")
             .expect("installed");
         let wrong_arch = DnfPackageManager::parse_versioned_packages(b"lib\ti686\t2-1\tupdates\n")
             .expect("candidate");
-        assert!(DnfPackageManager::match_updates(&installed, &wrong_arch).is_err());
-        assert!(DnfPackageManager::match_updates(&installed, &installed).is_err());
+        assert!(
+            DnfPackageManager::match_updates(&installed, &wrong_arch)
+                .await
+                .is_err()
+        );
+        assert!(
+            DnfPackageManager::match_updates(&installed, &installed)
+                .await
+                .is_err()
+        );
         assert!(
             DnfPackageManager::match_updates(&installed, &[])
+                .await
                 .expect("no updates")
                 .is_empty()
         );
@@ -3423,6 +4613,27 @@ mod tests {
         ] {
             assert!(DnfPackageManager::parse_versioned_packages(malformed).is_err());
         }
+    }
+
+    #[test]
+    fn cached_upgrade_listing_distinguishes_empty_results_from_invalid_data() -> Result<()> {
+        assert!(DnfPackageManager::parse_available_upgrades(b"\n")?.is_empty());
+        let candidate = DnfPackageManager::parse_available_upgrades(
+            b"Available upgrades\nlib.compat.noarch   2:1-1   updates\n",
+        )?;
+        assert_eq!(candidate[0].name, "lib.compat");
+        assert_eq!(candidate[0].version, "2:1-1");
+        assert_eq!(candidate[0].architecture, "noarch");
+        assert_eq!(candidate[0].repository, "updates");
+        for invalid in [
+            b"Unexpected heading".as_slice(),
+            b"Available upgrades\nlib.noarch updates",
+            b"Available upgrades\nlib 2:1-1 updates",
+            b"Available upgrades\nlib.noarch 2:1-1 up\x1bdates",
+        ] {
+            assert!(DnfPackageManager::parse_available_upgrades(invalid).is_err());
+        }
+        Ok(())
     }
 
     #[tokio::test]
@@ -3502,6 +4713,54 @@ mod tests {
                 "%{name}\t%{evr}\t%{full_nevra}\t%{reason}\\n",
                 "tree",
             ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn available_info_passes_the_exact_selector_without_an_architecture_override() -> Result<()> {
+        for selector in ["widget.lib.i686", "widget.lib-0:1.2-3.fc44.i686"] {
+            let args = DnfPackageManager::repository_query_args(RepositoryQuery::Available(Some(
+                selector,
+            )))?;
+            assert_eq!(args.last().map(String::as_str), Some(selector));
+            assert!(
+                !args.iter().any(|arg| arg.starts_with("--arch=")),
+                "{args:?}"
+            );
+        }
+        let search = DnfPackageManager::repository_query_args(RepositoryQuery::Available(None))?;
+        assert!(search.contains(&format!("--arch={},noarch", std::env::consts::ARCH)));
+        Ok(())
+    }
+
+    #[test]
+    fn available_info_keeps_native_preference_and_accepts_a_unique_multilib_build() -> Result<()> {
+        let manager = DnfPackageManager::select_available_info;
+        let parse = DnfPackageManager::parse_available_packages;
+        let host = std::env::consts::ARCH;
+        let foreign = if host == "i686" { "x86_64" } else { "i686" };
+        let foreign_row = format!("widget.lib.{foreign}\t1.2-3.fc44\tMultilib package\n");
+        let native_row = format!("widget.lib.{host}\t2.0-1.fc44\tNative package\n");
+        let combined = format!("{foreign_row}{native_row}");
+        let selected =
+            manager("widget.lib", parse(combined.as_bytes())?)?.context("native build")?;
+        assert_eq!(selected.name, format!("widget.lib.{host}"));
+        assert_eq!(selected.version.to_string(), "2.0-1.fc44");
+
+        let selector = format!("widget.lib-0:1.2-3.fc44.{foreign}");
+        let selected =
+            manager(&selector, parse(foreign_row.as_bytes())?)?.context("explicit build")?;
+        assert_eq!(selected.name, format!("widget.lib.{foreign}"));
+        assert!(!selected.installed);
+        let independent_row = b"widget.lib.noarch\t2.0-1.fc44\tArchitecture-independent\n";
+        let mut ambiguous = parse(native_row.as_bytes())?;
+        ambiguous.extend(parse(independent_row)?);
+        assert!(
+            manager("widget.lib", ambiguous)
+                .expect_err("multiple default builds are ambiguous")
+                .to_string()
+                .contains("multiple available builds")
         );
         Ok(())
     }
@@ -3594,7 +4853,7 @@ mod tests {
         );
     }
 
-    fn search_catalog_fixture() -> Vec<Package> {
+    fn search_catalog_fixture() -> ([InstalledPackage; 2], &'static [u8]) {
         let installed =
             [("widget.lib", "x86_64"), ("widget.local", "noarch")].map(|(name, architecture)| {
                 InstalledPackage {
@@ -3603,16 +4862,14 @@ mod tests {
                     version: "1".to_owned(),
                     release: "1".to_owned(),
                     summary: "Installed summary".to_owned(),
-                    reason: InstallReason::Dependency,
                 }
             });
-        let available = DnfPackageManager::parse_available_packages(
+        (
+            installed,
             b"widget.lib.x86_64\t2-1\tRepository keyword\n\
               widget.lib.x86_64\t3-1\tAnother repository build\n\
               widget.lib.i686\t2-1\tRepository keyword\n",
         )
-        .expect("valid repository rows");
-        DnfPackageManager::search_candidates(Vec::from(installed), available)
     }
 
     #[test]
@@ -3621,8 +4878,10 @@ mod tests {
             DnfPackageManager::repository_query_format(&RepositoryQuery::Available(None)),
             "%{name}.%{arch}\t%{evr}\t%{summary}\\n"
         );
+        let (installed_packages, output) = search_catalog_fixture();
         let search = |query| {
-            DnfPackageManager::search_results(search_catalog_fixture(), query)
+            DnfPackageManager::search_results(&installed_packages, output, query)
+                .expect("valid repository rows")
                 .into_iter()
                 .map(|pkg| {
                     (
@@ -3664,10 +4923,73 @@ mod tests {
         );
     }
 
+    #[test]
+    fn direct_search_preserves_the_first_repository_row_for_a_matching_identity() -> Result<()> {
+        let output = "editor.noarch\t1-1\tPreferred repository\n\
+                      editor.noarch\t1-2\tÉditeur de texte\n";
+        let matches = DnfPackageManager::search_results(&[], output.as_bytes(), "éditeur")?;
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].name, "editor.noarch");
+        assert_eq!(matches[0].version.to_string(), "1-1");
+        assert_eq!(matches[0].description, "Preferred repository");
+        assert!(!matches[0].installed);
+
+        let malformed = "editor.noarch\t1-1\tÉditeur\nmissing-version";
+        assert!(DnfPackageManager::search_results(&[], malformed.as_bytes(), "éditeur").is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn search_prefers_the_latest_installed_build_without_losing_older_descriptions()
+    -> Result<()> {
+        let installed: Vec<_> = [
+            ("x86_64", "1", "2", "Older kernel"),
+            ("i686", "2:1", "1", "Higher epoch kernel"),
+            ("x86_64", "1", "10", "Latest native kernel"),
+            ("x86_64", "1", "3", "Intermediate kernel"),
+            ("i686", "1:100", "1", "Old multilib kernel"),
+        ]
+        .into_iter()
+        .map(
+            |(architecture, version, release, summary)| InstalledPackage {
+                name: "kernel-test".into(),
+                version: version.into(),
+                release: release.into(),
+                architecture: architecture.into(),
+                summary: summary.into(),
+            },
+        )
+        .collect();
+        let ordered = DnfPackageManager::order_installed_search_builds(&installed).await?;
+        let results = DnfPackageManager::search_results(ordered.iter().copied(), b"", "kernel")?;
+        let versions = results
+            .iter()
+            .map(|package| (package.name.as_str(), package.version.to_string()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            versions,
+            [
+                ("kernel-test.i686", "2:1-1".into()),
+                ("kernel-test.x86_64", "1-10".into())
+            ]
+        );
+        let results =
+            DnfPackageManager::search_results(ordered.iter().copied(), b"", "older kernel")?;
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].version.to_string(), "1-10");
+        let candidates = DnfPackageManager::search_candidates(ordered, Vec::new());
+        assert_eq!(candidates.len(), installed.len());
+        assert_eq!(candidates[0].version.to_string(), "1-10");
+        Ok(())
+    }
+
     #[cfg(unix)]
     pub(crate) fn search_parity_data(query: &str) -> (Vec<Package>, Vec<Package>) {
-        let catalog = search_catalog_fixture();
-        let direct = DnfPackageManager::search_results(catalog.clone(), query);
+        let (installed, output) = search_catalog_fixture();
+        let available = DnfPackageManager::parse_available_packages(output).expect("fixture rows");
+        let catalog = DnfPackageManager::search_candidates(&installed, available);
+        let direct =
+            DnfPackageManager::search_results(&installed, output, query).expect("valid search");
         (catalog, direct)
     }
 
@@ -3698,7 +5020,6 @@ mod tests {
             RepositoryQuery::Available(None),
             RepositoryQuery::Available(Some("tree")),
             RepositoryQuery::Installed,
-            RepositoryQuery::Upgrades,
             RepositoryQuery::Unneeded,
             RepositoryQuery::InstalledSizes(InstalledSizeQuery::All),
             RepositoryQuery::InstalledSizes(InstalledSizeQuery::Package("tree")),
@@ -3871,6 +5192,29 @@ mod tests {
             DnfPackageManager::cached_update_args(),
             ["--setopt=cacheonly=metadata", "upgrade", "-y"]
         );
+    }
+
+    #[test]
+    fn fresh_dnf_history_requires_absence_at_the_effective_location() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let config = format!(
+            "[main]\ninstallroot = /\ntransaction_history_dir = {}\n",
+            directory.path().display()
+        );
+        assert!(DnfPackageManager::history_is_missing(&config)?);
+        std::fs::write(
+            directory.path().join(DNF_HISTORY_DATABASE),
+            b"unreadable journal format",
+        )?;
+        assert!(!DnfPackageManager::history_is_missing(&config)?);
+        for invalid in [
+            format!("{config}transaction_history_dir = /other"),
+            config.replace("installroot = /", "installroot = /other"),
+            "installroot = /\ntransaction_history_dir = relative".into(),
+        ] {
+            assert!(DnfPackageManager::history_is_missing(&invalid).is_err());
+        }
+        Ok(())
     }
 
     #[test]
@@ -4096,13 +5440,16 @@ mod tests {
             new_version: None,
             source: "dnf".into(),
         }];
-        result(
-            TransactionType::Remove,
-            &history,
-            Ok(()),
-            Ok(NativeOutcome::NoTransaction),
-        )
-        .unwrap();
+        assert_eq!(
+            result(
+                TransactionType::Remove,
+                &history,
+                Ok(()),
+                Ok(NativeOutcome::NoTransaction),
+            )
+            .unwrap(),
+            0
+        );
         assert!(
             history.load().unwrap().is_empty(),
             "no-op must not invent history"
@@ -4155,6 +5502,15 @@ mod tests {
             2,
             "invalid journal must not invent changes"
         );
+        let count = result(
+            TransactionType::Update,
+            &history,
+            Ok(()),
+            Ok(NativeOutcome::Committed(committed_changes)),
+        )
+        .unwrap();
+        assert_eq!(count, history.load().unwrap()[2].changes.len());
+        assert_eq!(count, 1);
     }
 
     #[tokio::test]
@@ -4191,6 +5547,141 @@ mod tests {
                 .to_string()
                 .contains("DNF query failed")
         );
+    }
+
+    #[tokio::test]
+    async fn native_command_does_not_wait_for_descendants_stderr() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let pid_file = fixture.path().join("child.pid");
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .args([
+                "-c",
+                "sleep 10 & printf '%s\\n' \"$!\" > \"$1\"; exit 7",
+                "--",
+            ])
+            .arg(&pid_file);
+        let status = tokio::time::timeout(
+            std::time::Duration::from_secs(4),
+            tokio::task::spawn_blocking(move || DnfPackageManager::run_native_command(command)),
+        )
+        .await;
+        let child_pid: i32 = std::fs::read_to_string(pid_file)?.trim().parse()?;
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(child_pid),
+            nix::sys::signal::Signal::SIGTERM,
+        );
+        assert_eq!(
+            status
+                .context("DNF did not return after the owned command exited")???
+                .code(),
+            Some(7)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn captured_query_drains_diagnostics_and_preserves_failure_reason() -> Result<()> {
+        let mut verbose = tokio::process::Command::new("/bin/sh");
+        verbose
+            .stderr(std::process::Stdio::piped())
+            .args(["-c", "head -c 131072 /dev/zero >&2 && printf '[]'"]);
+        let deadline = std::time::Duration::from_secs(5);
+        assert_eq!(
+            DnfPackageManager::query_output_with_deadline(verbose, deadline).await?,
+            b"[]"
+        );
+
+        let mut failed = tokio::process::Command::new("/bin/sh");
+        failed.stderr(std::process::Stdio::piped()).args([
+            "-c",
+            "printf 'Loading repositories\nRepository is unavailable\n' >&2; exit 7",
+        ]);
+        let error = DnfPackageManager::query_output(failed).await.unwrap_err();
+        assert!(error.to_string().ends_with("Repository is unavailable"));
+
+        let mut authenticated_mirror = tokio::process::Command::new("/bin/sh");
+        authenticated_mirror.stderr(std::process::Stdio::piped()).args([
+            "-c",
+            "printf '%s\n' 'Failed to load repository example: \"https://fixture-user:fixture-pass@mirror.example/repo?secret=fixture-token#fixture-fragment\"' >&2; exit 7",
+        ]);
+        let error = DnfPackageManager::query_output(authenticated_mirror)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("repository example"), "{error}");
+        assert!(error.contains("https://mirror.example/repo"), "{error}");
+        assert!(!error.contains("fixture-"), "{error}");
+
+        let mut over_budget = tokio::process::Command::new("/bin/sh");
+        over_budget.args([
+            "-c",
+            "printf '%s\n%s' 'Repository example refused' 'https://fixture-user:fixture-pass' >&2; head -c 65536 /dev/zero >&2; printf '@mirror.example\n' >&2; exit 7",
+        ]);
+        let error = DnfPackageManager::query_output(over_budget)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.ends_with("Repository example refused"), "{error}");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn orphan_cleanup_preview_preserves_plan_and_protected_package_diagnostics() -> Result<()> {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        let output = |code, stdout: &str, stderr: &str| std::process::Output {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: stderr.as_bytes().to_vec(),
+        };
+        let preview = DnfPackageManager::transaction_preview_output;
+        let protected = "Unneeded protected package: leaf-0:1-1.noarch";
+        assert_eq!(
+            preview(&output(0, "Nothing to do.\n", protected))?,
+            ("Nothing to do.\n".into(), protected.into())
+        );
+
+        let plan = "Removing:\n leaf noarch 0:1-1\n";
+        let abort = "Operation aborted by the user.\n";
+        let diagnostics = format!("{protected}\n{abort}");
+        assert_eq!(
+            preview(&output(1, plan, &diagnostics))?,
+            (plan.into(), protected.into())
+        );
+
+        for failure in [
+            output(7, plan, abort),
+            output(1, "", abort),
+            output(1, plan, "Failed to resolve the transaction\n"),
+            output(1, plan, &format!("Invalid diagnostic: {abort}")),
+        ] {
+            assert!(preview(&failure).is_err());
+        }
+        let failure = preview(&output(
+            1,
+            "",
+            "Failed to resolve the transaction\nNo match for argument: package\n  --skip-unavailable to skip unavailable packages\n",
+        ))
+        .expect_err("an unresolved request must fail the preview")
+        .to_string();
+        assert!(failure.contains("No match for argument: package"));
+        assert!(failure.contains("--skip-unavailable"));
+
+        let mirror = "https://fixture-user:fixture-pass@mirror.example/repo?secret=fixture-token";
+        let message = format!("Repository example ({mirror})");
+        let failed_preview = preview(&output(7, "", &message)).unwrap_err().to_string();
+        let (plan, diagnostics) = preview(&output(
+            1,
+            &format!("{message}\n"),
+            &format!("{message}\n{abort}"),
+        ))?;
+        for text in [failed_preview, plan, diagnostics] {
+            assert!(text.contains("https://mirror.example/repo"), "{text}");
+            assert!(!text.contains("fixture-"), "{text}");
+        }
+        Ok(())
     }
 
     #[tokio::test]
@@ -4265,6 +5756,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stored_query_accepts_a_missing_manifest_only_for_native_noop() -> Result<()> {
+        for (script, no_changes) in [
+            ("printf 'Nothing to do.\\n'", true),
+            (
+                "printf 'Package Arch Version Repository Size\\nSkipping packages with broken dependencies:\\n package noarch 2-1 test 7 B\\n\\nNothing to do.\\n'",
+                true,
+            ),
+            ("printf 'Preparing transaction\\n'", false),
+            ("printf 'Nothing to do.\\nPreparing transaction\\n'", false),
+            ("printf 'Warning: Nothing to do.\\n'", false),
+            ("printf 'Nothing to do.\\n'; exit 1", false),
+            (
+                "mkdir \"$1/transaction.json\"; printf 'Nothing to do.\\n'",
+                false,
+            ),
+        ] {
+            let directory = tempfile::tempdir()?;
+            let path = directory.path().to_owned();
+            let mut command = tokio::process::Command::new("/bin/sh");
+            command.args(["-c", script, "--"]).arg(&path);
+            let result = DnfPackageManager::owned_stored_transaction(
+                command,
+                directory,
+                std::time::Duration::from_secs(5),
+            )
+            .await;
+            if no_changes {
+                assert!(result?.is_none());
+            } else {
+                assert!(result.is_err(), "{script}");
+            }
+            assert!(!path.exists(), "{script}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn stored_query_returns_owned_namespace_and_exact_manifest_after_child_exit() -> Result<()>
     {
         let directory = tempfile::tempdir()?;
@@ -4282,7 +5810,8 @@ mod tests {
             directory,
             std::time::Duration::from_secs(5),
         )
-        .await?;
+        .await?
+        .context("expected a stored transaction")?;
         assert_eq!(bytes, b"stored bytes");
         assert!(path.is_dir());
         drop(directory);
@@ -4548,17 +6077,16 @@ mod tests {
 
     #[test]
     fn install_reason_failure_preserves_the_rpm_inventory() {
-        let mut packages = vec![InstalledPackage {
+        let packages = [InstalledPackage {
             name: "bash".to_string(),
             version: "5.2".to_string(),
             release: "1.fc42".to_string(),
             architecture: "x86_64".to_string(),
             summary: "GNU shell".to_string(),
-            reason: InstallReason::Dependency,
         }];
 
-        let error = DnfPackageManager::apply_install_reasons(
-            &mut packages,
+        let error = DnfPackageManager::explicit_package_names(
+            &packages,
             Err(anyhow::anyhow!("repoquery unavailable")),
         )
         .expect_err(
@@ -4567,37 +6095,32 @@ mod tests {
         assert!(format!("{error:#}").contains("repoquery unavailable"));
 
         assert_eq!(packages.len(), 1);
-        assert_eq!(packages[0].reason, InstallReason::Dependency);
         assert_eq!(packages[0].name, "bash");
         assert_eq!(packages[0].version, "5.2");
         assert_eq!(packages[0].release, "1.fc42");
         assert_eq!(packages[0].summary, "GNU shell");
 
-        // A successful empty set is different from an unavailable query.
-        // A later successful observation must still be able to update reasons.
-        DnfPackageManager::apply_install_reasons(
-            &mut packages,
-            Ok(HashSet::from([
-                "bash".to_string(),
-                "not-installed".to_string(),
-            ])),
+        let explicit = DnfPackageManager::explicit_package_names(
+            &packages,
+            Ok(HashSet::from(["bash".into(), "not-installed".into()])),
         )
         .unwrap();
-        assert_eq!(packages[0].reason, InstallReason::User);
-        DnfPackageManager::apply_install_reasons(&mut packages, Ok(HashSet::new())).unwrap();
-        assert_eq!(packages[0].reason, InstallReason::Dependency);
+        assert_eq!(explicit, ["bash"]);
+        let explicit =
+            DnfPackageManager::explicit_package_names(&packages, Ok(HashSet::new())).unwrap();
+        assert!(explicit.is_empty());
     }
 
     #[tokio::test]
     async fn installed_inventory_observes_external_removal() -> Result<()> {
         let blob = include_bytes!("../../tests/data/fedora-publicsuffix.rpmhdr");
         let directory = write_packages_db(&[blob.as_slice()]);
-        let mut manager = DnfPackageManager::new();
-        manager.rpm_db_path = directory.path().join("rpmdb.sqlite");
+        let rpm_db_path = directory.path().join("rpmdb.sqlite");
+        let manager = manager_for_database(&rpm_db_path);
         assert_eq!(manager.list_installed().await?.len(), 1);
         assert!(manager.is_installed_fast("publicsuffix-list-dafsa")?);
         assert!(!manager.is_installed_fast("definitely-not-installed")?);
-        let database = Connection::open(&manager.rpm_db_path)?;
+        let database = Connection::open(&rpm_db_path)?;
         database.execute("DELETE FROM Packages", [])?;
 
         assert!(
@@ -4610,17 +6133,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn installed_inventory_preserves_database_order_across_cache_hits() -> Result<()> {
+        let first = named_rpm_header("first");
+        let middle = named_rpm_header("middle");
+        let last = rpm_string_header([
+            (rpm_tags::NAME, "first"),
+            (rpm_tags::VERSION, "1.0"),
+            (rpm_tags::RELEASE, "1.fc44"),
+            (rpm_tags::ARCH, "i686"),
+        ]);
+        let directory = write_packages_db(&[&first, &middle, &last]);
+        let rpm_db_path = directory.path().join("rpmdb.sqlite");
+        let manager = manager_for_database(&rpm_db_path);
+
+        for _ in 0..2 {
+            let names: Vec<_> = manager
+                .list_installed()
+                .await?
+                .into_iter()
+                .map(|package| package.name)
+                .collect();
+            assert_eq!(names, ["first.noarch", "middle.noarch", "first.i686"]);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn installed_inventory_observes_commits_when_file_metadata_matches() -> Result<()> {
         for journal_mode in ["DELETE", "WAL"] {
             let blob = include_bytes!("../../tests/data/fedora-publicsuffix.rpmhdr");
             let directory = write_packages_db(&[blob.as_slice()]);
-            let mut manager = DnfPackageManager::new();
-            manager.rpm_db_path = directory.path().join("rpmdb.sqlite");
-            let database = Connection::open(&manager.rpm_db_path)?;
+            let rpm_db_path = directory.path().join("rpmdb.sqlite");
+            let manager = manager_for_database(&rpm_db_path);
+            let database = Connection::open(&rpm_db_path)?;
             database.pragma_update(None, "journal_mode", journal_mode)?;
             assert_eq!(manager.list_installed().await?.len(), 1);
             assert!(
-                manager.cached_installed_packages().is_some(),
+                manager.cached_installed_packages(&rpm_db_path).is_some(),
                 "first inventory read must initialize a cache in {journal_mode} mode"
             );
             database.execute("DELETE FROM Packages", [])?;
@@ -4633,8 +6182,7 @@ mod tests {
                 .as_mut()
                 .expect("cached inventory")
                 .observation
-                .identity =
-                RpmDatabaseIdentity::read(&manager.rpm_db_path).expect("database identity");
+                .identity = RpmDatabaseIdentity::read(&rpm_db_path).expect("database identity");
             assert!(
                 !manager.is_installed("publicsuffix-list-dafsa").await?,
                 "{journal_mode}"
@@ -4653,24 +6201,21 @@ mod tests {
     async fn installed_inventory_observes_wal_only_removal() -> Result<()> {
         let blob = include_bytes!("../../tests/data/fedora-publicsuffix.rpmhdr");
         let directory = write_packages_db(&[blob.as_slice()]);
-        let mut manager = DnfPackageManager::new();
-        manager.rpm_db_path = directory.path().join("rpmdb.sqlite");
-        let database = Connection::open(&manager.rpm_db_path)?;
+        let rpm_db_path = directory.path().join("rpmdb.sqlite");
+        let manager = manager_for_database(&rpm_db_path);
+        let database = Connection::open(&rpm_db_path)?;
         database.pragma_update(None, "journal_mode", "WAL")?;
         assert_eq!(manager.list_installed().await?.len(), 1);
         assert!(
             manager.is_installed("publicsuffix-list-dafsa").await?,
             "the private fixture package must be present before testing its removal"
         );
-        let original_bytes = std::fs::read(&manager.rpm_db_path)?;
-        let original_mtime = std::fs::metadata(&manager.rpm_db_path)?.modified()?;
+        let original_bytes = std::fs::read(&rpm_db_path)?;
+        let original_mtime = std::fs::metadata(&rpm_db_path)?.modified()?;
 
         database.execute("DELETE FROM Packages", [])?;
-        assert_eq!(std::fs::read(&manager.rpm_db_path)?, original_bytes);
-        assert_eq!(
-            std::fs::metadata(&manager.rpm_db_path)?.modified()?,
-            original_mtime
-        );
+        assert_eq!(std::fs::read(&rpm_db_path)?, original_bytes);
+        assert_eq!(std::fs::metadata(&rpm_db_path)?.modified()?, original_mtime);
         assert!(
             !manager.is_installed("publicsuffix-list-dafsa").await?,
             "committed WAL changes must invalidate an unchanged main file"
@@ -4682,24 +6227,21 @@ mod tests {
     async fn installed_inventory_observes_replacement_with_preserved_mtime() -> Result<()> {
         let blob = include_bytes!("../../tests/data/fedora-publicsuffix.rpmhdr");
         let directory = write_packages_db(&[blob.as_slice()]);
-        let mut manager = DnfPackageManager::new();
-        manager.rpm_db_path = directory.path().join("rpmdb.sqlite");
+        let rpm_db_path = directory.path().join("rpmdb.sqlite");
+        let manager = manager_for_database(&rpm_db_path);
         assert_eq!(manager.list_installed().await?.len(), 1);
         assert!(
             manager.is_installed("publicsuffix-list-dafsa").await?,
             "the private fixture package must be present before testing its removal"
         );
-        let original_mtime = std::fs::metadata(&manager.rpm_db_path)?.modified()?;
+        let original_mtime = std::fs::metadata(&rpm_db_path)?.modified()?;
         let replacement = write_packages_db(&[]);
         let replacement_path = replacement.path().join("rpmdb.sqlite");
         std::fs::File::open(&replacement_path)?
             .set_times(std::fs::FileTimes::new().set_modified(original_mtime))?;
-        std::fs::rename(replacement_path, &manager.rpm_db_path)?;
+        std::fs::rename(replacement_path, &rpm_db_path)?;
 
-        assert_eq!(
-            std::fs::metadata(&manager.rpm_db_path)?.modified()?,
-            original_mtime
-        );
+        assert_eq!(std::fs::metadata(&rpm_db_path)?.modified()?, original_mtime);
         assert!(!manager.is_installed("publicsuffix-list-dafsa").await?);
         Ok(())
     }
@@ -4707,23 +6249,25 @@ mod tests {
     #[tokio::test]
     async fn installed_inventory_refreshes_an_empty_snapshot_after_installation() -> Result<()> {
         let directory = write_packages_db(&[]);
-        let mut manager = DnfPackageManager::new();
-        manager.rpm_db_path = directory.path().join("rpmdb.sqlite");
+        let rpm_db_path = directory.path().join("rpmdb.sqlite");
+        let manager = manager_for_database(&rpm_db_path);
+        assert_eq!(manager.installed_count()?, 0);
+        assert!(manager.cache_read().is_none());
         assert!(manager.list_installed().await?.is_empty());
         assert!(
             manager
-                .cached_installed_packages()
+                .cached_installed_packages(&rpm_db_path)
                 .expect("empty snapshot")
                 .is_empty()
         );
-        let database = Connection::open(&manager.rpm_db_path)?;
+        let database = Connection::open(&rpm_db_path)?;
         let blob = include_bytes!("../../tests/data/fedora-publicsuffix.rpmhdr");
         database.execute("INSERT INTO Packages (blob) VALUES (?1)", [blob.as_slice()])?;
 
         assert!(manager.is_installed("publicsuffix-list-dafsa").await?);
         assert_eq!(manager.list_installed().await?.len(), 1);
         manager.cache_handle().invalidate_installed_cache();
-        assert!(manager.cached_installed_packages().is_none());
+        assert!(manager.cached_installed_packages(&rpm_db_path).is_none());
         Ok(())
     }
 
@@ -4731,21 +6275,22 @@ mod tests {
     fn installed_cache_rejects_changed_or_unobserved_generation() -> Result<()> {
         let blob = include_bytes!("../../tests/data/fedora-publicsuffix.rpmhdr");
         let directory = write_packages_db(&[blob.as_slice()]);
-        let mut manager = DnfPackageManager::new();
-        manager.rpm_db_path = directory.path().join("rpmdb.sqlite");
-        let mut observed = RpmDatabaseObservation::read(&manager.rpm_db_path);
-        let packages = DnfPackageManager::read_rpm_sqlite(&manager.rpm_db_path)?;
-        let database = Connection::open(&manager.rpm_db_path)?;
+        let rpm_db_path = directory.path().join("rpmdb.sqlite");
+        let manager = manager_for_database(&rpm_db_path);
+        let mut observed = RpmDatabaseObservation::read(&rpm_db_path);
+        let packages = DnfPackageManager::read_rpm_sqlite(&rpm_db_path)?;
+        let database = Connection::open(&rpm_db_path)?;
         database.execute("DELETE FROM Packages", [])?;
 
         // Even if metadata fails to reveal a commit between the inventory read
         // and publication, the original observer must reject the old inventory.
         observed.as_mut().expect("database observer").identity =
-            RpmDatabaseIdentity::read(&manager.rpm_db_path).expect("database identity");
-        manager.publish_installed_packages(&packages, observed);
-        assert!(manager.cached_installed_packages().is_none());
-        manager.publish_installed_packages(&packages, None);
-        assert!(manager.cached_installed_packages().is_none());
+            RpmDatabaseIdentity::read(&rpm_db_path).expect("database identity");
+        let packages = Arc::new(packages);
+        manager.publish_installed_packages(Some(&rpm_db_path), Arc::clone(&packages), observed);
+        assert!(manager.cached_installed_packages(&rpm_db_path).is_none());
+        manager.publish_installed_packages(Some(&rpm_db_path), packages, None);
+        assert!(manager.cached_installed_packages(&rpm_db_path).is_none());
         Ok(())
     }
 
@@ -4753,11 +6298,11 @@ mod tests {
     async fn installed_cache_rejects_unobservable_database_files() -> Result<()> {
         let blob = include_bytes!("../../tests/data/fedora-publicsuffix.rpmhdr");
         let directory = write_packages_db(&[blob.as_slice()]);
-        let mut manager = DnfPackageManager::new();
-        manager.rpm_db_path = directory.path().join("rpmdb.sqlite");
+        let rpm_db_path = directory.path().join("rpmdb.sqlite");
+        let manager = manager_for_database(&rpm_db_path);
         assert_eq!(manager.list_installed().await?.len(), 1);
         let cached = manager
-            .cached_installed_packages()
+            .cached_installed_packages(&rpm_db_path)
             .expect("private fixture cache must exist before testing invalidation");
         assert_eq!(
             cached
@@ -4773,19 +6318,19 @@ mod tests {
         );
         let wal = directory.path().join("rpmdb.sqlite-wal");
         std::fs::create_dir(&wal)?;
-        assert!(manager.cached_installed_packages().is_none());
+        assert!(manager.cached_installed_packages(&rpm_db_path).is_none());
         std::fs::remove_dir(wal)?;
-        std::fs::remove_file(&manager.rpm_db_path)?;
-        assert!(manager.cached_installed_packages().is_none());
+        std::fs::remove_file(&rpm_db_path)?;
+        assert!(manager.cached_installed_packages(&rpm_db_path).is_none());
         Ok(())
     }
 
     #[test]
     fn installed_cache_publication_is_idempotent_and_preserves_multilib_names() {
         let directory = write_packages_db(&[]);
-        let mut manager = DnfPackageManager::new();
-        manager.rpm_db_path = directory.path().join("rpmdb.sqlite");
-        let identity = RpmDatabaseObservation::read(&manager.rpm_db_path);
+        let rpm_db_path = directory.path().join("rpmdb.sqlite");
+        let manager = manager_for_database(&rpm_db_path);
+        let identity = RpmDatabaseObservation::read(&rpm_db_path);
         let packages: Vec<_> = ["x86_64", "i686"]
             .into_iter()
             .map(|architecture| InstalledPackage {
@@ -4794,15 +6339,19 @@ mod tests {
                 release: "1.fc42".to_string(),
                 architecture: architecture.to_string(),
                 summary: "C library".to_string(),
-                reason: InstallReason::Dependency,
             })
             .collect();
 
-        manager.publish_installed_packages(&packages, identity.clone());
-        manager.publish_installed_packages(&packages, identity);
+        let packages = Arc::new(packages);
+        manager.publish_installed_packages(
+            Some(&rpm_db_path),
+            Arc::clone(&packages),
+            identity.clone(),
+        );
+        manager.publish_installed_packages(Some(&rpm_db_path), packages, identity);
 
         let cached = manager
-            .cached_installed_packages()
+            .cached_installed_packages(&rpm_db_path)
             .expect("populated cache");
         assert_eq!(cached.len(), 2);
         let mut identities: Vec<_> = cached
@@ -4835,7 +6384,6 @@ mod tests {
                 release: "1.fc44".to_string(),
                 architecture: "x86_64".to_string(),
                 summary: "Kernel".to_string(),
-                reason: InstallReason::User,
             },
             InstalledPackage {
                 name: "kernel-core".to_string(),
@@ -4843,7 +6391,6 @@ mod tests {
                 release: "1.fc44".to_string(),
                 architecture: "x86_64".to_string(),
                 summary: "Kernel".to_string(),
-                reason: InstallReason::User,
             },
             InstalledPackage {
                 name: "kernel-modules".to_string(),
@@ -4851,12 +6398,15 @@ mod tests {
                 release: "1.fc44".to_string(),
                 architecture: "x86_64".to_string(),
                 summary: "Kernel modules".to_string(),
-                reason: InstallReason::Dependency,
             },
         ];
 
         assert_eq!(
-            DnfPackageManager::explicit_package_names(packages),
+            DnfPackageManager::explicit_package_names(
+                &packages,
+                Ok(HashSet::from(["kernel-core".into()])),
+            )
+            .unwrap(),
             vec!["kernel-core"]
         );
     }
@@ -4864,56 +6414,56 @@ mod tests {
     #[test]
     fn installed_cache_publication_replaces_the_previous_snapshot() {
         let directory = write_packages_db(&[]);
-        let mut manager = DnfPackageManager::new();
-        manager.rpm_db_path = directory.path().join("rpmdb.sqlite");
-        let identity = RpmDatabaseObservation::read(&manager.rpm_db_path);
+        let rpm_db_path = directory.path().join("rpmdb.sqlite");
+        let manager = manager_for_database(&rpm_db_path);
+        let identity = RpmDatabaseObservation::read(&rpm_db_path);
         manager.publish_installed_packages(
-            &[InstalledPackage {
+            Some(&rpm_db_path),
+            Arc::new(vec![InstalledPackage {
                 name: "glibc".to_string(),
                 version: "2.41".to_string(),
                 release: "1.fc42.x86_64".to_string(),
                 architecture: "x86_64".to_string(),
                 summary: "C library".to_string(),
-                reason: InstallReason::Dependency,
-            }],
+            }]),
             identity.clone(),
         );
         manager.publish_installed_packages(
-            &[InstalledPackage {
+            Some(&rpm_db_path),
+            Arc::new(vec![InstalledPackage {
                 name: "bash".to_string(),
                 version: "5.2".to_string(),
                 release: "1.fc42".to_string(),
                 architecture: "x86_64".to_string(),
                 summary: "GNU shell".to_string(),
-                reason: InstallReason::User,
-            }],
+            }]),
             identity,
         );
 
         let cached = manager
-            .cached_installed_packages()
+            .cached_installed_packages(&rpm_db_path)
             .expect("populated cache");
         assert_eq!(cached.len(), 1);
         assert_eq!(cached[0].name, "bash");
-        assert_eq!(cached[0].reason, InstallReason::User);
+        assert_eq!(cached[0].summary, "GNU shell");
     }
 
     #[test]
     fn test_parse_rpm_qa_line_reads_installed_package() {
         let pkg = DnfPackageManager::parse_rpm_qa_line(
-            "bash\t5.2.15\t1.fc39\tThe GNU Bourne Again shell\t0\tx86_64",
+            "bash\t5.2.15\t1.fc39\t0\tx86_64\tThe GNU Bourne Again shell\twith completion",
         )
         .expect("valid rpm -qa line");
         assert_eq!(pkg.name, "bash");
         assert_eq!(pkg.version, "5.2.15");
-        assert_eq!(pkg.reason, InstallReason::Dependency);
+        assert_eq!(pkg.architecture, "x86_64");
+        assert_eq!(pkg.summary, "The GNU Bourne Again shell\twith completion");
     }
 
     #[test]
     fn sqlite_string_values_exclude_rpm_terminators() {
-        let package =
-            DnfPackageManager::parse_package_from_blob(&minimal_named_rpm_header(b"bash\0"))
-                .expect("valid RPM name header");
+        let package = DnfPackageManager::parse_package_from_blob(&named_rpm_header("bash"))
+            .expect("valid RPM name header");
         assert_eq!(package.name, "bash");
     }
 
@@ -4927,8 +6477,83 @@ mod tests {
         );
     }
 
-    fn minimal_named_rpm_header(name: &[u8]) -> Vec<u8> {
-        strict_header(&[(1000, 6, 0, 1)], name)
+    #[test]
+    fn rpm_query_rejects_incomplete_installed_identity() {
+        let complete = ["bash", "5.2.15", "1.fc39", "0", "x86_64", "GNU shell"];
+        for field in [0, 1, 2, 4] {
+            for missing in ["", "(none)"] {
+                let mut fields = complete;
+                fields[field] = missing;
+                assert!(
+                    DnfPackageManager::parse_rpm_qa_line(&fields.join("\t")).is_err(),
+                    "incomplete installed RPM identity accepted: {fields:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rpm_sqlite_rejects_incomplete_installed_identity() {
+        let fields = [
+            (rpm_tags::NAME, "bash"),
+            (rpm_tags::VERSION, "5.2.15"),
+            (rpm_tags::RELEASE, "1.fc39"),
+            (rpm_tags::ARCH, "x86_64"),
+        ];
+        for (missing, _) in fields {
+            let header = rpm_string_header(fields.into_iter().filter(|(tag, _)| *tag != missing));
+            let directory = write_packages_db(&[&header]);
+            assert!(
+                DnfPackageManager::read_rpm_sqlite(&directory.path().join("rpmdb.sqlite")).is_err(),
+                "installed RPM identity accepted without tag {missing}"
+            );
+        }
+    }
+
+    #[test]
+    fn rpm_keeps_legacy_architectureless_trust_records() -> Result<()> {
+        let header = rpm_string_header([
+            (rpm_tags::NAME, "gpg-pubkey"),
+            (rpm_tags::VERSION, "3b94a80e"),
+            (rpm_tags::RELEASE, "6665a2fc"),
+        ]);
+        let stored_key = DnfPackageManager::parse_package_from_blob(&header)?;
+        let queried_key = DnfPackageManager::parse_rpm_qa_line(
+            "gpg-pubkey\t3b94a80e\t6665a2fc\t0\t(none)\tOpenPGP key",
+        )?;
+        for key in [stored_key, queried_key] {
+            assert_eq!(key.identity(), "gpg-pubkey");
+            assert_eq!(key.version, "3b94a80e");
+            assert_eq!(key.release, "6665a2fc");
+        }
+        Ok(())
+    }
+
+    fn named_rpm_header(name: &str) -> Vec<u8> {
+        rpm_string_header([
+            (rpm_tags::NAME, name),
+            (rpm_tags::VERSION, "1.0"),
+            (rpm_tags::RELEASE, "1.fc44"),
+            (rpm_tags::ARCH, "noarch"),
+        ])
+    }
+
+    fn rpm_string_header<'a>(fields: impl IntoIterator<Item = (u32, &'a str)>) -> Vec<u8> {
+        let mut entries = Vec::new();
+        let mut data = Vec::new();
+        for (tag, value) in fields {
+            entries.push((tag, 6, i32::try_from(data.len()).unwrap(), 1));
+            data.extend_from_slice(value.as_bytes());
+            data.push(0);
+        }
+        strict_header(&entries, &data)
+    }
+
+    fn manager_for_database(path: &Path) -> DnfPackageManager {
+        DnfPackageManager {
+            rpm_database: RpmDatabaseSource::Fixture(path.to_owned()),
+            ..DnfPackageManager::new()
+        }
     }
 
     fn write_packages_db(blobs: &[&[u8]]) -> tempfile::TempDir {
@@ -4947,6 +6572,76 @@ mod tests {
         dir
     }
 
+    #[tokio::test]
+    async fn installed_lookup_reads_one_package_when_an_unrelated_header_is_unreadable()
+    -> Result<()> {
+        let header = named_rpm_header("omg-indexed-read-fixture");
+        let directory = write_packages_db(&[header.as_slice(), &[0; 32]]);
+        let rpm_db_path = directory.path().join("rpmdb.sqlite");
+        let manager = manager_for_database(&rpm_db_path);
+        let database = Connection::open(&rpm_db_path)?;
+        database.execute_batch(
+            "CREATE TABLE Name (key TEXT NOT NULL, hnum INTEGER NOT NULL, idx INTEGER NOT NULL);
+             CREATE INDEX Name_key_idx ON Name(key);
+             INSERT INTO Name VALUES ('omg-indexed-read-fixture', 1, 0), ('unrelated', 2, 0);",
+        )?;
+        drop(database);
+
+        assert!(manager.is_installed("omg-indexed-read-fixture").await?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn indexed_installed_info_preserves_qualified_and_literal_matches() -> Result<()> {
+        let native = include_bytes!("../../tests/data/fedora-publicsuffix.rpmhdr");
+        let literal = named_rpm_header("publicsuffix-list-dafsa.noarch");
+        let directory = write_packages_db(&[native.as_slice(), &literal]);
+        let rpm_db_path = directory.path().join("rpmdb.sqlite");
+        let manager = manager_for_database(&rpm_db_path);
+        let database = Connection::open(&rpm_db_path)?;
+        database.execute_batch(
+            "CREATE TABLE Name (key TEXT NOT NULL, hnum INTEGER NOT NULL, idx INTEGER NOT NULL);
+             CREATE INDEX Name_key_idx ON Name(key);
+             INSERT INTO Name VALUES
+               ('publicsuffix-list-dafsa', 1, 0), ('publicsuffix-list-dafsa.noarch', 2, 0);",
+        )?;
+        drop(database);
+
+        let exact = DnfPackageManager::parse_package_from_blob(native)?.nevra();
+        let package = manager
+            .info(&exact)
+            .await?
+            .context("missing installed package")?;
+        assert_eq!(package.name, "publicsuffix-list-dafsa.noarch");
+        assert!(package.installed);
+
+        let error = manager
+            .info("publicsuffix-list-dafsa.noarch")
+            .await
+            .expect_err("the literal package name also matches this selector");
+        assert!(error.to_string().contains("multiple installed builds"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn indexed_installed_lookup_falls_back_on_inconsistent_rows() -> Result<()> {
+        let header = named_rpm_header("indexed-fallback-fixture");
+        let directory = write_packages_db(&[&header]);
+        let rpm_db_path = directory.path().join("rpmdb.sqlite");
+        let manager = manager_for_database(&rpm_db_path);
+        let database = Connection::open(&rpm_db_path)?;
+        database.execute_batch(
+            "CREATE TABLE Name (key TEXT NOT NULL, hnum INTEGER NOT NULL, idx INTEGER NOT NULL);
+             CREATE INDEX Name_key_idx ON Name(key);
+             INSERT INTO Name VALUES ('indexed-fallback-fixture', 2, 0);",
+        )?;
+        drop(database);
+
+        assert!(manager.is_installed("indexed-fallback-fixture").await?);
+        assert!(!manager.is_installed("indexed-fallback-absent").await?);
+        Ok(())
+    }
+
     #[test]
     fn test_read_rpm_sqlite_malformed_blob_is_error() {
         let dir = write_packages_db(&[&[0u8; 32]]);
@@ -4961,7 +6656,7 @@ mod tests {
 
     #[test]
     fn test_read_rpm_sqlite_mixed_blobs_do_not_drop_corrupt_row() {
-        let valid = minimal_named_rpm_header(b"bash\0");
+        let valid = named_rpm_header("bash");
         let dir = write_packages_db(&[valid.as_slice(), &[0u8; 32]]);
         let error = DnfPackageManager::read_rpm_sqlite(&dir.path().join("rpmdb.sqlite"))
             .expect_err("one corrupt row must not omit that package from the catalog");
@@ -4974,7 +6669,7 @@ mod tests {
 
     #[test]
     fn malformed_row_reports_position_decoded_count_and_cause() {
-        let valid = minimal_named_rpm_header(b"bash\0");
+        let valid = named_rpm_header("bash");
         let dir = write_packages_db(&[valid.as_slice(), &[0u8; 32]]);
         let error = DnfPackageManager::read_rpm_sqlite(&dir.path().join("rpmdb.sqlite"))
             .expect_err("corrupt row must fail loudly");
@@ -4991,6 +6686,6 @@ mod tests {
 #[test]
 fn ordinary_rpm_inventory_preserves_epoch() {
     let package =
-        DnfPackageManager::parse_rpm_qa_line("example\t1.0\t1.fc44\tsummary\t2\tx86_64").unwrap();
+        DnfPackageManager::parse_rpm_qa_line("example\t1.0\t1.fc44\t2\tx86_64\tsummary").unwrap();
     assert_eq!(package.version, "2:1.0");
 }

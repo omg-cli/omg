@@ -1,10 +1,38 @@
-import { describe, expect, mock, test } from 'bun:test';
+import { afterAll, beforeAll, describe, expect, mock, test } from 'bun:test';
 import { Database } from 'bun:sqlite';
 
 mock.module('cloudflare:workers', () => ({ DurableObject: class {
   constructor(protected ctx: unknown, protected env: unknown) {}
 } }));
 const { default: worker, CacheMintBudget, POLICY, parseSeed } = await import('../src/index');
+
+const originalLengthStream = Object.getOwnPropertyDescriptor(globalThis, 'FixedLengthStream');
+
+beforeAll(() => {
+  class TestFixedLengthStream extends TransformStream<Uint8Array, Uint8Array> {
+    constructor(expectedLength: number) {
+      let received = 0;
+      super({
+        transform(chunk, controller) {
+          received += chunk.byteLength;
+
+          if (received > expectedLength) throw new Error('stream exceeds expected length');
+          controller.enqueue(chunk);
+        },
+        flush() {
+          if (received !== expectedLength) throw new Error('stream ended before expected length');
+        },
+      });
+    }
+  }
+
+  Object.defineProperty(globalThis, 'FixedLengthStream', { configurable: true, value: TestFixedLengthStream });
+});
+
+afterAll(() => {
+  if (originalLengthStream) Object.defineProperty(globalThis, 'FixedLengthStream', originalLengthStream);
+  else Reflect.deleteProperty(globalThis, 'FixedLengthStream');
+});
 const account = 'a'.repeat(32), source = 'b'.repeat(40), digest = 'c'.repeat(64);
 const seed = {
   schemaVersion: 1, recipeDigest: digest, compilerIdentityDigest: digest,
@@ -208,6 +236,15 @@ describe('closed artifact Worker entrypoint', () => {
       else Reflect.deleteProperty(globalThis, 'caches');
     }
   });
+  test('artifact stream refuses a body shorter or longer than the authoritative object size', async () => {
+    const url = `https://artifacts/dependencies/sqlite-v1/x86_64/${digest}/${digest}/${digest}.tar`;
+
+    for (const size of [4, 6]) {
+      const response = await worker.fetch(new Request(url), fixture({ size }).env);
+      expect(response.status).toBe(200);
+      await expect(response.arrayBuffer()).rejects.toThrow('expected length');
+    }
+  });
   test('cache failure or invalid cached metadata falls back to guarded R2 bytes', async () => {
     const previous = Object.getOwnPropertyDescriptor(globalThis, 'caches');
     try {
@@ -257,7 +294,7 @@ describe('closed artifact Worker entrypoint', () => {
       else Reflect.deleteProperty(globalThis, 'caches');
     }
   });
-  test('cache backlog is dropped while a fast client receives all 129 MiB', async () => {
+  test('cache backlog is dropped while a fast client receives all 8 MiB', async () => {
     const previous = Object.getOwnPropertyDescriptor(globalThis, 'caches');
     const pending: Promise<unknown>[] = [];
     let resume: (() => void) | undefined, dropped = false, chunks = 0, cacheBytes = 0;
@@ -278,9 +315,9 @@ describe('closed artifact Worker entrypoint', () => {
       },
     } } });
     const f = fixture();
-    f.env.DEPENDENCIES.get = async () => ({ size: 129 * 1024 * 1024, httpEtag: '"large"',
+    f.env.DEPENDENCIES.get = async () => ({ size: 8 * 1024 * 1024, httpEtag: '"large"',
       body: new ReadableStream({ pull(controller) {
-        if (chunks++ < 129) controller.enqueue(new Uint8Array(1024 * 1024));
+        if (chunks++ < 8) controller.enqueue(new Uint8Array(1024 * 1024));
         else controller.close();
       } }, { highWaterMark: 0 }) });
     try {
@@ -288,12 +325,62 @@ describe('closed artifact Worker entrypoint', () => {
         f.env, { waitUntil(value: Promise<unknown>) { pending.push(value); } });
       const reader = response.body?.getReader(); let bytes = 0;
       for (;;) { const item = await reader?.read(); if (!item || item.done) break; bytes += item.value.byteLength; }
-      expect(bytes).toBe(129 * 1024 * 1024);
+
+      expect(bytes).toBe(8 * 1024 * 1024);
       resume?.(); await Promise.all(pending);
       expect(dropped).toBe(true);
       expect(cacheBytes).toBeLessThanOrEqual(5 * 1024 * 1024);
     } finally {
       resume?.();
+      if (previous) Object.defineProperty(globalThis, 'caches', previous);
+      else Reflect.deleteProperty(globalThis, 'caches');
+    }
+  });
+  test('a large archive uses a single length-checked R2 stream', async () => {
+    const previous = Object.getOwnPropertyDescriptor(globalThis, 'caches');
+    const cachePut = mock(async () => undefined);
+    const pending: Promise<void>[] = [];
+    const size = 43 * 1024 * 1024;
+    const f = fixture();
+
+    f.env.DEPENDENCIES.get = async key => {
+      f.reads.push(key);
+      let remaining = size;
+
+      return { size, httpEtag: '"large"', body: new ReadableStream<Uint8Array>({
+        pull(controller) {
+          if (remaining === 0) {
+            controller.close();
+
+            return;
+          }
+
+          const bytes = Math.min(remaining, 1024 * 1024);
+          remaining -= bytes;
+          controller.enqueue(new Uint8Array(bytes));
+        },
+      }) };
+    };
+
+    Object.defineProperty(globalThis, 'caches', { configurable: true, value: { default: {
+      async match() { return undefined; }, put: cachePut,
+    } } });
+
+    try {
+      const url = `https://artifacts/dependencies/sqlite-v1/x86_64/${digest}/${digest}/${digest}.tar`;
+
+      const response = await worker.fetch(new Request(url), f.env, {
+        waitUntil(promise: Promise<void>) { pending.push(promise); },
+      });
+
+      const received = await response.arrayBuffer();
+      await Promise.all(pending);
+
+      expect(received.byteLength).toBe(size);
+      expect(response.headers.get('x-omg-artifact-cache')).toBe('BYPASS');
+      expect(cachePut).not.toHaveBeenCalled();
+      expect(f.reads).toHaveLength(1);
+    } finally {
       if (previous) Object.defineProperty(globalThis, 'caches', previous);
       else Reflect.deleteProperty(globalThis, 'caches');
     }

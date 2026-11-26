@@ -366,6 +366,10 @@ fn print_fast_counter(
         FastCounter::Orphan => orphans,
         FastCounter::Updates => updates,
     };
+    print_counter_value(value, json);
+}
+
+fn print_counter_value(value: u32, json: bool) {
     if json {
         println!("{}", serde_json::json!({"count": value}));
     } else {
@@ -375,10 +379,10 @@ fn print_fast_counter(
 
 #[cfg(unix)]
 fn fast_status_from_daemon() -> Result<(u32, u32, u32, u32)> {
-    use omg_lib::core::client::SyncDaemonClient;
+    use omg_lib::core::client::{PROMPT_COUNTER_TIMEOUT, SyncDaemonClient};
     use omg_lib::daemon::protocol::{Request, ResponseResult};
 
-    let mut client = SyncDaemonClient::acquire()?;
+    let mut client = SyncDaemonClient::acquire_with_timeout(PROMPT_COUNTER_TIMEOUT)?;
     let ResponseResult::Status(status) = client.call(&Request::Status { id: 0 })? else {
         anyhow::bail!("Unexpected response from daemon");
     };
@@ -403,6 +407,20 @@ async fn run_counter(counter: FastCounter, json: bool) -> Result<()> {
         return Ok(());
     }
     let manager = omg_lib::package_managers::get_package_manager()?;
+    #[cfg(feature = "fedora")]
+    if manager.name() == "dnf" {
+        let count = match counter {
+            FastCounter::Orphan => {
+                Some(omg_lib::package_managers::DnfPackageManager::orphan_count().await?)
+            }
+            FastCounter::Updates => Some(manager.list_updates().await?.len()),
+            FastCounter::Explicit | FastCounter::Total => None,
+        };
+        if let Some(count) = count {
+            print_counter_value(count.try_into()?, json);
+            return Ok(());
+        }
+    }
     let (total, explicit, orphans, updates) = manager.get_status(false).await?;
     print_fast_counter(
         counter,
@@ -433,6 +451,18 @@ fn try_print_counter(counter: FastCounter, json: bool) -> Result<bool> {
             json,
         );
         return Ok(true);
+    }
+
+    #[cfg(feature = "fedora")]
+    if selected_backend == omg_lib::package_managers::Backend::Fedora {
+        if counter == FastCounter::Total {
+            let total = omg_lib::package_managers::DnfPackageManager::new().installed_count()?;
+            print_counter_value(total.try_into()?, json);
+            return Ok(true);
+        }
+        // DNF reasons and repository metadata can change independently of
+        // RPM. Query only the selected count on the dispatched path.
+        return Ok(false);
     }
 
     if let Some(status) = omg_lib::core::fast_status::FastStatus::read_default() {
@@ -485,7 +515,7 @@ fn try_print_counter(counter: FastCounter, json: bool) -> Result<bool> {
         return Ok(true);
     }
 
-    #[cfg(not(any(feature = "arch", target_os = "macos")))]
+    #[cfg(not(any(feature = "arch", feature = "fedora", target_os = "macos")))]
     let _ = selected_backend;
 
     // A cache/daemon miss must reach the selected backend through the normal
@@ -499,11 +529,16 @@ fn try_fast_explicit_count(args: &[String]) -> bool {
         return false;
     }
 
-    if args.len() == 3 && args[1] == "explicit" && matches!(args[2].as_str(), "--count" | "-c") {
-        if omg_lib::package_managers::resolve_backend().is_err() {
+    if args.len() == 3
+        && args[1] == "explicit"
+        && matches!(args[2].as_str(), "--count" | "-c")
+        && let Ok(backend) = omg_lib::package_managers::resolve_backend()
+    {
+        #[cfg(feature = "fedora")]
+        if backend == omg_lib::package_managers::Backend::Fedora {
             return false;
         }
-        if omg_lib::core::paths::test_mode() {
+        if backend == omg_lib::package_managers::Backend::Mock {
             return packages::explicit_sync(true).is_ok();
         }
         if let Some(count) = omg_lib::core::fast_status::FastStatus::read_explicit_count() {
@@ -591,15 +626,12 @@ fn try_fast_search(args: &[String]) -> bool {
 }
 
 /// Ultra-fast path for simple info
-fn try_fast_info(args: &[String]) -> bool {
+fn try_fast_info(args: &[String]) -> Option<bool> {
     if has_help_flag(args) || has_json_flag(args) {
-        return false;
+        return None;
     }
 
-    let Some(package) = info_package_from_fast_args(args) else {
-        return false;
-    };
-    matches!(packages::info_sync(package), Ok(true))
+    packages::info_sync(info_package_from_fast_args(args)?).ok()
 }
 
 /// `omg info fd` plus global quiet/verbose flags in any order.
@@ -771,10 +803,22 @@ fn try_fast_hooks(args: &[String]) -> bool {
 }
 
 fn try_fast_paths(args: &[String]) -> Result<bool> {
+    #[cfg(all(unix, feature = "fedora"))]
+    if args.len() == 2
+        && args[1] == "status"
+        && matches!(
+            omg_lib::package_managers::resolve_backend(),
+            Ok(omg_lib::package_managers::Backend::Fedora)
+        )
+    {
+        // Fedora status owns the daemon request and direct fallback.
+        commands::status_sync()?;
+        return Ok(true);
+    }
+
     if try_fast_counter(args)?
         || try_fast_explicit_count(args)
         || try_fast_search(args)
-        || try_fast_info(args)
         || try_fast_which(args)
         || try_fast_list(args)?
         || try_fast_status(args)
@@ -937,11 +981,16 @@ fn main() {
         Err(error) => finish(Err(error)),
     }
 
+    let info_fast_result = try_fast_info(&args);
+    if info_fast_result == Some(true) {
+        finish(Ok(()));
+    }
+
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build();
     let result = match runtime {
-        Ok(runtime) => runtime.block_on(async_main(args)),
+        Ok(runtime) => runtime.block_on(async_main(args, info_fast_result == Some(false))),
         Err(error) => Err(anyhow::Error::new(error).context("Failed to initialize async runtime")),
     };
 
@@ -987,7 +1036,7 @@ fn complete_audit(operation: Result<()>, audit: Result<()>) -> Result<()> {
     }
 }
 
-async fn async_main(args: Vec<String>) -> Result<()> {
+async fn async_main(args: Vec<String>, info_fast_missed: bool) -> Result<()> {
     // Record startup time for telemetry
     omg_lib::core::telemetry::record_startup_time();
 
@@ -1064,7 +1113,7 @@ async fn async_main(args: Vec<String>) -> Result<()> {
 
     let ctx = omg_lib::cli::CliContext { json: cli.json };
 
-    let result = dispatch_command(&cli.command, &ctx).await;
+    let result = dispatch_command(&cli.command, &ctx, info_fast_missed).await;
     finish_command_telemetry(cmd_start, command_name(&cli.command), result.is_ok()).await;
     if let Some(task) = telemetry_ping {
         match task.await {
@@ -1084,13 +1133,9 @@ fn command_requires_root(command: &Commands) -> bool {
             omg_lib::core::env::distro::Distro::Fedora,
         );
     match command {
-        Commands::Sync => true,
-        // DNF5 --store resolves the complete plan without executing it, but
-        // requires root even for a preview. Keep invalid recursion on its
-        // existing unprivileged refusal path before any native plan is made.
-        Commands::Remove {
-            recursive: false, ..
-        } => native_fedora,
+        // DNF refreshes the caller's cache before requesting elevation for
+        // the system cache. Re-executing the whole command skips that refresh.
+        Commands::Sync => !native_fedora,
         Commands::Clean {
             orphans,
             cache,
@@ -1130,6 +1175,14 @@ const fn command_uses_package_backend(command: &Commands) -> bool {
 fn validate_package_security(command: &Commands) -> Result<()> {
     match command {
         Commands::Install { packages, .. } => {
+            #[cfg(feature = "fedora")]
+            if omg_lib::package_managers::resolve_backend()?
+                == omg_lib::package_managers::Backend::Fedora
+            {
+                return omg_lib::package_managers::DnfPackageManager::validate_install_selectors(
+                    packages,
+                );
+            }
             #[cfg(any(feature = "debian", feature = "debian-pure"))]
             if omg_lib::core::env::distro::is_debian_like() {
                 omg_lib::core::security::validate_debian_package_names_or_files(packages)?;
@@ -1140,9 +1193,19 @@ fn validate_package_security(command: &Commands) -> Result<()> {
             omg_lib::core::security::validate_package_names_or_files(packages)?;
         }
         Commands::Remove { packages, .. } => {
+            #[cfg(feature = "fedora")]
+            if omg_lib::package_managers::resolve_backend()?
+                == omg_lib::package_managers::Backend::Fedora
+            {
+                return omg_lib::package_managers::DnfPackageManager::validate_package_selectors(
+                    packages,
+                );
+            }
             omg_lib::core::security::validate_package_names(packages)?;
         }
-        Commands::Info { package } => {
+        Commands::Info { package }
+        | Commands::Why { package, .. }
+        | Commands::Blame { package } => {
             #[cfg(feature = "fedora")]
             if omg_lib::package_managers::resolve_backend()?
                 == omg_lib::package_managers::Backend::Fedora
@@ -1152,9 +1215,6 @@ fn validate_package_security(command: &Commands) -> Result<()> {
                 omg_lib::core::security::validate_package_name(package)?;
             }
             #[cfg(not(feature = "fedora"))]
-            omg_lib::core::security::validate_package_name(package)?;
-        }
-        Commands::Why { package, .. } | Commands::Blame { package } => {
             omg_lib::core::security::validate_package_name(package)?;
         }
         _ => {}
@@ -1568,7 +1628,11 @@ const fn command_supports_json(command: &Commands) -> bool {
 
 /// Main command dispatcher - routes commands to appropriate handlers
 #[expect(clippy::too_many_lines)]
-async fn dispatch_command(command: &Commands, ctx: &omg_lib::cli::CliContext) -> Result<()> {
+async fn dispatch_command(
+    command: &Commands,
+    ctx: &omg_lib::cli::CliContext,
+    info_fast_missed: bool,
+) -> Result<()> {
     // Global --json contract: reject unsupported combinations explicitly instead
     // of silently emitting human-readable output.
     if ctx.json && !command_supports_json(command) {
@@ -1647,6 +1711,9 @@ async fn dispatch_command(command: &Commands, ctx: &omg_lib::cli::CliContext) ->
             }
             handle_update_command(*check, *yes, *dry_run, *no_sync, *aur_only, *fast, *turbo)
                 .await?;
+        }
+        Commands::Info { package } if info_fast_missed => {
+            packages::info_after_fast_miss(package).await?;
         }
         Commands::Info { package } => packages::info_with_json(package, ctx.json).await?,
         Commands::Clean {
@@ -2636,25 +2703,15 @@ mod tests {
     }
 
     #[test]
-    fn native_fedora_removal_preview_requires_root_before_dispatch() {
+    fn removal_preview_reaches_backend_before_elevation() {
         let cli = Cli::try_parse_from(["omg", "remove", "--dry-run", "jq"]).unwrap();
-        let native_fedora = cfg!(feature = "fedora")
-            && matches!(
-                omg_lib::core::env::distro::detect_distro(),
-                omg_lib::core::env::distro::Distro::Fedora
-            );
-        assert_eq!(command_requires_root(&cli.command), native_fedora);
+        assert!(!command_requires_root(&cli.command));
     }
 
     #[test]
-    fn native_fedora_removal_confirmation_requires_root_before_dispatch() {
+    fn removal_dispatch_retains_the_callers_history_context() {
         let cli = Cli::try_parse_from(["omg", "remove", "jq"]).unwrap();
-        let native_fedora = cfg!(feature = "fedora")
-            && matches!(
-                omg_lib::core::env::distro::detect_distro(),
-                omg_lib::core::env::distro::Distro::Fedora
-            );
-        assert_eq!(command_requires_root(&cli.command), native_fedora);
+        assert!(!command_requires_root(&cli.command));
     }
 
     #[tokio::test]
@@ -2706,6 +2763,15 @@ mod tests {
             if packages == &["jq"])
         );
         validate_package_security(&cli.command).unwrap();
+        #[cfg(feature = "fedora")]
+        if omg_lib::package_managers::resolve_backend()
+            .is_ok_and(|backend| backend == omg_lib::package_managers::Backend::Fedora)
+        {
+            let exact =
+                Cli::try_parse_from(["omg", "remove", "--dry-run", "jq-0:1.8-1.fc44.x86_64"])
+                    .unwrap();
+            validate_package_security(&exact.command).unwrap();
+        }
         let invalid = Cli::try_parse_from(["omg", "remove", "--dry-run", "--", "jq;id"]).unwrap();
         assert!(validate_package_security(&invalid.command).is_err());
         for args in [["omg", "search", "jq"], ["omg", "info", "jq"]] {
@@ -2728,7 +2794,7 @@ mod tests {
     }
 
     #[test]
-    fn clean_elevation_uses_native_fedora_or_root_dispatch() {
+    fn cleanup_and_sync_elevation_use_the_selected_backend() {
         let aur_only = Commands::Clean {
             orphans: false,
             cache: false,
@@ -2752,6 +2818,6 @@ mod tests {
                 omg_lib::core::env::distro::Distro::Fedora,
             );
         assert_eq!(command_requires_root(&cache), !native_fedora);
-        assert!(command_requires_root(&Commands::Sync));
+        assert_eq!(command_requires_root(&Commands::Sync), !native_fedora);
     }
 }

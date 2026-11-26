@@ -12,7 +12,7 @@ use anyhow::{Context, Result, anyhow};
 use crate::core::is_root;
 use crate::core::{Package, PackageSource};
 use crate::package_managers::types::{
-    LocalPackage, PackageInfo, SyncPackage, parse_version_or_zero,
+    LocalPackage, PackageInfo, PackageStatus, SyncPackage, parse_version_or_zero,
 };
 
 // Import rust-apt for full package management
@@ -237,6 +237,17 @@ impl crate::package_managers::PackageManager for AptPackageManager {
         &self,
         fast: bool,
     ) -> Pin<Box<dyn Future<Output = Result<(usize, usize, usize, usize)>> + Send + '_>> {
+        Box::pin(async move {
+            self.get_status_details(fast)
+                .await
+                .map(PackageStatus::into_counts)
+        })
+    }
+
+    fn get_status_details(
+        &self,
+        fast: bool,
+    ) -> Pin<Box<dyn Future<Output = Result<PackageStatus>> + Send + '_>> {
         Box::pin(async move {
             let fast_counts = tokio::task::spawn_blocking(super::debian_db::get_counts_fast)
                 .await

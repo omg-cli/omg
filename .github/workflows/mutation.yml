@@ -100,7 +100,7 @@ jobs:
 
       - name: Validate portable mutation baseline
         if: github.event_name == 'pull_request' || inputs.baseline-only == true
-        run: cargo test --package omg --no-default-features --features pgp,license --locked --no-fail-fast
+        run: cargo test --package omg --no-default-features --features pgp,license --locked --no-fail-fast --profile ci
 
       - name: Install cargo-mutants
         if: github.event_name != 'pull_request' && inputs.baseline-only != true

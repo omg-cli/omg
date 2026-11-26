@@ -184,6 +184,10 @@ fn validate_install_targets(packages: &[String]) -> Result<()> {
         crate::core::env::distro::Distro::Arch => {
             crate::core::security::validate_package_names_or_files(packages)?;
         }
+        #[cfg(feature = "fedora")]
+        crate::core::env::distro::Distro::Fedora => {
+            crate::package_managers::DnfPackageManager::validate_install_selectors(packages)?;
+        }
         _ => {
             crate::core::security::validate_package_names(packages)?;
         }
@@ -193,6 +197,16 @@ fn validate_install_targets(packages: &[String]) -> Result<()> {
 }
 
 async fn install_dry_run(packages: &[String]) -> Result<()> {
+    #[cfg(feature = "fedora")]
+    if crate::package_managers::resolve_backend()? == crate::package_managers::Backend::Fedora {
+        let (plan, diagnostics) =
+            crate::package_managers::DnfPackageManager::preview_install(packages).await?;
+        crate::cli::modern_ui::print_phase_header("📋", "Install Preview", "dry run");
+        super::common::print_dnf_preview(&plan, &diagnostics);
+        crate::cli::ui::print_dry_run_footer();
+        return Ok(());
+    }
+
     #[cfg(feature = "arch")]
     if super::mock_arch_backend()? {
         return arch::install_dry_run(packages).await;
