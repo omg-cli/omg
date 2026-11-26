@@ -26,6 +26,7 @@ const DOTNET_RELEASE_INDEX_URL: &str =
 
 /// Support phases OMG installs from; `eol` channels are never listed.
 const SUPPORTED_PHASES: &[&str] = &["active", "maintenance", "preview", "rc", "go-live"];
+const MAX_CONCURRENT_CHANNEL_FETCHES: usize = 4;
 
 /// .NET SDK version info.
 #[derive(Debug, Clone)]
@@ -69,31 +70,36 @@ impl DotnetManager {
 
     /// List available SDK versions across supported channels (newest first).
     pub async fn list_available(&self) -> Result<Vec<DotnetVersion>> {
-        let index = self.fetch_metadata(DOTNET_RELEASE_INDEX_URL).await?;
+        self.list_available_from(DOTNET_RELEASE_INDEX_URL).await
+    }
+
+    async fn list_available_from(&self, index_url: &str) -> Result<Vec<DotnetVersion>> {
+        use futures::StreamExt as _;
+
+        let index = self.fetch_metadata(index_url).await?;
         let Some(channels) = index
             .get("releases-index")
             .and_then(serde_json::Value::as_array)
         else {
             anyhow::bail!("Unexpected .NET release index shape from {DOTNET_RELEASE_INDEX_URL}");
         };
-        let mut versions = Vec::new();
-        for channel in channels {
-            let phase = channel
-                .get("support-phase")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("");
+        let supported = channels.iter().filter_map(|channel| {
+            let phase = channel.get("support-phase")?.as_str()?;
             if !SUPPORTED_PHASES.contains(&phase) {
-                continue;
+                return None;
             }
-            let Some(channel_url) = channel
-                .get("releases.json")
-                .and_then(serde_json::Value::as_str)
-            else {
-                continue;
-            };
+            let url = channel.get("releases.json")?.as_str()?;
             let prerelease = matches!(phase, "preview" | "rc" | "go-live");
-            let releases = self.fetch_metadata(channel_url).await?;
-            versions.extend(parse_channel_sdks(&releases, prerelease));
+            Some((url, prerelease))
+        });
+        let mut requests = futures::stream::iter(supported.map(|(url, prerelease)| async move {
+            let releases = self.fetch_metadata(url).await?;
+            Ok::<_, anyhow::Error>(parse_channel_sdks(&releases, prerelease))
+        }))
+        .buffered(MAX_CONCURRENT_CHANNEL_FETCHES);
+        let mut versions = Vec::new();
+        while let Some(result) = requests.next().await {
+            versions.extend(result?);
         }
         versions.sort_by(|a, b| super::common::version_cmp(&b.version, &a.version));
         versions.dedup_by(|a, b| a.version == b.version);
@@ -352,11 +358,7 @@ fn select_sdk_file(files: &[serde_json::Value], rid: &str) -> Option<(String, St
 
 /// The extracted tree must expose the `dotnet` host binary at its root.
 fn require_staged_dotnet(binary: &Path) -> Result<()> {
-    if binary.is_file() {
-        Ok(())
-    } else {
-        anyhow::bail!("Installed .NET SDK archive but found no `dotnet` binary inside")
-    }
+    super::common::require_regular_file(binary).context("Invalid .NET SDK archive launcher")
 }
 
 /// Ensure the staged host binary is executable (tarballs may drop modes).
@@ -549,6 +551,119 @@ mod tests {
                 "sdk": installed_sdk, "runtime": "9.0.19", "aspnetcore-runtime": "9.0.18"
             })
         );
+        Ok(())
+    }
+
+    #[test]
+    #[expect(unsafe_code)] // The isolated child sets its own fixture environment.
+    fn channel_listing_overlaps_requests_and_keeps_index_order() -> Result<()> {
+        const NAME: &str =
+            "runtimes::dotnet::tests::channel_listing_overlaps_requests_and_keeps_index_order";
+        if crate::core::testing::run_isolated_test(NAME) {
+            return Ok(());
+        }
+        // SAFETY: this fresh process has not started its runtime or another test.
+        unsafe {
+            std::env::set_var("OMG_TEST_MODE", "1");
+        }
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(async {
+                use std::sync::Arc;
+                use std::sync::atomic::{AtomicUsize, Ordering};
+                use std::time::Duration;
+                use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+                let origin = format!("http://{}", listener.local_addr()?);
+                let index = format!("{origin}/index.json");
+                let channels: Vec<_> = ["preview", "active", "active", "maintenance",
+                    "rc", "go-live", "active", "active", "eol"]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(number, phase)| {
+                        json!({"support-phase": phase, "releases.json": format!("{origin}/{number}")})
+                    })
+                    .collect();
+                let active = Arc::new(AtomicUsize::new(0));
+                let peak = Arc::new(AtomicUsize::new(0));
+                let first_wave = Arc::new(tokio::sync::Barrier::new(4));
+                let server_peak = Arc::clone(&peak);
+                let serve = async move {
+                    let mut workers = tokio::task::JoinSet::new();
+                    for _ in 0..9 {
+                        let (mut socket, _) = listener.accept().await?;
+                        let active = Arc::clone(&active);
+                        let peak = Arc::clone(&server_peak);
+                        let first_wave = Arc::clone(&first_wave);
+                        let index = json!({"releases-index": channels});
+                        workers.spawn(async move {
+                            let mut request = Vec::new();
+                            while !request.ends_with(b"\r\n\r\n") {
+                                anyhow::ensure!(request.len() < 8192, "oversized fixture request");
+                                request.push(socket.read_u8().await?);
+                            }
+                            let request = std::str::from_utf8(&request)?;
+                            let path = request.split_ascii_whitespace().nth(1).context("request path")?;
+                            let body = if path == "/index.json" {
+                                index
+                            } else {
+                                let id: usize = path.trim_start_matches('/').parse()?;
+                                assert!(id < 8, "EOL channel must never be requested");
+                                let concurrent = active.fetch_add(1, Ordering::SeqCst) + 1;
+                                peak.fetch_max(concurrent, Ordering::SeqCst);
+                                if id < 4 {
+                                    let _ = tokio::time::timeout(Duration::from_millis(500), first_wave.wait()).await;
+                                }
+                                if id == 0 {
+                                    tokio::time::sleep(Duration::from_millis(40)).await;
+                                }
+                                active.fetch_sub(1, Ordering::SeqCst);
+                                let version = if id < 2 { "20.0.100".to_owned() } else { format!("20.0.{id}") };
+                                json!({"releases": [{"sdk": {"version": version}}]})
+                            };
+                            let body = body.to_string();
+                            socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await?;
+                            Ok::<_, anyhow::Error>(path.to_owned())
+                        });
+                    }
+                    let mut requested = Vec::new();
+                    while let Some(result) = workers.join_next().await {
+                        requested.push(result??);
+                    }
+                    requested.sort_unstable();
+                    Ok::<_, anyhow::Error>(requested)
+                };
+                let manager = DotnetManager::new();
+                let (versions, requested) = tokio::time::timeout(Duration::from_secs(8), async {
+                    tokio::try_join!(manager.list_available_from(&index), serve)
+                })
+                .await??;
+                assert_eq!(requested, ["/0", "/1", "/2", "/3", "/4", "/5", "/6", "/7", "/index.json"]);
+                assert_eq!(versions.len(), 7);
+                assert_eq!(versions[0].version, "20.0.100");
+                assert!(versions[0].prerelease, "the first occurrence keeps its flag");
+                assert_eq!(peak.load(Ordering::SeqCst), 4, "supported channel reads should overlap up to the bound");
+                Ok(())
+            })
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staging_requires_a_regular_dotnet_launcher() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let binary = fixture.path().join("dotnet");
+        let adjacent = fixture.path().join("sdk-tool");
+        fs::write(&adjacent, b"ordinary fixture")?;
+        std::os::unix::fs::symlink(&adjacent, &binary)?;
+        assert!(
+            require_staged_dotnet(&binary).is_err(),
+            "staging must require the same regular launcher as activation"
+        );
+        fs::remove_file(&binary)?;
+        fs::write(&binary, b"regular launcher")?;
+        require_staged_dotnet(&binary)?;
         Ok(())
     }
 
