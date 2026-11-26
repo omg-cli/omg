@@ -1191,7 +1191,15 @@ fn install_managed_blocking(
                 .as_ref()
                 .map_or(Ok(()), |admission| admission.verify(&install_dir))
         })
-        .and_then(|()| link_binaries(&install_dir, bin_dir, is_venv));
+        .and_then(|()| {
+            let linked = link_binaries(&install_dir, bin_dir, is_venv)?;
+            anyhow::ensure!(
+                linked > 0,
+                "No executable tool commands could be linked to {}",
+                bin_dir.display()
+            );
+            Ok(())
+        });
     if let Err(error) = activation {
         let failed_dir = tools_dir.join(manager).join(format!(
             ".{install_name}.failed-{}",
@@ -1210,7 +1218,12 @@ fn install_managed_blocking(
             cleanup_broken_managed_links(bin_dir, &install_dir)?;
         }
         let _ = fs::remove_dir_all(&failed_dir);
-        return Err(error).context("Failed to activate managed tool; previous version restored");
+        let outcome = if backup_dir.is_some() {
+            "Failed to activate managed tool. Previous version restored"
+        } else {
+            "Failed to activate managed tool. No installation published"
+        };
+        return Err(error).context(outcome);
     }
     cleanup_broken_managed_links(bin_dir, &install_dir)?;
     if let Some(backup) = backup_dir
@@ -1269,7 +1282,7 @@ fn cleanup_broken_managed_links(bin_dir: &Path, install_dir: &Path) -> Result<()
     Ok(())
 }
 
-fn link_binaries(install_dir: &Path, bin_dir: &Path, skip_venv_base_tools: bool) -> Result<()> {
+fn link_binaries(install_dir: &Path, bin_dir: &Path, skip_venv_base_tools: bool) -> Result<usize> {
     println!("  {} Linking binaries...", style::dim("→"));
 
     // Find binaries in standard locations within the isolated install dir
@@ -1347,10 +1360,7 @@ fn link_binaries(install_dir: &Path, bin_dir: &Path, skip_venv_base_tools: bool)
         }
     }
 
-    if linked == 0 {
-        println!("  {} No binaries found to link!", style::warning("⚠"));
-        // Heuristic failed?
-    } else {
+    if linked > 0 {
         println!(
             "  {} {} binaries available in {}",
             style::success("✓"),
@@ -1358,8 +1368,7 @@ fn link_binaries(install_dir: &Path, bin_dir: &Path, skip_venv_base_tools: bool)
             style::info(&bin_dir.to_string_lossy())
         );
     }
-
-    Ok(())
+    Ok(linked)
 }
 
 pub fn list() -> Result<()> {
@@ -3153,6 +3162,154 @@ exit 1
 
     /// Tool installs may only swap their own package's links. Other packages,
     /// foreign symlinks and plain files must survive an install.
+    #[cfg(unix)]
+    #[test]
+    fn npm_tool_activation_requires_an_available_executable() -> Result<()> {
+        if crate::core::testing::run_isolated_test(
+            "cli::tool::tests::npm_tool_activation_requires_an_available_executable",
+        ) {
+            return Ok(());
+        }
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let launcher = b"#!/bin/sh\nprintf verified\n";
+        let mut mismatches = Vec::new();
+        for previous in [false, true] {
+            for conflict in ["file", "directory", "link", "dangling-link"] {
+                for (mode, succeeds) in [
+                    ("no-executable", false),
+                    ("non-executable", false),
+                    ("one-blocked", false),
+                    ("one-free", true),
+                ] {
+                    let case = format!("{previous}/{conflict}/{mode}");
+                    let owner = tempfile::tempdir()?;
+                    let tools = owner.path().join("tools");
+                    let bin = owner.path().join("bin");
+                    fs::create_dir(&bin)?;
+                    let foreign = owner.path().join("foreign");
+                    let occupied = bin.join("fixture-tool");
+                    match conflict {
+                        "file" => fs::write(&occupied, b"foreign file")?,
+                        "directory" => fs::create_dir(&occupied)?,
+                        "link" => {
+                            fs::write(&foreign, b"foreign target")?;
+                            symlink(&foreign, &occupied)?;
+                        }
+                        "dangling-link" => symlink(&foreign, &occupied)?,
+                        _ => unreachable!(),
+                    }
+                    let install = tools.join("npm/fixture-tool");
+                    let old = install.join("bin/old-command");
+                    if previous {
+                        fs::create_dir_all(old.parent().expect("old launcher directory"))?;
+                        fs::write(&old, launcher)?;
+                        fs::set_permissions(&old, fs::Permissions::from_mode(0o755))?;
+                        symlink(&old, bin.join("old-command"))?;
+                    }
+                    let npm = owner.path().join("npm");
+                    let contents = format!(
+                        r#"#!/bin/sh
+set -eu
+case "$1" in
+  install) cp "$(dirname "$0")/lock.fixture.json" "$3/package-lock.json" ;;
+  ci)
+    mkdir -p "$3/node_modules/fixture-tool" "$3/node_modules/.bin"
+    printf '%s' '{{"name":"fixture-tool","version":"1.0.0"}}' > "$3/node_modules/fixture-tool/package.json"
+    launchers="$3/node_modules/.bin"
+    case '{mode}' in
+      non-executable) printf 'not executable\n' > "$launchers/fixture-tool" ;;
+      one-blocked|one-free)
+        printf '#!/bin/sh\nprintf verified\n' > "$launchers/fixture-tool"
+        chmod 755 "$launchers/fixture-tool"
+        if [ '{mode}' = one-free ]; then
+          cp "$launchers/fixture-tool" "$launchers/fresh-command"
+        fi
+        ;;
+    esac
+    ;;
+  audit) printf signed > "$(dirname "$0")/signatures-checked" ;;
+  *) exit 1 ;;
+esac
+"#
+                    );
+                    fs::write(&npm, contents)?;
+                    fs::set_permissions(&npm, fs::Permissions::from_mode(0o755))?;
+                    prepare_managed_npm_fixture(&tools, &npm);
+                    with_managed_fixture_environment(TOOL_SYSTEM_PATH.as_ref(), || {
+                        let result = runtime.block_on(install_managed_fixture(
+                            "npm",
+                            "fixture-tool",
+                            "fixture-tool",
+                            &tools,
+                            &bin,
+                        ));
+                        let private_names: Vec<_> = fs::read_dir(tools.join("npm"))
+                            .expect("fixture manager created the installation directory")
+                            .map(|entry| entry.expect("fixture manager entry"))
+                            .filter(|entry| entry.file_name().to_string_lossy().starts_with('.'))
+                            .collect();
+                        let namespace_preserved = private_names.is_empty()
+                            && match conflict {
+                                "file" => fs::read(&occupied).is_ok_and(|b| b == b"foreign file"),
+                                "directory" => occupied.is_dir(),
+                                "link" | "dangling-link" => {
+                                    fs::read_link(&occupied).is_ok_and(|p| p == foreign)
+                                }
+                                _ => unreachable!(),
+                            };
+                        let previous_command = bin.join("old-command");
+                        let new_command = bin.join("fresh-command");
+                        let expected_state = if succeeds {
+                            install.join(".omg-npm-advisory-review.json").is_file()
+                                && fs::read(new_command).is_ok_and(|b| b == launcher)
+                                && previous_command.symlink_metadata().is_err()
+                        } else {
+                            let unpublished =
+                                !install.join(".omg-npm-advisory-review.json").exists()
+                                    && new_command.symlink_metadata().is_err();
+                            unpublished
+                                && if previous {
+                                    fs::read(&previous_command).is_ok_and(|b| b == launcher)
+                                } else {
+                                    !install.exists()
+                                }
+                        };
+                        let signed = fs::read(owner.path().join("signatures-checked"))
+                            .is_ok_and(|bytes| bytes == b"signed");
+                        let expected_result = match &result {
+                            Ok(()) => succeeds,
+                            Err(error) => {
+                                let diagnostic = format!("{error:#}");
+                                !succeeds
+                                    && diagnostic
+                                        .contains("No executable tool commands could be linked")
+                                    && diagnostic.contains(if previous {
+                                        "Previous version restored"
+                                    } else {
+                                        "No installation published"
+                                    })
+                            }
+                        };
+                        if !expected_result || !expected_state || !namespace_preserved || !signed {
+                            mismatches.push(format!("{case}: {result:?}, expected state={expected_state}, foreign entries and scratch preserved={namespace_preserved}, signatures checked={signed}"));
+                        }
+                    });
+                }
+            }
+        }
+        assert!(
+            mismatches.is_empty(),
+            "{}/32 failed:\n{}",
+            mismatches.len(),
+            mismatches.join("\n")
+        );
+        Ok(())
+    }
+
     #[cfg(unix)]
     #[test]
     fn linking_never_replaces_commands_omg_does_not_manage() {
