@@ -50,7 +50,9 @@ class NativePhaseMatrixTests(unittest.TestCase):
         proof = job_block(self.workflow, "linux-clippy")
         arch = job_block(self.workflow, "linux-arch")
         self.assertIn("    needs: [quick-gate, linux-matrix, linux-arch]\n", proof)
-        self.assertIn('    name: "Linux (arch)"\n', arch)
+        expected_name = '    name: "Linux (${{ matrix.platform }})"\n'
+        self.assertIn(expected_name, self.job)
+        self.assertIn(expected_name, arch)
         self.assertIn("        platform: [arch]\n", arch)
         for key in ("env", "container", "steps"):
             self.assertIn(f"    {key}: &native-linux-{key}\n", self.job)

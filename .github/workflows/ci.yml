@@ -1454,7 +1454,7 @@ jobs:
 
   # Give the sandbox consumer an explicit dependency on its sole producer.
   linux-arch:
-    name: "Linux (arch)"
+    name: "Linux (${{ matrix.platform }})"
     needs: quick-gate
     if: needs.quick-gate.outputs.should-build == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group'
     runs-on: ubuntu-24.04
