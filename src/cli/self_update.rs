@@ -24,6 +24,7 @@ const MAX_CHECKSUM_BYTES: usize = 1024;
 
 /// Repository used to verify Sigstore build-provenance attestations.
 const ATTESTATION_REPO: &str = "omg-cli/omg";
+const ATTESTATION_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(1);
 
 fn attestation_repository(tag: &str) -> Result<&'static str> {
     let version = Version::parse(tag.strip_prefix('v').context("Invalid release tag")?)?;
@@ -1007,20 +1008,28 @@ fn trusted_attestation_helper(path: &std::path::Path) -> Option<std::path::PathB
 }
 
 fn verify_attestation(archive_path: &std::path::Path, tag: &str) -> Result<bool> {
-    verify_attestation_with_candidates(archive_path, tag, GH_CANDIDATES)
+    let archive_path = archive_path.to_path_buf();
+    let tag = tag.to_owned();
+    crate::cli::tea::async_bridge::run_blocking_future(async move {
+        verify_attestation_with_candidates(&archive_path, &tag, GH_CANDIDATES, ATTESTATION_TIMEOUT)
+            .await
+    })?
 }
 
-fn verify_attestation_with_candidates(
+async fn verify_attestation_with_candidates(
     archive_path: &std::path::Path,
     tag: &str,
     candidates: &[&str],
+    deadline: std::time::Duration,
 ) -> Result<bool> {
+    use std::process::Stdio;
+
     let repository = attestation_repository(tag)?;
     let signer_workflow = format!("{repository}/.github/workflows/release.yml");
     let Some(gh) = locate_gh(candidates) else {
         return Ok(false);
     };
-    let output = std::process::Command::new(gh)
+    let mut child = tokio::process::Command::new(gh)
         .args(["attestation", "verify"])
         .arg(archive_path)
         .args([
@@ -1031,16 +1040,25 @@ fn verify_attestation_with_candidates(
             "--signer-workflow",
             &signer_workflow,
         ])
-        .stdin(std::process::Stdio::null())
-        .output();
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .context("Failed to execute GitHub CLI attestation check")?;
 
-    let output = match output {
-        Ok(output) => output,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(error).context("Failed to execute GitHub CLI attestation check"),
+    let Ok(status) = tokio::time::timeout(deadline, child.wait()).await else {
+        let timeout = || format!("GitHub CLI attestation check timed out after {deadline:?}");
+        tokio::time::timeout(std::time::Duration::from_secs(2), child.kill())
+            .await
+            .context("Timed out waiting for the attestation verifier to exit")
+            .and_then(|result| result.context("Failed to stop the attestation verifier"))
+            .with_context(timeout)?;
+        anyhow::bail!(timeout());
     };
+    let status = status.context("Failed to collect GitHub CLI attestation result")?;
 
-    if output.status.success() {
+    if status.success() {
         println!(
             "  {} build provenance verified",
             style::maybe_color("🔒", |t| t.green().to_string())
@@ -2216,6 +2234,10 @@ mod tests {
         let archive = fixture.path().join("archive.tar.gz");
         fs::write(&archive, b"unverified archive").expect("archive fixture");
         let absent = fixture.path().join("no-trusted-gh");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("attestation test runtime");
         temp_env::with_vars(
             [
                 ("PATH", Some(fixture.path().to_str().expect("fixture path"))),
@@ -2225,25 +2247,95 @@ mod tests {
                 ),
             ],
             || {
-                let verified = verify_attestation_with_candidates(
-                    &archive,
-                    "v0.0.0-test",
-                    &[absent.to_str().expect("candidate path")],
-                )
-                .expect("impostor must not error");
+                let verified = runtime
+                    .block_on(verify_attestation_with_candidates(
+                        &archive,
+                        "v0.0.0-test",
+                        &[absent.to_str().expect("candidate path")],
+                        ATTESTATION_TIMEOUT,
+                    ))
+                    .expect("impostor must not error");
                 assert!(!verified, "PATH impostor must not approve the archive");
                 assert!(!marker.exists(), "PATH impostor must never run");
 
-                let verified = verify_attestation_with_candidates(
-                    &archive,
-                    "v0.0.0-test",
-                    &[impostor.to_str().expect("trusted candidate path")],
-                )
-                .expect("trusted fixture must execute");
+                let verified = runtime
+                    .block_on(verify_attestation_with_candidates(
+                        &archive,
+                        "v0.0.0-test",
+                        &[impostor.to_str().expect("trusted candidate path")],
+                        ATTESTATION_TIMEOUT,
+                    ))
+                    .expect("trusted fixture must execute");
                 assert!(verified, "explicit trusted fixture must be accepted");
                 assert_eq!(fs::read(&marker).expect("trusted marker"), b"executed");
+
+                fs::write(&impostor, "#!/bin/sh\nexit 1\n").expect("rejecting verifier fixture");
+                let error = runtime
+                    .block_on(verify_attestation_with_candidates(
+                        &archive,
+                        "v0.0.0-test",
+                        &[impostor.to_str().expect("trusted candidate path")],
+                        ATTESTATION_TIMEOUT,
+                    ))
+                    .expect_err("a negative verification must refuse the archive");
+                assert!(
+                    error
+                        .to_string()
+                        .contains("Sigstore attestation verification FAILED")
+                );
+
+                fs::write(
+                    &impostor,
+                    format!(
+                        "#!{}\n",
+                        fixture.path().join("missing-interpreter").display()
+                    ),
+                )
+                .expect("broken executable fixture");
+                let error = runtime
+                    .block_on(verify_attestation_with_candidates(
+                        &archive,
+                        "v0.0.0-test",
+                        &[impostor.to_str().expect("trusted candidate path")],
+                        ATTESTATION_TIMEOUT,
+                    ))
+                    .expect_err("a selected verifier that fails to launch must fail closed");
+                assert!(error.to_string().contains("Failed to execute GitHub CLI"));
             },
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn attestation_timeout_reaps_the_verifier() -> Result<()> {
+        use nix::errno::Errno;
+        use nix::sys::signal::kill;
+        use nix::unistd::Pid;
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::time::Duration;
+
+        let fixture = tempfile::tempdir_in("/var/tmp")?;
+        let verifier = fixture.path().join("gh");
+        let archive = fixture.path().join("archive.tar.gz");
+        fs::write(&archive, b"private archive fixture")?;
+        let verifier_script = "#!/bin/sh\nprintf '%s\\n' \"$$\" > \"$3.pid\"\nexec /bin/sleep 2\n";
+        fs::write(&verifier, verifier_script)?;
+        fs::set_permissions(&verifier, fs::Permissions::from_mode(0o755))?;
+
+        let error = verify_attestation_with_candidates(
+            &archive,
+            "v0.1.227",
+            &[verifier.to_str().context("verifier path is not UTF-8")?],
+            Duration::from_millis(500),
+        )
+        .await
+        .expect_err("a verifier that exceeds its deadline must fail closed");
+        assert!(format!("{error:#}").contains("attestation check timed out"));
+        let pid = fs::read_to_string(archive.with_extension("gz.pid"))?
+            .trim()
+            .parse()?;
+        assert_eq!(kill(Pid::from_raw(pid), None), Err(Errno::ESRCH));
+        Ok(())
     }
 
     #[test]
