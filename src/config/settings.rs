@@ -313,12 +313,8 @@ impl Settings {
     ///
     /// Serde would otherwise silently ignore typos, fabricating a working-looking
     /// config from misspelled settings.
-    fn validate_known_keys(content: &str) -> Result<()> {
-        let table: toml::Table = toml::from_str(content).context("Config is not valid TOML")?;
-        crate::core::security::policy::validate_legacy_security_config(
-            &table,
-            std::path::Path::new("config.toml"),
-        )?;
+    fn validate_known_keys(table: &toml::Table, path: &Path) -> Result<()> {
+        crate::core::security::policy::validate_legacy_security_config(table, path)?;
 
         const ROOT_KEYS: [&str; 2] = ["telemetry_enabled", "aur"];
         const AUR_KEYS: [&str; 17] = [
@@ -526,69 +522,12 @@ impl Settings {
 
     pub fn load() -> Result<Self> {
         let config_path = Self::config_path()?;
-
-        if config_path.exists() {
-            // Security: refuse symlinks and non-files before reading, so a
-            // planted link cannot redirect the config read.
-            let metadata = std::fs::symlink_metadata(&config_path)
-                .with_context(|| format!("Failed to stat config: {}", config_path.display()))?;
-            if metadata.file_type().is_symlink() {
-                anyhow::bail!("Config must not be a symlink: {}", config_path.display());
-            }
-            if !metadata.file_type().is_file() {
-                anyhow::bail!("Config must be a regular file: {}", config_path.display());
-            }
-            // Security: Check file size before reading to prevent DoS
-            if metadata.len() > MAX_CONFIG_SIZE {
-                anyhow::bail!(
-                    "Config file too large: {} bytes (max {} bytes)",
-                    metadata.len(),
-                    MAX_CONFIG_SIZE
-                );
-            }
-
-            let content = std::fs::read_to_string(&config_path)
+        if let Some((bytes, _)) = Self::read_config(&config_path)? {
+            let content = std::str::from_utf8(&bytes)
                 .with_context(|| format!("Failed to read config: {}", config_path.display()))?;
-            Self::validate_known_keys(&content).with_context(|| {
-                format!(
-                    "Invalid config: {} (unknown keys are rejected to catch typos)",
-                    config_path.display()
-                )
-            })?;
-            let settings: Self = toml::from_str(&content)
-                .with_context(|| format!("Failed to parse config: {}", config_path.display()))?;
-
-            // Security: Validate all path fields to prevent path traversal
-            settings.validate_paths()?;
-
-            // Security: Validate TTL bounds
-            if settings.aur.metadata_cache_ttl_secs > MAX_CACHE_TTL_SECS {
-                anyhow::bail!(
-                    "aur.metadata_cache_ttl_secs too large: {} (max {} = 7 days)",
-                    settings.aur.metadata_cache_ttl_secs,
-                    MAX_CACHE_TTL_SECS
-                );
-            }
-            // Security: the `omg config set` CLI validates MAKEFLAGS, but
-            // the file itself is a trust boundary (shared dotfiles,
-            // OMG_CONFIG_DIR). Enforce the same allowlist here so
-            // direct-TOML edits cannot smuggle shell metacharacters into
-            // build commands.
-            // Note: build_concurrency is deliberately NOT range-checked
-            // here. The pinned contract
-            // (tests/coverage_1.rs
-            // `build_concurrency_clamps_configured_zero_to_one`) requires
-            // that a configured 0 loads and clamps to 1 at the consumer,
-            // and every consumer already bounds the value
-            // (`build_concurrency()` floors at 1, update checks clamp
-            // 4..=16, parallel builds clamp 1..=8). Rejecting here would
-            // hard-fail every command on out-of-range files for no gain.
-            if let Some(makeflags) = &settings.aur.makeflags {
-                validate_makeflags(makeflags)?;
-            }
-
-            settings.aur.validate_security_profile()?;
-            Ok(settings.with_runtime_overrides())
+            let table = toml::from_str(content)
+                .with_context(|| format!("Config is not valid TOML: {}", config_path.display()))?;
+            Self::from_config_table(&config_path, table)
         } else {
             if let Some(dir) = std::env::var_os("OMG_CONFIG_DIR").filter(|v| !v.is_empty()) {
                 tracing::warn!(
@@ -599,6 +538,64 @@ impl Settings {
             }
             Ok(Self::default().with_runtime_overrides())
         }
+    }
+
+    pub(crate) fn read_config(path: &Path) -> Result<Option<(Vec<u8>, std::fs::Metadata)>> {
+        match crate::core::safe_ops::read_bounded_regular_bytes(path, "Config", MAX_CONFIG_SIZE) {
+            Ok(snapshot) => Ok(Some(snapshot)),
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|cause| cause.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    pub(crate) fn from_config_table(path: &Path, table: toml::Table) -> Result<Self> {
+        Self::validate_known_keys(&table, path).with_context(|| {
+            format!(
+                "Invalid config: {} (unknown keys are rejected to catch typos)",
+                path.display()
+            )
+        })?;
+        let settings: Self = toml::Value::Table(table)
+            .try_into()
+            .with_context(|| format!("Failed to parse config: {}", path.display()))?;
+
+        // Security: Validate all path fields to prevent path traversal
+        settings.validate_paths()?;
+
+        // Security: Validate TTL bounds
+        if settings.aur.metadata_cache_ttl_secs > MAX_CACHE_TTL_SECS {
+            anyhow::bail!(
+                "aur.metadata_cache_ttl_secs too large: {} (max {} = 7 days)",
+                settings.aur.metadata_cache_ttl_secs,
+                MAX_CACHE_TTL_SECS
+            );
+        }
+        // Security: the `omg config set` CLI validates MAKEFLAGS, but
+        // the file itself is a trust boundary (shared dotfiles,
+        // OMG_CONFIG_DIR). Enforce the same allowlist here so
+        // direct-TOML edits cannot smuggle shell metacharacters into
+        // build commands.
+        // Note: build_concurrency is deliberately NOT range-checked
+        // here. The pinned contract
+        // (tests/coverage_1.rs
+        // `build_concurrency_clamps_configured_zero_to_one`) requires
+        // that a configured 0 loads and clamps to 1 at the consumer,
+        // and every consumer already bounds the value
+        // (`build_concurrency()` floors at 1, update checks clamp
+        // 4..=16, parallel builds clamp 1..=8). Rejecting here would
+        // hard-fail every command on out-of-range files for no gain.
+        if let Some(makeflags) = &settings.aur.makeflags {
+            validate_makeflags(makeflags)?;
+        }
+
+        settings.aur.validate_security_profile()?;
+        Ok(settings.with_runtime_overrides())
     }
 
     fn with_runtime_overrides(mut self) -> Self {
@@ -665,17 +662,22 @@ impl Settings {
         // Merge into the existing document instead of reserializing: a full
         // rewrite destroys user comments and unknown keys. Only managed
         // tables are touched; everything else keeps its text verbatim.
-        let content = match std::fs::read_to_string(&config_path) {
-            Ok(existing) => match existing.parse::<toml_edit::DocumentMut>() {
-                Ok(mut document) => {
-                    self.merge_settings(&mut document)?;
-                    document.to_string()
-                }
-                Err(_) => self.serialize_full()?,
-            },
-            Err(_) => self.serialize_full()?,
+        let document = Self::read_config(&config_path)?
+            .and_then(|(bytes, _)| String::from_utf8(bytes).ok())
+            .and_then(|existing| existing.parse::<toml_edit::DocumentMut>().ok());
+        let content = match document {
+            Some(mut document) => {
+                self.merge_settings(&mut document)?;
+                document.to_string()
+            }
+            None => self.serialize_full()?,
         };
-        crate::core::safe_ops::atomic_write_file_sync(&config_path, content)
+        anyhow::ensure!(
+            content.len() as u64 <= MAX_CONFIG_SIZE,
+            "Config would exceed the {MAX_CONFIG_SIZE} byte limit: {}",
+            config_path.display()
+        );
+        crate::core::safe_ops::atomic_write_file_sync_private(&config_path, content)
             .with_context(|| format!("Failed to write config: {}", config_path.display()))
     }
 

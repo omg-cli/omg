@@ -183,8 +183,25 @@ pub(crate) async fn sync_parent_directory(path: PathBuf) -> Result<()> {
         .context("Parent-directory sync task failed")?
 }
 
-/// Read a bounded snapshot from a regular file opened without following the final link.
+/// Read bounded UTF-8 text from a regular file without following the final link.
 pub(crate) fn read_bounded_regular_file(path: &Path, what: &str, limit: u64) -> Result<String> {
+    let (bytes, _) = read_bounded_regular_bytes(path, what, limit)?;
+    String::from_utf8(bytes)
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "stream did not contain valid UTF-8",
+            )
+        })
+        .with_context(|| format!("Failed to read {what}: {}", path.display()))
+}
+
+/// Read bounded bytes and metadata from the same opened regular file.
+pub(crate) fn read_bounded_regular_bytes(
+    path: &Path,
+    what: &str,
+    limit: u64,
+) -> Result<(Vec<u8>, std::fs::Metadata)> {
     let check_type = |metadata: &std::fs::Metadata| {
         anyhow::ensure!(
             metadata.is_file(),
@@ -215,12 +232,12 @@ pub(crate) fn read_bounded_regular_file(path: &Path, what: &str, limit: u64) -> 
         Ok(())
     };
     check_size(metadata.len())?;
-    let mut content = String::with_capacity(metadata.len() as usize);
+    let mut content = Vec::with_capacity(metadata.len() as usize);
     file.take(limit.saturating_add(1))
-        .read_to_string(&mut content)
+        .read_to_end(&mut content)
         .with_context(read_context)?;
     check_size(content.len() as u64)?;
-    Ok(content)
+    Ok((content, metadata))
 }
 
 /// Safe file write with atomic operations
@@ -309,7 +326,12 @@ fn stage_atomic_write(
     contents: &[u8],
     private: bool,
 ) -> Result<StagedFileWrite> {
-    let path = validate_path_syntax(path)?;
+    let path = path.as_ref();
+    anyhow::ensure!(!path.as_os_str().is_empty(), "Path cannot be empty");
+    anyhow::ensure!(
+        !path.as_os_str().as_encoded_bytes().contains(&0),
+        "Path contains null byte"
+    );
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -326,7 +348,7 @@ fn stage_atomic_write(
         #[cfg(not(unix))]
         None
     } else {
-        match std::fs::symlink_metadata(&path) {
+        match std::fs::symlink_metadata(path) {
             Ok(metadata) if metadata.file_type().is_file() => {
                 // Preserve only the nine permission bits. Reapplying the raw
                 // `st_mode` would carry set-user-ID, set-group-ID and sticky
@@ -372,7 +394,10 @@ fn stage_atomic_write(
         .as_file_mut()
         .sync_all()
         .with_context(|| format!("Failed to sync temporary file for {}", path.display()))?;
-    Ok(StagedFileWrite { temporary, path })
+    Ok(StagedFileWrite {
+        temporary,
+        path: path.to_path_buf(),
+    })
 }
 
 #[cfg(test)]

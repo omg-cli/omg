@@ -7,7 +7,6 @@ use dialoguer::Confirm;
 
 use crate::cli::style;
 use crate::config::Settings;
-use crate::core::paths;
 
 /// Get a configuration value
 pub fn get(key: &str) -> Result<()> {
@@ -110,7 +109,11 @@ pub fn list() -> Result<()> {
         style::info("socket"),
         settings.socket_path.display()
     );
-    println!("    {} = {}", style::info("config_file"), config_path());
+    println!(
+        "    {} = {}",
+        style::info("config_file"),
+        Settings::config_path()?.display()
+    );
 
     // General settings
     println!();
@@ -163,99 +166,90 @@ pub fn validate() -> Result<()> {
     println!("{} Validating configuration...", style::info("→"));
     println!();
 
-    let config_file = config_path();
-    let mut issues = 0;
-
-    // Check if config file exists
-    if !std::path::Path::new(&config_file)
-        .try_exists()
-        .context("Failed to inspect configuration file")?
-    {
+    let config_file = Settings::config_path()?;
+    let Some((bytes, metadata)) =
+        Settings::read_config(&config_file).context("Configuration validation failed")?
+    else {
         println!(
             "  {} No config file found (using defaults)",
             style::dim("•")
         );
-        println!("    Path: {config_file}");
+        println!("    Path: {}", config_file.display());
         println!();
         println!(
             "{} Configuration is valid (using defaults)",
             style::success("✓")
         );
         return Ok(());
-    }
+    };
 
     println!(
         "  {} Found config file: {}",
         style::success("✓"),
-        config_file
+        config_file.display()
     );
 
-    // Try to parse the config
-    let content = std::fs::read_to_string(&config_file)?;
-
-    // Check TOML syntax
-    match toml::from_str::<toml::Value>(&content) {
-        Ok(_) => {
+    let content = std::str::from_utf8(&bytes).context("Config is not UTF-8")?;
+    let table = match toml::from_str::<toml::Table>(content) {
+        Ok(table) => {
             println!("  {} TOML syntax is valid", style::success("✓"));
+            table
         }
-        Err(e) => {
-            println!("  {} TOML syntax error: {}", style::error("✗"), e);
-            issues += 1;
+        Err(error) => {
+            println!("  {} TOML syntax error: {}", style::error("✗"), error);
+            return Err(error).context("Configuration validation failed");
         }
-    }
+    };
 
-    // Try to deserialize into Settings
-    match Settings::load() {
+    let settings = match Settings::from_config_table(&config_file, table) {
         Ok(settings) => {
             println!("  {} Configuration schema is valid", style::success("✓"));
-
-            // Validate specific values
-            if settings.aur.build_concurrency == 0 {
-                println!(
-                    "  {} aur.build_concurrency should be > 0",
-                    style::warning("⚠")
-                );
-                issues += 1;
-            }
-
-            if settings.aur.build_concurrency > 8 {
-                println!(
-                    "  {} aur.build_concurrency is unusually high ({})",
-                    style::warning("⚠"),
-                    settings.aur.build_concurrency
-                );
-            }
+            settings
         }
-        Err(e) => {
+        Err(error) => {
             println!(
                 "  {} Failed to load configuration: {:#}",
                 style::error("✗"),
-                e
+                error
             );
-            return Err(e).context("Configuration validation failed");
+            return Err(error).context("Configuration validation failed");
         }
+    };
+
+    let mut issues = 0;
+    if settings.aur.build_concurrency == 0 {
+        println!(
+            "  {} aur.build_concurrency should be > 0",
+            style::warning("⚠")
+        );
+        issues += 1;
+    }
+    if settings.aur.build_concurrency > 8 {
+        println!(
+            "  {} aur.build_concurrency is unusually high ({})",
+            style::warning("⚠"),
+            settings.aur.build_concurrency
+        );
     }
 
-    // Check file permissions
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(&config_file)
-            .context("Failed to inspect configuration permissions")?
-            .permissions()
-            .mode();
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = metadata.permissions().mode();
         if mode & 0o077 != 0 {
             let perm_str = format!("{:o}", mode & 0o777);
             println!(
                 "  {} Config file has loose permissions ({perm_str})",
                 style::warning("⚠")
             );
-            println!("    Consider running: chmod 600 {config_file}");
+            println!("    Consider running: chmod 600 {}", config_file.display());
             issues += 1;
         } else {
             println!("  {} File permissions are secure", style::success("✓"));
         }
     }
+    #[cfg(not(unix))]
+    let _ = metadata;
 
     println!();
     if issues == 0 {
@@ -270,14 +264,14 @@ pub fn validate() -> Result<()> {
 
 /// Reset configuration to defaults
 pub fn reset(yes: bool) -> Result<()> {
-    let config_file = config_path();
-
-    if !std::path::Path::new(&config_file)
-        .try_exists()
-        .context("Failed to inspect configuration file")?
-    {
-        println!("{} No config file exists", style::dim("•"));
-        return Ok(());
+    let config_file = Settings::config_path()?;
+    match std::fs::symlink_metadata(&config_file) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            println!("{} No config file exists", style::dim("•"));
+            return Ok(());
+        }
+        Err(error) => return Err(error).context("Failed to inspect configuration file"),
     }
 
     if !yes {
@@ -293,17 +287,22 @@ pub fn reset(yes: bool) -> Result<()> {
     }
 
     let _write_lock = Settings::write_lock()?;
-    let backup_path = format!("{config_file}.backup");
+    let Some((bytes, _)) = Settings::read_config(&config_file)? else {
+        println!("{} No config file exists", style::dim("•"));
+        return Ok(());
+    };
+    let backup_path = config_file.with_extension("toml.backup");
     // Replace the backup entry atomically; copying into an existing symlink or
     // hard link would overwrite an unrelated file. Backups remain owner-only.
-    crate::core::safe_ops::atomic_write_file_sync_private(
-        &backup_path,
-        std::fs::read(&config_file).context("Failed to read configuration for backup")?,
-    )
-    .context("Failed to back up configuration")?;
-    println!("  {} Created backup at {backup_path}", style::dim("•"));
+    crate::core::safe_ops::atomic_write_file_sync_private(&backup_path, bytes)
+        .context("Failed to back up configuration")?;
+    println!(
+        "  {} Created backup at {}",
+        style::dim("•"),
+        backup_path.display()
+    );
 
-    crate::core::safe_ops::atomic_write_file_sync(
+    crate::core::safe_ops::atomic_write_file_sync_private(
         &config_file,
         toml::to_string_pretty(&Settings::default())?,
     )
@@ -315,16 +314,8 @@ pub fn reset(yes: bool) -> Result<()> {
 
 /// Show configuration file path
 pub fn path() -> Result<()> {
-    println!("{}", config_path());
+    println!("{}", Settings::config_path()?.display());
     Ok(())
-}
-
-/// Get the configuration file path
-fn config_path() -> String {
-    paths::config_dir()
-        .join("config.toml")
-        .display()
-        .to_string()
 }
 
 /// Validate a configuration key

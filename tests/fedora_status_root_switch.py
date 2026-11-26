@@ -3593,6 +3593,166 @@ exec {shlex.quote(str(native))} "$@"
                 refresh_fixture()
 
 
+    def inspect_config_files():
+        phase = "fedora-config-files"
+        original = b"# keep local choices\ntelemetry_enabled = true\n\n[aur]\nbuild_concurrency = 2\n"
+        max_size = 1024 * 1024
+
+        with tempfile.TemporaryDirectory(prefix="config-files-", dir=work) as directory:
+            here = Path(directory)
+            os.chown(here, account.pw_uid, account.pw_gid)
+
+            def settings(label, contents=original, mode=0o600, *, non_utf8=False):
+                home = here / label
+                config_dir = home / (os.fsdecode(b"config-\xff") if non_utf8 else "config")
+                config_dir.mkdir(parents=True)
+                os.chown(home, account.pw_uid, account.pw_gid)
+                os.chown(config_dir, account.pw_uid, account.pw_gid)
+                file = config_dir / "config.toml"
+                if contents is not None:
+                    file.write_bytes(contents)
+                    file.chmod(mode)
+                    os.chown(file, account.pw_uid, account.pw_gid)
+                env = dict(disabled, HOME=str(home), OMG_CONFIG_DIR=str(config_dir),
+                           OMG_DATA_DIR=str(home/"data"), XDG_CONFIG_HOME=str(home/"xdg-config"),
+                           XDG_DATA_HOME=str(home/"xdg-data"), XDG_CACHE_HOME=str(home/"cache"),
+                           XDG_STATE_HOME=str(home/"state"))
+                return file, env
+
+            def run(label, args, env, expect_status, expect_text, verify, *, exclude_text=None):
+                result = command([cli, "config", *args], env, ordinary, timeout=8)
+                transcript = result.stdout + result.stderr
+                persisted = verify()
+                checks.append(dict(
+                    phase=phase, case=label, status=result.returncode, persisted=persisted,
+                    passed=(result.returncode == expect_status and expect_text in transcript
+                            and (exclude_text is None or exclude_text not in transcript) and persisted),
+                    diagnostic=transcript[-1600:],
+                ))
+
+            def unchanged(file, contents=original, mode=0o600):
+                return (file.read_bytes() == contents and stat.S_IMODE(file.stat().st_mode) == mode
+                        and not file.with_suffix(".toml.backup").exists())
+
+            def rewritten(file):
+                data = file.read_bytes()
+                parsed = tomllib.loads(data.decode())
+                return (parsed.get("telemetry_enabled") is False and parsed["aur"]["build_concurrency"] == 2
+                        and data.startswith(b"# keep local choices\n")
+                        and stat.S_IMODE(file.stat().st_mode) == 0o600)
+
+            def reset_to_defaults(file, contents):
+                backup = file.with_suffix(".toml.backup")
+                if not file.is_file() or not backup.is_file():
+                    return False
+                parsed = tomllib.loads(file.read_text())
+                return (parsed.get("telemetry_enabled") is False and parsed["aur"]["build_concurrency"] == 1
+                        and stat.S_IMODE(file.stat().st_mode) == 0o600
+                        and stat.S_IMODE(backup.stat().st_mode) == 0o600
+                        and backup.read_bytes() == contents)
+
+            for mode in (0o600, 0o644, 0o664):
+                label = f"set-{mode:o}"
+                file, env = settings(label, mode=mode)
+                run(label, ["set", "telemetry.enabled", "false"], env, 0, "Set telemetry.enabled = false",
+                    lambda: rewritten(file))
+                label = f"reset-{mode:o}"
+                file, env = settings(label, mode=mode)
+                run(label, ["reset", "--yes"], env, 0, "Configuration reset to defaults",
+                    lambda: reset_to_defaults(file, original))
+                label = f"validate-{mode:o}"
+                file, env = settings(label, mode=mode)
+                expected = "Configuration is valid!" if mode == 0o600 else f"loose permissions ({mode:o})"
+                run(label, ["validate"], env, int(mode != 0o600), expected,
+                    lambda: unchanged(file, mode=mode))
+
+            file, env = settings("private")
+            run("private-path", ["path"], env, 0, str(file), lambda: unchanged(file))
+            run("private-get", ["get", "telemetry.enabled"], env, 0, "true\n", lambda: unchanged(file))
+            run("private-list", ["list"], env, 0, "telemetry.enabled = true", lambda: unchanged(file))
+
+            file, env = settings("inaccessible")
+            file.parent.chmod(0)
+            try:
+                for label, args in (
+                    ("get-telemetry", ["get", "telemetry.enabled"]),
+                    ("get-build", ["get", "aur.build_concurrency"]),
+                    ("list", ["list"]),
+                    ("default", []),
+                    ("validate", ["validate"]),
+                    ("reset", ["reset", "--yes"]),
+                ):
+                    run(f"inaccessible-{label}", args, env, 1, "Permission denied",
+                        lambda: unchanged(file), exclude_text="using defaults")
+            finally:
+                file.parent.chmod(0o755)
+
+            for label, args, expected in (
+                ("get", ["get", "aur.build_concurrency"], "1\n"),
+                ("validate", ["validate"], "Configuration is valid (using defaults)"),
+                ("reset", ["reset", "--yes"], "No config file exists"),
+            ):
+                file, env = settings(f"missing-{label}", contents=None)
+                run(f"missing-{label}", args, env, 0, expected,
+                    lambda: not file.exists() and not list(file.parent.iterdir()))
+
+            for label, contents, expected_status, expected_text in (
+                ("invalid-syntax", b"[aur\n", 1, "TOML syntax error"),
+                ("invalid-schema", b"[aur]\nbuild_concurrency = 'two'\n", 1, "Failed to load configuration"),
+                ("legacy-concurrency", b"[aur]\nbuild_concurrency = 9\n", 0, "unusually high (9)"),
+            ):
+                file, env = settings(label, contents)
+                run(label, ["validate"], env, expected_status, expected_text,
+                    lambda: unchanged(file, contents))
+
+            invalid_utf8 = b"# local configuration \xff\n"
+            file, env = settings("reset-invalid-utf8", invalid_utf8)
+            run("reset-invalid-utf8", ["reset", "--yes"], env, 0, "Configuration reset to defaults",
+                lambda: reset_to_defaults(file, invalid_utf8))
+
+            oversized = b"#" + b"x" * max_size
+            for label, args in (("get", ["get", "telemetry.enabled"]), ("validate", ["validate"]),
+                                ("reset", ["reset", "--yes"])):
+                file, env = settings(f"oversize-{label}", oversized)
+                run(f"oversize-{label}", args, env, 1, "1048576",
+                    lambda: unchanged(file, oversized), exclude_text="TOML syntax is valid")
+
+            at_limit = original + b"#" + b"x" * (max_size - len(original) - 1)
+            file, env = settings("at-limit-get", at_limit)
+            run("at-limit-get", ["get", "telemetry.enabled"], env, 0, "true\n",
+                lambda: unchanged(file, at_limit))
+            file, env = settings("at-limit-set", at_limit)
+            run("at-limit-set", ["set", "telemetry.enabled", "false"], env, 1, "1048576",
+                lambda: unchanged(file, at_limit))
+
+            file, env = settings("native-path", non_utf8=True)
+            run("native-path-get", ["get", "telemetry.enabled"], env, 0, "true\n", lambda: unchanged(file))
+            run("native-path-validate", ["validate"], env, 0, "Configuration is valid!",
+                lambda: unchanged(file), exclude_text="using defaults")
+            run("native-path-reset", ["reset", "--yes"], env, 0, "Configuration reset to defaults",
+                lambda: reset_to_defaults(file, original))
+
+            file, env = settings("directory-entry", contents=None)
+            file.mkdir()
+            os.chown(file, account.pw_uid, account.pw_gid)
+            for label, args in (("get", ["get", "telemetry.enabled"]), ("validate", ["validate"]),
+                                ("reset", ["reset", "--yes"])):
+                run(f"directory-entry-{label}", args, env, 1, "must be a regular file",
+                    lambda: file.is_dir() and not list(file.iterdir())
+                    and not file.with_suffix(".toml.backup").exists())
+
+            file, env = settings("locked")
+            lock = file.with_suffix(".lock")
+            with lock.open("x") as lease:
+                lock.chmod(0o600)
+                os.chown(lock, account.pw_uid, account.pw_gid)
+                fcntl.flock(lease, fcntl.LOCK_EX)
+                for label, args in (("set", ["set", "telemetry.enabled", "false"]),
+                                    ("reset", ["reset", "--yes"])):
+                    run(f"locked-{label}", args, env, 1, "Another configuration mutation",
+                        lambda: unchanged(file))
+
+
     def inspect_task_environment_bytes():
         phase = "task-environment-bytes"
         raw = b"test-\xff-value"
@@ -6307,6 +6467,7 @@ exec {shlex.quote(str(binary))} "$@"
                     inspect_managed_tool_inventory()
                     inspect_fedora_system_tool_registry()
                     inspect_named_tool_updates()
+                    inspect_config_files()
                     mark_progress("runtime selection and Python environments")
                     inspect_task_environment_bytes()
                     inspect_task_package_metadata()
@@ -6632,6 +6793,6 @@ mark_progress("completed with host inventory unchanged")
 report = dict(binaries=binaries, checks=checks, total=len(checks),
               passed=sum(entry["passed"] for entry in checks), host_unchanged=True)
 print(json.dumps(report))
-expected_checks = 303 if consent_oracle is None else 2204
+expected_checks = 303 if consent_oracle is None else 2242
 if report["passed"] != report["total"] or report["total"] != expected_checks:
     sys.exit(4)
