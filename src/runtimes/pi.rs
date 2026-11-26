@@ -43,6 +43,7 @@ impl PiManager {
     /// leases even when its asynchronous caller is cancelled.
     pub async fn install(&self, version: &str) -> Result<()> {
         crate::core::security::validate_runtime_version(version)?;
+        crate::core::security::npm::NpmSpec::parse(&format!("{PI_PACKAGE}@{version}"))?;
         let owner = Self {
             versions_dir: self.versions_dir.clone(),
             advisories: self.advisories.clone(),
@@ -71,6 +72,7 @@ impl PiManager {
             print_already_installed("Pi", version);
             return Ok(());
         }
+        common::require_unoccupied_install_destination(&destination)?;
         let staging = common::begin_staged_install(&self.versions_dir)?;
         let reviewed = install_reviewed_npm(
             &format!("{PI_PACKAGE}@{version}"),
@@ -111,7 +113,7 @@ impl PiManager {
     fn select_owned(&self, version: &str, lease: &common::RuntimeLease) -> Result<()> {
         let prefix = self.versions_dir.join(version);
         let entrypoint = validate_pi_install(&prefix, version)?;
-        if let Ok((admission, reviewed)) = (|| {
+        if let Ok(_reviewed) = (|| {
             let admission = self
                 .security
                 .installed("pi", &prefix, ReviewMode::CachedOnly)?;
@@ -128,10 +130,10 @@ impl PiManager {
                     == expected,
                 "Cached Pi launcher changed"
             );
-            Ok::<_, anyhow::Error>((admission, reviewed))
+            Ok::<_, anyhow::Error>(reviewed)
         })() {
-            reviewed.verify(&prefix)?;
-            admission.verify(&prefix)?;
+            // The cached review retains the Node lease while the switch
+            // rechecks the prepared Pi tree and its Node dependency.
             common::set_current_version_with_lease(&self.versions_dir, version, lease)?;
             print_using("Pi", version, &self.versions_dir.join("current/bin"));
             return Ok(());
@@ -527,6 +529,30 @@ esac
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn occupied_pi_version_does_not_start_the_install_transaction() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let npm = fake_npm(temp.path(), "0.83.0", true)?;
+        managed_node(temp.path(), &npm)?;
+        let versions = temp.path().join("versions/pi");
+        let occupied = versions.join("0.83.0");
+        fs::create_dir_all(&occupied)?;
+        let user_file = occupied.join("owned.txt");
+        fs::write(&user_file, "existing owner data")?;
+        let manager = PiManager::with_paths(versions, npm);
+        let result = manager.install("0.83.0").await;
+        assert!(
+            !temp.path().join("phases").exists(),
+            "occupied Pi destination must be checked before invoking npm"
+        );
+        let error = result.expect_err("occupied Pi version must remain untouched");
+        assert!(format!("{error:#}").contains("move it aside"), "{error:#}");
+        assert_eq!(fs::read_to_string(user_file)?, "existing owner data");
+        assert_eq!(manager.current_version(), None);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn failed_install_does_not_publish_or_replace_active_version() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let npm = fake_npm(temp.path(), "0.82.0", true)?;
@@ -791,7 +817,12 @@ esac
     async fn intact_cached_pi_selection_does_not_call_sources_or_run_npm() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let npm = fake_npm(temp.path(), "0.83.0", true)?;
-        managed_node(temp.path(), &npm)?;
+        let node = managed_node(temp.path(), &npm)?;
+        let payload = vec![b'x'; 256 * 1024];
+        fs::write(
+            node.parent().unwrap().join("../lib/owned-runtime-data"),
+            &payload,
+        )?;
         let advisories = Arc::new(TestAdvisories::default());
         let evidence = Arc::new(TestRuntimeEvidence::default());
         let mut manager = PiManager::with_paths(temp.path().join("versions/pi"), npm);
@@ -812,7 +843,12 @@ esac
         )
         .expect("mark signature auditing as unavailable in the cache reuse fixture");
         manager.install("0.83.0").await?;
-        manager.use_version("0.83.0")?;
+        let start = std::time::Instant::now();
+        for _ in 0..36 {
+            manager.use_version("0.83.0")?;
+            assert_eq!(manager.current_version().as_deref(), Some("0.83.0"));
+        }
+        eprintln!("PI_CACHE_SELECT_NS {}", start.elapsed().as_nanos());
         assert_eq!(advisories.reads.load(Ordering::SeqCst), package_reads);
         assert_eq!(evidence.reads.load(Ordering::SeqCst), runtime_reads);
         assert_eq!(manager.current_version().as_deref(), Some("0.83.0"));

@@ -635,7 +635,12 @@ mod tests {
                     requested.sort_unstable();
                     Ok::<_, anyhow::Error>(requested)
                 };
-                let manager = DotnetManager::new();
+                let owner = tempfile::tempdir()?;
+                let manager = DotnetManager {
+                    versions_dir: owner.path().join("versions"),
+                    security: super::super::security::RuntimeSecurity::fixture(),
+                    client: download_client(),
+                };
                 let (versions, requested) = tokio::time::timeout(Duration::from_secs(8), async {
                     tokio::try_join!(manager.list_available_from(&index), serve)
                 })
