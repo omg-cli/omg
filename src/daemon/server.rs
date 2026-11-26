@@ -250,8 +250,9 @@ async fn run_with_status_path(
                     return;
                 }
             };
+            let rpm_catalog = state.uses_rpm_catalog();
             #[cfg(feature = "fedora")]
-            let rpm_observation = if state.uses_rpm_catalog() {
+            let rpm_observation = if rpm_catalog {
                 match state.observe_status_rpm_catalog().await {
                     Ok(observation) => Some(observation),
                     Err(error) => {
@@ -262,7 +263,9 @@ async fn run_with_status_path(
             } else {
                 None
             };
-            let status = state.status_counts().await;
+            // Fedora's status API reads maintenance counts live. The worker
+            // only needs current installed counts to bind advisory coverage.
+            let status = state.package_manager.get_status(rpm_catalog).await;
             state
                 .runtime_versions
                 .write()
@@ -276,19 +279,21 @@ async fn run_with_status_path(
                     return;
                 }
             };
-            let fast_status =
-                crate::core::fast_status::FastStatus::new(total, explicit, orphans, updates);
-            match write_fast_status_async(
-                fast_status,
-                fast_status_path.to_path_buf(),
-                Arc::clone(state),
-                Arc::clone(&index),
-            )
-            .await
-            {
-                Ok(false) => return,
-                Ok(true) => {}
-                Err(error) => tracing::warn!("Failed to write fast status file: {error}"),
+            if !rpm_catalog {
+                let fast_status =
+                    crate::core::fast_status::FastStatus::new(total, explicit, orphans, updates);
+                match write_fast_status_async(
+                    fast_status,
+                    fast_status_path.to_path_buf(),
+                    Arc::clone(state),
+                    Arc::clone(&index),
+                )
+                .await
+                {
+                    Ok(false) => return,
+                    Ok(true) => {}
+                    Err(error) => tracing::warn!("Failed to write fast status file: {error}"),
+                }
             }
 
             // Isolated fixtures must explicitly configure their advisory
