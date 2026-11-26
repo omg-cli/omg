@@ -96,6 +96,20 @@ impl HistoryManager {
 
     /// Reads the default history without initializing a new store.
     pub(crate) fn load_existing() -> Result<Vec<Transaction>> {
+        Self::load_existing_with_live_window(None)
+    }
+
+    /// Reads the newest entries for the dashboard. The archive is needed
+    /// only if the live file cannot supply a complete, unique window.
+    pub(crate) fn load_recent_existing(limit: usize) -> Result<Vec<Transaction>> {
+        Ok(Self::load_existing_with_live_window(Some(limit))?
+            .into_iter()
+            .rev()
+            .take(limit)
+            .collect())
+    }
+
+    fn load_existing_with_live_window(live_window: Option<usize>) -> Result<Vec<Transaction>> {
         let manager = Self {
             log_path: Self::default_log_path(),
         };
@@ -106,7 +120,7 @@ impl HistoryManager {
             &manager.archive_path(),
         ] {
             match path.symlink_metadata() {
-                Ok(_) => return manager.load(),
+                Ok(_) => return manager.load_with_live_window(live_window),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => {
                     return Err(error).with_context(|| {
@@ -172,8 +186,18 @@ impl HistoryManager {
     /// Identical records from interrupted retirement are returned once;
     /// conflicting IDs or malformed data fail rather than choosing a version.
     pub fn load(&self) -> Result<Vec<Transaction>> {
+        self.load_with_live_window(None)
+    }
+
+    fn load_with_live_window(&self, live_window: Option<usize>) -> Result<Vec<Transaction>> {
         self.with_history_lock(|| {
             let live = self.load_locked()?;
+            if live_window.is_some_and(|limit| live.len() >= limit) {
+                let mut ids = std::collections::HashSet::with_capacity(live.len());
+                if live.iter().all(|entry| ids.insert(entry.id.as_str())) {
+                    return Ok(live);
+                }
+            }
             let archive_path = self.archive_path();
             let mut options = fs::OpenOptions::new();
             options.read(true);

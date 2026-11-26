@@ -229,8 +229,7 @@ impl App {
     }
 
     pub(super) fn read_recent_history() -> Result<Vec<Transaction>> {
-        let entries = crate::core::history::HistoryManager::load_existing()?;
-        Ok(entries.into_iter().rev().take(50).collect())
+        crate::core::history::HistoryManager::load_recent_existing(50)
     }
 
     #[cfg(unix)]
@@ -762,6 +761,58 @@ mod tests {
         temp_env::with_var("OMG_DATA_DIR", Some(&store), || -> Result<()> {
             assert!(App::read_recent_history()?.is_empty());
             assert!(!store.exists());
+            Ok(())
+        })
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recent_history_reads_the_archive_only_when_the_live_window_needs_it() -> Result<()> {
+        use crate::core::history::{HistoryManager, TransactionType};
+
+        const CASE: &str = "cli::tui::app::tests::recent_history_reads_the_archive_only_when_the_live_window_needs_it";
+        if crate::config::Settings::rerun_test_unprivileged(CASE)
+            || crate::core::testing::run_isolated_test(CASE)
+        {
+            return Ok(());
+        }
+        let fixture = tempfile::tempdir()?;
+        let archive = fixture.path().join("history.json.archive.jsonl");
+        temp_env::with_var("OMG_DATA_DIR", Some(fixture.path()), || -> Result<()> {
+            let transaction = |id: usize| Transaction {
+                id: id.to_string(),
+                timestamp: jiff::Timestamp::UNIX_EPOCH,
+                transaction_type: TransactionType::Sync,
+                changes: Vec::new(),
+                success: true,
+            };
+            let history = HistoryManager::new()?;
+            let live: Vec<_> = (1..=51).map(transaction).collect();
+            history.save(&live)?;
+            std::fs::write(&archive, b"invalid archive")?;
+
+            let recent = App::read_recent_history()?;
+            assert_eq!(
+                recent,
+                live.iter().rev().take(50).cloned().collect::<Vec<_>>()
+            );
+            assert!(
+                history.load().is_err(),
+                "full history must still check the archive"
+            );
+
+            history.save(&live[..1])?;
+            std::fs::write(&archive, serde_json::to_vec(&transaction(0))?)?;
+            assert_eq!(
+                App::read_recent_history()?,
+                [transaction(1), transaction(0)]
+            );
+
+            history.save(&vec![transaction(1); 51])?;
+            assert_eq!(
+                App::read_recent_history()?,
+                [transaction(1), transaction(0)]
+            );
             Ok(())
         })
     }

@@ -37,18 +37,27 @@ RUN cargo install cargo-chef --version 0.1.78 --locked -j 2
 
 WORKDIR /opt/omg
 
-FROM toolchain AS planner
-COPY . .
+FROM toolchain AS sources
+COPY Cargo.toml Cargo.lock build.rs rust-toolchain.toml ./
+COPY .cargo/ .cargo/
+COPY benches/ benches/
+COPY contracts/ contracts/
+COPY examples/ examples/
+COPY src/ src/
+COPY tests/ tests/
+COPY vendor/ vendor/
+
+FROM sources AS planner
 RUN cargo chef prepare --recipe-path /tmp/omg-recipe.json
 
 FROM toolchain AS builder
 COPY --from=planner /tmp/omg-recipe.json /tmp/omg-recipe.json
 # cargo-chef omits optional path patches from its manifest skeleton.
 COPY vendor/ vendor/
-# Ordinary image layers (not cache mounts) are exported by the GHA cache.
+# The registry cache exports ordinary image layers.
 # Keep toolchain, path, profile and default Arch features identical to the build.
 RUN cargo chef cook --release --locked -j 2 --recipe-path /tmp/omg-recipe.json
-COPY . .
+COPY --from=sources /opt/omg/ /opt/omg/
 RUN cargo build --release --locked -j 2
 
 FROM native AS runtime
