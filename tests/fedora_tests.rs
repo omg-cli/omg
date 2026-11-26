@@ -1415,6 +1415,8 @@ mod dnf_integration {
     fn native_transactions_record_install_remove_and_ignore_noops() -> Result<()> {
         use omg_lib::core::history::{HistoryManager, TransactionType};
         let package = uninstalled_repository_package()?;
+        let selector = std::env::var("OMG_FEDORA_TEST_INSTALL_SELECTOR")
+            .unwrap_or_else(|_| package.to_owned());
         let snapshot = || -> Result<Vec<String>> {
             let output = std::process::Command::new("rpm")
                 .args(["-qa", "--qf", "%{NAME}\t%{NEVRA}\n"])
@@ -1458,13 +1460,13 @@ mod dnf_integration {
                     "--setopt=assumeyes=false",
                     "--assumeno",
                     "install",
-                    package,
+                    &selector,
                 ])
                 .output()?;
             assert_eq!(native_preview.status.code(), Some(1));
             let native_plan = std::str::from_utf8(&native_preview.stdout)?.trim_end();
             assert!(native_plan.contains("Transaction Summary:"));
-            let preview = run(&["install", package, "--dry-run", "--yes"])?;
+            let preview = run(&["install", &selector, "--dry-run", "--yes"])?;
             assert!(
                 preview.status.success(),
                 "{}",
@@ -1487,7 +1489,7 @@ mod dnf_integration {
                 .arg(fixture.path().join("install-review.json"))
                 .arg("--")
                 .arg(binary)
-                .args(["install", package, "--yes"])
+                .args(["install", &selector, "--yes"])
                 .output()?;
             anyhow::ensure!(
                 install.status.success(),
@@ -1519,7 +1521,7 @@ mod dnf_integration {
                     && change.new_version.as_deref() == Some(std::str::from_utf8(&native.stdout)?),
                 "Recorded version differs from RPM"
             );
-            let noop = run(&["install", package, "--yes"])?;
+            let noop = run(&["install", &selector, "--yes"])?;
             anyhow::ensure!(
                 noop.status.success(),
                 "No-op install failed: {}",
