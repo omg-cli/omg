@@ -1196,6 +1196,43 @@ mod tests {
                     .expect_err("disabled AUR must stop before build");
                 assert!(matches!(error.downcast_ref::<crate::core::security::policy::PolicyError>(),
                     Some(crate::core::security::policy::PolicyError::AurDisabled {name}) if name=="aur-fixture"));
+
+                let archive = directory.path().join("local-fixture-1.0-1-any.pkg.tar.gz");
+                let gzip = flate2::write::GzEncoder::new(
+                    std::fs::File::create(&archive)?,
+                    flate2::Compression::fast(),
+                );
+                let mut package = tar::Builder::new(gzip);
+                let metadata = b"pkgname = local-fixture\npkgver = 1.0-1\narch = any\nsize = 0\n";
+                let mut header = tar::Header::new_gnu();
+                header.set_size(metadata.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                package.append_data(&mut header, ".PKGINFO", &metadata[..])?;
+                package.into_inner()?.finish()?;
+
+                let history_path = data.join("mixed-history.json");
+                let service = PackageService::builder(backend.clone())
+                    .policy(SecurityPolicy::default())
+                    .history(HistoryManager::new_in(&history_path)?)
+                    .build()?;
+                let error = service.install(&[
+                    archive.to_str().expect("UTF-8 test path").into(),
+                    "aur-fixture".into(),
+                ], true).await.expect_err("mock backend must refuse the archived package");
+                assert!(error.to_string().contains("not found in any repository"), "{error:#}");
+                let records = HistoryManager::new_in(history_path)?.load()?;
+                assert_eq!(records.len(), 1);
+                assert!(!records[0].success);
+                let changes = &records[0].changes;
+                assert_eq!(changes.len(), 2);
+                assert_eq!(changes[0].name, "local-fixture");
+                assert_eq!(changes[0].new_version.as_deref(), Some("1.0-1"));
+                assert_eq!(changes[0].source, "local");
+                assert_eq!(changes[1].name, "aur-fixture");
+                assert_eq!(changes[1].new_version.as_deref(), Some("2.0-1"));
+                assert_eq!(changes[1].source, "aur");
+                assert!(changes.iter().all(|change| change.architecture.is_none()));
                 assert!(backend.list_installed().await?.is_empty());
                 Ok::<(), anyhow::Error>(())
             })?;

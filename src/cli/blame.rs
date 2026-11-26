@@ -462,9 +462,13 @@ mod ordering_tests {
                 architecture: Some("x86_64"),
             },
         );
-        let Cmd::View(View::Card(_, rows)) = &filtered[1] else {
-            panic!("expected one history card");
-        };
+        let rows = filtered
+            .iter()
+            .find_map(|command| match command {
+                Cmd::View(View::Card(_, rows)) => Some(rows),
+                _ => None,
+            })
+            .expect("expected one history card");
         assert_eq!(rows.len(), 3);
         assert!(rows[0].ends_with("→ 3.0 (test)"));
         assert!(rows[1].ends_with("1.1 → (removed) (dnf, architecture unrecorded)"));
