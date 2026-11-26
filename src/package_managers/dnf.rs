@@ -188,6 +188,18 @@ impl RpmDatabaseIdentity {
         Some(Self { database, wal })
     }
 
+    fn hash_inventory_generation(self, hash: &mut sha2::Sha256, include_wal_ctime: bool) {
+        use sha2::Digest as _;
+
+        self.database.hash_generation(hash, true);
+        if let Some(wal) = self.wal.filter(|wal| wal.size != 0) {
+            hash.update([1]);
+            wal.hash_generation(hash, include_wal_ctime);
+        } else {
+            hash.update([0]);
+        }
+    }
+
     fn same_inventory_files(self, observed: Self) -> bool {
         if self.database != observed.database {
             return false;
@@ -982,15 +994,8 @@ impl DnfPackageManager {
             hash.update(path.as_os_str().as_encoded_bytes());
             hash.update([0]);
         }
-        identity.database.hash_generation(&mut hash, true);
-        if let Some(wal) = identity.wal.filter(|wal| wal.size != 0) {
-            // Read-only SQLite opens can create an empty WAL or reapply its
-            // permissions. Only its contents and file identity matter here.
-            hash.update([1]);
-            wal.hash_generation(&mut hash, false);
-        } else {
-            hash.update([0]);
-        }
+        // SQLite can reapply WAL permissions while reading without changing inventory.
+        identity.hash_inventory_generation(&mut hash, false);
 
         let reasons = match std::fs::read_dir(state) {
             Ok(entries) => {

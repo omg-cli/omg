@@ -5,7 +5,7 @@ Run as root in private mount and network namespaces without network routes.
 The arguments are the inert Fedora fixture directory and the built omg and
 omgd binaries. All RPM writes go to a disposable installroot.
 """
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, closing, contextmanager
 import fcntl
 import gzip
 import hashlib
@@ -16,6 +16,7 @@ import pwd
 import re
 import shlex
 import socket
+import sqlite3
 import shutil
 import signal
 import stat
@@ -2132,7 +2133,9 @@ exec {shlex.quote(str(binary))} "$@"
 
                 def search(label, query, summary, calls):
                     before = drop.read_bytes().count(b"\n")
+                    started = time.perf_counter_ns()
                     result = command([cli, "--json", "search", "--limit", "1", query], disabled, ordinary)
+                    duration_ms = (time.perf_counter_ns() - started) / 1_000_000
                     observed = drop.read_bytes().count(b"\n") - before
                     value = None
                     try:
@@ -2146,7 +2149,7 @@ exec {shlex.quote(str(binary))} "$@"
                     except (ValueError, TypeError, KeyError):
                         exact = False
                     checks.append(dict(phase=phase, case=label, passed=result.returncode == 0 and exact
-                                       and observed == calls, value={"calls": observed, "rows": value},
+                                       and observed == calls, value={"calls": observed, "rows": value}, duration_ms=duration_ms,
                                        diagnostic=result.stderr[-800:]))
 
                 unsigned = repo_config.replace("repo_gpgcheck=1", "repo_gpgcheck=0") + f"cachedir={native_cache}\n"
@@ -2199,6 +2202,35 @@ exec {shlex.quote(str(binary))} "$@"
                     search("expired-native", identity, updated, 1)
                     search("refreshed-seed", identity, updated, 1)
                     search("refreshed-reuse", identity, updated, 0)
+
+                    rpm_path = Path(checked([rpm, "--eval", "%{_dbpath}"]).strip()).resolve(strict=True)
+                    snapshot = work / "direct-catalog-rpmdb"
+                    snapshot.mkdir()
+                    database = snapshot / "rpmdb.sqlite"
+                    source_database = (rpm_path / database.name).as_uri() + "?mode=ro"
+                    with (closing(sqlite3.connect(source_database, uri=True)) as original_db,
+                          closing(sqlite3.connect(database)) as snapshot_db):
+                        original_db.backup(snapshot_db)
+                        assert snapshot_db.execute("PRAGMA journal_mode=DELETE").fetchone() == ("delete",)
+
+                    wal = snapshot / "rpmdb.sqlite-wal"
+                    checked(["/usr/bin/mount", "--bind", snapshot, rpm_path])
+                    try:
+                        search("isolated-rpmdb-seed", identity, updated, 1)
+                        for cycle in range(8):
+                            assert not wal.exists()
+                            wal.touch(mode=0o644)
+                            search(f"empty-wal-{cycle}-created", identity, updated, 0)
+                            assert wal.stat().st_size == 0
+                            stat_before = wal.stat()
+                            os.utime(wal, ns=(stat_before.st_atime_ns, stat_before.st_mtime_ns + 1_000_000_000))
+                            search(f"empty-wal-{cycle}-mtime", identity, updated, 0)
+                            wal.chmod(0o640)
+                            search(f"empty-wal-{cycle}-permissions", identity, updated, 0)
+                            wal.unlink()
+                            search(f"empty-wal-{cycle}-removed", identity, updated, 0)
+                    finally:
+                        checked(["/usr/bin/umount", rpm_path])
                 finally:
                     checked(["/usr/bin/umount", target])
                     config.write_text(host_config)
@@ -2539,6 +2571,6 @@ assert inventory() == before
 report = dict(binaries=binaries, checks=checks, total=len(checks),
               passed=sum(entry["passed"] for entry in checks), host_unchanged=True)
 print(json.dumps(report))
-expected_checks = 303 if consent_oracle is None else 978
+expected_checks = 303 if consent_oracle is None else 1011
 if report["passed"] != report["total"] or report["total"] != expected_checks:
     sys.exit(4)

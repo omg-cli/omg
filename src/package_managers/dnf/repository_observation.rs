@@ -8,12 +8,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 
-use super::RpmFileIdentity;
 use super::repository_freshness::{RepositoryAge, RepositoryAgePolicy};
 use super::rpm_database::{
     CONFIG_DROP_INS, PLUGIN_CONFIGS, RpmDatabase, parse_absolute_setting, read_dnf_settings,
     reported_setting, rooted_path,
 };
+use super::{RpmDatabaseIdentity, RpmFileIdentity};
 
 #[derive(Clone, Default, PartialEq, Eq)]
 struct RepositoryPaths {
@@ -22,6 +22,7 @@ struct RepositoryPaths {
     caches: Vec<PathBuf>,
     observe_expiration: bool,
     age_policies: Option<Vec<RepositoryAgePolicy>>,
+    rpm_database: Option<PathBuf>,
 }
 
 pub(super) struct RepositoryObservation {
@@ -163,7 +164,7 @@ impl DirectCatalogScope {
             }
         }
         let mut key = Sha256::new();
-        key.update(b"OMG DNF direct catalog v1\0");
+        key.update(b"OMG DNF direct catalog v2\0");
         key.update(std::env::consts::ARCH.as_bytes());
         key.update(self.report_digest);
         key.update(self.paths.fingerprint()?);
@@ -202,10 +203,7 @@ fn observe_native_catalog_controls(
     paths
         .files
         .push(crate::core::privilege::root_controlled_program_path("dnf")?);
-    paths.files.push(database.sqlite.clone());
-    let mut wal = database.sqlite.as_os_str().to_os_string();
-    wal.push("-wal");
-    paths.files.push(PathBuf::from(wal));
+    paths.rpm_database = Some(database.sqlite.clone());
 
     let state = parse_absolute_setting(main, "system_state_dir")?;
     let modules = state.join("modules.toml");
@@ -563,7 +561,20 @@ impl RepositoryPaths {
                 }
             }
         }
-        fingerprint_files(files)
+        let controls = fingerprint_files(files)?;
+        let Some(path) = &self.rpm_database else {
+            return Ok(controls);
+        };
+        let database = RpmDatabaseIdentity::read(path)
+            .context("Cannot observe the RPM database for DNF catalog caching")?;
+        let mut hash = Sha256::new();
+        hash.update(controls);
+        hash.update(path.as_os_str().as_encoded_bytes());
+        hash.update([0]);
+        // An empty journal has no RPM inventory data. Nonempty WAL changes
+        // still affect the key, including file identity and ctime.
+        database.hash_inventory_generation(&mut hash, true);
+        Ok(hash.finalize().into())
     }
 
     fn catalog_fingerprint(&self, controls: [u8; 32]) -> Result<[u8; 32]> {
@@ -828,6 +839,35 @@ mod tests {
         };
         fs::write(&manifest, "updated metadata")?;
         assert!(!observed.is_current()?);
+        Ok(())
+    }
+
+    #[test]
+    fn catalog_fingerprint_ignores_empty_wal_and_tracks_nonempty_wal() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let database = fixture.path().join("rpmdb.sqlite");
+        let wal = fixture.path().join("rpmdb.sqlite-wal");
+        fs::write(&database, b"database generation")?;
+        let paths = RepositoryPaths {
+            rpm_database: Some(database.clone()),
+            ..RepositoryPaths::default()
+        };
+        let initial = paths.fingerprint()?;
+
+        fs::write(&wal, [])?;
+        assert_eq!(paths.fingerprint()?, initial);
+        fs::write(&wal, b"nonempty journal generation")?;
+        let first_wal = paths.fingerprint()?;
+        assert_ne!(first_wal, initial);
+        fs::write(&wal, b"new journal generation with a different size")?;
+        assert_ne!(paths.fingerprint()?, first_wal);
+        fs::write(&wal, [])?;
+        assert_eq!(paths.fingerprint()?, initial);
+        fs::remove_file(&wal)?;
+        assert_eq!(paths.fingerprint()?, initial);
+
+        fs::write(&database, b"new database generation")?;
+        assert_ne!(paths.fingerprint()?, initial);
         Ok(())
     }
 
