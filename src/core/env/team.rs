@@ -153,6 +153,37 @@ impl TeamStatus {
     pub fn in_sync_count(&self) -> usize {
         self.members.iter().filter(|m| m.in_sync).count()
     }
+
+    fn record_local(&mut self, environment: &EnvironmentState, lock_hash: String, in_sync: bool) {
+        let updated_at = jiff::Timestamp::now().as_second();
+        let member = TeamMember {
+            id: self.config.member_id.clone(),
+            name: local_member_name(),
+            env_hash: environment.hash.clone(),
+            last_sync: updated_at,
+            in_sync,
+            drift_summary: (!in_sync).then(|| "Environment differs from team lock".to_owned()),
+        };
+
+        if let Some(existing) = self.members.iter_mut().find(|m| m.id == member.id) {
+            *existing = member;
+        } else {
+            self.members.push(member);
+        }
+
+        self.lock_hash = lock_hash;
+        self.updated_at = updated_at;
+    }
+
+    fn bounded_json(&self, path: &Path) -> Result<Vec<u8>> {
+        let json = serde_json::to_vec_pretty(self)?;
+        anyhow::ensure!(
+            json.len() as u64 <= MAX_TEAM_FILE_BYTES,
+            "Team status exceeds the {MAX_TEAM_FILE_BYTES} byte limit: {}",
+            path.display()
+        );
+        Ok(json)
+    }
 }
 
 /// Team workspace manager
@@ -393,9 +424,7 @@ impl TeamWorkspace {
     async fn update_status_with_lock(&self, require_lock: bool) -> Result<TeamStatus> {
         let root = self.root.clone();
         let (guard, mut status, lock) = tokio::task::spawn_blocking(move || {
-            Self::validate_config_dir(&root)?;
-            let guard = super::lock_regular_file(&root.join(".omg/team-status.lock"))?;
-            let status = Self::load_status_at(&root)?;
+            let (guard, status) = Self::lock_status(&root)?;
             let lock_path = root.join("omg.lock");
             let lock = match std::fs::symlink_metadata(&lock_path) {
                 Ok(_) => Some(EnvironmentState::load(&lock_path)?),
@@ -418,38 +447,13 @@ impl TeamWorkspace {
             .as_ref()
             .is_none_or(|lock| current_env.matches_inventory(lock));
 
-        let member = TeamMember {
-            id: status.config.member_id.clone(),
-            name: local_member_name(),
-            env_hash: current_env.hash,
-            last_sync: jiff::Timestamp::now().as_second(),
-            in_sync,
-            drift_summary: if in_sync {
-                None
-            } else {
-                Some("Environment differs from team lock".to_string())
-            },
-        };
-
-        // Update or add member
-        if let Some(existing) = status.members.iter_mut().find(|m| m.id == member.id) {
-            *existing = member;
-        } else {
-            status.members.push(member);
-        }
-
-        status.lock_hash = lock.map_or_else(String::new, |lock| lock.hash);
-        status.updated_at = jiff::Timestamp::now().as_second();
+        let lock_hash = lock.map_or_else(String::new, |lock| lock.hash);
+        status.record_local(&current_env, lock_hash, in_sync);
 
         let status_path = self.status_path();
         tokio::task::spawn_blocking(move || {
             let _guard = guard;
-            let status_json = serde_json::to_vec_pretty(&status)?;
-            anyhow::ensure!(
-                status_json.len() as u64 <= MAX_TEAM_FILE_BYTES,
-                "Team status exceeds the {MAX_TEAM_FILE_BYTES} byte limit: {}",
-                status_path.display()
-            );
+            let status_json = status.bounded_json(&status_path)?;
             crate::core::safe_ops::atomic_write_file_sync(status_path, status_json)?;
             Ok(status)
         })
@@ -485,23 +489,44 @@ impl TeamWorkspace {
         Ok(status)
     }
 
+    fn lock_status(root: &Path) -> Result<(std::fs::File, TeamStatus)> {
+        Self::validate_config_dir(root)?;
+        let guard = super::lock_regular_file(&root.join(".omg/team-status.lock"))?;
+        Ok((guard, Self::load_status_at(root)?))
+    }
+
     /// Push local environment to team lock
     pub async fn push(&self) -> Result<()> {
-        let config = self.config.as_ref().context("Not a team workspace")?;
+        self.config.as_ref().context("Not a team workspace")?;
+        let root = self.root.clone();
+        let (guard, mut status) = tokio::task::spawn_blocking(move || Self::lock_status(&root))
+            .await
+            .context("Team status read task failed")??;
 
-        // Capture and save
         let state = EnvironmentState::capture().await?;
-        let lock_path = self.root.join("omg.lock");
-        state.save(&lock_path)?;
+        status.record_local(&state, state.hash.clone(), true);
+        let auto_push = status.config.auto_push;
+        let root = self.root.clone();
+        let status_path = self.status_path();
+        tokio::task::spawn_blocking(move || {
+            {
+                let _status_guard = guard;
+                let status_json = status.bounded_json(&status_path)?;
+                let prepared = crate::core::safe_ops::stage_atomic_write_file_sync(
+                    &status_path,
+                    &status_json,
+                )?;
+                state.save_then(&root.join("omg.lock"), || prepared.publish())?;
+            }
 
-        // Update status
-        self.update_status().await?;
-
-        if config.auto_push && self.is_git_repo() {
-            self.git_commit_lock("Update omg.lock via team push")?;
-        }
-
-        Ok(())
+            // Git hooks can run environment commands, so release both guards first.
+            if auto_push && Self::is_git_repo(&root) {
+                Self::git_commit_lock(&root, "Update omg.lock via team push")?;
+            }
+            Ok(())
+        })
+        .await
+        .context("Team push publication task failed")?
     }
 
     /// Pull team lock and check for drift
@@ -534,8 +559,8 @@ impl TeamWorkspace {
     }
 
     /// Check if we're in a git repository
-    fn is_git_repo(&self) -> bool {
-        self.root.join(".git").exists()
+    fn is_git_repo(root: &Path) -> bool {
+        root.join(".git").exists()
     }
 
     fn git_path_metadata(path: &Path) -> Result<Option<std::fs::Metadata>> {
@@ -645,17 +670,17 @@ fi
     }
 
     /// Commit omg.lock to git
-    fn git_commit_lock(&self, message: &str) -> Result<()> {
+    fn git_commit_lock(root: &Path, message: &str) -> Result<()> {
         use std::process::Command;
 
-        let lock_path = self.root.join("omg.lock");
+        let lock_path = root.join("omg.lock");
         if !lock_path.exists() {
             return Ok(());
         }
 
         let add = Command::new("git")
             .args(["add", "--", "omg.lock"])
-            .current_dir(&self.root)
+            .current_dir(root)
             .output()
             .context("Failed to run git add for omg.lock")?;
         if !add.status.success() {
@@ -667,7 +692,7 @@ fi
 
         let changed = Command::new("git")
             .args(["diff", "--cached", "--quiet", "--", "omg.lock"])
-            .current_dir(&self.root)
+            .current_dir(root)
             .output()
             .context("Failed to inspect staged omg.lock")?;
         match changed.status.code() {
@@ -681,7 +706,7 @@ fi
 
         let commit = Command::new("git")
             .args(["commit", "--only", "-m", message, "--", "omg.lock"])
-            .current_dir(&self.root)
+            .current_dir(root)
             .output()
             .context("Failed to run git commit for omg.lock")?;
         if !commit.status.success() {
@@ -747,7 +772,7 @@ mod tests {
         let private_git_dir = String::from_utf8(git(&root, &["rev-parse", "--absolute-git-dir"]))?;
 
         let mut workspace = TeamWorkspace::new(&root)?;
-        assert!(workspace.is_git_repo());
+        assert!(TeamWorkspace::is_git_repo(&root));
         workspace.init("worktree-team", "Worktree Team")?;
 
         let mut reopened = TeamWorkspace::new(&root)?;
@@ -923,7 +948,7 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let root = directory.path().join("root");
         let mut workspace = TeamWorkspace::new(&root)?;
-        assert!(!workspace.is_git_repo());
+        assert!(!TeamWorkspace::is_git_repo(&root));
         std::fs::write(&root, b"not a directory")?;
 
         let error = workspace.init("team", "Team").unwrap_err();
@@ -982,7 +1007,6 @@ mod tests {
     fn team_lock_commit_preserves_unrelated_staged_and_unstaged_changes() {
         let directory = git_workspace();
         let root = directory.path();
-        let workspace = TeamWorkspace::new(root).unwrap();
         std::fs::write(root.join("other.txt"), "staged secret\n").unwrap();
         git(root, &["add", "--", "other.txt"]);
         std::fs::write(root.join("other.txt"), "unstaged work\n").unwrap();
@@ -995,7 +1019,7 @@ mod tests {
 
         for contents in ["first lock\n", "updated lock\n"] {
             std::fs::write(root.join("omg.lock"), contents).unwrap();
-            workspace.git_commit_lock("Team lock update").unwrap();
+            TeamWorkspace::git_commit_lock(root, "Team lock update").unwrap();
             assert_eq!(
                 git(root, &["show", "--format=", "--name-only", "HEAD"]),
                 b"omg.lock\n"
@@ -1013,7 +1037,7 @@ mod tests {
                 b"unstaged work\n"
             );
             let head = git(root, &["rev-parse", "HEAD"]);
-            workspace.git_commit_lock("Unchanged team lock").unwrap();
+            TeamWorkspace::git_commit_lock(root, "Unchanged team lock").unwrap();
             assert_eq!(git(root, &["rev-parse", "HEAD"]), head);
             assert_eq!(
                 git(
@@ -1032,7 +1056,6 @@ mod tests {
 
         let directory = git_workspace();
         let root = directory.path();
-        let workspace = TeamWorkspace::new(root).unwrap();
         std::fs::write(root.join("other.txt"), "staged secret\n").unwrap();
         git(root, &["add", "--", "other.txt"]);
         let staged = git(root, &["ls-files", "--stage", "--", "other.txt"]);
@@ -1042,7 +1065,7 @@ mod tests {
         std::fs::write(&hook, "#!/bin/sh\necho 'nothing to commit' >&2\nexit 1\n").unwrap();
         std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o700)).unwrap();
 
-        assert!(workspace.git_commit_lock("Rejected update").is_err());
+        assert!(TeamWorkspace::git_commit_lock(root, "Rejected update").is_err());
         assert_eq!(git(root, &["rev-parse", "HEAD"]), head);
         assert_eq!(
             git(root, &["ls-files", "--stage", "--", "other.txt"]),

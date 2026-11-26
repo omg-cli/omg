@@ -1032,6 +1032,171 @@ exec {shlex.quote(str(native_executable))} "$@"
             run("template-file-restored", gp("list"), ("starter",))
 
 
+    def inspect_team_push_publication():
+        import tomllib
+
+        phase = "team-push-publication"
+        with tempfile.TemporaryDirectory(prefix="team-push-publication-", dir=work) as directory:
+            here = Path(directory)
+            os.chown(here, account.pw_uid, account.pw_gid)
+            isolated = dict(disabled, HOME=str(here), XDG_DATA_HOME=str(here/"data"),
+                            XDG_CONFIG_HOME=str(here/"config"), XDG_CACHE_HOME=str(here/"cache"),
+                            XDG_STATE_HOME=str(here/"state"))
+            lock = here / "omg.lock"
+            status = here / ".omg/team-status.json"
+            guard = here / ".omg/team-status.lock"
+            writer = here / ".omg.lock.write.lock"
+            prior = b"previous environment bytes\n"
+            push = ("team", "push")
+
+            def run(label, args, markers=(), *, fails=False, inspect=None):
+                try:
+                    result = command([cli, *args], isolated, ordinary, timeout=8)
+                except subprocess.TimeoutExpired:
+                    checks.append(dict(phase=phase, case=label, passed=False, status=None,
+                                       diagnostic="command exceeded local deadline"))
+                    return
+                output = result.stdout + result.stderr
+                okay = ((result.returncode != 0) == fails
+                        and all(marker in output for marker in markers)
+                        and (inspect is None or inspect()))
+                checks.append(dict(phase=phase, case=label, passed=okay, status=result.returncode,
+                                   diagnostic=output[-1000:]))
+
+            expected = sorted(set(checked([dnf, "--cacheonly", "--setopt=disable_excludes=*",
+                                           "repoquery", "--userinstalled", "--qf", r"%{name}\n"],
+                                          isolated, ordinary).splitlines()))
+            assert len(expected) > 1
+            run("init", ("team", "init", "fixture/push"), ("initialized",))
+            initial_status = status.read_bytes()
+
+            def published():
+                current = tomllib.loads(lock.read_text())
+                team = json.loads(status.read_text())
+                members = [member for member in team["members"] if member["id"] == team["config"]["member_id"]]
+                return (current["packages"] == expected and len(members) == 1
+                        and members[0]["env_hash"] == current["hash"] == team["lock_hash"]
+                        and members[0]["in_sync"] and lock.stat().st_mode & 0o777 == 0o600)
+
+            run("first-push", push, ("Team lock updated",), inspect=published)
+            run("check-first-push", ("env", "check"), ("Environment is in sync",))
+            run("pull-first-push", ("team", "pull"), ("Environment is in sync",))
+            run("status-first-push", ("team", "status"), ("1/1 members in sync",), inspect=published)
+
+            document = json.loads(initial_status)
+            limit = 16 * 1024 * 1024
+            for label, obstruction, marker in (
+                ("missing", None, "Failed to inspect Team status"),
+                ("malformed", b"{\n", "Failed to parse team status"),
+                ("invalid-utf8", b"\xff", "Failed to read Team status"),
+                ("too-large", initial_status.ljust(limit + 1, b" "), "Team status exceeds"),
+                ("newer-format", json.dumps(dict(document, format_version=99)).encode(),
+                 "was written by a newer omg"),
+                ("wrong-team", json.dumps(dict(document, config=dict(document["config"],
+                 team_id="other/team"))).encode(), "belongs to a different team"),
+            ):
+                status.unlink(missing_ok=True)
+                if obstruction is not None:
+                    status.write_bytes(obstruction)
+                lock.write_bytes(prior)
+                run(f"push-status-{label}", push, (marker,), fails=True,
+                    inspect=lambda: lock.read_bytes() == prior
+                    and (not status.exists() if obstruction is None else status.read_bytes() == obstruction))
+            status.unlink(missing_ok=True)
+            link_target = here / "status-source"
+            link_target.write_bytes(initial_status)
+            for label in ("directory", "symlink", "fifo"):
+                if label == "directory":
+                    status.mkdir()
+                elif label == "symlink":
+                    status.symlink_to(link_target)
+                else:
+                    os.mkfifo(status, 0o644)
+                lock.write_bytes(prior)
+                run(f"push-status-{label}", push, ("Team status must be a regular file",), fails=True,
+                    inspect=lambda: lock.read_bytes() == prior and link_target.read_bytes() == initial_status)
+                if label == "directory":
+                    status.rmdir()
+                else:
+                    status.unlink()
+            status.write_bytes(initial_status)
+            guard.unlink()
+            guard.mkdir()
+            run("push-status-guard-directory", push, ("Lock path must be a regular file",), fails=True,
+                inspect=lambda: lock.read_bytes() == prior and status.read_bytes() == initial_status)
+            guard.rmdir()
+            guard.touch()
+            os.chown(guard, account.pw_uid, account.pw_gid)
+
+            lock.write_bytes(prior)
+            status.parent.chmod(0o500)
+            try:
+                run("push-status-parent-read-only", push, ("Failed to create temporary file",),
+                    fails=True, inspect=lambda: lock.read_bytes() == prior
+                    and status.read_bytes() == initial_status)
+            finally:
+                status.parent.chmod(0o700)
+
+            for trial in range(4):
+                lock.write_bytes(prior)
+                status.write_bytes(initial_status)
+                with guard.open("rb") as held:
+                    fcntl.flock(held, fcntl.LOCK_EX)
+                    with subprocess.Popen([str(cli), *push], cwd=here, env=isolated, text=True,
+                                          stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                          stderr=subprocess.PIPE, **ordinary) as child:
+                        try:
+                            child.wait(timeout=0.4)
+                            waited = False
+                        except subprocess.TimeoutExpired:
+                            waited = True
+                        stayed = lock.read_bytes() == prior and status.read_bytes() == initial_status
+                        fcntl.flock(held, fcntl.LOCK_UN)
+                        try:
+                            output, errors = child.communicate(timeout=8)
+                        except subprocess.TimeoutExpired:
+                            child.kill()
+                            output, errors = child.communicate()
+                            waited = False
+                checks.append(dict(phase=phase, case=f"push-waits-before-publication-{trial}",
+                                   status=child.returncode, waited=waited, prior_preserved=stayed,
+                                   passed=(waited and stayed and child.returncode == 0 and published()),
+                                   diagnostic=(output + errors)[-1000:]))
+
+            writer.unlink()
+            writer.symlink_to(link_target)
+            lock.write_bytes(prior)
+            status.write_bytes(initial_status)
+            run("push-invalid-workspace-guard", push, ("Lock path must be a regular file",), fails=True,
+                inspect=lambda: lock.read_bytes() == prior and status.read_bytes() == initial_status)
+            writer.unlink()
+            lock.unlink()
+            lock.mkdir()
+            (lock/"kept").write_bytes(prior)
+            run("push-target-directory", push, ("Failed to replace lockfile",), fails=True,
+                inspect=lambda: (lock/"kept").read_bytes() == prior and status.read_bytes() == initial_status)
+            (lock/"kept").unlink()
+            lock.rmdir()
+            run("push-after-obstructions", push, ("Team lock updated",), inspect=published)
+
+            # A status file exactly at the read limit remains usable when its
+            # serialized replacement fits.
+            status.write_bytes(status.read_bytes().ljust(limit, b" "))
+            run("push-status-at-bound", push, ("Team lock updated",), inspect=published)
+
+            for trial in range(3):
+                peer_doc = json.loads(initial_status)
+                peer = dict(peer_doc["members"][0], id=f"peer-{trial}", name=f"Peer {trial}", in_sync=False)
+                peer_doc["members"].append(peer)
+                status.write_text(json.dumps(peer_doc))
+                run(f"push-preserves-peer-{trial}", push, ("Team lock updated",),
+                    inspect=lambda: published() and json.loads(status.read_bytes())["members"][1] == peer)
+
+            run("status-after-repeated-push", ("team", "status"), ("1/2 members in sync",), inspect=published)
+            run("env-check-after-repeated-push", ("env", "check"), ("Environment is in sync",))
+            run("pull-after-repeated-push", ("team", "pull"), ("Environment is in sync",))
+
+
     def inspect_environment_lockfiles():
         phase = "environment-lockfiles"
         with tempfile.TemporaryDirectory(prefix="environment-locks-", dir=work) as directory:
@@ -2729,6 +2894,7 @@ exec {shlex.quote(str(binary))} "$@"
                     inspect_environment_lockfiles()
                     inspect_team_storage()
                     inspect_team_commands()
+                    inspect_team_push_publication()
                 config.write_text(alternate_config)
                 refresh_fixture()
                 expected = ordinary_control([dnf, "--cacheonly", "repoquery",
@@ -3046,6 +3212,6 @@ assert inventory() == before
 report = dict(binaries=binaries, checks=checks, total=len(checks),
               passed=sum(entry["passed"] for entry in checks), host_unchanged=True)
 print(json.dumps(report))
-expected_checks = 303 if consent_oracle is None else 1123
+expected_checks = 303 if consent_oracle is None else 1153
 if report["passed"] != report["total"] or report["total"] != expected_checks:
     sys.exit(4)

@@ -223,6 +223,37 @@ fn atomic_write_file_sync_inner<P: AsRef<Path>, C: AsRef<[u8]>>(
     contents: C,
     private: bool,
 ) -> Result<()> {
+    stage_atomic_write(path, contents.as_ref(), private)?.publish()
+}
+
+pub(crate) struct StagedFileWrite {
+    temporary: tempfile::NamedTempFile,
+    path: PathBuf,
+}
+
+impl StagedFileWrite {
+    pub(crate) fn publish(self) -> Result<()> {
+        self.temporary
+            .persist(&self.path)
+            .map_err(|error| error.error)
+            .with_context(|| format!("Failed to replace {}", self.path.display()))?;
+        // Sync the directory entry as well as the staged file.
+        sync_parent_directory_sync(&self.path)
+    }
+}
+
+pub(crate) fn stage_atomic_write_file_sync(
+    path: &Path,
+    contents: &[u8],
+) -> Result<StagedFileWrite> {
+    stage_atomic_write(path, contents, false)
+}
+
+fn stage_atomic_write(
+    path: impl AsRef<Path>,
+    contents: &[u8],
+    private: bool,
+) -> Result<StagedFileWrite> {
     let path = validate_path_syntax(path)?;
     let parent = path
         .parent()
@@ -280,21 +311,13 @@ fn atomic_write_file_sync_inner<P: AsRef<Path>, C: AsRef<[u8]>>(
     }
     temporary
         .as_file_mut()
-        .write_all(contents.as_ref())
+        .write_all(contents)
         .with_context(|| format!("Failed to write temporary file for {}", path.display()))?;
     temporary
         .as_file_mut()
         .sync_all()
         .with_context(|| format!("Failed to sync temporary file for {}", path.display()))?;
-    temporary
-        .persist(&path)
-        .map_err(|error| error.error)
-        .with_context(|| format!("Failed to replace {}", path.display()))?;
-    // The rename above is only durable once the parent directory entry is
-    // synced; without this, a crash can resurrect the previous version of the
-    // file. https://lwn.net/Articles/457667/
-    sync_parent_directory_sync(&path)?;
-    Ok(())
+    Ok(StagedFileWrite { temporary, path })
 }
 
 #[cfg(test)]

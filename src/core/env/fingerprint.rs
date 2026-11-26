@@ -105,13 +105,23 @@ impl EnvironmentState {
 
     /// Save state to omg.lock file
     pub fn save<P: AsRef<Path>>(&self, path: P) -> Result<()> {
+        self.save_then(path.as_ref(), || Ok(()))
+    }
+
+    /// Run a dependent publication while the workspace writer still owns the lock.
+    pub(crate) fn save_then(
+        &self,
+        path: &Path,
+        publish: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
         let mut normalized = self.clone();
         normalized.schema_version = Self::SCHEMA_VERSION;
         normalized.normalize();
         normalized.hash = normalized.calculate_hash();
         let content = toml::to_string_pretty(&normalized)?;
-        with_lockfile_write(path.as_ref(), |parent| {
-            write_lockfile(path.as_ref(), parent, content.as_bytes())
+        with_lockfile_write(path, |parent| {
+            write_lockfile(path, parent, content.as_bytes())?;
+            publish()
         })
     }
 
