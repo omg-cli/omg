@@ -759,10 +759,17 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     needs: [gate-on-ci, smoke-apt-debian, smoke-apt-ubuntu, smoke-apt-trixie, smoke-arch, smoke-fedora, smoke-macos]
+    # A job-level wildcard can include skipped fallback builders from the
+    # smoke jobs' dependency chains. The smoke jobs admit their own archives.
     if: >-
       ${{ !cancelled() && inputs.smoke_ci_sha == '' &&
-          !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') &&
-          !contains(needs.*.result, 'skipped') }}
+          needs.gate-on-ci.result == 'success' &&
+          needs.smoke-apt-debian.result == 'success' &&
+          needs.smoke-apt-ubuntu.result == 'success' &&
+          needs.smoke-apt-trixie.result == 'success' &&
+          needs.smoke-arch.result == 'success' &&
+          needs.smoke-fedora.result == 'success' &&
+          needs.smoke-macos.result == 'success' }}
     permissions:
       contents: write
       id-token: write
@@ -1119,3 +1126,29 @@ jobs:
             --content-type="text/plain" \
             --cache-control="no-store"
           echo "✓ Updated latest-version → $VERSION"
+
+  verify-publication:
+    name: Verify publication completed
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    needs: [release, sync-r2]
+    if: >-
+      ${{ !cancelled() && inputs.smoke_ci_sha == '' && inputs.smoke_ci_macos != true &&
+          (github.event_name == 'push' ||
+           (github.event_name == 'workflow_dispatch' && inputs.dry_run == 'false')) }}
+    permissions: {}
+    steps:
+      - name: Require release and mirror completion
+        env:
+          SYNC_ONLY: ${{ inputs.sync_existing_tag != '' }}
+          PUBLISH_RESULT: ${{ needs.release.result }}
+          SYNC_RESULT: ${{ needs.sync-r2.result }}
+        run: |
+          if [[ "$SYNC_ONLY" != true && "$PUBLISH_RESULT" != success ]]; then
+            echo "::error::GitHub release publication did not complete ($PUBLISH_RESULT)"
+            exit 1
+          fi
+          if [[ "$SYNC_RESULT" != success ]]; then
+            echo "::error::Cloudflare release sync did not complete ($SYNC_RESULT)"
+            exit 1
+          fi

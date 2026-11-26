@@ -279,8 +279,29 @@ class ReleaseWorkflowBoundaryTests(unittest.TestCase):
         self.assertIn('["arch", "debian", "debian-trixie", "fedora", "macos", "ubuntu"]',
                       step_script(publish, match))
         self.assertIn('sha256sum --strict --check', step_script(publish, match))
-        for state in ('failure', 'cancelled', 'skipped'):
-            self.assertIn(f"!contains(needs.*.result, '{state}')", publish)
+        dependencies = re.search(r'^    needs: \[([^\]]+)\]', publish, re.M)[1].split(', ')
+        condition = publish.split('permissions:', 1)[0]
+        self.assertEqual(re.findall(r"needs\.([\w-]+)\.result == 'success'", condition), dependencies)
+        self.assertNotIn('needs.*.result', condition)
+
+    def test_publish_run_reports_a_skipped_release_or_r2_sync(self):
+        release = (WORKFLOWS / 'release.yml').read_text(encoding='utf-8')
+        completion = job_block(release, 'verify-publication')
+        self.assertIn("inputs.smoke_ci_sha == ''", completion)
+        self.assertIn("inputs.smoke_ci_macos != true", completion)
+        self.assertIn("inputs.dry_run == 'false'", completion)
+        self.assertIn("needs: [release, sync-r2]", completion)
+        script = step_script(completion, 'Require release and mirror completion')
+        for sync_only, publish, sync, expected in (
+            ('false', 'success', 'success', 0), ('false', 'skipped', 'skipped', 1),
+            ('false', 'failure', 'success', 1), ('false', 'success', 'skipped', 1),
+            ('true', 'skipped', 'success', 0), ('true', 'skipped', 'failure', 1),
+        ):
+            with self.subTest(sync_only=sync_only, publish=publish, sync=sync):
+                result = subprocess.run([BASH, '-eu', '-o', 'pipefail', '-c', script], capture_output=True,
+                                        text=True, timeout=5, env=dict(os.environ, SYNC_ONLY=sync_only,
+                                            PUBLISH_RESULT=publish, SYNC_RESULT=sync))
+                self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
 
     def test_archive_stage_requires_macos_for_publication_and_explicit_smoke(self):
         release = (WORKFLOWS / 'release.yml').read_text(encoding='utf-8')
