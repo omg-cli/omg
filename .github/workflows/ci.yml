@@ -1232,7 +1232,7 @@ jobs:
           # Diagnostic output paths contain run IDs, not compiler settings.
           RUSTUP_DIAGNOSTICS_DIR: ""
         with:
-          prefix-key: ${{ matrix.platform == 'debian' && 'v2-platform-dependencies' || 'v3-platform-dependencies' }}
+          prefix-key: v2-platform-dependencies
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' && matrix.phase == 'validation' }}
           # Never restore across distro ABI or feature contracts. The action
@@ -2008,7 +2008,7 @@ jobs:
         env:
           ZSTD_CLEVEL: "6"
         with:
-          prefix-key: "v2-ubuntu-debian"
+          prefix-key: "v1-ubuntu-debian"
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
 

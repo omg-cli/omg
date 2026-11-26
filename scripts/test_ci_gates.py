@@ -130,6 +130,12 @@ class NativePhaseMatrixTests(unittest.TestCase):
         self.assertIn('cat "$source/cargo-config.toml"', prepare)
         self.assertIn('} >> "$config"', prepare)
 
+    def test_native_profiles_keep_existing_compatible_cache_names(self) -> None:
+        self.assertIn("          prefix-key: v2-platform-dependencies\n", self.steps["Cache Rust dependencies"])
+        ubuntu = job_block(self.workflow, "ubuntu")
+        cache = ubuntu.split("      - name: Setup cache\n", 1)[1].split("\n      - name:", 1)[0]
+        self.assertIn('          prefix-key: "v1-ubuntu-debian"\n', cache)
+
     def test_cache_keeps_compatibility_hash_without_run_specific_diagnostics_or_extra_writers(self) -> None:
         cache = self.steps["Cache Rust dependencies"]
         self.assertIn("          RUSTUP_DIAGNOSTICS_DIR: \"\"\n", cache)
