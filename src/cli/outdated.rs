@@ -281,6 +281,24 @@ mod tests {
     }
 
     #[test]
+    fn multilib_rows_keep_their_names_in_json_and_distinct_terminal_labels() {
+        for (architecture, label) in [("i686", "lib.i686"), ("x86_64", "lib.x86_64")] {
+            let package = OutdatedPackage {
+                name: "lib".into(),
+                architecture: Some(architecture.into()),
+                current_version: "1-1".into(),
+                new_version: "2-1".into(),
+                update_type: UpdateType::Unknown,
+                repo: "updates".into(),
+            };
+            assert_eq!(package.package_label(), label);
+            let row = serde_json::to_value(package).expect("multilib update row");
+            assert_eq!(row["name"], "lib");
+            assert_eq!(row["architecture"], architecture);
+        }
+    }
+
+    #[test]
     fn classify_update_uses_version_change_not_cve_status() {
         assert!(matches!(
             classify_update("1.0.0", "2.0.0"),

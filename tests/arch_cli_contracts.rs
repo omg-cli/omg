@@ -675,12 +675,22 @@ fn outdated_reports_empty_and_populated_arch_inventory_in_both_formats() -> Resu
             db.display()
         ),
     )?;
-    project.mock_install("git", "2.43.0")?;
-    project.mock_available("git", "2.43.0")?;
+    let upgrades = [
+        ("bash", "5.2", "5.3", "Unknown"),
+        ("curl", "7.0.0", "8.0.0", "Major"),
+        ("git", "2.43.0", "2.44.0", "Minor"),
+        ("ripgrep", "14.0.0", "14.0.1", "Patch"),
+    ];
+    for (package, installed, _, _) in upgrades {
+        project.mock_install(package, installed)?;
+        project.mock_available(package, installed)?;
+    }
     let args: [&[&str]; 2] = [&["outdated"], &["--json", "outdated"]];
     for populated in [false, true] {
         if populated {
-            project.mock_available("git", "2.44.0")?;
+            for (package, _, available, _) in upgrades {
+                project.mock_available(package, available)?;
+            }
         }
         for args in args {
             let output = project.run_with_env(
@@ -709,12 +719,16 @@ fn outdated_reports_empty_and_populated_arch_inventory_in_both_formats() -> Resu
             assert!(output.success, "{}", output_text(&output));
             if args[0] == "--json" {
                 let rows: Vec<serde_json::Value> = serde_json::from_str(&output.stdout)?;
-                assert_eq!(rows.len(), usize::from(populated));
+                assert_eq!(rows.len(), if populated { upgrades.len() } else { 0 });
                 if populated {
-                    assert_eq!(rows[0]["name"], "git");
-                    assert_eq!(rows[0]["current_version"], "2.43.0");
-                    assert_eq!(rows[0]["new_version"], "2.44.0");
-                    assert_eq!(rows[0]["repo"], "extra");
+                    for (row, (package, installed, available, kind)) in rows.iter().zip(upgrades) {
+                        assert_eq!(row["name"], package);
+                        assert_eq!(row["current_version"], installed);
+                        assert_eq!(row["new_version"], available);
+                        assert_eq!(row["update_type"], kind);
+                        assert!(row.get("architecture").is_none());
+                    }
+                    assert_eq!(rows[2]["repo"], "extra");
                 }
             } else {
                 let text = output_text(&output);
@@ -727,7 +741,20 @@ fn outdated_reports_empty_and_populated_arch_inventory_in_both_formats() -> Resu
                     "{text}"
                 );
                 if populated {
-                    assert!(text.contains("git") && text.contains("2.44.0"), "{text}");
+                    for (package, installed, available, _) in upgrades {
+                        assert!(
+                            text.contains(&format!("{package} {installed} → {available}")),
+                            "{text}"
+                        );
+                    }
+                    for heading in [
+                        "Major Updates",
+                        "Minor Updates",
+                        "Patch Updates",
+                        "Other Updates",
+                    ] {
+                        assert!(text.contains(heading), "{text}");
+                    }
                 }
             }
         }
