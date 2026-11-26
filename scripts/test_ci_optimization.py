@@ -800,6 +800,10 @@ git() { printf '%040d\\n' 1; }
                     binary = root / 'omg'
                     binary.write_text(textwrap.dedent('''\
                         #!/usr/bin/env bash
+                        if [[ "${OMG_DISABLE_TELEMETRY:-}" != 1 ]]; then
+                            echo 'Smoke CLI ran without an explicit telemetry opt-out' >&2
+                            exit 1
+                        fi
                         printf 'omg %s\\n' "$*" >> "$CALLS"
                         case "$1" in
                           search) printf '%s\\n' "$2" ;;
@@ -813,6 +817,7 @@ git() { printf '%040d\\n' 1; }
                     if ready:
                         args.append('--metadata-ready')
                     result = subprocess.run(args, cwd=root, env=dict(os.environ, CALLS=str(calls),
+                                            OMG_TELEMETRY='1', OMG_DISABLE_TELEMETRY='0',
                                             PATH=f'{root}{os.pathsep}{os.environ["PATH"]}'),
                                             capture_output=True, text=True, timeout=10)
                     self.assertEqual(result.returncode, 0, result.stderr)
@@ -820,6 +825,10 @@ git() { printf '%040d\\n' 1; }
                     expected = ['omg --version'] + ([] if ready else [refresh])
                     expected += [search, f'omg info {package}', 'omg status', 'omg outdated --json', 'omg doctor']
                     self.assertEqual(calls.read_text().splitlines(), expected)
+
+    def test_distro_systemd_smoke_disables_runtime_telemetry(self):
+        lifecycle = step_script('distro-e2e.yml', 'Verify omgd lifecycle and socket IPC on real systemd host')
+        self.assertIn('export OMG_DISABLE_TELEMETRY=1\n', lifecycle)
 
     def test_region_artifact_survives_downstream_comparison_failure_with_short_retention(self):
         text = (WORKFLOWS / 'coverage.yml').read_text()

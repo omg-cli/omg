@@ -327,24 +327,33 @@ test -f "$SYNC/started" || { echo 'admission did not overlap the harness' >&2; e
         segment = script[start:harness] + fake_harness + script[end_harness:end]
         for status in (0, 23):
             with self.subTest(status=status), tempfile.TemporaryDirectory() as directory:
-                stub = r'''
-unshare() {
-  : > "$SYNC/started"
-  for ((attempt=0; attempt<100; attempt++)); do
-    if test -f "$SYNC/harness-ran"; then break; fi
-    sleep .01
-  done
-  test -f "$SYNC/harness-ran" || exit 42
-  : > "$SYNC/admission-finished"
-  exit "$ADMISSION_STATUS"
-}
-'''
+                stub = Path(directory) / 'unshare'
+                stub.write_text('''#!/usr/bin/env python3
+import os, signal, sys, time
+from pathlib import Path
+
+sync = Path(os.environ['SYNC'])
+(sync / 'started').touch()
+for _ in range(100):
+    if (sync / 'harness-ran').exists():
+        break
+    time.sleep(.01)
+else:
+    sys.exit(42)
+if (signal.getsignal(signal.SIGINT) != signal.default_int_handler
+        or signal.getsignal(signal.SIGQUIT) != signal.SIG_DFL):
+    sys.exit('Background admission inherited ignored terminal signals')
+(sync / 'admission-finished').touch()
+sys.exit(int(os.environ['ADMISSION_STATUS']))
+''')
+                stub.chmod(0o755)
                 result = subprocess.run(
                     [BASH, '-euo', 'pipefail', '-c',
-                     stub + segment.replace('/evidence/cli/fresh-admission.json',
+                     segment.replace('/evidence/cli/fresh-admission.json',
                                             '"$SYNC/admission.json"')
                      + 'test -f "$SYNC/admission-finished"\n: > "$SYNC/later-phase"\n'],
-                    env=dict(os.environ, SYNC=directory, ADMISSION_STATUS=str(status)),
+                    env=dict(os.environ, SYNC=directory, ADMISSION_STATUS=str(status),
+                             PATH=f'{directory}{os.pathsep}{os.environ["PATH"]}'),
                     capture_output=True, text=True, timeout=5)
                 self.assertEqual(result.returncode, status, result.stderr)
                 self.assertTrue((Path(directory) / 'admission-finished').exists())

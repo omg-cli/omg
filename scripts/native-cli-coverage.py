@@ -2223,7 +2223,8 @@ for role in @@HARNESS_ROLES@@; do
     /omg-extra-bin/"$role" --list --format terse > /evidence/cli/registry-"$role".txt 2>&1
 done
 # Keep the full consent timeout while the independent native harnesses run.
-unshare --mount --net --fork --kill-child bash -euo pipefail -c '
+# Bash otherwise starts background jobs with SIGINT and SIGQUIT ignored.
+env --default-signal=INT,QUIT unshare --mount --net --fork --kill-child bash -euo pipefail -c '
   mount --make-rprivate /
   mount -t tmpfs -o nosuid,nodev,mode=1777 tmpfs /var/tmp
   ip link set lo up
