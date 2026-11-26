@@ -36,8 +36,8 @@ fn output_text(output: &CommandResult) -> String {
 async fn native_daemon_supplies_info_and_prompt_counters() -> Result<()> {
     use futures::{SinkExt, StreamExt};
     use omg_lib::daemon::protocol::{
-        DetailedPackageInfo, ExplicitResult, Request, Response, ResponseResult, StatusResult,
-        WirePackageSource, encode_frame, split_frame,
+        DetailedPackageInfo, ExplicitResult, PackageInfo, Request, Response, ResponseResult,
+        SearchResult, StatusResult, WirePackageSource, encode_frame, split_frame,
     };
     use std::os::unix::fs::PermissionsExt as _;
     use std::time::Duration;
@@ -56,7 +56,14 @@ async fn native_daemon_supplies_info_and_prompt_counters() -> Result<()> {
     omg_lib::core::client::validate_socket_with_context(&socket)?;
     let listener = tokio::net::UnixListener::bind(&socket)?;
     let server = tokio::spawn(async move {
-        for command in ["application", "repository-only", "oc", "ec", "explicit"] {
+        for command in [
+            "application",
+            "repository-only",
+            "oc",
+            "ec",
+            "explicit",
+            "search",
+        ] {
             let (stream, _) =
                 tokio::time::timeout(Duration::from_secs(5), listener.accept()).await??;
             let mut frames = Framed::new(stream, LengthDelimitedCodec::new());
@@ -97,6 +104,25 @@ async fn native_daemon_supplies_info_and_prompt_counters() -> Result<()> {
                         packages: vec!["private-explicit-fixture".into()],
                     })
                 }
+                (
+                    "search",
+                    Request::Search {
+                        query,
+                        limit: Some(2),
+                        ..
+                    },
+                ) if query == "fixture" => ResponseResult::Search(SearchResult {
+                    packages: ["fixture-addon", "fixture"]
+                        .into_iter()
+                        .map(|name| PackageInfo {
+                            name: name.into(),
+                            version: "1.0-1".into(),
+                            description: "Private daemon search fixture".into(),
+                            source: WirePackageSource::Official,
+                        })
+                        .collect(),
+                    total: 2,
+                }),
                 (command, request) => {
                     anyhow::bail!("unexpected private daemon request for {command}: {request:?}")
                 }
@@ -124,6 +150,24 @@ async fn native_daemon_supplies_info_and_prompt_counters() -> Result<()> {
                 output.stdout
             );
         }
+        let search = project.run_native_arch_daemon_query(
+            &socket,
+            &["search", "fixture", "--no-aur", "--limit", "2"],
+        );
+        search.assert_success();
+        let exact = search
+            .stdout
+            .lines()
+            .position(|line| line.split_whitespace().next() == Some("fixture"));
+        let addon = search
+            .stdout
+            .lines()
+            .position(|line| line.split_whitespace().next() == Some("fixture-addon"));
+        assert!(
+            matches!((exact, addon), (Some(exact), Some(addon)) if exact < addon),
+            "{}",
+            search.stdout
+        );
         assert_eq!(private_fixture_state(project.pacman_root.path())?, before);
         Ok((text, json))
     })
@@ -142,6 +186,84 @@ async fn native_daemon_supplies_info_and_prompt_counters() -> Result<()> {
     assert_eq!(json["name"], "repository-only");
     assert_eq!(json["version"], "9.9-1");
     assert_eq!(json["installed"], false);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn dashboard_search_accepts_rows_from_a_local_daemon() -> anyhow::Result<()> {
+    use futures::{SinkExt, StreamExt};
+    use omg_lib::cli::tui::app::App;
+    use omg_lib::daemon::protocol::{
+        PackageInfo, Request, Response, ResponseResult, SearchResult, WirePackageSource,
+        encode_frame, split_frame,
+    };
+    use std::os::unix::fs::PermissionsExt as _;
+    use tokio_util::codec::{Framed, LengthDelimitedCodec};
+
+    const CHILD: &str = "OMG_TUI_DAEMON_SEARCH_CHILD";
+    if let Some(socket) = std::env::var_os(CHILD) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        return runtime.block_on(async {
+            let listener = tokio::net::UnixListener::bind(socket)?;
+            let server = async {
+                let (stream, _) = listener.accept().await?;
+                let mut frames = Framed::new(stream, LengthDelimitedCodec::new());
+                let frame = frames.next().await.context("missing dashboard query")??;
+                let (_, payload) = split_frame(&frame)?;
+                let request: Request = bitcode::deserialize(payload)?;
+                assert!(matches!(&request, Request::Search { query, limit: Some(50), .. } if query == "fixture"));
+                let response = Response::Success {
+                    id: request.id(),
+                    result: ResponseResult::Search(SearchResult {
+                        packages: vec![PackageInfo {
+                            name: "daemon-only-fixture".into(),
+                            version: "1.2.3-1".into(),
+                            description: "Dashboard IPC fixture".into(),
+                            source: WirePackageSource::Official,
+                        }],
+                        total: 1,
+                    }),
+                };
+                frames.send(encode_frame(&response)?.into()).await?;
+                anyhow::Ok(())
+            };
+            let (rows, ()) = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                async { tokio::try_join!(App::search_packages("fixture"), server) },
+            ).await??;
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].name, "daemon-only-fixture");
+            assert_eq!(rows[0].repo, "official");
+            assert_eq!(rows[0].description, "Dashboard IPC fixture");
+            Ok(())
+        });
+    }
+
+    if !common::native_arch_fixture_available() {
+        return Ok(());
+    }
+    let directory = tempfile::Builder::new()
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir_in("/tmp")?;
+    let socket = directory.path().join("daemon.sock");
+    let output = std::process::Command::new(std::env::current_exe()?)
+        .args([
+            "--exact",
+            "dashboard_search_accepts_rows_from_a_local_daemon",
+        ])
+        .env(CHILD, &socket)
+        .env("OMG_SOCKET_PATH", &socket)
+        .env_remove("OMG_DISABLE_DAEMON")
+        .env_remove("OMG_TEST_MODE")
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
     Ok(())
 }
 

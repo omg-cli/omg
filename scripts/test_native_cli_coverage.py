@@ -832,7 +832,7 @@ with socket.socket(socket.AF_UNIX) as server:
                 else:
                     self.assertFalse(passed.exists(), 'Missing profiles must not be reported as a passed native fixture')
 
-    def test_supplemental_cli_execution_precedes_the_state_mount(self):
+    def test_supplemental_cli_execution_is_isolated_from_the_container_state_mount(self):
         workflow = (ROOT / '.github/workflows/coverage.yml').read_text()
         native = workflow.split('      - name: Cover sandbox descendant cancellation\n', 1)[1]
         native = native.split('\n      - name:', 1)[0]
@@ -841,8 +841,12 @@ with socket.socket(socket.AF_UNIX) as server:
         self.assertIn('--native-cli-coverage-dir', native)
         self.assertNotIn('python /native-cli-coverage.py run', native)
         self.assertIn('python3 scripts/native-cli-coverage.py verify', native)
-        self.assertLess(native.index('--native-cli-coverage-dir'),
-                        native.index('docker start --attach'))
+        container = native.split('container=$(docker create ', 1)[1]
+        options, guest = container.split('omg-coverage-sandbox /bin/bash', 1)
+        self.assertNotRegex(options, r'--(?:privileged|mount|volume|pid|volumes-from)\b|(?:^|\s)-v\b')
+        guest = guest.split('docker cp "$binary"', 1)[0]
+        self.assertIn('mount -t tmpfs -o nosuid,nodev,noexec,mode=755 tmpfs /var/lib', guest)
+        self.assertNotIn('--native-cli-coverage-dir', guest)
 
     def test_missing_runtime_directory_keeps_the_lock_private(self):
         names = {'omarchy-runtime-fallback', 'omarchy-runtime-foreign-lock'}

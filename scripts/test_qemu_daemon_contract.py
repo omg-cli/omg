@@ -198,18 +198,23 @@ fi
         function = source[begin:end]
         search = [{'name': 'bash', 'version': '5.3', 'description': 'Shell', 'source': 'Official'}]
         info = {'name': 'bash', 'version': '5.3', 'description': 'Shell', 'installed': True}
-        cases = [(search, info, search, info, True)]
+        dnf_search = [dict(search[0], source='DNF')]
+        cases = [('arch', search, info, search, info, True),
+                 ('fedora', search, info, search, info, True),
+                 ('fedora', dnf_search, info, dnf_search, info, True),
+                 ('fedora', dnf_search, info, search, info, False),
+                 ('arch', dnf_search, info, dnf_search, info, False)]
         cases += [
-            ([], info, search, info, False),
-            (search, dict(info, version='wrong'), search, info, False),
-            (search, info, search, dict(info, installed=False), False),
-            (search + search, info, search, info, False),
-            ([dict(search[0], source='AUR')], info, search, info, False),
-            (search, info, [dict(search[0], description='')], info, False),
-            (search, info, search, {'name': 'other', **{key: value for key, value in info.items() if key != 'name'}}, False),
+            ('arch', [], info, search, info, False),
+            ('arch', search, dict(info, version='wrong'), search, info, False),
+            ('arch', search, info, search, dict(info, installed=False), False),
+            ('arch', search + search, info, search, info, False),
+            ('arch', [dict(search[0], source='AUR')], info, search, info, False),
+            ('arch', search, info, [dict(search[0], description='')], info, False),
+            ('arch', search, info, search, dict(info, name='other'), False),
         ]
-        for daemon_search, daemon_info, direct_search, direct_info, passed in cases:
-            with self.subTest(daemon_search=daemon_search, daemon_info=daemon_info,
+        for distro, daemon_search, daemon_info, direct_search, direct_info, passed in cases:
+            with self.subTest(distro=distro, daemon_search=daemon_search, daemon_info=daemon_info,
                               direct_search=direct_search, direct_info=direct_info), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 for name, value in [('daemon-search', daemon_search), ('daemon-info', daemon_info),
@@ -217,7 +222,7 @@ fi
                     (root / name).write_text(json.dumps(value))
                 result = subprocess.run(
                     [BASH, '-c', function + '\ncheck_package_query_outputs bash daemon-search daemon-info direct-search direct-info'],
-                    cwd=root, capture_output=True, text=True, timeout=10)
+                    cwd=root, env=dict(os.environ, ID=distro), capture_output=True, text=True, timeout=10)
                 self.assertEqual(result.returncode == 0, passed, result.stderr)
 
     @unittest.skipIf(os.name == 'nt', 'text info oracle requires POSIX bash')
@@ -291,7 +296,9 @@ fi
             if identity != 'bash':
                 search += [dict(search[0], name='bash', version='5.3.10-1.fc44')]
             native = {'name': identity, 'version': version, 'description': 'The GNU Bourne Again shell', 'source': 'Official', 'installed': True}
-            daemon = dict(native, download_size=0)
+            if identity != 'bash':
+                native['source'] = 'rpm_database'
+            daemon = dict(native, download_size=0, repo='@System' if identity != 'bash' else 'core')
             cases = [(daemon, native, search, search, True)]
             if identity != 'bash':
                 cases += [(dict(daemon, name='bash'), native, search, search, False),
@@ -313,7 +320,8 @@ fi
                         (root / ('daemon-' + mode + '-info.txt')).write_text(
                             '\n          Name: ' + info['name'] + '\n     Installed: yes\n')
                     result = subprocess.run([BASH, '-c', functions + probe],
-                                            env=dict(os.environ, evidence=directory, package_identity=identity),
+                                            env=dict(os.environ, evidence=directory, package_identity=identity,
+                                                     ID='fedora' if identity != 'bash' else 'arch'),
                                             cwd=root, capture_output=True, text=True, timeout=10)
                     self.assertEqual(result.returncode == 0, passed, result.stderr)
 
@@ -367,21 +375,31 @@ fi
         native = {'name': 'bash', 'version': '1', 'description': 'shell', 'installed': True}
         fedora_native = {**native, 'source': 'Official'}
         daemon = {**native, 'source': 'Official', 'repo': 'core', 'download_size': 0}
-        for daemon_output, native_output, passed in [
-            (daemon, native, True),
-            (daemon, fedora_native, True),
-            (native, native, False),
-            (fedora_native, fedora_native, False),
-            (daemon, daemon, False),
-            ({**daemon, 'source': 'AUR'}, native, False),
+        legacy_fedora = {**daemon, 'repo': 'official'}
+        rpm_native = {**native, 'source': 'rpm_database'}
+        rpm_daemon = {**rpm_native, 'repo': '@System', 'download_size': 0}
+        for distro, daemon_output, native_output, passed in [
+            ('arch', daemon, native, True),
+            ('fedora', legacy_fedora, fedora_native, True),
+            ('fedora', rpm_daemon, rpm_native, True),
+            ('fedora', rpm_daemon, {**rpm_native, 'download_size': None}, False),
+            ('fedora', rpm_native, rpm_native, False),
+            ('fedora', rpm_daemon, fedora_native, False),
+            ('fedora', {**rpm_daemon, 'repo': ''}, rpm_native, False),
+            ('fedora', {**rpm_daemon, 'source': 'dnf_repository'}, rpm_native, False),
+            ('fedora', daemon, fedora_native, False),
+            ('arch', rpm_daemon, rpm_native, False),
+            ('arch', native, native, False),
+            ('arch', daemon, daemon, False),
+            ('arch', {**daemon, 'source': 'AUR'}, native, False),
         ]:
-            with self.subTest(daemon=daemon_output, native=native_output), tempfile.TemporaryDirectory() as directory:
+            with self.subTest(distro=distro, daemon=daemon_output, native=native_output), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 (root / 'daemon.json').write_text(json.dumps(daemon_output))
                 (root / 'native.json').write_text(json.dumps(native_output))
                 result = subprocess.run(
                     [BASH, '-c', function + '\ncheck_daemon_info_provenance daemon.json native.json'],
-                    cwd=root, capture_output=True, text=True, timeout=10)
+                    cwd=root, env=dict(os.environ, ID=distro), capture_output=True, text=True, timeout=10)
                 self.assertEqual(result.returncode == 0, passed, result.stderr)
 
     def test_shell_startup_does_not_skip_this_users_ipc_check_for_another_process(self):

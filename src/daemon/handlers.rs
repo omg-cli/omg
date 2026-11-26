@@ -77,6 +77,17 @@ async fn load_observed_index(
     manager: Arc<dyn PackageManager>,
     budget: Arc<tokio::sync::Semaphore>,
 ) -> anyhow::Result<(PackageIndex, Option<Arc<dyn InstalledCatalogObservation>>)> {
+    #[cfg(feature = "fedora")]
+    if let Some((packages, observation)) = manager.observed_package_index().await? {
+        let name_kind = crate::package_managers::SearchNameKind::for_manager(
+            manager.name(),
+            crate::core::paths::test_mode(),
+        );
+        return Ok((
+            PackageIndex::from_packages(packages, name_kind),
+            Some(observation),
+        ));
+    }
     for _ in 0..3 {
         let observation = observe_catalog(Arc::clone(&manager), Arc::clone(&budget), |manager| {
             manager.package_index_observation()
@@ -513,6 +524,8 @@ impl DaemonState {
             .installed_observation
             .clone();
         match observation {
+            #[cfg(feature = "fedora")]
+            Some(ref observation) if observation.search_index_expired() => Ok(true),
             Some(observation) => Ok(!installed_catalog_is_current(
                 observation,
                 Arc::clone(&self.catalog_observation_budget),
@@ -1274,10 +1287,10 @@ async fn handle_info(state: Arc<DaemonState>, id: RequestId, package: String) ->
                 url: String::new(), // info.url not in Package struct currently
                 size: 0,
                 download_size: 0,
-                repo: if cache_info {
-                    String::new()
+                repo: if !cache_info && info.installed {
+                    super::protocol::DNF_SYSTEM_REPO.into()
                 } else {
-                    "official".into()
+                    String::new()
                 },
                 depends: Vec::new(),
                 licenses: Vec::new(),
@@ -2757,7 +2770,7 @@ pub(super) mod tests {
                 assert_eq!(info.version, "5.3.9-3", "{query}/{cache_seed}");
                 assert_eq!(info.description, "Installed RPM metadata");
                 assert_eq!(info.source, WirePackageSource::Official);
-                assert_eq!(info.repo, "official");
+                assert_eq!(info.repo, crate::daemon::protocol::DNF_SYSTEM_REPO);
             }
         }
         Ok(())
@@ -2850,7 +2863,7 @@ pub(super) mod tests {
             assert_eq!(info.version, "2.0-2");
             assert_eq!(info.description, "Current available repository metadata");
             assert_eq!(info.source, WirePackageSource::Official);
-            assert_eq!(info.repo, "official");
+            assert!(info.repo.is_empty());
         }
         Ok(())
     }
@@ -2957,6 +2970,7 @@ pub(super) mod tests {
     pub(in crate::daemon) enum PausedLookup {
         Info,
         Explicit,
+        Status,
     }
 
     pub(in crate::daemon) struct PausedInfoBackend {
@@ -3000,7 +3014,14 @@ pub(super) mod tests {
             self.inner.list_installed()
         }
         fn get_status(&self, fast: bool) -> BackendFuture<'_, (usize, usize, usize, usize)> {
-            self.inner.get_status(fast)
+            Box::pin(async move {
+                let result = self.inner.get_status(fast).await;
+                if matches!(self.lookup, PausedLookup::Status) {
+                    self.started.notify_one();
+                    self.resume.notified().await;
+                }
+                result
+            })
         }
         fn list_explicit(&self) -> BackendFuture<'_, Vec<String>> {
             Box::pin(async move {
@@ -3142,6 +3163,9 @@ pub(super) mod tests {
             backend.started.notified(),
         )
         .await?;
+        let counts = tokio::time::timeout(std::time::Duration::from_secs(5), state.status_counts())
+            .await??;
+        assert_eq!(counts, (1, 1, 0, 0));
         backend.inner.remove(&["old-package".into()]).await?;
         backend.inner.set_installed_version("fresh-package", "2")?;
         state.replace_index(

@@ -514,6 +514,7 @@ mod dnf_integration {
                 assert_eq!(actual["name"], info.name);
                 assert_eq!(actual["version"], info.version.to_string());
                 assert_eq!(actual["installed"], false);
+                assert_eq!(actual["source"], "dnf_repository");
             } else {
                 let actual = std::str::from_utf8(&output.stdout)?;
                 assert!(
@@ -523,6 +524,12 @@ mod dnf_integration {
                 assert!(
                     actual.contains(&info.version.to_string()),
                     "missing version: {actual}"
+                );
+                assert!(
+                    actual
+                        .lines()
+                        .any(|line| line.trim() == "Source: Configured DNF repository"),
+                    "missing DNF repository source: {actual}"
                 );
                 assert!(
                     actual
@@ -730,6 +737,11 @@ mod dnf_integration {
             text.contains(&name) && text.contains(&version),
             "native installed metadata absent: {text}"
         );
+        assert!(
+            text.lines()
+                .any(|line| line.trim() == "Source: Installed RPM database"),
+            "missing installed RPM database source: {text}"
+        );
         Ok(())
     }
 
@@ -864,6 +876,7 @@ mod dnf_integration {
         assert_eq!(value["name"], name);
         assert_eq!(value["version"], version);
         assert_eq!(value["installed"], true);
+        assert_eq!(value["source"], "rpm_database");
         Ok(())
     }
 
@@ -2096,6 +2109,23 @@ mod dnf_rpm_database {
 mod dnf_operations {
     use super::*;
 
+    #[test]
+    fn test_cache_cleanup_preview_declares_downloaded_archives() -> Result<()> {
+        let output = std::process::Command::new(assert_cmd::cargo::cargo_bin!("omg"))
+            .args(["clean", "--cache", "--dry-run"])
+            .env("NO_COLOR", "1")
+            .output()?;
+        let stdout = std::str::from_utf8(&output.stdout)?;
+        assert!(output.status.success(), "{output:?}");
+        assert!(
+            stdout.contains("Clean Preview\n    Downloaded package archives"),
+            "{stdout}"
+        );
+        assert!(stdout.contains("Would clear downloaded package archives (dnf clean packages)"));
+        assert!(stdout.contains("No changes made (dry run)"));
+        Ok(())
+    }
+
     #[tokio::test]
     #[ignore = "requires a disposable VM; installs and removes an orphan fixture"]
     async fn test_orphan_cleanup_history() -> Result<()> {
@@ -2125,6 +2155,7 @@ mod dnf_operations {
         let run = |args: &[&str], answer: &[u8]| -> Result<std::process::Output> {
             let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin!("omg"))
                 .env("OMG_DATA_DIR", fixture.path())
+                .env("NO_COLOR", "1")
                 .args(args)
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
@@ -2174,9 +2205,10 @@ mod dnf_operations {
             );
             let preview_stdout = String::from_utf8_lossy(&preview.stdout);
             anyhow::ensure!(
-                preview_stdout
-                    .lines()
-                    .any(|line| line.trim() == "Removing:")
+                preview_stdout.contains("Clean Preview\n    Unneeded packages")
+                    && preview_stdout
+                        .lines()
+                        .any(|line| line.trim() == "Removing:")
                     && preview_stdout.lines().any(|line| {
                         line.split_ascii_whitespace()
                             .take(3)
@@ -2184,34 +2216,42 @@ mod dnf_operations {
                     }),
                 "Preview omitted the exact native removal row: {preview_stdout}"
             );
-            let decline = run(&["clean", "--orphans"], b"n\n")?;
-            anyhow::ensure!(
-                decline.status.code() == Some(1) && installed()?,
-                "Native decline did not preserve the fixture"
-            );
-            let declined = history.load()?;
-            anyhow::ensure!(
-                declined.len() == 1 && !declined[0].success && declined[0].changes.is_empty(),
-                "Unexpected decline history: {declined:?}; stderr: {}",
-                String::from_utf8_lossy(&decline.stderr)
-            );
+            for (attempt, answer) in [b"n\n".as_slice(), b"\n"].into_iter().enumerate() {
+                let decline = run(&["clean", "--orphans"], answer)?;
+                anyhow::ensure!(
+                    decline.status.code() == Some(1) && installed()?,
+                    "Native decline did not preserve the fixture for input {answer:?}"
+                );
+                let declined = history.load()?;
+                anyhow::ensure!(
+                    declined.len() == attempt + 1
+                        && declined
+                            .iter()
+                            .all(|entry| !entry.success && entry.changes.is_empty()),
+                    "Unexpected decline history: {declined:?}; stderr: {}",
+                    String::from_utf8_lossy(&decline.stderr)
+                );
+            }
             let accepted = run(&["clean", "--orphans"], b"y\n")?;
             anyhow::ensure!(
                 accepted.status.success() && !installed()?,
                 "Accepted cleanup did not remove the orphan"
             );
+            assert!(
+                std::str::from_utf8(&accepted.stdout)?.contains("Clean\n    Unneeded packages")
+            );
             let records = history.load()?;
             anyhow::ensure!(
-                records.len() == 2
-                    && records[1].success
-                    && records[1].transaction_type == TransactionType::Remove,
+                records.len() == 3
+                    && records[2].success
+                    && records[2].transaction_type == TransactionType::Remove,
                 "Missing cleanup history"
             );
             anyhow::ensure!(
-                records[1].changes.len() == 1
-                    && records[1].changes[0].name == "tree"
-                    && records[1].changes[0].old_version.as_deref() == Some(version)
-                    && records[1].changes[0].new_version.is_none(),
+                records[2].changes.len() == 1
+                    && records[2].changes[0].name == "tree"
+                    && records[2].changes[0].old_version.as_deref() == Some(version)
+                    && records[2].changes[0].new_version.is_none(),
                 "Cleanup history differs from native removal"
             );
             anyhow::ensure!(
@@ -2223,7 +2263,7 @@ mod dnf_operations {
                 "Cache cleanup failed"
             );
             anyhow::ensure!(
-                history.load()?.len() == 2,
+                history.load()?.len() == 3,
                 "Empty or cache cleanup invented package history"
             );
             Ok(())

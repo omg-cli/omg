@@ -13,6 +13,15 @@ use anyhow::Result;
 
 pub(crate) use crate::core::packages::search::validate_search_query;
 
+pub(crate) const fn dnf_search_label(
+    backend: crate::package_managers::Backend,
+) -> Option<&'static str> {
+    match backend {
+        crate::package_managers::Backend::Fedora => Some("DNF"),
+        _ => None,
+    }
+}
+
 #[cfg(feature = "fedora")]
 pub(super) fn print_dnf_preview(plan: &str, diagnostics: &str) {
     for line in plan.lines() {

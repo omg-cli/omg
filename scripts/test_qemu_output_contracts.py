@@ -426,12 +426,13 @@ class OutputContracts(unittest.TestCase):
                     result = self.run_oracle(assertion=f'update-{mode}-output', stdout=output)
                     self.assertNotEqual(result.returncode, 0, 'Formatting normalization cannot replace required update evidence')
 
-    def test_fedora_firefox_requires_one_exact_compatible_official_identity(self):
+    def test_fedora_firefox_requires_one_exact_compatible_native_identity(self):
         showrc = 'compatible archs : x86_64 noarch i686\n'
         header = '  | Search\n    firefox\n'
-        for name in ('firefox', 'firefox.x86_64', 'firefox.noarch', 'firefox.i686'):
-            output = header + f'  {name} 157.0.1-1.fc44  Official\n  firefox-langpacks.x86_64 157.0.1-1.fc44  Official\n'
-            with self.subTest(name=name):
+        for name, source in (('firefox', 'Official'), ('firefox.x86_64', 'DNF'),
+                             ('firefox.noarch', 'DNF'), ('firefox.i686', 'DNF')):
+            output = header + f'  {name} 157.0.1-1.fc44  {source}\n  firefox-langpacks.x86_64 157.0.1-1.fc44  {source}\n'
+            with self.subTest(name=name, source=source):
                 result = self.run_oracle(assertion='search-firefox-results', distro='fedora', stdout=output, rpm_showrc=showrc)
                 self.assertEqual(result.returncode, 0, result.stderr)
         good = header + '  firefox.x86_64 157.0.1-1.fc44  Official\n'
@@ -484,10 +485,14 @@ class OutputContracts(unittest.TestCase):
     @unittest.skipIf(os.name == 'nt', 'Full receiver needs POSIX shell descriptors')
     def test_fedora_info_accepts_native_identity_and_bare_published_base(self):
         row = 'info\t["info","pacman"]\tread\t0\tpass\t-\thermetic\thermetic:pass\tinfo-native-package\ttempdir-drop'
-        for native_name, shown in (('pacman.x86_64', 'pacman.x86_64'), ('pacman.i686', 'pacman.i686'),
-                                  ('pacman.noarch', 'pacman.noarch'), ('pacman.x86_64', 'pacman')):
-            with self.subTest(native=native_name, shown=shown):
-                output = self.receiver_info_output(shown)
+        for native_name, shown, source in (
+            ('pacman.x86_64', 'pacman.x86_64', 'Configured DNF repository'),
+            ('pacman.i686', 'pacman.i686', 'Configured DNF repository'),
+            ('pacman.noarch', 'pacman.noarch', 'Configured DNF repository'),
+            ('pacman.x86_64', 'pacman', 'Official repository (dnf)'),
+        ):
+            with self.subTest(native=native_name, shown=shown, source=source):
+                output = self.receiver_info_output(shown, source=source)
                 result, evidence, logs = self.run_inventory('printf %s ' + shlex.quote(output) + '\n', [row],
                     distro='fedora', native_commands=self.receiver_native(native_name + '\t7.0.0-6.fc44\n'))
                 self.assertEqual(result.returncode, 0, logs)
@@ -546,6 +551,9 @@ class OutputContracts(unittest.TestCase):
             ('extra name token', good.replace('Name: pacman.x86_64', 'Name: pacman.x86_64 extra'), 'disagrees with the native'),
             ('extra version token', good.replace('Version: 7.0.0-6.fc44', 'Version: 7.0.0-6.fc44 extra'), 'disagrees with the native'),
             ('foreign source', self.receiver_info_output(source='Official repository (copr)'), 'disagrees with the native'),
+            ('installed database source', self.receiver_info_output(source='Installed RPM database'), 'disagrees with the native'),
+            ('unknown DNF source', self.receiver_info_output(source='DNF (repository unspecified)'), 'disagrees with the native'),
+            ('new DNF source without arch', self.receiver_info_output('pacman', source='Configured DNF repository'), 'disagrees with the native'),
             ('duplicate Name', good + 'Name: pacman\n', 'unique pacman'),
             ('duplicate Version', good + 'Version: 7.0.0-6.fc44\n', 'unique pacman'),
             ('duplicate Source', good + 'Source: Official repository (dnf)\n', 'unique pacman'),
@@ -4424,7 +4432,7 @@ esac
         for showrc, identities in configurations:
             for identity in identities:
                 with self.subTest(identity=identity):
-                    output = f'  {identity} 2.2.1-4.fc44  Official\n  tree-sitter-cli.x86_64 0.26.11-1.fc44  Official\n'
+                    output = f'  {identity} 2.2.1-4.fc44  DNF\n  tree-sitter-cli.x86_64 0.26.11-1.fc44  DNF\n'
                     result = self.run_oracle(assertion='search-official-tree-output',
                                              stdout=output, distro='fedora', rpm_showrc=showrc)
                     self.assertEqual(result.returncode, 0, result.stderr)
@@ -4704,8 +4712,9 @@ printf '  tree.x86_64 2.2.1-4.fc44  Official\n  tree.i686 2.2.1-4.fc44  Official
         self.assertEqual(args, ['search', '--detailed', '--no-aur', '--limit', '3', 'git-'])
         self.assertEqual(self.run_oracle(assertion='search-official-limit-three', stdout=valid).returncode, 0)
         fedora = valid.replace('  git-branchless 0.11.1-2  Official\n',
-                               '  git-all 2.55.0-1.fc44  Official\n')
-        self.assertEqual(self.run_oracle(assertion='search-official-limit-three', stdout=fedora).returncode, 0)
+                               '  git-all 2.55.0-1.fc44  Official\n').replace('  Official', '  DNF')
+        self.assertEqual(self.run_oracle(assertion='search-official-limit-three', distro='fedora', stdout=fedora).returncode, 0)
+        self.assertNotEqual(self.run_oracle(assertion='search-official-limit-three', stdout=fedora).returncode, 0)
         for output in (
             '',
             '  | Search\n    git-\n',

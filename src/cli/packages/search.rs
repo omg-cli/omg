@@ -96,13 +96,20 @@ fn present_search_results(
     mut packages: Vec<DisplayPackage>,
     json: bool,
     limit: usize,
-    name_kind: SearchNameKind,
+    backend: Backend,
 ) -> Vec<DisplayPackage> {
-    rank_display_packages(query, &mut packages, name_kind);
+    rank_display_packages(query, &mut packages, SearchNameKind::from_backend(backend));
     if !json {
         packages = group_langpacks(query, packages);
     }
     truncate_search_results(&mut packages, limit);
+    if let Some(label) = super::common::dnf_search_label(backend) {
+        for package in &mut packages {
+            if PackageSource::from_label(&package.source) == Some(PackageSource::Official) {
+                package.source.replace_range(.., label);
+            }
+        }
+    }
     packages
 }
 
@@ -203,7 +210,6 @@ async fn search_internal(
 ) -> Result<()> {
     validate_search_query(query)?;
     let backend = crate::package_managers::resolve_backend()?;
-    let name_kind = SearchNameKind::from_backend(backend);
     let include_aur = should_search_aur(query, backend, no_aur)?;
 
     let official_search = async { search_official_packages(query, limit).await };
@@ -246,7 +252,7 @@ async fn search_internal(
     let total_matches = official_total.saturating_add(aur_count);
 
     crate::core::usage::track_search_result(true);
-    display_packages = present_search_results(query, display_packages, json, limit, name_kind);
+    display_packages = present_search_results(query, display_packages, json, limit, backend);
 
     if json {
         let json_str = serde_json::to_string_pretty(&display_packages)
@@ -413,16 +419,15 @@ pub fn search_sync_cli_with_limit(
         return Ok(false);
     }
     let backend = crate::package_managers::resolve_backend()?;
-    let name_kind = SearchNameKind::from_backend(backend);
 
     // Fast path: official-only search via sync client (zero runtime overhead).
     #[cfg(any(feature = "debian", feature = "debian-pure"))]
     if crate::core::env::distro::is_debian_like() {
-        return search_sync_official_only(query, limit, name_kind);
+        return search_sync_official_only(query, limit, backend);
     }
 
     if no_aur || backend != crate::package_managers::Backend::Arch {
-        return search_sync_official_only(query, limit, name_kind);
+        return search_sync_official_only(query, limit, backend);
     }
 
     // AUR path requires async — create a minimal runtime only when necessary
@@ -444,7 +449,7 @@ pub fn search_sync_cli_with_limit(
 }
 
 /// Sync-only search: daemon IPC via `SyncDaemonClient`, no tokio runtime.
-fn search_sync_official_only(query: &str, limit: usize, name_kind: SearchNameKind) -> Result<bool> {
+fn search_sync_official_only(query: &str, limit: usize, backend: Backend) -> Result<bool> {
     #[cfg(not(unix))]
     {
         return Ok(false); // Daemon not supported on Windows
@@ -472,7 +477,7 @@ fn search_sync_official_only(query: &str, limit: usize, name_kind: SearchNameKin
             .into_iter()
             .map(DisplayPackage::from_wire)
             .collect();
-        packages = present_search_results(query, packages, false, limit, name_kind);
+        packages = present_search_results(query, packages, false, limit, backend);
 
         let mut stdout = std::io::BufWriter::new(std::io::stdout());
         writeln!(
@@ -646,7 +651,7 @@ mod tests {
         json: bool,
         limit: usize,
     ) -> Vec<DisplayPackage> {
-        present_search_results(query, packages, json, limit, SearchNameKind::RpmIdentity)
+        present_search_results(query, packages, json, limit, Backend::Fedora)
     }
 
     #[test]
@@ -667,7 +672,7 @@ mod tests {
                 ],
                 true,
                 1,
-                SearchNameKind::from_backend(backend),
+                backend,
             );
             assert_eq!(results[0].name, "tree-sitter-cli.x86_64", "{backend:?}");
         }
@@ -693,14 +698,16 @@ mod tests {
             assert_eq!(results[0].name, "tree.x86_64");
             assert_eq!(results[0].version, "2:2.2.1-4.fc44");
             assert_eq!(results[0].description, "List directories recursively");
-            assert_eq!(results[0].source, "Official");
+            assert_eq!(results[0].source, "DNF");
             let serialized = serde_json::to_value(&results).expect("serialize ranked records");
             assert_eq!(serialized[0]["name"], "tree.x86_64");
             assert_eq!(serialized[0]["version"], "2:2.2.1-4.fc44");
             assert_eq!(serialized[0]["description"], "List directories recursively");
+            assert_eq!(serialized[0]["source"], "DNF");
             let rendered = format_package(&results[0]);
             assert!(rendered.contains("tree.x86_64"), "{rendered}");
             assert!(rendered.contains("2:2.2.1-4.fc44"), "{rendered}");
+            assert!(rendered.contains("DNF"), "{rendered}");
         }
     }
 
@@ -899,7 +906,7 @@ mod tests {
             display("firefox-developer-edition-i18n-an"),
             display("firefox-developer-edition-i18n-ar"),
         ];
-        let json = present_search_results("firefox", packages, true, 50, SearchNameKind::Literal);
+        let json = present_search_results("firefox", packages, true, 50, Backend::Arch);
         let names: Vec<&str> = json.iter().map(|pkg| pkg.name.as_str()).collect();
         assert_eq!(names[0], "firefox");
         assert!(names.contains(&"firefox-developer-edition-i18n-af"));
@@ -916,7 +923,7 @@ mod tests {
             ],
             false,
             50,
-            SearchNameKind::Literal,
+            Backend::Arch,
         );
         assert_eq!(human.len(), 2);
         assert_eq!(
@@ -1197,15 +1204,14 @@ mod tests {
                 out_of_date: None,
             })
             .collect();
-        let actual =
-            present_search_results("tree", packages, true, 20, SearchNameKind::RpmIdentity);
+        let actual = present_search_results("tree", packages, true, 20, Backend::Fedora);
         assert_eq!(actual.len(), 20);
         for (row, &(name, version, description)) in actual.iter().zip(EXPECTED) {
             assert_eq!(
                 (&*row.name, &*row.version, &*row.description),
                 (name, version, description)
             );
-            assert_eq!(row.source, "Official");
+            assert_eq!(row.source, "DNF");
         }
     }
 
@@ -1234,8 +1240,7 @@ mod tests {
             maintainer: None,
             out_of_date: None,
         });
-        let actual =
-            present_search_results("tree", packages, true, 1000, SearchNameKind::RpmIdentity);
+        let actual = present_search_results("tree", packages, true, 1000, Backend::Fedora);
         assert_eq!(actual.len(), 1000);
         assert_eq!(
             (

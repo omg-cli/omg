@@ -191,10 +191,10 @@ pub enum Commands {
         /// Clear package cache
         #[arg(short, long)]
         cache: bool,
-        /// Clear build directories for source-based installs
+        /// Clear AUR build directories (Arch only)
         #[arg(long)]
         aur: bool,
-        /// Remove all (orphans + cache + aur)
+        /// Remove orphans and clear package cache (includes AUR builds on Arch)
         #[arg(short = 'a', long)]
         all: bool,
         /// Show what would be cleaned without making changes

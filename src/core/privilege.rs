@@ -793,8 +793,12 @@ async fn run_privileged_program_in(
         .stderr(std::process::Stdio::inherit());
     #[cfg(feature = "fedora")]
     let status = if program == "dnf" {
+        let cache_cleanup = args == ["clean", "packages"];
         tokio::task::spawn_blocking(move || {
-            crate::package_managers::DnfPackageManager::run_native_command(elevated.into_std())
+            crate::package_managers::DnfPackageManager::run_native_command(
+                elevated.into_std(),
+                cache_cleanup,
+            )
         })
         .await?
     } else {
@@ -802,17 +806,16 @@ async fn run_privileged_program_in(
     };
     #[cfg(not(feature = "fedora"))]
     let status = elevated.status().await;
-    let status = status.map_err(|e| anyhow::anyhow!("Failed to run {program} under sudo: {e}"))?;
-
     crate::core::security::audit::record_operation(
         program,
         &audit_targets,
-        if status.success() {
+        if status.as_ref().is_ok_and(std::process::ExitStatus::success) {
             "succeeded"
         } else {
             "failed"
         },
     )?;
+    let status = status.map_err(|e| anyhow::anyhow!("Failed to run {program} under sudo: {e}"))?;
     if status.success() {
         Ok(())
     } else {

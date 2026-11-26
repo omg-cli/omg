@@ -576,7 +576,7 @@ rpm_compatible_arches() {
 
 check_info_native_package() {
   local distro=$1 output=$2 status=0 version='' source='' actual_name actual_version actual_source
-  local rpm_arches='' native_identity='' native_reference=''
+  local rpm_arches='' native_identity='' native_reference='' expected_name=pacman
   case "$distro" in
     arch)
       timeout --kill-after=2s 30 pacman -Si pacman > native-info.raw 2> native-info.stderr || status=$?
@@ -601,7 +601,7 @@ check_info_native_package() {
         ' native-info.raw) || { printf 'native info reference has an invalid or ambiguous RPM identity and EVR\n' >&2; return 2; }
         IFS=$'\t' read -r native_identity version <<< "$native_reference"
       fi
-      source='Official repository (dnf)' ;;
+      source='Configured DNF repository' ;;
     *) return 2 ;;
   esac
   if [[ "$status" != 0 || -z "$version" || "$version" == '(none)' || "$version" == *$'\n'* || -z "$source" || "$source" == *$'\n'* ]]; then
@@ -618,9 +618,16 @@ check_info_native_package() {
   actual_name=$(awk '$1 == "Name:" && NF == 2 {print $2}' "$output")
   actual_version=$(awk '$1 == "Version:" && NF == 2 {print $2}' "$output")
   actual_source=$(sed -n 's/^[[:space:]]*Source: //p' "$output")
+  if [[ "$distro" == fedora ]]; then
+    expected_name=$native_identity
+    # Older signed Fedora releases used one source label and could omit the architecture.
+    if [[ "$actual_source" == 'Official repository (dnf)' ]]; then
+      source='Official repository (dnf)'
+      if [[ "$actual_name" == pacman ]]; then expected_name=pacman; fi
+    fi
+  fi
   printf 'native info %s expected=%s identity=%s source=%s actual=%s identity=%s source=%s\n' "$distro" "$version" "$native_identity" "$source" "$actual_version" "$actual_name" "$actual_source" >&2
-  if [[ ( "$actual_name" != pacman && ( "$distro" != fedora || "$actual_name" != "$native_identity" ) ) \
-    || "$actual_version" != "$version" || "$actual_source" != "$source" ]]; then
+  if [[ "$actual_name" != "$expected_name" || "$actual_version" != "$version" || "$actual_source" != "$source" ]]; then
     printf 'assertion failed: info disagrees with the native %s package catalog\n' "$distro" >&2
     return 1
   fi
@@ -1690,6 +1697,8 @@ PY_DNF_LOG
 
 check_product_output() {
   local safety=$1 assertion=$2 code=$3 stdout=$4 stderr=$5 distro=${6:-arch} update_output
+  local search_source='^Official$'
+  if [[ "$distro" == fedora ]]; then search_source='^(Official|DNF)$'; fi
   if [[ "$assertion" == update-fast-output || "$assertion" == update-turbo-output ]]; then
     update_output=$(sed -E $'s/\033\\[[0-?]*[ -/]*[@-~]//g' "$stdout") || return 1
   fi
@@ -2110,18 +2119,18 @@ PY
           # Do not invent an ordering preference or infer it from uname.
           rpm_arches=$(rpm_compatible_arches) || { printf 'assertion failed: unavailable RPM architecture compatibility\n' >&2; return 1; }
         fi
-        if ! awk -v distro="$distro" -v arches="$rpm_arches" '
+        if ! awk -v distro="$distro" -v arches="$rpm_arches" -v source="$search_source" '
           BEGIN { count=split(arches, values, /[[:space:]]+/); for (i=1; i<=count; i++) supported[values[i]]=1 }
           function exact(name) {
             return name == "tree" || (distro == "fedora" && substr(name, 1, 5) == "tree." && (substr(name, 6) in supported))
           }
           /^  [^[:space:]]+ [^[:space:]]+  / {
             results++
-            if (results == 1 && (!exact($1) || $2 !~ /^[0-9]/ || $3 != "Official" || NF != 3)) bad=1
+            if (results == 1 && (!exact($1) || $2 !~ /^[0-9]/ || $3 !~ source || NF != 3)) bad=1
             if (exact($1)) {
               trees++
               if (identities[$1]++) bad=1
-              if ($2 !~ /^[0-9]/ || $3 != "Official" || NF != 3) bad=1
+              if ($2 !~ /^[0-9]/ || $3 !~ source || NF != 3) bad=1
             }
           }
           END { exit !(results > 0 && trees > 0 && !bad) }
@@ -2136,7 +2145,7 @@ PY
         fi
         if [[ "$code" != 0 ]] || ! grep -Fxq '  | Search' "$stdout" \
           || ! grep -Fxq '    firefox' "$stdout" \
-          || ! awk -v target="$target" -v distro="$distro" -v arches="$rpm_arches" '
+          || ! awk -v target="$target" -v distro="$distro" -v arches="$rpm_arches" -v source="$search_source" '
             BEGIN { count=split(arches, values, /[[:space:]]+/); for (i=1; i<=count; i++) supported[values[i]]=1 }
             function exact(name) {
               return name == target || (distro == "fedora" && substr(name, 1, 8) == "firefox." && (substr(name, 9) in supported))
@@ -2144,7 +2153,7 @@ PY
             /^  [^[:space:]]/ {
               if (exact($1)) {
                 matches++
-                if ($0 !~ /^  [^[:space:]]+ [^[:space:]]+  / || $2 !~ /^[0-9]/ || $3 != "Official" || NF != 3) bad=1
+                if ($0 !~ /^  [^[:space:]]+ [^[:space:]]+  / || $2 !~ /^[0-9]/ || $3 !~ source || NF != 3) bad=1
               }
             }
             END { exit !(matches == 1 && !bad) }
@@ -2152,12 +2161,12 @@ PY
           printf 'assertion failed: firefox search lacks its official package and version\n' >&2; return 1
         fi ;;
       search-official-limit-three)
-        if ! awk '
+        if ! awk -v source="$search_source" '
           /^  \| Search$/ { headings++; next }
           /^    git-$/ { queries++; next }
           /^  [^[:space:]]+ [^[:space:]]+  / {
             results++
-            if ($1 !~ /^git-/ || $3 != "Official" || NF != 3) bad=1
+            if ($1 !~ /^git-/ || $3 !~ source || NF != 3) bad=1
             if (seen[$1]++) bad=1
             next
           }
