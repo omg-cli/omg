@@ -8065,6 +8065,179 @@ env.OMG_FIXTURE_TASK = "changed"
                     checked(["/usr/bin/umount", database])
         verify("native-inventory-unchanged", checked(query) == before)
 
+    def inspect_container_cli():
+        import pty
+
+        phase = "container-engine-contracts"
+        with tempfile.TemporaryDirectory(prefix="container-cli-", dir=work) as directory:
+            scope = Path(directory)
+            scope.chmod(0o755)
+            shims = scope / "bin"
+            shims.mkdir()
+            project = scope / "project"
+            project.mkdir()
+            os.chown(project, account.pw_uid, account.pw_gid)
+            calls_path = project / "engine-calls.jsonl"
+            (project / "Dockerfile").write_text("FROM scratch\n")
+            engine = shims / "engine-fixture"
+            engine.write_text("""#!/usr/bin/python3
+import json
+import os
+from pathlib import Path
+import sys
+
+engine = Path(sys.argv[0]).name
+args = sys.argv[1:]
+with Path(os.environ["OMG_FIXTURE_ENGINE_LOG"]).open("a") as log:
+    print(json.dumps([engine, *args]), file=log)
+if args == ["--version"]:
+    raise SystemExit(int(engine == "podman" and os.environ.get("OMG_FIXTURE_FORCE_DOCKER") == "1"))
+if args[:1] in (["ps"], ["images"]):
+    sys.stdout.write(os.environ.get("OMG_FIXTURE_ENGINE_LISTING", ""))
+else:
+    if "printf-input" in args:
+        sys.stdout.write("input=" + sys.stdin.read())
+    print("engine-operation=" + args[0])
+sys.stderr.write(os.environ.get("OMG_FIXTURE_ENGINE_ERROR", ""))
+raise SystemExit(int(os.environ.get("OMG_FIXTURE_ENGINE_STATUS", "0")))
+""")
+            engine.chmod(0o755)
+            for name in ("podman", "docker"):
+                (shims / name).symlink_to(engine.name)
+            mode = dict(disabled, HOME=str(project), PATH=f"{shims}:{base_env['PATH']}",
+                        TERM="dumb", NO_COLOR="1", OMG_NO_UPDATE_CHECK="1",
+                        OMG_FIXTURE_ENGINE_LOG=str(calls_path))
+
+            def verify(case, args, expected_calls, output, *, status=0, environment=None,
+                       input_text=None, terminal=False):
+                calls_path.unlink(missing_ok=True)
+                env = dict(mode, **(environment or {}))
+                command_args = [str(cli), "container", *args]
+                if terminal:
+                    master, slave = pty.openpty()
+                    try:
+                        result = subprocess.run(command_args, cwd=project, env=env, stdin=slave,
+                                                stdout=slave, stderr=slave, timeout=12, **ordinary)
+                        result.stdout = result.stderr = ""
+                    finally:
+                        os.close(slave)
+                        os.close(master)
+                elif input_text is not None:
+                    result = subprocess.run(command_args, cwd=project, env=env, input=input_text,
+                                            capture_output=True, text=True, timeout=12, **ordinary)
+                else:
+                    result = command(command_args, env, ordinary, timeout=12)
+                calls = ([json.loads(line) for line in calls_path.read_text().splitlines()]
+                         if calls_path.exists() else [])
+                checks.append(dict(phase=phase, case=case, passed=result.returncode == status
+                                   and calls == expected_calls and output(result),
+                                   status=result.returncode, calls=calls, output=result.stdout[-550:],
+                                   diagnostic=result.stderr[-550:]))
+
+            podman = [["podman", "--version"]]
+            docker = [*podman, ["docker", "--version"]]
+            listing_formats = {
+                "ps": "{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.Status}}",
+                "images": "{{.Repository}}\t{{.Tag}}\t{{.ID}}\t{{.Size}}",
+            }
+            good_ps = "0123456789abcdef\tdemo\tfedora:44\tUp 2 minutes\n"
+            good_images = "registry.example/fedora\t44\t0123456789abcdef\t124 MB\n"
+            for subcommand, operation, listing, found, empty in (
+                ("status", "ps", good_ps, "demo", "No running containers"),
+                ("list", "ps", good_ps, "demo", "No active containers"),
+                ("images", "images", good_images, "registry.example/fedora", "No images found"),
+            ):
+                call = ["podman", operation, "--format", listing_formats[operation]]
+                for label, data, marker in (("records", listing, found), ("empty", "", empty)):
+                    verify(f"{subcommand}-{label}", [subcommand], [*podman, call],
+                           lambda result, marker=marker: marker in result.stdout,
+                           environment={"OMG_FIXTURE_ENGINE_LISTING": data})
+                for label, data in (
+                    ("malformed-only", "partial\tfields\n"),
+                    ("malformed-after-record", listing + "partial\tfields\n"),
+                    ("extra-column", listing.rstrip("\n") + "\textra\n"),
+                ):
+                    verify(f"{subcommand}-{label}", [subcommand], [*podman, call],
+                           lambda result: not result.stdout and "Malformed" in result.stderr,
+                           status=1, environment={"OMG_FIXTURE_ENGINE_LISTING": data})
+                verify(f"{subcommand}-native-error", [subcommand], [*podman, call],
+                       lambda result: not result.stdout and "engine unavailable" in result.stderr,
+                       status=1, environment={"OMG_FIXTURE_ENGINE_STATUS": "125",
+                                              "OMG_FIXTURE_ENGINE_ERROR": "engine unavailable\n",
+                                              "OMG_FIXTURE_ENGINE_LISTING": listing})
+                localized = (listing.replace("0123456789abcdef", "0123456789界wide")
+                             .replace(found, f"{found}\u202e"))
+                verify(f"{subcommand}-display-metadata", [subcommand], [*podman, call],
+                       lambda result, marker=found: "\u202e" not in result.stdout
+                       and marker in result.stdout and not result.stderr,
+                       environment={"OMG_FIXTURE_ENGINE_LISTING": localized})
+
+            verify("status-docker-fallback", ["status"],
+                   [*docker, ["docker", "ps", "--format", listing_formats["ps"]]],
+                   lambda result: "Runtime: Docker" in result.stdout,
+                   environment={"OMG_FIXTURE_FORCE_DOCKER": "1"})
+
+            for subcommand, args, expected, exit_status in (
+                ("foreground", ["run", "fedora:44", "--", "printf-input"],
+                 ["run", "--rm", "-i", "--", "fedora:44", "printf-input"], 0),
+                ("foreground-remote-exit", ["run", "fedora:44", "--", "printf-input"],
+                 ["run", "--rm", "-i", "--", "fedora:44", "printf-input"], 23),
+                ("exec", ["exec", "demo", "--", "printf-input"],
+                 ["exec", "-i", "--", "demo", "printf-input"], 0),
+                ("exec-remote-exit", ["exec", "demo", "--", "printf-input"],
+                 ["exec", "-i", "--", "demo", "printf-input"], 29),
+            ):
+                verify(subcommand, args, [*podman, ["podman", *expected]],
+                       lambda result: "input=hello from stdin\n" in result.stdout, status=exit_status,
+                       input_text="hello from stdin\n", environment={"OMG_FIXTURE_ENGINE_STATUS": str(exit_status)})
+            verify("run-tty", ["run", "fedora:44", "--", "true"],
+                   [*podman, ["podman", "run", "--rm", "-it", "--", "fedora:44", "true"]],
+                   lambda _: True, terminal=True)
+            verify("exec-tty", ["exec", "demo", "--", "true"],
+                   [*podman, ["podman", "exec", "-it", "--", "demo", "true"]],
+                   lambda _: True, terminal=True)
+
+            for label, opts, forwarded in (("detached", [], []), ("detached-interactive", ["-i"], ["-i"])):
+                verify(label, ["run", "--detach", *opts, "fedora:44", "--", "true"],
+                       [*podman, ["podman", "run", "--detach", *forwarded, "--", "fedora:44", "true"]],
+                       lambda result: "engine-operation=run" in result.stdout)
+
+            for image, shell in (("fedora:44", "/bin/bash"), ("alpine:3", "/bin/sh")):
+                verify(f"shell-{image}", ["shell", "--image", image],
+                       [*podman, ["podman", "run", "--rm", "-i", "--name", "project-dev",
+                                  "-w", "/app", "-e", "TERM=xterm-256color", "-v", f"{project}:/app",
+                                  "--", image, shell]],
+                       lambda result: "engine-operation=run" in result.stdout)
+
+            for action, operand in (("stop", "demo"), ("pull", "fedora:44")):
+                verify(f"{action}-operation", [action, operand], [*podman, ["podman", action, "--", operand]],
+                       lambda result, action=action: f"engine-operation={action}" in result.stdout)
+                verify(f"{action}-native-error", [action, operand], [*podman, ["podman", action, "--", operand]],
+                       lambda result: "engine failed" in result.stderr and "successfully" not in result.stdout,
+                       status=1, environment={"OMG_FIXTURE_ENGINE_STATUS": "125",
+                                              "OMG_FIXTURE_ENGINE_ERROR": "engine failed\n"})
+
+            build = ["podman", "build", "-f", "Dockerfile", "-t", "fedora-build:44",
+                     "--no-cache", "--build-arg", "MODE=verification", "--target", "builder", "--", str(project)]
+            build_args = ["build", "-t", "fedora-build:44", "--no-cache", "--build-arg",
+                          "MODE=verification", "--target", "builder"]
+            verify("build-operation", build_args, [*podman, build],
+                   lambda result: "fedora-build:44 built successfully" in result.stdout)
+            verify("build-native-error", build_args, [*podman, build],
+                   lambda result: "Container build failed" in result.stderr and "built successfully" not in result.stdout,
+                   status=1, environment={"OMG_FIXTURE_ENGINE_STATUS": "125"})
+
+            recipe = project / "Dockerfile.omg"
+            ignore = project / ".dockerignore"
+            verify("init-without-engine", ["init", "--base", "fedora:44"], [],
+                   lambda result: "Created Dockerfile.omg" in result.stdout and recipe.is_file()
+                   and recipe.read_text().startswith("FROM fedora:44\n")
+                   and "dnf install" in recipe.read_text() and ".env" in ignore.read_text())
+            initial = recipe.read_bytes() if recipe.is_file() else b""
+            verify("init-existing-recipe", ["init", "--base", "fedora:44"], [],
+                   lambda result: "already exists" in result.stderr and recipe.is_file()
+                   and recipe.read_bytes() == initial, status=1)
+
     def inspect_dashboard_terminal():
         import pty
         import select
@@ -9185,6 +9358,7 @@ exec {shlex.quote(str(binary))} "$@"
                 if consent_oracle is not None:
                     inspect_enterprise_inventory()
                     inspect_audit_licenses()
+                    inspect_container_cli()
                     inspect_info_attempts()
                     inspect_info_json_writes()
                     inspect_dashboard_terminal()
@@ -9517,6 +9691,6 @@ mark_progress("completed with host inventory unchanged")
 report = dict(binaries=binaries, checks=checks, total=len(checks),
               passed=sum(entry["passed"] for entry in checks), host_unchanged=True)
 print(json.dumps(report))
-expected_checks = 303 if consent_oracle is None else 3011
+expected_checks = 303 if consent_oracle is None else 3051
 if report["passed"] != report["total"] or report["total"] != expected_checks:
     sys.exit(4)

@@ -1042,10 +1042,10 @@ chmod 755 "$OMG_QEMU_TEST_TREE_BINARY"
         inventory = (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8')
         for case, operation, correct, faults in (
             ('container-shell-argv', 'shell',
-             'podman run --rm -it --name "$(basename "$PWD")-dev" -w /tmp '
+             'podman run --rm -i --name "$(basename "$PWD")-dev" -w /tmp '
              '-e TERM=xterm-256color -e SMOKE=1 -v "$PWD:/app" '
              '-v "$PWD:/tmp/omg-smoke" -- debian:bookworm /bin/bash\n',
-             ('--rm ', '-it ', 'SMOKE=1', ':/app', 'debian:bookworm', '/bin/bash')),
+             ('--rm ', '-i ', 'SMOKE=1', ':/app', 'debian:bookworm', '/bin/bash')),
             ('container-build-argv', 'build',
              'podman build -f Dockerfile -t smoke:latest --no-cache '
              '--build-arg SMOKE=1 --target dev -- "$PWD"\n',
@@ -1064,6 +1064,8 @@ chmod 755 "$OMG_QEMU_TEST_TREE_BINARY"
             for omitted in faults:
                 self.assertIn(omitted, correct)
                 variants.append((f'omit {omitted}', prefix + correct.replace(omitted, '', 1), 'FAIL'))
+            if operation == 'shell':
+                variants.append(('unexpected tty', prefix + correct.replace('-i ', '-it ', 1), 'FAIL'))
             for distro in ('arch', 'debian', 'ubuntu', 'fedora'):
                 for label, product, expected in variants:
                     with self.subTest(case=case, distro=distro, variant=label):

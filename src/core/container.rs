@@ -8,6 +8,7 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::io::IsTerminal as _;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
@@ -311,7 +312,7 @@ pub struct ContainerConfig {
     pub workdir: Option<String>,
     /// Whether to remove container after exit
     pub rm: bool,
-    /// Whether to run interactively with TTY
+    /// Keep stdin open and allocate a TTY when all streams are terminals.
     pub interactive: bool,
 }
 
@@ -399,9 +400,7 @@ impl ContainerManager {
             cmd.arg("--rm");
         }
 
-        if config.interactive {
-            cmd.arg("-it");
-        }
+        configure_interactive_io(&mut cmd, config.interactive);
 
         if let Some(ref name) = config.name {
             cmd.args(["--name", name]);
@@ -439,9 +438,7 @@ impl ContainerManager {
         let mut cmd = Command::new(self.runtime.command());
         cmd.arg("exec");
 
-        if interactive {
-            cmd.arg("-it");
-        }
+        configure_interactive_io(&mut cmd, interactive);
 
         cmd.arg("--");
         cmd.arg(container);
@@ -552,20 +549,14 @@ impl ContainerManager {
             .context("Failed to list containers")?;
         let output = require_successful_output(output, "Container listing")?;
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let containers = stdout
-            .lines()
-            .filter_map(|line| {
-                parse_listing_line(line, 4).map(|parts| ContainerInfo {
-                    id: parts[0].to_string(),
-                    name: parts[1].to_string(),
-                    image: parts[2].to_string(),
-                    status: parts[3].to_string(),
-                })
-            })
-            .collect();
-
-        Ok(containers)
+        parse_listing(&output.stdout, "container", |[id, name, image, status]| {
+            ContainerInfo {
+                id: id.to_owned(),
+                name: name.to_owned(),
+                image: image.to_owned(),
+                status: status.to_owned(),
+            }
+        })
     }
 
     /// Stop a running container
@@ -617,20 +608,14 @@ impl ContainerManager {
             .context("Failed to list images")?;
         let output = require_successful_output(output, "Image listing")?;
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let images = stdout
-            .lines()
-            .filter_map(|line| {
-                parse_listing_line(line, 4).map(|parts| ImageInfo {
-                    repository: parts[0].to_string(),
-                    tag: parts[1].to_string(),
-                    id: parts[2].to_string(),
-                    size: parts[3].to_string(),
-                })
-            })
-            .collect();
-
-        Ok(images)
+        parse_listing(&output.stdout, "image", |[repository, tag, id, size]| {
+            ImageInfo {
+                repository: repository.to_owned(),
+                tag: tag.to_owned(),
+                id: id.to_owned(),
+                size: size.to_owned(),
+            }
+        })
     }
 
     /// Generate a Dockerfile for OMG development environment
@@ -643,6 +628,14 @@ impl ContainerManager {
     /// failing build step; the CLI refuses them before writing a Dockerfile.
     pub fn generate_dockerfile(
         &self,
+        base_image: &str,
+        runtimes: &[(&str, &str)],
+        installer_digests: &InstallerDigests,
+    ) -> GeneratedDockerfile {
+        Self::generate_recipe(base_image, runtimes, installer_digests)
+    }
+
+    pub(crate) fn generate_recipe(
         base_image: &str,
         runtimes: &[(&str, &str)],
         installer_digests: &InstallerDigests,
@@ -1270,21 +1263,41 @@ fn push_package_install(dockerfile: &mut String, base_image: &str, package: &str
     }
 }
 
-/// Split one tab-separated `--format` output line from the runtime.
-///
-/// Lines without the expected column count are reported via `tracing::warn!`
-/// and skipped instead of being dropped silently.
-fn parse_listing_line(line: &str, expected_columns: usize) -> Option<Vec<&str>> {
-    let parts: Vec<&str> = line.split('\t').collect();
-    if parts.len() < expected_columns {
-        if !line.is_empty() {
-            tracing::warn!(
-                "Skipping malformed runtime listing line (expected {expected_columns} columns): {line:?}"
-            );
-        }
-        return None;
+fn configure_interactive_io(command: &mut Command, interactive: bool) {
+    if interactive {
+        let terminal = std::io::stdin().is_terminal()
+            && std::io::stdout().is_terminal()
+            && std::io::stderr().is_terminal();
+        command.arg(if terminal { "-it" } else { "-i" });
     }
-    Some(parts)
+}
+
+fn parse_listing<T>(stdout: &[u8], kind: &str, parse: impl Fn([&str; 4]) -> T) -> Result<Vec<T>> {
+    std::str::from_utf8(stdout)
+        .with_context(|| format!("Malformed {kind} listing: expected UTF-8"))?
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| !line.is_empty())
+        .map(|(index, line)| {
+            let mut columns = line.split('\t');
+            let parts = (
+                columns.next(),
+                columns.next(),
+                columns.next(),
+                columns.next(),
+                columns.next(),
+            );
+            match parts {
+                (Some(first), Some(second), Some(third), Some(fourth), None) => {
+                    Ok(parse([first, second, third, fourth]))
+                }
+                _ => anyhow::bail!(
+                    "Malformed {kind} listing at line {}: expected four tab-separated fields",
+                    index + 1
+                ),
+            }
+        })
+        .collect()
 }
 
 fn require_successful_output(

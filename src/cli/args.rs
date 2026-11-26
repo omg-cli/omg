@@ -986,7 +986,7 @@ pub enum ContainerCommands {
         /// Run in background (detached)
         #[arg(short, long)]
         detach: bool,
-        /// Run interactively with TTY
+        /// Keep stdin open and allocate a TTY when attached to a terminal
         #[arg(short, long)]
         interactive: bool,
         /// Environment variables (KEY=VALUE)

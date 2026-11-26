@@ -2237,7 +2237,7 @@ check_container_engine_argv() {
         -v "$root:/tmp/omg-smoke" -- debian:bookworm sh -c 'printf smoke') ;;
     container-shell-argv)
       operation=run
-      expected=(--rm -it --name "$(basename "$root")-dev" -w /tmp
+      expected=(--rm -i --name "$(basename "$root")-dev" -w /tmp
         -e TERM=xterm-256color -e SMOKE=1
         -v "$root:/app" -v "$root:/tmp/omg-smoke" -- debian:bookworm /bin/bash) ;;
     container-build-argv)

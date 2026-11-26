@@ -4,11 +4,12 @@ use anyhow::{Context, Result};
 use std::io::Write as _;
 
 use crate::cli::components::Components;
+use crate::cli::style::sanitize_terminal_text;
 use crate::cli::tea::Cmd;
 
 use crate::core::container::{
-    ContainerConfig, ContainerManager, ContainerRuntime, InstallerDigests, detect_runtime,
-    dev_container_config, ensure_dockerignore, normalized_base_image,
+    ContainerConfig, ContainerManager, InstallerDigests, detect_runtime, dev_container_config,
+    ensure_dockerignore, normalized_base_image,
 };
 
 /// Parse environment variables from strict `KEY=VALUE` entries.
@@ -144,12 +145,11 @@ fn go_tarball_digest(metadata: &serde_json::Value, tarball_url: &str) -> Result<
 /// Pin each installer using an explicit caller checksum or a digest resolved
 /// over TLS. The generated build step verifies the downloaded bytes.
 fn pinned_dockerfile(
-    manager: &ContainerManager,
     base: &str,
     runtime_refs: &[(&str, &str)],
     supplied: &InstallerDigests,
 ) -> Result<String> {
-    let draft = manager.generate_dockerfile(base, runtime_refs, &InstallerDigests::new());
+    let draft = ContainerManager::generate_recipe(base, runtime_refs, &InstallerDigests::new());
     anyhow::ensure!(
         draft.runtime_errors.is_empty(),
         "Cannot generate a container that satisfies project runtime requests: {}",
@@ -183,7 +183,7 @@ fn pinned_dockerfile(
         })??;
     }
 
-    let verified = manager.generate_dockerfile(base, runtime_refs, &digests);
+    let verified = ContainerManager::generate_recipe(base, runtime_refs, &digests);
     anyhow::ensure!(
         verified.unpinned_urls.is_empty(),
         "Could not pin digests for {} (refusing to generate a Dockerfile that runs unverified downloads as root)",
@@ -205,7 +205,11 @@ pub fn status() -> Result<()> {
             Ok(containers) if !containers.is_empty() => {
                 let container_list: Vec<String> = containers
                     .iter()
-                    .map(|c| format!("{} {} ({})", "•", c.name, c.image))
+                    .map(|c| {
+                        let name = sanitize_terminal_text(&c.name);
+                        let image = sanitize_terminal_text(&c.image);
+                        format!("• {name} ({image})")
+                    })
                     .collect();
 
                 Cmd::batch([
@@ -453,13 +457,11 @@ pub fn list() -> Result<()> {
     let container_list: Vec<String> = containers
         .iter()
         .map(|c| {
-            format!(
-                "{:<12} {:<20} {:<25} {}",
-                &c.id[..12.min(c.id.len())],
-                c.name,
-                c.image,
-                c.status
-            )
+            let id: String = sanitize_terminal_text(&c.id).chars().take(12).collect();
+            let name = sanitize_terminal_text(&c.name);
+            let image = sanitize_terminal_text(&c.image);
+            let status = sanitize_terminal_text(&c.status);
+            format!("{id:<12} {name:<20} {image:<25} {status}")
         })
         .collect();
 
@@ -494,13 +496,11 @@ pub fn images() -> Result<()> {
     let image_list: Vec<String> = images
         .iter()
         .map(|img| {
-            format!(
-                "{:<30} {:<15} {:<12} {}",
-                img.repository,
-                img.tag,
-                &img.id[..12.min(img.id.len())],
-                img.size
-            )
+            let repository = sanitize_terminal_text(&img.repository);
+            let tag = sanitize_terminal_text(&img.tag);
+            let id: String = sanitize_terminal_text(&img.id).chars().take(12).collect();
+            let size = sanitize_terminal_text(&img.size);
+            format!("{repository:<30} {tag:<15} {id:<12} {size}")
         })
         .collect();
 
@@ -614,15 +614,12 @@ pub fn init_with_installer_digests(base_image: Option<String>, entries: &[String
 
     let runtimes = project_container_runtimes(&cwd)?;
 
-    let manager = ContainerManager::new()
-        .unwrap_or_else(|_| ContainerManager::with_runtime(ContainerRuntime::Docker));
-
     let runtime_refs: Vec<(&str, &str)> = runtimes
         .iter()
         .map(|(r, v)| (r.as_str(), v.as_str()))
         .collect();
 
-    let dockerfile = pinned_dockerfile(&manager, &base, &runtime_refs, &supplied)?;
+    let dockerfile = pinned_dockerfile(&base, &runtime_refs, &supplied)?;
 
     // `COPY . .` must never embed untracked credentials or repository data.
     ensure_dockerignore(&cwd)?;
@@ -732,9 +729,7 @@ mod tests {
 
     #[test]
     fn container_generation_refuses_an_unsupported_python_constraint_before_writing() {
-        let manager = ContainerManager::with_runtime(ContainerRuntime::Docker);
         let error = pinned_dockerfile(
-            &manager,
             "ubuntu:24.04",
             &[("python", ">=3.13")],
             &InstallerDigests::new(),
