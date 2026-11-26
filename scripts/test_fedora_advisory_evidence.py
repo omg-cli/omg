@@ -19,6 +19,17 @@ checker = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(checker)
 
 
+class FedoraAdvisoryLookupTests(unittest.TestCase):
+    def test_missing_bindings_report_an_unavailable_lookup(self):
+        helper = Path(__file__).resolve().parents[1] / 'src/package_managers/dnf_advisory_lookup.py'
+        # Isolate the interpreter from installed site packages on any test host.
+        lookup = subprocess.run([sys.executable, '-I', '-S', '-B', str(helper)],
+                                capture_output=True, text=True, timeout=5)
+        self.assertNotEqual(lookup.returncode, 0, lookup.stdout)
+        self.assertEqual(lookup.stdout, '')
+        self.assertIn('python3-libdnf5', lookup.stderr)
+
+
 class FedoraEvidenceTests(unittest.TestCase):
     def test_repository_metadata_requires_utf8(self):
         document = "<updates><update/></updates>"
