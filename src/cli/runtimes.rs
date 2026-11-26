@@ -544,7 +544,7 @@ pub async fn list_versions(runtime: Option<&str>, available: bool, json: bool) -
                 "{} Available remote versions (python-build-standalone):",
                 style::informative("→")
             );
-            for v in mgr.list_available().await?.iter().take(20) {
+            for v in mgr.list_available().await? {
                 let pre = if v.prerelease { " (pre-release)" } else { "" };
                 ui::print_list_item(&v.version, Some(pre));
             }

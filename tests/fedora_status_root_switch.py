@@ -2957,6 +2957,106 @@ print("fixture python " + json.dumps({
             assert hashlib.sha256(binary.read_bytes()).hexdigest() == original_image
 
 
+    def inspect_python_inventory_and_removal():
+        phase = "python-inventory-removal"
+        version = "3.12.7"
+        sibling = "3.11.9"
+        cases = (
+            ("relative-active", True, True, True),
+            ("absolute-active", True, True, True),
+            ("no-selection", True, False, False),
+            ("sibling-active", True, False, False),
+            ("dangling-selection", True, False, False),
+            ("foreign-selection", True, False, False),
+            ("directory-selection", True, False, False),
+            ("missing-version", False, False, True),
+        )
+        with tempfile.TemporaryDirectory(prefix="python-inventory-removal-", dir=work) as directory:
+            here = Path(directory)
+            os.chown(here, account.pw_uid, account.pw_gid)
+            for label, installed, selected, refuse in cases:
+                home = here / label
+                home.mkdir()
+                os.chown(home, account.pw_uid, account.pw_gid)
+                data = home / "data"
+                versions = data / "versions/python"
+                destination = versions / version
+                current = versions / "current"
+                outside = home / "outside" / version
+                outside.mkdir(parents=True)
+                (outside / "owner-file").write_text("outside file\n")
+                for release in (sibling, version) if installed else (sibling,):
+                    runtime = versions / release
+                    runtime.mkdir(parents=True)
+                    (runtime / ".omg-install-complete").write_text(f"{release}\n")
+                    (runtime / "owner-file").write_text(f"{release}\n")
+
+                target = {
+                    "relative-active": version,
+                    "absolute-active": destination,
+                    "sibling-active": sibling,
+                    "dangling-selection": home / "missing" / version,
+                    "foreign-selection": outside,
+                }.get(label)
+                if target is not None:
+                    current.symlink_to(target)
+                elif label == "directory-selection":
+                    current.mkdir()
+                for path in (data, *data.rglob("*")):
+                    os.chown(path, account.pw_uid, account.pw_gid, follow_symlinks=False)
+                expected_active = version if selected else sibling if label == "sibling-active" else None
+                before = [version, sibling] if installed else [sibling]
+                after = before if refuse else [sibling]
+                env = dict(disabled, HOME=str(home), OMG_DATA_DIR=str(data),
+                           OMG_CONFIG_DIR=str(home/"config"/"omg"), OMG_NATIVE_TEST_DATA_DIR="1",
+                           XDG_CONFIG_HOME=str(home/"config"), XDG_DATA_HOME=str(home/"xdg-data"),
+                           XDG_CACHE_HOME=str(home/"cache"), XDG_STATE_HOME=str(home/"state"))
+
+                for mode, args in (
+                    ("list", ("--json", "list", "python")),
+                    ("alias-list", ("--json", "list", "python3")),
+                    ("which", ("which", "python")),
+                    ("remove", ("use", "python", version, "--uninstall")),
+                    ("list-after", ("--json", "list", "python")),
+                ):
+                    result = subprocess.run([cli, *args], cwd=home, env=env, stdin=subprocess.DEVNULL,
+                                            capture_output=True, text=True, timeout=8, **ordinary)
+                    if mode in ("list", "alias-list", "list-after"):
+                        expected = dict(runtime="python", current=expected_active,
+                                        installed=after if mode == "list-after" else before)
+                        try:
+                            observed = json.loads(result.stdout)
+                        except json.JSONDecodeError:
+                            observed = None
+                        passed = result.returncode == 0 and observed == expected
+                    elif mode == "which":
+                        if expected_active is None:
+                            passed = result.returncode != 0 and "no version set" in result.stderr
+                        else:
+                            passed = result.returncode == 0 and result.stdout.strip() == f"python {expected_active}"
+                    else:
+                        diagnostic = "active; switch" if selected else "not installed"
+                        passed = (result.returncode != 0 and diagnostic in result.stderr) if refuse else (
+                            result.returncode == 0 and f"Removed python {version}" in result.stdout)
+                        passed &= destination.is_dir() == (version in after)
+
+                    # A removal may change only the requested local version's tree.
+                    if target is not None:
+                        current_unchanged = current.is_symlink() and os.readlink(current) == str(target)
+                    elif label == "directory-selection":
+                        current_unchanged = current.is_dir() and not current.is_symlink()
+                    else:
+                        current_unchanged = not current.exists() and not current.is_symlink()
+                    passed &= (current_unchanged
+                               and (outside/"owner-file").read_text() == "outside file\n"
+                               and (versions/sibling/"owner-file").read_text() == f"{sibling}\n")
+                    checks.append(dict(
+                        phase=phase, case=f"{label}-{mode}", status=result.returncode, passed=passed,
+                        current=expected_active,
+                        diagnostic=(result.stdout + result.stderr)[-1100:],
+                    ))
+
+
     def inspect_task_environment_bytes():
         phase = "task-environment-bytes"
         raw = b"test-\xff-value"
@@ -5664,6 +5764,7 @@ exec {shlex.quote(str(binary))} "$@"
                     inspect_node_alias_selection()
                     inspect_python_project_constraints()
                     inspect_python_virtualenv_launch()
+                    inspect_python_inventory_and_removal()
                     mark_progress("runtime selection and Python environments")
                     inspect_task_environment_bytes()
                     inspect_task_package_metadata()
@@ -5989,6 +6090,6 @@ mark_progress("completed with host inventory unchanged")
 report = dict(binaries=binaries, checks=checks, total=len(checks),
               passed=sum(entry["passed"] for entry in checks), host_unchanged=True)
 print(json.dumps(report))
-expected_checks = 303 if consent_oracle is None else 1980
+expected_checks = 303 if consent_oracle is None else 2020
 if report["passed"] != report["total"] or report["total"] != expected_checks:
     sys.exit(4)

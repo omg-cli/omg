@@ -1933,10 +1933,7 @@ pub(crate) fn uninstall_version_with_lease(
         }
         anyhow::bail!("Version {version} is not installed; nothing to remove");
     }
-    if fs::read_link(versions_dir.join("current"))
-        .ok()
-        .is_some_and(|target| target.ends_with(version))
-    {
+    if get_current_version(versions_dir).as_deref() == Some(version) {
         anyhow::bail!("Version {version} is active; switch to another version before removing it");
     }
     fs::remove_dir_all(&version_dir).with_context(|| {

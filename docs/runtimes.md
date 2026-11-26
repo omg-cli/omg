@@ -64,6 +64,8 @@ omg which node
 
 `omg list node --available` asks the provider for available versions. That may require network access. `omg which node` prints the resolved active version or says that none is set; it does not identify the source file.
 
+`omg list python --available` shows all releases in the compatible download catalog and labels prereleases.
+
 To use the version detected from a project file, omit only the version:
 
 ```bash
