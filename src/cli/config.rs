@@ -42,15 +42,23 @@ pub fn set(key: &str, value: &str) -> Result<()> {
     validate_key(key)?;
     validate_value(value)?;
 
+    if key == "telemetry.enabled" {
+        let enabled = value.parse().context("Invalid boolean value")?;
+        crate::core::telemetry::set_telemetry_preference(enabled)?;
+    } else {
+        save_local_setting(key, value)?;
+    }
+    println!("{} Set {} = {}", style::success("✓"), key, value);
+    Ok(())
+}
+
+fn save_local_setting(key: &str, value: &str) -> Result<()> {
     let _write_lock = Settings::write_lock()?;
     let mut settings = Settings::load().context("Failed to load OMG settings")?;
 
     match key {
         "aur.security_profile" => {
             settings.aur.security_profile = value.parse()?;
-        }
-        "telemetry.enabled" => {
-            settings.telemetry_enabled = value.parse().context("Invalid boolean value")?;
         }
         "aur.build_concurrency" => {
             let concurrency: usize = value.parse().context("Invalid number")?;
@@ -85,9 +93,7 @@ pub fn set(key: &str, value: &str) -> Result<()> {
         }
     }
 
-    settings.save()?;
-    println!("{} Set {} = {}", style::success("✓"), key, value);
-    Ok(())
+    settings.save()
 }
 
 /// List all configuration values

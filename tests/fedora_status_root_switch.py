@@ -4561,6 +4561,251 @@ for version in versions:
         assert sorted(set(ordinary_control(query).splitlines())) == expected
 
 
+    def inspect_privacy_commands():
+        phase = "fedora-privacy"
+
+        @contextmanager
+        def arrange():
+            with tempfile.TemporaryDirectory(prefix="privacy-", dir=work) as directory:
+                home = Path(directory)
+                parent = home / "data"
+                settings = home / "config"
+                for path in (home, parent, settings):
+                    path.mkdir(exist_ok=True)
+                    os.chown(path, account.pw_uid, account.pw_gid)
+                    path.chmod(0o700)
+                selected = dict(disabled, HOME=str(home), OMG_DATA_DIR=str(parent), OMG_CONFIG_DIR=str(settings),
+                                XDG_CONFIG_HOME=str(home/"xdg-config"), XDG_DATA_HOME=str(home/"xdg-data"),
+                                XDG_STATE_HOME=str(home/"state"), XDG_CACHE_HOME=str(home/"cache"),
+                                CI="1", OMG_NO_UPDATE_CHECK="1")
+                yield home, parent, settings / "config.toml", selected
+
+        def write(path, value, mode=0o600):
+            if not path.parent.is_dir():
+                path.parent.mkdir(parents=True)
+                os.chown(path.parent, account.pw_uid, account.pw_gid)
+            path.write_bytes(value)
+            os.chown(path, account.pw_uid, account.pw_gid)
+            path.chmod(mode)
+
+        def run(label, args, chosen, verify, *, surface="privacy"):
+            result = command([cli, surface, *args], chosen, ordinary, timeout=12)
+            checks.append(dict(phase=phase, case=label, passed=verify(result),
+                               status=result.returncode, diagnostic=(result.stdout[-850:],
+                                                                      result.stderr[-850:])))
+
+        def success(result, text):
+            return result.returncode == 0 and text in result.stdout
+
+        def refused(result, text):
+            return result.returncode == 1 and text.lower() in result.stderr.lower() and "Data exported to" not in result.stdout
+
+        def valid_export(path, expected):
+            if not path.is_file() or stat.S_IMODE(path.stat().st_mode) != 0o600:
+                return False
+            value = json.loads(path.read_bytes())
+            return (set(value) == {"exported_at", "local", "scope"} and value["scope"] == "local"
+                    and bool(value["exported_at"]) and value["local"] == expected)
+
+        with arrange() as (home, data, config, chosen):
+            run("status-empty", ["status"], chosen, lambda result: success(result, "Telemetry: Disabled")
+                and not config.exists())
+            run("status-default-subcommand", [], chosen, lambda result: success(result, "OMG Privacy Settings")
+                and "Telemetry: Disabled" in result.stdout and not config.exists())
+            path = home / "empty.json"
+            run("export-empty", ["export", "--output", path], chosen,
+                lambda result: success(result, "Data exported to") and valid_export(path, {}))
+            run("export-default-name", ["export"], chosen,
+                lambda result: success(result, "Data exported to")
+                and len(paths := list(home.glob("omg-data-export-????-??-??.json"))) == 1
+                and valid_export(paths[0], {}))
+
+            archive = '{"id":"older"}\n{"id":"newer"}\n'
+            clock_fixture = str(int(time.time()) + 3600)
+            for file, value in (
+                (data/"usage.json", b'{"total_commands":7}'),
+                (data/"telemetry_queue.json", b'{"format_version":1,"events":[]}'),
+                (data/"telemetry_session.json", b'{"session_id":"local-session"}'),
+                (data/"history.json", b'[{"id":"latest"}]'),
+                (data/"completion-cache.json", b'{"packages":["git"]}'),
+                (data/".installed", b'{"install_id":"local-identifier"}'),
+                (data/"history.json.archive.jsonl", archive.encode()),
+                (data/"machine-id", b"machine-fixture"),
+                (data/"license-clock.highwater", clock_fixture.encode()),
+                (data/"license.json", b'{"key":"inert-key","tier":"pro","features":["sbom"],'
+                 b'"customer":"fixture@example.invalid","expires_at":null,"validated_at":1700000000,'
+                 b'"token":"inert-token","machine_id":"fixture-machine"}'),
+                (data/"audit/audit.jsonl", b'current audit\n'),
+                (data/"audit/audit.jsonl.1", b'archived audit\n'),
+                (data/"audit/notes.txt", b'ordinary note\n'),
+                (data/"sbom/a.json", b'{"name":"sbom-a"}'),
+                (data/"sbom/z.json", b'{"name":"sbom-z"}'),
+                (data/"snapshots/index.json", b'{"snapshots":[]}'),
+                (data/"snapshots/one.json", b'{"id":"one"}'),
+                (data/"snapshots/.create.pending", b'{"id":"prepared"}'),
+                (config, b'telemetry_enabled = false\n'),
+            ):
+                write(file, value)
+            expected = {
+                "usage.json": {"total_commands": 7},
+                "telemetry_queue.json": {"format_version": 1, "events": []},
+                "telemetry_session.json": {"session_id": "local-session"},
+                "history.json": [{"id": "latest"}],
+                "completion-cache.json": {"packages": ["git"]},
+                ".installed": {"install_id": "local-identifier"},
+                "history.json.archive.jsonl": archive,
+                "machine-id": "machine-fixture",
+                "license-clock.highwater": clock_fixture,
+                "license.json": {"tier": "pro", "features": ["sbom"], "customer": "fixture@example.invalid",
+                                 "expires_at": None, "validated_at": 1700000000, "machine_id": "fixture-machine"},
+                "audit": {"audit.jsonl": "current audit\n", "audit.jsonl.1": "archived audit\n"},
+                "sbom": {"a.json": {"name": "sbom-a"}, "z.json": {"name": "sbom-z"}},
+                "snapshots": {"index.json": {"snapshots": []}, "one.json": {"id": "one"}},
+                "config.toml": "telemetry_enabled = false\n",
+            }
+            before = {file: file.read_bytes() for file in data.rglob("*") if file.is_file()}
+            full = home / "local report.json"
+            run("export-all-durable-categories", ["export", "--output", full], chosen,
+                lambda result: success(result, str(full)) and valid_export(full, expected))
+            run("export-relative-path", ["export", "--output", "relative.json"], chosen,
+                lambda result: success(result, "relative.json") and valid_export(home/"relative.json", expected))
+            permissive = home / "replace.json"
+            write(permissive, b"old export", 0o644)
+            inode = permissive.stat().st_ino
+            run("export-replaces-permissive-file", ["export", "--output", permissive], chosen,
+                lambda result: success(result, str(permissive)) and valid_export(permissive, expected)
+                and permissive.stat().st_ino != inode)
+            shared = home / "other name.txt"
+            linked = home / "linked export.json"
+            write(shared, b"previous local data", 0o644)
+            os.link(shared, linked)
+            run("export-replaces-only-output-inode", ["export", "--output", linked], chosen,
+                lambda result: success(result, str(linked)) and valid_export(linked, expected)
+                and shared.read_bytes() == b"previous local data"
+                and stat.S_IMODE(shared.stat().st_mode) == 0o644
+                and shared.stat().st_ino != linked.stat().st_ino)
+            assert all(file.read_bytes() == value for file, value in before.items())
+            as_directory = home / "output-directory"
+            as_directory.mkdir()
+            run("export-folder-destination", ["export", "--output", as_directory], chosen,
+                lambda result: refused(result, "Failed to replace") and as_directory.is_dir())
+
+        for label, relative, contents, error in (
+            ("invalid-source-json", "usage.json", b'{', "Failed to parse"),
+            ("invalid-license-json", "license.json", b'{"tier":null}', "Failed to parse"),
+            ("invalid-audit-text", "audit/audit.jsonl", b'\xff\n', "valid UTF-8"),
+            ("source-directory-in-file-slot", "history.json", None, "regular file"),
+            ("source-file-in-directory-slot", "snapshots", b'{}', "regular directory"),
+        ):
+            with arrange() as (home, data, config, chosen):
+                source = data / relative
+                if contents is None:
+                    source.mkdir()
+                else:
+                    write(source, contents)
+                output = home / "prior.json"
+                write(output, b"prior export", 0o644)
+                original = output.stat().st_ino
+                run(label, ["export", "--output", output], chosen,
+                    lambda result: refused(result, error) and output.read_bytes() == b"prior export"
+                    and output.stat().st_ino == original and stat.S_IMODE(output.stat().st_mode) == 0o644)
+
+        with arrange() as (home, data, config, chosen):
+            oversized = data / "usage.json"
+            write(oversized, b'{}')
+            with oversized.open("r+b") as stream:
+                stream.truncate(64 * 1024 * 1024 + 1)
+            output = home / "prior.json"
+            write(output, b"prior export")
+            run("individual-source-limit", ["export", "--output", output], chosen,
+                lambda result: refused(result, "byte limit") and output.read_bytes() == b"prior export")
+            oversized.unlink()
+            for name in ("usage.json", "history.json", "completion-cache.json"):
+                source = data / name
+                write(source, b'{}')
+                with source.open("ab") as stream:
+                    for _ in range(44):
+                        stream.write(b" " * (1024 * 1024))
+            run("combined-source-limit", ["export", "--output", output], chosen,
+                lambda result: refused(result, "combined source byte limit") and output.read_bytes() == b"prior export")
+
+        with arrange() as (home, data, config, chosen):
+            queue = data / "telemetry_queue.json"
+            queued = b'{"format_version":1,"events":[]}'
+            write(config, b"telemetry_enabled = true\n# preserved preference\n")
+            write(queue, queued)
+            run("opt-out-clears-queue", ["opt-out"], chosen,
+                lambda result: success(result, "Telemetry disabled locally") and not queue.exists()
+                and tomllib.loads(config.read_text())["telemetry_enabled"] is False
+                and "# preserved preference" in config.read_text())
+            run("status-after-opt-out", ["status"], chosen, lambda result: success(result, "Telemetry: Disabled"))
+            run("opt-out-idempotent", ["opt-out"], chosen,
+                lambda result: success(result, "Telemetry disabled locally") and not queue.exists()
+                and tomllib.loads(config.read_text())["telemetry_enabled"] is False)
+            write(queue, queued)
+            run("opt-in-purges-leftover-disabled-queue", ["opt-in"], chosen,
+                lambda result: success(result, "environment override keeps telemetry disabled")
+                and not queue.exists() and tomllib.loads(config.read_text())["telemetry_enabled"] is True)
+            write(queue, queued)
+            run("repeated-opt-in-keeps-consented-queue", ["opt-in"], chosen,
+                lambda result: success(result, "environment override keeps telemetry disabled")
+                and queue.read_bytes() == queued and tomllib.loads(config.read_text())["telemetry_enabled"] is True)
+            run("status-disable-override", ["status"], chosen, lambda result: success(result, "Telemetry: Disabled"))
+            chosen = {key: value for key, value in chosen.items() if key != "OMG_DISABLE_TELEMETRY"}
+            for label, override in (
+                ("off", {"OMG_TELEMETRY": "OFF"}),
+                ("no", {"OMG_TELEMETRY": "no"}),
+                ("yes-disable", {"OMG_DISABLE_TELEMETRY": "YES"}),
+            ):
+                overlay = dict(chosen, **override)
+                run(f"status-{label}", ["status"], overlay,
+                    lambda result: success(result, "Telemetry: Disabled"))
+                run(f"opt-in-{label}", ["opt-in"], overlay,
+                    lambda result: success(result, "environment override keeps telemetry disabled")
+                    and tomllib.loads(config.read_text())["telemetry_enabled"] is True)
+            run("status-enabled-without-override", ["status"], chosen,
+                lambda result: success(result, "Telemetry: Enabled"))
+
+        with arrange() as (home, data, config, chosen):
+            queue = data / "telemetry_queue.json"
+            queue.mkdir()
+            write(config, b"telemetry_enabled = true\n")
+            run("opt-out-purge-failure-persists-disabled", ["opt-out"], chosen,
+                lambda result: refused(result, "Failed to purge queued telemetry")
+                and tomllib.loads(config.read_text())["telemetry_enabled"] is False and queue.is_dir())
+            run("opt-in-blocked-by-unpurged-queue", ["opt-in"], chosen,
+                lambda result: refused(result, "Failed to purge queued telemetry")
+                and tomllib.loads(config.read_text())["telemetry_enabled"] is False and queue.is_dir())
+            queue.rmdir()
+            run("opt-in-after-purge-obstruction-removed", ["opt-in"], chosen,
+                lambda result: success(result, "environment override keeps telemetry disabled")
+                and tomllib.loads(config.read_text())["telemetry_enabled"] is True)
+            write(config, b"telemetry_enabled = [")
+            for operation in ("status", "opt-in", "opt-out"):
+                run(f"corrupt-config-{operation}", [operation], chosen,
+                    lambda result: refused(result, "Failed to load OMG settings")
+                    and config.read_bytes() == b"telemetry_enabled = [")
+
+
+        with arrange() as (home, data, config, chosen):
+            queue = data / "telemetry_queue.json"
+            queue.mkdir()
+            write(config, b"telemetry_enabled = false\n")
+            run("config-opt-in-blocked-by-unpurged-queue", ["set", "telemetry.enabled", "true"], chosen,
+                lambda result: refused(result, "Failed to purge queued telemetry")
+                and tomllib.loads(config.read_text())["telemetry_enabled"] is False, surface="config")
+            queue.rmdir()
+            write(queue, b'{"format_version":1,"events":[]}')
+            write(config, b"telemetry_enabled = false\n")
+            run("config-opt-in-clears-disabled-queue", ["set", "telemetry.enabled", "true"], chosen,
+                lambda result: success(result, "Set telemetry.enabled = true") and not queue.exists()
+                and tomllib.loads(config.read_text())["telemetry_enabled"] is True, surface="config")
+            write(queue, b'{"format_version":1,"events":[]}')
+            run("config-opt-out-purges-queue", ["set", "telemetry.enabled", "false"], chosen,
+                lambda result: success(result, "Set telemetry.enabled = false") and not queue.exists()
+                and tomllib.loads(config.read_text())["telemetry_enabled"] is False, surface="config")
+
+
     def inspect_task_environment_bytes():
         phase = "task-environment-bytes"
         raw = b"test-\xff-value"
@@ -7295,6 +7540,7 @@ exec {shlex.quote(str(binary))} "$@"
                     inspect_migration()
                     inspect_snapshots()
                     inspect_snapshot_recovery()
+                    inspect_privacy_commands()
                 config.write_text(host_config)
                 inspect("returned-host", host_count, host_explicit, host=True)
                 mark_progress("root switch and return")
@@ -7606,6 +7852,6 @@ mark_progress("completed with host inventory unchanged")
 report = dict(binaries=binaries, checks=checks, total=len(checks),
               passed=sum(entry["passed"] for entry in checks), host_unchanged=True)
 print(json.dumps(report))
-expected_checks = 303 if consent_oracle is None else 2434
+expected_checks = 303 if consent_oracle is None else 2472
 if report["passed"] != report["total"] or report["total"] != expected_checks:
     sys.exit(4)

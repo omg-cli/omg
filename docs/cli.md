@@ -902,9 +902,11 @@ omg privacy [SUBCOMMAND]
 | `opt-out` | Disable telemetry collection |
 | `opt-in` | Re-enable telemetry collection |
 
-Local exports include archived package history. Each source file is limited to
-64 MiB. Larger files cause the export to fail rather than silently omitting or
-truncating data. Streaming exports for larger archives are not supported.
+Local exports include archived package history. Export accepts up to 64 MiB per
+source file and 128 MiB across all source files. The output is replaced atomically
+with owner-only permissions. `privacy opt-in`, `privacy opt-out`, and `config set telemetry.enabled`
+discard queued events on opt-out and before enabling telemetry from a disabled state.
+Environment overrides can keep collection disabled after opt-in.
 
 ---
 

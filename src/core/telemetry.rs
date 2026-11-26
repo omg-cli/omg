@@ -74,15 +74,12 @@ pub fn is_telemetry_opt_out() -> bool {
         return true;
     }
 
-    // Check environment variables first (highest priority)
-    let env_opt_out = env_value_matches("OMG_TELEMETRY", &["0", "false", "off", "no"])
-        || env_value_matches("OMG_DISABLE_TELEMETRY", &["1", "true", "on", "yes"]);
+    telemetry_disabled_by_environment() || settings_file_opts_out()
+}
 
-    if env_opt_out {
-        return true;
-    }
-
-    settings_file_opts_out()
+pub(crate) fn telemetry_disabled_by_environment() -> bool {
+    env_value_matches("OMG_TELEMETRY", &["0", "false", "off", "no"])
+        || env_value_matches("OMG_DISABLE_TELEMETRY", &["1", "true", "on", "yes"])
 }
 
 /// Identity of the config file a cached opt-out verdict was read from.
@@ -660,6 +657,23 @@ fn purge_queue(queue: Option<&Mutex<EventQueue>>, path: &std::path::Path) -> Res
 /// Remove queued telemetry after a user opts out.
 pub fn purge_persisted_queue() -> Result<()> {
     purge_queue(EVENT_QUEUE.get(), &telemetry_queue_path())
+}
+
+pub(crate) fn set_telemetry_preference(enabled: bool) -> Result<()> {
+    use crate::config::Settings;
+
+    let _write_lock = Settings::write_lock()?;
+    let mut settings = Settings::load().context("Failed to load OMG settings")?;
+    if enabled && !settings.telemetry_enabled {
+        purge_persisted_queue().context("Failed to purge queued telemetry before opting in")?;
+    }
+
+    settings.telemetry_enabled = enabled;
+    settings.save()?;
+    if !enabled {
+        purge_persisted_queue().context("Failed to purge queued telemetry after opting out")?;
+    }
+    Ok(())
 }
 
 /// Get or create the session state

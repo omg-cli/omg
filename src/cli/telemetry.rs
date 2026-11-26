@@ -1,4 +1,4 @@
-use std::io::Read;
+use std::io::{BufWriter, Write as _};
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -6,9 +6,13 @@ use owo_colors::OwoColorize;
 
 use crate::cli::style;
 use crate::config::Settings;
-use crate::core::telemetry::{is_telemetry_opt_out, purge_persisted_queue};
+use crate::core::safe_ops;
+use crate::core::telemetry::{
+    is_telemetry_opt_out, set_telemetry_preference, telemetry_disabled_by_environment,
+};
 
 const MAX_PRIVACY_EXPORT_FILE_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_PRIVACY_EXPORT_SOURCE_BYTES: u64 = 128 * 1024 * 1024;
 
 // =============================================================================
 // Privacy Rights (GDPR/CCPA - Available Globally)
@@ -59,12 +63,12 @@ pub fn export_data(output_path: Option<&str>) -> Result<()> {
         },
         String::from,
     );
-    write_private_export(Path::new(&path), &serde_json::to_vec_pretty(&data)?)?;
+    write_private_export(Path::new(&path), &data)?;
 
     println!(
         "  {} Data exported to: {}",
         style::maybe_color("✓", |t| t.green().to_string()),
-        style::path(&path)
+        style::path(&style::sanitize_terminal_text(&path))
     );
     Ok(())
 }
@@ -81,6 +85,7 @@ fn collect_local_privacy_data_from(
     config_dir: &Path,
 ) -> Result<serde_json::Value> {
     let mut files = serde_json::Map::new();
+    let mut remaining_bytes = MAX_PRIVACY_EXPORT_SOURCE_BYTES;
 
     for name in [
         "usage.json",
@@ -90,12 +95,13 @@ fn collect_local_privacy_data_from(
         "completion-cache.json",
         ".installed",
     ] {
-        if let Some(value) = read_json_file(&data_dir.join(name))? {
+        if let Some(value) = read_json_file(&data_dir.join(name), &mut remaining_bytes)? {
             files.insert(name.to_string(), value);
         }
     }
 
-    if let Some(value) = read_license_export(&data_dir.join("license.json"))? {
+    if let Some(value) = read_license_export(&data_dir.join("license.json"), &mut remaining_bytes)?
+    {
         files.insert("license.json".to_string(), value);
     }
 
@@ -104,94 +110,69 @@ fn collect_local_privacy_data_from(
         "license-clock.highwater",
         "history.json.archive.jsonl",
     ] {
-        if let Some(value) = read_text_file(&data_dir.join(name))? {
+        if let Some(value) = read_text_file(&data_dir.join(name), &mut remaining_bytes)? {
             files.insert(name.to_string(), serde_json::Value::String(value));
         }
     }
 
-    if let Some(value) = collect_text_directory(&data_dir.join("audit"), |name| {
-        name == "audit.jsonl"
-            || name
-                .strip_prefix("audit.jsonl.")
-                .is_some_and(|suffix| suffix.parse::<usize>().is_ok())
-    })? {
+    if let Some(value) =
+        collect_text_directory(&data_dir.join("audit"), &mut remaining_bytes, |name| {
+            name == "audit.jsonl"
+                || name
+                    .strip_prefix("audit.jsonl.")
+                    .is_some_and(|suffix| suffix.parse::<usize>().is_ok())
+        })?
+    {
         files.insert("audit".to_string(), value);
     }
 
     for category in ["sbom", "snapshots"] {
-        if let Some(value) = collect_json_directory(&data_dir.join(category))? {
+        if let Some(value) = collect_json_directory(&data_dir.join(category), &mut remaining_bytes)?
+        {
             files.insert(category.to_string(), value);
         }
     }
 
-    if let Some(config) = read_text_file(&config_dir.join("config.toml"))? {
+    if let Some(config) = read_text_file(&config_dir.join("config.toml"), &mut remaining_bytes)? {
         files.insert("config.toml".to_string(), serde_json::Value::String(config));
     }
 
     Ok(serde_json::Value::Object(files))
 }
 
-fn write_private_export(path: &Path, contents: &[u8]) -> Result<()> {
-    #[cfg(unix)]
-    if let Ok(metadata) = std::fs::symlink_metadata(path)
-        && metadata.file_type().is_file()
-    {
-        use std::os::unix::fs::PermissionsExt;
-
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("Failed to secure existing export: {}", path.display()))?;
-    }
-
-    crate::core::safe_ops::atomic_write_file_sync(path, contents)?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("Failed to secure privacy export: {}", path.display()))?;
-    }
-
-    Ok(())
+fn write_private_export(path: &Path, value: &serde_json::Value) -> Result<()> {
+    safe_ops::atomic_write_file_sync_private_with(path, |file| {
+        let mut writer = BufWriter::with_capacity(64 * 1024, file);
+        serde_json::to_writer_pretty(&mut writer, value)
+            .context("Failed to serialize privacy export")?;
+        writer.flush().context("Failed to flush privacy export")
+    })
 }
 
-fn read_bounded_regular_file(path: &Path) -> Result<Option<Vec<u8>>> {
-    let metadata = match std::fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(error).with_context(|| format!("Failed to inspect {}", path.display()));
+fn read_privacy_file(path: &Path, remaining_bytes: &mut u64) -> Result<Option<Vec<u8>>> {
+    let bytes = match safe_ops::read_bounded_regular_bytes(
+        path,
+        "Privacy export source",
+        MAX_PRIVACY_EXPORT_FILE_BYTES,
+    ) {
+        Ok((bytes, _)) => bytes,
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|cause| cause.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            return Ok(None);
         }
+        Err(error) => return Err(error),
     };
-    anyhow::ensure!(
-        metadata.file_type().is_file(),
-        "Privacy export source is not a regular file: {}",
-        path.display()
-    );
-    anyhow::ensure!(
-        metadata.len() <= MAX_PRIVACY_EXPORT_FILE_BYTES,
-        "Privacy export source exceeds the {} byte limit: {}",
-        MAX_PRIVACY_EXPORT_FILE_BYTES,
-        path.display()
-    );
-
-    let mut bytes = Vec::new();
-    std::fs::File::open(path)
-        .with_context(|| format!("Failed to open {}", path.display()))?
-        .take(MAX_PRIVACY_EXPORT_FILE_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .with_context(|| format!("Failed to read {}", path.display()))?;
-    anyhow::ensure!(
-        bytes.len() as u64 <= MAX_PRIVACY_EXPORT_FILE_BYTES,
-        "Privacy export source exceeds the {} byte limit: {}",
-        MAX_PRIVACY_EXPORT_FILE_BYTES,
-        path.display()
-    );
+    *remaining_bytes = remaining_bytes.checked_sub(bytes.len() as u64).with_context(|| {
+        format!("Privacy export exceeds the combined source byte limit ({MAX_PRIVACY_EXPORT_SOURCE_BYTES}): {}", path.display())
+    })?;
     Ok(Some(bytes))
 }
 
-fn read_json_file(path: &Path) -> Result<Option<serde_json::Value>> {
-    read_bounded_regular_file(path)?
+fn read_json_file(path: &Path, remaining_bytes: &mut u64) -> Result<Option<serde_json::Value>> {
+    read_privacy_file(path, remaining_bytes)?
         .map(|bytes| {
             serde_json::from_slice(&bytes)
                 .with_context(|| format!("Failed to parse {}", path.display()))
@@ -199,8 +180,11 @@ fn read_json_file(path: &Path) -> Result<Option<serde_json::Value>> {
         .transpose()
 }
 
-fn read_license_export(path: &Path) -> Result<Option<serde_json::Value>> {
-    let Some(bytes) = read_bounded_regular_file(path)? else {
+fn read_license_export(
+    path: &Path,
+    remaining_bytes: &mut u64,
+) -> Result<Option<serde_json::Value>> {
+    let Some(bytes) = read_privacy_file(path, remaining_bytes)? else {
         return Ok(None);
     };
     let license: crate::core::license::StoredLicense = serde_json::from_slice(&bytes)
@@ -215,8 +199,8 @@ fn read_license_export(path: &Path) -> Result<Option<serde_json::Value>> {
     })))
 }
 
-fn read_text_file(path: &Path) -> Result<Option<String>> {
-    read_bounded_regular_file(path)?
+fn read_text_file(path: &Path, remaining_bytes: &mut u64) -> Result<Option<String>> {
+    read_privacy_file(path, remaining_bytes)?
         .map(|bytes| {
             String::from_utf8(bytes)
                 .with_context(|| format!("{} is not valid UTF-8", path.display()))
@@ -255,7 +239,10 @@ fn regular_directory_entries(path: &Path) -> Result<Option<Vec<(String, std::pat
     Ok(Some(entries))
 }
 
-fn collect_json_directory(path: &Path) -> Result<Option<serde_json::Value>> {
+fn collect_json_directory(
+    path: &Path,
+    remaining_bytes: &mut u64,
+) -> Result<Option<serde_json::Value>> {
     let Some(entries) = regular_directory_entries(path)? else {
         return Ok(None);
     };
@@ -264,7 +251,7 @@ fn collect_json_directory(path: &Path) -> Result<Option<serde_json::Value>> {
         if entry_path
             .extension()
             .is_some_and(|extension| extension == "json")
-            && let Some(value) = read_json_file(&entry_path)?
+            && let Some(value) = read_json_file(&entry_path, remaining_bytes)?
         {
             files.insert(name, value);
         }
@@ -274,6 +261,7 @@ fn collect_json_directory(path: &Path) -> Result<Option<serde_json::Value>> {
 
 fn collect_text_directory(
     path: &Path,
+    remaining_bytes: &mut u64,
     include: impl Fn(&str) -> bool,
 ) -> Result<Option<serde_json::Value>> {
     let Some(entries) = regular_directory_entries(path)? else {
@@ -282,7 +270,7 @@ fn collect_text_directory(
     let mut files = serde_json::Map::new();
     for (name, entry_path) in entries {
         if include(&name)
-            && let Some(value) = read_text_file(&entry_path)?
+            && let Some(value) = read_text_file(&entry_path, remaining_bytes)?
         {
             files.insert(name, serde_json::Value::String(value));
         }
@@ -292,11 +280,7 @@ fn collect_text_directory(
 
 /// Disable telemetry on this machine.
 pub fn opt_out_api() -> Result<()> {
-    let _write_lock = Settings::write_lock()?;
-    let mut settings = Settings::load().context("Failed to load OMG settings")?;
-    settings.telemetry_enabled = false;
-    settings.save()?;
-    purge_persisted_queue().context("Failed to purge queued telemetry after opting out")?;
+    set_telemetry_preference(false)?;
     println!(
         "  {} Telemetry disabled locally",
         style::maybe_color("✓", |t| t.green().to_string())
@@ -306,15 +290,16 @@ pub fn opt_out_api() -> Result<()> {
 
 /// Enable telemetry on this machine.
 pub fn opt_in_api() -> Result<()> {
-    let _write_lock = Settings::write_lock()?;
-    let mut settings = Settings::load().context("Failed to load OMG settings")?;
-    settings.telemetry_enabled = true;
-    settings.save()?;
+    set_telemetry_preference(true)?;
+    let message = if telemetry_disabled_by_environment() {
+        "Telemetry enabled locally in settings. An environment override keeps telemetry disabled."
+    } else {
+        "Telemetry enabled locally"
+    };
     println!(
-        "  {} Telemetry enabled locally",
+        "  {} {message}",
         style::maybe_color("✓", |t| t.green().to_string())
     );
-    println!("  Thank you for helping improve OMG!");
     Ok(())
 }
 
@@ -440,9 +425,12 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
             .expect("make existing export permissive");
 
-        write_private_export(&path, b"new").expect("write private export");
-
-        assert_eq!(std::fs::read(&path).expect("read export"), b"new");
+        let value = serde_json::json!({"export": "new"});
+        write_private_export(&path, &value).expect("write private export");
+        let written: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("read export"))
+                .expect("parse export");
+        assert_eq!(written, value);
         assert_eq!(
             std::fs::metadata(&path)
                 .expect("export metadata")
@@ -490,7 +478,7 @@ mod tests {
         let error =
             collect_local_privacy_data_from(&data_dir, &config_dir).expect_err("symlink must fail");
 
-        assert!(error.to_string().contains("not a regular file"));
+        assert!(error.to_string().contains("must be a regular file"));
         assert!(error.to_string().contains(&link.display().to_string()));
     }
 

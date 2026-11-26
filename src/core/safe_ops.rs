@@ -275,6 +275,13 @@ pub fn atomic_write_file_sync_private<P: AsRef<Path>, C: AsRef<[u8]>>(
     atomic_write_file_sync_inner(path, contents, true)
 }
 
+pub(crate) fn atomic_write_file_sync_private_with(
+    path: &Path,
+    write: impl FnOnce(&mut std::fs::File) -> Result<()>,
+) -> Result<()> {
+    stage_atomic_write_with(path, true, write)?.publish()
+}
+
 fn atomic_write_file_sync_inner<P: AsRef<Path>, C: AsRef<[u8]>>(
     path: P,
     contents: C,
@@ -325,6 +332,17 @@ fn stage_atomic_write(
     path: impl AsRef<Path>,
     contents: &[u8],
     private: bool,
+) -> Result<StagedFileWrite> {
+    stage_atomic_write_with(path, private, |file| {
+        file.write_all(contents)?;
+        Ok(())
+    })
+}
+
+fn stage_atomic_write_with(
+    path: impl AsRef<Path>,
+    private: bool,
+    write: impl FnOnce(&mut std::fs::File) -> Result<()>,
 ) -> Result<StagedFileWrite> {
     let path = path.as_ref();
     anyhow::ensure!(!path.as_os_str().is_empty(), "Path cannot be empty");
@@ -386,9 +404,7 @@ fn stage_atomic_write(
             .set_permissions(permissions)
             .with_context(|| format!("Failed to preserve permissions for {}", path.display()))?;
     }
-    temporary
-        .as_file_mut()
-        .write_all(contents)
+    write(temporary.as_file_mut())
         .with_context(|| format!("Failed to write temporary file for {}", path.display()))?;
     temporary
         .as_file_mut()
