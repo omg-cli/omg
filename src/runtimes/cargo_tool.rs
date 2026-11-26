@@ -12,6 +12,8 @@ use super::tool_artifacts as artifacts;
 use crate::core::security::vulnerability::VulnerabilitySource;
 use crate::package_managers::types::{SecurityOrigin, SecurityPackage};
 
+const CRATE_FILE_LIMIT: u64 = 128 * 1024 * 1024;
+
 #[derive(Deserialize)]
 struct Lock {
     package: Vec<LockedCrate>,
@@ -183,13 +185,9 @@ fn command(
     Ok(command)
 }
 
-fn checked_cache_archive(
-    cache: &Path,
-    name: &str,
-    version: &str,
-    expected: &str,
-) -> Result<PathBuf> {
+fn unique_cache_archive(cache: &Path, name: &str, version: &str) -> Result<PathBuf> {
     let base = cache.join("registry/cache");
+    let filename = format!("{name}-{version}.crate");
     let mut found = None;
     for index in fs::read_dir(&base)? {
         let index = index?;
@@ -197,17 +195,21 @@ fn checked_cache_archive(
             index.file_type()?.is_dir(),
             "Cargo registry cache is redirected"
         );
-        let path = index.path().join(format!("{name}-{version}.crate"));
-        if path.try_exists()? {
-            ensure!(
-                found.is_none(),
-                "Cargo checksum cache contains ambiguous archives"
-            );
-            ensure!(
-                artifacts::hash(&artifacts::read(&path, 128 * 1024 * 1024)?) == expected,
-                "Cargo downloaded archive differs from its reviewed registry checksum"
-            );
-            found = Some(path);
+        let path = index.path().join(&filename);
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) => {
+                ensure!(
+                    metadata.is_file(),
+                    "Cargo cache archive is not a regular file"
+                );
+                ensure!(
+                    found.is_none(),
+                    "Cargo checksum cache contains ambiguous archives"
+                );
+                found = Some(path);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("Could not inspect Cargo cache archive"),
         }
     }
     found.context("Cargo did not fetch a checksum-bound locked dependency")
@@ -219,16 +221,20 @@ fn extract_verified_archive(
     destination: &Path,
     prefix: &str,
     work: &Path,
-) -> Result<()> {
-    let bytes = artifacts::read(archive, 128 * 1024 * 1024)?;
-    ensure!(
-        artifacts::hash(&bytes) == checksum,
-        "Cargo archive changed before source verification"
-    );
-    let private = tempfile::Builder::new()
+) -> Result<BTreeMap<PathBuf, String>> {
+    let mut private = tempfile::Builder::new()
         .prefix("crate-")
         .tempfile_in(work)?;
-    fs::write(private.path(), bytes)?;
+    let (digest, _) = artifacts::RegularFileHasher::new().copy_and_hash(
+        archive,
+        &fs::symlink_metadata(archive)?,
+        CRATE_FILE_LIMIT,
+        private.as_file_mut(),
+    )?;
+    ensure!(
+        digest == checksum,
+        "Cargo archive changed before source verification"
+    );
     super::common::extract_component_tar_gz(
         private.path(),
         destination,
@@ -251,14 +257,14 @@ fn extract_verified_archive(
             Ok((!relative.as_os_str().is_empty()).then_some(relative))
         },
     )?;
-    source_files(destination, false)?;
-    Ok(())
+    source_files(destination, false)
 }
 
 fn source_files(root: &Path, cargo_markers: bool) -> Result<BTreeMap<PathBuf, String>> {
     let mut pending = vec![root.to_path_buf()];
     let mut files = BTreeMap::new();
     let mut count = 0;
+    let mut hasher = artifacts::RegularFileHasher::new();
     while let Some(directory) = pending.pop() {
         for child in fs::read_dir(directory)? {
             let child = child?;
@@ -275,18 +281,16 @@ fn source_files(root: &Path, cargo_markers: bool) -> Result<BTreeMap<PathBuf, St
             {
                 continue;
             }
-            let kind = child.file_type()?;
-            if kind.is_dir() {
+            let metadata = child.metadata()?;
+            if metadata.is_dir() {
                 pending.push(path);
             } else {
                 ensure!(
-                    kind.is_file(),
+                    metadata.is_file(),
                     "Cargo packaged source contains a link or special file"
                 );
-                files.insert(
-                    relative,
-                    artifacts::hash(&artifacts::read(&path, 128 * 1024 * 1024)?),
-                );
+                let (digest, _) = hasher.hash(&path, &metadata, CRATE_FILE_LIMIT)?;
+                files.insert(relative, digest);
             }
         }
     }
@@ -305,8 +309,7 @@ fn verify_extracted_archive(
         .prefix("verified-crate-")
         .tempdir_in(work)?;
     let prefix = format!("{name}-{version}");
-    extract_verified_archive(archive, checksum, private.path(), &prefix, work)?;
-    let expected = source_files(private.path(), false)?;
+    let expected = extract_verified_archive(archive, checksum, private.path(), &prefix, work)?;
     let mut found = false;
     for index in fs::read_dir(cache.join("registry/src"))? {
         let index = index?;
@@ -448,7 +451,7 @@ pub(crate) fn install_reviewed(
         .as_deref()
         .context("Selected Cargo archive has no registry checksum")?;
     let cache = work.join("cargo-home");
-    let archive = checked_cache_archive(&cache, name, version, checksum)?;
+    let archive = unique_cache_archive(&cache, name, version)?;
     let project = work.join("source");
     extract_verified_archive(
         &archive,
@@ -479,7 +482,7 @@ pub(crate) fn install_reviewed(
         .arg(project.join("Cargo.toml"));
     artifacts::run(fetch, "Cargo locked source download", false)?;
     for ((name, version), checksum) in &checksums {
-        let archive = checked_cache_archive(&cache, name, version, checksum)?;
+        let archive = unique_cache_archive(&cache, name, version)?;
         verify_extracted_archive(&cache, &archive, checksum, name, version, work)?;
     }
     let metadata: serde_json::Value = serde_json::from_slice(&resolved)?;
@@ -786,14 +789,11 @@ printf '{}'
         fs::create_dir_all(source.parent().context("Missing source parent")?)?;
         fs::create_dir(cache.join("registry/src/unrelated-index"))?;
         let (archive, digest) = archive_fixture(owner.path())?;
-        assert!(checked_cache_archive(&cache, "tool", "1.0.0", &digest).is_err());
+        assert!(unique_cache_archive(&cache, "tool", "1.0.0").is_err());
         let cached = index.join("tool-1.0.0.crate");
         fs::copy(&archive, &cached)?;
-        assert_eq!(
-            checked_cache_archive(&cache, "tool", "1.0.0", &digest)?,
-            cached
-        );
-        extract_verified_archive(&archive, &digest, &source, "tool-1.0.0", owner.path())?;
+        assert_eq!(unique_cache_archive(&cache, "tool", "1.0.0")?, cached);
+        extract_verified_archive(&cached, &digest, &source, "tool-1.0.0", owner.path())?;
         fs::write(source.join(".cargo-ok"), b"local Cargo extraction marker")?;
         fs::write(source.join(".cargo-checksum.json"), b"{}")?;
         verify_extracted_archive(&cache, &archive, &digest, "tool", "1.0.0", owner.path())?;
@@ -803,12 +803,96 @@ printf '{}'
                 .is_err()
         );
         fs::write(&cached, b"changed downloaded bytes")?;
-        assert!(checked_cache_archive(&cache, "tool", "1.0.0", &digest).is_err());
+        let rejected = owner.path().join("rejected");
+        let error = extract_verified_archive(
+            &unique_cache_archive(&cache, "tool", "1.0.0")?,
+            &digest,
+            &rejected,
+            "tool-1.0.0",
+            owner.path(),
+        )
+        .expect_err("changed cached archive must fail integrity verification");
+        assert!(
+            error
+                .to_string()
+                .contains("changed before source verification")
+        );
+        assert!(!rejected.exists());
         fs::copy(&archive, &cached)?;
         let second = cache.join("registry/cache/other");
         fs::create_dir(&second)?;
         fs::copy(&archive, second.join("tool-1.0.0.crate"))?;
-        assert!(checked_cache_archive(&cache, "tool", "1.0.0", &digest).is_err());
+        assert!(unique_cache_archive(&cache, "tool", "1.0.0").is_err());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cargo_cache_refuses_a_dangling_archive_entry_with_a_valid_peer() -> Result<()> {
+        let owner = tempfile::tempdir()?;
+        let cache = owner.path().join("cache");
+        let first = cache.join("registry/cache/public");
+        let second = cache.join("registry/cache/other");
+        fs::create_dir_all(&first)?;
+        fs::create_dir_all(&second)?;
+        let (archive, _) = archive_fixture(owner.path())?;
+        fs::copy(&archive, first.join("tool-1.0.0.crate"))?;
+        std::os::unix::fs::symlink("missing.crate", second.join("tool-1.0.0.crate"))?;
+        let error = unique_cache_archive(&cache, "tool", "1.0.0")
+            .expect_err("every matching archive entry must be a regular file");
+        assert!(
+            error.to_string().contains("not a regular file"),
+            "{error:#}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cargo_verifies_and_extracts_large_archive() -> Result<()> {
+        use sha2::{Digest as _, Sha256};
+        use std::io::Read as _;
+
+        const SIZE: u64 = 64 * 1024 * 1024;
+        let owner = tempfile::tempdir()?;
+        let archive_path = owner.path().join("tool-1.0.0.crate");
+        let writer = flate2::write::GzEncoder::new(
+            fs::File::create(&archive_path)?,
+            flate2::Compression::none(),
+        );
+        let mut archive = tar::Builder::new(writer);
+        let mut header = tar::Header::new_gnu();
+        header.set_size(SIZE);
+        header.set_mode(0o644);
+        header.set_cksum();
+        archive.append_data(
+            &mut header,
+            "tool-1.0.0/payload.dat",
+            std::io::repeat(0).take(SIZE),
+        )?;
+        archive.into_inner()?.finish()?;
+
+        let mut file = fs::File::open(&archive_path)?;
+        let mut digest = Sha256::new();
+        let mut block = [0_u8; 16 * 1024];
+        loop {
+            let count = file.read(&mut block)?;
+            if count == 0 {
+                break;
+            }
+            digest.update(&block[..count]);
+        }
+        let checksum = hex::encode(digest.finalize());
+        let destination = owner.path().join("source");
+        let started = std::time::Instant::now();
+        extract_verified_archive(
+            &archive_path,
+            &checksum,
+            &destination,
+            "tool-1.0.0",
+            owner.path(),
+        )?;
+        println!("verified elapsed-us={}", started.elapsed().as_micros());
+        assert_eq!(fs::metadata(destination.join("payload.dat"))?.len(), SIZE);
         Ok(())
     }
 

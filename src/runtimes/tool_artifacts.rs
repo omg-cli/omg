@@ -270,6 +270,16 @@ impl RegularFileHasher {
         expected: &fs::Metadata,
         limit: u64,
     ) -> Result<(String, u64)> {
+        self.copy_and_hash(path, expected, limit, std::io::sink())
+    }
+
+    pub(super) fn copy_and_hash(
+        &mut self,
+        path: &Path,
+        expected: &fs::Metadata,
+        limit: u64,
+        mut output: impl std::io::Write,
+    ) -> Result<(String, u64)> {
         ensure!(expected.is_file(), "Registry source is not a regular file");
         ensure!(
             expected.len() <= limit,
@@ -311,7 +321,9 @@ impl RegularFileHasher {
             };
             count += size as u64;
             ensure!(count <= limit, "Registry source exceeds its byte allowance");
-            digest.update(&self.buffer[..size]);
+            let bytes = &self.buffer[..size];
+            digest.update(bytes);
+            output.write_all(bytes)?;
         }
         let after = file.get_ref().metadata()?;
         ensure!(
@@ -955,12 +967,20 @@ esac
             let metadata = fs::symlink_metadata(&path)?;
             let expected = hash(&bytes);
             for limit in [size - 1, size, size + 1, size + 2] {
-                let result = hasher.hash(&path, &metadata, limit as u64);
+                let mut copy = Vec::new();
+                let result = hasher.copy_and_hash(&path, &metadata, limit as u64, &mut copy);
                 if limit >= size {
                     assert_eq!(result?, (expected.clone(), size as u64));
+                    assert_eq!(copy, bytes);
+                    assert_eq!(
+                        hasher.hash(&path, &metadata, limit as u64)?,
+                        (expected.clone(), size as u64)
+                    );
                 } else {
                     let error = result.expect_err("file larger than allowance");
                     assert!(error.to_string().contains("byte allowance"), "{error:#}");
+                    assert!(copy.is_empty());
+                    assert!(hasher.hash(&path, &metadata, limit as u64).is_err());
                 }
             }
         }
