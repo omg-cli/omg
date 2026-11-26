@@ -57,12 +57,12 @@ pub(crate) struct ErlangManager {
 }
 
 /// Host addressing: `(index arch token, tarball arch token)`.
-fn host_arch_tokens() -> Result<(&'static str, &'static str)> {
+fn host_arch_token() -> Result<&'static str> {
     match (std::env::consts::OS, std::env::consts::ARCH) {
-        ("linux", "x86_64") => Ok(("amd64", "amd64")),
-        ("linux", "aarch64") => Ok(("arm64", "arm64")),
-        ("macos", "x86_64") => Ok(("x86_64", "x86_64")),
-        ("macos", "aarch64") => Ok(("aarch64", "aarch64")),
+        ("linux", "x86_64") => Ok("amd64"),
+        ("linux", "aarch64") => Ok("arm64"),
+        ("macos", "x86_64") => Ok("x86_64"),
+        ("macos", "aarch64") => Ok("aarch64"),
         (os, arch) => anyhow::bail!("Unsupported operating system for Erlang/OTP: {os}/{arch}"),
     }
 }
@@ -148,44 +148,51 @@ fn ubuntu_release_from_os(content: &str, arch: &str) -> Result<&'static str> {
     Ok(mapped)
 }
 
-/// Version index URL for this host.
-fn index_url() -> Result<String> {
-    let (arch, _) = host_arch_tokens()?;
-    match std::env::consts::OS {
-        "linux" => {
-            let release = ubuntu_release(arch)?;
-            Ok(format!(
-                "https://builds.hex.pm/builds/otp/{arch}/ubuntu-{release}/builds.txt"
-            ))
+/// Publisher and build platform shared by the catalog and archive.
+#[derive(Debug)]
+enum OtpSource {
+    Hex {
+        arch: &'static str,
+        release: &'static str,
+    },
+    Erlef {
+        arch: &'static str,
+    },
+}
+
+impl OtpSource {
+    fn for_host() -> Result<Self> {
+        let arch = host_arch_token()?;
+        match std::env::consts::OS {
+            "linux" => Ok(Self::Hex {
+                arch,
+                release: ubuntu_release(arch)?,
+            }),
+            "macos" => Ok(Self::Erlef { arch }),
+            os => anyhow::bail!("Unsupported operating system for Erlang/OTP: {os}"),
         }
-        "macos" => Ok(format!(
-            "https://raw.githubusercontent.com/erlef/otp_builds/refs/heads/main/builds/{arch}-apple-darwin.csv"
-        )),
-        os => anyhow::bail!("Unsupported operating system for Erlang/OTP: {os}"),
     }
-}
 
-/// asdf parity: hex.pm and erlef name tarballs `OTP-28.2`, so a trailing
-/// `.0` patch is dropped for URL construction (`28.2.0` → `28.2`).
-fn upstream_version(version: &str) -> &str {
-    version.strip_suffix(".0").unwrap_or(version)
-}
-
-/// Tarball download URL for one resolved version on this host.
-fn tarball_url(version: &str) -> Result<String> {
-    let (arch, _) = host_arch_tokens()?;
-    let upstream = upstream_version(version);
-    match std::env::consts::OS {
-        "linux" => {
-            let release = ubuntu_release(arch)?;
-            Ok(format!(
-                "https://builds.hex.pm/builds/otp/{arch}/ubuntu-{release}/OTP-{upstream}.tar.gz"
-            ))
+    fn index_url(&self) -> String {
+        match self {
+            Self::Hex { arch, release } => {
+                format!("https://builds.hex.pm/builds/otp/{arch}/ubuntu-{release}/builds.txt")
+            }
+            Self::Erlef { arch } => format!(
+                "https://raw.githubusercontent.com/erlef/otp_builds/refs/heads/main/builds/{arch}-apple-darwin.csv"
+            ),
         }
-        "macos" => Ok(format!(
-            "https://github.com/erlef/otp_builds/releases/download/OTP-{upstream}/otp-{arch}-apple-darwin.tar.gz"
-        )),
-        os => anyhow::bail!("Unsupported operating system for Erlang/OTP: {os}"),
+    }
+
+    fn tarball_url(&self, version: &str) -> String {
+        match self {
+            Self::Hex { arch, release } => format!(
+                "https://builds.hex.pm/builds/otp/{arch}/ubuntu-{release}/OTP-{version}.tar.gz"
+            ),
+            Self::Erlef { arch } => format!(
+                "https://github.com/erlef/otp_builds/releases/download/OTP-{version}/otp-{arch}-apple-darwin.tar.gz"
+            ),
+        }
     }
 }
 
@@ -299,81 +306,71 @@ impl ErlangManager {
         }
     }
 
-    /// Fetch a publisher version index as text.
-    async fn fetch_index(&self, url: &str) -> Result<String> {
-        self.client
-            .get(url)
+    /// List available upstream releases (newest first).
+    pub async fn list_available(&self) -> Result<Vec<OtpVersion>> {
+        self.list_from(&OtpSource::for_host()?).await
+    }
+
+    async fn list_from(&self, source: &OtpSource) -> Result<Vec<OtpVersion>> {
+        let url = source.index_url();
+        let response = self
+            .client
+            .get(&url)
             .timeout(std::time::Duration::from_secs(30))
             .send()
             .await
             .with_context(|| format!("Failed to fetch Erlang/OTP index from {url}"))?
             .error_for_status()
-            .with_context(|| format!("Erlang/OTP index request failed: {url}"))?
+            .with_context(|| format!("Erlang/OTP index request failed: {url}"))?;
+        anyhow::ensure!(
+            response.status() == reqwest::StatusCode::OK,
+            "Erlang/OTP index returned HTTP {} for {url}",
+            response.status()
+        );
+        let text = response
             .bounded_text()
             .await
-            .with_context(|| format!("Failed to read Erlang/OTP index from {url}"))
-    }
-
-    /// List available upstream releases (newest first).
-    pub async fn list_available(&self) -> Result<Vec<OtpVersion>> {
-        let url = index_url()?;
-        let text = self.fetch_index(&url).await?;
-        let mut versions = match std::env::consts::OS {
-            "linux" => parse_builds_txt(&text)?,
-            "macos" => parse_erlef_csv(&text)?,
-            os => anyhow::bail!("Unsupported operating system for Erlang/OTP: {os}"),
+            .with_context(|| format!("Failed to read Erlang/OTP index from {url}"))?;
+        let mut versions = match source {
+            OtpSource::Hex { .. } => parse_builds_txt(&text)?,
+            OtpSource::Erlef { .. } => parse_erlef_csv(&text)?,
         };
         sort_versions_desc(&mut versions);
+        for [left, right] in versions.array_windows() {
+            anyhow::ensure!(
+                left.version != right.version || left.checksum == right.checksum,
+                "Erlang/OTP index carries conflicting checksums for version {}",
+                left.version
+            );
+        }
+        versions.dedup();
         Ok(versions)
-    }
-
-    /// Resolve `latest` and partial requests (`27`, `27.0`) against the
-    /// upstream list. Exact versions pass through so the installed fast path
-    /// and the existing not-found UX are preserved.
-    pub async fn resolve_alias(&self, alias: &str) -> Result<String> {
-        let alias = normalize_version(alias);
-        if alias == "latest" {
-            let versions = self.list_available().await?;
-            versions
-                .first()
-                .map(|version| version.version.clone())
-                .context("No Erlang/OTP versions found upstream")
-        } else {
-            Ok(alias)
-        }
-    }
-
-    /// Resolve a partial version against the upstream list.
-    async fn resolve_requested_version(&self, version: &str) -> Result<String> {
-        if !super::common::is_partial_version(version) {
-            return Ok(version.to_owned());
-        }
-        let available = self.list_available().await?;
-        let names: Vec<String> = available
-            .iter()
-            .map(|version| version.version.clone())
-            .collect();
-        Ok(super::resolve_version_request(&names, version))
-    }
-
-    /// Find the index checksum for one resolved version.
-    async fn checksum_for_version(&self, version: &str) -> Result<String> {
-        let available = self.list_available().await?;
-        available
-            .into_iter()
-            .find(|candidate| candidate.version == version)
-            .map(|candidate| candidate.checksum)
-            .with_context(|| {
-                format!(
-                    "Version {version} not found for Erlang/OTP. Check available versions with: omg list erlang --available"
-                )
-            })
     }
 
     /// Install Erlang/OTP from a publisher prebuilt tarball.
     pub async fn install(&self, version: &str) -> Result<()> {
-        let version = self.resolve_alias(version).await?;
-        let version = self.resolve_requested_version(&version).await?;
+        let requested = normalize_version(version);
+        let (version, catalog) =
+            if requested == "latest" || super::common::is_partial_version(&requested) {
+                let source = OtpSource::for_host()?;
+                let catalog = self.list_from(&source).await?;
+                let version = if requested == "latest" {
+                    catalog
+                        .first()
+                        .context("No Erlang/OTP versions found upstream")?
+                        .version
+                        .clone()
+                } else {
+                    let names: Vec<_> = catalog
+                        .iter()
+                        .map(|release| release.version.clone())
+                        .collect();
+                    super::resolve_version_request(&names, &requested)
+                };
+                (version, Some((source, catalog)))
+            } else {
+                (requested, None)
+            };
         crate::core::security::validate_runtime_version(&version)?;
         // This nonblocking filesystem lease owns final-path initialization.
         let _install_lease = super::common::try_lock_runtime_install(&self.versions_dir, &version)?;
@@ -391,8 +388,20 @@ impl ErlangManager {
             style::caution(&version)
         );
 
-        let checksum = self.checksum_for_version(&version).await?;
-        let url = tarball_url(&version)?;
+        let (source, catalog) = if let Some(published) = catalog {
+            published
+        } else {
+            let source = OtpSource::for_host()?;
+            let catalog = self.list_from(&source).await?;
+            (source, catalog)
+        };
+        let release = catalog
+            .iter()
+            .find(|candidate| candidate.version == version)
+            .with_context(|| format!(
+                "Version {version} not found for Erlang/OTP. Check available versions with: omg list erlang --available"
+            ))?;
+        let url = source.tarball_url(&release.version);
         let filename = url
             .rsplit('/')
             .next()
@@ -407,7 +416,7 @@ impl ErlangManager {
             .prefix(".download-")
             .tempdir_in(&self.versions_dir)?;
         let download_path = downloads.path().join(filename);
-        download_with_progress(self.client, &url, &download_path, &checksum).await?;
+        download_with_progress(self.client, &url, &download_path, &release.checksum).await?;
 
         println!("{} Extracting (pure Rust)...", style::informative("→"));
         self.publish_download(&download_path, &url, &version)
@@ -604,11 +613,20 @@ mod tests {
             "a".repeat(40),
             hex::encode(Sha256::digest(&archive))
         );
-        let index = reqwest::Url::parse(&index_url().unwrap()).unwrap();
-        let url = reqwest::Url::parse(&tarball_url(version).unwrap()).unwrap();
+        let arch = host_arch_token().unwrap();
+        let release = ubuntu_release(arch).unwrap();
+        let base = format!("/builds/otp/{arch}/ubuntu-{release}");
         super::super::test_https::fixed_public_routes(&[
-            (index.host_str().unwrap(), index.path(), metadata.as_bytes()),
-            (url.host_str().unwrap(), url.path(), &archive),
+            (
+                "builds.hex.pm",
+                &format!("{base}/builds.txt"),
+                metadata.as_bytes(),
+            ),
+            (
+                "builds.hex.pm",
+                &format!("{base}/OTP-27.0.1.tar.gz"),
+                &archive,
+            ),
         ]);
 
         let fixture = PublicationFixture::new("erlang", "bin/erl");
@@ -630,9 +648,9 @@ mod tests {
         fs::rename(&interrupted, &backup).unwrap();
 
         manager
-            .install(version)
+            .install("27")
             .await
-            .expect("complete authenticated public installation");
+            .expect("install from one catalog and the selected authenticated archive");
         let installed = fixture.versions.join(version);
         assert_eq!(
             fs::read(fixture.versions.join("current").join("bin/erl")).unwrap(),
@@ -827,17 +845,17 @@ mod tests {
         if crate::core::testing::run_isolated_test(NAME) {
             return;
         }
-        let (arch, _) = host_arch_tokens().expect("supported Linux coverage architecture");
+        let arch = host_arch_token().expect("supported Linux coverage architecture");
         for release in ["20.04", "22.04", "24.04", "26.04"] {
             temp_env::with_var(UBUNTU_RELEASE_OVERRIDE_ENV, Some(release), || {
                 assert_eq!(
-                    index_url().expect("supported release resolves a publisher index"),
+                    OtpSource::for_host().unwrap().index_url(),
                     format!("https://builds.hex.pm/builds/otp/{arch}/ubuntu-{release}/builds.txt")
                 );
                 assert_eq!(
-                    tarball_url("28.2.0").expect("supported release resolves a publisher archive"),
+                    OtpSource::for_host().unwrap().tarball_url("28.2.0"),
                     format!(
-                        "https://builds.hex.pm/builds/otp/{arch}/ubuntu-{release}/OTP-28.2.tar.gz"
+                        "https://builds.hex.pm/builds/otp/{arch}/ubuntu-{release}/OTP-28.2.0.tar.gz"
                     )
                 );
             });
@@ -856,21 +874,19 @@ mod tests {
         use std::os::unix::ffi::OsStrExt as _;
         let non_unicode = std::ffi::OsStr::from_bytes(b"\xff");
         temp_env::with_var(UBUNTU_RELEASE_OVERRIDE_ENV, Some(non_unicode), || {
-            let error = index_url().expect_err("non-UTF-8 override must stop URL resolution");
+            let error =
+                OtpSource::for_host().expect_err("non-UTF-8 override must stop URL resolution");
             assert!(error.to_string().contains("must be valid UTF-8"));
         });
         temp_env::with_var(UBUNTU_RELEASE_OVERRIDE_ENV, Some("nobleb"), || {
-            for error in [
-                index_url().expect_err("invalid override must stop index resolution"),
-                tarball_url("28.2.0").expect_err("invalid override must stop archive resolution"),
-            ] {
-                let diagnostic = error.to_string();
-                assert!(
-                    diagnostic.contains(UBUNTU_RELEASE_OVERRIDE_ENV),
-                    "{diagnostic}"
-                );
-                assert!(diagnostic.contains("22.04, 24.04, 26.04"), "{diagnostic}");
-            }
+            let error =
+                OtpSource::for_host().expect_err("invalid override must stop URL resolution");
+            let diagnostic = error.to_string();
+            assert!(
+                diagnostic.contains(UBUNTU_RELEASE_OVERRIDE_ENV),
+                "{diagnostic}"
+            );
+            assert!(diagnostic.contains("22.04, 24.04, 26.04"), "{diagnostic}");
         });
     }
 
@@ -883,11 +899,83 @@ mod tests {
     }
 
     #[test]
-    fn upstream_version_drops_one_trailing_zero() {
-        assert_eq!(upstream_version("28.2.0"), "28.2");
-        assert_eq!(upstream_version("27.1"), "27.1");
-        assert_eq!(upstream_version("27.0"), "27");
-        assert_eq!(upstream_version("24.3.4.10"), "24.3.4.10");
+    fn archive_url_preserves_the_published_release() {
+        let hex = OtpSource::Hex {
+            arch: "amd64",
+            release: "24.04",
+        };
+        let erlef = OtpSource::Erlef { arch: "aarch64" };
+        for version in ["27.0", "28.2.0", "27.1", "24.3.4.10"] {
+            assert_eq!(
+                hex.tarball_url(version),
+                format!("https://builds.hex.pm/builds/otp/amd64/ubuntu-24.04/OTP-{version}.tar.gz"),
+            );
+            assert_eq!(
+                erlef.tarball_url(version),
+                format!(
+                    "https://github.com/erlef/otp_builds/releases/download/OTP-{version}/otp-aarch64-apple-darwin.tar.gz"
+                ),
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn catalog_requires_complete_and_consistent_publisher_metadata() -> Result<()> {
+        let index = reqwest::Url::parse(&OtpSource::for_host()?.index_url())?;
+        let path = index.path().to_owned();
+        let row = format!(
+            "OTP-27.0 {} 2026-09-01T00:00:00Z {}\n",
+            "a".repeat(40),
+            "b".repeat(64)
+        );
+        let conflicting_row = row.replace(&"b".repeat(64), &"c".repeat(64));
+        let fixture = super::super::test_https::HttpsFixture::new_with_statuses(
+            "builds.hex.pm",
+            vec![
+                (path.clone(), 200, format!("{row}{row}").into_bytes()),
+                (path.clone(), 206, row.as_bytes().to_vec()),
+                (path.clone(), 304, Vec::new()),
+                (path.clone(), 404, Vec::new()),
+                (
+                    path.clone(),
+                    200,
+                    format!("{row}{conflicting_row}").into_bytes(),
+                ),
+            ],
+        )
+        .await?;
+        let manager = ErlangManager {
+            client: Box::leak(Box::new(fixture.client(true)?)),
+            ..ErlangManager::new()
+        };
+        let agreed = manager.list_available().await;
+        let partial = manager.list_available().await;
+        let unchanged = manager.list_available().await;
+        let missing = manager.list_available().await;
+        let conflict = manager.list_available().await;
+        assert_eq!(
+            fixture.finish().await?,
+            vec![format!("GET {path} HTTP/1.1"); 5]
+        );
+
+        for (diagnostic, result) in [
+            ("HTTP 206", partial),
+            ("HTTP 304", unchanged),
+            ("404", missing),
+            ("conflicting checksums", conflict),
+        ] {
+            let error = result.expect_err("reject invalid publisher metadata");
+            assert!(format!("{error:#}").contains(diagnostic), "{error:#}");
+        }
+        assert_eq!(
+            agreed?,
+            [OtpVersion {
+                version: "27.0".to_owned(),
+                checksum: "b".repeat(64)
+            }]
+        );
+        Ok(())
     }
 
     #[test]
@@ -915,23 +1003,21 @@ mod tests {
     }
 
     #[test]
-    fn host_arch_tokens_name_the_platform() {
-        const EXPECTED: Option<(&str, &str)> =
-            if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
-                Some(("amd64", "amd64"))
-            } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
-                Some(("arm64", "arm64"))
-            } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
-                Some(("x86_64", "x86_64"))
-            } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
-                Some(("aarch64", "aarch64"))
-            } else {
-                None
-            };
-        let (index, tarball) = host_arch_tokens().expect("host is supported");
+    fn host_arch_token_names_the_platform() {
+        const EXPECTED: Option<&str> = if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+            Some("amd64")
+        } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+            Some("arm64")
+        } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
+            Some("x86_64")
+        } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+            Some("aarch64")
+        } else {
+            None
+        };
+        let index = host_arch_token().expect("host is supported");
         let expected = EXPECTED.expect("unsupported test host");
-        assert_eq!((index, tarball), expected);
-        assert_eq!(index, tarball);
+        assert_eq!(index, expected);
         match std::env::consts::ARCH {
             "x86_64" => assert!(index.contains("64") || index.contains("amd")),
             "aarch64" => assert!(index.contains("arm") || index.contains("aarch")),
