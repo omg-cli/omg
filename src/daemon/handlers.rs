@@ -77,6 +77,17 @@ async fn load_observed_index(
     manager: Arc<dyn PackageManager>,
     budget: Arc<tokio::sync::Semaphore>,
 ) -> anyhow::Result<(PackageIndex, Option<Arc<dyn InstalledCatalogObservation>>)> {
+    #[cfg(feature = "fedora")]
+    if let Some((packages, observation)) = manager.observed_package_index().await? {
+        let name_kind = crate::package_managers::SearchNameKind::for_manager(
+            manager.name(),
+            crate::core::paths::test_mode(),
+        );
+        return Ok((
+            PackageIndex::from_packages(packages, name_kind),
+            Some(observation),
+        ));
+    }
     for _ in 0..3 {
         let observation = observe_catalog(Arc::clone(&manager), Arc::clone(&budget), |manager| {
             manager.package_index_observation()
@@ -513,6 +524,8 @@ impl DaemonState {
             .installed_observation
             .clone();
         match observation {
+            #[cfg(feature = "fedora")]
+            Some(ref observation) if observation.search_index_expired() => Ok(true),
             Some(observation) => Ok(!installed_catalog_is_current(
                 observation,
                 Arc::clone(&self.catalog_observation_budget),

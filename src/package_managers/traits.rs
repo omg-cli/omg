@@ -12,7 +12,18 @@ use crate::core::Package;
 /// Observation checks can perform native I/O; callers must use a blocking task.
 pub trait InstalledCatalogObservation: Send + Sync {
     fn is_current(&self) -> Result<bool>;
+
+    #[cfg(feature = "fedora")]
+    fn search_index_expired(&self) -> bool {
+        false
+    }
 }
+
+#[cfg(feature = "fedora")]
+pub type ObservedPackageIndex = (
+    Vec<Package>,
+    std::sync::Arc<dyn InstalledCatalogObservation>,
+);
 
 /// Trait for package manager backends (object-safe for dynamic dispatch)
 ///
@@ -38,6 +49,14 @@ pub trait PackageManager: Send + Sync {
         &self,
     ) -> Result<Option<std::sync::Arc<dyn InstalledCatalogObservation>>> {
         self.installed_catalog_observation()
+    }
+
+    /// Read a search index using a backend's own observation and refresh sequence.
+    #[cfg(feature = "fedora")]
+    fn observed_package_index(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<ObservedPackageIndex>>> + Send + '_>> {
+        Box::pin(async { Ok(None) })
     }
 
     /// Preserve installed package identities for security exports. Backends

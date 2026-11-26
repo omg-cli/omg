@@ -1466,6 +1466,73 @@ impl DnfPackageManager {
         Self::parse_available_packages(&bytes)
     }
 
+    fn search_repository_paths() -> Result<(catalog::RepositoryPaths, catalog::Stamps)> {
+        let mut paths = catalog::RepositoryPaths::default();
+        let before = paths.configuration_stamps()?;
+        let mut command =
+            tokio::process::Command::from(crate::core::privilege::system_command("dnf")?);
+        command.env("LC_ALL", "C").arg("--dump-main-config");
+        let config = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(Self::query_output_with_deadline(
+                command,
+                std::time::Duration::from_secs(3),
+            ))?;
+        paths.add_effective_paths(std::str::from_utf8(&config)?)?;
+        anyhow::ensure!(
+            before == catalog::RepositoryPaths::default().configuration_stamps()?,
+            "DNF configuration changed while resolving repository inputs"
+        );
+        let configuration = paths.configuration_stamps()?;
+        Ok((paths, configuration))
+    }
+
+    async fn search_repository_metadata(
+        cache_only: bool,
+    ) -> Result<Vec<catalog::RepositoryMetadata>> {
+        let mut command =
+            tokio::process::Command::from(crate::core::privilege::system_command("dnf")?);
+        command.env("LC_ALL", "C");
+        if cache_only {
+            command.arg("--cacheonly");
+        }
+        command.args(["repo", "info", "--enabled", "--json"]);
+        let output = Self::query_output(command).await?;
+        serde_json::from_slice(&output).context("Invalid DNF repository metadata")
+    }
+
+    async fn search_cached_repositories(
+        repositories: &[&catalog::RepositoryMetadata],
+    ) -> Result<Vec<Package>> {
+        if repositories.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut ids = Vec::with_capacity(repositories.len());
+        for repo in repositories {
+            anyhow::ensure!(
+                !repo.id.is_empty()
+                    && repo
+                        .id
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || b"-_.:".contains(&byte)),
+                "Invalid native DNF repository ID"
+            );
+            ids.push(repo.id.as_str());
+        }
+        // Normal DNF can skip an expired, unavailable repo whose stale
+        // metadata is still readable with --cacheonly. Admit only repositories
+        // that the normal query actually loaded.
+        let mut command =
+            tokio::process::Command::from(crate::core::privilege::system_command("dnf")?);
+        command.args(["--cacheonly", &format!("--repo={}", ids.join(","))]);
+        command.args(Self::repository_query_args(RepositoryQuery::Available(
+            None,
+        ))?);
+        let output = Self::query_output(command).await?;
+        Self::parse_available_packages(&output)
+    }
+
     fn select_available_info(
         selector: &str,
         mut candidates: Vec<Package>,
@@ -3333,31 +3400,72 @@ impl PackageManager for DnfPackageManager {
         })))
     }
 
-    fn package_index_observation(
+    fn observed_package_index(
         &self,
-    ) -> Result<Option<Arc<dyn super::InstalledCatalogObservation>>> {
-        let rpm = self
-            .installed_catalog_observation()?
-            .context("Cannot observe the installed RPM search catalog")?;
-        let mut paths = catalog::RepositoryPaths::default();
-        let before = paths.snapshot()?;
-        let mut command =
-            tokio::process::Command::from(crate::core::privilege::system_command("dnf")?);
-        command.env("LC_ALL", "C").arg("--dump-main-config");
-        let config = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?
-            .block_on(Self::query_output_with_deadline(
-                command,
-                std::time::Duration::from_secs(3),
-            ))?;
-        paths.add_effective_paths(std::str::from_utf8(&config)?)?;
-        let observation = catalog::PackageCatalog::new(rpm, paths)?;
-        anyhow::ensure!(
-            before == catalog::RepositoryPaths::default().snapshot()?,
-            "DNF configuration changed while resolving repository inputs"
-        );
-        Ok(Some(Arc::new(observation)))
+    ) -> Pin<
+        Box<dyn Future<Output = Result<Option<super::traits::ObservedPackageIndex>>> + Send + '_>,
+    > {
+        use super::InstalledCatalogObservation as _;
+        Box::pin(async move {
+            for _ in 0..3 {
+                let (paths, config) =
+                    tokio::task::spawn_blocking(Self::search_repository_paths).await??;
+                let repos = Self::search_repository_metadata(false).await?;
+                let admitted: Vec<_> = repos
+                    .iter()
+                    .filter(|repo| repo.available_pkgs != 0)
+                    .collect();
+                if !admitted.is_empty() && !paths.cache_only {
+                    // Cache-only repo info can touch metadata. Verify its revision
+                    // before observing the read-only index query.
+                    let cached = Self::search_repository_metadata(true).await?;
+                    if admitted.iter().any(|repo| !cached.contains(repo)) {
+                        continue;
+                    }
+                }
+                let refresh_at = if paths.cache_only {
+                    None
+                } else {
+                    catalog::RepositoryMetadata::refresh_at(&repos)?
+                };
+                let owner = self.cache_handle();
+                let observation = tokio::task::spawn_blocking(move || {
+                    if config != paths.configuration_stamps()? {
+                        return Ok::<_, anyhow::Error>(None);
+                    }
+                    let rpm = owner
+                        .installed_catalog_observation()?
+                        .context("Cannot observe the installed RPM search catalog")?;
+                    let observation = catalog::PackageCatalog::new(rpm, paths, refresh_at)?;
+                    Ok((observation.configuration_matches(&config)?).then_some(observation))
+                })
+                .await??;
+                let Some(observation) = observation else {
+                    continue;
+                };
+                let (installed, available) = tokio::try_join!(
+                    self.load_installed_packages(),
+                    Self::search_cached_repositories(&admitted),
+                )?;
+                let installed = Self::order_installed_search_builds(&installed).await?;
+                let packages = Self::search_candidates(installed, available);
+                let observation = tokio::task::spawn_blocking(move || {
+                    observation
+                        .is_current()
+                        .map(|current| current.then_some(observation))
+                })
+                .await??;
+                if let Some(observation) = observation {
+                    return Ok(Some((
+                        packages,
+                        Arc::new(observation) as Arc<dyn super::InstalledCatalogObservation>,
+                    )));
+                }
+            }
+            anyhow::bail!(
+                "Package catalog inputs changed during three package index rebuild attempts"
+            )
+        })
     }
     fn security_inventory(
         &self,
