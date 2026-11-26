@@ -50,6 +50,8 @@ omg use node 22
 
 If a matching version is already installed, OMG selects it. Otherwise, it installs it through that runtime's manager. A short request such as `22` or `3.12` can resolve to a matching release. Use a full version when you need an exact patch level. `latest`, `lts`, and channels such as Rust `stable` are moving requests; available selectors vary by provider.
 
+For Node, `omg use` matches exact versions, major and minor series, version ranges, and local NVM aliases against OMG-managed installations before contacting the provider. When it needs a download, it resolves the request to a published release and verifies that release through the native installer.
+
 Check what you have:
 
 ```bash

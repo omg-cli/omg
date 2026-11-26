@@ -7,7 +7,7 @@ use anyhow::Context as _;
 use thiserror::Error;
 
 const MAX_PACKAGE_NAME_LENGTH: usize = 255;
-const MAX_VERSION_LENGTH: usize = 128;
+pub(crate) const MAX_VERSION_LENGTH: usize = 128;
 const MAX_RELATIVE_PATH_LENGTH: usize = 4096;
 
 /// Domain failures from package-name, version, and relative-path checks.

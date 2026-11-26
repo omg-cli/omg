@@ -10,7 +10,7 @@ use std::process::Command;
 
 use crate::config::mise_env::{Environment, ResolvedEnv, prepend_paths};
 use crate::core::runtime_resolver::{RuntimeVersionReq, find_in_path};
-use crate::hooks::{self, NodeAliasErrors, NodeSelection};
+use crate::hooks::{self, NodeSelection, NodeSelectionMode};
 
 #[cfg(test)]
 use crate::core::runtime_resolver::resolve_nvm_alias;
@@ -1403,7 +1403,7 @@ fn find_rust_toolchain_file(start: &Path) -> Option<PathBuf> {
 
 fn ensure_node_runtime(request: &str) -> Result<PathBuf> {
     let data_dir = crate::core::paths::data_dir();
-    let request = match hooks::select_node_runtime(&data_dir, request, NodeAliasErrors::Report)? {
+    let request = match hooks::select_node_runtime(&data_dir, request, NodeSelectionMode::Task)? {
         NodeSelection::Installed(path) => return Ok(path),
         NodeSelection::Missing(request) => request,
     };
@@ -1415,7 +1415,7 @@ fn ensure_node_runtime(request: &str) -> Result<PathBuf> {
     let manager = NodeManager::new();
     let resolved = run_async(manager.resolve_alias(&request))?;
     run_async(manager.install(&resolved))?;
-    match hooks::select_node_runtime(&data_dir, &resolved, NodeAliasErrors::Report)? {
+    match hooks::select_node_runtime(&data_dir, &resolved, NodeSelectionMode::Task)? {
         NodeSelection::Installed(path) => Ok(path),
         NodeSelection::Missing(_) => {
             anyhow::bail!("Node.js setup did not select an installation for {resolved:?}")

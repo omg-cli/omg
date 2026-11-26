@@ -2455,7 +2455,7 @@ printf 'fixture runtime {runtime} {version}|<%s>\\n' "$@"
 
 
     def inspect_node_alias_selection():
-        managed = ("24.15.3", "24.15.9", "24.16.2")
+        managed = ("24.15.3", "24.15.9", "24.16.2", "v23.1.7")
         external = ("v26.0.5", "v26.1.0")
         seed = r"""
 import importlib.util, json, sys
@@ -2620,6 +2620,80 @@ printf 'fixture node {directory} {version}|<%s>\\n' "$@"
                     checks.append(dict(phase=phase, case=f"{label}-{mode}", status=result.returncode,
                                        passed=passed and "fixture-note-" not in log, diagnostic=log[-1100:],
                                        expected_selector=selector, expected_version=version))
+
+            phase = "node-use-installed"
+            current = here / "data/versions/node/current"
+            initial = current.with_name("24.15.3")
+            def seed_unreviewed(version):
+                program = current.with_name(version) / "bin/node"
+                program.parent.mkdir(parents=True)
+                program.write_text(f"#!/bin/sh\nprintf 'v{version}\\n'\n")
+                program.chmod(0o755)
+                for path in (program.parent.parent, program.parent, program):
+                    os.chown(path, account.pw_uid, account.pw_gid)
+
+            seed_unreviewed("19.7.2")
+            cases = (
+                ("exact", "24.15.9", (), "24.15.9", None),
+                ("v-exact", "v24.15.9", (), "24.15.9", None),
+                ("upper-v-exact", "V24.15.9", (), "24.15.9", None),
+                ("major", "24", (), "24.16.2", None),
+                ("minor", "24.15", (), "24.15.9", None),
+                ("caret", "^24.15.0", (), "24.16.2", None),
+                ("compound", ">=24.15.0 <24.16.0", (), "24.15.9", None),
+                ("exact-comparator", "=24.15.3", (), "24.15.3", None),
+                ("named", "default", (), "24.15.3", None),
+                ("vendor", "vendor", (), "24.15.3", None),
+                ("chain", "team", (), "24.15.3", None),
+                ("latest", "latest", (), "24.16.2", None),
+                ("builtin", "node", (), "24.16.2", None),
+                ("lts", "lts", (), "24.15.9", None),
+                ("lts-wildcard", "lts/*", (), "24.15.9", None),
+                ("lts-name", "lts/krypton", (), "24.15.9", None),
+                ("prefixed-directory", "23.1", (), "v23.1.7", None),
+                ("external-only", "external", (), None, "Node.js checksum manifest"),
+                ("unknown-request", "unlisted", (), None, "Invalid Node.js version request"),
+                ("unavailable-exact", "28.0.0", (), None, "Node.js checksum manifest"),
+                ("requires-review", "19.7.2", (), None, "Failed to review installed Node.js runtime"),
+                ("file-exact", None, ((".nvmrc", "# release\nv24.15.9\n"),), "24.15.9", None),
+                ("file-alias", None, ((".nvmrc", "vendor # release\n"),), "24.15.3", None),
+                ("file-lts", None, ((".nvmrc", "lts/*\n"),), "24.15.9", None),
+                ("file-range", None, ((".nvmrc", ">=24.15.0 <24.16.0\n"),), "24.15.9", None),
+                ("file-priority", None, ((".node-version", "24.15.9"), (".nvmrc", "24.16.2")), "24.15.9", None),
+                ("parent-file", None, (("../.nvmrc", "24.15\n"),), "24.15.9", None),
+                ("tool-versions", None, ((".tool-versions", "node 24.15\n"),), "24.15.9", None),
+                ("package-engines", None,
+                 (("package.json", '{"engines":{"node":">=24.15.0 <24.16.0"}}'),), "24.15.9", None),
+                ("mise-tools", None, (("mise.toml", "[tools]\nnode = '24.15'\n"),), "24.15.9", None),
+                ("invalid-file", None, ((".nvmrc", "24.15.9\n24.16.2\n"),), None, "Invalid .nvmrc"),
+                ("missing-pin", None, (), None, "No version specified and none detected"),
+                ("latest-requires-review", "latest", (), None, "Failed to review installed Node.js runtime"),
+            )
+            for label, request, files, expected, failure in cases:
+                if label == "latest-requires-review":
+                    seed_unreviewed("28.0.2")
+                project = here / f"use-{label}" / "work"
+                project.mkdir(parents=True)
+                for name, value in files:
+                    (project / name).write_text(value)
+                if current.is_symlink():
+                    current.unlink()
+                current.symlink_to(initial)
+                os.lchown(current, account.pw_uid, account.pw_gid)
+                args = [cli, "use", "node"]
+                if request is not None:
+                    args.append(request)
+                result = subprocess.run(args, cwd=project, env=env, stdin=subprocess.DEVNULL,
+                                        capture_output=True, text=True, timeout=8, **ordinary)
+                active = current.resolve(strict=True)
+                if expected is None:
+                    passed = result.returncode != 0 and active == initial and failure in result.stderr
+                else:
+                    passed = (result.returncode == 0 and active == current.with_name(expected)
+                              and "Now using Node.js" in result.stdout and "Downloading" not in result.stdout)
+                checks.append(dict(phase=phase, case=label, status=result.returncode, passed=passed,
+                                   active=active.name, expected=expected,
+                                   diagnostic=(result.stdout + result.stderr)[-1300:]))
 
 
     def inspect_task_environment_bytes():
@@ -5643,6 +5717,6 @@ assert inventory() == before
 report = dict(binaries=binaries, checks=checks, total=len(checks),
               passed=sum(entry["passed"] for entry in checks), host_unchanged=True)
 print(json.dumps(report))
-expected_checks = 303 if consent_oracle is None else 1836
+expected_checks = 303 if consent_oracle is None else 1869
 if report["passed"] != report["total"] or report["total"] != expected_checks:
     sys.exit(4)

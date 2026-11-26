@@ -19,6 +19,7 @@ use super::common::{
     download_with_progress, extract_tar_xz, normalize_version, print_already_installed,
     print_installed, print_using,
 };
+use crate::core::runtime_resolver::RuntimeVersionReq;
 use crate::{cli::style, core::http::download_client};
 
 #[cfg(feature = "pgp")]
@@ -149,14 +150,8 @@ impl NodeManager {
         let alias = normalize_version(alias);
 
         let result = match alias.as_str() {
-            "latest" => {
-                let versions = self.list_available().await?;
-                versions
-                    .first()
-                    .map(|v| v.version.trim_start_matches('v').to_string())
-                    .ok_or_else(|| anyhow::anyhow!("No Node.js versions found upstream"))?
-            }
-            "lts" => {
+            "latest" | "node" => self.resolve_requested_version("latest").await?,
+            "lts" | "lts/*" => {
                 let versions = self.list_available().await?;
                 versions
                     .iter()
@@ -241,20 +236,22 @@ impl NodeManager {
         complete_staged_install(staging, &self.versions_dir.join(version), version)
     }
 
-    /// Resolve a partial version request (`20`, `20.1`) to the newest matching
-    /// nodejs.org release. This must happen before any download URL is built;
-    /// the interpolation is exact-string, so an unresolved partial would 404.
-    /// Exact and non-numeric requests pass through unchanged, preserving the
-    /// already-installed fast path and the existing not-found UX.
+    /// Resolve a version request before constructing any release URL.
     async fn resolve_requested_version(&self, version: &str) -> Result<String> {
-        if !crate::runtimes::common::is_partial_version(version) {
-            return Ok(version.to_owned());
+        let request = RuntimeVersionReq::parse(version)
+            .with_context(|| format!("Invalid Node.js version request {version:?}"))?;
+        if let RuntimeVersionReq::Exact(version) = request {
+            return Ok(version.to_string());
         }
+
         let available = self.list_available().await?;
-        Ok(crate::runtimes::resolve_version_request(
-            &available_version_names(&available),
-            version,
-        ))
+        available_version_names(&available)
+            .into_iter()
+            .filter_map(|version| version.parse::<semver::Version>().ok())
+            .filter(|version| request.matches(version))
+            .max()
+            .map(|version| version.to_string())
+            .with_context(|| format!("No published Node.js release matches {version:?}"))
     }
 
     /// Authenticate the publisher before selecting its exact archive checksum.
@@ -286,10 +283,13 @@ impl NodeManager {
 
     /// Switch to a specific version
     pub fn use_version(&self, version: &str) -> Result<()> {
-        let version = normalize_version(version);
-        crate::core::security::validate_runtime_version(&version)?;
+        self.activate_installed(&normalize_version(version))
+    }
+
+    pub(crate) fn activate_installed(&self, version: &str) -> Result<()> {
+        crate::core::security::validate_runtime_version(version)?;
         let lease = super::common::try_lock_runtime_file(&self.versions_dir, ".mutation.lock")?;
-        let version_dir = self.versions_dir.join(&version);
+        let version_dir = self.versions_dir.join(version);
         anyhow::ensure!(
             super::common::is_valid_version_dir(&version_dir),
             "Node.js version {version} is not installed as a valid directory"
@@ -299,14 +299,14 @@ impl NodeManager {
             .security
             .installed(
                 "node",
-                &self.versions_dir.join(&version),
+                &self.versions_dir.join(version),
                 super::security::ReviewMode::FreshAttended,
             )
             .context("Failed to review installed Node.js runtime")?;
-        admission.verify(&self.versions_dir.join(&version))?;
-        smoke_node(&version_dir, &version)?;
-        activate_version_with_lease(&self.versions_dir, &version, Path::new("bin/node"), &lease)?;
-        print_using("Node.js", &version, &self.versions_dir.join("current/bin"));
+        admission.verify(&self.versions_dir.join(version))?;
+        smoke_node(&version_dir, &normalize_version(version))?;
+        activate_version_with_lease(&self.versions_dir, version, Path::new("bin/node"), &lease)?;
+        print_using("Node.js", version, &self.versions_dir.join("current/bin"));
         Ok(())
     }
 
@@ -840,7 +840,12 @@ async fn probe_node_with_signals(
 }
 
 // Generate common runtime manager methods (list_installed, current_version)
-crate::runtimes::common::impl_runtime_common!(NodeManager);
+impl NodeManager {
+    #[must_use]
+    pub fn current_version(&self) -> Option<String> {
+        super::common::get_current_version(&self.versions_dir)
+    }
+}
 
 fn node_platform() -> Result<String> {
     let os = match std::env::consts::OS {
@@ -1582,7 +1587,7 @@ mod tests {
         let staging = begin_staged_install(directory.path())?;
         assert!(manager.publish_install(&staging, "22.0.0").is_err());
         assert!(!directory.path().join("22.0.0").exists());
-        assert!(manager.list_installed()?.is_empty());
+        assert!(super::super::common::list_installed_versions(&manager.versions_dir)?.is_empty());
         drop(staging);
 
         let staging = begin_staged_install(directory.path())?;
@@ -1596,7 +1601,10 @@ mod tests {
         )
         .context("Bind complete Node publication retry fixture")?;
         manager.publish_install(&staging, "22.0.0")?;
-        assert_eq!(manager.list_installed()?, vec!["22.0.0"]);
+        assert_eq!(
+            super::super::common::list_installed_versions(&manager.versions_dir)?,
+            vec!["22.0.0"]
+        );
         Ok(())
     }
 
@@ -2288,7 +2296,10 @@ mod tests {
             || {
                 let mgr = NodeManager::new();
                 assert!(mgr.versions_dir.ends_with("node"));
-                Ok((mgr.list_installed()?, mgr.current_version()))
+                Ok((
+                    super::super::common::list_installed_versions(&mgr.versions_dir)?,
+                    mgr.current_version(),
+                ))
             },
         )
     }
@@ -2355,10 +2366,10 @@ mod tests {
 
     #[tokio::test]
     async fn https_alias_resolution_requires_the_exact_release_identity() -> Result<()> {
-        let body = br#"[{"version":"v21.0.0","lts":false},{"version":"v20.10.0","lts":"Iron"},{"version":"v18.19.0","lts":"Hydrogen"}]"#;
+        let body = br#"[{"version":"v22.0.0-rc.1","lts":false},{"version":"v20.10.0","lts":"Iron"},{"version":"v21.0.0","lts":false},{"version":"v18.19.0","lts":"Hydrogen"}]"#;
         let fixture = super::super::test_https::HttpsFixture::new(
             "nodejs.org",
-            (0..6)
+            (0..9)
                 .map(|_| ("/dist/index.json".into(), body.to_vec()))
                 .collect(),
         )
@@ -2377,8 +2388,17 @@ mod tests {
         assert_eq!(manager.resolve_requested_version("20").await?, "20.10.0");
         assert_eq!(manager.resolve_requested_version("20.10").await?, "20.10.0");
         assert_eq!(
+            manager
+                .resolve_requested_version(">=20.0.0 <21.0.0")
+                .await?,
+            "20.10.0"
+        );
+        assert_eq!(manager.resolve_alias("lts/*").await?, "20.10.0");
+        assert!(manager.resolve_requested_version("22").await.is_err());
+        assert!(manager.resolve_requested_version("unknown").await.is_err());
+        assert_eq!(
             fixture.finish().await?,
-            vec!["GET /dist/index.json HTTP/1.1"; 6]
+            vec!["GET /dist/index.json HTTP/1.1"; 9]
         );
         assert_eq!(std::fs::read_dir(versions.path())?.count(), 0);
         Ok(())

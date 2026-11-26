@@ -109,7 +109,6 @@ macro_rules! impl_runtime_install_use {
 }
 
 impl_runtime_install_use!(
-    NodeManager,
     PythonManager,
     GoManager,
     RubyManager,
@@ -152,6 +151,14 @@ fn canonical_runtime_name(runtime: &str) -> String {
 }
 
 fn validate_requested_version(runtime: &str, version: &str) -> Result<()> {
+    if runtime == "node"
+        && version.len() <= crate::core::security::validation::MAX_VERSION_LENGTH
+        && !version.chars().any(char::is_control)
+        && (version == "lts/*"
+            || crate::core::runtime_resolver::RuntimeVersionReq::parse(version).is_some())
+    {
+        return Ok(());
+    }
     let version = if runtime == "node" {
         version.strip_prefix("lts/").unwrap_or(version)
     } else {
@@ -197,7 +204,24 @@ async fn select_version(runtime: &str, version: Option<&str>, restoring: bool) -
 
     match runtime.as_str() {
         "node" => {
-            install_or_use(&NodeManager::new(), strip_version_prefix(&version)).await?;
+            let data = crate::core::paths::data_dir();
+            let selection = crate::hooks::select_node_runtime(
+                &data,
+                &version,
+                crate::hooks::NodeSelectionMode::Activation,
+            )?;
+            let manager = NodeManager::new();
+            match selection {
+                crate::hooks::NodeSelection::Installed(path) => {
+                    let directory_version = path
+                        .parent()
+                        .and_then(std::path::Path::file_name)
+                        .and_then(std::ffi::OsStr::to_str)
+                        .context("Selected Node installation has no version directory")?;
+                    manager.activate_installed(directory_version)?;
+                }
+                crate::hooks::NodeSelection::Missing(request) => manager.install(&request).await?,
+            }
         }
         "python" => {
             install_or_use(&PythonManager::new(), strip_version_prefix(&version)).await?;
@@ -717,6 +741,9 @@ mod tests {
 
     #[test]
     fn node_lts_requests_do_not_relax_directory_validation() {
+        assert!(validate_requested_version("node", ">=22.0.0 <23.0.0").is_ok());
+        assert!(validate_requested_version("node", "lts/*").is_ok());
+        assert!(validate_requested_version("node", ">22.0.0\n<23.0.0").is_err());
         assert!(validate_requested_version("node", "lts/iron").is_ok());
         assert!(validate_requested_version("node", "lts/jod").is_ok());
         assert!(validate_requested_version("node", "22.0.0").is_ok());

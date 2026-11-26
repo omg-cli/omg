@@ -707,9 +707,10 @@ pub(crate) fn selected_runtime_paths<S: std::hash::BuildHasher>(
 }
 
 #[derive(Clone, Copy)]
-pub(crate) enum NodeAliasErrors {
-    IgnoreRejected,
-    Report,
+pub(crate) enum NodeSelectionMode {
+    Hook,
+    Task,
+    Activation,
 }
 
 pub(crate) enum NodeSelection {
@@ -720,12 +721,15 @@ pub(crate) enum NodeSelection {
 pub(crate) fn select_node_runtime(
     data_dir: &Path,
     request: &str,
-    errors: NodeAliasErrors,
+    mode: NodeSelectionMode,
 ) -> Result<NodeSelection> {
     fn normalized(request: &str) -> &str {
         match request {
             "node" => "latest",
-            request => request.strip_prefix('v').unwrap_or(request),
+            request => request
+                .strip_prefix(['v', 'V'])
+                .filter(|rest| rest.as_bytes().first().is_some_and(u8::is_ascii_digit))
+                .unwrap_or(request),
         }
     }
 
@@ -741,9 +745,9 @@ pub(crate) fn select_node_runtime(
         .map(PathBuf::from)
         .or_else(|| home::home_dir().map(|dir| dir.join(".nvm")))
     {
-        resolved_alias = match errors {
-            NodeAliasErrors::IgnoreRejected => resolve_nvm_alias(&nvm_dir, request)?,
-            NodeAliasErrors::Report => {
+        resolved_alias = match mode {
+            NodeSelectionMode::Hook => resolve_nvm_alias(&nvm_dir, request)?,
+            NodeSelectionMode::Task | NodeSelectionMode::Activation => {
                 crate::core::runtime_resolver::resolve_nvm_alias(&nvm_dir, request)?
             }
         };
@@ -753,7 +757,8 @@ pub(crate) fn select_node_runtime(
         {
             return Ok(NodeSelection::Installed(path));
         }
-        if RuntimeVersionReq::parse(target).is_some()
+        if !matches!(mode, NodeSelectionMode::Activation)
+            && RuntimeVersionReq::parse(target).is_some()
             && let Some(path) = select_nvm_node_bin(&nvm_dir.join("versions/node"), target)?
         {
             return Ok(NodeSelection::Installed(path));
@@ -784,7 +789,7 @@ fn select_nvm_node_bin(versions: &Path, request: &str) -> Result<Option<PathBuf>
 }
 
 fn resolve_node_bin_path(data_dir: &Path, version: &str) -> Result<Option<PathBuf>> {
-    match select_node_runtime(data_dir, version, NodeAliasErrors::IgnoreRejected)? {
+    match select_node_runtime(data_dir, version, NodeSelectionMode::Hook)? {
         NodeSelection::Installed(path) => Ok(Some(path)),
         NodeSelection::Missing(_) => Ok(None),
     }
