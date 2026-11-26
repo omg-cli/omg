@@ -23,7 +23,7 @@
 //! batches remain queued for a later invocation.
 
 use std::collections::{HashSet, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
@@ -35,6 +35,8 @@ use crate::core::telemetry_client::{CommandEvent, PerformanceEvent, SessionEvent
 
 /// Maximum queue size before dropping old events
 const MAX_QUEUE_SIZE: usize = 5000;
+const MAX_QUEUE_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_SESSION_BYTES: u64 = 64 * 1024;
 /// Persist queue to disk every N events
 const PERSIST_EVERY_N_EVENTS: u32 = 10;
 /// Persist queue to disk every N seconds
@@ -82,16 +84,14 @@ pub(crate) fn telemetry_disabled_by_environment() -> bool {
         || env_value_matches("OMG_DISABLE_TELEMETRY", &["1", "true", "on", "yes"])
 }
 
-/// Identity of the config file a cached opt-out verdict was read from.
-/// Same shape as the pacman_db cache contract: the verdict is reused while
-/// the file at the path keeps its size and mtime, and any save, rewrite,
-/// or replacement misses and re-parses. A missed identity re-reads on the
-/// next call, so a torn read can never stick.
+/// Identity of the settings version used for the cached opt-out verdict.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct OptOutCacheKey {
     path: PathBuf,
     len: Option<u64>,
     mtime: Option<std::time::SystemTime>,
+    #[cfg(unix)]
+    unix_identity: Option<(u64, u64, i64, i64)>,
 }
 
 static OPT_OUT_CACHE: Mutex<Option<(OptOutCacheKey, bool)>> = Mutex::new(None);
@@ -103,17 +103,23 @@ fn settings_file_opts_out() -> bool {
     let Ok(path) = crate::config::Settings::config_path() else {
         return load_opt_out_uncached();
     };
-    let key = match std::fs::metadata(&path) {
-        Ok(metadata) => OptOutCacheKey {
-            path,
-            len: Some(metadata.len()),
-            mtime: metadata.modified().ok(),
-        },
-        Err(_) => OptOutCacheKey {
-            path,
-            len: None,
-            mtime: None,
-        },
+    let metadata = std::fs::symlink_metadata(&path).ok();
+    let key = OptOutCacheKey {
+        path,
+        len: metadata.as_ref().map(std::fs::Metadata::len),
+        mtime: metadata
+            .as_ref()
+            .and_then(|metadata| metadata.modified().ok()),
+        #[cfg(unix)]
+        unix_identity: metadata.as_ref().map(|metadata| {
+            use std::os::unix::fs::MetadataExt as _;
+            (
+                metadata.dev(),
+                metadata.ino(),
+                metadata.ctime(),
+                metadata.ctime_nsec(),
+            )
+        }),
     };
     {
         let cached = OPT_OUT_CACHE
@@ -141,6 +147,41 @@ fn load_opt_out_uncached() -> bool {
             tracing::warn!("Disabling telemetry because settings could not be loaded: {error:#}");
             true
         }
+    }
+}
+
+fn telemetry_consent_lease() -> Option<std::fs::File> {
+    use crate::config::Settings;
+
+    match Settings::try_read_lock() {
+        Ok(Some(lease)) if !is_telemetry_opt_out() => Some(lease),
+        Ok(_) => None,
+        Err(error) => {
+            tracing::debug!(
+                "Skipping telemetry because the configuration lock is unavailable: {error:#}"
+            );
+            None
+        }
+    }
+}
+
+fn persist_with_consent(save: impl FnOnce() -> Result<()>) {
+    if let Some(_consent) = telemetry_consent_lease() {
+        persist_best_effort(save());
+    }
+}
+
+fn read_saved_telemetry(path: &Path, kind: &str, limit: u64) -> Result<Option<String>> {
+    match crate::core::safe_ops::read_bounded_regular_file(path, kind, limit) {
+        Ok(content) => Ok(Some(content)),
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|cause| cause.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -379,7 +420,7 @@ impl EventQueue {
             Ok(queue) => queue,
             Err(error) => {
                 tracing::warn!(
-                    "Telemetry queue persistence disabled because its state is invalid: {error}"
+                    "Telemetry queue persistence disabled because its state is invalid: {error:#}"
                 );
                 Self {
                     persistence_enabled: false,
@@ -390,16 +431,8 @@ impl EventQueue {
     }
 
     fn load_from(path: &std::path::Path) -> Result<Self> {
-        let content = match std::fs::read_to_string(path) {
-            Ok(content) => content,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(Self::default());
-            }
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!("Failed to read telemetry queue: {}", path.display())
-                });
-            }
+        let Some(content) = read_saved_telemetry(path, "Telemetry queue", MAX_QUEUE_BYTES)? else {
+            return Ok(Self::default());
         };
         let persisted = serde_json::from_str::<PersistedEventQueue>(&content)
             .with_context(|| format!("Malformed telemetry queue: {}", path.display()))?;
@@ -410,8 +443,14 @@ impl EventQueue {
             QUEUE_FORMAT_VERSION
         );
         let now = jiff::Timestamp::now().as_second();
+        let excess = persisted.events.len().saturating_sub(MAX_QUEUE_SIZE);
         Ok(Self {
-            events: persisted.events.into_iter().map(Arc::new).collect(),
+            events: persisted
+                .events
+                .into_iter()
+                .skip(excess)
+                .map(Arc::new)
+                .collect(),
             events_since_persist: AtomicU32::new(0),
             last_persist: AtomicI64::new(now),
             persistence_enabled: true,
@@ -434,7 +473,11 @@ impl EventQueue {
         };
         let content =
             serde_json::to_vec(&persisted).context("Failed to serialize telemetry queue")?;
-        crate::core::safe_ops::atomic_write_file_sync(&path, content)
+        anyhow::ensure!(
+            content.len() as u64 <= MAX_QUEUE_BYTES,
+            "Telemetry queue exceeds the {MAX_QUEUE_BYTES} byte limit"
+        );
+        crate::core::safe_ops::atomic_write_file_sync_private(&path, content)
             .with_context(|| format!("Failed to save telemetry queue: {}", path.display()))?;
 
         // Reset persist tracking
@@ -506,7 +549,7 @@ impl TelemetrySession {
             Ok(session) => session,
             Err(error) => {
                 tracing::warn!(
-                    "Telemetry session persistence disabled because its state is invalid: {error}"
+                    "Telemetry session persistence disabled because its state is invalid: {error:#}"
                 );
                 Self {
                     persistence_enabled: false,
@@ -517,16 +560,9 @@ impl TelemetrySession {
     }
 
     fn load_from(path: &std::path::Path) -> Result<Self> {
-        let content = match std::fs::read_to_string(path) {
-            Ok(content) => content,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(Self::default());
-            }
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!("Failed to read telemetry session: {}", path.display())
-                });
-            }
+        let Some(content) = read_saved_telemetry(path, "Telemetry session", MAX_SESSION_BYTES)?
+        else {
+            return Ok(Self::default());
         };
         let session = serde_json::from_str::<SerializableSession>(&content)
             .with_context(|| format!("Malformed telemetry session: {}", path.display()))?;
@@ -572,7 +608,11 @@ impl TelemetrySession {
         };
         let content =
             serde_json::to_vec_pretty(&sess).context("Failed to serialize telemetry session")?;
-        crate::core::safe_ops::atomic_write_file_sync(&path, content)
+        anyhow::ensure!(
+            content.len() as u64 <= MAX_SESSION_BYTES,
+            "Telemetry session exceeds the {MAX_SESSION_BYTES} byte limit"
+        );
+        crate::core::safe_ops::atomic_write_file_sync_private(&path, content)
             .with_context(|| format!("Failed to save telemetry session: {}", path.display()))?;
 
         // Reset persist tracking
@@ -585,7 +625,11 @@ impl TelemetrySession {
 
     /// Increment command counter and update activity (non-blocking)
     fn record_activity(&self) {
-        self.commands_run.fetch_add(1, Ordering::Relaxed);
+        let _ = self
+            .commands_run
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                Some(count.saturating_add(1))
+            });
         self.last_activity
             .store(jiff::Timestamp::now().as_second(), Ordering::Relaxed);
         self.persist_counter.fetch_add(1, Ordering::Relaxed);
@@ -604,7 +648,7 @@ impl TelemetrySession {
     pub fn is_expired(&self) -> bool {
         let now = jiff::Timestamp::now().as_second();
         let last_activity = self.last_activity.load(Ordering::Relaxed);
-        now - last_activity > 1800 // 30 minutes
+        now.saturating_sub(last_activity) > 1800 // 30 minutes
     }
 
     /// Get session duration in seconds
@@ -682,7 +726,7 @@ fn get_session() -> &'static Mutex<TelemetrySession> {
         let mut session = TelemetrySession::load();
         if session.is_expired() {
             session = TelemetrySession::new();
-            persist_best_effort(session.save());
+            persist_with_consent(|| session.save());
         }
         Mutex::new(session)
     })
@@ -724,7 +768,7 @@ fn enqueue(event: TelemetryEvent) {
 
         // Only persist periodically, not on every event
         if queue.needs_persist() {
-            persist_best_effort(queue.save());
+            persist_with_consent(|| queue.save());
         }
     } else {
         tracing::debug!("Telemetry queue lock poisoned; dropped one event (non-fatal)");
@@ -738,7 +782,7 @@ fn record_session_activity() {
 
         // Only persist periodically
         if session.needs_persist() {
-            persist_best_effort(session.save());
+            persist_with_consent(|| session.save());
         }
     } else {
         tracing::debug!("Telemetry session lock poisoned; activity not recorded (non-fatal)");
@@ -804,6 +848,9 @@ pub async fn flush_events() {
     }
 
     let _flush_guard = FLUSH_LOCK.lock().await;
+    let Some(_consent) = telemetry_consent_lease() else {
+        return;
+    };
     flush_queue(get_event_queue(), crate::core::telemetry_client::send_batch).await;
 }
 
@@ -969,6 +1016,64 @@ mod tests {
 
         std::fs::write(&config, "telemetry_enabled = true\n").expect("re-enable config");
         assert!(!check());
+
+        #[cfg(unix)]
+        {
+            std::fs::write(&config, "telemetry_enabled = true \n")
+                .expect("same-size enabled config");
+            assert!(!check());
+            let modified = std::fs::metadata(&config).unwrap().modified().unwrap();
+            crate::core::safe_ops::atomic_write_file_sync(&config, "telemetry_enabled = false\n")
+                .expect("replace with same-size disabled config");
+            std::fs::File::options()
+                .write(true)
+                .open(&config)
+                .unwrap()
+                .set_modified(modified)
+                .unwrap();
+            assert!(
+                check(),
+                "a same-size, same-mtime replacement must revoke cached consent"
+            );
+        }
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn telemetry_consent_lease_follows_settings_and_mutation_lock() {
+        if crate::config::Settings::rerun_test_unprivileged(
+            "core::telemetry::tests::telemetry_consent_lease_follows_settings_and_mutation_lock",
+        ) {
+            return;
+        }
+        let directory = tempfile::TempDir::new().expect("isolated config directory");
+        let settings = directory.path().join("config.toml");
+        std::fs::write(&settings, "telemetry_enabled = true\n").unwrap();
+        temp_env::with_vars(
+            [
+                ("OMG_TEST_MODE", None),
+                ("OMG_TELEMETRY", None),
+                ("OMG_DISABLE_TELEMETRY", None),
+                ("OMG_CONFIG_DIR", Some(directory.path().to_str().unwrap())),
+            ],
+            || {
+                let mutation = crate::config::Settings::write_lock().unwrap();
+                assert!(telemetry_consent_lease().is_none());
+                drop(mutation);
+                let admitted = telemetry_consent_lease().expect("admit with consent");
+                assert!(crate::config::Settings::write_lock().is_err());
+                drop(admitted);
+                let _mutation = crate::config::Settings::write_lock().unwrap();
+                std::fs::write(&settings, "telemetry_enabled = false\n").unwrap();
+            },
+        );
+        temp_env::with_vars(
+            [
+                ("OMG_TEST_MODE", None),
+                ("OMG_CONFIG_DIR", Some(directory.path().to_str().unwrap())),
+            ],
+            || assert!(telemetry_consent_lease().is_none()),
+        );
     }
 
     #[test]

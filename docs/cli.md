@@ -906,7 +906,10 @@ Local exports include archived package history. Export accepts up to 64 MiB per
 source file and 128 MiB across all source files. The output is replaced atomically
 with owner-only permissions. `privacy opt-in`, `privacy opt-out`, and `config set telemetry.enabled`
 discard queued events on opt-out and before enabling telemetry from a disabled state.
-Environment overrides can keep collection disabled after opt-in.
+Environment overrides can keep collection disabled after opt-in. A telemetry
+batch holds a shared settings lease while it sends. If opt-out reports a busy
+configuration lock, retry after the batch finishes. Saved queue and session files
+are limited to 8 MiB and 64 KiB respectively.
 
 ---
 

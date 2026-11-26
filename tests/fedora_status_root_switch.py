@@ -4806,6 +4806,128 @@ for version in versions:
                 and tomllib.loads(config.read_text())["telemetry_enabled"] is False, surface="config")
 
 
+    def inspect_telemetry_storage():
+        phase = "fedora-telemetry-storage"
+
+        @contextmanager
+        def telemetry_fixture():
+            with tempfile.TemporaryDirectory(prefix="telemetry-", dir=work) as directory:
+                home = Path(directory)
+                data, config = home / "data", home / "config"
+                for path in (home, data, config):
+                    path.mkdir(exist_ok=True)
+                    path.chmod(0o700)
+                    os.chown(path, account.pw_uid, account.pw_gid)
+                chosen = {key: value for key, value in disabled.items()
+                          if key != "OMG_DISABLE_TELEMETRY"}
+                chosen.update(HOME=str(home), OMG_DATA_DIR=str(data), OMG_CONFIG_DIR=str(config),
+                              XDG_CONFIG_HOME=str(home/"xdg-config"), XDG_DATA_HOME=str(home/"xdg-data"),
+                              XDG_STATE_HOME=str(home/"state"), XDG_CACHE_HOME=str(home/"cache"),
+                              CI="1", OMG_NO_UPDATE_CHECK="1", RUST_LOG="warn")
+                settings = config / "config.toml"
+                lock = config / "config.lock"
+                for path, contents in ((settings, b"telemetry_enabled = true\n"),
+                                       (data/".installed", b"{}"), (lock, b"")):
+                    write(path, contents)
+                yield data, settings, lock, chosen
+
+        def write(path, contents):
+            path.write_bytes(contents)
+            path.chmod(0o600)
+            os.chown(path, account.pw_uid, account.pw_gid)
+
+        def invoke(case, args, chosen, expected_code, verify):
+            result = command([cli, "privacy", *args], chosen, ordinary, timeout=12)
+            checks.append(dict(phase=phase, case=case, passed=result.returncode == expected_code and verify(result),
+                               status=result.returncode, diagnostic=(result.stdout[-650:], result.stderr[-1100:])))
+
+        def enabled(result):
+            return "Telemetry: Enabled" in result.stdout
+
+        def prior(path):
+            return hashlib.sha256(path.read_bytes()).digest() if path.is_file() else None
+
+        for kind in ("queue", "session"):
+            for stage in ("missing", "current", "malformed", "future", "oversized", "overfull"):
+                for locked in (False, True):
+                    with telemetry_fixture() as (data, settings, lock, chosen):
+                        queue = data / "telemetry_queue.json"
+                        session = data / "telemetry_session.json"
+                        focus = queue if kind == "queue" else session
+                        payload = ({"format_version": 1, "events": []} if kind == "queue" else
+                                   {"format_version": 1, "session_id": "fixture-session",
+                                    "started_at": "2026-10-01T01:02:03Z", "commands_run": 7,
+                                    "last_activity": int(time.time())})
+                        if stage == "future":
+                            payload["format_version"] = 999
+                        if stage == "overfull":
+                            if kind == "queue":
+                                payload["events"] = [
+                                    dict(type="performance", metric_type="fixture-event", duration_ms=n)
+                                    for n in range(6000)
+                                ]
+                            else:
+                                payload["last_activity"] = -(2**63)
+                        if stage != "missing":
+                            write(focus, b"{" if stage == "malformed" else json.dumps(payload).encode())
+                        if stage == "oversized":
+                            budget = 8 * 1024 * 1024 if kind == "queue" else 64 * 1024
+                            with focus.open("ab") as stream:
+                                for _ in range(budget // (64 * 1024) + 1):
+                                    stream.write(b" " * (64 * 1024))
+                        old_queue, old_session = prior(queue), prior(session)
+                        file_before = prior(focus)
+
+                        def verify(result):
+                            if not enabled(result):
+                                return False
+                            if locked and (prior(queue), prior(session)) != (old_queue, old_session):
+                                return False
+                            if stage in ("malformed", "future", "oversized"):
+                                expected = {"malformed": f"Malformed telemetry {kind}",
+                                            "future": f"Unsupported telemetry {kind} format",
+                                            "oversized": "byte limit"}[stage]
+                                return expected in result.stderr and prior(focus) == file_before
+                            if "panicked" in result.stderr:
+                                return False
+                            if not locked and stage == "overfull":
+                                if kind == "queue":
+                                    events = json.loads(queue.read_bytes())["events"]
+                                    retained = [row["duration_ms"] for row in events
+                                                if row.get("metric_type") == "fixture-event"]
+                                    return len(events) <= 5000 and 5999 in retained and 0 not in retained
+                                saved = json.loads(session.read_bytes())
+                                return saved["session_id"] != "fixture-session" and saved["last_activity"] > 0
+                            return True
+
+                        with lock.open("r+b") as writer:
+                            if locked:
+                                fcntl.flock(writer, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            policy = "writer-held" if locked else "no-writer"
+                            invoke(f"{kind}-{stage}-{policy}", ["status"], chosen, 0, verify)
+
+        with telemetry_fixture() as (data, settings, lock, chosen):
+            queue = data / "telemetry_queue.json"
+            original = b'{"format_version":1,"events":[]}'
+            write(queue, original)
+            with lock.open("r+b") as reader:
+                fcntl.flock(reader, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                invoke("opt-out-respects-live-consent-lease", ["opt-out"], dict(chosen, OMG_TELEMETRY="0"), 1,
+                       lambda result: "retry" in result.stderr
+                       and tomllib.loads(settings.read_text())["telemetry_enabled"] is True)
+                invoke("status-override-during-lease", ["status"], dict(chosen, OMG_TELEMETRY="0"), 0,
+                       lambda result: "Telemetry: Disabled" in result.stdout and queue.read_bytes() == original)
+            invoke("opt-out-after-lease-release", ["opt-out"], chosen, 0,
+                   lambda result: "Telemetry disabled locally" in result.stdout and not queue.exists()
+                   and tomllib.loads(settings.read_text())["telemetry_enabled"] is False)
+            invoke("status-disabled-after-release", ["status"], chosen, 0,
+                   lambda result: "Telemetry: Disabled" in result.stdout and not queue.exists())
+            invoke("opt-in-after-lease-release", ["opt-in"], dict(chosen, OMG_TELEMETRY="0"), 0,
+                   lambda result: "environment override keeps telemetry disabled" in result.stdout
+                   and tomllib.loads(settings.read_text())["telemetry_enabled"] is True)
+            invoke("status-enabled-after-release", ["status"], chosen, 0, enabled)
+
+
     def inspect_task_environment_bytes():
         phase = "task-environment-bytes"
         raw = b"test-\xff-value"
@@ -7541,6 +7663,7 @@ exec {shlex.quote(str(binary))} "$@"
                     inspect_snapshots()
                     inspect_snapshot_recovery()
                     inspect_privacy_commands()
+                    inspect_telemetry_storage()
                 config.write_text(host_config)
                 inspect("returned-host", host_count, host_explicit, host=True)
                 mark_progress("root switch and return")
@@ -7852,6 +7975,6 @@ mark_progress("completed with host inventory unchanged")
 report = dict(binaries=binaries, checks=checks, total=len(checks),
               passed=sum(entry["passed"] for entry in checks), host_unchanged=True)
 print(json.dumps(report))
-expected_checks = 303 if consent_oracle is None else 2472
+expected_checks = 303 if consent_oracle is None else 2502
 if report["passed"] != report["total"] or report["total"] != expected_checks:
     sys.exit(4)

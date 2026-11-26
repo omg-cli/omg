@@ -1049,9 +1049,6 @@ async fn async_main(args: Vec<String>, info_sync_missed: bool) -> Result<()> {
         );
     }
 
-    // Initialize session tracking (will create new session if expired)
-    omg_lib::core::telemetry::track_session_start();
-
     // Set the yes flag globally based on command
     let yes_flag = matches!(
         &cli.command,
@@ -1097,6 +1094,7 @@ async fn async_main(args: Vec<String>, info_sync_missed: bool) -> Result<()> {
     // leak there. Explicit RUST_LOG still wins inside init_logging.
     init_logging(cli.verbose, cli.quiet || cli.json);
 
+    omg_lib::core::telemetry::track_session_start();
     let telemetry_ping = spawn_telemetry_ping();
 
     if matches!(

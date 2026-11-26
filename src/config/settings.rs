@@ -624,6 +624,31 @@ impl Settings {
 
     /// Hold this lease across the complete read-modify-save operation.
     pub(crate) fn write_lock() -> Result<std::fs::File> {
+        let lock = Self::open_config_lock()?;
+        match lock.try_lock() {
+            Ok(()) => Ok(lock),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                anyhow::bail!("Another configuration mutation is running; retry when it finishes")
+            }
+            Err(std::fs::TryLockError::Error(error)) => {
+                Err(error).context("Failed to acquire configuration lock")
+            }
+        }
+    }
+
+    /// A non-blocking lease on the same lock used to publish settings changes.
+    pub(crate) fn try_read_lock() -> Result<Option<std::fs::File>> {
+        let lock = Self::open_config_lock()?;
+        match lock.try_lock_shared() {
+            Ok(()) => Ok(Some(lock)),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+            Err(std::fs::TryLockError::Error(error)) => {
+                Err(error).context("Failed to acquire shared configuration lock")
+            }
+        }
+    }
+
+    fn open_config_lock() -> Result<std::fs::File> {
         let path = Self::config_path()?.with_extension("lock");
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).context("Failed to create config directory")?;
@@ -636,17 +661,14 @@ impl Settings {
             options.mode(0o600).custom_flags(nix::libc::O_NOFOLLOW);
         }
         let lock = options
-            .open(path)
+            .open(&path)
             .context("Failed to open configuration lock")?;
-        match lock.try_lock() {
-            Ok(()) => Ok(lock),
-            Err(std::fs::TryLockError::WouldBlock) => {
-                anyhow::bail!("Another configuration mutation is running; retry when it finishes")
-            }
-            Err(std::fs::TryLockError::Error(error)) => {
-                Err(error).context("Failed to acquire configuration lock")
-            }
-        }
+        anyhow::ensure!(
+            lock.metadata()?.is_file(),
+            "Configuration lock must be a regular file: {}",
+            path.display()
+        );
+        Ok(lock)
     }
 
     /// Save a complete settings value, replacing all managed values rather than patching a field.
