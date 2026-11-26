@@ -14,6 +14,7 @@ use crate::cli::style::sanitize_terminal_text;
 use crate::core::env::distro::Distro;
 use crate::core::license;
 use crate::package_managers::types::SecurityPackage;
+use crate::package_managers::{collect_compliance_inventory, inventory_package_name};
 
 fn artifact_stamp() -> String {
     format!(
@@ -402,36 +403,6 @@ fn serialize_installed_packages_csv_rows(
         .into_inner()
         .map_err(|error| anyhow::anyhow!("Failed to finish installed-package CSV: {error}"))?;
     String::from_utf8(bytes).context("Installed-package CSV was not UTF-8")
-}
-
-async fn collect_compliance_inventory() -> Result<(Distro, Vec<SecurityPackage>)> {
-    #[cfg(any(feature = "arch", feature = "fedora"))]
-    use crate::package_managers::Backend;
-
-    tokio::task::spawn_blocking(|| match crate::package_managers::resolve_backend()? {
-        #[cfg(feature = "fedora")]
-        Backend::Fedora => Ok((
-            Distro::Fedora,
-            crate::package_managers::DnfPackageManager::new().installed_compliance_inventory()?,
-        )),
-        #[cfg(feature = "arch")]
-        Backend::Arch | Backend::Mock => Ok((
-            Distro::Arch,
-            crate::package_managers::alpm_direct::security_inventory()?,
-        )),
-        backend => {
-            anyhow::bail!("Native installed compliance inventory is unavailable for {backend:?}")
-        }
-    })
-    .await
-    .context("Installed inventory worker failed")?
-}
-
-fn inventory_package_name(package: &SecurityPackage, distro: Distro) -> String {
-    match (distro, package.architecture.as_deref()) {
-        (Distro::Fedora, Some(architecture)) => format!("{}.{architecture}", package.name),
-        _ => package.name.clone(),
-    }
 }
 
 #[derive(Debug, Serialize)]

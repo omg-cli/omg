@@ -46,6 +46,37 @@ class LicenseOracleTests(unittest.TestCase):
         self.assertEqual(run.call_args.kwargs["env"]["LC_ALL"], "C")
         return packages
 
+    def test_rpm_license_oracle_retains_multilib_and_installonly_versions(self):
+        inventory = (
+            "kernel\t0\t1-1\tx86_64\tGPL-2.0-only\n"
+            "kernel\t0\t2-1\tx86_64\tGPL-2.0-only\n"
+            "demo\t3\t1-1\ti686\tMIT OR Apache-2.0\n"
+            "demo\t3\t1-1\tx86_64\t(none)\n"
+            "gpg-pubkey\t0\t1-1\t(none)\tpubkey\n"
+        )
+        with patch.object(ORACLE.subprocess, "run",
+                          return_value=SimpleNamespace(stdout=inventory)) as run:
+            packages = ORACLE.native_fedora_packages()
+        self.assertEqual(run.call_args.args[0], [
+            "rpm", "-qa", "--qf",
+            r"%{NAME}\t%{EPOCHNUM}\t%{VERSION}-%{RELEASE}\t%{ARCH}\t%{LICENSE}\n",
+        ])
+        rows = [
+            {"name": "kernel.x86_64", "version": "0:1-1", "license": "GPL-2.0-only",
+             "category": "Copyleft", "unresolved_review": False},
+            {"name": "kernel.x86_64", "version": "0:2-1", "license": "GPL-2.0-only",
+             "category": "Copyleft", "unresolved_review": False},
+            {"name": "demo.i686", "version": "3:1-1", "license": "MIT OR Apache-2.0",
+             "category": "Permissive", "unresolved_review": False},
+            {"name": "demo.x86_64", "version": "3:1-1", "license": "Unknown",
+             "category": "Unknown", "unresolved_review": True},
+        ]
+        expected = ORACLE.expected_audit(packages)
+        ORACLE.compare_audit_rows(rows, expected)
+        for invalid in (rows[1:], [*rows, rows[0]]):
+            with self.assertRaises(AssertionError):
+                ORACLE.compare_audit_rows(invalid, expected)
+
     def audit_rows(self):
         return [
             {"name": "alpha", "version": "1.0-1", "license": "MIT", "category": "Permissive", "unresolved_review": False},
@@ -106,7 +137,7 @@ class LicenseOracleTests(unittest.TestCase):
         with self.assertRaises(AssertionError):
             ORACLE.check("audit-csv", self.output, native)
         # Spreadsheet-neutralized output is still the correct native license.
-        native = dict(native, delta=("1.0-1", ["=HYPERLINK(\"https://example.invalid\")"]))
+        native = native | {("delta", "1.0-1"): ["=HYPERLINK(\"https://example.invalid\")"]}
         with self.output.open("w", newline="", encoding="utf-8") as stream:
             writer = csv.writer(stream)
             writer.writerow(["Package", "Version", "License", "Category", "UnresolvedReview"])
@@ -185,7 +216,7 @@ class LicenseOracleTests(unittest.TestCase):
             ORACLE.check("enterprise-text", self.output, native)
 
     def test_enterprise_text_sorts_formatted_prefix_license_rows(self):
-        native = dict(self.native(), delta=("1.0-1", ["Apache-2.0 OR MIT"]))
+        native = self.native() | {("delta", "1.0-1"): ["Apache-2.0 OR MIT"]}
         self.output.write_text("[License Compliance Scan] 4 total packages\n"
                                "License Inventory\n"
                                "│ Apache-2.0 OR MIT: 1 assignments (25%)\n"
@@ -235,7 +266,7 @@ class LicenseOracleTests(unittest.TestCase):
         self.assertEqual(ORACLE.advisory_category("GPL2 WITH LicenseRef-exception"), "Copyleft")
         self.assertEqual(ORACLE.known_category(["GPL2", "LGPL3"]), "Copyleft")
         self.assertEqual(ORACLE.advisory_category("GPL2, LGPL3"), "Unknown")
-        packages = {"libidn2": ("2.3.8-1", ["GPL2", "LGPL3"])}
+        packages = {("libidn2", "2.3.8-1"): ["GPL2", "LGPL3"]}
         ORACLE.compare_audit_rows([{"name": "libidn2", "version": "2.3.8-1",
                                     "license": "GPL2, LGPL3", "category": "Copyleft", "unresolved_review": False}],
                                   ORACLE.expected_audit(packages))
@@ -308,8 +339,8 @@ class LicenseOracleTests(unittest.TestCase):
                 ORACLE.check_enterprise_text(bad, packages)
 
     def test_enterprise_text_validates_renderer_limits_and_truncation(self):
-        packages = {f"p{i:02}": ("1", ["GPL2" if i % 2 else "GPL3"]) for i in range(23)}
-        packages.update({f"unknown{i}": ("1", []) for i in range(7)})
+        packages = {(f"p{i:02}", "1"): ["GPL2" if i % 2 else "GPL3"] for i in range(23)}
+        packages.update({(f"unknown{i}", "1"): [] for i in range(7)})
         correct = ("[License Compliance Scan] 30 total packages\nLicense Inventory\n"
                    "│ GPL2: 11 assignments (48%)\n│ GPL3: 12 assignments (52%)\n"
                    "Unresolved License Review\n│ 0 unresolved assignments; 7 packages without license metadata\n"
@@ -324,7 +355,7 @@ class LicenseOracleTests(unittest.TestCase):
                     correct.replace("│ unknown0\n", "│ unknown1\n")):
             with self.assertRaises(AssertionError):
                 ORACLE.check_enterprise_text(bad, packages)
-        many = {f"p{i:02}": ("1", [f"LicenseRef-{i:02}"]) for i in range(23)}
+        many = {(f"p{i:02}", "1"): [f"LicenseRef-{i:02}"] for i in range(23)}
         inventory = ("[License Compliance Scan] 23 total packages\nLicense Inventory\n"
                      + "".join(f"│ LicenseRef-{i:02}: 1 assignments (4%) [unresolved license review]\n" for i in range(20))
                      + "│ ... and 3 more\nUnresolved License Review\n│ 23 unresolved assignments; 0 packages without license metadata\n")
@@ -346,7 +377,7 @@ class LicenseOracleTests(unittest.TestCase):
         ):
             self.assertEqual(ORACLE.advisory_assessment(expression), (category, True))
         self.assertEqual(ORACLE.advisory_assessment("MIT OR Apache-2.0"), ("Permissive", False))
-        packages = {"mixed": ("1", ["MIT AND LicenseRef-private"])}
+        packages = {("mixed", "1"): ["MIT AND LicenseRef-private"]}
         row = {"name": "mixed", "version": "1", "license": "MIT AND LicenseRef-private",
                "category": "Permissive", "unresolved_review": True}
         ORACLE.compare_audit_rows([row], ORACLE.expected_audit(packages))

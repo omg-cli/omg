@@ -3639,7 +3639,7 @@ printf 'Audit evidence exported: iso27001 2025-Q1\\n'
                 self.assertEqual(result.returncode, int(expected == 'FAIL'))
         for mutation, expected in (('', 'PASS'), ('mkdir enterprise-evidence-flags\n', 'FAIL')):
             with self.subTest(distro='debian', mutation=mutation):
-                product = mutation + '''printf 'Error: Installed-package export requires the Arch package backend\\n' >&2
+                product = mutation + '''printf 'Error: Native installed compliance inventory is unavailable for Debian\\n' >&2
 exit 1
 '''
                 result, evidence, logs = self.run_inventory(product, [row], distro='debian')
@@ -4279,16 +4279,13 @@ RUNTIME_FIXTURE_REVIEW
         refusal = ('if [[ " $* " == *" --check-policy "* && ! -f "$OMG_CONFIG_DIR/config.toml" ]]; then\n'
                    '  printf "WARN missing config.toml at %s\\n" "$OMG_CONFIG_DIR" >&2\n'
                    'fi\n'
-                   'if [[ "$1" == audit ]]; then\n'
-                   '  echo "Error: License scanning of installed packages is not available without the Arch backend" >&2\n'
-                   'else\n'
-                   '  echo "Error: Enterprise license scan requires the Arch package backend" >&2\n'
-                   'fi\nexit 1\n')
+                   'echo "Error: Native installed compliance inventory is unavailable for Debian" >&2\n'
+                   'exit 1\n')
         leaked_export = ('if [[ "$*" == *--export* ]]; then\n'
                          '  if [[ "$1" == audit ]]; then printf partial > licenses-export.csv;\n'
                          '  else printf partial > license-scan-fixture.json; fi\n'
                          'fi\n' + refusal)
-        for distro in ('debian', 'ubuntu', 'fedora'):
+        for distro in ('debian', 'ubuntu'):
             for label, product, rejected in (
                 ('wrong cause', 'echo unrelated permission error >&2\nexit 1\n', ids),
                 ('explicit refusal', refusal, set()),
@@ -4303,6 +4300,56 @@ RUNTIME_FIXTURE_REVIEW
                         self.assertEqual(row['result'], 'FAIL' if case in rejected else 'PASS',
                                          f'{result.stdout}\n{result.stderr}\n{logs}')
                     self.assertEqual(result.returncode, 1 if rejected else 0)
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX descriptors')
+    def test_fedora_license_rows_require_native_report_and_policy_evidence(self):
+        ids = {'audit-licenses', 'audit-licenses-filter-policy', 'audit-licenses-export',
+               'enterprise-license-scan-export'}
+        rows = [line for line in (ROOT / 'tests/cli_behavior_inventory.tsv').read_text().splitlines()
+                if line.split('\t', 1)[0] in ids]
+        self.assertEqual(len(rows), len(ids))
+        rpm = r'''[[ "$1:$2" == '-qa:--qf' && "$#" == 3 ]] || exit 70
+printf 'demo\t3\t1-1\tx86_64\tMIT\n'
+'''
+        tools = {'rpm': rpm, 'id': 'if [[ "$*" == -u ]]; then echo 1000; else exec /usr/bin/id "$@"; fi\n'}
+        json_row = ('[{"name":"demo.x86_64","version":"3:1-1","license":"MIT",'
+                    '"category":"Permissive","unresolved_review":false}]')
+        product = r'''case "$1:$2" in
+  audit:licenses)
+    if [[ " $* " == *' --export '* ]]; then
+      printf 'Package,Version,License,Category,UnresolvedReview\ndemo.x86_64,3:1-1,MIT,Permissive,false\n' > "$6"
+      chmod 600 "$6"
+    else
+      printf '%s\n' 'JSON_REPORT'
+      if [[ " $* " == *' --check-policy '* ]]; then
+        grep -Fxq 'allowed_licenses = ["LicenseRef-QemuNoInstalledLicense"]' "$OMG_CONFIG_DIR/policy.toml" || exit 70
+        printf 'Error: License policy check found 1 violation(s)\n' >&2
+        exit 1
+      fi
+    fi ;;
+  enterprise:license-scan)
+    printf '%s' '{"total":1,"by_license":{"MIT":1},"violations":[],"unknown":[],"unresolved_review":[]}' > license-scan-demo.json
+    chmod 600 license-scan-demo.json ;;
+  *) exit 70 ;;
+esac
+'''.replace('JSON_REPORT', json_row)
+        for label, body, rejected in (
+            ('native agreement', product, set()),
+            ('old refusal',
+             'echo "Error: License scanning of installed packages is not available without the Arch backend" >&2\nexit 1\n',
+             ids),
+            ('wrong version', product.replace('3:1-1', '0:1-1'), ids - {'enterprise-license-scan-export'}),
+            ('wrong policy result', product.replace('found 1 violation', 'found 2 violation'),
+             {'audit-licenses-filter-policy'}),
+        ):
+            with self.subTest(label=label):
+                result, evidence, logs = self.run_inventory(body, rows, distro='fedora', native_commands=tools)
+                self.assertEqual(len(evidence), len(ids), result.stderr)
+                for row in evidence:
+                    case = row['case_id'].removeprefix('qemu-fedora-')
+                    self.assertEqual(row['result'], 'FAIL' if case in rejected else 'PASS',
+                                     f'{result.stdout}\n{result.stderr}\n{logs}')
+                self.assertEqual(result.returncode, int(bool(rejected)))
 
     @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX jq process-substitution descriptors')
     def test_actual_runner_executes_offline_refusals(self):

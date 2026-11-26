@@ -42,16 +42,19 @@ use crate::cli::{
 };
 #[cfg(unix)]
 use crate::core::client::DaemonClient;
+use crate::core::env::distro::Distro;
+use crate::core::security::policy::{
+    LicenseClassification, assess_license_expression, classify_license_expression,
+    combined_license_expression, license_matches_allowlist, spdx_license_tokens,
+};
 use crate::core::security::{AuditLogger, AuditSeverity, SbomGenerator, SecurityPolicy};
+use crate::package_managers::types::SecurityPackage;
+use crate::package_managers::{collect_compliance_inventory, inventory_package_name};
 use crate::runtimes::eol::{SCHEDULE_REVIEWED, SupportStatus, SupportWindow};
 
 impl LocalCommandRunner for AuditCommands {
     async fn execute(&self, ctx: &CliContext) -> Result<()> {
-        let machine_stdout = matches!(
-            self,
-            AuditCommands::Licenses { format, export: None, .. } if format.as_str() != "table"
-        );
-        if !machine_stdout {
+        if !matches!(self, AuditCommands::Licenses { .. }) {
             ui::print_spacer();
         }
         match self {
@@ -88,13 +91,16 @@ impl LocalCommandRunner for AuditCommands {
                 export,
                 filter,
                 check_policy,
-            } => scan_licenses(
-                format.as_str(),
-                export.clone(),
-                filter.clone(),
-                *check_policy,
-                ctx,
-            ),
+            } => {
+                scan_licenses(
+                    format.as_str(),
+                    export.clone(),
+                    filter.clone(),
+                    *check_policy,
+                    ctx,
+                )
+                .await
+            }
             AuditCommands::Fix {
                 dry_run,
                 yes,
@@ -107,7 +113,7 @@ impl LocalCommandRunner for AuditCommands {
             } => export_compliance(framework.as_str(), period.clone(), output, ctx).await,
             AuditCommands::Eol => check_eol(ctx),
         }?;
-        if !machine_stdout {
+        if !matches!(self, AuditCommands::Licenses { .. }) {
             ui::print_spacer();
         }
         Ok(())
@@ -811,8 +817,11 @@ impl LicenseCategory {
     /// Shared with the enterprise license scan so `omg audit` and
     /// `omg enterprise audit` agree on what counts as copyleft.
     pub(crate) fn from_license(license: &str) -> Self {
-        use crate::core::security::policy::{LicenseClassification, classify_license_expression};
-        match classify_license_expression(license) {
+        Self::from_classification(classify_license_expression(license))
+    }
+
+    fn from_classification(classification: LicenseClassification) -> Self {
+        match classification {
             LicenseClassification::Unknown => Self::Unknown,
             LicenseClassification::Proprietary => Self::Proprietary,
             LicenseClassification::Permissive => Self::Permissive,
@@ -832,23 +841,39 @@ impl LicenseCategory {
     }
 }
 
-/// ALPM's display join is not expression syntax. Normalize only at this
-/// installed-inventory caller, keeping the original metadata for serialization.
-fn installed_license_category(license: &str) -> LicenseCategory {
-    crate::core::security::policy::combined_license_expression(license.split(',').map(str::trim))
-        .as_deref()
-        .map_or(LicenseCategory::Unknown, LicenseCategory::from_license)
-}
-
-fn installed_license_requires_review(license: &str) -> bool {
-    crate::core::security::policy::combined_license_expression(license.split(',').map(str::trim))
-        .as_deref()
-        .is_none_or(|expression| {
-            crate::core::security::policy::assess_license_expression(expression).unresolved_review
-        })
-}
-
 type LicenseRow = (String, String, String, LicenseCategory, bool);
+
+fn license_display(licenses: &[String]) -> String {
+    if licenses.is_empty() {
+        "Unknown".into()
+    } else {
+        licenses.join(", ")
+    }
+}
+
+fn package_license_expression(package: &SecurityPackage) -> Option<String> {
+    combined_license_expression(package.licenses.iter().map(|license| license.trim()))
+}
+
+fn license_row(package: SecurityPackage, distro: Distro) -> LicenseRow {
+    let (category, unresolved_review) = package_license_expression(&package).map_or(
+        (LicenseCategory::Unknown, true),
+        |expression| {
+            let assessment = assess_license_expression(&expression);
+            (
+                LicenseCategory::from_classification(assessment.category),
+                assessment.unresolved_review,
+            )
+        },
+    );
+    (
+        inventory_package_name(&package, distro),
+        license_display(&package.licenses),
+        package.version,
+        category,
+        unresolved_review,
+    )
+}
 
 pub(crate) fn spreadsheet_safe_cell(value: &str) -> std::borrow::Cow<'_, str> {
     if value.starts_with(['=', '+', '-', '@']) {
@@ -908,7 +933,10 @@ fn serialize_license_rows(format: &str, rows: &[LicenseRow]) -> Result<Vec<u8>> 
             for (name, license, version, category, unresolved_review) in rows {
                 let _ = writeln!(
                     content,
-                    "{name}\t{version}\t{license}\t{category:?}\t{unresolved_review}"
+                    "{}\t{}\t{}\t{category:?}\t{unresolved_review}",
+                    style::sanitize_terminal_text(name),
+                    style::sanitize_terminal_text(version),
+                    style::sanitize_terminal_text(license),
                 );
             }
             Ok(content.into_bytes())
@@ -918,148 +946,161 @@ fn serialize_license_rows(format: &str, rows: &[LicenseRow]) -> Result<Vec<u8>> 
 }
 
 /// Scan for software license compliance
-pub fn scan_licenses(
+pub async fn scan_licenses(
     format: &str,
     export: Option<String>,
     filter: Option<String>,
     check_policy: bool,
     _ctx: &CliContext,
 ) -> Result<()> {
-    // Validate the requested format up front instead of silently rendering any
-    // unknown value with the table renderer.
+    use std::io::Write as _;
+
     if !matches!(format, "table" | "json" | "csv") {
         anyhow::bail!("Unsupported output format '{format}'. Valid formats: table, json, csv");
     }
 
-    if export.is_some() || format == "table" {
-        println!(
-            "{} Scanning installed packages for license information...\n",
-            style::runtime("OMG")
-        );
-    }
-
     // Policy evaluation must cover every installed package. A display filter
     // cannot turn an omitted violation into a successful compliance check.
-    let packages = installed_packages_with_licenses()?;
+    let (distro, packages) = collect_compliance_inventory().await?;
     let policy_violations = if check_policy {
         let policy = SecurityPolicy::load_default().context("Failed to load security policy")?;
-        license_policy_violations(&packages, &policy)
+        license_policy_violations(&packages, distro, &policy)
     } else {
         Vec::new()
     };
     let installed_count = packages.len();
 
-    // Filter by license if specified, categorizing each package once.
-    // Native assignments are combined at this caller, not in the parser.
-    // Classification must not be recomputed
-    // separately for the summary, policy check, AND export.
     let filter_terms: Vec<String> = filter
         .map(|f| f.split(',').map(|s| s.trim().to_lowercase()).collect())
         .unwrap_or_default();
 
     let filtered_packages: Vec<LicenseRow> = packages
         .into_iter()
-        .filter(|(_, license, _)| {
-            if filter_terms.is_empty() {
-                true
-            } else {
-                let tokens = crate::core::security::policy::spdx_license_tokens(license);
-                filter_terms.iter().any(|term| {
-                    tokens.iter().any(|token| {
-                        token == term
-                            || token.strip_suffix('+') == Some(term.as_str())
-                            || token.starts_with(&format!("{term}-"))
+        .filter(|package| {
+            filter_terms.is_empty()
+                || (package.licenses.is_empty()
+                    && filter_terms.iter().any(|term| term == "unknown"))
+                || package
+                    .licenses
+                    .iter()
+                    .flat_map(|license| spdx_license_tokens(license))
+                    .any(|token| {
+                        filter_terms.iter().any(|term| {
+                            token == *term
+                                || token.strip_suffix('+') == Some(term.as_str())
+                                || token
+                                    .strip_prefix(term.as_str())
+                                    .is_some_and(|suffix| suffix.starts_with('-'))
+                        })
                     })
-                })
-            }
         })
-        .map(|(name, license, version)| {
-            let category = installed_license_category(&license);
-            let unresolved_review = installed_license_requires_review(&license);
-            (name, license, version, category, unresolved_review)
-        })
+        .map(|package| license_row(package, distro))
         .collect();
 
+    let mut stdout = std::io::stdout().lock();
     if export.is_none() && matches!(format, "json" | "csv") {
-        use std::io::Write as _;
         let report = serialize_license_rows(format, &filtered_packages)?;
-        let mut stdout = std::io::stdout().lock();
         stdout.write_all(&report)?;
-        stdout.write_all(b"\n")?;
+        if format == "json" {
+            stdout.write_all(b"\n")?;
+        }
         stdout.flush()?;
         return enforce_license_policy(&policy_violations);
     }
 
+    writeln!(
+        stdout,
+        "\n{} Scanning installed packages for license information...\n",
+        style::runtime("OMG")
+    )?;
     // Print summary
-    println!("  {}", style::header("License Summary"));
-    println!(
+    writeln!(stdout, "  {}", style::header("License Summary"))?;
+    writeln!(
+        stdout,
         "    {} {}",
         style::success("Permissive:"),
         filtered_packages
             .iter()
             .filter(|(_, _, _, c, _)| *c == LicenseCategory::Permissive)
             .count()
-    );
-    println!(
+    )?;
+    writeln!(
+        stdout,
         "    {} {}",
         style::warning("Copyleft:"),
         filtered_packages
             .iter()
             .filter(|(_, _, _, c, _)| *c == LicenseCategory::Copyleft)
             .count()
-    );
+    )?;
     let strong_copyleft = filtered_packages
         .iter()
         .filter(|(_, _, _, c, _)| *c == LicenseCategory::StrongCopyleft)
         .count();
     if strong_copyleft > 0 {
-        println!(
+        writeln!(
+            stdout,
             "    {} {}",
             style::error("Strong Copyleft (AGPL):"),
             strong_copyleft
-        );
+        )?;
     }
     let proprietary = filtered_packages
         .iter()
         .filter(|(_, _, _, c, _)| *c == LicenseCategory::Proprietary)
         .count();
     if proprietary > 0 {
-        println!("    {} {}", style::error("Proprietary:"), proprietary);
+        writeln!(
+            stdout,
+            "    {} {}",
+            style::error("Proprietary:"),
+            proprietary
+        )?;
     }
     let unknown = filtered_packages
         .iter()
         .filter(|(_, _, _, c, _)| *c == LicenseCategory::Unknown)
         .count();
     if unknown > 0 {
-        println!("    {} {}", style::dim("Unknown:"), unknown);
+        writeln!(stdout, "    {} {}", style::dim("Unknown:"), unknown)?;
     }
-    println!(
+    writeln!(
+        stdout,
         "    {} {}",
         style::warning("Unresolved license review:"),
         filtered_packages.iter().filter(|row| row.4).count()
-    );
-    println!();
+    )?;
+    writeln!(stdout)?;
 
     // Check against policy if requested
     if check_policy {
-        println!("  Policy checked all {installed_count} installed packages.");
+        writeln!(
+            stdout,
+            "  Policy checked all {installed_count} installed packages."
+        )?;
         if policy_violations.is_empty() {
-            println!(
+            writeln!(
+                stdout,
                 "  {} No configured license restrictions were violated\n",
                 style::success("✓")
-            );
+            )?;
         } else {
-            println!("  {} License Policy Violations:\n", style::warning("⚠"));
+            writeln!(
+                stdout,
+                "  {} License Policy Violations:\n",
+                style::warning("⚠")
+            )?;
             for (name, license, reason) in &policy_violations {
-                println!(
+                writeln!(
+                    stdout,
                     "    {} {} ({}) - {}",
                     style::error("✗"),
-                    name,
-                    license,
+                    style::sanitize_terminal_text(name),
+                    style::sanitize_terminal_text(license),
                     reason
-                );
+                )?;
             }
-            println!();
+            writeln!(stdout)?;
         }
     }
 
@@ -1070,65 +1111,70 @@ pub fn scan_licenses(
         let report = serialize_license_rows(format, &filtered_packages)?;
         write_private_export(&path, &report)?;
 
-        println!(
+        writeln!(
+            stdout,
             "{} Exported {} packages to {}",
             style::success("✓"),
             filtered_packages.len(),
-            export_path
-        );
+            style::sanitize_terminal_text(&export_path)
+        )?;
     } else if format == "table" {
         // Show first 20 packages in table format
-        println!("  {}", style::header("Packages"));
+        writeln!(stdout, "  {}", style::header("Packages"))?;
         for (name, license, _, category, unresolved_review) in filtered_packages.iter().take(20) {
-            println!(
+            writeln!(
+                stdout,
                 "    {} {} ({}){}",
-                style::package(name),
-                style::dim(license),
+                style::package(&style::sanitize_terminal_text(name)),
+                style::dim(&style::sanitize_terminal_text(license)),
                 category.color(),
                 if *unresolved_review {
                     " [unresolved license review]"
                 } else {
                     ""
                 }
-            );
+            )?;
         }
         if filtered_packages.len() > 20 {
-            println!(
+            writeln!(
+                stdout,
                 "\n  {} Showing 20 of {} packages. Use --export to see all.",
                 style::dim("..."),
                 filtered_packages.len()
-            );
+            )?;
         }
     }
 
+    stdout.flush()?;
     enforce_license_policy(&policy_violations)
 }
 
 type LicenseViolation = (String, String, &'static str);
 
 fn license_policy_violations(
-    packages: &[(String, String, String)],
+    packages: &[SecurityPackage],
+    distro: Distro,
     policy: &SecurityPolicy,
 ) -> Vec<LicenseViolation> {
-    let mut violations = Vec::new();
-    for (name, license, _) in packages {
-        // ALPM stores separate license entries; the display string joins them
-        // with commas, but every entry represents a cumulative obligation.
-        let expression = crate::core::security::policy::combined_license_expression(
-            license.split(',').map(str::trim),
-        );
-        if !policy.allowed_licenses.is_empty()
-            && !expression.as_deref().is_some_and(|expression| {
-                crate::core::security::policy::license_matches_allowlist(
-                    expression,
-                    &policy.allowed_licenses,
-                )
-            })
-        {
-            violations.push((name.clone(), license.clone(), "Not in allowed list"));
-        }
+    if policy.allowed_licenses.is_empty() {
+        return Vec::new();
     }
-    violations
+
+    packages
+        .iter()
+        .filter(|package| {
+            !package_license_expression(package).is_some_and(|expression| {
+                license_matches_allowlist(&expression, &policy.allowed_licenses)
+            })
+        })
+        .map(|package| {
+            (
+                inventory_package_name(package, distro),
+                license_display(&package.licenses),
+                "Not in allowed list",
+            )
+        })
+        .collect()
 }
 
 fn enforce_license_policy(violations: &[LicenseViolation]) -> Result<()> {
@@ -1138,29 +1184,6 @@ fn enforce_license_policy(violations: &[LicenseViolation]) -> Result<()> {
         violations.len()
     );
     Ok(())
-}
-
-fn installed_packages_with_licenses() -> Result<Vec<(String, String, String)>> {
-    #[cfg(feature = "arch")]
-    {
-        anyhow::ensure!(
-            matches!(
-                crate::package_managers::resolve_backend()?,
-                crate::package_managers::Backend::Arch | crate::package_managers::Backend::Mock
-            ),
-            "Native license scanning through ALPM requires an Arch host"
-        );
-        crate::package_managers::alpm_direct::list_installed_with_licenses()
-    }
-    #[cfg(not(feature = "arch"))]
-    license_scan_requires_arch()
-}
-
-#[cfg(any(not(feature = "arch"), test))]
-fn license_scan_requires_arch() -> Result<Vec<(String, String, String)>> {
-    anyhow::bail!(
-        "License scanning of installed packages is not available without the Arch backend"
-    )
 }
 
 #[cfg(any(not(feature = "arch"), test))]
@@ -2058,23 +2081,51 @@ mod tests {
         assert!(csv.contains("demo,1.2.3,MIT,Permissive"));
     }
 
+    fn license_package(name: &str, version: &str, licenses: &[&str]) -> SecurityPackage {
+        SecurityPackage {
+            origin: crate::package_managers::types::SecurityOrigin::Unknown,
+            name: name.into(),
+            version: version.into(),
+            advisory_source: None,
+            architecture: Some("x86_64".into()),
+            description: String::new(),
+            licenses: licenses.iter().map(|license| (*license).into()).collect(),
+        }
+    }
+
+    #[test]
+    fn license_table_preserves_row_boundaries_and_json_preserves_metadata() {
+        let row = license_row(
+            license_package("demo", "1.0", &["MIT\u{202e}\n\t"]),
+            Distro::Fedora,
+        );
+        let table =
+            String::from_utf8(serialize_license_rows("table", std::slice::from_ref(&row)).unwrap())
+                .unwrap();
+        assert_eq!(table.lines().count(), 2);
+        assert_eq!(
+            table
+                .lines()
+                .nth(1)
+                .unwrap()
+                .split('\t')
+                .collect::<Vec<_>>()[..3],
+            ["demo.x86_64", "1.0", "MIT"]
+        );
+        let json: serde_json::Value =
+            serde_json::from_slice(&serialize_license_rows("json", &[row]).unwrap()).unwrap();
+        assert_eq!(json[0]["license"], "MIT\u{202e}\n\t");
+    }
+
     #[test]
     fn unresolved_license_review_survives_inventory_and_all_exports() {
-        let mut rows = Vec::new();
-        for (name, license) in [
-            ("mixed", "MIT AND LicenseRef-private"),
-            ("native", "GPL2, LicenseRef-private"),
-            ("exception", "MIT WITH AGPL-3.0"),
-            ("known", "MIT OR Apache-2.0"),
-        ] {
-            rows.push((
-                name.into(),
-                license.into(),
-                "1.0".into(),
-                installed_license_category(license),
-                installed_license_requires_review(license),
-            ));
-        }
+        let rows = [
+            ("mixed", &["MIT AND LicenseRef-private"][..]),
+            ("native", &["GPL2", "LicenseRef-private"][..]),
+            ("exception", &["MIT WITH AGPL-3.0"][..]),
+            ("known", &["MIT OR Apache-2.0"][..]),
+        ]
+        .map(|(name, licenses)| license_row(license_package(name, "1.0", licenses), Distro::Arch));
         assert_eq!(rows.iter().filter(|row| row.4).count(), 3);
         let json: serde_json::Value =
             serde_json::from_slice(&serialize_license_rows("json", &rows).unwrap()).unwrap();
@@ -2102,49 +2153,37 @@ mod tests {
     #[test]
     fn license_policy_checks_unfiltered_inventory_and_fails_on_violations() {
         let packages = vec![
-            ("visible".to_string(), "MIT".to_string(), "1.0".to_string()),
-            (
-                "hidden".to_string(),
-                "AGPL-3.0".to_string(),
-                "1.0".to_string(),
-            ),
+            license_package("visible", "1.0", &["MIT"]),
+            license_package("hidden", "1.0", &["AGPL-3.0"]),
         ];
         let policy = SecurityPolicy {
             allowed_licenses: vec!["MIT".to_string()],
             ..SecurityPolicy::default()
         };
-        let violations = license_policy_violations(&packages, &policy);
+        let violations = license_policy_violations(&packages, Distro::Arch, &policy);
         assert!(violations.iter().any(|(name, _, _)| name == "hidden"));
         assert!(enforce_license_policy(&violations).is_err());
     }
 
     #[test]
     fn explicitly_allowed_agpl_is_not_a_license_policy_violation() {
-        let packages = vec![(
-            "allowed".to_string(),
-            "AGPL-3.0".to_string(),
-            "1.0".to_string(),
-        )];
+        let packages = [license_package("allowed", "1.0", &["AGPL-3.0"])];
         let policy = SecurityPolicy {
             allowed_licenses: vec!["AGPL-3.0".to_string()],
             ..SecurityPolicy::default()
         };
-        assert!(license_policy_violations(&packages, &policy).is_empty());
+        assert!(license_policy_violations(&packages, Distro::Arch, &policy).is_empty());
     }
 
     #[test]
     fn separate_alpm_license_entries_all_must_be_allowed() {
-        let packages = vec![(
-            "dual-license".to_string(),
-            "MIT, GPL-3.0".to_string(),
-            "1.0".to_string(),
-        )];
+        let packages = [license_package("dual-license", "1.0", &["MIT", "GPL-3.0"])];
         let policy = SecurityPolicy {
             allowed_licenses: vec!["MIT".to_string()],
             ..SecurityPolicy::default()
         };
 
-        let violations = license_policy_violations(&packages, &policy);
+        let violations = license_policy_violations(&packages, Distro::Arch, &policy);
         assert_eq!(violations.len(), 1);
         assert_eq!(violations[0].0, "dual-license");
         assert!(enforce_license_policy(&violations).is_err());
@@ -2332,22 +2371,9 @@ mod tests {
 
     #[test]
     fn native_license_assignment_join_keeps_category_and_export_metadata() {
-        // Actual ALPM libidn2 assignment spellings, joined by the inventory caller.
-        let display = ["GPL2", "LGPL3"].join(", ");
-        assert_eq!(
-            LicenseCategory::from_license(&display),
-            LicenseCategory::Unknown
-        );
-        assert_eq!(
-            installed_license_category(&display),
-            LicenseCategory::Copyleft
-        );
-        let rows = vec![(
-            "libidn2".into(),
-            display.clone(),
-            "2.3.8-1".into(),
-            installed_license_category(&display),
-            installed_license_requires_review(&display),
+        let rows = [license_row(
+            license_package("libidn2", "2.3.8-1", &["GPL2", "LGPL3"]),
+            Distro::Arch,
         )];
         let json: serde_json::Value =
             serde_json::from_slice(&serialize_license_rows("json", &rows).unwrap()).unwrap();
@@ -2356,11 +2382,15 @@ mod tests {
         let csv = String::from_utf8(serialize_license_rows("csv", &rows).unwrap()).unwrap();
         assert!(csv.contains("libidn2,2.3.8-1,\"GPL2, LGPL3\",Copyleft"));
         assert_eq!(
-            installed_license_category("MIT, AGPL3+"),
+            license_row(
+                license_package("test", "1", &["MIT", "AGPL3+"]),
+                Distro::Arch
+            )
+            .3,
             LicenseCategory::StrongCopyleft
         );
         assert_eq!(
-            installed_license_category("MIT, "),
+            license_row(license_package("test", "1", &["MIT", ""]), Distro::Arch).3,
             LicenseCategory::Unknown
         );
     }
@@ -2461,15 +2491,27 @@ mod tests {
     }
 
     #[test]
-    fn license_scan_without_arch_fails() {
-        let error = license_scan_requires_arch()
-            .expect_err("license scan must not treat a missing backend as zero packages");
-        assert!(
-            error
-                .to_string()
-                .contains("not available without the Arch backend"),
-            "got: {error}"
+    fn license_policy_uses_fedora_expressions_and_flags_missing_metadata() {
+        let packages = [
+            license_package("dual", "0:1-1", &["MIT OR GPL-3.0-only"]),
+            license_package("missing", "0:1-1", &[]),
+        ];
+        let policy = SecurityPolicy {
+            allowed_licenses: vec!["MIT".into()],
+            ..SecurityPolicy::default()
+        };
+        assert_eq!(
+            license_policy_violations(&packages, Distro::Fedora, &policy),
+            [(
+                "missing.x86_64".into(),
+                "Unknown".into(),
+                "Not in allowed list"
+            )]
         );
+        let row = license_row(packages[1].clone(), Distro::Fedora);
+        assert_eq!(row.1, "Unknown");
+        assert_eq!(row.3, LicenseCategory::Unknown);
+        assert!(row.4);
     }
 
     #[test]

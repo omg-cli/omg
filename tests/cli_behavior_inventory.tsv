@@ -74,7 +74,7 @@ audit-verify	["audit","verify"]	read	0	pass	-	hermetic	hermetic:pass	local:audit
 audit-policy	["audit","policy"]	read	0	pass	-	hermetic	hermetic:pass	local:audit-policy	tempdir-drop
 audit-slsa	["audit","slsa","${ROOT}/project/README.md"]	controlled-error	2	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 audit-slsa-identity	["audit","slsa","--certificate-identity","dev@example.invalid","--certificate-oidc-issuer","https://issuer.example.invalid","${ROOT}/project/README.md"]	controlled-error	1	pass	-	hermetic	hermetic:pass	-	tempdir-drop
-audit-licenses	["audit","licenses","--format","json"]	read	arch:0,debian:1,ubuntu:1,fedora:1	pass	-	hermetic	hermetic:pass	license-audit-json	tempdir-drop
+audit-licenses	["audit","licenses","--format","json"]	read	arch:0,debian:1,ubuntu:1,fedora:0	pass	-	hermetic	hermetic:pass	license-audit-json	tempdir-drop
 audit-fix	["audit","fix","--dry-run"]	read	1	pass	-	hermetic	hermetic:pass	audit-fix-refusal	tempdir-drop
 audit-export	["audit","export","--output","${ROOT}/audit-evidence"]	isolated-write	1	pass	-	hermetic	hermetic:pass	local:audit-export	tempdir-drop
 audit-eol	["audit","eol"]	read	0	pass	-	hermetic	hermetic:pass	audit-eol-state	tempdir-drop
@@ -121,7 +121,7 @@ fleet-status	["fleet","status"]	controlled-error	1	pass	-	hermetic	hermetic:pass
 enterprise-reports	["enterprise","reports"]	controlled-error	1	pass	-	hermetic	hermetic:pass	local:enterprise-reports	tempdir-drop
 enterprise-policy-show	["enterprise","policy","show"]	controlled-error	1	pass	-	hermetic	hermetic:pass	local:enterprise-policy-show	tempdir-drop
 enterprise-audit-export	["enterprise","audit-export","--output","${ROOT}/enterprise-evidence"]	controlled-error	1	pass	-	hermetic	hermetic:pass	local:enterprise-audit-export	tempdir-drop
-enterprise-license-scan	["enterprise","license-scan"]	controlled-error	arch:0,debian:1,ubuntu:1,fedora:1	pass	-	hermetic	hermetic:pass	license-enterprise-text	tempdir-drop
+enterprise-license-scan	["enterprise","license-scan"]	controlled-error	arch:0,debian:1,ubuntu:1,fedora:0	pass	-	hermetic	hermetic:pass	license-enterprise-text	tempdir-drop
 history	["history","--limit","3"]	read	0	pass	-	hermetic	hermetic:pass	local:history	tempdir-drop
 rollback	["rollback"]	controlled-error	1	pass	-	hermetic	hermetic:pass	local:rollback	tempdir-drop
 dash	["dash","--help"]	help-boundary	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
@@ -159,7 +159,7 @@ workspace-run-sequential-all	["workspace","run","--yes","smoke"]	read	0	pass	wor
 complete-full	["complete","--shell","bash","--current","cap","--last","env","--full","omg env cap"]	read	0	pass	-	hermetic	hermetic:pass	completion-env-capture	tempdir-drop
 audit-log-flags	["audit","log","--limit","3","--severity","error","--export","${ROOT}/audit-log-export.json"]	isolated-write	0	pass	-	hermetic	hermetic:pass	local:audit-log-flags	tempdir-drop
 audit-licenses-filter-policy	["audit","licenses","--format","json","--filter","mit","--check-policy"]	read	1	pass	-	hermetic	hermetic:pass	license-audit-mit-json	tempdir-drop
-audit-licenses-export	["audit","licenses","--format","csv","--export","${ROOT}/licenses-export.csv"]	isolated-write	arch:0,debian:1,ubuntu:1,fedora:1	pass	-	hermetic	hermetic:pass	license-audit-csv	tempdir-drop
+audit-licenses-export	["audit","licenses","--format","csv","--export","${ROOT}/licenses-export.csv"]	isolated-write	arch:0,debian:1,ubuntu:1,fedora:0	pass	-	hermetic	hermetic:pass	license-audit-csv	tempdir-drop
 audit-fix-flags	["audit","fix","--dry-run","--yes","--min-severity","high"]	read	1	pass	-	hermetic	hermetic:pass	audit-fix-refusal	tempdir-drop
 audit-export-flags	["audit","export","--framework","soc2","--period","2024-Q4","--output","${ROOT}/audit-evidence-flags"]	isolated-write	1	pass	-	hermetic	hermetic:pass	local:audit-export-flags	tempdir-drop
 run-parallel	["run","--parallel","parallel-one,parallel-two"]	read	0	pass	-	hermetic	hermetic:pass	parallel-tasks-executed	tempdir-drop
@@ -169,8 +169,8 @@ team-compliance-export	["team","compliance","--export","${ROOT}/compliance.json"
 team-compliance-enforce	["team","compliance","--enforce"]	read	0	pass	team-init	hermetic	hermetic:pass	local:team-compliance-enforce	tempdir-drop
 enterprise-reports-type	["enterprise","reports","--report-type","quarterly"]	controlled-error	1	pass	-	hermetic	hermetic:pass	local:enterprise-reports-type	tempdir-drop
 enterprise-policy-scope	["enterprise","policy","show","--scope","global"]	controlled-error	1	pass	-	hermetic	hermetic:pass	local:enterprise-policy-scope	tempdir-drop
-enterprise-audit-export-flags	["enterprise","audit-export","--framework","iso27001","--period","2025-Q1","--output","./enterprise-evidence-flags"]	isolated-write	arch:0,debian:1,ubuntu:1,fedora:1	pass	-	hermetic	hermetic:pass	enterprise-audit-export-evidence	tempdir-drop
-enterprise-license-scan-export	["enterprise","license-scan","--export","json"]	read	arch:0,debian:1,ubuntu:1,fedora:1	pass	-	hermetic	hermetic:pass	license-enterprise-json	tempdir-drop
+enterprise-audit-export-flags	["enterprise","audit-export","--framework","iso27001","--period","2025-Q1","--output","./enterprise-evidence-flags"]	isolated-write	arch:0,debian:1,ubuntu:1,fedora:0	pass	-	hermetic	hermetic:pass	enterprise-audit-export-evidence	tempdir-drop
+enterprise-license-scan-export	["enterprise","license-scan","--export","json"]	read	arch:0,debian:1,ubuntu:1,fedora:0	pass	-	hermetic	hermetic:pass	license-enterprise-json	tempdir-drop
 history-flags	["history","--limit","3","--search","pacman","--type","install","--from","2024-01-01","--to","2026-12-31"]	read	0	pass	-	hermetic	hermetic:pass	local:history-flags	tempdir-drop
 rollback-yes	["rollback","--yes"]	controlled-error	1	pass	-	hermetic	hermetic:pass	local:rollback-yes	tempdir-drop
 release-package-search-tree	["search","tree"]	read	0	pass	-	container	arch:pass,debian:pass,ubuntu:pass,fedora:known-defect	search-official-tree-output	none

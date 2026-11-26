@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare OMG license reports with the guest's installed ALPM database.
+"""Compare OMG license reports with the guest's native installed packages.
 
 ALPM local desc field semantics: https://man.archlinux.org/man/alpm-db-desc.5.en
 Independent installed-state query: https://man.archlinux.org/man/pacman.8.en
@@ -88,6 +88,26 @@ def native_packages(db=LOCAL_DB):
         pacman[parts[0]] = parts[1]
     require({name: version for name, (version, _) in packages.items()} == pacman,
             "ALPM desc inventory disagrees with pacman -Q")
+    return {(name, version): licenses for name, (version, licenses) in packages.items()}
+
+
+def native_fedora_packages():
+    query = r"%{NAME}\t%{EPOCHNUM}\t%{VERSION}-%{RELEASE}\t%{ARCH}\t%{LICENSE}\n"
+    result = subprocess.run(["rpm", "-qa", "--qf", query], check=True, capture_output=True,
+                            text=True, timeout=30, env=dict(os.environ, LC_ALL="C"))
+    packages = {}
+    for line in result.stdout.split("\n"):
+        if not line:
+            continue
+        name, epoch, release, architecture, license_value = line.split("\t", 4)
+        if name == "gpg-pubkey" and architecture in ("", "(none)"):
+            continue
+        require(name and epoch.isascii() and epoch.isdecimal() and release
+                and architecture not in ("", "(none)"), "malformed RPM package identity")
+        key = (f"{name}.{architecture}", f"{epoch}:{release}")
+        require(key not in packages, f"duplicate installed RPM package: {key}")
+        packages[key] = [license_value] if license_value.strip() and license_value != "(none)" else []
+    require(bool(packages), "RPM inventory is empty")
     return packages
 
 
@@ -200,7 +220,7 @@ def unresolved_review(licenses):
 
 def expected_audit(packages, mit_only=False, csv_safe=False):
     rows = {}
-    for name, (version, licenses) in packages.items():
+    for (name, version), licenses in packages.items():
         if mit_only:
             tokens = re.split(r"[^A-Za-z0-9.+-]+", ", ".join(licenses).lower())
             if not any(token == "mit" or token == "mit+" or token.startswith("mit-")
@@ -208,11 +228,8 @@ def expected_audit(packages, mit_only=False, csv_safe=False):
                 continue
         license_value = ", ".join(licenses) if licenses else "Unknown"
         if csv_safe:
-            rows[spreadsheet_safe(name)] = (spreadsheet_safe(version),
-                                            spreadsheet_safe(license_value),
-                                            known_category(licenses), unresolved_review(licenses))
-        else:
-            rows[name] = (version, license_value, known_category(licenses), unresolved_review(licenses))
+            name, version, license_value = map(spreadsheet_safe, (name, version, license_value))
+        rows[name, version] = (license_value, known_category(licenses), unresolved_review(licenses))
     return rows
 
 
@@ -227,15 +244,15 @@ def compare_audit_rows(rows, expected):
         require(all(isinstance(value, str) and value for value in
                     (name, version, license_value, category)) and category in CATEGORIES,
                 "license report row has invalid values")
-        require(name not in observed, f"duplicate license report package: {name}")
-        expected_row = expected.get(name)
-        require(expected_row is not None, f"unexpected license report package: {name}")
-        if expected_row[2] is not None:
-            require(category == expected_row[2], f"wrong license category for {name}")
-        require(type(row["unresolved_review"]) is bool and row["unresolved_review"] == expected_row[3],
-                f"wrong unresolved review marker for {name}")
-        observed[name] = (version, license_value)
-    require(observed == {name: row[:2] for name, row in expected.items()},
+        key = (name, version)
+        require(key not in observed, f"duplicate license report package: {key}")
+        expected_row = expected.get(key)
+        require(expected_row is not None, f"unexpected license report package: {key}")
+        require(category == expected_row[1], f"wrong license category for {key}")
+        require(type(row["unresolved_review"]) is bool and row["unresolved_review"] == expected_row[2],
+                f"wrong unresolved review marker for {key}")
+        observed[key] = license_value
+    require(observed == {key: row[0] for key, row in expected.items()},
             "license report differs from native installed inventory")
 
 
@@ -255,7 +272,7 @@ def expected_enterprise(packages):
     counts = Counter()
     unknown = []
     violations = []
-    for name, (_, licenses) in packages.items():
+    for (name, _), licenses in packages.items():
         if not licenses:
             unknown.append(name)
         for license_value in licenses:
@@ -272,7 +289,7 @@ def expected_enterprise(packages):
 
 
 def expected_unresolved_assignments(packages):
-    return sorted((name, license_value) for name, (_, licenses) in packages.items()
+    return sorted((name, license_value) for (name, _), licenses in packages.items()
                   for license_value in licenses if advisory_assessment(license_value)[1])
 
 
@@ -353,7 +370,7 @@ def check(mode, path, packages, stderr=None):
             require(stderr is not None, "policy rejection stderr evidence is missing")
             regular(stderr)
             require(all(REJECT_POLICY.casefold() not in value.casefold()
-                        for _, licenses in packages.values() for value in licenses),
+                        for licenses in packages.values() for value in licenses),
                     "impossible policy license marker matches native inventory")
             expected = f"Error: License policy check found {len(packages)} violation(s)"
             require(stderr.read_text(encoding="utf-8").strip() == expected,
@@ -405,10 +422,12 @@ def check(mode, path, packages, stderr=None):
 
 
 def main():
-    require(len(sys.argv) == (4 if len(sys.argv) > 1 and sys.argv[1] == "audit-mit-json" else 3),
-            "usage: qemu-license-oracle.py MODE PATH [PATH_STDERR for audit-mit-json]")
-    check(sys.argv[1], Path(sys.argv[2]), native_packages(),
-          Path(sys.argv[3]) if len(sys.argv) == 4 else None)
+    require(len(sys.argv) >= 4, "usage: qemu-license-oracle.py DISTRO MODE PATH [PATH_STDERR]")
+    distro, mode, report, *diagnostic = sys.argv[1:]
+    require(distro in ("arch", "fedora"), f"unknown license oracle distro: {distro}")
+    require(len(diagnostic) == int(mode == "audit-mit-json"), "incorrect diagnostic arguments")
+    packages = native_fedora_packages() if distro == "fedora" else native_packages()
+    check(mode, Path(report), packages, Path(diagnostic[0]) if diagnostic else None)
 
 
 if __name__ == "__main__":

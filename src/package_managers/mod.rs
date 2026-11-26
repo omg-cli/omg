@@ -6,6 +6,9 @@
 
 use std::sync::Arc;
 
+use crate::core::env::distro::Distro;
+use types::SecurityPackage;
+
 #[cfg(feature = "arch")]
 pub mod alpm_direct;
 #[cfg(feature = "arch")]
@@ -621,6 +624,34 @@ pub fn resolve_backend() -> anyhow::Result<Backend> {
         CompiledBackends::current(),
         test_mode,
     )
+}
+
+/// Read installed identities and licenses from the selected native database.
+pub(crate) async fn collect_compliance_inventory() -> anyhow::Result<(Distro, Vec<SecurityPackage>)>
+{
+    use anyhow::Context as _;
+
+    tokio::task::spawn_blocking(|| match resolve_backend()? {
+        #[cfg(feature = "fedora")]
+        Backend::Fedora => Ok((
+            Distro::Fedora,
+            DnfPackageManager::new().installed_compliance_inventory()?,
+        )),
+        #[cfg(feature = "arch")]
+        Backend::Arch | Backend::Mock => Ok((Distro::Arch, alpm_direct::security_inventory()?)),
+        backend => {
+            anyhow::bail!("Native installed compliance inventory is unavailable for {backend:?}")
+        }
+    })
+    .await
+    .context("Installed inventory worker failed")?
+}
+
+pub(crate) fn inventory_package_name(package: &SecurityPackage, distro: Distro) -> String {
+    match (distro, package.architecture.as_deref()) {
+        (Distro::Fedora, Some(architecture)) => format!("{}.{architecture}", package.name),
+        _ => package.name.clone(),
+    }
 }
 
 /// Get the appropriate package manager for the current distribution.

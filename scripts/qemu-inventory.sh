@@ -1585,9 +1585,9 @@ check_file_output_oracle() {
         fi
       done < <(find man -maxdepth 1 -type f -name 'omg*.1' -print) ;;
     enterprise-audit-export-evidence)
-      if [[ "$distro" != arch ]]; then
+      if [[ "$distro" != arch && "$distro" != fedora ]]; then
         if [[ "$code" != 1 || -e enterprise-evidence-flags || -L enterprise-evidence-flags ]] \
-          || ! grep -Fq 'Installed-package export requires the Arch package backend' "$stderr"; then
+          || ! grep -Fxq 'Error: Native installed compliance inventory is unavailable for Debian' "$stderr"; then
           printf 'assertion failed: unsupported enterprise export left evidence behind\n' >&2
           return 1
         fi
@@ -1758,13 +1758,10 @@ check_product_output() {
   fi
   if [[ "$assertion" == license-* ]]; then
     local mode=${assertion#license-} report=$stdout
-    if [[ "$distro" != arch ]]; then
-      local refusal='Error: License scanning of installed packages is not available without the Arch backend'
-      [[ "$mode" != enterprise-* ]] || refusal='Error: Enterprise license scan requires the Arch package backend'
-      local allowed_output='^[[:space:]]*$'
-      [[ "$mode" != audit-csv ]] || allowed_output+='|^OMG Scanning installed packages for license information\.\.\.$'
+    if [[ "$distro" != arch && "$distro" != fedora ]]; then
+      local refusal='Error: Native installed compliance inventory is unavailable for Debian'
       if [[ "$code" != 1 || $(cat "$stderr") != "$refusal" ]] \
-        || grep -Ev "$allowed_output" "$stdout" >/dev/null \
+        || grep -q '[^[:space:]]' "$stdout" \
         || [[ -e licenses-export.csv || -L licenses-export.csv ]] \
         || compgen -G 'license-scan-*' >/dev/null; then
         printf 'assertion failed: unsupported license backend must refuse without a report or export\n' >&2; return 1
@@ -1772,7 +1769,7 @@ check_product_output() {
     else
       local expected_code=0
       [[ "$mode" != audit-mit-json ]] || expected_code=1
-      [[ "$code" == "$expected_code" ]] || { printf 'assertion failed: Arch license scan returned the wrong status\n' >&2; return 1; }
+      [[ "$code" == "$expected_code" ]] || { printf 'assertion failed: native license scan returned the wrong status\n' >&2; return 1; }
       if [[ "$mode" == audit-csv ]]; then
         report=licenses-export.csv
       elif [[ "$mode" == enterprise-json ]]; then
@@ -1782,9 +1779,9 @@ check_product_output() {
         report=${exports[0]}
       fi
       if [[ "$mode" == audit-mit-json ]]; then
-        python3 qemu-license-oracle.py "$mode" "$report" "$stderr" || return 1
+        python3 qemu-license-oracle.py "$distro" "$mode" "$report" "$stderr" || return 1
       else
-        python3 qemu-license-oracle.py "$mode" "$report" || return 1
+        python3 qemu-license-oracle.py "$distro" "$mode" "$report" || return 1
       fi
     fi
   fi
@@ -2563,7 +2560,7 @@ while IFS=$'\t' read -r id aj s e u r t tg a cleanup; do
       jq -e '. == ["enterprise","audit-export","--output","${ROOT}/enterprise-evidence"]' <<< "$aj" >/dev/null || exit 2 ;;
     enterprise-audit-export-flags)
       [[ "$a" == enterprise-audit-export-evidence && "$s" == isolated-write
-        && "$e" == 'arch:0,debian:1,ubuntu:1,fedora:1' ]] || exit 2
+        && "$e" == 'arch:0,debian:1,ubuntu:1,fedora:0' ]] || exit 2
       jq -e '. == ["enterprise","audit-export","--framework","iso27001","--period","2025-Q1","--output","./enterprise-evidence-flags"]' <<< "$aj" >/dev/null || exit 2 ;;
     team-compliance-export)
       [[ ( "$a" == team-compliance-no-report || "$a" == local:team-compliance-export ) && "$s" == controlled-error && "$resolved" == 1 && "$r" == team-init ]] || exit 2
@@ -3053,7 +3050,7 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   if [[ "$assertions" == license-* ]]; then
     remote+="; printf '%s' $license_oracle > qemu-license-oracle.py"
     if [[ "$assertions" == license-audit-mit-json ]]; then
-      if [[ "$distro" == arch ]]; then
+      if [[ "$distro" == arch || "$distro" == fedora ]]; then
         remote+="; [[ \$(id -u) != 0 ]] || { printf 'assertion failed: license policy fixture requires an unprivileged guest user\n' >&2; exit 2; }"
       fi
       remote+="; export OMG_CONFIG_DIR=\"\$rowdir/license-policy\"; mkdir -p \"\$OMG_CONFIG_DIR\"; : > \"\$OMG_CONFIG_DIR/config.toml\"; printf '%s\n' 'allowed_licenses = [\"LicenseRef-QemuNoInstalledLicense\"]' > \"\$OMG_CONFIG_DIR/policy.toml\""

@@ -1148,7 +1148,7 @@ pub enum AuditCommands {
         #[command(flatten)]
         certificate_identity: SlsaCertificateIdentity,
     },
-    /// Scan installed package licenses (Arch backend only)
+    /// Scan installed package licenses on Arch and Fedora
     Licenses {
         /// Output format (table, json, csv)
         #[arg(short, long, value_enum, default_value_t = LicenseOutputFormat::Table)]

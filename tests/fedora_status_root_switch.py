@@ -7918,6 +7918,153 @@ env.OMG_FIXTURE_TASK = "changed"
                     checked(["/usr/bin/umount", database])
         verify("native-inventory-unchanged", checked(query) == native_before)
 
+    def inspect_audit_licenses():
+        import csv
+        import io
+
+        phase = "audit-license-inventory"
+        query = [rpm, "--root", alternate, "-qa", "--qf",
+                 r"%{NAME}\t%{EPOCHNUM}\t%{VERSION}-%{RELEASE}\t%{ARCH}\t%{LICENSE}\n"]
+        before = checked(query)
+        name, epoch, release, architecture, license = before.rstrip("\n").split("\t")
+        assert license == "MIT", before
+        identity = f"{name}.{architecture}"
+        version = f"{epoch}:{release}"
+        row = dict(name=identity, version=version, license=license, category="Permissive",
+                   unresolved_review=False)
+        csv_header = ["Package", "Version", "License", "Category", "UnresolvedReview"]
+        csv_row = [identity, version, license, "Permissive", "false"]
+
+        def verify(case, passed, **details):
+            checks.append(dict(phase=phase, case=case, passed=bool(passed), **details))
+
+        def parse_json(text):
+            try:
+                return json.loads(text)
+            except ValueError:
+                return None
+
+        def matches_report(format, report, visible):
+            if format == "json":
+                return parse_json(report) == ([row] if visible else [])
+            if format == "csv":
+                return list(csv.reader(io.StringIO(report))) == [csv_header, *([csv_row] if visible else [])]
+            if format == "table":
+                return ("License Summary" in report and (identity in report) == visible
+                        and f"Permissive: {int(visible)}" in report)
+            raise AssertionError(format)
+
+        with tempfile.TemporaryDirectory(prefix="audit-license-inventory-", dir=work) as directory:
+            scope = Path(directory)
+            os.chown(scope, account.pw_uid, account.pw_gid)
+            mode = dict(disabled, HOME=str(scope), OMG_CONFIG_DIR=str(scope))
+            audit = [cli, "audit", "licenses"]
+            with reject_native_selection("-qa", executable=rpm):
+                for format in ("json", "csv", "table"):
+                    for label, filters, visible in (
+                        ("all", [], True),
+                        ("exact", ["--filter", "mit"], True),
+                        ("list", ["--filter", "Apache-2.0, MIT"], True),
+                        ("nonmatch", ["--filter", "Apache-2.0"], False),
+                    ):
+                        result = command([*audit, "--format", format, *filters], mode, ordinary)
+                        verify(f"{format}-{label}", result.returncode == 0 and not result.stderr
+                               and matches_report(format, result.stdout, visible),
+                               status=result.returncode, diagnostic=result.stderr[-600:])
+
+                policy = scope / "policy.toml"
+                policy.write_text('allowed_licenses = ["MIT"]\n')
+                os.chown(policy, account.pw_uid, account.pw_gid)
+                policy.chmod(0o600)
+                for format in ("json", "csv", "table"):
+                    result = command([*audit, "--format", format, "--check-policy"], mode, ordinary)
+                    verify(f"{format}-allows-verified-license", result.returncode == 0
+                           and not result.stderr and matches_report(format, result.stdout, True)
+                           and (format != "table" or "Policy checked all 1 installed packages." in result.stdout),
+                           status=result.returncode, diagnostic=result.stderr[-600:])
+
+                policy.write_text('allowed_licenses = ["Apache-2.0"]\n')
+                for format in ("json", "csv", "table"):
+                    for label, filters, visible in (
+                        ("visible", ["--filter", "MIT"], True),
+                        ("hidden", ["--filter", "Apache-2.0"], False),
+                    ):
+                        result = command([*audit, "--format", format, "--check-policy", *filters], mode, ordinary)
+                        display = (result.stdout.split("Packages", 1)[-1]
+                                   if format == "table" else result.stdout)
+                        correct_table = ("Policy checked all 1 installed packages." in result.stdout
+                                         and f"{identity} ({license}) - Not in allowed list" in result.stdout
+                                         and (identity in display) == visible)
+                        expected_report = correct_table if format == "table" else matches_report(
+                            format, result.stdout, visible)
+                        verify(f"{format}-denies-{label}", result.returncode == 1 and expected_report
+                               and "License policy check found 1 violation(s)" in result.stderr,
+                               status=result.returncode, diagnostic=result.stderr[-600:])
+
+                for format in ("json", "csv", "table"):
+                    for label, options, status in (
+                        ("export", [], 0),
+                        ("export-policy-refusal",
+                         ["--check-policy", "--filter", "Apache-2.0"], 1),
+                    ):
+                        path = scope / f"license-{label}.{format}"
+                        path.write_text("superseded report")
+                        os.chown(path, account.pw_uid, account.pw_gid)
+                        path.chmod(0o644)
+                        result = command([*audit, "--format", format, "--export", path, *options],
+                                         mode, ordinary)
+                        verify(f"{format}-{label}-status", result.returncode == status
+                               and (not result.stderr if status == 0 else
+                                    "License policy check found 1 violation(s)" in result.stderr),
+                               status=result.returncode, diagnostic=result.stderr[-600:])
+                        verify(f"{format}-{label}-private", path.is_file()
+                               and path.stat().st_uid == account.pw_uid
+                               and stat.S_IMODE(path.stat().st_mode) == 0o600)
+                        artifact = path.read_text() if path.is_file() else ""
+                        if format == "table":
+                            header = "Package\tVersion\tLicense\tCategory\tUnresolvedReview\n"
+                            correct = artifact == header + ("\t".join(csv_row) + "\n" if status == 0 else "")
+                        else:
+                            correct = matches_report(format, artifact, status == 0)
+                        verify(f"{format}-{label}-content", correct, output=artifact[-350:])
+
+                for format in ("json", "csv", "table"):
+                    with open("/dev/full", "wb") as sink:
+                        result = subprocess.run([str(cli), "audit", "licenses", "--format", format],
+                                                cwd=scope, stdin=subprocess.DEVNULL, stdout=sink,
+                                                stderr=subprocess.PIPE, text=True, env=mode,
+                                                timeout=30, **ordinary)
+                    verify(f"{format}-stdout-failure", result.returncode == 1
+                           and "No space left on device" in result.stderr
+                           and "panicked" not in result.stderr,
+                           status=result.returncode, diagnostic=result.stderr[-600:])
+
+                result = command([*audit, "--help"], mode, ordinary)
+                verify("help-names-supported-backends", result.returncode == 0
+                       and "Fedora" in result.stdout and "Arch" in result.stdout)
+                result = command([*audit, "--format", "xml"], mode, ordinary)
+                verify("unsupported-format", result.returncode == 2 and not result.stdout
+                       and "invalid value 'xml'" in result.stderr, status=result.returncode)
+
+                db_path = Path(checked([rpm, "--root", alternate, "--eval", "%{_dbpath}"]).strip())
+                database = alternate / db_path.relative_to("/") / "rpmdb.sqlite"
+                invalid = scope / "invalid-inventory.sqlite"
+                with closing(sqlite3.connect(invalid)) as db:
+                    db.execute("CREATE TABLE Unrelated (name TEXT)")
+                invalid.chmod(0o644)
+                checked(["/usr/bin/mount", "--bind", invalid, database])
+                try:
+                    for format, options in (("json", []), ("csv", ["--export", "invalid.csv"])):
+                        result = command([*audit, "--format", format, *options], mode, ordinary)
+                        verify(f"{format}-invalid-inventory", result.returncode == 1
+                               and "no such table: Packages" in result.stderr
+                               and (format != "json" or not result.stdout)
+                               and not (scope / "invalid.csv").exists(),
+                               status=result.returncode, diagnostic=result.stderr[-600:])
+                finally:
+                    checked(["/usr/bin/umount", database])
+        verify("native-inventory-unchanged", checked(query) == before)
+
     def inspect_dashboard_terminal():
         import pty
         import select
@@ -9037,6 +9184,7 @@ exec {shlex.quote(str(binary))} "$@"
                 inspect("switched-alternate", 1, 1, fixture_explicit=True)
                 if consent_oracle is not None:
                     inspect_enterprise_inventory()
+                    inspect_audit_licenses()
                     inspect_info_attempts()
                     inspect_info_json_writes()
                     inspect_dashboard_terminal()
@@ -9369,6 +9517,6 @@ mark_progress("completed with host inventory unchanged")
 report = dict(binaries=binaries, checks=checks, total=len(checks),
               passed=sum(entry["passed"] for entry in checks), host_unchanged=True)
 print(json.dumps(report))
-expected_checks = 303 if consent_oracle is None else 2964
+expected_checks = 303 if consent_oracle is None else 3011
 if report["passed"] != report["total"] or report["total"] != expected_checks:
     sys.exit(4)
