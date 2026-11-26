@@ -12,6 +12,23 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class ReleaseRecipeAlignment(unittest.TestCase):
+    def test_release_staging_pins_match_the_ci_and_tagged_builds(self):
+        workflows = ROOT / '.github/workflows'
+        ci = (workflows / 'ci.yml').read_text(encoding='utf-8')
+        tagged = (workflows / 'release.yml').read_text(encoding='utf-8')
+        matrix = job_block(ci, 'linux-matrix')
+        for distro, image in BUILD.RELEASE_IMAGES.items():
+            with self.subTest(distro=distro):
+                tagged_job = job_block(tagged, 'build-' + distro)
+                if distro == 'ubuntu':
+                    self.assertIn('runs-on: ' + image, tagged_job)
+                    self.assertIn('--image ' + image, job_block(ci, 'ubuntu'))
+                else:
+                    self.assertTrue({f'    container: {image}', f'      image: {image}'}
+                                    & set(tagged_job.splitlines()), 'tagged build image or digest differs')
+                    self.assertIn('- platform: ' + distro + '\n            image: ' + image, matrix)
+                self.assertIn('--features ' + BUILD.FEATURES[distro] + ' --locked', tagged_job)
+
     def test_native_tests_run_before_release_builds(self):
         ci = job_block((ROOT / '.github/workflows/ci.yml').read_text(encoding='utf-8'), 'linux-matrix')
         for preparation in ('Install nextest', 'Verify nextest', 'Prepare genuine Node activation fixture'):
