@@ -16,6 +16,7 @@ import tarfile
 import tempfile
 import time
 import unittest
+from contextlib import redirect_stdout
 from unittest.mock import patch
 
 
@@ -304,6 +305,59 @@ class HostedProducer(unittest.TestCase):
                              'fresh-one\t0\nfresh-two\t0\n' + ''.join(
                                  stage + '\t0\n' for stage in PRODUCER.SIGNED_DECODER_STAGES))
             self.assertEqual(result.stderr, '')
+
+    @unittest.skipUnless(sys.platform == 'linux', 'Requires POSIX Bash background jobs')
+    def test_fresh_admission_overlaps_native_harness_and_keeps_its_exit_status(self):
+        artifacts = {role: {'sha256': 'a' * 64} for role in PRODUCER.ROLES}
+        script = PRODUCER.guest_script(artifacts, '/workspace/target/debug/omg')
+        registry = script.index('for role in ' + ' '.join(PRODUCER.HARNESSES) + '; do')
+        start = script.index('\ndone\n', registry) + len('\ndone\n')
+        harness = script.index("while IFS=$'\\t' read -r stage role name; do", start)
+        end_harness = script.index('done < /evidence/cli/expected-tests.tsv\n', harness)
+        end_harness += len('done < /evidence/cli/expected-tests.tsv\n')
+        end = script.index('for flags in q v vv vvv;', end_harness)
+        fake_harness = r'''
+for ((attempt=0; attempt<100; attempt++)); do
+  if test -f "$SYNC/started"; then break; fi
+  sleep .01
+done
+test -f "$SYNC/started" || { echo 'admission did not overlap the harness' >&2; exit 41; }
+: > "$SYNC/harness-ran"
+'''
+        segment = script[start:harness] + fake_harness + script[end_harness:end]
+        for status in (0, 23):
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as directory:
+                stub = Path(directory) / 'unshare'
+                stub.write_text('''#!/usr/bin/env python3
+import os, signal, sys, time
+from pathlib import Path
+
+sync = Path(os.environ['SYNC'])
+(sync / 'started').touch()
+for _ in range(100):
+    if (sync / 'harness-ran').exists():
+        break
+    time.sleep(.01)
+else:
+    sys.exit(42)
+if (signal.getsignal(signal.SIGINT) != signal.default_int_handler
+        or signal.getsignal(signal.SIGQUIT) != signal.SIG_DFL):
+    sys.exit('Background admission inherited ignored terminal signals')
+(sync / 'admission-finished').touch()
+sys.exit(int(os.environ['ADMISSION_STATUS']))
+''')
+                stub.chmod(0o755)
+                result = subprocess.run(
+                    [BASH, '-euo', 'pipefail', '-c',
+                     segment.replace('/evidence/cli/fresh-admission.json',
+                                            '"$SYNC/admission.json"')
+                     + 'test -f "$SYNC/admission-finished"\n: > "$SYNC/later-phase"\n'],
+                    env=dict(os.environ, SYNC=directory, ADMISSION_STATUS=str(status),
+                             PATH=f'{directory}{os.pathsep}{os.environ["PATH"]}'),
+                    capture_output=True, text=True, timeout=5)
+                self.assertEqual(result.returncode, status, result.stderr)
+                self.assertTrue((Path(directory) / 'admission-finished').exists())
+                self.assertEqual((Path(directory) / 'later-phase').exists(), status == 0)
 
     def test_generated_cli_identity_preserves_literal_template_words(self):
         artifacts = {role: {'sha256': 'a' * 64} for role in PRODUCER.ROLES}
@@ -2174,6 +2228,20 @@ class FreshAdmissionFixture(unittest.TestCase):
                 row, = [item for item in candidate['cases'] if item['name'] == 'repository-decline-signing-key']
                 row.update(change)
                 PRODUCER.validate_fresh_admission(candidate, 'a' * 64)
+
+    def test_failed_native_matrix_publishes_receipt_and_keeps_nonzero_exit(self):
+        receipt = fresh_admission_receipt()
+        receipt['status'] = 'FAIL'
+        receipt['cases'][0]['status'] = 'FAIL'
+        receipt['cases'][0]['failure'] = 'Prepared repository state differed'
+        output = io.StringIO()
+        arguments = ['native-cli-coverage.py', 'fresh-admission-fixture',
+                     '--owner', '/opt/omg-coverage-fresh-test', '--cli', '/omg-extra-bin/cli']
+        with patch.object(PRODUCER.sys, 'argv', arguments), redirect_stdout(output), \
+             patch.object(PRODUCER, 'run_fresh_admission_fixture', return_value=receipt):
+            with self.assertRaisesRegex(ValueError, 'Native fresh admission matrix failed'):
+                PRODUCER.main()
+        self.assertEqual(json.loads(output.getvalue()), receipt)
 
     def test_native_matrix_refuses_an_ordinary_process_before_creating_fixtures(self):
         with patch.object(PRODUCER.os, 'geteuid', return_value=1000), \

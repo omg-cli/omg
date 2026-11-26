@@ -249,7 +249,7 @@ jobs:
           export OMG_DATA_DIR="$state/data"
           export OMG_CONFIG_DIR="$state/config"
           export OMG_CACHE_DIR="$state/cache"
-          export OMG_NO_TELEMETRY=1
+          export OMG_DISABLE_TELEMETRY=1
           ./target/ci/omgd >"$state/omgd.log" 2>&1 &
           DAEMON_PID=$!
           for _ in $(seq 1 30); do

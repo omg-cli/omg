@@ -46,7 +46,7 @@ class ParallelChecksTests(unittest.TestCase):
         self.assertIn("github.event_name != 'push'", docs)
         self.assertIn("checks-required != 'true'", docs)
         self.assertIn('test_ci_change_scope.py', docs)
-        for job in ('portable', 'linux-matrix', 'ubuntu', 'macos', 'standalone-suites'):
+        for job in ('portable', 'linux-matrix', 'linux-arch', 'ubuntu', 'macos', 'standalone-suites'):
             header = job_block(source, job).split('    steps:', 1)[0]
             self.assertNotIn('workflow-checks', header)
         final = job_block(source, 'ci-success')

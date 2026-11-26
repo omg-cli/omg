@@ -176,7 +176,8 @@ def allowed_file(parts):
         return name in HOST_FILES
     if parent == ("native-evidence", "cli"):
         return name in {"tests.xml", "verification.json", "expected-tests.tsv", "passed.tsv",
-                        "process-checks.tsv", "db-before.txt", "db-after.txt", "identity.txt",
+                        "process-checks.tsv", "fresh-admission.json", "signed-decoders.json",
+                        "db-before.txt", "db-after.txt", "identity.txt",
                         "artifacts.sha256", "artifact-check.txt", "all-stages-pass.txt"} or re.fullmatch(
             r"(?:omarchy-(?:success|vendor-failure|unknown-signing-key|declined|optional-failures|migration-refusal|"
             r"unsupported-mode|invalid-transport|snapshot-missing|snapshot-unsupported|required-helper-missing|"

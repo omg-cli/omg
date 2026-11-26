@@ -19,7 +19,7 @@ if [[ ! -x "$OMG_BIN" ]]; then
 fi
 
 export OMG_DISABLE_DAEMON=1
-export OMG_NO_TELEMETRY=1
+export OMG_DISABLE_TELEMETRY=1
 export OMG_DATA_DIR="$(mktemp -d /tmp/omg-e2e-data.XXXXXX)"
 export OMG_CONFIG_DIR="$(mktemp -d /tmp/omg-e2e-config.XXXXXX)"
 export OMG_CACHE_DIR="$(mktemp -d /tmp/omg-e2e-cache.XXXXXX)"

@@ -896,7 +896,6 @@ def run_fresh_admission_fixture(owner, cli, names=None, profiles=None, decoder_c
         real_guest_database_unchanged=unchanged,
         complete_matrix=len(selected) == len(cases), coverage_acceptance=False)
     (owner / 'receipt.json').write_text(json.dumps(result, indent=2) + '\n')
-    require(result['status'] == 'PASS', 'Native fresh admission matrix failed; inspect per-case receipts')
     return result
 
 
@@ -2223,6 +2222,18 @@ for role in @@HARNESS_ROLES@@; do
   LLVM_PROFILE_FILE="/profiles/omg-extra-registry-$role-%p-%m.profraw" \
     /omg-extra-bin/"$role" --list --format terse > /evidence/cli/registry-"$role".txt 2>&1
 done
+# Keep the full consent timeout while the independent native harnesses run.
+# Bash otherwise starts background jobs with SIGINT and SIGQUIT ignored.
+env --default-signal=INT,QUIT unshare --mount --net --fork --kill-child bash -euo pipefail -c '
+  mount --make-rprivate /
+  mount -t tmpfs -o nosuid,nodev,mode=1777 tmpfs /var/tmp
+  ip link set lo up
+  test "$(ip -o link show | wc -l)" = 1
+  exec python3 /native-cli-coverage.py fresh-admission-fixture --owner /opt/omg-coverage-fresh-ci \
+    --cli /omg-extra-bin/cli --profiles /profiles
+' < /dev/null > /evidence/cli/fresh-admission.json &
+fresh_pid=$!
+trap 'wait "$fresh_pid" || true' EXIT
 while IFS=$'\t' read -r stage role name; do
   registry=/evidence/cli/registry-$role.txt
   test "$(grep -Fxc "$name: test" "$registry")" = 1
@@ -2270,6 +2281,10 @@ while IFS=$'\t' read -r stage role name; do
   fi
   printf '%s\t%s\t%s\tPASS\n' "$stage" "$role" "$name" >> /evidence/cli/passed.tsv
 done < /evidence/cli/expected-tests.tsv
+fresh_status=0
+wait "$fresh_pid" || fresh_status=$?
+trap - EXIT
+if (( fresh_status != 0 )); then exit "$fresh_status"; fi
 for flags in q v vv vvv; do
   ordinary env LLVM_PROFILE_FILE="/profiles/omg-extra-cli-$flags-%p-%m.profraw" \
     bash -c 'cd "$HOME/work"; test -z "${RUST_LOG+x}"; exec /omg-extra-bin/cli "-$1" config' bash "$flags" \
@@ -2356,8 +2371,6 @@ ordinary env LLVM_PROFILE_FILE='/profiles/omg-extra-daemon-%p-%m.profraw' RUST_L
   ' > /evidence/cli/daemon.log 2>&1
 printf 'daemon\t0\n' >> /evidence/cli/process-checks.tsv
 @@OMARCHY_CASE_BODY@@
-python3 /native-cli-coverage.py fresh-admission-fixture --owner /opt/omg-coverage-fresh-ci \
-  --cli /omg-extra-bin/cli --profiles /profiles > /evidence/cli/fresh-admission.json
 unshare --mount -- python3 /native-cli-coverage.py fresh-admission-fixture --owner /opt/omg-coverage-fresh-decoders \
   --cli /omg-extra-bin/cli --profiles /profiles --decoder-cases > /evidence/cli/signed-decoders.json
 python3 - <<'OMG_FRESH_STAGE_RECEIPTS'
@@ -2915,7 +2928,9 @@ def main():
                               unknown_app_signer=args.unknown_app_signer, foreign_package=args.foreign_package,
                               platform_keyring=args.platform_keyring)
     elif args.operation == 'fresh-admission-fixture':
-        print(json.dumps(run_fresh_admission_fixture(args.owner, args.cli, args.case, args.profiles, args.decoder_cases)))
+        receipt = run_fresh_admission_fixture(args.owner, args.cli, args.case, args.profiles, args.decoder_cases)
+        print(json.dumps(receipt))
+        require(receipt['status'] == 'PASS', 'Native fresh admission matrix failed; inspect per-case receipts')
     elif args.operation == 'verify-signed-fixture':
         print(json.dumps(verify_signed_fixture(args.owner, args.phase)))
     elif args.operation == 'verify-machine-identity-fixture':

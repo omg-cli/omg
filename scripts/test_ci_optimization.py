@@ -29,6 +29,12 @@ def step_script(workflow, name):
     return textwrap.dedent(step.split('        run: |\n', 1)[1])
 
 
+def coverage_report_script(name):
+    script = step_script('coverage.yml', name)
+    runner = 'scripts/run-coverage-report.sh'
+    return 'export -f cargo\n' + script.replace(runner, shlex.quote((ROOT / runner).as_posix()))
+
+
 class OptimizationContracts(unittest.TestCase):
     def test_native_qemu_cache_identity_binds_the_exact_reviewed_image(self):
         script = step_script('coverage.yml', 'Identify pinned native QEMU image cache')
@@ -644,8 +650,49 @@ git() { printf '%040d\\n' 1; }
                 if count == 1:
                     self.assertEqual(Path(result.stdout), deps / 'omg_lib-fixture0')
 
+    def test_report_reuses_only_a_current_profile_and_restores_raw_inputs(self):
+        runner = ROOT / 'scripts/run-coverage-report.sh'
+        cases = ((True, 'none', 0), (True, 'none', 23), (True, 'new', 0),
+                 (True, 'modified', 0), (True, 'late', 0), (False, 'none', 0))
+        for reused, change, exit_code in cases:
+            with self.subTest(reused=reused, change=change, exit_code=exit_code), \
+                    tempfile.TemporaryDirectory() as directory:
+                target = Path(directory) / 'target/llvm-cov-target'
+                target.mkdir(parents=True)
+                raw = target / 'sample.profraw'
+                raw.write_bytes(b'raw')
+                merged = target / 'omg.profdata'
+                merged.write_bytes(b'merged')
+                (target / 'omg-profraw-list').write_text(f'{raw.as_posix()}\n')
+                os.utime(raw, (1, 1))
+                os.utime(merged, (2, 2))
+                if change == 'new':
+                    (target / 'extra.profraw').write_bytes(b'new profile')
+                if change == 'modified':
+                    os.utime(raw, (3, 3))
+                exporter = '''
+                cargo() {
+                    test "$*" = 'llvm-cov report --lcov' || return 99
+                    if test -e "$RAW"; then printf 'raw visible'; else printf 'merged only'; fi
+                    if test "$CHANGE" = late; then printf 'new profile' > "${RAW%/*}/extra.profraw"; fi
+                    return "$REPORT_STATUS"
+                }
+                export -f cargo
+                bash "$REPORT_RUNNER" --lcov
+                '''
+                result = subprocess.run([BASH, '-e', '-c', textwrap.dedent(exporter)],
+                                        cwd=directory, text=True, capture_output=True, timeout=10,
+                                        env=dict(os.environ, COVERAGE_REUSE_MERGED_PROFILE=str(reused).lower(),
+                                                 REPORT_RUNNER=runner.as_posix(), RAW=raw.as_posix(),
+                                                 CHANGE=change, REPORT_STATUS=str(exit_code)))
+                self.assertEqual(result.returncode, 1 if change == 'late' else exit_code, result.stderr)
+                self.assertEqual(result.stdout, 'merged only' if reused and change in ('none', 'late') else 'raw visible')
+                self.assertEqual(raw.read_bytes(), b'raw')
+                self.assertEqual(merged.read_bytes(), b'merged')
+                self.assertEqual((target / 'extra.profraw').exists(), change in ('new', 'late'))
+
     def test_function_report_is_isolated_and_requires_nonempty_output(self):
-        script = step_script('coverage.yml', 'Generate function coverage evidence')
+        script = coverage_report_script('Generate function coverage evidence')
         exporter = """
         cargo() {
             test "$*" = 'llvm-cov report' || return 99
@@ -665,7 +712,7 @@ git() { printf '%040d\\n' 1; }
                     self.assertEqual((Path(directory) / 'coverage-functions.txt').read_text().strip(), 'audit.rs functions')
 
     def test_coverage_region_evidence_preserves_export_and_failure(self):
-        script = step_script('coverage.yml', 'Generate region evidence')
+        script = coverage_report_script('Generate region evidence')
         for export_status in (0, 23):
             with self.subTest(export_status=export_status), tempfile.TemporaryDirectory() as directory:
                 exporter = """
@@ -753,6 +800,10 @@ git() { printf '%040d\\n' 1; }
                     binary = root / 'omg'
                     binary.write_text(textwrap.dedent('''\
                         #!/usr/bin/env bash
+                        if [[ "${OMG_DISABLE_TELEMETRY:-}" != 1 ]]; then
+                            echo 'Smoke CLI ran without an explicit telemetry opt-out' >&2
+                            exit 1
+                        fi
                         printf 'omg %s\\n' "$*" >> "$CALLS"
                         case "$1" in
                           search) printf '%s\\n' "$2" ;;
@@ -766,6 +817,7 @@ git() { printf '%040d\\n' 1; }
                     if ready:
                         args.append('--metadata-ready')
                     result = subprocess.run(args, cwd=root, env=dict(os.environ, CALLS=str(calls),
+                                            OMG_TELEMETRY='1', OMG_DISABLE_TELEMETRY='0',
                                             PATH=f'{root}{os.pathsep}{os.environ["PATH"]}'),
                                             capture_output=True, text=True, timeout=10)
                     self.assertEqual(result.returncode, 0, result.stderr)
@@ -773,6 +825,10 @@ git() { printf '%040d\\n' 1; }
                     expected = ['omg --version'] + ([] if ready else [refresh])
                     expected += [search, f'omg info {package}', 'omg status', 'omg outdated --json', 'omg doctor']
                     self.assertEqual(calls.read_text().splitlines(), expected)
+
+    def test_distro_systemd_smoke_disables_runtime_telemetry(self):
+        lifecycle = step_script('distro-e2e.yml', 'Verify omgd lifecycle and socket IPC on real systemd host')
+        self.assertIn('export OMG_DISABLE_TELEMETRY=1\n', lifecycle)
 
     def test_region_artifact_survives_downstream_comparison_failure_with_short_retention(self):
         text = (WORKFLOWS / 'coverage.yml').read_text()
@@ -1096,7 +1152,7 @@ class CoverageProducerDiagnosticsTests(unittest.TestCase):
           test "$EXPORT_STATUS" = 0 || return "$EXPORT_STATUS"
           cp export.json coverage-regions.json
         };\n'''
-        script = step_script('coverage.yml', 'Generate region evidence')
+        script = coverage_report_script('Generate region evidence')
         text = (WORKFLOWS / 'coverage.yml').read_text()
         if '      - name: Validate local coverage evidence\n' in text:
             script += step_script('coverage.yml', 'Validate local coverage evidence')
