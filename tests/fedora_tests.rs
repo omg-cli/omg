@@ -1914,6 +1914,40 @@ mod dnf_integration {
             .collect::<Result<Vec<_>>>()?;
         cli.sort();
         assert_eq!(cli, expected, "CLI outdated JSON differs from native DNF");
+
+        let native_preview = std::process::Command::new("dnf")
+            .env("LC_ALL", "C")
+            .args([
+                "--cacheonly",
+                "--color=never",
+                "--setopt=assumeyes=false",
+                "--assumeno",
+                "upgrade",
+            ])
+            .output()?;
+        let native_plan = std::str::from_utf8(&native_preview.stdout)?.trim_end();
+        let diagnostics = std::str::from_utf8(&native_preview.stderr)?;
+        anyhow::ensure!(
+            native_preview.status.success()
+                || native_preview.status.code() == Some(1)
+                    && diagnostics
+                        .trim_end()
+                        .ends_with("Operation aborted by the user."),
+            "native DNF upgrade preview failed: {diagnostics}"
+        );
+        anyhow::ensure!(!native_plan.is_empty(), "native DNF upgrade plan is empty");
+        let preview = std::process::Command::new(assert_cmd::cargo::cargo_bin!("omg"))
+            .args(["update", "--dry-run", "--yes"])
+            .env("NO_COLOR", "1")
+            .output()?;
+        assert!(
+            preview.status.success(),
+            "{}",
+            String::from_utf8_lossy(&preview.stderr)
+        );
+        let stdout = std::str::from_utf8(&preview.stdout)?;
+        assert!(stdout.contains(native_plan), "{stdout}");
+        assert!(stdout.contains("No changes made (dry run)"), "{stdout}");
         Ok(())
     }
 

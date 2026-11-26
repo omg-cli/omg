@@ -2920,6 +2920,10 @@ impl DnfPackageManager {
         Self::preview_declined_transaction(["--cacheonly", "autoremove"]).await
     }
 
+    pub(crate) async fn preview_cached_upgrade() -> Result<(String, String)> {
+        Self::preview_declined_transaction(["--cacheonly", "upgrade"]).await
+    }
+
     pub(crate) async fn preview_install(packages: &[String]) -> Result<(String, String)> {
         Self::validate_install_selectors(packages)?;
         Self::preview_declined_transaction(

@@ -293,7 +293,7 @@ async fn confirm_proceed_with_upgrade() -> Result<bool> {
 ///
 /// Download sizes are unknown without resolving dependencies, so none are
 /// claimed.
-/// Also used by Fedora and Homebrew when included in an additive build.
+/// Also used by Homebrew when included in an additive build.
 pub(crate) fn update_official_only_dry_run(updates: &[UpdateInfo]) -> Result<()> {
     updates
         .iter()
