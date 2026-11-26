@@ -689,6 +689,39 @@ mod snapshot_contracts {
         assert_eq!(before, after, "dry run must not rewrite the snapshot file");
     }
 
+    #[test]
+    fn restore_rejects_invalid_plan_entries_before_applying() {
+        let project = TestProject::new();
+        let id = create_snapshot(&project, "base");
+        let path = project.data_dir.path().join(format!("snapshots/{id}.json"));
+        let clean: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).expect("snapshot bytes")).expect("snapshot");
+
+        for (key, value, diagnostic) in [
+            (
+                "packages",
+                serde_json::json!(["two words"]),
+                "Invalid snapshot package targets",
+            ),
+            (
+                "runtimes",
+                serde_json::json!({"unknown-tool": "1.2.3"}),
+                "Unsupported runtime 'unknown-tool'",
+            ),
+        ] {
+            let mut snapshot = clean.clone();
+            snapshot["state"][key] = value;
+            fs::write(&path, serde_json::to_string(&snapshot).unwrap()).expect("write snapshot");
+
+            for flag in ["--dry-run", "--yes"] {
+                let result = project.run(&["snapshot", "restore", &id, flag]);
+                result.assert_failure();
+                assert!(result.stderr.contains(diagnostic), "{}", result.stderr);
+                assert!(!result.stdout.contains("Applying changes"));
+            }
+        }
+    }
+
     /// Contract: a non-interactive restore with pending package changes
     /// refuses to act, exits non-zero, and points at `--yes` as the remedy.
     #[test]

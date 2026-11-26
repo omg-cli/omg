@@ -1733,12 +1733,7 @@ omg migrate import my-setup.json --dry-run
 omg migrate import my-setup.json
 ```
 
-**Manifest includes:**
-
-- All installed packages with versions
-- Runtime versions
-- Configuration settings
-- Automatic package name mapping between distros
+The manifest records names of explicitly installed system packages and versions of active OMG-managed runtimes. Import shows known package renames and keeps the original name for other packages. The dry run validates runtime identifiers and package selectors. The target package manager resolves availability and versions during installation.
 
 ---
 

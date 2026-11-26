@@ -2,6 +2,7 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::PathBuf;
 
@@ -262,18 +263,35 @@ pub async fn restore(id: &str, dry_run: bool, yes: bool) -> Result<()> {
     // Capture current state
     let current = EnvironmentState::capture().await?;
 
-    // Calculate diff
-    println!("  {}", style::emphasis("Changes to apply:"));
-    println!();
-
-    // Runtime changes
     let mut runtime_changes = Vec::new();
     for (runtime, target_ver) in &snapshot.state.runtimes {
+        crate::cli::runtimes::validate_restore_version(runtime, target_ver).with_context(|| {
+            format!(
+                "Invalid snapshot runtime '{}'",
+                style::sanitize_terminal_text(runtime)
+            )
+        })?;
         let current_ver = current.runtimes.get(runtime);
         if current_ver != Some(target_ver) {
             runtime_changes.push((runtime.clone(), current_ver.cloned(), target_ver.clone()));
         }
     }
+
+    let current_pkgs: BTreeSet<_> = current.packages.iter().collect();
+    let target_pkgs: BTreeSet<_> = snapshot.state.packages.iter().collect();
+    let to_install: Vec<String> = target_pkgs
+        .difference(&current_pkgs)
+        .map(|s| (*s).clone())
+        .collect();
+    let to_remove: Vec<String> = current_pkgs
+        .difference(&target_pkgs)
+        .map(|s| (*s).clone())
+        .collect();
+    crate::cli::packages::validate_install_request(&to_install, false)
+        .context("Invalid snapshot package targets")?;
+
+    println!("  {}", style::emphasis("Changes to apply:"));
+    println!();
 
     if !runtime_changes.is_empty() {
         println!("  Runtimes:");
@@ -288,19 +306,6 @@ pub async fn restore(id: &str, dry_run: bool, yes: bool) -> Result<()> {
         }
         println!();
     }
-
-    // Package changes
-    let current_pkgs: std::collections::HashSet<_> = current.packages.iter().collect();
-    let target_pkgs: std::collections::HashSet<_> = snapshot.state.packages.iter().collect();
-
-    let to_install: Vec<String> = target_pkgs
-        .difference(&current_pkgs)
-        .map(|s| (*s).clone())
-        .collect();
-    let to_remove: Vec<String> = current_pkgs
-        .difference(&target_pkgs)
-        .map(|s| (*s).clone())
-        .collect();
 
     if !to_install.is_empty() {
         println!("  Packages to install ({}):", to_install.len());

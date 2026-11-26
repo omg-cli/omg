@@ -28,6 +28,7 @@ pub use explicit::{explicit, explicit_sync, explicit_sync_with_json};
 pub use info::info_after_fast_miss;
 pub use info::{info, info_sync, info_with_json};
 pub use install::install;
+pub(crate) use install::validate_install_request;
 pub use remove::remove;
 #[cfg(feature = "fedora")]
 pub(crate) use remove::review_fedora_removal;

@@ -145,8 +145,8 @@ async fn install_with_replacement_budget(
         anyhow::bail!("No packages specified");
     }
 
-    crate::core::security::ensure_local_archive_consent(packages, allow_local_file)?;
-    validate_install_targets(packages)?;
+    validate_install_request(packages, allow_local_file)?;
+    crate::package_managers::resolve_backend()?;
 
     if dry_run {
         return install_dry_run(packages).await;
@@ -176,7 +176,8 @@ async fn install_with_replacement_budget(
     }
 }
 
-fn validate_install_targets(packages: &[String]) -> Result<()> {
+pub(crate) fn validate_install_request(packages: &[String], allow_local_file: bool) -> Result<()> {
+    crate::core::security::ensure_local_archive_consent(packages, allow_local_file)?;
     match crate::core::env::distro::detect_distro() {
         crate::core::env::distro::Distro::Debian | crate::core::env::distro::Distro::Ubuntu => {
             crate::core::security::validate_debian_package_names_or_files(packages)?;
@@ -192,7 +193,6 @@ fn validate_install_targets(packages: &[String]) -> Result<()> {
             crate::core::security::validate_package_names(packages)?;
         }
     }
-    crate::package_managers::resolve_backend()?;
     Ok(())
 }
 
@@ -221,11 +221,11 @@ async fn install_dry_run(packages: &[String]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{deduplicate_packages, validate_install_targets};
+    use super::{deduplicate_packages, validate_install_request};
 
     #[test]
     fn install_targets_are_validated_before_backend_dispatch() {
-        let error = validate_install_targets(&["invalid\nname".to_string()])
+        let error = validate_install_request(&["invalid\nname".to_string()], false)
             .expect_err("invalid target must fail at the command boundary");
         assert!(error.to_string().contains("Invalid"));
     }
