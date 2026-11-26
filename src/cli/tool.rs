@@ -736,7 +736,19 @@ pub fn installed_tool_names() -> Result<Vec<String>> {
 }
 
 fn installed_tool_names_in(tools_dir: &Path) -> Result<Vec<String>> {
-    let mut names = Vec::new();
+    let mut names: Vec<_> = installed_tool_locations(tools_dir)?.into_values().collect();
+    names.sort();
+    names.dedup();
+    Ok(names)
+}
+
+fn installed_tool_locations(tools_dir: &Path) -> Result<BTreeMap<PathBuf, String>> {
+    let mut installations = BTreeMap::new();
+    let tools_dir = match tools_dir.canonicalize() {
+        Ok(path) => path,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(installations),
+        Err(error) => return Err(error).context("Failed to resolve managed tools directory"),
+    };
     let mut legacy_registry_paths = std::collections::HashSet::new();
 
     for (name, _, _, _) in TOOL_REGISTRY {
@@ -749,16 +761,21 @@ fn installed_tool_names_in(tools_dir: &Path) -> Result<Vec<String>> {
         }
         let current = tools_dir.join(manager).join(name);
         let legacy = tools_dir.join(manager).join(package);
-        if current.is_dir() || legacy.is_dir() {
-            names.push((*name).to_string());
-        }
         if current != legacy {
+            if looks_like_tool_install(&legacy)
+                && legacy.canonicalize().is_ok_and(|path| path == legacy)
+            {
+                installations.insert(legacy.clone(), (*name).to_owned());
+            }
             legacy_registry_paths.insert(legacy);
         }
     }
 
     for manager in ["cargo", "npm", "pip", "go"] {
         let manager_dir = tools_dir.join(manager);
+        if fs::symlink_metadata(&manager_dir).is_ok_and(|metadata| metadata.is_symlink()) {
+            continue;
+        }
         let entries = match fs::read_dir(&manager_dir) {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
@@ -775,29 +792,26 @@ fn installed_tool_names_in(tools_dir: &Path) -> Result<Vec<String>> {
                     manager_dir.display()
                 )
             })?;
-            let path = entry.path();
-            // Hidden siblings (.name.staging-*, .name.backup-*) are transient
-            // install-swap directories, never installed tools.
-            let hidden = entry
-                .file_name()
-                .to_str()
-                .is_some_and(|name| name.starts_with('.'));
-            if hidden || legacy_registry_paths.contains(&path) || !looks_like_tool_install(&path) {
+            let filename = entry.file_name();
+            let Some(name) = filename.to_str() else {
                 continue;
-            }
-            if let Some(name) = entry.file_name().to_str() {
-                names.push(name.to_string());
+            };
+            let path = entry.path();
+            // Hidden directories belong to install and rollback operations.
+            if !name.starts_with('.')
+                && !legacy_registry_paths.contains(&path)
+                && looks_like_tool_install(&path)
+            {
+                installations.insert(path, name.to_owned());
             }
         }
     }
 
-    names.sort();
-    names.dedup();
-    Ok(names)
+    Ok(installations)
 }
 
 fn looks_like_tool_install(path: &Path) -> bool {
-    path.is_dir()
+    crate::runtimes::common::is_runtime_payload_dir(path)
         && (path.join("bin").is_dir()
             || path.join("node_modules/.bin").is_dir()
             || path.join("pyvenv.cfg").is_file())
@@ -1315,30 +1329,60 @@ fn link_binaries(install_dir: &Path, bin_dir: &Path, skip_venv_base_tools: bool)
 }
 
 pub fn list() -> Result<()> {
-    let (_, bin_dir) = get_dirs();
-    if !crate::runtimes::common::is_runtime_payload_dir(&bin_dir) {
+    let (tools_dir, bin_dir) = get_dirs();
+    let installations = installed_tool_locations(&tools_dir)?;
+    if installations.is_empty() {
         println!("{}", style::dim("No tools installed via omg tool."));
+        return Ok(());
+    }
+    let launcher_dirs: BTreeMap<_, _> = installations
+        .keys()
+        .flat_map(|install| {
+            tool_binary_dirs(install)
+                .into_iter()
+                .map(move |directory| (directory, install))
+        })
+        .collect();
+    let mut links = BTreeMap::new();
+    if crate::runtimes::common::is_runtime_payload_dir(&bin_dir) {
+        for entry in fs::read_dir(&bin_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            let Ok(target) = fs::read_link(&path) else {
+                continue;
+            };
+            let target_path = bin_dir.join(&target);
+            let Some(directory) = target_path.parent() else {
+                continue;
+            };
+            let install = launcher_dirs.get(directory).or_else(|| {
+                let canonical = directory.canonicalize().ok()?;
+                launcher_dirs.get(&canonical)
+            });
+            let Some(install) = install else {
+                continue;
+            };
+            if target_path
+                .canonicalize()
+                .is_ok_and(|resolved| resolved.starts_with(install) && resolved.is_file())
+            {
+                links.insert(entry.file_name(), target);
+            }
+        }
+    }
+    if links.is_empty() {
+        println!("{}", style::dim("No managed tool commands are linked."));
         return Ok(());
     }
 
     println!("{} Installed Tools:", style::header("OMG"));
-
-    for entry in fs::read_dir(bin_dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if let Ok(target) = fs::read_link(&path) {
-            println!(
-                "  {} {} -> {}",
-                style::package(
-                    &path
-                        .file_name()
-                        .map(|f| f.to_string_lossy())
-                        .unwrap_or_default()
-                ),
-                style::arrow("points to"),
-                style::dim(&target.to_string_lossy())
-            );
-        }
+    for (name, target) in links {
+        println!(
+            "  {} {} -> {}",
+            style::package(&name.to_string_lossy()),
+            style::arrow("points to"),
+            style::dim(&target.to_string_lossy())
+        );
     }
     Ok(())
 }

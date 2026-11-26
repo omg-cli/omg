@@ -3119,6 +3119,104 @@ print("fixture python " + json.dumps({
                     ))
 
 
+    def inspect_managed_tool_inventory():
+        phase = "managed-tool-inventory"
+        cases = (
+            ("healthy-pip", "pip", "black", "black", "bin/black", "absolute"),
+            ("legacy-cargo", "cargo", "diesel", "diesel_cli", "bin/diesel", "relative"),
+            ("npm-shim", "npm", "typescript", "typescript", "node_modules/.bin/tsc", "npm"),
+            ("unlinked", "pip", "black", "black", "bin/black", "unlinked"),
+            ("empty-registered", "pip", "black", "black", None, "empty"),
+            ("dangling-link", "pip", "black", "black", None, "dangling"),
+            ("foreign-link", "pip", "black", "black", None, "foreign"),
+            ("staging-link", "pip", "black", ".black.staging-fixture", "bin/black", "staging"),
+            ("incomplete-link", "pip", "black", "black", "bin/black", "incomplete"),
+        )
+        with tempfile.TemporaryDirectory(prefix="managed-tool-inventory-", dir=work) as directory:
+            here = Path(directory)
+            os.chown(here, account.pw_uid, account.pw_gid)
+            for label, manager, tool, install_name, launcher, mode in cases:
+                home = here / label
+                home.mkdir()
+                os.chown(home, account.pw_uid, account.pw_gid)
+                data = home / "data"
+                bin_dir = data / "bin"
+                bin_dir.mkdir(parents=True)
+                install = data / "tools" / manager / install_name
+                install.mkdir(parents=True)
+                outside = home / "ordinary-file"
+                outside.write_text("user-owned file\n")
+                if mode == "incomplete":
+                    (install / ".omg-installing").write_text("incomplete tool publication\n")
+                target = install / launcher if launcher else install / "bin" / tool
+                if launcher:
+                    target.parent.mkdir(parents=True)
+                    if mode == "npm":
+                        implementation = install / "node_modules/typescript/bin/tsc"
+                        implementation.parent.mkdir(parents=True)
+                        implementation.write_text("#!/bin/sh\nprintf 'fixture tool\\n'\n")
+                        implementation.chmod(0o755)
+                        target.symlink_to("../typescript/bin/tsc")
+                    else:
+                        target.write_text("#!/bin/sh\nprintf 'fixture tool\\n'\n")
+                        target.chmod(0o755)
+                link = bin_dir / target.name
+                if mode == "foreign":
+                    linked = outside
+                elif mode == "relative":
+                    linked = Path(os.path.relpath(target, bin_dir))
+                else:
+                    linked = target
+                if mode not in ("unlinked", "empty"):
+                    link.symlink_to(linked)
+                for path in (data, *data.rglob("*")):
+                    os.chown(path, account.pw_uid, account.pw_gid, follow_symlinks=False)
+                installed = mode in ("absolute", "relative", "npm", "unlinked")
+                listed = installed and mode != "unlinked"
+                env = dict(disabled, HOME=str(home), OMG_DATA_DIR=str(data),
+                           OMG_CONFIG_DIR=str(home/"config"/"omg"), OMG_NATIVE_TEST_DATA_DIR="1",
+                           XDG_CONFIG_HOME=str(home/"config"), XDG_DATA_HOME=str(home/"xdg-data"),
+                           XDG_CACHE_HOME=str(home/"cache"), XDG_STATE_HOME=str(home/"state"))
+
+                def run(case, args, inspect):
+                    result = subprocess.run([cli, *args], cwd=home, env=env, stdin=subprocess.DEVNULL,
+                                            capture_output=True, text=True, timeout=8, **ordinary)
+                    checks.append(dict(
+                        phase=phase, case=f"{label}-{case}", status=result.returncode,
+                        passed=(inspect(result) and outside.read_text() == "user-owned file\n"),
+                        diagnostic=(result.stdout + result.stderr)[-1100:],
+                    ))
+
+                def list_matches(result):
+                    if listed:
+                        return (result.returncode == 0 and "Installed Tools:" in result.stdout
+                                and f"  {link.name} points to -> {linked}" in result.stdout.splitlines())
+                    message = ("No managed tool commands are linked." if installed
+                               else "No tools installed via omg tool.")
+                    return result.returncode == 0 and message in result.stdout
+
+                def update_matches(result):
+                    unchanged = install.is_dir() and (not launcher or target.is_file())
+                    unchanged &= (not link.is_symlink() if mode in ("unlinked", "empty")
+                                  else link.is_symlink() and os.readlink(link) == str(linked))
+                    unchanged &= sorted(path.name for path in install.parent.iterdir()) == [install_name]
+                    if installed:
+                        return unchanged and result.returncode != 0 and f"Updating {tool}" in result.stdout
+                    return unchanged and result.returncode == 0 and "No tools installed." in result.stdout
+
+                run("list", ("tool", "list"), list_matches)
+                for verb in ("remove", "update"):
+                    run(f"complete-{verb}", ("complete", "--shell", "bash", "--current", tool,
+                                             "--last", verb, "--full", f"omg tool {verb} {tool}"),
+                        lambda result: result.returncode == 0
+                        and result.stdout.splitlines() == ([tool] if installed else []))
+                run("update-all", ("tool", "update", "all"), update_matches)
+                if installed:
+                    run("remove", ("tool", "remove", tool),
+                        lambda result: result.returncode == 0 and "Removal complete" in result.stdout
+                        and not install.exists() and not link.is_symlink())
+
+
     def inspect_task_environment_bytes():
         phase = "task-environment-bytes"
         raw = b"test-\xff-value"
@@ -5828,6 +5926,7 @@ exec {shlex.quote(str(binary))} "$@"
                     inspect_python_virtualenv_launch()
                     inspect_python_inventory_and_removal()
                     inspect_python_tool_prerequisites()
+                    inspect_managed_tool_inventory()
                     mark_progress("runtime selection and Python environments")
                     inspect_task_environment_bytes()
                     inspect_task_package_metadata()
@@ -6153,6 +6252,6 @@ mark_progress("completed with host inventory unchanged")
 report = dict(binaries=binaries, checks=checks, total=len(checks),
               passed=sum(entry["passed"] for entry in checks), host_unchanged=True)
 print(json.dumps(report))
-expected_checks = 303 if consent_oracle is None else 2056
+expected_checks = 303 if consent_oracle is None else 2096
 if report["passed"] != report["total"] or report["total"] != expected_checks:
     sys.exit(4)
