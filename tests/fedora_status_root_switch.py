@@ -3316,7 +3316,14 @@ print("fixture python " + json.dumps({
                                   else link.is_symlink() and os.readlink(link) == str(linked))
                     unchanged &= sorted(path.name for path in install.parent.iterdir()) == [install_name]
                     if installed:
-                        return unchanged and result.returncode != 0 and f"Updating {tool}" in result.stdout
+                        missing_runtime = {
+                            "pip": "requires a selected OMG-managed python",
+                            "cargo": "requires a selected OMG-managed rust",
+                            "npm": "requires an active OMG-managed Node runtime",
+                        }[manager]
+                        return (unchanged and result.returncode == 1 and f"Updating {tool}" in result.stdout
+                                and missing_runtime in result.stdout
+                                and f"Failed to update 1 tool(s): {tool}" in result.stderr)
                     return unchanged and result.returncode == 0 and "No tools installed." in result.stdout
 
                 run("list", ("tool", "list"), list_matches)
@@ -3330,6 +3337,104 @@ print("fixture python " + json.dumps({
                     run("remove", ("tool", "remove", tool),
                         lambda result: result.returncode == 0 and "Removal complete" in result.stdout
                         and not install.exists() and not link.is_symlink())
+
+
+
+    def inspect_managed_tool_mutation_lease():
+        phase = "managed-tool-mutation-lease"
+        cases = (
+            ("npm-busy", "typescript", "npm", "typescript", "busy"),
+            ("cargo-legacy-busy", "diesel", "cargo", "diesel_cli", "busy"),
+            ("pip-busy", "black", "pip", "black", "busy"),
+            ("go-busy", "hey", "go", "hey", "busy"),
+            ("symlink", "typescript", "npm", "typescript", "symlink"),
+            ("hardlink", "typescript", "npm", "typescript", "hardlink"),
+            ("fifo", "typescript", "npm", "typescript", "fifo"),
+            ("directory", "typescript", "npm", "typescript", "directory"),
+        )
+        with tempfile.TemporaryDirectory(prefix="managed-tool-mutation-lease-", dir=work) as directory:
+            here = Path(directory)
+            os.chown(here, account.pw_uid, account.pw_gid)
+            for label, tool, manager, install_name, layout in cases:
+                home = here / label
+                bin_dir = home / "data/bin"
+                tools_dir = home / "data/tools"
+                install = tools_dir / manager / install_name
+                payload = install / "bin/owned"
+                marker = home / "independent-data"
+                lock = tools_dir / ".mutation.lock"
+                link = bin_dir / "owned"
+                bin_dir.mkdir(parents=True)
+                payload.parent.mkdir(parents=True)
+                payload.write_text("#!/bin/sh\nprintf 'published fixture'\n")
+                payload.chmod(0o755)
+                link.symlink_to(payload)
+                marker.write_text("unchanged user file\n")
+                (bin_dir / "independent").symlink_to(marker)
+                if layout == "busy":
+                    lock.touch(mode=0o600)
+                elif layout == "symlink":
+                    lock.symlink_to(marker)
+                elif layout == "hardlink":
+                    lock.hardlink_to(marker)
+                elif layout == "fifo":
+                    os.mkfifo(lock, 0o600)
+                else:
+                    lock.mkdir()
+                for item in (home, *home.rglob("*")):
+                    os.chown(item, account.pw_uid, account.pw_gid, follow_symlinks=False)
+                home.chmod(0o700)
+                lock_identity = lock.lstat()
+
+                env = dict(disabled, HOME=str(home), OMG_DATA_DIR=str(home/"data"),
+                           OMG_CONFIG_DIR=str(home/"config"/"omg"), OMG_NATIVE_TEST_DATA_DIR="1",
+                           XDG_CONFIG_HOME=str(home/"config"), XDG_DATA_HOME=str(home/"xdg-data"),
+                           XDG_CACHE_HOME=str(home/"cache"), XDG_STATE_HOME=str(home/"state"))
+
+                def unchanged():
+                    current_lock = lock.lstat()
+                    return (current_lock.st_ino == lock_identity.st_ino
+                            and current_lock.st_mode == lock_identity.st_mode
+                            and lock_identity.st_nlink == current_lock.st_nlink
+                            and marker.read_text() == "unchanged user file\n"
+                            and payload.read_text() == "#!/bin/sh\nprintf 'published fixture'\n"
+                            and link.is_symlink() and os.readlink(link) == str(payload)
+                            and sorted(child.name for child in install.parent.iterdir()) == [install_name]
+                            and os.readlink(bin_dir / "independent") == str(marker))
+
+                def check(case, args, inspect):
+                    result = command([cli, "tool", *args], env, ordinary, timeout=8)
+                    checks.append(dict(phase=phase, case=f"{label}-{case}", status=result.returncode,
+                                       passed=inspect(result), diagnostic=(result.stdout + result.stderr)[-1100:]))
+
+                with ExitStack() as held:
+                    if layout == "busy":
+                        descriptor = held.enter_context(lock.open("r+b"))
+                        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    check("list", ("list",), lambda result: (
+                        result.returncode == 0 and f"  owned points to -> {payload}" in result.stdout.splitlines()
+                        and unchanged()
+                    ))
+                    for verb, name in (("install", tool), ("update", tool), ("update", "all"), ("remove", tool)):
+                        check(f"{verb}-{name}", (verb, name), lambda result: (
+                            result.returncode == 1
+                            and "Could not lock managed tool storage" in result.stdout + result.stderr
+                            and unchanged()
+                        ))
+
+                # An interrupted owner may leave a lock file. Reuse it after the
+                # process closes it, and reject malformed entries until corrected.
+                if layout == "directory":
+                    lock.rmdir()
+                elif layout != "busy":
+                    lock.unlink()
+                check("remove-after-release", ("remove", tool), lambda result: (
+                    result.returncode == 0 and "Removal complete" in result.stdout
+                    and not install.exists() and not os.path.lexists(link)
+                    and marker.read_text() == "unchanged user file\n"
+                    and os.readlink(bin_dir / "independent") == str(marker)
+                    and lock.is_file() and not lock.is_symlink()
+                ))
 
 
     def inspect_fedora_system_tool_registry():
@@ -9705,6 +9810,7 @@ exec {shlex.quote(str(binary))} "$@"
                     inspect_python_inventory_and_removal()
                     inspect_python_tool_prerequisites()
                     inspect_managed_tool_inventory()
+                    inspect_managed_tool_mutation_lease()
                     inspect_fedora_system_tool_registry()
                     inspect_named_tool_updates()
                     inspect_config_files()
@@ -10061,6 +10167,6 @@ mark_progress("completed with host inventory unchanged")
 report = dict(binaries=binaries, checks=checks, total=len(checks),
               passed=sum(entry["passed"] for entry in checks), host_unchanged=True)
 print(json.dumps(report))
-expected_checks = 303 if consent_oracle is None else 3147
+expected_checks = 303 if consent_oracle is None else 3195
 if report["passed"] != report["total"] or report["total"] != expected_checks:
     sys.exit(4)

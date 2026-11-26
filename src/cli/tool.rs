@@ -954,10 +954,37 @@ pub async fn install(name: &str) -> Result<()> {
 // async caller has been dropped. Waiting callers do not consume blocking threads.
 static MANAGED_INSTALL_PERMITS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
 
+enum ManagedToolChange<'a> {
+    Install(&'a str),
+    Update(&'a str),
+}
+
+fn lock_managed_tool_storage(tools_dir: &Path) -> Result<crate::runtimes::common::RuntimeLease> {
+    crate::runtimes::common::try_lock_runtime_file(tools_dir, ".mutation.lock")
+        .context("Could not lock managed tool storage")
+}
+
 async fn install_managed(
     manager: &str,
     pkg: &str,
     install_name: &str,
+    tools_dir: &Path,
+    bin_dir: &Path,
+) -> Result<()> {
+    change_managed(
+        manager,
+        pkg,
+        ManagedToolChange::Install(install_name),
+        tools_dir,
+        bin_dir,
+    )
+    .await
+}
+
+async fn change_managed(
+    manager: &str,
+    pkg: &str,
+    change: ManagedToolChange<'_>,
     tools_dir: &Path,
     bin_dir: &Path,
 ) -> Result<()> {
@@ -972,10 +999,10 @@ async fn install_managed(
         return crate::cli::packages::install(&[package.to_owned()], false, false, false).await;
     }
 
-    install_managed_with_advisories(
+    change_managed_with_advisories(
         manager,
         pkg,
-        install_name,
+        change,
         tools_dir,
         bin_dir,
         std::sync::Arc::new(crate::core::security::vulnerability::VulnerabilityScanner::new()),
@@ -984,25 +1011,72 @@ async fn install_managed(
     .await
 }
 
-async fn install_managed_with_advisories(
+async fn change_managed_with_advisories(
     manager: &str,
     pkg: &str,
-    install_name: &str,
+    change: ManagedToolChange<'_>,
     tools_dir: &Path,
     bin_dir: &Path,
     advisories: std::sync::Arc<dyn crate::core::security::vulnerability::VulnerabilitySource>,
     runtime_security: crate::runtimes::security::RuntimeSecurity,
 ) -> Result<()> {
+    let (install_name, updating) = match change {
+        ManagedToolChange::Install(name) => (name, false),
+        ManagedToolChange::Update(name) => (name, true),
+    };
     crate::core::security::validate_package_name(install_name)?;
     validate_managed_package(manager, pkg)?;
     let permit = MANAGED_INSTALL_PERMITS
         .acquire()
         .await
         .context("Managed installation admission closed")?;
+    let manager = manager.to_owned();
+    let pkg = pkg.to_owned();
+    let install_name = install_name.to_owned();
+    let tools_dir = tools_dir.to_path_buf();
+    let bin_dir = bin_dir.to_path_buf();
+    // A started blocking task cannot be aborted. Keep the complete transaction
+    // and its permit in the worker: caller cancellation must not orphan a child,
+    // remove its staging tree early, or interrupt verification/rollback.
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let outcome = (|| {
+            let _lease = lock_managed_tool_storage(&tools_dir)?;
+            if updating {
+                require_managed_tool_installation(&tools_dir, &manager, &pkg, &install_name)?;
+            }
+            install_managed_blocking(
+                &manager,
+                &pkg,
+                &install_name,
+                &tools_dir,
+                &bin_dir,
+                &advisories,
+                &runtime_security,
+            )
+        })();
+        if let Err(error) = &outcome {
+            tracing::warn!(%manager, %pkg, %error, "managed tool installation failed");
+        }
+        outcome
+    })
+    .await
+    .context("Managed tool installation worker failed")?
+}
+
+fn install_managed_blocking(
+    manager: &str,
+    pkg: &str,
+    install_name: &str,
+    tools_dir: &Path,
+    bin_dir: &Path,
+    advisories: &std::sync::Arc<dyn crate::core::security::vulnerability::VulnerabilitySource>,
+    runtime_security: &crate::runtimes::security::RuntimeSecurity,
+) -> Result<()> {
     // Keep storage flat and keyed by the user-facing registry name. Package
     // identifiers such as Go module paths are installer inputs, not paths.
     let install_dir = tools_dir.join(manager).join(install_name);
-    let has_previous_install = match tokio::fs::symlink_metadata(&install_dir).await {
+    let has_previous_install = match fs::symlink_metadata(&install_dir) {
         Ok(metadata) if metadata.is_dir() => true,
         Ok(_) => {
             anyhow::bail!(
@@ -1020,47 +1094,6 @@ async fn install_managed_with_advisories(
             });
         }
     };
-
-    let manager = manager.to_owned();
-    let pkg = pkg.to_owned();
-    let install_name = install_name.to_owned();
-    let tools_dir = tools_dir.to_path_buf();
-    let bin_dir = bin_dir.to_path_buf();
-    // A started blocking task cannot be aborted. Keep the complete transaction
-    // and its permit in the worker: caller cancellation must not orphan a child,
-    // remove its staging tree early, or interrupt verification/rollback.
-    tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        let outcome = install_managed_blocking(
-            &manager,
-            &pkg,
-            &install_name,
-            &tools_dir,
-            &bin_dir,
-            has_previous_install,
-            &advisories,
-            &runtime_security,
-        );
-        if let Err(error) = &outcome {
-            tracing::warn!(%manager, %pkg, %error, "managed tool installation failed");
-        }
-        outcome
-    })
-    .await
-    .context("Managed tool installation worker failed")?
-}
-
-fn install_managed_blocking(
-    manager: &str,
-    pkg: &str,
-    install_name: &str,
-    tools_dir: &Path,
-    bin_dir: &Path,
-    has_previous_install: bool,
-    advisories: &std::sync::Arc<dyn crate::core::security::vulnerability::VulnerabilitySource>,
-    runtime_security: &crate::runtimes::security::RuntimeSecurity,
-) -> Result<()> {
-    let install_dir = tools_dir.join(manager).join(install_name);
     for variable in active_security_overrides(manager, pkg) {
         eprintln!(
             "{} {variable} weakens install security for {manager}:{pkg}",
@@ -1454,6 +1487,11 @@ pub async fn remove(name: &str) -> Result<()> {
         );
     }
 
+    anyhow::ensure!(
+        tools_dir.try_exists()?,
+        "Tool '{name}' not found in managed storage"
+    );
+    let _lease = lock_managed_tool_storage(&tools_dir)?;
     let mut found = false;
     let mut removed_installs = Vec::new();
     for (manager, install_path) in candidates {
@@ -1547,8 +1585,14 @@ pub async fn update(name: &str) -> Result<()> {
             );
             match find_registry_entry(&tool) {
                 Some(Ok((manager, pkg, _))) => {
-                    if let Err(error) =
-                        install_managed(manager, pkg, &tool, &tools_dir, &bin_dir).await
+                    if let Err(error) = change_managed(
+                        manager,
+                        pkg,
+                        ManagedToolChange::Update(&tool),
+                        &tools_dir,
+                        &bin_dir,
+                    )
+                    .await
                     {
                         println!(
                             "  {}",
@@ -1591,10 +1635,26 @@ pub async fn update(name: &str) -> Result<()> {
         format!("Tool '{name}' not found in registry. Cannot determine update source.")
     })??;
 
-    if manager == "system" {
-        return install_managed(manager, pkg, name, &tools_dir, &bin_dir).await;
+    change_managed(
+        manager,
+        pkg,
+        ManagedToolChange::Update(name),
+        &tools_dir,
+        &bin_dir,
+    )
+    .await?;
+    if manager != "system" {
+        println!("\n{}", style::success("Update complete!"));
     }
+    Ok(())
+}
 
+fn require_managed_tool_installation(
+    tools_dir: &Path,
+    manager: &str,
+    pkg: &str,
+    name: &str,
+) -> Result<()> {
     let installed = match tools_dir.canonicalize() {
         Ok(root) => {
             let manager_dir = root.join(manager);
@@ -1613,8 +1673,6 @@ pub async fn update(name: &str) -> Result<()> {
         "Tool '{name}' is not installed; run omg tool install {name} first"
     );
 
-    install_managed(manager, pkg, name, &tools_dir, &bin_dir).await?;
-    println!("\n{}", style::success("Update complete!"));
     Ok(())
 }
 
@@ -2024,10 +2082,10 @@ with zipfile.ZipFile(sys.argv[1], 'w') as archive:
         tools: &Path,
         bin: &Path,
     ) -> Result<()> {
-        install_managed_with_advisories(
+        change_managed_with_advisories(
             manager,
             package,
-            name,
+            ManagedToolChange::Install(name),
             tools,
             bin,
             std::sync::Arc::new(TestNpmAdvisories::default()),
@@ -2278,10 +2336,10 @@ esac
             .build()
             .unwrap();
         let error = runtime
-            .block_on(install_managed_with_advisories(
+            .block_on(change_managed_with_advisories(
                 "npm",
                 "fixture-tool@1.0.0",
-                "fixture-tool",
+                ManagedToolChange::Install("fixture-tool"),
                 &tools,
                 &bin,
                 std::sync::Arc::new(source),
@@ -2478,10 +2536,10 @@ esac
                         .enable_all()
                         .build()
                         .unwrap();
-                    let result = runtime.block_on(install_managed_with_advisories(
+                    let result = runtime.block_on(change_managed_with_advisories(
                         "npm",
                         "fixture-tool@1.0.0",
-                        "fixture-tool",
+                        ManagedToolChange::Install("fixture-tool"),
                         &tools,
                         &bin,
                         std::sync::Arc::new(source),
@@ -2602,6 +2660,9 @@ esac
                     }
                 }
                 assert!(!managers.join("verified").exists(), "verification has not run yet");
+                let contention = lock_managed_tool_storage(&tools)
+                    .expect_err("the in-flight installer must still own its storage lease");
+                assert!(format!("{contention:#}").contains("Another runtime mutation"));
                 assert_eq!(fs::read(bin.join("fixture-tool")).expect("previous link"), b"previous version");
                 drop(hold);
                 tokio::time::timeout(Duration::from_secs(5), async {
@@ -3432,10 +3493,10 @@ esac
         let tools = fixture.path().join("tools");
         let bin = fixture.path().join("bin");
         fs::create_dir(&bin)?;
-        install_managed_with_advisories(
+        change_managed_with_advisories(
             "go",
             "example.com/tool@v1.2.3",
-            "fixture-tool",
+            ManagedToolChange::Install("fixture-tool"),
             &tools,
             &bin,
             advisories,
@@ -3471,10 +3532,10 @@ esac
             } else {
                 fs::write(&bin, b"keep this entry")?;
             }
-            let result = install_managed_with_advisories(
+            let result = change_managed_with_advisories(
                 "go",
                 "example.com/tool@v1.2.3",
-                "fixture-tool",
+                ManagedToolChange::Install("fixture-tool"),
                 &fixture.path().join("tools"),
                 &bin,
                 advisories,
