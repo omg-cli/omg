@@ -27,7 +27,8 @@ class RequiredResultsTests(unittest.TestCase):
         script = textwrap.dedent(block.split("        run: |\n", 1)[1])
         with tempfile.TemporaryDirectory() as directory:
             env = dict(os.environ, QUICK_GATE="success", WORKFLOW_CHECKS="success", BUILD_REQUIRED=required,
-                       STANDALONE_SUITES="success", PORTABLE="success", PORTABLE_RELEASE="success", LINUX_MATRIX="success", LINUX_CLIPPY="success", SANDBOX_CANCELLATION="success",
+                       STANDALONE_SUITES="success", PORTABLE="success", PORTABLE_RELEASE="success", LINUX_MATRIX="success",
+                       LINUX_ARCH="success", LINUX_CLIPPY="success", SANDBOX_CANCELLATION="success",
                        FEATURE_INTERSECTIONS="success", MACOS="success", MACOS_NEXTEST_SOURCE="success", UBUNTU="success",
                        DOCS_AUDIT="success", RUNTIME_USAGE="success", FEDORA_SQLITE="success",
                        NATIVE_READINESS="success",
@@ -47,6 +48,14 @@ class RequiredResultsTests(unittest.TestCase):
                                                'QEMU': 'success', 'QEMU_FEDORA': 'success'})
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn('Native artifact readiness did not succeed', result.stdout)
+
+    def test_arch_validation_failure_cannot_hide_behind_other_linux_results(self):
+        for state in ('failure', 'cancelled', 'skipped', '', None):
+            with self.subTest(state=state):
+                result = self.evaluate('true', {'LINUX_ARCH': state})
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('Linux (arch) did not succeed', result.stdout)
+        self.assertEqual(self.evaluate('false', {'LINUX_ARCH': 'skipped'}).returncode, 0)
 
     def test_fedora_sqlite_supply_failure_cannot_hide_behind_successful_guests(self):
         for result in ('failure', 'cancelled', 'skipped', '', None):
@@ -71,7 +80,9 @@ class RequiredResultsTests(unittest.TestCase):
                 self.assertNotEqual(self.evaluate("true", {job: "skipped"}).returncode, 0)
 
     def test_docs_only_skips_pass(self):
-        jobs = ("STANDALONE_SUITES", "PORTABLE", "PORTABLE_RELEASE", "LINUX_MATRIX", "SANDBOX_CANCELLATION", "FEATURE_INTERSECTIONS", "MACOS", "MACOS_NEXTEST_SOURCE", "UBUNTU", "RUNTIME_USAGE", "FEDORA_SQLITE")
+        jobs = ("STANDALONE_SUITES", "PORTABLE", "PORTABLE_RELEASE", "LINUX_MATRIX", "LINUX_ARCH",
+                "SANDBOX_CANCELLATION", "FEATURE_INTERSECTIONS", "MACOS", "MACOS_NEXTEST_SOURCE",
+                "UBUNTU", "RUNTIME_USAGE", "FEDORA_SQLITE")
         self.assertEqual(self.evaluate("false", {job: "skipped" for job in jobs}).returncode, 0)
 
     def test_all_success_passes_and_failure_never_does(self):
@@ -154,6 +165,13 @@ class RequiredResultsTests(unittest.TestCase):
                          "makepkg_invocations_isolate_every_writable_cache",
                          "--include-ignored", "sandbox-evidence"):
             self.assertIn(expected, block)
+
+    def test_sandbox_pipeline_needs_only_the_arch_producer_and_quick_gate(self):
+        text = CI_YML.read_text(encoding='utf-8')
+        sandbox = job_block(text, 'sandbox-cancellation')
+        needs = next(line.strip() for line in sandbox.splitlines() if line.startswith('    needs:'))
+        self.assertEqual(needs, 'needs: [quick-gate, linux-arch]')
+        self.assertIn('name: aur-sandbox-test', sandbox)
 
 
 if __name__ == "__main__":

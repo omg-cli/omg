@@ -16,7 +16,6 @@ class ReleaseRecipeAlignment(unittest.TestCase):
         workflows = ROOT / '.github/workflows'
         ci = (workflows / 'ci.yml').read_text(encoding='utf-8')
         tagged = (workflows / 'release.yml').read_text(encoding='utf-8')
-        matrix = job_block(ci, 'linux-matrix')
         for distro, image in BUILD.RELEASE_IMAGES.items():
             with self.subTest(distro=distro):
                 tagged_job = job_block(tagged, 'build-' + distro)
@@ -26,7 +25,8 @@ class ReleaseRecipeAlignment(unittest.TestCase):
                 else:
                     self.assertTrue({f'    container: {image}', f'      image: {image}'}
                                     & set(tagged_job.splitlines()), 'tagged build image or digest differs')
-                    self.assertIn('- platform: ' + distro + '\n            image: ' + image, matrix)
+                    owner = 'linux-arch' if distro == 'arch' else 'linux-matrix'
+                    self.assertIn('- platform: ' + distro + '\n            image: ' + image, job_block(ci, owner))
                 self.assertIn('--features ' + BUILD.FEATURES[distro] + ' --locked', tagged_job)
 
     def test_native_tests_run_before_release_builds(self):

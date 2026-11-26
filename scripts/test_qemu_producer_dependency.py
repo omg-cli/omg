@@ -21,7 +21,7 @@ class QemuProducerDependency(unittest.TestCase):
         self.assertIsNotNone(phases)
         self.assertEqual(phases.group(1).split(', '), ['validation'])
         clippy = job_block(ci, 'linux-clippy')
-        self.assertIn('needs: [quick-gate, linux-matrix]', clippy)
+        self.assertIn('needs: [quick-gate, linux-matrix, linux-arch]', clippy)
         self.assertIn('!cancelled()', clippy)
         self.assertNotIn('needs.linux-matrix.result', clippy)
         self.assertNotIn('strategy:', clippy)
@@ -34,7 +34,7 @@ class QemuProducerDependency(unittest.TestCase):
         script = step_script(job_block(ci, 'ci-success'), 'Evaluate results')
         results = dict(QUICK_GATE='success', WORKFLOW_CHECKS='success', BUILD_REQUIRED='true',
                        STANDALONE_SUITES='success', PORTABLE='success', PORTABLE_RELEASE='success',
-                       LINUX_MATRIX='success',
+                       LINUX_MATRIX='success', LINUX_ARCH='success',
                        FEDORA_SQLITE='success', SANDBOX_CANCELLATION='success',
                        FEATURE_INTERSECTIONS='success', MACOS='success', MACOS_NEXTEST_SOURCE='success',
                        UBUNTU='success', RUNTIME_USAGE='success', QEMU='success', QEMU_FEDORA='success',

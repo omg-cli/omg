@@ -48,8 +48,14 @@ class NativePhaseMatrixTests(unittest.TestCase):
 
     def test_all_five_platforms_reuse_native_targets_for_required_clippy(self) -> None:
         proof = job_block(self.workflow, "linux-clippy")
-        self.assertIn("    needs: [quick-gate, linux-matrix]\n", proof)
-        platforms = ["arch", "debian", "debian-trixie", "ubuntu-2604", "fedora"]
+        arch = job_block(self.workflow, "linux-arch")
+        self.assertIn("    needs: [quick-gate, linux-matrix, linux-arch]\n", proof)
+        self.assertIn('    name: "Linux (arch)"\n', arch)
+        self.assertIn("        platform: [arch]\n", arch)
+        for key in ("env", "container", "steps"):
+            self.assertIn(f"    {key}: &native-linux-{key}\n", self.job)
+            self.assertIn(f"    {key}: *native-linux-{key}\n", arch)
+        platforms = ["debian", "debian-trixie", "ubuntu-2604", "fedora"]
         match = re.search(r"^        platform: \[([^\]]+)\]$", self.job, re.MULTILINE)
         self.assertIsNotNone(match)
         assert match is not None
@@ -70,6 +76,7 @@ class NativePhaseMatrixTests(unittest.TestCase):
         self.assertIn("name: native-clippy-${{ matrix.platform }}-${{ github.run_attempt }}", self.job)
         final = job_block(self.workflow, "ci-success").split("    steps:", 1)[0]
         self.assertIn("linux-matrix", final)
+        self.assertIn("linux-arch", final)
         self.assertIn("linux-clippy", final)
         self.assertIn("needs: [qemu-preflight]", job_block(self.workflow, "qemu"))
         self.assertIn("needs: [qemu-preflight, fedora-sqlite]", job_block(self.workflow, "qemu-fedora"))
@@ -701,8 +708,11 @@ class CiDeduplicationTests(unittest.TestCase):
     def test_arch_combination_has_one_platform_lane(self) -> None:
         text = CI_YML.read_text(encoding="utf-8")
         linux = job_block(text, "linux-matrix")
+        arch = job_block(text, "linux-arch")
         intersections = job_block(text, "feature-intersections")
-        self.assertIn("features: arch,pgp,license", linux)
+        self.assertIn("features: arch,pgp,license", arch)
+        self.assertIn("steps: *native-linux-steps", arch)
+        self.assertNotIn("features: arch,pgp,license", linux)
         self.assertIn("cargo clippy --all-targets", linux)
         self.assertIn("python3 scripts/run-native-contracts.py --features ${{ matrix.features }}", linux)
         self.assertNotIn("features: arch,pgp,license", intersections)

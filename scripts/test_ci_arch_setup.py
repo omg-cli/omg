@@ -12,9 +12,9 @@ CI_YML = Path(__file__).resolve().parents[1] / '.github/workflows/ci.yml'
 
 def arch_setup(text):
     """Extract this workflow's unique literal Arch matrix setup, or refuse."""
-    jobs = list(re.finditer(r'(?m)^  linux-matrix:\n', text))
+    jobs = list(re.finditer(r'(?m)^  linux-arch:\n', text))
     if len(jobs) != 1:
-        raise ValueError('Expected one linux-matrix job')
+        raise ValueError('Expected one linux-arch job')
     remaining = text[jobs[0].end():]
     end = re.search(r'(?m)^  [a-zA-Z0-9_-]+:\n', remaining)
     job = remaining[:end.start()] if end else remaining
@@ -221,16 +221,16 @@ class ArchSetupExtractionTests(unittest.TestCase):
 
     def test_empty_setup_is_fatal(self):
         with self.assertRaises(ValueError):
-            arch_setup('  linux-matrix:\n          - platform: arch\n            setup: |\n            other: value\n')
+            arch_setup('  linux-arch:\n          - platform: arch\n            setup: |\n            other: value\n')
 
     def test_duplicate_setup_is_fatal(self):
         with self.assertRaises(ValueError):
-            arch_setup('  linux-matrix:\n          - platform: arch\n            setup: |\n              first\n            setup: |\n              second\n')
+            arch_setup('  linux-arch:\n          - platform: arch\n            setup: |\n              first\n            setup: |\n              second\n')
 
     def test_duplicate_job_is_fatal(self):
         text = CI_YML.read_text(encoding='utf-8')
         with self.assertRaises(ValueError):
-            arch_setup(text + '\n  linux-matrix:\n')
+            arch_setup(text + '\n  linux-arch:\n')
 
 
 if __name__ == '__main__':

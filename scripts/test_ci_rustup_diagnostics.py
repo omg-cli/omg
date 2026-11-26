@@ -208,9 +208,12 @@ class WorkflowBytesTests(unittest.TestCase):
  def test_matrix_bootstrap_installs_declared_toolchain_components(self):
   import os,re,tomllib
   required=set(tomllib.loads((C/'rust-toolchain.toml').read_text())['toolchain']['components'])
-  block=(C/'.github/workflows/ci.yml').read_text().split('  linux-matrix:',1)[1].split('    container:',1)[0]
-  lanes=re.findall(r'^          - platform: (\S+)\n(.*?)(?=^          - platform: |\Z)',block,re.M|re.S)
-  self.assertEqual({lane for lane,_ in lanes},{'arch','debian','debian-trixie','ubuntu-2604','fedora'})
+  text=(C/'.github/workflows/ci.yml').read_text()
+  lanes=[]
+  for job in ('linux-matrix','linux-arch'):
+   block=text.split(f'  {job}:',1)[1].split('    container:',1)[0]
+   lanes.extend(re.findall(r'^          - platform: (\S+)\n(.*?)(?=^          - platform: |\Z)',block,re.M|re.S))
+  self.assertCountEqual([lane for lane,_ in lanes],['arch','debian','debian-trixie','ubuntu-2604','fedora'])
   for lane,row in lanes:
    with self.subTest(platform=lane),tempfile.TemporaryDirectory() as directory:
     home=pathlib.Path(directory);fake=home/'.cargo/bin/rustup';fake.parent.mkdir(parents=True);record=home/'arguments.json'
@@ -226,7 +229,7 @@ class WorkflowBytesTests(unittest.TestCase):
   allowed={'github','needs','strategy','matrix','vars','secrets','inputs'}
   # GitHub's jobs.<job_id>.env context table excludes runner and env.
   for job,body in re.findall(r'^  ([\w-]+):\n(.*?)(?=^  [\w-]+:|\Z)',text,re.M|re.S):
-   env=re.search(r'^    env:\n(.*?)(?=^    \S|\Z)',body,re.M|re.S)
+   env=re.search(r'^    env:(?: &[\w-]+)?\n(.*?)(?=^    \S|\Z)',body,re.M|re.S)
    if env:
     for expression in re.findall(r'\$\{\{(.*?)\}\}',env.group(1),re.S):
      roots=set(re.findall(r'\b([A-Za-z_]\w*)\s*[.\[]',expression))

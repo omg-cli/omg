@@ -84,7 +84,7 @@ class ReleaseWorkflowBoundaryTests(unittest.TestCase):
         self.assertNotIn('needs:', block)
         self.assertIn('uses: ./.github/workflows/authorize-release.yml', legacy)
         self.assertIn('ci-success]', legacy)
-        for platform in ('linux-matrix', 'sandbox-cancellation', 'feature-intersections', 'macos', 'ubuntu'):
+        for platform in ('linux-matrix', 'linux-arch', 'sandbox-cancellation', 'feature-intersections', 'macos', 'ubuntu'):
             self.assertIn(f"needs.{platform}.result == 'success'", legacy)
         self.assertRegex(ci, r'(?m)^      release-candidate:\n        description: [^\n]+\n'
                              r'        type: string\n        default: ""$')
