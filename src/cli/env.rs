@@ -131,12 +131,22 @@ struct GistFileResponse {
     truncated: bool,
 }
 
-fn parse_gist_id(input: &str) -> Result<String> {
+pub(super) fn parse_gist_id(input: &str) -> Result<String> {
+    anyhow::ensure!(
+        input.len() <= 255
+            && !input.chars().any(char::is_whitespace)
+            && !input.chars().any(char::is_control),
+        "Invalid Gist URL or ID"
+    );
     let gist_id = if input.starts_with("https://") {
         let url = reqwest::Url::parse(input).context("Invalid Gist URL")?;
         anyhow::ensure!(
             url.scheme() == "https" && url.host_str() == Some("gist.github.com"),
             "Gist URL must use https://gist.github.com"
+        );
+        anyhow::ensure!(
+            url.username().is_empty() && url.password().is_none() && url.port().is_none(),
+            "Gist URL must use the default HTTPS authority without credentials"
         );
         anyhow::ensure!(
             url.query().is_none() && url.fragment().is_none(),
@@ -282,12 +292,8 @@ async fn sync_lockfile(url_or_id: &str, root: &Path) -> Result<()> {
 }
 
 async fn sync_lockfile_with_api_base(url_or_id: &str, root: &Path, api_base: &str) -> Result<()> {
-    if url_or_id.len() > 255 || url_or_id.chars().any(char::is_control) {
-        anyhow::bail!("Invalid Gist URL or ID");
-    }
-
-    let client = shared_client();
     let gist_id = parse_gist_id(url_or_id)?;
+    let client = shared_client();
     let api_url = format!("{api_base}/gists/{gist_id}");
 
     let mut req = client.get(&api_url);

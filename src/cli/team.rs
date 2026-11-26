@@ -8,6 +8,7 @@ use crate::cli::{
 use anyhow::{Context, Result};
 
 use crate::cli::packages::execute_cmd;
+use crate::cli::style::sanitize_terminal_text;
 use crate::core::env::team::TeamWorkspace;
 use crate::core::license;
 
@@ -87,20 +88,14 @@ fn validate_team_id(team_id: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_team_remote(remote_url: &str) -> Result<()> {
-    let url = reqwest::Url::parse(remote_url).context("Invalid remote URL")?;
-    anyhow::ensure!(
-        url.scheme() == "https" && url.host_str() == Some("gist.github.com"),
-        "Team remotes must be HTTPS gist.github.com URLs"
-    );
-    anyhow::ensure!(
-        url.path_segments()
-            .into_iter()
-            .flatten()
-            .any(|segment| !segment.is_empty()),
-        "Team remote URL must include a Gist ID"
-    );
-    Ok(())
+fn team_remote(input: &str) -> Result<(String, String)> {
+    let gist_id = super::env::parse_gist_id(input)?;
+    let url = if input.starts_with("https://") {
+        input.to_owned()
+    } else {
+        format!("https://gist.github.com/{gist_id}")
+    };
+    Ok((url, gist_id))
 }
 
 /// Initialize a new team workspace.
@@ -148,33 +143,27 @@ pub fn init(team_id: &str, name: Option<&str>, _ctx: &CliContext) -> Result<()> 
 
 /// Join an existing team by setting remote URL
 pub async fn join(remote_url: &str, _ctx: &CliContext) -> Result<()> {
-    // SECURITY: Basic URL validation
-    if !remote_url.starts_with("https://") {
+    if remote_url.contains("://") && !remote_url.starts_with("https://") {
         execute_cmd(Components::error_with_suggestion(
             "Only HTTPS URLs allowed for security",
             "Use https:// instead of http://",
         ))?;
         anyhow::bail!("Only HTTPS URLs allowed for security");
     }
-    if remote_url.len() > 1024 || remote_url.chars().any(char::is_control) {
-        execute_cmd(Cmd::error("Invalid remote URL"))?;
-        anyhow::bail!("Invalid remote URL");
-    }
-    validate_team_remote(remote_url)?;
+    let (remote_url, gist_id) = team_remote(remote_url)?;
 
     let cwd = std::env::current_dir()?;
     let mut workspace = TeamWorkspace::new(&cwd)?;
 
     if !workspace.is_team_workspace() {
         // Auto-init if not a team workspace
-        let team_id = extract_team_id(remote_url);
-        validate_team_id(&team_id)?;
+        let team_id = format!("gist-{}", prefix(&gist_id, 8));
         workspace.init(&team_id, &team_id)?;
     }
 
     execute_cmd(Components::loading("Joining team..."))?;
 
-    workspace.join(remote_url)?;
+    workspace.join(&remote_url)?;
 
     // Pull the team lock
     let in_sync = workspace.pull().await?;
@@ -203,11 +192,15 @@ pub async fn status(_ctx: &CliContext) -> Result<()> {
 
     let mut details = vec![format!(
         "Team: {} ({})",
-        team_status.config.name, team_status.config.team_id
+        sanitize_terminal_text(&team_status.config.name),
+        sanitize_terminal_text(&team_status.config.team_id)
     )];
 
     if let Some(ref url) = team_status.config.remote_url {
-        details.push(format!("Remote: {}", crate::core::http::redact_url(url)));
+        details.push(format!(
+            "Remote: {}",
+            sanitize_terminal_text(&crate::core::http::redact_url(url))
+        ));
     }
 
     details.push(format!(
@@ -225,7 +218,7 @@ pub async fn status(_ctx: &CliContext) -> Result<()> {
         member_list.push(format!(
             "{} {} - {}",
             status_icon,
-            member.name,
+            sanitize_terminal_text(&member.name),
             if member.in_sync {
                 "in sync"
             } else {
@@ -351,23 +344,6 @@ pub async fn members(_ctx: &CliContext) -> Result<()> {
     Ok(())
 }
 
-fn extract_team_id(url: &str) -> String {
-    let Ok(url) = reqwest::Url::parse(url) else {
-        return "team".to_string();
-    };
-    if url.host_str() != Some("gist.github.com") {
-        return "team".to_string();
-    }
-    let id = url
-        .path_segments()
-        .into_iter()
-        .flatten()
-        .rev()
-        .find(|segment| !segment.is_empty())
-        .unwrap_or("team");
-    format!("gist-{}", prefix(id, 8))
-}
-
 /// Interactive team dashboard (TUI)
 pub async fn dashboard(_ctx: &CliContext) -> Result<()> {
     crate::cli::tui::run_with_tab(crate::cli::tui::app::Tab::Team).await
@@ -399,12 +375,19 @@ pub mod roles {
 
 /// Manage golden path templates
 pub mod golden_path {
-    use super::{CliContext, Result};
+    use super::{CliContext, Result, sanitize_terminal_text};
     use crate::cli::components::Components;
     use crate::cli::packages::execute_cmd;
     use crate::cli::tea::Cmd;
+    use crate::core::env::{
+        lock_regular_file,
+        team::{MAX_TEAM_FILE_BYTES, read_regular_file},
+    };
+    use anyhow::Context as _;
     use serde::{Deserialize, Serialize};
     use std::collections::HashMap;
+    use std::io::ErrorKind;
+    use std::path::{Path, PathBuf};
 
     #[derive(Debug, Serialize, Deserialize)]
     pub struct GoldenPathTemplate {
@@ -420,26 +403,50 @@ pub mod golden_path {
     }
 
     impl GoldenPathConfig {
-        fn path() -> std::path::PathBuf {
+        fn path() -> PathBuf {
             crate::core::paths::config_dir().join("golden-paths.toml")
         }
 
         pub fn load() -> Result<Self> {
-            let path = Self::path();
-            if path.exists() {
-                let content = std::fs::read_to_string(&path)?;
-                Ok(toml::from_str(&content)?)
-            } else {
-                Ok(Self::default())
+            Self::load_at(&Self::path())
+        }
+
+        fn load_at(path: &Path) -> Result<Self> {
+            match read_regular_file(path, "Golden path config") {
+                Ok(content) => {
+                    toml::from_str(&content).context("Failed to parse golden path config")
+                }
+                Err(error)
+                    if error
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|cause| cause.kind() == ErrorKind::NotFound) =>
+                {
+                    Ok(Self::default())
+                }
+                Err(error) => Err(error),
             }
         }
 
         pub fn save(&self) -> Result<()> {
             let path = Self::path();
-            // Atomic replacement keeps a crash from truncating the template
-            // store, matching the durability of other omg config writes.
+            let _guard = Self::lock(&path)?;
+            self.save_at(&path)
+        }
+
+        fn save_at(&self, path: &Path) -> Result<()> {
             let content = toml::to_string_pretty(self)?;
+            anyhow::ensure!(
+                content.len() as u64 <= MAX_TEAM_FILE_BYTES,
+                "Golden path config exceeds the {MAX_TEAM_FILE_BYTES} byte limit"
+            );
             crate::core::safe_ops::atomic_write_file_sync(path, content)
+        }
+
+        fn lock(path: &Path) -> Result<std::fs::File> {
+            let directory = path.parent().context("Golden path config needs a parent")?;
+            std::fs::create_dir_all(directory)
+                .with_context(|| format!("Failed to create {}", directory.display()))?;
+            lock_regular_file(&directory.join("golden-paths.lock"))
         }
     }
 
@@ -451,7 +458,7 @@ pub mod golden_path {
         _ctx: &CliContext,
     ) -> Result<()> {
         // SECURITY: Validate all inputs
-        if name.chars().any(|c| !c.is_ascii_alphanumeric() && c != '-') {
+        if name.is_empty() || name.chars().any(|c| !c.is_ascii_alphanumeric() && c != '-') {
             return execute_cmd(Components::error_with_suggestion(
                 "Invalid template name (alphanumeric and hyphens only)",
                 "Template names must be alphanumeric with hyphens only",
@@ -478,8 +485,6 @@ pub mod golden_path {
             }
         }
 
-        let mut config = GoldenPathConfig::load()?;
-
         let mut runtimes = HashMap::new();
         if let Some(v) = node {
             runtimes.insert("node".to_string(), v.to_string());
@@ -500,9 +505,14 @@ pub mod golden_path {
         };
 
         // Remove existing if same name
-        config.templates.retain(|t| t.name != name);
-        config.templates.push(template);
-        config.save()?;
+        {
+            let path = GoldenPathConfig::path();
+            let _guard = GoldenPathConfig::lock(&path)?;
+            let mut config = GoldenPathConfig::load_at(&path)?;
+            config.templates.retain(|t| t.name != name);
+            config.templates.push(template);
+            config.save_at(&path)?;
+        }
 
         let mut details = vec![format!("Template: {}", name)];
         if let Some(v) = node {
@@ -519,9 +529,7 @@ pub mod golden_path {
             Cmd::success(format!("Golden path '{name}' created!")),
             Cmd::card("Template Details", details),
             Cmd::spacer(),
-            Cmd::info(format!(
-                "Developers can now use: omg new {name} <project-name>"
-            )),
+            Cmd::info("View saved templates with 'omg team golden-path list'"),
         ]))?;
 
         Ok(())
@@ -548,10 +556,16 @@ pub mod golden_path {
         } else {
             let mut template_list = vec![];
             for t in &config.templates {
-                let runtimes = t.runtimes.keys().cloned().collect::<Vec<_>>().join(", ");
+                let mut runtimes: Vec<_> = t
+                    .runtimes
+                    .keys()
+                    .map(|name| sanitize_terminal_text(name))
+                    .collect();
+                runtimes.sort_unstable();
+                let runtimes = runtimes.join(", ");
                 template_list.push(format!(
                     "{} - runtimes: [{}], packages: {}",
-                    t.name,
+                    sanitize_terminal_text(&t.name),
                     runtimes,
                     t.packages.len()
                 ));
@@ -571,15 +585,23 @@ pub mod golden_path {
     }
 
     pub fn delete(name: &str, _ctx: &CliContext) -> Result<()> {
-        let mut config = GoldenPathConfig::load()?;
-        let original_len = config.templates.len();
-        config.templates.retain(|t| t.name != name);
-
-        if config.templates.len() < original_len {
-            config.save()?;
-            execute_cmd(Cmd::success(format!("Deleted template '{name}'")))?;
+        let deleted = {
+            let path = GoldenPathConfig::path();
+            let _guard = GoldenPathConfig::lock(&path)?;
+            let mut config = GoldenPathConfig::load_at(&path)?;
+            let original_len = config.templates.len();
+            config.templates.retain(|t| t.name != name);
+            let deleted = config.templates.len() < original_len;
+            if deleted {
+                config.save_at(&path)?;
+            }
+            deleted
+        };
+        let label = sanitize_terminal_text(name);
+        if deleted {
+            execute_cmd(Cmd::success(format!("Deleted template '{label}'")))?;
         } else {
-            execute_cmd(Cmd::warning(format!("Template '{name}' not found")))?;
+            execute_cmd(Cmd::warning(format!("Template '{label}' not found")))?;
         }
 
         Ok(())
@@ -665,4 +687,28 @@ pub async fn activity(days: u32, _ctx: &CliContext) -> Result<()> {
     ]))?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::team_remote;
+
+    #[test]
+    fn team_remote_accepts_gist_urls_and_normalizes_bare_ids() {
+        for (input, expected) in [
+            ("0123abcdef", "https://gist.github.com/0123abcdef"),
+            (
+                "https://gist.github.com/0123abcdef",
+                "https://gist.github.com/0123abcdef",
+            ),
+            (
+                "https://gist.github.com/ci/0123abcdef",
+                "https://gist.github.com/ci/0123abcdef",
+            ),
+        ] {
+            let (url, id) = team_remote(input).expect("accepted team remote");
+            assert_eq!(url, expected);
+            assert_eq!(id, "0123abcdef");
+        }
+    }
 }

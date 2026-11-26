@@ -8,7 +8,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::ErrorKind;
 use std::path::Path;
 
-fn lock_regular_file(path: &Path) -> Result<File> {
+pub(crate) fn lock_regular_file(path: &Path) -> Result<File> {
     let check_type = |metadata: fs::Metadata| {
         ensure!(
             metadata.is_file(),

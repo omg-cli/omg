@@ -866,6 +866,172 @@ exec {shlex.quote(str(native_executable))} "$@"
             run("status-lock-reused", status_args, ("members in sync",), umask=0o777,
                 inspect=lambda: is_private_file(status_lock) and status_lock.read_bytes() == b"")
 
+    def inspect_team_commands():
+        import tomllib
+
+        phase = "team-commands"
+        with tempfile.TemporaryDirectory(prefix="team-commands-", dir=work) as directory:
+            here = Path(directory)
+            os.chown(here, account.pw_uid, account.pw_gid)
+            profile = here / "profile"
+            isolated = dict(disabled, HOME=str(here), OMG_CONFIG_DIR=str(profile),
+                            XDG_DATA_HOME=str(here/"data"), XDG_CONFIG_HOME=str(here/"config"),
+                            XDG_CACHE_HOME=str(here/"cache"), XDG_STATE_HOME=str(here/"state"))
+            team = here / ".omg/team.toml"
+            status = here / ".omg/team-status.json"
+            lock = here / "omg.lock"
+            templates = profile / "golden-paths.toml"
+            templates_guard = profile / "golden-paths.lock"
+
+            def run(label, args, markers=(), *, fails=False, inspect=None, forbidden=()):
+                try:
+                    result = command([cli, "team", *args], isolated, ordinary, timeout=6)
+                except subprocess.TimeoutExpired:
+                    checks.append(dict(phase=phase, case=label, passed=False, status=None,
+                                       diagnostic="command exceeded local deadline"))
+                    return
+                output = result.stdout + result.stderr
+                okay = ((result.returncode != 0) == fails
+                        and all(marker in output for marker in markers)
+                        and all(marker not in output for marker in forbidden)
+                        and (inspect is None or inspect()))
+                checks.append(dict(phase=phase, case=label, passed=okay, status=result.returncode,
+                                   diagnostic=output[-1200:]))
+
+            def contents():
+                return tomllib.loads(templates.read_text())["templates"]
+
+            def workspace_absent():
+                return not team.parent.exists() and not lock.exists()
+
+            for action in ("status", "push", "pull"):
+                run(f"{action}-missing-workspace", (action,), ("Not a team workspace",),
+                    fails=True, inspect=workspace_absent)
+            run("bad-team-id", ("init", "bad id"), ("Invalid team ID",),
+                fails=True, inspect=workspace_absent)
+            run("team-name-newline", ("init", "fixture/team", "--name", "line\nbreak"),
+                ("Invalid team name",), fails=True, inspect=workspace_absent)
+            run("team-name-over-limit", ("init", "fixture/team", "--name", "a"*129),
+                ("Invalid team name",), fails=True, inspect=workspace_absent)
+            run("init", ("init", "fixture/team", "--name", "Équipe"), ("Équipe",))
+            original_config = team.read_bytes()
+            original_status = status.read_bytes()
+            run("init-existing", ("init", "other/team"), ("already initialized",), fails=True,
+                inspect=lambda: (team.read_bytes(), status.read_bytes()) == (original_config, original_status))
+            run("pull-no-lock", ("pull",), ("No team omg.lock",), fails=True,
+                inspect=lambda: not lock.exists(),
+                forbidden=("Environment is in sync",))
+            run("push", ("push",), ("Team lock updated",), inspect=lock.is_file)
+            run("pull-matching-lock", ("pull",), ("Environment is in sync",))
+            saved_lock = lock.read_bytes()
+            lock.write_text("runtimes = [\n")
+            run("pull-broken-lock", ("pull",), fails=True, forbidden=("Environment is in sync",))
+            lock.write_bytes(saved_lock)
+
+            # Rejected inputs must leave the persisted remote and lock alone.
+            for label, url in (
+                ("wrong-scheme", "http://gist.github.com/ci/0123abcdef"),
+                ("wrong-host", "https://example.invalid/ci/0123abcdef"),
+                ("missing-id", "https://gist.github.com/"),
+                ("short-id", "https://gist.github.com/ci/abc"),
+                ("nonhex-id", "https://gist.github.com/ci/example"),
+                ("query", "https://gist.github.com/ci/0123abcdef?view=1"),
+                ("fragment", "https://gist.github.com/ci/0123abcdef#file"),
+                ("nonstandard-port", "https://gist.github.com:8443/ci/0123abcdef"),
+            ):
+                team.write_bytes(original_config)
+                run(f"join-{label}", ("join", url), fails=True,
+                    inspect=lambda: team.read_bytes() == original_config and lock.read_bytes() == saved_lock)
+            team.write_bytes(original_config)
+            status_data = json.loads(status.read_bytes())
+            peer = dict(status_data["members"][0], id="fixture-peer", name="peer\u2028fixture")
+            status_data["members"].append(peer)
+            status.write_text(json.dumps(status_data))
+            original_name = 'name = "Équipe"'.encode()
+            assert original_name in original_config
+            team.write_bytes(original_config.replace(original_name, 'name = "Équipe\u2028fixture"'.encode()))
+            run("status-keeps-fields-on-one-line", ("status",), ("Équipefixture", "peerfixture"),
+                forbidden=("\u2028",),
+                inspect=lambda: any(member["name"] == peer["name"]
+                                    for member in json.loads(status.read_bytes())["members"]))
+            team.write_bytes(original_config)
+            status.write_bytes(original_status)
+            run("status-restored", ("status",), ("Équipe", "members in sync"))
+
+            def gp(*args):
+                return ("golden-path", *args)
+
+            run("templates-empty", gp("list"), ("No custom templates",))
+            run("template-empty-name", gp("create", ""), ("Invalid template name",), fails=True,
+                inspect=lambda: not templates.exists())
+            templates.unlink(missing_ok=True)
+            run("template-bad-name", gp("create", "bad name"), ("Invalid template name",),
+                fails=True, inspect=lambda: not templates.exists())
+            run("template-bad-version", gp("create", "valid", "--node", "20 21"),
+                ("Invalid Node version",), fails=True, inspect=lambda: not templates.exists())
+            run("template-empty-package", gp("create", "valid", "--packages", "python,"),
+                ("Invalid package name",), fails=True, inspect=lambda: not templates.exists())
+            run("template-create", gp("create", "starter", "--python", "3.12", "--node", "20"),
+                ("created",), inspect=lambda: len(contents()) == 1)
+            run("template-replace", gp("create", "starter", "--python", "3.13", "--node", "22"),
+                ("created",), inspect=lambda: [entry["runtimes"] for entry in contents()]
+                == [{"node": "22", "python": "3.13"}])
+            run("template-list-ordered", gp("list"), ("starter - runtimes: [node, python]",))
+            original_templates = templates.read_bytes()
+            run("template-delete-missing", gp("delete", "missing"), ("not found",),
+                inspect=lambda: templates.read_bytes() == original_templates)
+
+            templates_guard.touch()
+            os.chown(templates_guard, account.pw_uid, account.pw_gid)
+            with templates_guard.open("rb") as guard:
+                fcntl.flock(guard, fcntl.LOCK_EX)
+                with subprocess.Popen([str(cli), "team", *gp("create", "second")], cwd=here,
+                                      env=isolated, text=True, stdin=subprocess.DEVNULL,
+                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, **ordinary) as child:
+                    try:
+                        child.wait(timeout=0.55)
+                        waited = False
+                    except subprocess.TimeoutExpired:
+                        waited = True
+                    preserved = templates.read_bytes() == original_templates
+                    run("template-read-during-write", gp("list"), ("starter",), forbidden=("second",))
+                    fcntl.flock(guard, fcntl.LOCK_UN)
+                    try:
+                        output, errors = child.communicate(timeout=8)
+                    except subprocess.TimeoutExpired:
+                        child.kill()
+                        output, errors = child.communicate()
+                        waited = False
+            checks.append(dict(phase=phase, case="template-writer-waits", status=child.returncode,
+                               passed=(waited and preserved and child.returncode == 0
+                                       and {entry["name"] for entry in contents()} == {"starter", "second"}),
+                               diagnostic=(output + errors)[-1200:]))
+            run("template-delete", gp("delete", "second"), ("Deleted template",),
+                inspect=lambda: [entry["name"] for entry in contents()] == ["starter"])
+
+            original_templates = templates.read_bytes()
+            limit = 16 * 1024 * 1024
+            templates.write_bytes(original_templates.ljust(limit, b" "))
+            run("template-file-at-bound", gp("list"), ("starter",))
+            templates.write_bytes(original_templates.ljust(limit + 1, b" "))
+            run("template-file-above-bound", gp("list"), ("Golden path config exceeds",), fails=True)
+            templates.unlink()
+            reference = here / "template-source"
+            reference.write_bytes(original_templates)
+            templates.symlink_to(reference)
+            run("template-file-symlink", gp("list"), ("Golden path config must be a regular file",),
+                fails=True, inspect=lambda: reference.read_bytes() == original_templates)
+            templates.unlink()
+            templates.mkdir()
+            run("template-file-directory", gp("list"), ("Golden path config must be a regular file",), fails=True)
+            templates.rmdir()
+            os.mkfifo(templates, 0o644)
+            run("template-file-fifo", gp("list"), ("Golden path config must be a regular file",), fails=True)
+            templates.unlink()
+            templates.write_bytes(original_templates)
+            run("template-file-restored", gp("list"), ("starter",))
+
+
     def inspect_environment_lockfiles():
         phase = "environment-lockfiles"
         with tempfile.TemporaryDirectory(prefix="environment-locks-", dir=work) as directory:
@@ -2562,6 +2728,7 @@ exec {shlex.quote(str(binary))} "$@"
                     inspect_artifact_signature_inputs()
                     inspect_environment_lockfiles()
                     inspect_team_storage()
+                    inspect_team_commands()
                 config.write_text(alternate_config)
                 refresh_fixture()
                 expected = ordinary_control([dnf, "--cacheonly", "repoquery",
@@ -2879,6 +3046,6 @@ assert inventory() == before
 report = dict(binaries=binaries, checks=checks, total=len(checks),
               passed=sum(entry["passed"] for entry in checks), host_unchanged=True)
 print(json.dumps(report))
-expected_checks = 303 if consent_oracle is None else 1083
+expected_checks = 303 if consent_oracle is None else 1123
 if report["passed"] != report["total"] or report["total"] != expected_checks:
     sys.exit(4)

@@ -102,10 +102,10 @@ fn current_member_id() -> String {
     whoami::username().unwrap_or_else(|_| "unknown".to_string())
 }
 
-const MAX_TEAM_FILE_BYTES: u64 = 16 * 1024 * 1024;
+pub(crate) const MAX_TEAM_FILE_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Read a bounded snapshot from a regular team file opened without following the final link.
-fn read_regular_file(path: &Path, what: &str) -> Result<String> {
+pub(crate) fn read_regular_file(path: &Path, what: &str) -> Result<String> {
     let check_type = |metadata: &std::fs::Metadata| {
         anyhow::ensure!(
             metadata.is_file(),
@@ -265,8 +265,8 @@ impl TeamWorkspace {
             anyhow::bail!(
                 "This directory is already initialized as team '{}' ({}). \
                  Remove .omg/team.toml first if you really want to re-initialize.",
-                existing.name,
-                existing.team_id
+                crate::cli::style::sanitize_terminal_text(&existing.name),
+                crate::cli::style::sanitize_terminal_text(&existing.team_id)
             );
         }
         let hooks_dir = self.preflight_git_hooks()?;
@@ -387,26 +387,36 @@ impl TeamWorkspace {
 
     /// Update local member status
     pub async fn update_status(&self) -> Result<TeamStatus> {
+        self.update_status_with_lock(false).await
+    }
+
+    async fn update_status_with_lock(&self, require_lock: bool) -> Result<TeamStatus> {
         let root = self.root.clone();
-        let (guard, mut status) = tokio::task::spawn_blocking(move || {
+        let (guard, mut status, lock) = tokio::task::spawn_blocking(move || {
             Self::validate_config_dir(&root)?;
             let guard = super::lock_regular_file(&root.join(".omg/team-status.lock"))?;
             let status = Self::load_status_at(&root)?;
-            Ok::<_, anyhow::Error>((guard, status))
+            let lock_path = root.join("omg.lock");
+            let lock = match std::fs::symlink_metadata(&lock_path) {
+                Ok(_) => Some(EnvironmentState::load(&lock_path)?),
+                Err(error) if error.kind() == ErrorKind::NotFound => {
+                    anyhow::ensure!(
+                        !require_lock,
+                        "No team omg.lock found. Run 'omg team push' or obtain the team's lockfile."
+                    );
+                    None
+                }
+                Err(error) => return Err(error).context("Failed to inspect the team omg.lock"),
+            };
+            Ok::<_, anyhow::Error>((guard, status, lock))
         })
         .await
         .context("Team status read task failed")??;
 
         let current_env = EnvironmentState::capture().await?;
-
-        // Load team lock if exists
-        let lock_path = self.root.join("omg.lock");
-        let (in_sync, lock_hash) = if lock_path.exists() {
-            let lock = EnvironmentState::load(&lock_path)?;
-            (current_env.matches_inventory(&lock), lock.hash)
-        } else {
-            (true, String::new())
-        };
+        let in_sync = lock
+            .as_ref()
+            .is_none_or(|lock| current_env.matches_inventory(lock));
 
         let member = TeamMember {
             id: status.config.member_id.clone(),
@@ -428,7 +438,7 @@ impl TeamWorkspace {
             status.members.push(member);
         }
 
-        status.lock_hash = lock_hash;
+        status.lock_hash = lock.map_or_else(String::new, |lock| lock.hash);
         status.updated_at = jiff::Timestamp::now().as_second();
 
         let status_path = self.status_path();
@@ -514,8 +524,11 @@ impl TeamWorkspace {
         }
 
         // Update status and return whether we're in sync
-        let status = self.update_status().await?;
-        let member = status.members.iter().find(|m| m.id == config.member_id);
+        let status = self.update_status_with_lock(true).await?;
+        let member = status
+            .members
+            .iter()
+            .find(|m| m.id == status.config.member_id);
 
         Ok(member.is_some_and(|m| m.in_sync))
     }
