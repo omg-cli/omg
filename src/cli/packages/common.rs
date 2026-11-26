@@ -176,7 +176,8 @@ pub(crate) async fn update_official_only(
     let daemon_updates = async {
         // DNF keeps metadata in the caller's cache. Even a same-user daemon
         // can have a different home and therefore a different update list.
-        if pm.name() == "dnf" {
+        #[cfg(feature = "fedora")]
+        if fedora {
             return None;
         }
         try_daemon_list_updates().await

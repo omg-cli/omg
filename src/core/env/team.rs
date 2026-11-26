@@ -389,15 +389,7 @@ impl TeamWorkspace {
         let lock_path = self.root.join("omg.lock");
         let lock_hash = match lock_update {
             LockUpdate::Replace => current_env.hash.clone(),
-            LockUpdate::Keep => match lock_path.symlink_metadata() {
-                Ok(_) => EnvironmentState::load(&lock_path)?.hash,
-                Err(error) if error.kind() == ErrorKind::NotFound => String::new(),
-                Err(error) => {
-                    return Err(error).with_context(|| {
-                        format!("Failed to inspect team lockfile {}", lock_path.display())
-                    });
-                }
-            },
+            LockUpdate::Keep => current_lock_hash(&lock_path)?,
         };
 
         let in_sync = lock_hash.is_empty() || current_env.hash == lock_hash;
@@ -653,6 +645,15 @@ fi
         }
 
         Ok(())
+    }
+}
+
+fn current_lock_hash(path: &Path) -> Result<String> {
+    match path.symlink_metadata() {
+        Ok(_) => Ok(EnvironmentState::load(path)?.hash),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(String::new()),
+        Err(error) => Err(error)
+            .with_context(|| format!("Failed to inspect team lockfile {}", path.display())),
     }
 }
 
@@ -1054,6 +1055,56 @@ mod tests {
         std::fs::write(workspace.config_path(), toml::to_string(&config)?)?;
         assert!(workspace.load_status().is_err());
         assert_eq!(std::fs::read(workspace.status_path())?, persisted);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn team_lock_lookup_distinguishes_missing_and_invalid_parent() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let parent = directory.path().join("not-a-directory");
+        std::fs::write(&parent, "regular file")?;
+        assert_eq!(current_lock_hash(&directory.path().join("omg.lock"))?, "");
+        let rejected = current_lock_hash(&parent.join("omg.lock"))
+            .expect_err("an invalid parent is not a missing team lockfile");
+        assert!(
+            rejected
+                .to_string()
+                .contains("Failed to inspect team lockfile")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn team_status_refuses_a_directory_at_its_lock_path() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut workspace = TeamWorkspace::new(directory.path())?;
+        workspace.init("fixture-team", "Fixture")?;
+        let mut state = EnvironmentState {
+            schema_version: EnvironmentState::SCHEMA_VERSION,
+            runtimes: std::collections::BTreeMap::new(),
+            packages: Vec::new(),
+            timestamp: 0,
+            hash: String::new(),
+        };
+        state.hash = state.calculate_hash();
+        state.save(directory.path().join("omg.lock"))?;
+        let status = workspace.persist_status(&state, LockUpdate::Keep)?;
+        assert_eq!(status.lock_hash, state.hash);
+        let before = std::fs::read(workspace.status_path())?;
+        let lock = workspace.status_path().with_extension("lock");
+        std::fs::remove_file(&lock)?;
+        std::fs::create_dir(&lock)?;
+        let rejected = workspace
+            .persist_status(&state, LockUpdate::Keep)
+            .expect_err("directory cannot be opened as the status lock");
+        assert!(
+            rejected
+                .to_string()
+                .contains("Failed to open team status lock")
+        );
+        assert!(lock.is_dir());
+        assert_eq!(std::fs::read(workspace.status_path())?, before);
         Ok(())
     }
 

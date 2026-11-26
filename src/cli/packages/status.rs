@@ -55,24 +55,14 @@ async fn status_json(fast: bool) -> Result<()> {
     let start = std::time::Instant::now();
 
     #[cfg(unix)]
-    let daemon_counts = {
-        #[cfg(feature = "fedora")]
-        let local_counts_only = uses_fedora_status();
-        #[cfg(not(feature = "fedora"))]
-        let local_counts_only = false;
-        if local_counts_only {
-            None
-        } else {
-            query_daemon_status(fast).await.map(|status| {
-                PackageStatus::from((
-                    status.total_packages,
-                    status.explicit_packages,
-                    status.orphan_packages,
-                    status.updates_available,
-                ))
-            })
-        }
-    };
+    let daemon_counts = query_daemon_status().await.map(|status| {
+        PackageStatus::from((
+            status.total_packages,
+            status.explicit_packages,
+            status.orphan_packages,
+            status.updates_available,
+        ))
+    });
     #[cfg(not(unix))]
     let daemon_counts: Option<PackageStatus> = None;
 
@@ -108,11 +98,9 @@ pub(crate) fn uses_fedora_status() -> bool {
 }
 
 #[cfg(unix)]
-async fn query_daemon_status(fast: bool) -> Option<StatusResult> {
-    #[cfg(not(feature = "fedora"))]
-    let _ = fast;
+async fn query_daemon_status() -> Option<StatusResult> {
     #[cfg(feature = "fedora")]
-    if fast && uses_fedora_status() {
+    if uses_fedora_status() {
         return None;
     }
     tokio::time::timeout(std::time::Duration::from_millis(500), async {
@@ -208,7 +196,7 @@ async fn status_fallback(fast: bool) -> Result<()> {
     }
 
     #[cfg(unix)]
-    if let Some(status) = query_daemon_status(fast).await {
+    if let Some(status) = query_daemon_status().await {
         display_status_report(
             status.total_packages,
             status.explicit_packages,

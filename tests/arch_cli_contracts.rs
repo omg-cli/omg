@@ -37,7 +37,7 @@ async fn native_daemon_supplies_info_and_prompt_counters() -> Result<()> {
     use futures::{SinkExt, StreamExt};
     use omg_lib::daemon::protocol::{
         DetailedPackageInfo, ExplicitResult, PackageInfo, Request, Response, ResponseResult,
-        SearchResult, StatusResult, WirePackageSource, encode_frame, split_frame,
+        SearchResult, StatusMetadata, StatusResult, WirePackageSource, encode_frame, split_frame,
     };
     use std::os::unix::fs::PermissionsExt as _;
     use std::time::Duration;
@@ -62,6 +62,9 @@ async fn native_daemon_supplies_info_and_prompt_counters() -> Result<()> {
             "oc",
             "ec",
             "explicit",
+            "explicit-fallback",
+            "status",
+            "status-fallback",
             "search",
         ] {
             let (stream, _) =
@@ -88,7 +91,7 @@ async fn native_daemon_supplies_info_and_prompt_counters() -> Result<()> {
                         source: WirePackageSource::Official,
                     })
                 }
-                ("oc", Request::Status { .. }) => ResponseResult::Status(StatusResult {
+                ("oc" | "status", Request::Status { .. }) => ResponseResult::Status(StatusResult {
                     total_packages: 9,
                     explicit_packages: 5,
                     orphan_packages: 3,
@@ -102,6 +105,13 @@ async fn native_daemon_supplies_info_and_prompt_counters() -> Result<()> {
                 ("explicit", Request::Explicit { .. }) => {
                     ResponseResult::Explicit(ExplicitResult {
                         packages: vec!["private-explicit-fixture".into()],
+                    })
+                }
+                ("explicit-fallback", Request::Explicit { .. })
+                | ("status-fallback", Request::Status { .. }) => {
+                    ResponseResult::StatusMetadata(StatusMetadata {
+                        runtime_versions: Vec::new(),
+                        rpm_advisories: None,
                     })
                 }
                 (
@@ -149,6 +159,24 @@ async fn native_daemon_supplies_info_and_prompt_counters() -> Result<()> {
                 "{}",
                 output.stdout
             );
+        }
+        let explicit = project.run_native_arch_daemon_query(&socket, &["explicit"]);
+        explicit.assert_success();
+        assert!(
+            explicit
+                .stdout
+                .lines()
+                .any(|line| line.trim() == "· application"),
+            "{}",
+            explicit.stdout
+        );
+        for (total, explicit) in [(9, 5), (2, 1)] {
+            let status =
+                project.run_native_arch_daemon_query(&socket, &["status", "--fast", "--json"]);
+            status.assert_success();
+            let status: serde_json::Value = serde_json::from_str(&status.stdout)?;
+            assert_eq!(status["total_packages"], total);
+            assert_eq!(status["explicit_packages"], explicit);
         }
         let search = project.run_native_arch_daemon_query(
             &socket,

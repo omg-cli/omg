@@ -616,7 +616,9 @@ async fn status_reports_backend_corruption_without_cached_success_and_recovers_o
         }
         other => panic!("corrupt backend status returned {other:?}"),
     }
-    match request_on_wire(&fixture, Request::StatusMetadata { id: 743 }).await? {
+    let metadata_request = Request::StatusMetadata { id: 743 };
+    assert_eq!(metadata_request.variant_name(), "status_metadata");
+    match request_on_wire(&fixture, metadata_request).await? {
         Response::Success {
             id: 743,
             result: ResponseResult::StatusMetadata(metadata),
