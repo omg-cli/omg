@@ -34,7 +34,7 @@ pub(super) struct RepositoryObservation {
 impl RepositoryObservation {
     pub(super) fn capture(root: &Path) -> Result<Self> {
         let paths = ResolvedRepositoryPaths::capture(root, true)?.paths;
-        let fingerprint = paths.fingerprint()?;
+        let fingerprint = paths.fingerprint_for_daemon()?;
         let metadata_ages = paths.age_policies.as_ref().and_then(|policies| {
             match policies
                 .iter()
@@ -56,7 +56,7 @@ impl RepositoryObservation {
     }
 
     pub(super) fn is_current(&self) -> Result<bool> {
-        Ok(self.paths.fingerprint()? == self.fingerprint)
+        Ok(self.paths.fingerprint_for_daemon()? == self.fingerprint)
     }
 
     pub(super) fn metadata_is_fresh(&self) -> Result<bool> {
@@ -89,10 +89,6 @@ impl DirectCatalogScope {
         anyhow::ensure!(
             database.root == Path::new("/") && !crate::core::is_root(),
             "DNF search cache requires the ordinary host installroot"
-        );
-        anyhow::ensure!(
-            std::env::var_os("DNF5_PLUGINS_DIR").is_none(),
-            "Custom DNF plugins require native catalog loading"
         );
         let options = ["--dump-repo-config=*", "--dump-variables"];
         let report = read_dnf_settings(&options)?;
@@ -292,7 +288,6 @@ fn standard_repository_exists() -> Result<bool> {
     use std::os::unix::fs::MetadataExt as _;
 
     if !super::rpm_database::uses_default_repository_paths()
-        || std::env::var_os("DNF5_PLUGINS_DIR").is_some()
         || !crate::core::privilege::root_controlled_program_path("dnf")?.ends_with("dnf5")
     {
         return Ok(false);
@@ -402,12 +397,14 @@ impl StatusRepositories {
         {
             let controls = paths.paths.configuration_fingerprint()?;
             if controls == paths.control_revision {
-                return paths.paths.catalog_fingerprint(controls);
+                return paths.paths.catalog_fingerprint(controls, false);
             }
         }
 
         let paths = ResolvedRepositoryPaths::capture(root, false)?;
-        let revision = paths.paths.catalog_fingerprint(paths.control_revision)?;
+        let revision = paths
+            .paths
+            .catalog_fingerprint(paths.control_revision, false)?;
         self.paths = Some(paths);
         Ok(revision)
     }
@@ -577,11 +574,33 @@ impl RepositoryPaths {
         Ok(hash.finalize().into())
     }
 
-    fn catalog_fingerprint(&self, controls: [u8; 32]) -> Result<[u8; 32]> {
+    fn catalog_fingerprint(&self, controls: [u8; 32], observe_payloads: bool) -> Result<[u8; 32]> {
         let mut files = Vec::new();
         for directory in &self.caches {
             for repository in cached_repositories(directory)? {
-                files.push(repository.join("repodata/repomd.xml"));
+                let repodata = repository.join("repodata");
+                let always_refreshes = observe_payloads
+                    && self.age_policies.as_ref().is_some_and(|policies| {
+                        policies.iter().any(|policy| {
+                            policy.refreshes_every_query() && policy.directory() == repository
+                        })
+                    });
+                // A zero lifetime refresh can touch existing payloads during
+                // the native query. Fence that load with the manifest and
+                // keep the result ineligible for reuse.
+                if observe_payloads && !always_refreshes {
+                    // The live index also depends on the payloads described by
+                    // the manifest. Solver files can churn while loading rows.
+                    for entry in directory_entries(&repodata)?.into_iter().flatten() {
+                        let entry = entry?;
+                        let kind = entry.file_type()?;
+                        if kind.is_file() || kind.is_symlink() {
+                            files.push(entry.path());
+                        }
+                    }
+                } else {
+                    files.push(repodata.join("repomd.xml"));
+                }
                 if self.observe_expiration {
                     files.push(repository.join("attrs/expired"));
                 }
@@ -595,7 +614,11 @@ impl RepositoryPaths {
     }
 
     fn fingerprint(&self) -> Result<[u8; 32]> {
-        self.catalog_fingerprint(self.configuration_fingerprint()?)
+        self.catalog_fingerprint(self.configuration_fingerprint()?, false)
+    }
+
+    fn fingerprint_for_daemon(&self) -> Result<[u8; 32]> {
+        self.catalog_fingerprint(self.configuration_fingerprint()?, true)
     }
 }
 
@@ -803,7 +826,7 @@ mod tests {
         let policy = config.join("fixture.repo");
         fs::write(&policy, "enabled=1")?;
         fs::write(&manifest, "original")?;
-        let fingerprint = paths.fingerprint()?;
+        let fingerprint = paths.fingerprint_for_daemon()?;
         let observed = RepositoryObservation {
             paths,
             fingerprint,
@@ -817,7 +840,7 @@ mod tests {
         let mut catalog_paths = observed.paths.clone();
         catalog_paths.observe_expiration = true;
         let catalog = RepositoryObservation {
-            fingerprint: catalog_paths.fingerprint()?,
+            fingerprint: catalog_paths.fingerprint_for_daemon()?,
             paths: catalog_paths,
             metadata_ages: None,
         };
@@ -831,7 +854,7 @@ mod tests {
 
         fs::write(&policy, "enabled=0\n")?;
         assert!(!observed.is_current()?);
-        let fingerprint = observed.paths.fingerprint()?;
+        let fingerprint = observed.paths.fingerprint_for_daemon()?;
         let observed = RepositoryObservation {
             paths: observed.paths,
             fingerprint,
@@ -839,6 +862,61 @@ mod tests {
         };
         fs::write(&manifest, "updated metadata")?;
         assert!(!observed.is_current()?);
+        Ok(())
+    }
+
+    #[test]
+    fn daemon_observation_tracks_repository_payload_generations() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let cache = fixture.path().join("cache");
+        let repository = cache.join("fixture-a1");
+        let repodata = repository.join("repodata");
+        fs::create_dir_all(&repodata)?;
+        fs::create_dir(repository.join("solv"))?;
+        let primary = repodata.join("primary.xml.gz");
+        fs::write(repodata.join("repomd.xml"), b"manifest")?;
+        fs::write(&primary, b"original")?;
+        let paths = RepositoryPaths {
+            caches: vec![cache],
+            observe_expiration: true,
+            ..RepositoryPaths::default()
+        };
+        let observation = RepositoryObservation {
+            fingerprint: paths.fingerprint_for_daemon()?,
+            paths,
+            metadata_ages: None,
+        };
+        fs::write(repository.join("solv/fixture.solv"), b"derived")?;
+        assert!(observation.is_current()?);
+        let replacement = fixture.path().join("replacement");
+        fs::write(&replacement, b"modified")?;
+        fs::rename(replacement, &primary)?;
+        assert!(
+            !observation.is_current()?,
+            "a new primary payload invalidates the index"
+        );
+
+        let observation = RepositoryObservation {
+            fingerprint: observation.paths.fingerprint_for_daemon()?,
+            paths: observation.paths,
+            metadata_ages: None,
+        };
+        fs::remove_file(&primary)?;
+        assert!(
+            !observation.is_current()?,
+            "a missing primary payload invalidates the index"
+        );
+
+        let observation = RepositoryObservation {
+            fingerprint: observation.paths.fingerprint_for_daemon()?,
+            paths: observation.paths,
+            metadata_ages: None,
+        };
+        fs::write(repodata.join("primary.xml.zck"), b"alternate")?;
+        assert!(
+            !observation.is_current()?,
+            "a newly available payload invalidates the index"
+        );
         Ok(())
     }
 

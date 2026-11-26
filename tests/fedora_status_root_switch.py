@@ -8316,10 +8316,10 @@ exec {shlex.quote(str(binary))} "$@"
                 initial = "Catalog-QZ Direct Generation ΩΣ"
                 updated = "Catalog-QZ Revalidated Generation ΩΣ"
 
-                def search(label, query, summary, calls):
+                def search(label, query, summary, calls, mode=disabled):
                     before = drop.read_bytes().count(b"\n")
                     started = time.perf_counter_ns()
-                    result = command([cli, "--json", "search", "--limit", "1", query], disabled, ordinary)
+                    result = command([cli, "--json", "search", "--limit", "1", query], mode, ordinary)
                     duration_ms = (time.perf_counter_ns() - started) / 1_000_000
                     observed = drop.read_bytes().count(b"\n") - before
                     value = None
@@ -8387,6 +8387,33 @@ exec {shlex.quote(str(binary))} "$@"
                     search("expired-native", identity, updated, 1)
                     search("refreshed-seed", identity, updated, 1)
                     search("refreshed-reuse", identity, updated, 0)
+
+                    empty_plugins = root / "empty-dnf-plugins"
+                    empty_plugins.mkdir()
+                    for variable in ("DNF5_PLUGINS_DIR", "LIBDNF_PLUGINS_CONFIG_DIR"):
+                        mode = dict(disabled, **{variable: str(empty_plugins)})
+                        search(f"warm-with-{variable}", identity, updated, 0, mode)
+
+                    requests_before = request_counters()
+                    search("daemon-seed", identity, updated, 1, env)
+                    search("daemon-warm", identity, updated, 0, env)
+                    cached_manifest, = native_cache.glob("signed-fixture-*/repodata/repomd.xml")
+                    primary = cached_manifest.with_name("primary-direct-updated.xml.gz")
+                    original_primary = primary.stat()
+                    original_manifest = cached_manifest.stat()
+                    replacement = primary.with_suffix(".replacement")
+                    shutil.copy2(primary, replacement)
+                    os.chown(replacement, original_primary.st_uid, original_primary.st_gid)
+                    replacement.replace(primary)
+                    assert primary.stat().st_ino != original_primary.st_ino
+                    assert primary.stat().st_mtime_ns == original_primary.st_mtime_ns
+                    assert cached_manifest.stat() == original_manifest
+                    search("daemon-native-after-primary-replacement", identity, updated, 1, env)
+                    search("daemon-warm-after-primary-replacement", identity, updated, 0, env)
+                    total, failed = request_counters()
+                    calls = (total - requests_before[0] - 1, failed - requests_before[1])
+                    checks.append(dict(phase=phase, case="daemon-payload-ipc",
+                                       passed=calls == (4, 0), value=calls))
 
                     rpm_path = Path(checked([rpm, "--eval", "%{_dbpath}"]).strip()).resolve(strict=True)
                     snapshot = work / "direct-catalog-rpmdb"
@@ -8807,6 +8834,6 @@ mark_progress("completed with host inventory unchanged")
 report = dict(binaries=binaries, checks=checks, total=len(checks),
               passed=sum(entry["passed"] for entry in checks), host_unchanged=True)
 print(json.dumps(report))
-expected_checks = 303 if consent_oracle is None else 2744
+expected_checks = 303 if consent_oracle is None else 2751
 if report["passed"] != report["total"] or report["total"] != expected_checks:
     sys.exit(4)

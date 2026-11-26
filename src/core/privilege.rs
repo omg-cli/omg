@@ -505,6 +505,8 @@ const PRIVILEGED_ENV_SCRUB: &[&str] = &[
     "DPKG_ROOT",
     "DPKG_ADMINDIR",
     "RPM_CONFIGDIR",
+    "DNF5_PLUGINS_DIR",
+    "LIBDNF_PLUGINS_CONFIG_DIR",
     "DNF0",
     "DNF1",
     "DNF2",
@@ -1999,14 +2001,15 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn system_command_does_not_pass_legacy_dnf_repository_variables() {
+    fn system_command_does_not_pass_dnf_configuration_variables() {
         if crate::core::testing::run_isolated_test(
-            "core::privilege::tests::system_command_does_not_pass_legacy_dnf_repository_variables",
+            "core::privilege::tests::system_command_does_not_pass_dnf_configuration_variables",
         ) {
             return;
         }
         let variables = (0..10)
             .map(|index| format!("DNF{index}"))
+            .chain(["DNF5_PLUGINS_DIR", "LIBDNF_PLUGINS_CONFIG_DIR"].map(str::to_owned))
             .collect::<Vec<_>>();
         let values = variables
             .iter()
@@ -2024,7 +2027,7 @@ mod tests {
                     .unwrap();
                 assert!(
                     output.stdout.is_empty(),
-                    "legacy repository variable {variable} must not reach native commands"
+                    "DNF configuration variable {variable} must not reach native commands"
                 );
                 assert_eq!(
                     output.status.code(),

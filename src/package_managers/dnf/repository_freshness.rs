@@ -71,6 +71,10 @@ impl RepositoryAgePolicy {
         &self.repository
     }
 
+    pub(super) fn refreshes_every_query(&self) -> bool {
+        self.interval_seconds == 0
+    }
+
     pub(super) fn read(&self) -> Result<RepositoryAge> {
         self.read_primary(false)
     }
@@ -192,8 +196,9 @@ pub(super) struct RepositoryAge {
 
 impl RepositoryAge {
     pub(super) fn is_fresh(&self, now: i64) -> Result<bool> {
-        Ok(metadata_timestamp(&self.primary)?
-            .is_some_and(|mtime| now.saturating_sub(mtime) < self.interval_seconds))
+        Ok(self.interval_seconds > 0
+            && metadata_timestamp(&self.primary)?
+                .is_some_and(|mtime| now.saturating_sub(mtime) < self.interval_seconds))
     }
 }
 
@@ -229,6 +234,11 @@ mod tests {
         policy.prefer_zchunk = false;
         assert!(policy.read()?.is_fresh(1_049)?);
         assert!(!policy.read()?.is_fresh(1_050)?);
+        policy.interval_seconds = 0;
+        assert!(
+            !policy.read()?.is_fresh(1_019)?,
+            "a future timestamp cannot override zero expiry"
+        );
         Ok(())
     }
 }
