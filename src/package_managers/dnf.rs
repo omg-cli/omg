@@ -3503,18 +3503,23 @@ impl DnfPackageManager {
                     let result = tokio::time::timeout(
                         std::time::Duration::from_secs(1),
                         &mut diagnostics,
-                    ).await.unwrap_or(Ok(()));
+                    ).await.unwrap_or_else(|_| Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "Timed out reading DNF diagnostics",
+                    )));
                     (status?, result)
                 }
             }
         };
-        if let Err(error) = diagnostic_result {
+        if cache_cleanup && status.success() {
+            if removal_failed || repository_failed {
+                return Err(std::io::Error::other(
+                    "DNF reported package cache cleanup errors",
+                ));
+            }
+            diagnostic_result?;
+        } else if let Err(error) = diagnostic_result {
             tracing::debug!(%error, "Could not forward DNF diagnostics");
-        }
-        if cache_cleanup && status.success() && (removal_failed || repository_failed) {
-            return Err(std::io::Error::other(
-                "DNF reported package cache cleanup errors",
-            ));
         }
         Ok(status)
     }
@@ -3573,8 +3578,8 @@ impl DnfPackageManager {
             }
         })
         .await?;
-        if forward {
-            terminal.flush()?;
+        if forward && let Err(error) = terminal.flush() {
+            tracing::debug!(%error, "Could not flush DNF diagnostics to terminal");
         }
         Ok(())
     }
@@ -6115,6 +6120,11 @@ mod tests {
             .success()
         );
         assert_eq!(run(&format!("{repository}; exit 7"), true)?.code(), Some(7));
+
+        let incomplete = "(sleep 2) & exit 0";
+        let error =
+            run(incomplete, true).expect_err("cleanup requires complete native diagnostics");
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
         Ok(())
     }
 
