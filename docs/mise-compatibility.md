@@ -68,7 +68,7 @@ Relative directive paths use the declaring configuration root. Environment files
 
 ## Project tasks
 
-OMG accepts shorthand string tasks and task tables with `run`, `depends`, `dir`, `env`, `description`, and `hide`. A `run` value may be a string or an array of strings. Commands run in sequence and stop at the first failure.
+OMG accepts shorthand string tasks and task tables with `run`, `depends`, `dir`, `env`, `description`, and `hide`. A `run` value may be a string or an array of strings. OMG runs the commands in sequence in one `sh` process with `errexit` enabled. An unhandled command failure stops the task.
 
 ```toml
 [tasks]
@@ -82,7 +82,7 @@ omg run build --using mise
 
 Dependencies run once, in declared order, before the requested task. OMG checks for missing dependencies and cycles before it starts. Arguments after `--` go only to the requested task. Task-local environment values do not flow into dependencies. A task runs from its declaring configuration root by default; a literal `dir` changes that directory relative to the root.
 
-Task names requested through `omg run` may contain only ASCII letters, digits, `-`, `_`, and `.`. The file parser may accept a dependency name that you cannot request directly because it contains a colon. Use a supported top-level name or the native mise command for that task.
+Task names requested through `omg run` can contain ASCII letters, digits, `-`, `_`, `.`, and `:`. A task name cannot start with `-`.
 
 OMG rejects unsupported execution properties instead of ignoring them. These include `task_config`, post-dependencies, conditional controls, custom shells, file tasks, dependency arguments or patterns, and templates in `run` or `dir`. Tasks run sequentially; the supported subset does not claim identical mise scheduling or visibility behavior.
 

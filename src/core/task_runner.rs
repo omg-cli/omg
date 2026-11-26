@@ -396,7 +396,7 @@ impl TaskDetector {
             tasks.push(Task {
                 name: task.name.clone(),
                 command: "sh".to_string(),
-                args: vec!["-c".to_string(), task.script(), task.name.clone()],
+                args: task.shell_args().into(),
                 source: task
                     .source
                     .strip_prefix(&self.current_dir)
@@ -943,7 +943,7 @@ fn execute_native_mise_task(directory: &Path, name: &str, extra_args: &[String])
         if native.runs.is_empty() {
             continue;
         }
-        let args = vec!["-c".to_string(), native.script(), native.name.clone()];
+        let args = native.shell_args();
         let forwarded = if native.name == name { extra_args } else { &[] };
         execute_process_in(
             "sh",
@@ -3543,14 +3543,27 @@ var_colon ::= value
         .unwrap();
         let detector = TaskDetector::new(dir.path().to_path_buf()).unwrap();
         let tasks = detector.detect().unwrap();
-        let hello = tasks.iter().find(|task| task.name == "hello").unwrap();
-        assert_eq!(hello.command, "sh");
-        assert_eq!(hello.args, vec!["-c", "{\necho hi\n}", "hello"]);
-        assert_eq!(hello.source, "mise.toml");
-        assert!(matches!(hello.ecosystem, Ecosystem::Mise));
-        let build = tasks.iter().find(|task| task.name == "build").unwrap();
-        assert_eq!(build.args[1], "{\necho a\n} && {\necho b\n}");
-        assert!(tasks.iter().all(|task| task.name != "nodeps"));
+        let names: Vec<_> = tasks.iter().map(|task| task.name.as_str()).collect();
+        assert_eq!(names, ["build", "hello"]);
+        for task in &tasks {
+            assert_eq!(task.source, "mise.toml");
+            assert!(matches!(task.ecosystem, Ecosystem::Mise));
+            #[cfg(unix)]
+            {
+                let expected = if task.name == "build" {
+                    "a\nb\n"
+                } else {
+                    "hi\n"
+                };
+                let output = Command::new(&task.command)
+                    .args(&task.args)
+                    .current_dir(dir.path())
+                    .output()
+                    .unwrap();
+                assert!(output.status.success(), "{:?}", output.stderr);
+                assert_eq!(output.stdout, expected.as_bytes());
+            }
+        }
     }
 
     #[test]
@@ -3669,26 +3682,34 @@ var_colon ::= value
         let dir = TempDir::new().unwrap();
         fs::write(
             dir.path().join("mise.toml"),
-            "[tasks.with_env]\nrun = \"echo hi\"\n[tasks.with_env.env]\nA = \"1\"\n[tasks.plain]\nrun = \"echo yo\"\n[tasks.with_object]\nrun = \"echo obj\"\n[tasks.with_object.env]\nA = { value = \"x\" }\n",
+            r#"[tasks.with_env]
+run = "echo hi"
+env.A = "fixture-plain-env-value"
+[tasks.plain]
+run = "echo yo"
+[tasks.with_object]
+run = "echo obj"
+env.A = { value = "fixture-object-env-value" }
+"#,
         )
         .unwrap();
         let detector = TaskDetector::new(dir.path().to_path_buf()).unwrap();
         let tasks = detector.detect().unwrap();
-        let with_env = tasks.iter().find(|task| task.name == "with_env").unwrap();
-        assert_eq!(with_env.args[1], "{\necho hi\n}");
-        let plain = tasks.iter().find(|task| task.name == "plain").unwrap();
-        assert_eq!(plain.args[1], "{\necho yo\n}");
-        let with_object = tasks
-            .iter()
-            .find(|task| task.name == "with_object")
-            .unwrap();
-        assert_eq!(with_object.args[1], "{\necho obj\n}");
+        let names: Vec<_> = tasks.iter().map(|task| task.name.as_str()).collect();
+        assert_eq!(names, ["plain", "with_env", "with_object"]);
+        for task in &tasks {
+            let argv = std::iter::once(&task.command).chain(&task.args);
+            for argument in argv {
+                assert!(!argument.contains("fixture-plain-env-value"));
+                assert!(!argument.contains("fixture-object-env-value"));
+            }
+        }
     }
 
     #[test]
     fn mise_steps_stop_after_failure_and_preserve_first_argument() {
         let dir = TempDir::new().unwrap();
-        fs::write(dir.path().join("mise.toml"), "[tasks.stop]\nrun = ['false', 'echo skipped; echo must_not_run']\n[tasks.args]\nrun = 'printf %s \"$1\"'\n").unwrap();
+        fs::write(dir.path().join("mise.toml"), "[tasks.stop]\nrun = ['false; echo must_not_run', 'echo must_not_run']\n[tasks.args]\nrun = 'printf %s \"$1\"'\n").unwrap();
         let tasks = TaskDetector::new(dir.path().to_path_buf())
             .unwrap()
             .detect()

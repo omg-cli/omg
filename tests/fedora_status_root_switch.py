@@ -2831,6 +2831,140 @@ env.OMG_FIXTURE_TASK = "changed"
                 writable=("mise.local.toml",), initial_args=("ready", "planned"), version=next_node)
 
 
+    def inspect_mise_task_execution():
+        phase = "mise-task-execution"
+        ok = "printf '%s\\n' 'fixture:target'"
+        forbidden = "touch unexpected; printf '%s\\n' 'fixture:unexpected'"
+        failed = 'Mise task "fixture" failed'
+
+        def task(label, steps):
+            value = json.dumps(steps, ensure_ascii=False)
+            return f"[tasks.{label}]\nrun = {value}\n"
+
+        def dependency(label, names, steps=None):
+            return (task(label, steps) if steps is not None else f"[tasks.{label}]\n") + (
+                "depends = " + json.dumps(names) + "\n")
+
+        with tempfile.TemporaryDirectory(prefix="mise-task-execution-", dir=work) as directory:
+            home = Path(directory)
+            os.chown(home, account.pw_uid, account.pw_gid)
+            env = dict(disabled, HOME=str(home), XDG_CONFIG_HOME=str(home/"config"),
+                       XDG_DATA_HOME=str(home/"data"), XDG_CACHE_HOME=str(home/"cache"),
+                       XDG_RUNTIME_DIR=str(home/"run"), XDG_STATE_HOME=str(home/"state"))
+            (home / "run").mkdir(mode=0o700)
+            os.chown(home / "run", account.pw_uid, account.pw_gid)
+
+            def run(case, content, *, expected=(), error=None, parent=None, files=(),
+                    args=(), name="fixture", overlay=None):
+                outer = home / case
+                outer.mkdir()
+                project = outer / "project"
+                project.mkdir()
+                os.chown(project, account.pw_uid, account.pw_gid)
+                if parent is not None:
+                    (outer / "mise.toml").write_text(parent)
+                (project / "mise.toml").write_text(content)
+                launch = env
+                if overlay is not None:
+                    (project / "mise.test.toml").write_text(overlay)
+                    launch = dict(env, MISE_ENV="test")
+                for subdir in files:
+                    path = project / subdir
+                    path.mkdir(parents=True)
+                    os.chown(path, account.pw_uid, account.pw_gid)
+                result = subprocess.run([cli, "run", name, "--using", "mise", "--", *args],
+                                        cwd=project, env=launch, stdin=subprocess.DEVNULL,
+                                        text=True, capture_output=True, timeout=10, **ordinary)
+                output = [line.removeprefix("fixture:") for line in result.stdout.splitlines()
+                          if line.startswith("fixture:")]
+                still_clean = not (project / "unexpected").exists() and not (outer / "unexpected").exists()
+                status_ok = (result.returncode == 0 if error is None else
+                             result.returncode != 0 and error in result.stderr)
+                checks.append(dict(phase=phase, case=case, status=result.returncode,
+                                   passed=(status_ok and output == list(expected) and still_clean),
+                                   output=output, expected_output=list(expected), unexpected_write=not still_clean,
+                                   diagnostic=(result.stdout + result.stderr)[-1000:]))
+
+            for label, steps, output in [
+                ("single-multiline-failure", "false\n" + forbidden, ()),
+                ("single-semicolon-failure", "false; " + forbidden, ()),
+                ("single-shell-group-failure", "{ false; " + forbidden + "; }", ()),
+                ("single-function-failure", "step() { return 7; }\nstep\n" + forbidden, ()),
+                ("single-subshell-failure", "(exit 9)\n" + forbidden, ()),
+                ("single-pipeline-failure", "true | false\n" + forbidden, ()),
+                ("first-array-step-failure", ["false\n" + forbidden, forbidden], ()),
+                ("middle-array-step-failure", [ok, "false\n" + forbidden, forbidden], ("target",)),
+                ("last-array-step-failure", [ok, "false\n" + forbidden], ("target",)),
+                ("explicit-exit-failure", ["exit 27", forbidden], ()),
+                ("array-short-circuit-status", ["false && true", forbidden], ()),
+                ("array-errexit-disabled-status", ["set +e\nfalse", forbidden], ()),
+            ]:
+                run(label, task("fixture", steps), expected=output, error=failed)
+
+            for label, steps in [
+                ("explicit-recovery", "false || true\n" + ok),
+                ("conditional-test", "if false; then " + forbidden + "; else " + ok + "; fi"),
+                ("negated-command", "! false\n" + ok),
+                ("pipeline-last-command-wins", "false | true\n" + ok),
+                ("early-short-circuit-is-handled", "false && { " + forbidden + "; }\n" + ok),
+                ("explicit-errexit-opt-out", "set +e\nfalse\n" + ok),
+                ("empty-array-entry", ["", ok]),
+                ("comment-array-entry", ["# explicit no-op", ok]),
+            ]:
+                run(label, task("fixture", steps), expected=("target",))
+
+            run("comment-only-task", task("fixture", "# no work"))
+            run("explicit-successful-exit", task("fixture", ["exit 0", forbidden]))
+
+            setup = task("setup", "printf 'fixture:setup:%s:%s\\n' \"$#\" \"${TASK_LOCAL-unset}\"")
+            left = dependency("left", "setup", "printf '%s\\n' 'fixture:left'")
+            right = dependency("right", ["setup"], "printf '%s\\n' 'fixture:right'")
+            run("diamond-with-args-only-on-root",
+                setup + left + right + dependency("fixture", ["left", "right"],
+                    "printf 'fixture:args:%s:%s:%s\\n' \"$0\" \"$1\" \"$2\"") +
+                    "env.TASK_LOCAL = 'root-only'\n",
+                expected=("setup:0:unset", "left", "right", "args:fixture:two words:--literal"),
+                args=("two words", "--literal"))
+            run("dependency-only-root", setup + left + right + dependency("fixture", ["right", "left"]),
+                expected=("setup:0:unset", "right", "left"))
+            run("repeated-direct-dependency", setup + dependency("fixture", ["setup", "setup"], ok),
+                expected=("setup:0:unset", "target"))
+            run("array-shares-shell-state", task("fixture", [
+                    "export TASK_LOCAL=kept; cd child", "printf 'fixture:%s:%s\\n' \"$TASK_LOCAL\" \"${PWD##*/}\"",
+                ]), expected=("kept:child",), files=("child",))
+            run("parent-declaring-root",
+                "", parent=task("fixture", "printf 'fixture:%s\\n' \"${PWD##*/}\""),
+                expected=("parent-declaring-root",))
+            run("dependency-creates-target-directory",
+                task("setup", "mkdir built") + dependency("fixture", ["setup"],
+                    "printf 'fixture:%s\\n' \"${PWD##*/}\"") + "dir = 'built'\n",
+                expected=("built",))
+            run("selected-task-replaces-whole-declaration",
+                dependency("fixture", ["missing"], forbidden) + "env.TASK_LOCAL = 'older'\n",
+                overlay=task("fixture", "printf 'fixture:%s\\n' \"${TASK_LOCAL-unset}\""),
+                expected=("unset",))
+            run("colon-task-name", '[tasks."fixture:colon"]\nrun = ' + json.dumps(ok) + "\n",
+                name="fixture:colon", expected=("target",))
+            run("missing-dependency-invalidates-whole-graph",
+                task("setup", forbidden) + dependency("fixture", ["setup", "absent"], forbidden),
+                error="Missing mise task dependency: absent")
+            run("cycle-invalidates-whole-graph",
+                task("setup", forbidden) + dependency("other", "fixture", forbidden) +
+                dependency("fixture", ["setup", "other"], forbidden),
+                error="Mise task dependency cycle at fixture")
+            run("failed-dependency-stops-dependent",
+                task("setup", "false\n" + forbidden) + dependency("fixture", ["setup"], forbidden),
+                error='Mise task "setup" failed')
+            run("invalid-later-shell-syntax-runs-no-step", task("fixture", [forbidden, "if"]),
+                error=failed)
+            run("unsupported-task-property-invalidates-graph",
+                task("setup", forbidden) + dependency("fixture", "setup", forbidden) + "shell = 'sh -c'\n",
+                error="Unsupported mise task property: shell")
+            run("invalid-dependency-shape-runs-no-task",
+                task("setup", forbidden) + dependency("fixture", ["setup", "different task"], forbidden),
+                error="expected a plain task name")
+
+
     def inspect_environment_lockfiles():
         phase = "environment-lockfiles"
         with tempfile.TemporaryDirectory(prefix="environment-locks-", dir=work) as directory:
@@ -4539,6 +4673,7 @@ exec {shlex.quote(str(binary))} "$@"
                     inspect_task_runtime_admissions()
                     inspect_task_environment_bytes()
                     inspect_task_package_metadata()
+                    inspect_mise_task_execution()
                 config.write_text(alternate_config)
                 refresh_fixture()
                 expected = ordinary_control([dnf, "--cacheonly", "repoquery",
@@ -4856,6 +4991,6 @@ assert inventory() == before
 report = dict(binaries=binaries, checks=checks, total=len(checks),
               passed=sum(entry["passed"] for entry in checks), host_unchanged=True)
 print(json.dumps(report))
-expected_checks = 303 if consent_oracle is None else 1486
+expected_checks = 303 if consent_oracle is None else 1522
 if report["passed"] != report["total"] or report["total"] != expected_checks:
     sys.exit(4)

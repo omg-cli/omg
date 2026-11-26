@@ -18,12 +18,17 @@ pub(crate) struct NativeTask {
 }
 
 impl NativeTask {
-    pub fn script(&self) -> String {
-        self.runs
-            .iter()
-            .map(|run| format!("{{\n{run}\n}}"))
-            .collect::<Vec<_>>()
-            .join(" && ")
+    pub fn shell_args(&self) -> [String; 3] {
+        // The outer group parses every entry before execution. Check each
+        // step after it runs so an && condition cannot suppress errexit inside it.
+        let mut script = String::from("{\n:\n");
+        for run in &self.runs {
+            script.push_str("{\n:\n");
+            script.push_str(run);
+            script.push_str("\n}\ncase $? in 0) ;; *) exit $? ;; esac\n");
+        }
+        script.push_str("}\n");
+        ["-ec".to_owned(), script, self.name.clone()]
     }
 }
 
