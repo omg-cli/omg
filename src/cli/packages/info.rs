@@ -21,6 +21,7 @@ const DAEMON_INFO_TIMEOUT: Duration = Duration::from_secs(3);
 #[cfg(feature = "arch")]
 const AUR_INFO_TIMEOUT: Duration = Duration::from_secs(8);
 
+#[cfg(any(unix, feature = "fedora", feature = "macos", test))]
 #[derive(Clone, Copy, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 enum DnfInfoSource {
@@ -30,7 +31,9 @@ enum DnfInfoSource {
     Dnf,
 }
 
+#[cfg(any(unix, feature = "fedora", feature = "macos", test))]
 impl DnfInfoSource {
+    #[cfg(any(feature = "fedora", feature = "macos", target_os = "macos", test))]
     fn from_installed(installed: bool) -> Self {
         if installed {
             Self::RpmDatabase
@@ -49,6 +52,7 @@ impl DnfInfoSource {
         }
     }
 
+    #[cfg(any(unix, feature = "fedora", feature = "macos", test))]
     fn label(self) -> &'static str {
         match self {
             Self::RpmDatabase => "Installed RPM database",
@@ -174,20 +178,27 @@ fn daemon_installation_selector(
     std::borrow::Cow::Borrowed(&info.name)
 }
 
-/// Helper to display detailed info from daemon
+#[cfg(unix)]
+fn daemon_info_source_label(
+    info: &crate::daemon::protocol::DetailedPackageInfo,
+    backend: crate::package_managers::Backend,
+) -> String {
+    if backend == crate::package_managers::Backend::Fedora {
+        DnfInfoSource::from_daemon_repo(&info.repo).label().into()
+    } else if info.source == WirePackageSource::Official {
+        format!("Official repository ({})", style::info(&info.repo))
+    } else {
+        style::warning("AUR (Arch User Repository)")
+    }
+}
+
 #[cfg(unix)]
 fn display_detailed_info(
     info: &crate::daemon::protocol::DetailedPackageInfo,
     backend: crate::package_managers::Backend,
 ) -> Result<()> {
     let selector = daemon_installation_selector(backend, info);
-    let source_label = if backend == crate::package_managers::Backend::Fedora {
-        DnfInfoSource::from_daemon_repo(&info.repo).label().into()
-    } else if info.source == WirePackageSource::Official {
-        format!("Official repository ({})", style::info(&info.repo))
-    } else {
-        style::warning("AUR (Arch User Repository)")
-    };
+    let source_label = daemon_info_source_label(info, backend);
     #[cfg(not(target_os = "macos"))]
     let installed = crate::package_managers::is_installed_fast(&selector)
         .context("Failed to query local package installation state")?;
@@ -238,6 +249,27 @@ fn daemon_info_json(
         }
     }
     Ok(value)
+}
+
+#[cfg(any(feature = "fedora", feature = "macos", target_os = "macos", test))]
+fn format_native_manager_info_json(
+    info: &crate::core::Package,
+    backend: crate::package_managers::Backend,
+) -> Result<String> {
+    let mut value = serde_json::to_value(info).context("Failed to serialize package info")?;
+    if backend == crate::package_managers::Backend::Fedora {
+        value["source"] = serde_json::json!(DnfInfoSource::from_installed(info.installed));
+    }
+    serde_json::to_string_pretty(&value).context("Failed to serialize package info as JSON")
+}
+
+#[cfg(any(feature = "fedora", feature = "macos", target_os = "macos", test))]
+fn native_manager_info_source_label(manager: &str, installed: bool) -> String {
+    if manager == "dnf" {
+        DnfInfoSource::from_installed(installed).label().into()
+    } else {
+        format!("Official repository ({manager})")
+    }
 }
 
 pub async fn info(package: &str) -> Result<()> {
@@ -367,18 +399,11 @@ async fn info_json(package: &str) -> Result<()> {
         }
     }
 
+    #[cfg(any(feature = "fedora", feature = "macos", target_os = "macos"))]
     if pm.name() != "pacman"
         && let Some(info) = pm.info(package).await?
     {
-        let mut value = serde_json::to_value(&info).context("Failed to serialize package info")?;
-        if backend == crate::package_managers::Backend::Fedora {
-            value["source"] = serde_json::json!(DnfInfoSource::from_installed(info.installed));
-        }
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&value)
-                .context("Failed to serialize package info as JSON")?
-        );
+        println!("{}", format_native_manager_info_json(&info, backend)?);
         return Ok(());
     }
     anyhow::bail!("Package '{package}' not found")
@@ -407,18 +432,18 @@ async fn info_fallback(
         anyhow::bail!("Package '{package}' not found. Try: omg search {package}");
     }
 
-    let pm = get_package_manager()?;
-    if pm.name() != "pacman" {
+    #[cfg(any(feature = "fedora", feature = "macos", target_os = "macos"))]
+    if matches!(
+        crate::package_managers::resolve_backend()?,
+        crate::package_managers::Backend::Fedora | crate::package_managers::Backend::MacOS
+    ) {
+        let pm = get_package_manager()?;
         let info = pm
             .info(package)
             .await?
             .with_context(|| format!("Package '{package}' not found. Try: omg search {package}"))?;
         let version = info.version.to_string();
-        let source = if pm.name() == "dnf" {
-            DnfInfoSource::from_installed(info.installed).label().into()
-        } else {
-            format!("Official repository ({})", pm.name())
-        };
+        let source = native_manager_info_source_label(pm.name(), info.installed);
         ui::print_package_info(
             &ui::InfoCore {
                 name: &info.name,
@@ -640,15 +665,16 @@ mod tests {
             assert_eq!(value["installed"], installed);
         }
 
-        for (repo, source, installed, expected_repo) in [
+        for (repo, source, installed, expected_repo, label) in [
             (
                 crate::daemon::protocol::DNF_SYSTEM_REPO,
                 "rpm_database",
                 false,
                 "@System",
+                "Installed RPM database",
             ),
-            ("", "dnf_repository", true, ""),
-            ("official", "dnf", true, ""),
+            ("", "dnf_repository", true, "", "Configured DNF repository"),
+            ("official", "dnf", true, "", "DNF (repository unspecified)"),
         ] {
             info.repo = repo.into();
             let value = super::daemon_info_json(&info, installed, Backend::Fedora)
@@ -656,7 +682,16 @@ mod tests {
             assert_eq!(value["source"], source);
             assert_eq!(value["repo"], expected_repo);
             assert_eq!(value["installed"], installed);
+            assert_eq!(
+                super::daemon_info_source_label(&info, Backend::Fedora),
+                label
+            );
         }
+        info.source = WirePackageSource::Aur;
+        assert!(
+            super::daemon_info_source_label(&info, Backend::Arch)
+                .contains("AUR (Arch User Repository)")
+        );
     }
 
     #[cfg(unix)]
@@ -712,6 +747,43 @@ mod tests {
                 .is_none()
         );
         assert_eq!(std::fs::read_dir(directory.path())?.count(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn direct_package_info_labels_installed_and_available_rpm_builds() -> anyhow::Result<()> {
+        use crate::package_managers::Backend;
+        let directory = tempfile::tempdir()?;
+        let manager =
+            crate::package_managers::mock::MockPackageManager::new_in("arch", directory.path());
+        let mut info = super::manager_info(&manager, "git")
+            .await?
+            .expect("catalog package");
+
+        for (installed, source, label) in [
+            (true, "rpm_database", "Installed RPM database"),
+            (false, "dnf_repository", "Configured DNF repository"),
+        ] {
+            info.installed = installed;
+            let rendered = super::format_native_manager_info_json(&info, Backend::Fedora)?;
+            let value: serde_json::Value = serde_json::from_str(&rendered)?;
+            assert_eq!(value["source"], source);
+            assert_eq!(value["installed"], installed);
+            assert_eq!(value["name"], "git");
+            assert_eq!(
+                super::native_manager_info_source_label("dnf", installed),
+                label
+            );
+        }
+        let homebrew = super::format_native_manager_info_json(&info, Backend::MacOS)?;
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&homebrew)?,
+            serde_json::to_value(&info)?
+        );
+        assert_eq!(
+            super::native_manager_info_source_label("brew", false),
+            "Official repository (brew)"
+        );
         Ok(())
     }
 
