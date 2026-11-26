@@ -403,7 +403,20 @@ async fn run_counter(counter: FastCounter, json: bool) -> Result<()> {
         return Ok(());
     }
     let manager = omg_lib::package_managers::get_package_manager()?;
-    let (total, explicit, orphans, updates) = manager.get_status(false).await?;
+    #[cfg(feature = "fedora")]
+    let counts = match (manager.name(), counter) {
+        ("dnf", FastCounter::Orphan) => (
+            0,
+            0,
+            omg_lib::package_managers::DnfPackageManager::orphan_count().await?,
+            0,
+        ),
+        ("dnf", FastCounter::Updates) => (0, 0, 0, manager.list_updates().await?.len()),
+        _ => manager.get_status(false).await?,
+    };
+    #[cfg(not(feature = "fedora"))]
+    let counts = manager.get_status(false).await?;
+    let (total, explicit, orphans, updates) = counts;
     print_fast_counter(
         counter,
         total.try_into()?,

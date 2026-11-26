@@ -408,11 +408,8 @@ async fn handle_fedora_clean(
 
     let manager = DnfPackageManager::new();
     if !orphans && !cache && !all {
-        let packages = DnfPackageManager::orphan_packages().await?;
-        println!(
-            "{} orphan packages can be removed (omg clean --orphans)",
-            packages.len()
-        );
+        let count = DnfPackageManager::orphan_count().await?;
+        println!("{count} orphan packages can be removed (omg clean --orphans)");
         println!("To clear downloaded package archives: omg clean --cache");
         return Ok(());
     }

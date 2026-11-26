@@ -2854,6 +2854,15 @@ impl DnfPackageManager {
         Self::parse_versioned_packages(&output)
     }
 
+    /// Count packages DNF reports as unneeded.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the DNF query fails or its output is invalid.
+    pub async fn orphan_count() -> Result<usize> {
+        Ok(Self::unneeded_packages().await?.len())
+    }
+
     pub(crate) async fn orphan_packages() -> Result<Vec<String>> {
         Ok(Self::unneeded_packages()
             .await?
@@ -3282,9 +3291,9 @@ impl PackageManager for DnfPackageManager {
             let (orphans, updates) = if fast {
                 (0, 0)
             } else {
-                let (unneeded, upgrades) =
-                    tokio::try_join!(Self::unneeded_packages(), self.list_updates())?;
-                (unneeded.len(), upgrades.len())
+                let (orphans, upgrades) =
+                    tokio::try_join!(Self::orphan_count(), self.list_updates())?;
+                (orphans, upgrades.len())
             };
 
             Ok((total, explicit, orphans, updates))

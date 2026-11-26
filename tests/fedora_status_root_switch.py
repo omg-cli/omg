@@ -511,6 +511,38 @@ exec {shlex.quote(str(native_executable))} "$@"
                 checks.append(dict(phase=phase, case=f"blocked-update-native-{label}", passed=passed,
                                    status=result.returncode, diagnostic=(result.stderr or result.stdout)[-900:]))
 
+    def inspect_independent_counters(phase, expected_orphans, expected_updates):
+        for option, expected in (("--unneeded", expected_orphans), ("--upgrades", expected_updates)):
+            packages = ordinary_control([dnf, "--cacheonly", "repoquery", option, "--qf", r"%{name}\n"])
+            assert packages.splitlines() == [package] * expected, (phase, option, packages)
+        for blocked in ("--unneeded", "--upgrades"):
+            with reject_native_selection(blocked):
+                for label, args, matching_option, expected in (
+                    ("json-oc", ["--json", "oc"], "--unneeded", {"count": expected_orphans}),
+                    ("text-oc", ["oc"], "--unneeded", expected_orphans),
+                    ("json-uc", ["--json", "uc"], "--upgrades", {"count": expected_updates}),
+                    ("text-uc", ["uc"], "--upgrades", expected_updates),
+                    ("full-status", ["--json", "status"], blocked, None),
+                ):
+                    result = command([cli, *args], disabled, ordinary)
+                    diagnostic = "Unexpected DNF selection subprocess" in result.stderr
+                    if blocked == matching_option:
+                        passed = result.returncode != 0 and not result.stdout.strip() and diagnostic
+                    else:
+                        try:
+                            if isinstance(expected, dict):
+                                actual = json.loads(result.stdout)
+                                correct = (isinstance(actual, dict) and type(actual.get("count")) is int
+                                           and actual == expected)
+                            else:
+                                correct = result.stdout == f"{expected}\n"
+                        except ValueError:
+                            correct = False
+                        passed = result.returncode == 0 and not diagnostic and correct
+                    checks.append(dict(phase=phase, case=f"{label}-without-{blocked[2:]}",
+                                       passed=passed, status=result.returncode,
+                                       diagnostic=(result.stderr or result.stdout)[-750:]))
+
     def inspect_advisory_details(phase, matches_installed):
         with reject_native_selection("info", after="advisory"):
             result = command([cli, "audit", "scan", "--fail-on-findings"], disabled, ordinary)
@@ -1473,6 +1505,7 @@ exec {shlex.quote(str(binary))} "$@"
                     inspect_update_query_refusal("update-empty-native-upgrades", "--upgrades", False)
                     inspect_overlapping_status("status-metadata-only", 0)
                     inspect_status_inventory_scope("status-metadata-only", 0, custom_state)
+                    inspect_independent_counters("independent-counters-empty", 0, 0)
 
                 manifest.write_bytes(original_manifest)
                 sign_manifest()
@@ -1483,6 +1516,11 @@ exec {shlex.quote(str(binary))} "$@"
                     inspect_update_query_refusal("update-present-native-installed", "--installed", False)
                     inspect_overlapping_status("status-metadata-restored", 1)
                     inspect_status_inventory_scope("status-metadata-restored", 1, custom_state)
+                    mark("dependency")
+                    try:
+                        inspect_independent_counters("independent-counters-populated", 1, 1)
+                    finally:
+                        mark("user")
                     pending = custom_state / "omg-fixture.new"
                     pending.touch(exist_ok=False)
                     try:
@@ -1578,6 +1616,6 @@ assert inventory() == before
 report = dict(binaries=binaries, checks=checks, total=len(checks),
               passed=sum(entry["passed"] for entry in checks), host_unchanged=True)
 print(json.dumps(report))
-expected_checks = 303 if consent_oracle is None else 582
+expected_checks = 303 if consent_oracle is None else 602
 if report["passed"] != report["total"] or report["total"] != expected_checks:
     sys.exit(4)
