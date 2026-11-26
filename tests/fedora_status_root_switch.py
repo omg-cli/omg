@@ -611,13 +611,14 @@ exec {shlex.quote(str(native_executable))} "$@"
 
 
 
-    def audit_fixture_segment(tag, count, *, legacy=False, broken_link=False, severities=None):
+    def audit_fixture_segment(tag, count, *, legacy=False, broken_link=False, severities=None, description_size=0):
         previous = "genesis"
         rows = []
         for sequence in range(count):
-            row = dict(id=f"{tag}-{sequence}", timestamp=f"2026-01-01T12:00:0{sequence}Z",
+            row = dict(id=f"{tag}-{sequence}", timestamp=f"2026-01-01T12:00:{sequence:02d}Z",
                        event_type="policy_violation", severity=severities[sequence] if severities is not None else "info", user="fixture",
-                       resource=f"{tag}-{sequence}", description=f"Inventory event {sequence}", prev_hash=previous)
+                       resource=f"{tag}-{sequence}", description=f"Inventory event {sequence}" + "x" * description_size,
+                       prev_hash=previous)
             if broken_link and sequence == 1:
                 row["prev_hash"] = "unlinked"
             parts = [row["id"], row["timestamp"], "PolicyViolation", row["severity"].capitalize(),
@@ -701,6 +702,72 @@ exec {shlex.quote(str(native_executable))} "$@"
                                diagnostic=(result.stdout + result.stderr)[-1200:]))
 
 
+
+    def inspect_audit_record_windows():
+        phases = ("short", "large", "long-record", "crlf", "separator-window", "missing-hash")
+        cases = (
+            ("text-one", ["log", "--limit", "1"], 1, None, False),
+            ("text-recent", ["log"], 20, None, False),
+            ("text-error", ["log", "--severity", "error", "--limit", "2"], 2, "error", False),
+            ("json-one", ["log", "--limit", "1"], 1, None, True),
+            ("json-error", ["log", "--severity", "error", "--limit", "2"], 2, "error", True),
+            ("verify", ["verify"], 0, None, False),
+        )
+        for phase in phases:
+            data = Path(tempfile.mkdtemp(prefix=f"audit-record-window-{phase}-", dir=work))
+            os.chown(data, account.pw_uid, account.pw_gid)
+            directory = data / "audit"
+            directory.mkdir(mode=0o700)
+            os.chown(directory, account.pw_uid, account.pw_gid)
+            active = directory / "audit.jsonl"
+            count = 24 if phase in ("large", "crlf") else 4
+            severities = ["error" if index % 3 == 1 else "info" for index in range(count)]
+            entries = audit_fixture_segment("window", count, severities=severities,
+                                            description_size=4000 if phase == "long-record" else 0)
+            if phase == "missing-hash":
+                del entries[-1]["hash"]
+            write_audit_fixture_segment(active, entries)
+            if phase == "crlf":
+                active.write_bytes(active.read_bytes().replace(b"\n", b"\r\n"))
+            if phase == "separator-window":
+                with active.open("ab") as file:
+                    file.write(b"\n" * (128 * 1024 + 12))
+            before = active.read_bytes()
+            if phase == "short":
+                assert len(before) < 4096
+            elif phase in ("large", "long-record", "crlf"):
+                assert 4096 < len(before) < 128 * 1024
+            if phase == "long-record":
+                assert len(before.splitlines()[-1]) > 4096
+            mode = dict(disabled, OMG_DATA_DIR=str(data))
+            rejected = {"separator-window": "trailing audit entry exceeds",
+                        "missing-hash": "missing hash"}
+            for label, args, limit, severity, exported in cases:
+                output = data / f"{label}.json"
+                result = command([cli, "audit", *args, *(["--export", output] if exported else [])], mode, ordinary)
+                if phase in rejected:
+                    passed = (result.returncode == 1 and rejected[phase] in result.stderr
+                              and "Local audit chain consistency verified" not in result.stdout
+                              and "No audit entries found." not in result.stdout and not output.exists())
+                elif label == "verify":
+                    passed = (result.returncode == 0 and f"Total: {count} entries" in result.stdout
+                              and f"Valid: {count} entries" in result.stdout
+                              and "Local audit chain consistency verified" in result.stdout)
+                else:
+                    expected = [item for item in reversed(entries)
+                                if severity is None or item["severity"] == severity][:limit]
+                    if exported:
+                        try:
+                            passed = (result.returncode == 0 and stat.S_IMODE(output.stat().st_mode) == 0o600
+                                      and json.loads(output.read_text()) == expected)
+                        except (OSError, ValueError):
+                            passed = False
+                    else:
+                        actual = re.findall(r"(?m)^\s*Resource: (window-\d+)\s*$", result.stdout)
+                        passed = result.returncode == 0 and actual == [item["resource"] for item in expected]
+                assert active.read_bytes() == before
+                checks.append(dict(phase="audit-record-window", case=f"{phase}-{label}", passed=passed,
+                                   status=result.returncode, diagnostic=(result.stdout + result.stderr)[-1000:]))
 
     def inspect_audit_marker_snapshot():
         layout_counts = {"empty": 0, "active": 1, "archived": 2, "mixed": 3, "sparse": 4, "malformed": 4}
@@ -1797,6 +1864,7 @@ exec {shlex.quote(str(binary))} "$@"
                     inspect_audit_segments()
                     inspect_audit_log_selection()
                     inspect_audit_marker_snapshot()
+                    inspect_audit_record_windows()
                 config.write_text(alternate_config)
                 refresh_fixture()
                 expected = ordinary_control([dnf, "--cacheonly", "repoquery",
@@ -2114,6 +2182,6 @@ assert inventory() == before
 report = dict(binaries=binaries, checks=checks, total=len(checks),
               passed=sum(entry["passed"] for entry in checks), host_unchanged=True)
 print(json.dumps(report))
-expected_checks = 303 if consent_oracle is None else 834
+expected_checks = 303 if consent_oracle is None else 870
 if report["passed"] != report["total"] or report["total"] != expected_checks:
     sys.exit(4)

@@ -939,34 +939,25 @@ fn get_last_hash(path: &Path) -> Result<String, AuditError> {
         return Ok("genesis".to_string());
     }
 
-    let max_tail_bytes = u64::try_from(MAX_AUDIT_ENTRY_BYTES + 2).unwrap_or(u64::MAX);
-    let tail_start = length.saturating_sub(max_tail_bytes);
-    file.seek(SeekFrom::Start(tail_start))
-        .map_err(|source| AuditError::Read {
-            path: path.display().to_string(),
-            source,
-        })?;
-    let mut tail = Vec::with_capacity(usize::try_from(length - tail_start).unwrap_or(0));
-    file.read_to_end(&mut tail)
-        .map_err(|source| AuditError::Read {
-            path: path.display().to_string(),
-            source,
-        })?;
+    const SMALL_AUDIT_TAIL_BYTES: usize = 4096;
+    let file_size = usize::try_from(length).unwrap_or(usize::MAX);
+    if file_size > SMALL_AUDIT_TAIL_BYTES {
+        let mut tail = [0; SMALL_AUDIT_TAIL_BYTES];
+        read_audit_tail(&mut file, path, length, &mut tail)?;
+        let (start, line) = audit_tail_line(&tail);
+        if start > 0
+            && let Ok(entry) = serde_json::from_slice::<AuditEntry>(line)
+            && let Some(hash) = entry.hash
+        {
+            return Ok(hash);
+        }
+    }
 
-    while tail
-        .last()
-        .is_some_and(|byte| matches!(byte, b'\n' | b'\r'))
-    {
-        tail.pop();
-    }
-    if tail.is_empty() {
-        return Ok("genesis".to_string());
-    }
-    let line_start = tail
-        .iter()
-        .rposition(|byte| *byte == b'\n')
-        .map_or(0, |index| index + 1);
-    if tail_start > 0 && line_start == 0 {
+    let mut tail = vec![0; file_size.min(MAX_AUDIT_ENTRY_BYTES + 2)];
+    read_audit_tail(&mut file, path, length, &mut tail)?;
+    let complete = tail.len() == file_size;
+    let (line_start, line) = audit_tail_line(&tail);
+    if !complete && line_start == 0 {
         return Err(AuditError::Read {
             path: path.display().to_string(),
             source: io::Error::new(
@@ -975,12 +966,15 @@ fn get_last_hash(path: &Path) -> Result<String, AuditError> {
             ),
         });
     }
-    let line_number = if tail_start == 0 {
+    if line.is_empty() {
+        return Ok("genesis".to_string());
+    }
+    let line_number = if complete {
         memchr::memchr_iter(b'\n', &tail[..line_start]).count() + 1
     } else {
         0
     };
-    let line = std::str::from_utf8(&tail[line_start..]).map_err(|source| AuditError::Read {
+    let line = std::str::from_utf8(line).map_err(|source| AuditError::Read {
         path: path.display().to_string(),
         source: io::Error::new(io::ErrorKind::InvalidData, source),
     })?;
@@ -994,6 +988,30 @@ fn get_last_hash(path: &Path) -> Result<String, AuditError> {
         path: path.display().to_string(),
         line: line_number,
     })
+}
+
+fn read_audit_tail(
+    file: &mut File,
+    path: &Path,
+    length: u64,
+    tail: &mut [u8],
+) -> Result<(), AuditError> {
+    let count = u64::try_from(tail.len()).unwrap_or(u64::MAX);
+    file.seek(SeekFrom::Start(length.saturating_sub(count)))
+        .and_then(|_| file.read_exact(tail))
+        .map_err(|source| AuditError::Read {
+            path: path.display().to_string(),
+            source,
+        })
+}
+
+fn audit_tail_line(tail: &[u8]) -> (usize, &[u8]) {
+    let end = tail
+        .iter()
+        .rposition(|byte| !matches!(byte, b'\n' | b'\r'))
+        .map_or(0, |index| index + 1);
+    let start = memchr::memrchr(b'\n', &tail[..end]).map_or(0, |index| index + 1);
+    (start, &tail[start..end])
 }
 
 /// Report from audit log integrity verification
@@ -1854,6 +1872,69 @@ mod tests {
                 "unexpected audit read error: {error:?}"
             );
         }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn common_audit_tail_does_not_read_the_full_window() -> anyhow::Result<()> {
+        const NAME: &str =
+            "core::security::audit::tests::common_audit_tail_does_not_read_the_full_window";
+        const LOOKUPS: u64 = 16;
+        if crate::core::testing::run_isolated_test(NAME) {
+            return Ok(());
+        }
+        fn read_chars() -> anyhow::Result<u64> {
+            std::fs::read_to_string("/proc/self/io")?
+                .lines()
+                .find_map(|line| line.strip_prefix("rchar: "))
+                .ok_or_else(|| anyhow::anyhow!("missing rchar in process I/O counters"))?
+                .parse()
+                .map_err(Into::into)
+        }
+
+        let root = tempfile::tempdir()?;
+        let path = root.path().join("audit.jsonl");
+        let mut file = File::create(&path)?;
+        let mut entry = AuditEntry {
+            id: String::new(),
+            timestamp: "2026-01-01T12:00:00Z".into(),
+            event_type: AuditEventType::PolicyViolation,
+            severity: AuditSeverity::Info,
+            user: "fixture".into(),
+            resource: "fixture-package".into(),
+            description: "Recorded inventory event".into(),
+            metadata: None,
+            prev_hash: "genesis".into(),
+            hash_version: HASH_VERSION_LENGTH_PREFIXED,
+            hash: None,
+        };
+        for index in 0..800 {
+            entry.id = format!("event-{index}");
+            entry.hash = Some(entry.compute_hash());
+            serde_json::to_writer(&mut file, &entry)?;
+            writeln!(file)?;
+            entry.prev_hash = entry.hash.take().expect("entry hash");
+        }
+        let log_bytes = file.metadata()?.len();
+        assert!(log_bytes > u64::try_from(MAX_AUDIT_ENTRY_BYTES + 2)?);
+        drop(file);
+
+        let before = read_chars()?;
+        let start = std::time::Instant::now();
+        for _ in 0..LOOKUPS {
+            assert_eq!(get_last_hash(&path)?, entry.prev_hash);
+        }
+        let elapsed = start.elapsed();
+        let bytes = read_chars()? - before;
+        println!(
+            "audit_tail_log_bytes={log_bytes} lookups={LOOKUPS} read_bytes={bytes} elapsed_us={}",
+            elapsed.as_micros()
+        );
+        assert!(
+            bytes <= LOOKUPS * 8 * 1024,
+            "small final records read {bytes} bytes in {LOOKUPS} lookups"
+        );
         Ok(())
     }
 
