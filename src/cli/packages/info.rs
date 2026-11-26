@@ -1,6 +1,7 @@
 //! Info/display functionality for packages
 
 use anyhow::{Context, Result};
+use std::io::{self, BufWriter, Write};
 use std::time::Duration;
 
 use crate::cli::{style, ui};
@@ -21,7 +22,7 @@ const DAEMON_INFO_TIMEOUT: Duration = Duration::from_secs(3);
 #[cfg(feature = "arch")]
 const AUR_INFO_TIMEOUT: Duration = Duration::from_secs(8);
 
-fn validate_info_selector(package: &str) -> Result<()> {
+pub(crate) fn validate_info_selector(package: &str) -> Result<()> {
     #[cfg(feature = "fedora")]
     if crate::package_managers::resolve_backend()? == crate::package_managers::Backend::Fedora {
         return crate::package_managers::DnfPackageManager::validate_query_selector(package);
@@ -177,6 +178,18 @@ fn display_detailed_info(
 }
 
 #[cfg(unix)]
+pub(crate) async fn daemon_package_installed(
+    backend: crate::package_managers::Backend,
+    info: &crate::daemon::protocol::DetailedPackageInfo,
+) -> Result<bool> {
+    let selector = daemon_installation_selector(backend, info);
+    get_package_manager()?
+        .is_installed(&selector)
+        .await
+        .context("Failed to query local package installation state")
+}
+
+#[cfg(unix)]
 fn daemon_info_json(
     info: &crate::daemon::protocol::DetailedPackageInfo,
     installed: bool,
@@ -218,12 +231,7 @@ async fn info_json(package: &str) -> Result<()> {
         let info = manager_info(pm.as_ref(), package)
             .await?
             .with_context(|| format!("Package '{package}' not found"))?;
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&info)
-                .context("Failed to serialize package info as JSON")?
-        );
-        return Ok(());
+        return write_info_json(&info);
     }
 
     #[cfg(unix)]
@@ -235,15 +243,8 @@ async fn info_json(package: &str) -> Result<()> {
     {
         // Installation state belongs to the local package database, not the
         // daemon's warm repository record.
-        let selector = daemon_installation_selector(backend, &info);
-        let installed = get_package_manager()?
-            .is_installed(&selector)
-            .await
-            .context("Failed to query local package installation state")?;
-        let json_str = serde_json::to_string_pretty(&daemon_info_json(&info, installed)?)
-            .context("Failed to serialize package info as JSON")?;
-        println!("{json_str}");
-        return Ok(());
+        let installed = daemon_package_installed(backend, &info).await?;
+        return write_info_json(&daemon_info_json(&info, installed)?);
     }
 
     #[cfg(any(feature = "debian", feature = "debian-pure"))]
@@ -270,12 +271,7 @@ async fn info_json(package: &str) -> Result<()> {
             "description": description,
             "installed": installed,
         });
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json_obj)
-                .context("Failed to serialize package info as JSON")?
-        );
-        return Ok(());
+        return write_info_json(&json_obj);
     }
 
     let pm = get_package_manager()?;
@@ -297,26 +293,24 @@ async fn info_json(package: &str) -> Result<()> {
                 "licenses": info.licenses,
                 "installed": info.installed,
             });
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&json_obj)
-                    .context("Failed to serialize package info as JSON")?
-            );
-            return Ok(());
+            return write_info_json(&json_obj);
         }
     }
 
     if pm.name() != "pacman"
         && let Some(info) = pm.info(package).await?
     {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&info)
-                .context("Failed to serialize package info as JSON")?
-        );
-        return Ok(());
+        return write_info_json(&info);
     }
     anyhow::bail!("Package '{package}' not found")
+}
+
+fn write_info_json(info: &impl serde::Serialize) -> Result<()> {
+    let mut output = BufWriter::new(io::stdout().lock());
+    serde_json::to_writer_pretty(&mut output, info)
+        .context("Failed to serialize package info as JSON")?;
+    writeln!(output)?;
+    output.flush().context("Failed to write package info")
 }
 
 async fn info_fallback(package: &str, #[cfg(feature = "arch")] aur_rpc: &str) -> Result<()> {
@@ -364,8 +358,7 @@ async fn info_local_fallback(package: &str, #[cfg(feature = "arch")] aur_rpc: &s
 
     let pm = get_package_manager()?;
     if pm.name() != "pacman" {
-        let info = pm
-            .info(package)
+        let info = manager_info(pm.as_ref(), package)
             .await?
             .with_context(|| format!("Package '{package}' not found. Try: omg search {package}"))?;
         let version = info.version.to_string();
@@ -429,7 +422,7 @@ async fn info_local_fallback(package: &str, #[cfg(feature = "arch")] aur_rpc: &s
     anyhow::bail!("Package '{package}' not found. Try: omg search {package}");
 }
 
-async fn manager_info(
+pub(crate) async fn manager_info(
     manager: &dyn crate::package_managers::PackageManager,
     package: &str,
 ) -> Result<Option<crate::core::Package>> {

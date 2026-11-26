@@ -7735,6 +7735,25 @@ env.OMG_FIXTURE_TASK = "changed"
                     checks.append(dict(phase=phase, case=f"{role}-{option[2:]}-ipc",
                                        passed=calls == (0, 0), value=calls))
 
+    def inspect_info_json_writes():
+        cases = (
+            ("name", package, "No space left on device"),
+            ("nevra", f"{package}-0:1-1.noarch", "No space left on device"),
+            ("missing", "omg-fixture-name-absent", "not found"),
+            ("invalid", f"../{package}", "Package name cannot start with '.'"),
+        )
+        for role, mode in (("daemon", env), ("direct", disabled)):
+            for label, selector, expected in cases:
+                with open("/dev/full", "wb") as sink:
+                    result = subprocess.run([str(cli), "--json", "info", selector], cwd=work,
+                                            env=mode, stdout=sink, stderr=subprocess.PIPE,
+                                            text=True, timeout=30, **ordinary)
+                error = result.stderr
+                checks.append(dict(phase="info-unwritable-output", case=f"{role}-{label}",
+                                   passed=result.returncode == 1 and expected in error
+                                   and "panicked" not in error, status=result.returncode,
+                                   diagnostic=error[-900:]))
+
     def inspect_status_write_failures():
         for label, args in (("json", ["--json", "status"]), ("fast-json", ["--json", "status", "--fast"])):
             with open("/dev/full", "wb") as sink:
@@ -8658,6 +8677,7 @@ exec {shlex.quote(str(binary))} "$@"
                 inspect("switched-alternate", 1, 1, fixture_explicit=True)
                 if consent_oracle is not None:
                     inspect_info_attempts()
+                    inspect_info_json_writes()
                     inspect_migration()
                     inspect_snapshots()
                     inspect_snapshot_recovery()
@@ -8987,6 +9007,6 @@ mark_progress("completed with host inventory unchanged")
 report = dict(binaries=binaries, checks=checks, total=len(checks),
               passed=sum(entry["passed"] for entry in checks), host_unchanged=True)
 print(json.dumps(report))
-expected_checks = 303 if consent_oracle is None else 2827
+expected_checks = 303 if consent_oracle is None else 2835
 if report["passed"] != report["total"] or report["total"] != expected_checks:
     sys.exit(4)

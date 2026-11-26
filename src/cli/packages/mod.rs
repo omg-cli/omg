@@ -24,7 +24,10 @@ mod update;
 // Re-export all public functions
 pub use clean::clean;
 pub use explicit::{explicit, explicit_sync, explicit_sync_with_json};
+#[cfg(unix)]
+pub(crate) use info::daemon_package_installed;
 pub use info::{info, info_after_sync_miss, info_sync, info_with_json};
+pub(crate) use info::{manager_info, validate_info_selector};
 pub use install::install;
 pub(crate) use install::{deduplicate_packages, validate_install_target_syntax};
 pub use remove::remove;

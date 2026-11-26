@@ -2,13 +2,13 @@
 //!
 //! Modern, stylish package information display with Bubble Tea-inspired UX.
 
+use crate::cli::packages::{manager_info, validate_info_selector};
 use crate::cli::style;
 use crate::cli::tea::{Cmd, Model};
-#[cfg(unix)]
 use crate::core::PackageSource;
 #[cfg(unix)]
 use crate::core::client::DaemonClient;
-use crate::package_managers::get_package_manager;
+use crate::package_managers::{Backend, get_package_manager, resolve_backend};
 use std::fmt::Write;
 use std::time::Duration;
 
@@ -157,9 +157,10 @@ impl Model for InfoModel {
     fn view(&self) -> String {
         match self.state {
             InfoState::Idle => String::new(),
-            InfoState::Loading => {
-                style::accent(&format!("⟳ Fetching info for '{}'...", self.package_name))
-            }
+            InfoState::Loading => style::accent(&format!(
+                "⟳ Fetching info for '{}'...",
+                style::sanitize_terminal_text(&self.package_name)
+            )),
             InfoState::Complete => {
                 if let Some(info) = &self.info {
                     let mut output = String::new();
@@ -282,6 +283,14 @@ fn package_is_installed(name: &str) -> bool {
 
 /// Helper function to fetch package info
 async fn fetch_info(package: &str) -> InfoMsg {
+    if let Err(error) = validate_info_selector(package) {
+        return InfoMsg::Error(format!("Invalid package name: {error:#}"));
+    }
+    let backend = match resolve_backend() {
+        Ok(backend) => backend,
+        Err(error) => return InfoMsg::Error(format!("{error:#}")),
+    };
+
     // 1. Try Daemon first
     #[cfg(unix)]
     if let Ok(Ok(info)) = tokio::time::timeout(DAEMON_INFO_TIMEOUT, async {
@@ -290,6 +299,14 @@ async fn fetch_info(package: &str) -> InfoMsg {
     })
     .await
     {
+        let installed = if backend == Backend::Fedora {
+            match crate::cli::packages::daemon_package_installed(backend, &info).await {
+                Ok(installed) => installed,
+                Err(error) => return InfoMsg::Error(format!("{error:#}")),
+            }
+        } else {
+            package_is_installed(package)
+        };
         return InfoMsg::InfoReceived(PackageInfo {
             name: info.name,
             version: info.version,
@@ -310,7 +327,7 @@ async fn fetch_info(package: &str) -> InfoMsg {
             maintainer: None,
             popularity: None,
             out_of_date: false,
-            installed: package_is_installed(package),
+            installed,
         });
     }
 
@@ -319,6 +336,29 @@ async fn fetch_info(package: &str) -> InfoMsg {
         Ok(pm) => pm,
         Err(error) => return InfoMsg::Error(error.to_string()),
     };
+    if matches!(backend, Backend::Fedora | Backend::Mock) {
+        return match manager_info(pm.as_ref(), package).await {
+            Ok(Some(info)) => InfoMsg::InfoReceived(PackageInfo {
+                name: info.name,
+                version: info.version.to_string(),
+                description: info.description,
+                source: match info.source {
+                    PackageSource::Official => InfoSource::Official,
+                    PackageSource::Aur => InfoSource::Aur,
+                },
+                repo: pm.name().to_owned(),
+                url: None,
+                size: None,
+                licenses: Vec::new(),
+                maintainer: None,
+                popularity: None,
+                out_of_date: false,
+                installed: info.installed,
+            }),
+            Ok(None) => InfoMsg::NotFound(package.to_owned()),
+            Err(error) => InfoMsg::Error(format!("{error:#}")),
+        };
+    }
     if pm.name() == "pacman" {
         #[cfg(feature = "arch")]
         {
@@ -454,7 +494,7 @@ async fn fetch_info(package: &str) -> InfoMsg {
 #[cfg(any(not(feature = "arch"), test))]
 fn info_requires_backend(package: &str) -> InfoMsg {
     InfoMsg::Error(format!(
-        "Package information for '{package}' is not available without an Arch or Debian package backend"
+        "Package information for '{package}' is unavailable for this package backend"
     ))
 }
 
@@ -544,16 +584,75 @@ mod tests {
         assert_eq!(non_negative_install_size(42), Some(42));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn fedora_model_reads_installed_and_available_info_without_the_daemon() -> anyhow::Result<()> {
+        const NAME: &str = "cli::tea::info_model::tests::fedora_model_reads_installed_and_available_info_without_the_daemon";
+        if crate::config::Settings::rerun_test_unprivileged(NAME)
+            || crate::core::testing::run_isolated_test(NAME)
+        {
+            return Ok(());
+        }
+        let fixture = tempfile::tempdir()?;
+        let state = fixture.path().join("mock_state_dnf.json");
+        let inventory = serde_json::json!({
+            "installed": {"git": "2.43.0"},
+            "available": {"git": "2.43.0", "curl": "8.7.0"}
+        });
+        std::fs::write(&state, serde_json::to_vec(&inventory)?)?;
+        temp_env::with_vars(
+            [
+                ("OMG_TEST_MODE", Some("1")),
+                ("OMG_TEST_DISTRO", Some("fedora")),
+                ("OMG_DATA_DIR", fixture.path().to_str()),
+                ("OMG_DISABLE_DAEMON", Some("1")),
+            ],
+            || -> anyhow::Result<()> {
+                let mut model = InfoModel::default();
+                let mut load = |name: &str| -> anyhow::Result<InfoMsg> {
+                    let Cmd::Exec(fetch) = model.update(InfoMsg::Fetch(name.to_owned())) else {
+                        anyhow::bail!("package info did not start its lookup");
+                    };
+                    Ok(fetch())
+                };
+                for (name, version, installed) in
+                    [("git", "2.43.0", true), ("curl", "8.7.0", false)]
+                {
+                    let message = load(name)?;
+                    let InfoMsg::InfoReceived(info) = message else {
+                        anyhow::bail!("expected {name} metadata, got {message:?}");
+                    };
+                    assert_eq!(info.name, name);
+                    assert_eq!(info.version, version);
+                    assert_eq!(info.installed, installed);
+                    assert_eq!(info.source, InfoSource::Official);
+                }
+                assert!(
+                    matches!(load("fixture-absent")?, InfoMsg::NotFound(name) if name == "fixture-absent")
+                );
+                assert!(
+                    matches!(load("../git")?, InfoMsg::Error(error) if error.contains("Invalid package name"))
+                );
+
+                std::fs::write(&state, b"malformed fixture")?;
+                assert!(
+                    matches!(load("git")?, InfoMsg::Error(error) if error.contains("failed to parse mock state"))
+                );
+                Ok(())
+            },
+        )
+    }
+
     #[test]
     fn info_without_backend_is_an_error_not_not_found() {
         match info_requires_backend("bash") {
             InfoMsg::Error(message) => {
                 assert_eq!(
                     message,
-                    "Package information for 'bash' is not available without an Arch or Debian package backend"
+                    "Package information for 'bash' is unavailable for this package backend"
                 );
                 assert!(
-                    message.contains("not available without an Arch or Debian package backend"),
+                    message.contains("unavailable for this package backend"),
                     "got: {message}"
                 );
             }

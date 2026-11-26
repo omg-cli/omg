@@ -2908,12 +2908,12 @@ impl DnfPackageManager {
     }
 
     fn check_update_generation(
-        host_path: &Path,
+        current_location: Option<&RpmDatabase>,
         location: &RpmDatabase,
         generation: RpmDatabaseIdentity,
     ) -> Result<()> {
         anyhow::ensure!(
-            RpmDatabase::detect_default(host_path).as_ref() == Some(location)
+            current_location == Some(location)
                 && RpmDatabaseIdentity::read_update_generation(&location.sqlite)
                     .is_some_and(|current| current.same_inventory_files(generation)),
             "RPM inventory changed during the upgrade query; retry the check"
@@ -3414,12 +3414,20 @@ impl PackageManager for DnfPackageManager {
             if let Some((location, generation)) = snapshot {
                 let need_versions = !upgrades.is_empty();
                 let installed = tokio::task::spawn_blocking(move || {
-                    Self::check_update_generation(&host_path, &location, generation)?;
+                    Self::check_update_generation(
+                        RpmDatabase::detect_default(&host_path).as_ref(),
+                        &location,
+                        generation,
+                    )?;
                     if !need_versions {
                         return Ok(None);
                     }
                     let installed = Self::read_rpm_sqlite(&location.sqlite);
-                    Self::check_update_generation(&host_path, &location, generation)?;
+                    Self::check_update_generation(
+                        RpmDatabase::detect_default(&host_path).as_ref(),
+                        &location,
+                        generation,
+                    )?;
                     match installed {
                         Ok(installed) => Ok(Some(installed)),
                         Err(error) => {
@@ -4377,12 +4385,20 @@ mod tests {
         let generation = RpmDatabaseIdentity::read_update_generation(&database)
             .context("inventory generation is available")?;
         let wal = owned.path().join("rpmdb.sqlite-wal");
+        let check =
+            |current| DnfPackageManager::check_update_generation(current, &location, generation);
         std::fs::write(&wal, [])?;
-        DnfPackageManager::check_update_generation(&database, &location, generation)?;
+        check(Some(&location))?;
+        assert!(
+            check(None)
+                .expect_err("a non-default RPM scope must invalidate the update snapshot")
+                .to_string()
+                .contains("RPM inventory changed")
+        );
         std::fs::write(&wal, b"owned newer inventory generation")?;
         assert!(
-            DnfPackageManager::check_update_generation(&database, &location, generation)
-                .unwrap_err()
+            check(Some(&location))
+                .expect_err("a changed RPM inventory must invalidate the update snapshot")
                 .to_string()
                 .contains("RPM inventory changed")
         );
