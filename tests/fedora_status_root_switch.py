@@ -3331,7 +3331,7 @@ exit 95
                             OMG_CONFIG_DIR=str(home/"config"/"omg"), OMG_NATIVE_TEST_DATA_DIR="1",
                             XDG_CONFIG_HOME=str(home/"config"), XDG_DATA_HOME=str(home/"xdg-data"),
                             XDG_CACHE_HOME=str(home/"cache"), XDG_STATE_HOME=str(home/"state"),
-                            TERM="xterm")
+                            TERM="xterm", OMG_NO_UPDATE_CHECK="1")
 
             for tool, manager, installed_name, runtime in tools:
                 for layout in layouts:
@@ -3483,7 +3483,7 @@ fi
 exec {shlex.quote(str(native))} "$@"
 """)
             tracker.chmod(0o755)
-            terminal_env = dict(disabled, TERM="xterm-256color")
+            terminal_env = dict(disabled, TERM="xterm-256color", OMG_NO_UPDATE_CHECK="1")
 
             def run_picker(keys, expect_selection, wait_for_no_match):
                 child, master = pty.fork()
@@ -3751,6 +3751,195 @@ exec {shlex.quote(str(native))} "$@"
                                     ("reset", ["reset", "--yes"])):
                     run(f"locked-{label}", args, env, 1, "Another configuration mutation",
                         lambda: unchanged(file))
+
+
+    def inspect_fedora_output_admission():
+        import errno
+        import pty
+        import shlex
+        import shutil
+
+        phase = "fedora-output-admission"
+        clean = ["clean", "--cache", "--dry-run"]
+        tip = "Prime sudo credentials for prompt-light package operations"
+        preview = "No changes made (dry run)"
+
+        with tempfile.TemporaryDirectory(prefix="output-admission-", dir=work) as directory:
+            here = Path(directory)
+            os.chown(here, account.pw_uid, account.pw_gid)
+
+            def environment(label):
+                home = here / label
+                home.mkdir()
+                data = home / "data"
+                data.mkdir(mode=0o700)
+                for owned in (home, data):
+                    os.chown(owned, account.pw_uid, account.pw_gid)
+                return dict(disabled, HOME=str(home), OMG_DATA_DIR=str(data),
+                            OMG_CONFIG_DIR=str(home/"config"), XDG_CONFIG_HOME=str(home/"config"),
+                            XDG_DATA_HOME=str(home/"xdg-data"), XDG_STATE_HOME=str(home/"state"),
+                            XDG_CACHE_HOME=str(home/"cache"), XDG_RUNTIME_DIR=str(home/"run"),
+                            TERM="xterm", OMG_NO_UPDATE_CHECK="1")
+
+            def invoke(args, env, tty=()):
+                if not tty:
+                    result = command([cli, *args], env, ordinary, timeout=10)
+                    return result.returncode, result.stdout, result.stderr, ""
+                master, terminal = pty.openpty()
+                try:
+                    try:
+                        result = subprocess.run([cli, *args], cwd=env["HOME"], env=env, timeout=10,
+                                                stdin=terminal if "in" in tty else subprocess.DEVNULL,
+                                                stdout=terminal if "out" in tty else subprocess.PIPE,
+                                                stderr=terminal if "err" in tty else subprocess.PIPE,
+                                                **ordinary)
+                    finally:
+                        os.close(terminal)
+                    captured = bytearray()
+                    os.set_blocking(master, False)
+                    while True:
+                        try:
+                            chunk = os.read(master, 4096)
+                        except BlockingIOError:
+                            break
+                        except OSError as error:
+                            if error.errno != errno.EIO:
+                                raise
+                            break
+                        if not chunk:
+                            break
+                        captured.extend(chunk)
+                        assert len(captured) <= 16384
+                    return (result.returncode, (result.stdout or b"").decode(),
+                            (result.stderr or b"").decode(), captured.decode())
+                finally:
+                    os.close(master)
+
+            def marker(env):
+                path = Path(env["OMG_DATA_DIR"]) / ".turbo_hint_shown"
+                if not path.is_file():
+                    return "absent"
+                if (stat.S_IMODE(path.stat().st_mode) == 0o600 and
+                        path.stat().st_uid == account.pw_uid and path.read_bytes() == b"1"):
+                    return "private"
+                return "unexpected"
+
+            def record(label, result, passes, marker_state, **evidence):
+                status, stdout, stderr, terminal = result
+                checks.append(dict(
+                    phase=phase, case=label, status=status, marker=marker_state,
+                    passed=passes, stdout=stdout[-1200:], stderr=stderr[-1200:],
+                    terminal=terminal[-1200:], **evidence,
+                ))
+
+            for name, args in (
+                ("install", ["install", "--dry-run", "bash"]),
+                ("remove", ["remove", "--recursive", "--dry-run", "bash"]),
+                ("update", ["update", "--dry-run"]),
+                ("clean", clean),
+                ("sync", ["sync"]),
+                ("tool", ["tool", "list"]),
+            ):
+                for placement in ("prefix", "suffix"):
+                    label = f"json-refused-{name}-{placement}"
+                    env = environment(label)
+                    argv = ["--json", *args] if placement == "prefix" else [*args, "--json"]
+                    result = invoke(argv, env)
+                    status, stdout, stderr, _ = result
+                    marker_state = marker(env)
+                    record(label, result, status == 1 and not stdout and marker_state == "absent"
+                           and f"--json is not supported for \x60{name}\x60" in stderr
+                           and tip not in stderr and "sudo:" not in stderr, marker_state)
+
+            native_sudo = Path(shutil.which("sudo")).resolve(strict=True)
+            witness = here / "sudo-attempts"
+            witness.touch(mode=0o600)
+            os.chown(witness, account.pw_uid, account.pw_gid)
+            inactive_sudo = here / "inactive-sudo"
+            inactive_sudo.write_text(
+                "#!/usr/bin/bash\nprintf 'attempted\\n' >> " + shlex.quote(str(witness)) + "\nexit 1\n"
+            )
+            inactive_sudo.chmod(0o755)
+            subprocess.run(["/usr/bin/mount", "--bind", inactive_sudo, native_sudo], check=True)
+            try:
+                for placement in ("prefix", "suffix"):
+                    label = f"json-refused-before-sudo-{placement}"
+                    env = environment(label)
+                    args = ["remove", "--dry-run", "--yes", "bash"]
+                    argv = ["--json", *args] if placement == "prefix" else [*args, "--json"]
+                    previous = witness.read_bytes().count(b"\n")
+                    result = invoke(argv, env)
+                    status, stdout, stderr, _ = result
+                    marker_state = marker(env)
+                    sudo_attempts = witness.read_bytes().count(b"\n") - previous
+                    record(label, result, status == 1 and not stdout and marker_state == "absent"
+                           and "--json is not supported for \x60remove\x60" in stderr
+                           and sudo_attempts == 0, marker_state, sudo_attempts=sudo_attempts)
+            finally:
+                subprocess.run(["/usr/bin/umount", native_sudo], check=True)
+
+            for label, args in (
+                ("plain", clean),
+                ("quiet", ["--quiet", *clean]),
+                ("quiet-short", ["-q", *clean]),
+                ("verbose", ["-v", *clean]),
+                ("quiet-trailing", [*clean, "--quiet"]),
+                ("verbose-trailing", [*clean, "--verbose"]),
+            ):
+                env = environment(f"piped-{label}")
+                result = invoke(args, env)
+                status, stdout, stderr, _ = result
+                marker_state = marker(env)
+                record(f"piped-{label}", result, status == 0 and preview in stdout
+                       and tip not in stderr and marker_state == "absent", marker_state)
+
+            def terminal_case(label, args, env, tty, expect_hint, expect_marker):
+                result = invoke(args, env, tty)
+                status, stdout, stderr, terminal = result
+                marker_state = marker(env)
+                all_output = stdout + stderr + terminal
+                record(label, result, status == 0 and preview in all_output
+                       and all_output.count(tip) == int(expect_hint)
+                       and marker_state == expect_marker, marker_state)
+
+            attended = ("in", "out", "err")
+            shared = environment("attended-repeat")
+            terminal_case("attended-first", clean, shared, attended, True, "private")
+            terminal_case("attended-repeat", clean, shared, attended, False, "private")
+            shared = environment("quiet-then-attended")
+            terminal_case("attended-quiet", ["--quiet", *clean], shared, attended, False, "absent")
+            terminal_case("attended-after-quiet", clean, shared, attended, True, "private")
+            for label, args, tty, expect_hint in (
+                ("attended-short-quiet", ["-q", *clean], attended, False),
+                ("attended-verbose", ["-v", *clean], attended, True),
+                ("redirect-stdout", clean, ("in", "err"), False),
+                ("redirect-stderr", clean, ("in", "out"), False),
+                ("redirect-stdin", clean, ("out", "err"), False),
+                ("redirect-both-outputs", clean, ("in",), False),
+                ("only-stderr-tty", clean, ("err",), False),
+                ("only-stdout-tty", clean, ("out",), False),
+            ):
+                terminal_case(label, args, environment(label), tty, expect_hint,
+                              "private" if expect_hint else "absent")
+
+            for name, args, expected in (
+                ("list", ["list", "node"], (list, dict)),
+                ("status", ["status", "--fast"], (dict,)),
+                ("stats", ["stats"], (dict,)),
+            ):
+                for placement in ("prefix", "suffix"):
+                    label = f"json-result-{name}-{placement}"
+                    env = environment(label)
+                    argv = ["--json", *args] if placement == "prefix" else [*args, "--json"]
+                    result = invoke(argv, env)
+                    status, stdout, stderr, _ = result
+                    try:
+                        parsed = json.loads(stdout)
+                    except ValueError:
+                        parsed = None
+                    marker_state = marker(env)
+                    record(label, result, status == 0 and isinstance(parsed, expected)
+                           and not stderr and marker_state == "absent", marker_state)
 
 
     def inspect_task_environment_bytes():
@@ -6468,6 +6657,7 @@ exec {shlex.quote(str(binary))} "$@"
                     inspect_fedora_system_tool_registry()
                     inspect_named_tool_updates()
                     inspect_config_files()
+                    inspect_fedora_output_admission()
                     mark_progress("runtime selection and Python environments")
                     inspect_task_environment_bytes()
                     inspect_task_package_metadata()
@@ -6793,6 +6983,6 @@ mark_progress("completed with host inventory unchanged")
 report = dict(binaries=binaries, checks=checks, total=len(checks),
               passed=sum(entry["passed"] for entry in checks), host_unchanged=True)
 print(json.dumps(report))
-expected_checks = 303 if consent_oracle is None else 2242
+expected_checks = 303 if consent_oracle is None else 2280
 if report["passed"] != report["total"] or report["total"] != expected_checks:
     sys.exit(4)

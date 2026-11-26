@@ -1042,6 +1042,12 @@ async fn async_main(args: Vec<String>, info_sync_missed: bool) -> Result<()> {
 
     let cmd_start = std::time::Instant::now();
     let cli = Cli::parse_from(&args);
+    if cli.json && !command_supports_json(&cli.command) {
+        anyhow::bail!(
+            "--json is not supported for `{}`; supported: search, info, explicit, list, status, history, stats, outdated",
+            command_name(&cli.command)
+        );
+    }
 
     // Initialize session tracking (will create new session if expired)
     omg_lib::core::telemetry::track_session_start();
@@ -1082,7 +1088,7 @@ async fn async_main(args: Vec<String>, info_sync_missed: bool) -> Result<()> {
     validate_package_security(&cli.command)?;
 
     // Configure terminal rendering before any long-running command starts.
-    omg_lib::cli::modern_ui::configure_output(cli.verbose, cli.quiet);
+    omg_lib::cli::modern_ui::configure_output(cli.verbose, cli.quiet || cli.json);
 
     // Initialize logging. JSON mode implies quiet logging: the
     // advertised contract (tests/arch_cli_contracts.rs
@@ -1631,15 +1637,6 @@ async fn dispatch_command(
     ctx: &omg_lib::cli::CliContext,
     info_sync_missed: bool,
 ) -> Result<()> {
-    // Global --json contract: reject unsupported combinations explicitly instead
-    // of silently emitting human-readable output.
-    if ctx.json && !command_supports_json(command) {
-        anyhow::bail!(
-            "--json is not supported for `{}`; supported: search, info, explicit, list, status, history, stats, outdated",
-            command_name(command)
-        );
-    }
-
     match command {
         // Single dispatcher: each group runner is invoked directly here; there is
         // deliberately no blanket `impl LocalCommandRunner for Commands` fallback.

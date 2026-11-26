@@ -21,12 +21,19 @@ pub fn can_write_pacman_db() -> bool {
     crate::core::privilege::is_root()
 }
 
-/// Show a one-time hint about prompt-light sudo credential caching.
+/// Show a one-time hint about sudo credential caching in an attended terminal.
 ///
 /// Returns `true` when the hint was shown.
 #[cfg(target_os = "linux")]
 pub fn maybe_show_turbo_hint() -> bool {
-    if is_elevated() || crate::core::privilege::is_root() {
+    use std::io::IsTerminal as _;
+
+    if crate::cli::modern_ui::output_mode() == crate::cli::modern_ui::OutputMode::Quiet
+        || !std::io::stdin().is_terminal()
+        || !std::io::stdout().is_terminal()
+        || !std::io::stderr().is_terminal()
+        || crate::core::privilege::is_root()
+    {
         return false;
     }
 
