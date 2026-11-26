@@ -969,7 +969,7 @@ pub(crate) async fn bounded_metadata_body(response: reqwest::Response) -> anyhow
     bounded_metadata_body_with_limit(response, DEFAULT_METADATA_BODY_LIMIT).await
 }
 
-async fn bounded_metadata_body_with_limit(
+pub(crate) async fn bounded_metadata_body_with_limit(
     mut response: reqwest::Response,
     limit: usize,
 ) -> anyhow::Result<Vec<u8>> {

@@ -4,7 +4,10 @@ use crate::cli::tool::{
     ALLOW_NPM_SCRIPTS_ENV, ALLOW_UNVERIFIED_ENV, active_security_overrides,
     host_environment_is_allowed, package_is_allowed, secured_manager_command,
 };
-use crate::core::security::npm::read_metadata as read_npm_metadata;
+use crate::core::security::npm::{
+    MAX_LOCK_BYTES, MissingNpmIntegrity, NpmLock, NpmLockStatus, NpmRegistryPackage, NpmSpec,
+    read_metadata as read_npm_metadata,
+};
 use anyhow::{Context, Result};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -99,6 +102,76 @@ impl ManagedNpm {
     }
 }
 
+fn recover_registry_integrities(
+    missing: &MissingNpmIntegrity,
+) -> Result<BTreeMap<NpmRegistryPackage, String>> {
+    use futures::{StreamExt as _, TryStreamExt as _};
+    use std::sync::LazyLock;
+    use std::time::Duration;
+
+    static CLIENT: LazyLock<Result<reqwest::Client, reqwest::Error>> = LazyLock::new(|| {
+        reqwest::Client::builder()
+            .user_agent("omg-package-manager")
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(10))
+            .build()
+    });
+    let client = CLIENT
+        .as_ref()
+        .map_err(|error| anyhow::anyhow!("Cannot create npm registry HTTPS client: {error}"))?;
+    let packages = missing.packages().cloned().collect::<Vec<_>>();
+    crate::cli::tea::run_blocking_future(async move {
+        tokio::time::timeout(Duration::from_secs(30), async move {
+            futures::stream::iter(packages)
+                .map(|package| async move {
+                    let response = client
+                        .get(package.metadata_url()?)
+                        .send()
+                        .await
+                        .with_context(|| format!("Fetching npm metadata for {package}"))?;
+                    anyhow::ensure!(
+                        response.status().is_success(),
+                        "npm registry metadata for {package} returned HTTP {}",
+                        response.status()
+                    );
+                    let bytes =
+                        crate::core::http::bounded_metadata_body_with_limit(response, 1024 * 1024)
+                            .await
+                            .with_context(|| format!("Reading npm metadata for {package}"))?;
+                    let integrity = package.integrity_from_metadata(&bytes)?;
+                    Ok((package, integrity))
+                })
+                .buffer_unordered(8)
+                .try_collect::<BTreeMap<_, _>>()
+                .await
+        })
+        .await
+        .context("npm registry integrity resolution exceeded its deadline")?
+    })?
+}
+
+fn prepare_npm_lock(
+    path: &Path,
+    spec: &NpmSpec,
+    recover: impl FnOnce(&MissingNpmIntegrity) -> Result<BTreeMap<NpmRegistryPackage, String>>,
+) -> Result<NpmLock> {
+    let bytes = read_npm_metadata(path, MAX_LOCK_BYTES)?;
+    let missing = match NpmLock::inspect(&bytes, spec)? {
+        NpmLockStatus::Complete(lock) => return Ok(lock),
+        NpmLockStatus::NeedsIntegrity(missing) => missing,
+    };
+    let integrities = recover(&missing).context("Failed to recover npm registry integrity")?;
+    let complete = missing.complete(&bytes, &integrities)?;
+    let lock = NpmLock::parse(&complete, spec)?;
+    anyhow::ensure!(
+        read_npm_metadata(path, MAX_LOCK_BYTES)? == bytes,
+        "npm lock changed during registry integrity recovery"
+    );
+    crate::core::safe_ops::atomic_write_file_sync(path, complete)?;
+    Ok(lock)
+}
+
 pub(crate) fn install_reviewed_npm<'a>(
     package: &str,
     staging_dir: &Path,
@@ -107,8 +180,26 @@ pub(crate) fn install_reviewed_npm<'a>(
     advisories: &'a dyn crate::core::security::vulnerability::VulnerabilitySource,
     security: &crate::runtimes::security::RuntimeSecurity,
 ) -> Result<ReviewedNpm<'a>> {
-    use crate::core::security::npm::{NpmLock, NpmSpec};
+    install_reviewed_npm_with_registry(
+        package,
+        staging_dir,
+        install_dir,
+        tools_dir,
+        advisories,
+        security,
+        recover_registry_integrities,
+    )
+}
 
+fn install_reviewed_npm_with_registry<'a>(
+    package: &str,
+    staging_dir: &Path,
+    install_dir: &Path,
+    tools_dir: &Path,
+    advisories: &'a dyn crate::core::security::vulnerability::VulnerabilitySource,
+    security: &crate::runtimes::security::RuntimeSecurity,
+    recover: impl FnOnce(&MissingNpmIntegrity) -> Result<BTreeMap<NpmRegistryPackage, String>>,
+) -> Result<ReviewedNpm<'a>> {
     anyhow::ensure!(
         !host_environment_is_allowed("npm", package),
         "NPM advisory admission currently requires the pinned public registry; host/private registry coordinates remain UNKNOWN"
@@ -158,7 +249,7 @@ pub(crate) fn install_reviewed_npm<'a>(
         "NPM lock resolution materialized packages before advisory review"
     );
     let lock_path = staging_dir.join("package-lock.json");
-    let lock = NpmLock::parse(&read_npm_metadata(&lock_path, 16 * 1024 * 1024)?, &spec)?;
+    let lock = prepare_npm_lock(&lock_path, &spec, recover)?;
     let review = review_lock(
         package,
         install_dir,
@@ -173,7 +264,7 @@ pub(crate) fn install_reviewed_npm<'a>(
         node_admission.verify(&runtime.version_dir)?;
         anyhow::ensure!(
             active_security_overrides("npm", package) == overrides
-                && super::tool_artifacts::hash(&read_npm_metadata(&lock_path, 16 * 1024 * 1024)?)
+                && super::tool_artifacts::hash(&read_npm_metadata(&lock_path, MAX_LOCK_BYTES)?)
                     == lock.sha256,
             "NPM dependencies or security options changed after advisory review; installation cancelled"
         );
@@ -317,7 +408,7 @@ fn verify_installation(
         active_security_overrides("npm", package) == overrides
             && super::tool_artifacts::hash(&read_npm_metadata(
                 &prefix.join("package-lock.json"),
-                16 * 1024 * 1024,
+                MAX_LOCK_BYTES,
             )?) == lock.sha256,
         "NPM dependencies or security options changed after advisory review; activation cancelled"
     );
@@ -451,13 +542,12 @@ pub(crate) fn review_installed_npm<'a>(
     advisories: &'a dyn crate::core::security::vulnerability::VulnerabilitySource,
     security: &crate::runtimes::security::RuntimeSecurity,
 ) -> Result<ReviewedNpm<'a>> {
-    use crate::core::security::npm::{NpmLock, NpmSpec};
     anyhow::ensure!(
         !host_environment_is_allowed("npm", package),
         "NPM activation requires the pinned public registry"
     );
     let spec = NpmSpec::parse(package)?;
-    let lock = NpmLock::parse(&read_npm_metadata(&prefix.join("package-lock.json"), 16 * 1024 * 1024)
+    let lock = NpmLock::parse(&read_npm_metadata(&prefix.join("package-lock.json"), MAX_LOCK_BYTES)
         .context("This Pi installation has no reviewed dependency lock; install a current Pi release before selecting it")?, &spec)?;
     let previous = read_advisory_receipt(prefix)?;
     anyhow::ensure!(
@@ -548,7 +638,6 @@ pub(crate) fn cached_installed_npm(
     pi_admission: &crate::runtimes::security::RuntimeAdmission,
 ) -> Result<ReviewedNpm<'static>> {
     use crate::core::security::advisory_review::AdvisoryRiskReview;
-    use crate::core::security::npm::{NpmLock, NpmSpec};
     use crate::core::security::vulnerability::{PackageAssessment, PackageCoverage};
     use crate::package_managers::types::{SecurityOrigin, SecurityPackage};
     use sha2::{Digest as _, Sha256};
@@ -559,7 +648,7 @@ pub(crate) fn cached_installed_npm(
     );
     let spec = NpmSpec::parse(package)?;
     let lock = NpmLock::parse(
-        &read_npm_metadata(&prefix.join("package-lock.json"), 16 * 1024 * 1024)?,
+        &read_npm_metadata(&prefix.join("package-lock.json"), MAX_LOCK_BYTES)?,
         &spec,
     )?;
     let receipt = read_advisory_receipt(prefix)?;
@@ -1235,6 +1324,96 @@ esac
             fs::read(receipt_path).expect("previous authority survives refused replacement"),
             previous
         );
+    }
+
+    #[test]
+    fn installs_from_the_recovered_lock_and_binds_the_receipt_to_it() -> Result<()> {
+        let fixture = Fixture::new();
+        let witness = fixture.owner.path().join("lock.fixture.json");
+        let mut document: serde_json::Value = serde_json::from_slice(&fs::read(&witness)?)?;
+        let root = "node_modules/@earendil-works/pi-coding-agent";
+        let integrity = document["packages"][root]
+            .as_object_mut()
+            .unwrap()
+            .remove("integrity")
+            .expect("complete fixture starts with a digest");
+        let prior = serde_json::to_vec(&document)?;
+        fs::write(&witness, &prior)?;
+        let completed = install_reviewed_npm_with_registry(
+            PACKAGE,
+            &fixture.prefix,
+            &fixture.prefix,
+            &fixture.tools,
+            &CleanSource,
+            &super::super::security::RuntimeSecurity::fixture(),
+            |missing| {
+                assert_eq!(
+                    fs::read_to_string(fixture.owner.path().join("phases"))?,
+                    "install\n"
+                );
+                assert!(!fixture.prefix.join("node_modules").exists());
+                let requested = missing.packages().cloned().collect::<Vec<_>>();
+                assert_eq!(requested.len(), 1);
+                assert_eq!(requested[0].to_string(), PACKAGE);
+                Ok(BTreeMap::from([(
+                    requested[0].clone(),
+                    integrity.as_str().unwrap().to_owned(),
+                )]))
+            },
+        )?;
+        let on_disk = fs::read(fixture.prefix.join("package-lock.json"))?;
+        let recovered: serde_json::Value = serde_json::from_slice(&on_disk)?;
+        document["packages"][root]["integrity"] = integrity;
+        assert_eq!(recovered, document);
+        assert_eq!(fs::read(witness)?, prior);
+        assert_eq!(
+            fs::read_to_string(fixture.owner.path().join("phases"))?,
+            "install\nci\naudit\n"
+        );
+        let receipt = read_advisory_receipt(&fixture.prefix)?;
+        assert_eq!(
+            receipt["lock_sha256"],
+            super::super::tool_artifacts::hash(&on_disk)
+        );
+        assert_eq!(receipt["npm_signatures_verified"], true);
+        completed.verify(&fixture.prefix)?;
+        Ok(())
+    }
+
+    #[test]
+    fn integrity_recovery_does_not_replace_concurrently_changed_lock_bytes() -> Result<()> {
+        let fixture = Fixture::new();
+        let witness = fixture.owner.path().join("lock.fixture.json");
+        let mut document: serde_json::Value = serde_json::from_slice(&fs::read(witness)?)?;
+        let record = document["packages"]["node_modules/@earendil-works/pi-coding-agent"]
+            .as_object_mut()
+            .unwrap();
+        let integrity = record
+            .remove("integrity")
+            .expect("complete fixture starts with a digest");
+        let path = fixture.prefix.join("package-lock.json");
+        fs::write(&path, serde_json::to_vec(&document)?)?;
+        let spec = NpmSpec::parse(PACKAGE)?;
+        let changed = b"changed while the registry request was in flight";
+        let error = prepare_npm_lock(&path, &spec, |missing| {
+            fs::write(&path, changed)?;
+            let package = missing
+                .packages()
+                .next()
+                .expect("exact missing fixture package");
+            Ok(BTreeMap::from([(
+                package.clone(),
+                integrity.as_str().unwrap().to_owned(),
+            )]))
+        })
+        .expect_err("different bytes cannot acquire the old registry evidence");
+        assert!(
+            error
+                .to_string()
+                .contains("changed during registry integrity recovery")
+        );
+        assert_eq!(fs::read(path)?, changed);
+        Ok(())
     }
 
     #[test]

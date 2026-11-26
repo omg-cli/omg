@@ -2,10 +2,13 @@
 
 use anyhow::{Context, Result, ensure};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+
+pub(crate) const MAX_LOCK_BYTES: usize = 16 * 1024 * 1024;
+const NPM_REGISTRY: &str = "https://registry.npmjs.org/";
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct NpmSpec {
@@ -38,8 +41,6 @@ impl NpmSpec {
 pub(crate) struct NpmPackage {
     pub(crate) name: String,
     pub(crate) version: String,
-    pub(crate) resolved: String,
-    pub(crate) integrity: String,
     can_be_absent: bool,
     required_dependencies: Vec<Arc<str>>,
 }
@@ -48,6 +49,113 @@ pub(crate) struct NpmPackage {
 pub(crate) struct NpmLock {
     pub(crate) sha256: String,
     pub(crate) packages: BTreeMap<String, NpmPackage>,
+}
+
+pub(crate) enum NpmLockStatus {
+    Complete(NpmLock),
+    NeedsIntegrity(MissingNpmIntegrity),
+}
+
+pub(crate) struct MissingNpmIntegrity {
+    paths: BTreeMap<NpmRegistryPackage, Vec<String>>,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) struct NpmRegistryPackage {
+    name: String,
+    version: String,
+}
+
+impl MissingNpmIntegrity {
+    pub(crate) fn packages(&self) -> impl Iterator<Item = &NpmRegistryPackage> {
+        self.paths.keys()
+    }
+
+    pub(crate) fn complete(
+        self,
+        bytes: &[u8],
+        integrities: &BTreeMap<NpmRegistryPackage, String>,
+    ) -> Result<Vec<u8>> {
+        ensure!(
+            integrities.len() == self.paths.len(),
+            "Incomplete npm registry integrity evidence"
+        );
+        let mut document: serde_json::Value = serde_json::from_slice(bytes)?;
+        let packages = document["packages"]
+            .as_object_mut()
+            .context("npm lock has no package records")?;
+        for (package, paths) in self.paths {
+            let integrity = integrities
+                .get(&package)
+                .context("Missing exact npm registry integrity")?;
+            validate_integrity(integrity).context("Invalid npm registry SHA-512 integrity")?;
+            for path in paths {
+                let record = packages
+                    .get_mut(&path)
+                    .and_then(serde_json::Value::as_object_mut)
+                    .context("npm lock package disappeared during integrity recovery")?;
+                ensure!(
+                    !record.contains_key("integrity"),
+                    "npm lock already declares an integrity for '{path}'"
+                );
+                record.insert("integrity".into(), integrity.as_str().into());
+            }
+        }
+        Ok(serde_json::to_vec(&document)?)
+    }
+}
+
+impl std::fmt::Display for NpmRegistryPackage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}@{}", self.name, self.version)
+    }
+}
+
+impl NpmRegistryPackage {
+    fn tarball_url(&self) -> String {
+        let basename = self.name.rsplit('/').next().unwrap_or(&self.name);
+        format!(
+            "{NPM_REGISTRY}{}/-/{basename}-{}.tgz",
+            self.name, self.version
+        )
+    }
+
+    pub(crate) fn metadata_url(&self) -> Result<reqwest::Url> {
+        let mut url = reqwest::Url::parse(NPM_REGISTRY)?;
+        url.path_segments_mut()
+            .map_err(|()| anyhow::anyhow!("Invalid npm registry endpoint"))?
+            .pop_if_empty()
+            .push(&self.name)
+            .push(&self.version);
+        Ok(url)
+    }
+
+    pub(crate) fn integrity_from_metadata(&self, bytes: &[u8]) -> Result<String> {
+        #[derive(Deserialize)]
+        struct Metadata {
+            name: String,
+            version: String,
+            dist: Distribution,
+        }
+
+        #[derive(Deserialize)]
+        struct Distribution {
+            tarball: String,
+            integrity: String,
+        }
+
+        let metadata: Metadata =
+            serde_json::from_slice(bytes).context("Invalid exact npm registry metadata")?;
+        ensure!(
+            metadata.name == self.name
+                && metadata.version == self.version
+                && metadata.dist.tarball == self.tarball_url(),
+            "npm registry metadata does not match {self}"
+        );
+        validate_integrity(&metadata.dist.integrity)
+            .context("Invalid npm registry SHA-512 integrity")?;
+        Ok(metadata.dist.integrity)
+    }
 }
 
 impl NpmLock {
@@ -152,7 +260,14 @@ impl NpmLock {
     }
 
     pub(crate) fn parse(bytes: &[u8], requested: &NpmSpec) -> Result<Self> {
-        ensure!(bytes.len() <= 16 * 1024 * 1024, "npm lock exceeds 16 MiB");
+        match Self::inspect(bytes, requested)? {
+            NpmLockStatus::Complete(lock) => Ok(lock),
+            NpmLockStatus::NeedsIntegrity(_) => anyhow::bail!("npm lock package has no integrity"),
+        }
+    }
+
+    pub(crate) fn inspect(bytes: &[u8], requested: &NpmSpec) -> Result<NpmLockStatus> {
+        ensure!(bytes.len() <= MAX_LOCK_BYTES, "npm lock exceeds 16 MiB");
         let lock: RawLock = serde_json::from_slice(bytes).context("Invalid npm lock")?;
         ensure!(
             lock.lockfile_version == 3,
@@ -194,6 +309,7 @@ impl NpmLock {
             "npm lock changed the requested exact version"
         );
         let mut packages = BTreeMap::new();
+        let mut missing = BTreeMap::<_, Vec<_>>::new();
         for (path, entry) in &lock.packages {
             if path.is_empty() {
                 continue;
@@ -230,32 +346,27 @@ impl NpmLock {
                 .resolved
                 .as_deref()
                 .context("npm lock package has no registry tarball")?;
-            let basename = name
-                .rsplit('/')
-                .next()
-                .context("npm package has no basename")?;
+            let package = NpmRegistryPackage {
+                name: name.into(),
+                version: version.into(),
+            };
             ensure!(
-                resolved == format!("https://registry.npmjs.org/{name}/-/{basename}-{version}.tgz"),
+                resolved == package.tarball_url(),
                 "npm lock tarball does not bind its public registry package and version"
             );
-            let integrity = entry
-                .integrity
-                .as_deref()
-                .context("npm lock package has no integrity")?;
-            let digest = integrity
-                .strip_prefix("sha512-")
-                .context("npm lock requires SHA-512 integrity")?;
-            ensure!(
-                STANDARD.decode(digest)?.len() == 64,
-                "npm lock has invalid SHA-512 integrity"
-            );
+            if let Some(integrity) = entry.integrity.as_deref() {
+                validate_integrity(integrity)?;
+            } else {
+                missing
+                    .entry(package.clone())
+                    .or_default()
+                    .push(path.clone());
+            }
             packages.insert(
                 path.clone(),
                 NpmPackage {
-                    name: name.into(),
-                    version: version.into(),
-                    resolved: resolved.into(),
-                    integrity: integrity.into(),
+                    name: package.name,
+                    version: package.version,
                     can_be_absent: entry.optional || entry.dev || entry.dev_optional,
                     required_dependencies: Vec::new(),
                 },
@@ -273,11 +384,37 @@ impl NpmLock {
                 package.required_dependencies = required_dependencies;
             }
         }
-        Ok(Self {
-            sha256: hex::encode(Sha256::digest(bytes)),
-            packages,
-        })
+        if missing.is_empty() {
+            Ok(NpmLockStatus::Complete(Self {
+                sha256: hex::encode(Sha256::digest(bytes)),
+                packages,
+            }))
+        } else {
+            Ok(NpmLockStatus::NeedsIntegrity(MissingNpmIntegrity {
+                paths: missing,
+            }))
+        }
     }
+}
+
+fn validate_integrity(integrity: &str) -> Result<()> {
+    let digest = integrity
+        .strip_prefix("sha512-")
+        .context("npm lock requires SHA-512 integrity")?;
+    ensure!(
+        digest.len() == 88
+            && STANDARD
+                .decode(digest)
+                .is_ok_and(|decoded| decoded.len() == 64),
+        "Invalid npm lock SHA-512 integrity"
+    );
+    Ok(())
+}
+
+fn declared_integrity<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<String>, D::Error> {
+    String::deserialize(deserializer).map(Some)
 }
 
 fn parent_package(path: &str) -> &str {
@@ -527,6 +664,7 @@ struct RawPackage {
     name: Option<String>,
     version: Option<String>,
     resolved: Option<String>,
+    #[serde(default, deserialize_with = "declared_integrity")]
     integrity: Option<String>,
     #[serde(default)]
     link: bool,
@@ -791,6 +929,89 @@ mod tests {
             NpmLock::parse(&serde_json::to_vec(&changed)?, &spec())?.sha256,
             reviewed.sha256
         );
+        Ok(())
+    }
+
+    #[test]
+    fn exact_registry_integrity_only_completes_missing_fields() -> Result<()> {
+        let mut document = lock();
+        let nested = "node_modules/app/node_modules/@scope/dep";
+        let hoisted = "node_modules/@scope/dep";
+        let declared = document["packages"][nested]["integrity"].clone();
+        document["packages"][nested]
+            .as_object_mut()
+            .unwrap()
+            .remove("integrity");
+        document["packages"][hoisted] = document["packages"][nested].clone();
+        document["packages"][nested]["customMetadata"] = json!({ "keep": ["unchanged"] });
+        let bytes = serde_json::to_vec(&document)?;
+        let NpmLockStatus::NeedsIntegrity(missing) = NpmLock::inspect(&bytes, &spec())? else {
+            anyhow::bail!("Missing integrities require exact registry lookups");
+        };
+        let packages = missing.packages().cloned().collect::<Vec<_>>();
+        assert_eq!(packages.len(), 1);
+        let coordinate = &packages[0];
+        assert_eq!(
+            coordinate.metadata_url()?.as_str(),
+            "https://registry.npmjs.org/@scope%2Fdep/2.3.4-beta.1"
+        );
+        let metadata = json!({
+            "name": "@scope/dep",
+            "version": "2.3.4-beta.1",
+            "dist": {
+                "tarball": "https://registry.npmjs.org/@scope/dep/-/dep-2.3.4-beta.1.tgz",
+                "integrity": declared
+            }
+        });
+        let integrity = coordinate.integrity_from_metadata(&serde_json::to_vec(&metadata)?)?;
+        let filled =
+            missing.complete(&bytes, &BTreeMap::from([(coordinate.clone(), integrity)]))?;
+        let completed: Value = serde_json::from_slice(&filled)?;
+        document["packages"][nested]["integrity"] = declared.clone();
+        document["packages"][hoisted]["integrity"] = declared;
+        assert_eq!(completed, document);
+        assert!(NpmLock::parse(&bytes, &spec()).is_err());
+        assert_eq!(NpmLock::parse(&filled, &spec())?.packages.len(), 4);
+        Ok(())
+    }
+
+    #[test]
+    fn registry_integrity_rejects_mismatched_evidence() -> Result<()> {
+        let coordinate = NpmRegistryPackage {
+            name: "@scope/dep".into(),
+            version: "2.3.4-beta.1".into(),
+        };
+        let metadata = json!({
+            "name": "@scope/dep",
+            "version": "2.3.4-beta.1",
+            "dist": {
+                "tarball": "https://registry.npmjs.org/@scope/dep/-/dep-2.3.4-beta.1.tgz",
+                "integrity": package("@scope/dep", "2.3.4-beta.1")["integrity"]
+            }
+        });
+        for (field, unexpected) in [
+            ("/name", json!("@scope/other")),
+            ("/version", json!("2.3.5")),
+            (
+                "/dist/tarball",
+                json!("https://registry.example.invalid/pkg.tgz"),
+            ),
+            ("/dist/integrity", json!("sha1-AQID")),
+            ("/dist/integrity", json!("sha512-AQID")),
+            ("/dist/integrity", Value::Null),
+        ] {
+            let mut invalid = metadata.clone();
+            *invalid.pointer_mut(field).unwrap() = unexpected;
+            assert!(
+                coordinate
+                    .integrity_from_metadata(&serde_json::to_vec(&invalid)?)
+                    .is_err(),
+                "unexpected acceptance for {field}"
+            );
+        }
+        let mut document = lock();
+        document["packages"]["node_modules/app"]["integrity"] = Value::Null;
+        assert!(NpmLock::inspect(&serde_json::to_vec(&document)?, &spec()).is_err());
         Ok(())
     }
 

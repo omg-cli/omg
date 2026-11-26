@@ -8424,6 +8424,157 @@ fixture["seed_runtime_advisory_fixture"](pi, "pi", version, config)
                         output=result.stdout[-450:],
                     ))
 
+    def inspect_pi_integrity_admission():
+        phase = "pi-registry-integrity"
+        version, node_version = "0.83.0", "24.22.3"
+        seed = r"""
+import base64, json, runpy, shlex, sys
+from pathlib import Path
+
+helper, directory, version, node_version, variant = sys.argv[1:]
+home = Path(directory)
+fixture = runpy.run_path(helper)
+config = Path(fixture["fixture_cli_environment"](home)["OMG_CONFIG_DIR"])
+(config / "config.toml").touch()
+(home / ".tool-versions").write_text(f"pi {version}\n")
+node = home / "data/versions/node" / node_version
+npm = node / "lib/node_modules/npm"
+(npm / "bin").mkdir(parents=True)
+(node / "bin").mkdir()
+(npm / "package.json").write_text('{"name":"npm","version":"11.15.0"}\n')
+program = node / "bin/node"
+program.write_text('#!/bin/sh\nexec /bin/sh "$@"\n')
+program.chmod(0o755)
+cli = npm / "bin/npm-cli.js"
+cli.write_text(
+    '#!/bin/sh\nset -eu\nhome=' + shlex.quote(str(home)) + '\n'
+    'while [ "${1#--}" != "$1" ]; do shift; done\n'
+    'printf "%s\\n" "$1" >> "$home/manager-phases"\n'
+    '[ "$1" = install ] && [ "$2" = --prefix ] || exit 81\n'
+    'cp "$home/witness-lock.json" "$3/package-lock.json"\n'
+    'if [ -f "$home/materialize-early" ]; then mkdir "$3/node_modules"; fi\n'
+)
+cli.chmod(0o755)
+(node / "bin/npm").symlink_to("../lib/node_modules/npm/bin/npm-cli.js")
+(node.parent / "current").symlink_to(node_version)
+fixture["seed_runtime_advisory_fixture"](node, "node", node_version, config)
+
+root = "@earendil-works/pi-coding-agent"
+root_path = f"node_modules/{root}"
+nested = root_path + "/node_modules/@fixture/one"
+hoisted = "node_modules/@fixture/two"
+integrity = "sha512-" + base64.b64encode(bytes(range(64))).decode()
+def package(name, exact):
+    return {"version": exact, "integrity": integrity,
+            "resolved": f"https://registry.npmjs.org/{name}/-/{name.rsplit('/', 1)[-1]}-{exact}.tgz"}
+packages = {
+    "": {"dependencies": {root: version}},
+    root_path: package(root, version),
+    nested: package("@fixture/one", "1.2.3"),
+    hoisted: package("@fixture/two", "2.0.0"),
+}
+packages[root_path]["dependencies"] = {"@fixture/one": "1.2.3", "@fixture/two": "2.0.0"}
+if variant in ("nested-integrity-absent", "several-integrities-absent", "duplicate-coordinate",
+               "invalid-later-entry", "early-materialization"):
+    del packages[nested]["integrity"]
+if variant in ("several-integrities-absent", "optional-integrity-absent"):
+    del packages[hoisted]["integrity"]
+if variant == "root-integrity-absent":
+    del packages[root_path]["integrity"]
+if variant == "optional-integrity-absent":
+    packages[hoisted]["optional"] = True
+    del packages[root_path]["dependencies"]["@fixture/two"]
+    packages[root_path]["optionalDependencies"] = {"@fixture/two": "2.0.0"}
+if variant == "duplicate-coordinate":
+    copy = dict(packages[nested])
+    packages["node_modules/@fixture/one"] = copy
+if variant == "declared-null":
+    packages[nested]["integrity"] = None
+if variant == "declared-empty":
+    packages[nested]["integrity"] = ""
+if variant == "declared-sha1":
+    packages[nested]["integrity"] = "sha1-AQID"
+if variant == "invalid-later-entry":
+    packages[hoisted]["integrity"] = "sha512-invalid"
+if variant == "foreign-tarball":
+    del packages[nested]["integrity"]
+    packages[nested]["resolved"] = "https://registry.example.invalid/fixture.tgz"
+if variant == "tarball-query":
+    del packages[nested]["integrity"]
+    packages[nested]["resolved"] += "?x=1"
+if variant == "registry-alias":
+    del packages[nested]["integrity"]
+    packages[nested]["name"] = "@fixture/different"
+if variant == "linked-package":
+    del packages[nested]["integrity"]
+    packages[nested]["link"] = True
+if variant == "wrong-root-version":
+    exact = "0.82.0"
+    packages[""]["dependencies"][root] = exact
+    packages[root_path] = package(root, exact)
+    del packages[root_path]["integrity"]
+if variant == "unresolved-peer":
+    del packages[nested]["integrity"]
+    packages[nested]["peerDependencies"] = {"@fixture/missing": "1.0.0"}
+if variant == "early-materialization":
+    (home / "materialize-early").touch()
+(home / "witness-lock.json").write_text(json.dumps({"lockfileVersion": 3, "packages": packages}))
+pi = home / "data/versions/pi"
+pi.mkdir()
+(pi / "current").symlink_to("0.82.0")
+"""
+        cases = {
+            "nested-integrity-absent": "Failed to recover npm registry integrity",
+            "several-integrities-absent": "Failed to recover npm registry integrity",
+            "root-integrity-absent": "Failed to recover npm registry integrity",
+            "optional-integrity-absent": "Failed to recover npm registry integrity",
+            "duplicate-coordinate": "Failed to recover npm registry integrity",
+            "declared-null": "Invalid npm lock",
+            "declared-empty": "npm lock requires SHA-512 integrity",
+            "declared-sha1": "npm lock requires SHA-512 integrity",
+            "invalid-later-entry": "Invalid npm lock SHA-512 integrity",
+            "foreign-tarball": "npm lock tarball does not bind its public registry package and version",
+            "tarball-query": "npm lock tarball does not bind its public registry package and version",
+            "registry-alias": "npm lock aliases cannot establish registry identity",
+            "linked-package": "npm lock links cannot establish registry identity",
+            "wrong-root-version": "npm lock changed the requested exact version",
+            "unresolved-peer": "npm lock omits a resolved peer dependency '@fixture/missing'",
+            "early-materialization": "NPM lock resolution materialized packages before advisory review",
+        }
+        for variant, diagnostic in cases.items():
+            with tempfile.TemporaryDirectory(prefix=f"pi-integrity-{variant}-", dir=work) as directory:
+                home = Path(directory)
+                os.chown(home, account.pw_uid, account.pw_gid)
+                config_dir = home / "config/omg"
+                mode = dict(disabled, HOME=str(home), OMG_CONFIG_DIR=str(config_dir),
+                            OMG_DATA_DIR=str(home / "data"), OMG_NATIVE_TEST_DATA_DIR="1",
+                            XDG_CONFIG_HOME=str(config_dir.parent), XDG_DATA_HOME=str(home / "xdg-data"),
+                            XDG_CACHE_HOME=str(home / "cache"), XDG_STATE_HOME=str(home / "state"),
+                            OMG_NO_UPDATE_CHECK="1")
+                checked([sys.executable, "-I", "-B", "-c", seed, runtime_advisory_fixture, home,
+                         version, node_version, variant], mode, ordinary)
+                versions = home / "data/versions/pi"
+                phases = home / "manager-phases"
+                original = (home / "witness-lock.json").read_bytes()
+                for shorthand, args in (
+                    ("positional", ["use", "pi", version]),
+                    ("project-pin", ["use", "pi"]),
+                ):
+                    phases.unlink(missing_ok=True)
+                    result = command([cli, *args], mode, ordinary, timeout=60)
+                    children = sorted(path.name for path in versions.iterdir())
+                    observed = phases.read_text().splitlines() if phases.exists() else []
+                    checks.append(dict(
+                        phase=phase, case=f"{variant}-{shorthand}", status=result.returncode,
+                        passed=(result.returncode == 1 and diagnostic in result.stderr
+                                and observed == ["install"] and "Now using Pi" not in result.stdout
+                                and all(item in (".mutation.lock", "current") for item in children)
+                                and os.readlink(versions / "current") == "0.82.0"
+                                and (home / "witness-lock.json").read_bytes() == original),
+                        diagnostic=result.stderr[-1500:], output=result.stdout[-350:],
+                        value=(children, observed),
+                    ))
+
     def inspect_dashboard_terminal():
         import pty
         import select
@@ -9546,6 +9697,7 @@ exec {shlex.quote(str(binary))} "$@"
                     inspect_audit_licenses()
                     inspect_container_cli()
                     inspect_pi_dependency_activation()
+                    inspect_pi_integrity_admission()
                     inspect_info_attempts()
                     inspect_info_json_writes()
                     inspect_dashboard_terminal()
@@ -9878,6 +10030,6 @@ mark_progress("completed with host inventory unchanged")
 report = dict(binaries=binaries, checks=checks, total=len(checks),
               passed=sum(entry["passed"] for entry in checks), host_unchanged=True)
 print(json.dumps(report))
-expected_checks = 303 if consent_oracle is None else 3083
+expected_checks = 303 if consent_oracle is None else 3115
 if report["passed"] != report["total"] or report["total"] != expected_checks:
     sys.exit(4)
