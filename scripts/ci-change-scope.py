@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Classify PR checks from the complete local Git diff."""
+"""Classify CI checks from the complete local Git diff."""
+import argparse
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -52,13 +53,17 @@ def coverage_irrelevant(paths):
 def changed_paths(event, cwd=None):
     base = event['pull_request']['base']['sha']
     head = event['pull_request']['head']['sha']
+    return git_diff_paths(base, head, '...', cwd)
+
+
+def git_diff_paths(base, head, separator, cwd):
     if not all(isinstance(sha, str) and re.fullmatch(r'[0-9a-f]{40}', sha)
                for sha in (base, head)):
-        raise ValueError('Invalid PR commit identity')
+        raise ValueError('Invalid commit identity')
     # Disable rename folding: moving code into docs must include the deleted
     # source path. NUL separators preserve whitespace and unusual filenames.
     result = subprocess.run(
-        ['git', 'diff', '--name-only', '--no-renames', '-z', f'{base}...{head}', '--'],
+        ['git', 'diff', '--name-only', '--no-renames', '-z', f'{base}{separator}{head}', '--'],
         cwd=cwd, check=True, capture_output=True, timeout=60,
     )
     return [path for path in result.stdout.decode('utf-8', errors='surrogateescape').split('\0') if path]
@@ -76,10 +81,35 @@ def requires_build(event_name, event, cwd=None):
     return classify_scope(event_name, event, cwd)[0]
 
 
+def distro_e2e_required(event_name, event, cwd=None):
+    if event_name != 'push':
+        return True
+    try:
+        paths = git_diff_paths(event['before'], event['after'], '..', cwd)
+    except (KeyError, ValueError, subprocess.SubprocessError):
+        # A shallow checkout can be missing the old commit during a batched push.
+        return True
+    return not paths or not all(
+        documentation_only([path]) or (
+            path.startswith('services/advisories/') and '..' not in PurePosixPath(path).parts
+        )
+        for path in paths
+    )
+
+
 if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--distro-e2e', action='store_true')
+    args = parser.parse_args()
     event = json.loads(Path(os.environ['GITHUB_EVENT_PATH']).read_text(encoding='utf-8'))
-    required, coverage_required = classify_scope(os.environ['GITHUB_EVENT_NAME'], event)
+    event_name = os.environ['GITHUB_EVENT_NAME']
     with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:
-        output.write(f'required={str(required).lower()}\n')
-        output.write(f'coverage_required={str(coverage_required).lower()}\n')
-    print(f'Build required: {required}; instrumented Rust coverage required: {coverage_required}')
+        if args.distro_e2e:
+            required = distro_e2e_required(event_name, event)
+            output.write(f'required={str(required).lower()}\n')
+            print(f'Distro E2E required: {required}')
+        else:
+            required, coverage_required = classify_scope(event_name, event)
+            output.write(f'required={str(required).lower()}\n')
+            output.write(f'coverage_required={str(coverage_required).lower()}\n')
+            print(f'Build required: {required}; instrumented Rust coverage required: {coverage_required}')
