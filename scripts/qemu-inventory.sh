@@ -576,7 +576,7 @@ rpm_compatible_arches() {
 
 check_info_native_package() {
   local distro=$1 output=$2 status=0 version='' source='' actual_name actual_version actual_source
-  local rpm_arches='' native_identity='' native_reference=''
+  local rpm_arches='' native_identity='' native_reference='' expected_name=pacman
   case "$distro" in
     arch)
       timeout --kill-after=2s 30 pacman -Si pacman > native-info.raw 2> native-info.stderr || status=$?
@@ -601,7 +601,7 @@ check_info_native_package() {
         ' native-info.raw) || { printf 'native info reference has an invalid or ambiguous RPM identity and EVR\n' >&2; return 2; }
         IFS=$'\t' read -r native_identity version <<< "$native_reference"
       fi
-      source='Official repository (dnf)' ;;
+      source='Configured DNF repository' ;;
     *) return 2 ;;
   esac
   if [[ "$status" != 0 || -z "$version" || "$version" == '(none)' || "$version" == *$'\n'* || -z "$source" || "$source" == *$'\n'* ]]; then
@@ -618,9 +618,16 @@ check_info_native_package() {
   actual_name=$(awk '$1 == "Name:" && NF == 2 {print $2}' "$output")
   actual_version=$(awk '$1 == "Version:" && NF == 2 {print $2}' "$output")
   actual_source=$(sed -n 's/^[[:space:]]*Source: //p' "$output")
+  if [[ "$distro" == fedora ]]; then
+    expected_name=$native_identity
+    # Older signed Fedora releases used one source label and could omit the architecture.
+    if [[ "$actual_source" == 'Official repository (dnf)' ]]; then
+      source='Official repository (dnf)'
+      if [[ "$actual_name" == pacman ]]; then expected_name=pacman; fi
+    fi
+  fi
   printf 'native info %s expected=%s identity=%s source=%s actual=%s identity=%s source=%s\n' "$distro" "$version" "$native_identity" "$source" "$actual_version" "$actual_name" "$actual_source" >&2
-  if [[ ( "$actual_name" != pacman && ( "$distro" != fedora || "$actual_name" != "$native_identity" ) ) \
-    || "$actual_version" != "$version" || "$actual_source" != "$source" ]]; then
+  if [[ "$actual_name" != "$expected_name" || "$actual_version" != "$version" || "$actual_source" != "$source" ]]; then
     printf 'assertion failed: info disagrees with the native %s package catalog\n' "$distro" >&2
     return 1
   fi

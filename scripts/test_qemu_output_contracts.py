@@ -484,10 +484,14 @@ class OutputContracts(unittest.TestCase):
     @unittest.skipIf(os.name == 'nt', 'Full receiver needs POSIX shell descriptors')
     def test_fedora_info_accepts_native_identity_and_bare_published_base(self):
         row = 'info\t["info","pacman"]\tread\t0\tpass\t-\thermetic\thermetic:pass\tinfo-native-package\ttempdir-drop'
-        for native_name, shown in (('pacman.x86_64', 'pacman.x86_64'), ('pacman.i686', 'pacman.i686'),
-                                  ('pacman.noarch', 'pacman.noarch'), ('pacman.x86_64', 'pacman')):
-            with self.subTest(native=native_name, shown=shown):
-                output = self.receiver_info_output(shown)
+        for native_name, shown, source in (
+            ('pacman.x86_64', 'pacman.x86_64', 'Configured DNF repository'),
+            ('pacman.i686', 'pacman.i686', 'Configured DNF repository'),
+            ('pacman.noarch', 'pacman.noarch', 'Configured DNF repository'),
+            ('pacman.x86_64', 'pacman', 'Official repository (dnf)'),
+        ):
+            with self.subTest(native=native_name, shown=shown, source=source):
+                output = self.receiver_info_output(shown, source=source)
                 result, evidence, logs = self.run_inventory('printf %s ' + shlex.quote(output) + '\n', [row],
                     distro='fedora', native_commands=self.receiver_native(native_name + '\t7.0.0-6.fc44\n'))
                 self.assertEqual(result.returncode, 0, logs)
@@ -546,6 +550,9 @@ class OutputContracts(unittest.TestCase):
             ('extra name token', good.replace('Name: pacman.x86_64', 'Name: pacman.x86_64 extra'), 'disagrees with the native'),
             ('extra version token', good.replace('Version: 7.0.0-6.fc44', 'Version: 7.0.0-6.fc44 extra'), 'disagrees with the native'),
             ('foreign source', self.receiver_info_output(source='Official repository (copr)'), 'disagrees with the native'),
+            ('installed database source', self.receiver_info_output(source='Installed RPM database'), 'disagrees with the native'),
+            ('unknown DNF source', self.receiver_info_output(source='DNF (repository unspecified)'), 'disagrees with the native'),
+            ('new DNF source without arch', self.receiver_info_output('pacman', source='Configured DNF repository'), 'disagrees with the native'),
             ('duplicate Name', good + 'Name: pacman\n', 'unique pacman'),
             ('duplicate Version', good + 'Version: 7.0.0-6.fc44\n', 'unique pacman'),
             ('duplicate Source', good + 'Source: Official repository (dnf)\n', 'unique pacman'),

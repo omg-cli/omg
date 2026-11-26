@@ -514,6 +514,7 @@ mod dnf_integration {
                 assert_eq!(actual["name"], info.name);
                 assert_eq!(actual["version"], info.version.to_string());
                 assert_eq!(actual["installed"], false);
+                assert_eq!(actual["source"], "dnf_repository");
             } else {
                 let actual = std::str::from_utf8(&output.stdout)?;
                 assert!(
@@ -523,6 +524,12 @@ mod dnf_integration {
                 assert!(
                     actual.contains(&info.version.to_string()),
                     "missing version: {actual}"
+                );
+                assert!(
+                    actual
+                        .lines()
+                        .any(|line| line.trim() == "Source: Configured DNF repository"),
+                    "missing DNF repository source: {actual}"
                 );
                 assert!(
                     actual
@@ -730,6 +737,11 @@ mod dnf_integration {
             text.contains(&name) && text.contains(&version),
             "native installed metadata absent: {text}"
         );
+        assert!(
+            text.lines()
+                .any(|line| line.trim() == "Source: Installed RPM database"),
+            "missing installed RPM database source: {text}"
+        );
         Ok(())
     }
 
@@ -864,6 +876,7 @@ mod dnf_integration {
         assert_eq!(value["name"], name);
         assert_eq!(value["version"], version);
         assert_eq!(value["installed"], true);
+        assert_eq!(value["source"], "rpm_database");
         Ok(())
     }
 

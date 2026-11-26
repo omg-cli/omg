@@ -118,12 +118,18 @@ check_package_ipc_delta() {
 # BEGIN INFO PROVENANCE ORACLE
 check_daemon_info_provenance() {
   local daemon_info=$1 native_info=$2
-  jq -e -s '
+  jq -e -s --arg distro "$ID" '
     length == 2 and
     (.[0] | type) == "object" and (.[1] | type) == "object" and
-    .[0].source == "Official" and
     (.[0].download_size | type) == "number" and
-    (.[1].source != "Official" or (.[1].download_size | type) != "number")
+    if $distro == "fedora" then
+      (.[1] | has("download_size") | not) and
+      ((.[0].repo == "@System" and .[0].source == "rpm_database" and .[1].source == "rpm_database") or
+       (.[0].repo == "official" and .[0].source == "Official" and .[1].source == "Official"))
+    else
+      .[0].source == "Official" and
+      (.[1].source != "Official" or (.[1].download_size | type) != "number")
+    end
   ' "$daemon_info" "$native_info" >/dev/null
 }
 # END INFO PROVENANCE ORACLE
