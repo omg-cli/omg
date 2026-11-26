@@ -50,7 +50,7 @@ For explicit task execution, OMG reads supported `[env]` entries. Strings
 and integers set values. `true` sets the string `true`, while `false` unsets
 the value. Tables support `value`, `default`, `required`, `tools`, and
 `redact`. The `[env._]` table supports `path`, `file`, and `source`
-directives.
+directives. Use one assignment per variable table with `value`, `default`, or `required = true`. Options such as `tools`, `redact`, and `expand` take booleans. A directive can use a single `path` key or a legacy `value` or `values` alias. OMG adds `_.path` entries at the front of `PATH`.
 
 ```toml
 [env]

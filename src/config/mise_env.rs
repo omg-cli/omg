@@ -51,7 +51,7 @@ pub(crate) enum EnvAction {
     /// Assign only when the variable is unset or empty.
     Default(String),
     /// Fail when the variable is unset or empty; never assigns.
-    Required { redact: bool },
+    Required,
     /// Remove the variable.
     Unset,
 }
@@ -82,6 +82,13 @@ pub(crate) struct EnvFileDirective {
     pub expand: bool,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct EnvPathDirective {
+    path: PathBuf,
+    tools_phase: bool,
+    redact: bool,
+}
+
 /// Parsed `[env]` table of one `mise.toml` file.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct MiseEnv {
@@ -91,8 +98,8 @@ pub(crate) struct MiseEnv {
     pub paths: Vec<(PathBuf, bool)>,
     /// `_.file` directives in declaration order.
     pub files: Vec<EnvFileDirective>,
-    /// `_.source` scripts as `(script, tools_phase)` in declaration order.
-    pub sources: Vec<(PathBuf, bool)>,
+    /// `_.source` scripts in declaration order.
+    pub sources: Vec<EnvPathDirective>,
     /// Top-level `redactions = [...]` glob patterns (`*` wildcards).
     pub redactions: Vec<String>,
 }
@@ -277,11 +284,15 @@ fn expand_dollar<'a>(
     Ok(output)
 }
 
-/// Parse one `[env]` variable spec into an [`EnvEntry`].
-///
-/// `false` unsets; `{ default = … }` fills gaps; `{ required = true }`
-/// validates; `{ value = …, tools = …, redact = … }` assigns with options.
-/// Plain strings and integers assign directly. Anything else is rejected.
+fn boolean_option(table: &toml::Table, key: &str, context: impl std::fmt::Display) -> Result<bool> {
+    match table.get(key) {
+        Some(value) => value
+            .as_bool()
+            .with_context(|| format!("{key} must be a boolean in {context}")),
+        None => Ok(false),
+    }
+}
+
 fn parse_entry(name: &str, spec: &toml::Value) -> Result<EnvEntry> {
     validate_env_name(name)?;
     let mut tools_phase = false;
@@ -293,213 +304,199 @@ fn parse_entry(name: &str, spec: &toml::Value) -> Result<EnvEntry> {
         toml::Value::Boolean(true) => EnvAction::Set("true".to_string()),
         toml::Value::Table(table) => {
             for key in table.keys() {
-                match key.as_str() {
-                    "value" | "default" | "required" | "tools" | "redact" => {}
-                    other => anyhow::bail!("Unknown option {other:?} in [env] {name}"),
-                }
+                anyhow::ensure!(
+                    matches!(
+                        key.as_str(),
+                        "value" | "default" | "required" | "tools" | "redact"
+                    ),
+                    "Unknown option {key:?} in [env] {name}"
+                );
             }
-            tools_phase = table
-                .get("tools")
-                .and_then(toml::Value::as_bool)
-                .unwrap_or(false);
-            redact = table
-                .get("redact")
-                .and_then(toml::Value::as_bool)
-                .unwrap_or(false);
-            if let Some(default) = table.get("default") {
-                let fallback = match default {
-                    toml::Value::String(value) => value.clone(),
-                    toml::Value::Integer(number) => number.to_string(),
-                    other => anyhow::bail!(
-                        "Unsupported default value {other} in [env] {name}: want string or integer"
-                    ),
-                };
-                EnvAction::Default(fallback)
-            } else if table
-                .get("required")
-                .and_then(toml::Value::as_bool)
-                .unwrap_or(false)
-            {
-                EnvAction::Required { redact }
-            } else if let Some(value) = table.get("value") {
-                let assigned = match value {
-                    toml::Value::String(value) => value.clone(),
-                    toml::Value::Integer(number) => number.to_string(),
-                    other => anyhow::bail!(
-                        "Unsupported value {other} in [env] {name}: want string or integer"
-                    ),
-                };
-                EnvAction::Set(assigned)
-            } else {
-                anyhow::bail!("[env] {name} needs one of `value`, `default`, or `required`");
+            tools_phase = boolean_option(table, "tools", format_args!("[env] {name}"))?;
+            redact = boolean_option(table, "redact", format_args!("[env] {name}"))?;
+            let required = boolean_option(table, "required", format_args!("[env] {name}"))?;
+            match (table.get("value"), table.get("default"), required) {
+                (Some(value), None, false) => {
+                    let text = assignment_text(value).with_context(|| {
+                        format!("Unsupported value in [env] {name}: want string or integer")
+                    })?;
+                    EnvAction::Set(text)
+                }
+                (None, Some(default), false) => {
+                    let text = assignment_text(default).with_context(|| {
+                        format!("Unsupported default value in [env] {name}: want string or integer")
+                    })?;
+                    EnvAction::Default(text)
+                }
+                (None, None, true) => EnvAction::Required,
+                _ => anyhow::bail!(
+                    "[env] {name} needs exactly one of `value`, `default`, or `required = true`"
+                ),
             }
         }
-        other => anyhow::bail!("Unsupported value {other} in [env] {name}"),
+        _ => anyhow::bail!(
+            "Unsupported value in [env] {name}: want string, integer, boolean, or table"
+        ),
     };
     Ok(EnvEntry {
-        name: name.to_string(),
+        name: name.to_owned(),
         action,
         tools_phase,
         redact,
     })
 }
 
-/// Collect path strings from a directive value: a single string, an array of
-/// strings and `{ path = … }` objects, or a bare `{ path = … }` object. The
-/// deprecated `value`/`values` spellings are accepted as `path` aliases so
-/// older configs keep working.
-pub(crate) fn directive_paths(spec: &toml::Value, directive: &str) -> Result<Vec<(String, bool)>> {
-    fn one(item: &toml::Value, directive: &str) -> Result<Vec<(String, bool)>> {
-        match item {
-            toml::Value::String(path) => Ok(vec![(path.clone(), false)]),
-            toml::Value::Table(table) => {
-                let raw = table
-                    .get("path")
-                    .or_else(|| table.get("value"))
-                    .or_else(|| table.get("values"));
-                let paths = match raw {
-                    Some(toml::Value::String(path)) => vec![path.clone()],
-                    Some(toml::Value::Array(paths)) => paths
-                        .iter()
-                        .map(|path| {
-                            path.as_str().map(str::to_owned).with_context(|| {
-                                format!("{directive} entry `path` must be a string or string array")
-                            })
-                        })
-                        .collect::<Result<Vec<_>>>()?,
-                    _ => anyhow::bail!("{directive} entry needs a `path` string"),
-                };
-                let tools_phase = table
-                    .get("tools")
-                    .and_then(toml::Value::as_bool)
-                    .unwrap_or(false);
-                Ok(paths.into_iter().map(|path| (path, tools_phase)).collect())
-            }
-            other => anyhow::bail!("Unsupported {directive} entry: {other}"),
-        }
-    }
-    match spec {
-        toml::Value::Array(items) => {
-            let mut merged = Vec::new();
-            for item in items {
-                merged.extend(one(item, directive)?);
-            }
-            Ok(merged)
-        }
-        single => one(single, directive),
+fn assignment_text(value: &toml::Value) -> Option<String> {
+    match value {
+        toml::Value::String(text) => Some(text.clone()),
+        toml::Value::Integer(number) => Some(number.to_string()),
+        _ => None,
     }
 }
 
-/// Parse one `_.file` object: `{ path, redact, tools, expand }` (plus the
-/// deprecated `value`/`values` aliases for `path`).
-pub(crate) fn parse_file_directive(item: &toml::Value) -> Result<EnvFileDirective> {
-    let (path, tools_phase) = match item {
-        toml::Value::String(path) => (PathBuf::from(path), false),
-        toml::Value::Table(table) => {
-            let raw = table
-                .get("path")
-                .or_else(|| table.get("value"))
-                .or_else(|| table.get("values"));
-            let Some(path) = raw.and_then(toml::Value::as_str) else {
-                anyhow::bail!("_.file entry needs a `path` string");
-            };
-            for key in table.keys() {
-                match key.as_str() {
-                    "path" | "value" | "values" | "redact" | "tools" | "expand" => {}
-                    other => anyhow::bail!("Unknown option {other:?} in _.file entry"),
-                }
-            }
-            let tools_phase = table
-                .get("tools")
-                .and_then(toml::Value::as_bool)
-                .unwrap_or(false);
-            (PathBuf::from(path), tools_phase)
-        }
-        other => anyhow::bail!("Unsupported _.file entry: {other}"),
+fn directive_table_path<'a>(
+    table: &'a toml::Table,
+    directive: &str,
+    options: &[&str],
+) -> Result<&'a toml::Value> {
+    let known_paths = ["path", "value", "values"];
+    for key in table.keys() {
+        anyhow::ensure!(
+            known_paths.contains(&key.as_str()) || options.contains(&key.as_str()),
+            "Unknown option {key:?} in {directive} entry"
+        );
+    }
+    let mut paths = known_paths.into_iter().filter_map(|key| table.get(key));
+    let path = paths
+        .next()
+        .with_context(|| format!("{directive} entry needs a `path` string"))?;
+    anyhow::ensure!(
+        paths.next().is_none(),
+        "{directive} entry accepts only one path spelling"
+    );
+    Ok(path)
+}
+
+fn directive_items(value: &toml::Value) -> &[toml::Value] {
+    value
+        .as_array()
+        .map_or_else(|| std::slice::from_ref(value), Vec::as_slice)
+}
+
+/// Parse path and source directives, including legacy path aliases.
+fn directive_paths(
+    spec: &toml::Value,
+    directive: &str,
+    config_root: &Path,
+) -> Result<Vec<EnvPathDirective>> {
+    let source = directive == "_.source";
+    let options: &[&str] = if source {
+        &["tools", "redact"]
+    } else {
+        &["tools", "position"]
     };
-    let table = item.as_table();
-    let redact = table
-        .and_then(|table| table.get("redact"))
-        .and_then(toml::Value::as_bool)
-        .unwrap_or(false);
-    let expand = table
-        .and_then(|table| table.get("expand"))
-        .and_then(toml::Value::as_bool)
-        .unwrap_or(false);
+    let mut paths = Vec::new();
+    for item in directive_items(spec) {
+        let (raw, tools_phase, redact) = match item {
+            toml::Value::String(_) => (item, false, false),
+            toml::Value::Table(table) => {
+                let raw = directive_table_path(table, directive, options)?;
+                if let Some(position) = table.get("position") {
+                    anyhow::ensure!(
+                        position.as_str() == Some("prepend"),
+                        "_.path position must be 'prepend'"
+                    );
+                }
+                (
+                    raw,
+                    boolean_option(table, "tools", directive)?,
+                    source && boolean_option(table, "redact", directive)?,
+                )
+            }
+            _ => anyhow::bail!("Unsupported {directive} entry: want string or table"),
+        };
+        for candidate in directive_items(raw) {
+            let path = candidate.as_str().with_context(|| {
+                format!("{directive} entry `path` must be a string or string array")
+            })?;
+            paths.push(EnvPathDirective {
+                path: config_root.join(path),
+                tools_phase,
+                redact,
+            });
+        }
+    }
+    Ok(paths)
+}
+
+fn parse_file_directive(item: &toml::Value, config_root: &Path) -> Result<EnvFileDirective> {
+    let (path, redact, tools_phase, expand) = match item {
+        toml::Value::String(path) => (path.as_str(), false, false, false),
+        toml::Value::Table(table) => {
+            let path = directive_table_path(table, "_.file", &["redact", "tools", "expand"])?
+                .as_str()
+                .context("_.file entry needs a `path` string")?;
+            (
+                path,
+                boolean_option(table, "redact", "_.file")?,
+                boolean_option(table, "tools", "_.file")?,
+                boolean_option(table, "expand", "_.file")?,
+            )
+        }
+        _ => anyhow::bail!("Unsupported _.file entry: want string or table"),
+    };
     Ok(EnvFileDirective {
-        path,
+        path: config_root.join(path),
         redact,
         tools_phase,
         expand,
     })
 }
 
-/// Resolve a directive path against the declaring file's directory
-/// (mise `config_root`; here the containing directory).
-fn resolve_against(path: &str, config_root: &Path) -> PathBuf {
-    let candidate = PathBuf::from(path);
-    if candidate.is_absolute() {
-        candidate
-    } else {
-        config_root.join(candidate)
-    }
-}
-
-/// Parse the `[env]` table of one `mise.toml` document.
-///
-/// `config_root` is the declaring file's directory; relative `_.path`,
-/// `_.file`, and `_.source` entries resolve against it.
+/// Parse the `[env]` table and redaction patterns of one document.
+/// Relative directive paths resolve against the declaring root.
 pub(crate) fn parse_mise_env(document: &toml::Value, config_root: &Path) -> Result<MiseEnv> {
     let mut parsed = MiseEnv::default();
-    let Some(env) = document.get("env").and_then(toml::Value::as_table) else {
+    if let Some(value) = document.get("redactions") {
+        let patterns = value
+            .as_array()
+            .context("redactions must be an array of strings")?;
+        for pattern in patterns {
+            let pattern = pattern
+                .as_str()
+                .context("redactions entries must be strings")?;
+            parsed.redactions.push(pattern.to_owned());
+        }
+    }
+    let Some(env) = document.get("env") else {
         return Ok(parsed);
     };
+    let env = env.as_table().context("env must be a table")?;
     for (name, spec) in env {
-        if name == "_" {
-            let Some(directives) = spec.as_table() else {
-                anyhow::bail!("env._ must be a table of directives");
-            };
-            for (directive, value) in directives {
-                match directive.as_str() {
-                    "path" => {
-                        for (raw, tools_phase) in directive_paths(value, "_.path")? {
-                            parsed
-                                .paths
-                                .push((resolve_against(&raw, config_root), tools_phase));
-                        }
-                    }
-                    "file" => {
-                        let items = match value {
-                            toml::Value::Array(items) => items.clone(),
-                            single => vec![single.clone()],
-                        };
-                        for item in &items {
-                            let mut entry = parse_file_directive(item)?;
-                            entry.path =
-                                resolve_against(&entry.path.to_string_lossy(), config_root);
-                            parsed.files.push(entry);
-                        }
-                    }
-                    "source" => {
-                        for (raw, tools_phase) in directive_paths(value, "_.source")? {
-                            parsed
-                                .sources
-                                .push((resolve_against(&raw, config_root), tools_phase));
-                        }
-                    }
-                    other => anyhow::bail!("Unknown env directive _.{other}"),
-                }
-            }
+        if name != "_" {
+            parsed.entries.push(parse_entry(name, spec)?);
             continue;
         }
-        parsed.entries.push(parse_entry(name, spec)?);
-    }
-    if let Some(patterns) = document.get("redactions").and_then(toml::Value::as_array) {
-        for pattern in patterns {
-            let Some(pattern) = pattern.as_str() else {
-                anyhow::bail!("redactions entries must be strings");
-            };
-            parsed.redactions.push(pattern.to_string());
+        let directives = spec
+            .as_table()
+            .context("env._ must be a table of directives")?;
+        for (directive, value) in directives {
+            match directive.as_str() {
+                "path" => parsed.paths.extend(
+                    directive_paths(value, "_.path", config_root)?
+                        .into_iter()
+                        .map(|entry| (entry.path, entry.tools_phase)),
+                ),
+                "file" => {
+                    for item in directive_items(value) {
+                        parsed.files.push(parse_file_directive(item, config_root)?);
+                    }
+                }
+                "source" => parsed
+                    .sources
+                    .extend(directive_paths(value, "_.source", config_root)?),
+                other => anyhow::bail!("Unknown env directive _.{other}"),
+            }
         }
     }
     Ok(parsed)
@@ -885,7 +882,7 @@ impl Resolver<'_> {
                     self.assign(&entry.name, value.to_owned(), entry.redact);
                 }
             }
-            EnvAction::Required { .. } => {
+            EnvAction::Required => {
                 let current = self.lookup(&entry.name);
                 if current.is_none_or(OsStr::is_empty) {
                     let message = format!(
@@ -967,8 +964,8 @@ fn resolve_one(
             // PATH is an ordered layer effect and must be visible to later sources.
             resolver.assign("PATH", path, false);
         }
-        for (script, phase) in &parsed.sources {
-            if *phase != tools_phase {
+        for source in &parsed.sources {
+            if source.tools_phase != tools_phase {
                 continue;
             }
             #[cfg(unix)]
@@ -986,9 +983,9 @@ fn resolve_one(
                 for name in &resolver.unset {
                     effective.remove(OsStr::new(name));
                 }
-                let sourced = eval_sourced_file(script, &effective)?;
+                let sourced = eval_sourced_file(&source.path, &effective)?;
                 for (key, value) in sourced.set {
-                    resolver.assign(&key, value, false);
+                    resolver.assign(&key, value, source.redact);
                 }
                 for key in sourced.unset {
                     resolver.remove(&key);
@@ -997,7 +994,7 @@ fn resolve_one(
             #[cfg(not(unix))]
             anyhow::bail!(
                 "_.source scripts require a Unix shell: {}",
-                script.display()
+                source.path.display()
             );
         }
     }
@@ -1595,7 +1592,7 @@ mod tests {
         assert_eq!(parsed.files.len(), 1);
         assert_eq!(parsed.files[0].path, dir.path().join(".env"));
         assert_eq!(parsed.sources.len(), 1);
-        assert_eq!(parsed.sources[0].0, dir.path().join("scripts/env.sh"));
+        assert_eq!(parsed.sources[0].path, dir.path().join("scripts/env.sh"));
     }
 
     #[test]
@@ -1672,6 +1669,32 @@ mod tests {
         assert!(eval_sourced_file(&script, &env).is_err());
         std::fs::write(&script, "export PARTIAL=yes\nreturn 1\n").expect("script");
         assert!(eval_sourced_file(&script, &env).is_err());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn source_redaction_and_parent_patterns_reach_the_resolved_environment() {
+        let root = tempfile::tempdir().unwrap();
+        let child = root.path().join("child");
+        std::fs::create_dir(&child).unwrap();
+        std::fs::write(root.path().join("mise.toml"), "redactions = ['*_TOKEN']\n").unwrap();
+        std::fs::write(
+            child.join("mise.toml"),
+            "[env]\nLOCAL_TOKEN = 'fixture'\n[env._]\nsource = { path = 'source.sh', redact = true }\n",
+        )
+        .unwrap();
+        std::fs::write(child.join("source.sh"), "export OMG_SOURCE_FIXTURE=ready\n").unwrap();
+        let resolved =
+            load_mise_env_chain(&child, &std::env::vars_os().collect(), Strictness::Strict)
+                .expect("load configured environment");
+        assert_eq!(
+            resolved.redacted,
+            HashSet::from(["LOCAL_TOKEN".to_owned(), "OMG_SOURCE_FIXTURE".to_owned()])
+        );
+        assert_eq!(
+            get(&resolved, "OMG_SOURCE_FIXTURE").as_deref(),
+            Some("ready")
+        );
     }
 
     #[test]

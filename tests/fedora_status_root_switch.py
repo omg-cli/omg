@@ -2785,6 +2785,101 @@ run = "cp next.toml mise.local.toml"
                 run(name, conf=f"[env._]\nfile = '{filename}'\n", files=((filename, value),),
                     error="Non-scalar value for OMG_FIXTURE_OUT", diagnostic_excludes=("fixture-private-object",))
 
+            phase = "mise-env-options"
+            assignment = "OMG_FIXTURE_OUT"
+            env_prefix = "[env]\n"
+            directive_prefix = "[env._]\n"
+            success = {result_key: b"ready"}
+            ordinary_file = (("fixture.env", assignment + "=ready\n"), ("other.env", assignment + "=other\n"))
+            ordinary_script = (("source.sh", "export OMG_FIXTURE_OUT=ready\n"),
+                               ("other.sh", "export OMG_FIXTURE_OUT=other\n"))
+            private = ("fixture-private-option",)
+
+            for label, conf, diagnostic in [
+                ("env-string-is-invalid", "env = 'no'\n", "env must be a table"),
+                ("env-array-is-invalid", 'env = [{ MODE = "ready" }]\n', "env must be a table"),
+                ("redactions-string-is-invalid", "redactions = 'MODE'\n", "redactions must be an array"),
+                ("redactions-elements-checked-without-env", "redactions = [7]\n", "redactions entries must be strings"),
+            ]:
+                run(label, conf=conf, error=diagnostic)
+
+            for label, spec, diagnostic in [
+                ("entry-tools-needs-boolean", "{ value = 'ready', tools = 'yes' }", "tools must be a boolean"),
+                ("entry-redact-needs-boolean", "{ value = 'ready', redact = 'yes' }", "redact must be a boolean"),
+                ("entry-required-needs-boolean", "{ value = 'ready', required = 'yes' }", "required must be a boolean"),
+                ("entry-rejects-value-and-default", "{ value = 'ready', default = 'other' }", "exactly one"),
+                ("entry-rejects-required-and-default", "{ required = true, default = 'ready' }", "exactly one"),
+                ("entry-rejects-required-and-value", "{ required = true, value = 'other' }", "exactly one"),
+                ("unsupported-entry-value-is-private", "['fixture-private-option']", "Unsupported value"),
+                ("unsupported-default-is-private", "{ default = ['fixture-private-option'] }", "Unsupported default value"),
+                ("unsupported-object-value-is-private", "{ value = ['fixture-private-option'] }", "Unsupported value"),
+            ]:
+                run(label, env={result_key: b"existing"}, conf=env_prefix + f"{assignment} = {spec}\n",
+                    error=diagnostic, diagnostic_excludes=private)
+
+            for label, spec, diagnostic in [
+                ("file-expand-needs-boolean", "{ path = 'fixture.env', expand = 'true' }", "expand must be a boolean"),
+                ("file-tools-needs-boolean", "{ path = 'fixture.env', tools = 'true' }", "tools must be a boolean"),
+                ("file-redact-needs-boolean", "{ path = 'fixture.env', redact = 'true' }", "redact must be a boolean"),
+                ("file-rejects-two-path-keys", "{ path = 'fixture.env', value = 'other.env' }", "one path spelling"),
+                ("file-rejected-type-is-private", "[['fixture-private-option']]", "Unsupported _.file entry"),
+            ]:
+                run(label, conf=directive_prefix + f"file = {spec}\n", files=ordinary_file,
+                    error=diagnostic, diagnostic_excludes=private)
+
+            for label, spec, diagnostic in [
+                ("path-tools-needs-boolean", "{ path = 'bin', tools = 'yes' }", "tools must be a boolean"),
+                ("path-append-is-unsupported", "{ path = 'bin', position = 'append' }", "_.path position must be 'prepend'"),
+                ("path-redact-is-unsupported", "{ path = 'bin', redact = true }", 'Unknown option "redact" in _.path'),
+                ("path-rejects-two-path-keys", "{ path = 'bin', values = ['more'] }", "one path spelling"),
+                ("path-rejected-type-is-private", "[['fixture-private-option']]", "Unsupported _.path entry"),
+            ]:
+                run(label, conf=directive_prefix + f"path = {spec}\n", error=diagnostic,
+                    diagnostic_excludes=private)
+
+            for label, spec, diagnostic in [
+                ("source-unknown-option-fails", "{ path = 'source.sh', expand = true }", 'Unknown option "expand" in _.source'),
+                ("source-tools-needs-boolean", "{ path = 'source.sh', tools = 'yes' }", "tools must be a boolean"),
+                ("source-redact-needs-boolean", "{ path = 'source.sh', redact = 'yes' }", "redact must be a boolean"),
+                ("source-rejects-two-path-keys", "{ path = 'source.sh', value = 'other.sh' }", "one path spelling"),
+                ("source-rejected-type-is-private", "[['fixture-private-option']]", "Unsupported _.source entry"),
+            ]:
+                run(label, conf=directive_prefix + f"source = {spec}\n", files=ordinary_script,
+                    error=diagnostic, diagnostic_excludes=private)
+            run("task-env-value-type-rejected", native_task=True,
+                conf=task + "env.OMG_FIXTURE_OUT = { value = 'ready', tools = 'yes' }\n",
+                error="tools must be a boolean")
+            run("task-env-container-checked", native_task=True, conf=task + "env = 'no'\n",
+                error="env must be a table")
+
+            for label, spec, existing, expected in [
+                ("entry-string", "'ready'", None, b"ready"),
+                ("entry-integer", "41", None, b"41"),
+                ("entry-false-unsets", "false", b"before", None),
+                ("entry-true-is-text", "true", None, b"true"),
+                ("entry-explicit-required-false-with-value", "{ required = false, value = 'ready' }", None, b"ready"),
+                ("entry-explicit-required-false-with-default", "{ required = false, default = 'ready' }", None, b"ready"),
+                ("entry-default-keeps-present", "{ default = 'different', tools = false }", b"ready", b"ready"),
+                ("entry-required-validates-present", "{ required = true, redact = true }", b"ready", b"ready"),
+            ]:
+                run(label, env={result_key: existing}, conf=env_prefix + f"{assignment} = {spec}\n",
+                    expected={result_key: expected})
+
+            run("file-deprecated-value-alias", conf=directive_prefix + "file = { value = 'fixture.env' }\n",
+                files=ordinary_file, expected=success)
+            run("file-deprecated-values-alias", conf=directive_prefix + "file = { values = 'fixture.env' }\n",
+                files=ordinary_file, expected=success)
+            run("path-deprecated-alias-and-prepend",
+                conf=directive_prefix + "path = { values = ['bin', 'more'], tools = false, position = 'prepend' }\n",
+                expected=lambda cwd: {path_key: b":".join((os.fsencode(cwd/"bin"),
+                                                           os.fsencode(cwd/"more"), default_path))})
+            run("source-redact-and-deprecated-alias",
+                conf=directive_prefix + "source = { value = 'source.sh', redact = true, tools = false }\n",
+                files=ordinary_script, expected=success)
+            run("task-local-valid-flags", native_task=True,
+                conf=task + "env.OMG_FIXTURE_OUT = { value = 'ready', tools = true, redact = false }\n",
+                expected=success)
+
 
     def inspect_task_package_metadata():
         import ctypes
@@ -5158,6 +5253,6 @@ assert inventory() == before
 report = dict(binaries=binaries, checks=checks, total=len(checks),
               passed=sum(entry["passed"] for entry in checks), host_unchanged=True)
 print(json.dumps(report))
-expected_checks = 303 if consent_oracle is None else 1594
+expected_checks = 303 if consent_oracle is None else 1637
 if report["passed"] != report["total"] or report["total"] != expected_checks:
     sys.exit(4)
