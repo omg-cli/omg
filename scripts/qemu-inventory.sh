@@ -222,7 +222,7 @@ check_native_counter() {
     fedora:tc) native=(rpm -qa --qf '%{NAME}.%{ARCH}\n') ;;
     fedora:ec) native=(dnf --cacheonly repoquery --userinstalled --qf '%{name}\n') ;;
     fedora:oc) native=(dnf --cacheonly repoquery --unneeded --qf '%{name}.%{arch}\n') ;;
-    fedora:uc) native=(dnf --cacheonly repoquery --upgrades --latest-limit=1 --qf '%{name}.%{arch}\n') ;;
+    fedora:uc) native=(env LC_ALL=C dnf --quiet --color=never --cacheonly '--setopt=*.skip_if_unavailable=false' list --upgrades) ;;
     *) return 2 ;;
   esac
   timeout --kill-after=2s 30 "${native[@]}" > native-counter.raw 2> native-counter.stderr || status=$?
@@ -239,7 +239,13 @@ check_native_counter() {
       debian:tc|debian-trixie:tc|ubuntu:tc) awk '$0 == "installed" {n++} END {print n+0}' native-counter.raw ;;
       debian:oc|debian-trixie:oc|ubuntu:oc) awk '/^Remv / {n++} END {print n+0}' native-counter.raw ;;
       debian:uc|debian-trixie:uc|ubuntu:uc) awk '$1 ~ /\// {n++} END {print n+0}' native-counter.raw ;;
-      *:ec|fedora:oc|fedora:uc) sort -u native-counter.raw | awk 'NF {n++} END {print n+0}' ;;
+      fedora:uc) LC_ALL=C awk '
+        NF == 0 { next }
+        !heading && $0 == "Available upgrades" { heading = 1; next }
+        !heading || NF != 3 || $1 !~ /.+[.][^.]+$/ || ($1 $2 $3) ~ /[[:cntrl:]]/ { invalid = 1; next }
+        !seen[$1]++ { n++ }
+        END { if (invalid) exit 1; print n+0 }' native-counter.raw ;;
+      *:ec|fedora:oc) sort -u native-counter.raw | awk 'NF {n++} END {print n+0}' ;;
       *) awk 'NF {n++} END {print n+0}' native-counter.raw ;;
     esac
   ) || { printf 'native counter reference processing failed\n' >&2; return 2; }
