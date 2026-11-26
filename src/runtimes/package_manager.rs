@@ -34,24 +34,34 @@ impl ManagedRuntime {
             .parent()
             .context("Tools directory has no OMG data root")?
             .canonicalize()?;
+        let missing_runtime = || {
+            anyhow::anyhow!(
+                "Package installation requires a selected OMG-managed {runtime}; run omg use {runtime} <version> first"
+            )
+        };
+        let inspect_directory = |path: &Path| {
+            std::fs::symlink_metadata(path).map_err(|error| {
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    missing_runtime()
+                } else {
+                    error.into()
+                }
+            })
+        };
         let versions_root = data_root.join("versions");
         ensure!(
-            std::fs::symlink_metadata(&versions_root)?.is_dir()
+            inspect_directory(&versions_root)?.is_dir()
                 && versions_root.canonicalize()?.parent() == Some(data_root.as_path()),
             "Managed runtime versions escape the OMG data root"
         );
         let versions = versions_root.join(runtime);
         ensure!(
-            std::fs::symlink_metadata(&versions)?.is_dir()
+            inspect_directory(&versions)?.is_dir()
                 && versions.canonicalize()?.parent() == Some(versions_root.as_path()),
             "Managed {runtime} versions escape the OMG versions tree"
         );
         let lease = try_lock_runtime_use(&versions)?;
-        let version = get_current_version(&versions).with_context(|| {
-            format!(
-                "Package installation requires a selected OMG-managed {runtime}; run omg use {runtime} <version> first"
-            )
-        })?;
+        let version = get_current_version(&versions).ok_or_else(missing_runtime)?;
         crate::core::security::validate_runtime_version(&version)?;
         let root = versions.join(&version).canonicalize()?;
         ensure!(

@@ -12,6 +12,8 @@ use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 
+const MAX_INTERPRETER_BYTES: u64 = 512 * 1024 * 1024;
+
 #[derive(Clone, Debug, serde::Serialize)]
 struct Wheel {
     name: String,
@@ -318,18 +320,18 @@ impl WheelDownloader for PublicWheelDownloader {
     }
 }
 
-fn fetch_wheel(wheel: &Wheel, path: &Path, downloader: &dyn WheelDownloader) -> Result<()> {
+fn fetch_wheel(wheel: &Wheel, path: &Path, downloader: &dyn WheelDownloader) -> Result<u64> {
     ensure!(
         wheel.public,
         "Private Python wheel sources remain UNKNOWN and cannot be fetched through the fixed public transport"
     );
     downloader.download(&wheel.url, path)?;
-    let (sha256, _) = super::security::file_digest(path, 512 * 1024 * 1024)?;
+    let (sha256, bytes) = super::security::file_digest(path, 512 * 1024 * 1024)?;
     ensure!(
         sha256 == wheel.sha256,
         "Downloaded Python wheel differs from its reviewed hash"
     );
-    Ok(())
+    Ok(bytes)
 }
 
 fn installed_distributions(prefix: &Path) -> Result<BTreeMap<String, String>> {
@@ -446,9 +448,9 @@ pub(super) fn install_reviewed_with_downloader(
             .starts_with(staging.canonicalize()?),
         "Python venv interpreter escaped the owned staging tree"
     );
-    let interpreter_sha256 = artifacts::hash(&artifacts::read(&python, 512 * 1024 * 1024)?);
+    let (interpreter_sha256, _) = super::security::file_digest(&python, MAX_INTERPRETER_BYTES)?;
     ensure!(
-        artifacts::hash(&artifacts::read(&isolated, 512 * 1024 * 1024)?) == interpreter_sha256,
+        super::security::file_digest(&isolated, MAX_INTERPRETER_BYTES)?.0 == interpreter_sha256,
         "Venv interpreter differs from the reviewed managed Python"
     );
     let installer_roots = [staging.join("bin"), staging.join("lib")];
@@ -520,8 +522,19 @@ pub(super) fn install_reviewed_with_downloader(
     if let Some(preflight) = &preflight {
         preflight.verify(source.as_ref())?;
     }
-    let (wheels, gaps) = report(&artifacts::read(&output, 16 * 1024 * 1024)?, Some(request))?;
-    let graph = serde_json::json!({"wheels":wheels,"report_sha256":artifacts::hash(&artifacts::read(&output,16*1024*1024)?),"installer_trees":installer_seals,"interpreter_sha256":interpreter_sha256,"venv_configuration_sha256":configuration_sha256,"bootstrap_distributions":bootstrap});
+    let (wheels, gaps, report_sha256) = {
+        let bytes = artifacts::read(&output, 16 * 1024 * 1024)?;
+        let (wheels, gaps) = report(&bytes, Some(request))?;
+        (wheels, gaps, artifacts::hash(&bytes))
+    };
+    let graph = serde_json::json!({
+        "wheels": wheels,
+        "report_sha256": report_sha256,
+        "installer_trees": installer_seals,
+        "interpreter_sha256": interpreter_sha256,
+        "venv_configuration_sha256": configuration_sha256,
+        "bootstrap_distributions": bootstrap,
+    });
     let context = artifacts::context("pip", request, destination, &runtime, &graph, &gaps)?;
     let full_inventory = bootstrap_inventory
         .into_iter()
@@ -543,8 +556,7 @@ pub(super) fn install_reviewed_with_downloader(
     let mut requirements = String::new();
     for wheel in &wheels {
         let path = wheelhouse.join(&wheel.filename);
-        fetch_wheel(wheel, &path, downloader)?;
-        total += fs::metadata(&path)?.len();
+        total += fetch_wheel(wheel, &path, downloader)?;
         ensure!(
             total <= 2 * 1024 * 1024 * 1024,
             "Frozen Python wheel inventory exceeds its byte allowance"
@@ -642,7 +654,7 @@ pub(super) fn install_reviewed_with_downloader(
         "Pip frozen requirements changed during installation"
     );
     ensure!(
-        artifacts::hash(&artifacts::read(&isolated, 512 * 1024 * 1024)?) == interpreter_sha256,
+        super::security::file_digest(&isolated, MAX_INTERPRETER_BYTES)?.0 == interpreter_sha256,
         "Wheel installation replaced the reviewed Python interpreter"
     );
     ensure!(

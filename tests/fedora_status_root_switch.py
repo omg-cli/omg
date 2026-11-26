@@ -3057,6 +3057,68 @@ print("fixture python " + json.dumps({
                     ))
 
 
+    def inspect_python_tool_prerequisites():
+        phase = "python-tool-prerequisites"
+        tools = ("black", "glances", "httpie", "mypy", "pipx",
+                 "poetry", "rich-cli", "ruff", "yt-dlp")
+        layouts = ("fresh", "other-runtime", "unselected", "dangling")
+        with tempfile.TemporaryDirectory(prefix="python-tool-prerequisites-", dir=work) as directory:
+            here = Path(directory)
+            os.chown(here, account.pw_uid, account.pw_gid)
+            for tool in tools:
+                for layout in layouts:
+                    home = here / f"{layout}-{tool}"
+                    home.mkdir()
+                    os.chown(home, account.pw_uid, account.pw_gid)
+                    data = home / "data"
+                    data.mkdir()
+                    versions = data / "versions"
+                    python = versions / "python"
+                    if layout == "other-runtime":
+                        (versions / "node").mkdir(parents=True)
+                    elif layout in ("unselected", "dangling"):
+                        python.mkdir(parents=True)
+                        if layout == "dangling":
+                            (python / "current").symlink_to("3.12.7")
+                    previous = data / "tools" / "pip" / tool
+                    previous.mkdir(parents=True)
+                    marker = previous / "owner-file"
+                    marker.write_text("previous tool state\n")
+                    bin_dir = data / "bin"
+                    bin_dir.mkdir()
+                    entry = bin_dir / tool
+                    entry.symlink_to(marker)
+                    for path in (data, *data.rglob("*")):
+                        os.chown(path, account.pw_uid, account.pw_gid, follow_symlinks=False)
+                    env = dict(disabled, HOME=str(home), OMG_DATA_DIR=str(data),
+                               OMG_CONFIG_DIR=str(home/"config"/"omg"), OMG_NATIVE_TEST_DATA_DIR="1",
+                               XDG_CONFIG_HOME=str(home/"config"), XDG_DATA_HOME=str(home/"xdg-data"),
+                               XDG_CACHE_HOME=str(home/"cache"), XDG_STATE_HOME=str(home/"state"))
+                    result = subprocess.run([cli, "tool", "install", tool], cwd=home, env=env,
+                                            stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                                            timeout=8, **ordinary)
+                    current = python / "current"
+                    selection_unchanged = (
+                        current.is_symlink() and os.readlink(current) == "3.12.7"
+                        if layout == "dangling" else not current.is_symlink()
+                    )
+                    preserved = (
+                        marker.read_text() == "previous tool state\n" and entry.is_symlink()
+                        and os.readlink(entry) == str(marker) and selection_unchanged
+                        and sorted(path.name for path in previous.parent.iterdir()) == [tool]
+                        and (layout != "fresh" or not versions.exists())
+                        and (layout != "other-runtime" or not python.exists())
+                    )
+                    diagnostic = "Package installation requires a selected OMG-managed python"
+                    checks.append(dict(
+                        phase=phase, case=f"{layout}-{tool}", status=result.returncode,
+                        passed=(result.returncode != 0 and diagnostic in result.stderr
+                                and "omg use python <version>" in result.stderr
+                                and "Found in registry:" in result.stdout and preserved),
+                        preserved=preserved, diagnostic=(result.stdout + result.stderr)[-1100:],
+                    ))
+
+
     def inspect_task_environment_bytes():
         phase = "task-environment-bytes"
         raw = b"test-\xff-value"
@@ -5765,6 +5827,7 @@ exec {shlex.quote(str(binary))} "$@"
                     inspect_python_project_constraints()
                     inspect_python_virtualenv_launch()
                     inspect_python_inventory_and_removal()
+                    inspect_python_tool_prerequisites()
                     mark_progress("runtime selection and Python environments")
                     inspect_task_environment_bytes()
                     inspect_task_package_metadata()
@@ -6090,6 +6153,6 @@ mark_progress("completed with host inventory unchanged")
 report = dict(binaries=binaries, checks=checks, total=len(checks),
               passed=sum(entry["passed"] for entry in checks), host_unchanged=True)
 print(json.dumps(report))
-expected_checks = 303 if consent_oracle is None else 2020
+expected_checks = 303 if consent_oracle is None else 2056
 if report["passed"] != report["total"] or report["total"] != expected_checks:
     sys.exit(4)
