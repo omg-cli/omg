@@ -52,7 +52,21 @@ ROLES = {'admin': 'Full access (push, policy, members)',
          'developer': 'Can pull, cannot push without approval',
          'readonly': 'Can only view status'}
 
-REGISTRY = [('ripgrep', 'pacman:ripgrep', 'Ultra-fast regex search tool', 'search'), ('rg', 'pacman:ripgrep', 'Alias for ripgrep', 'search'), ('fd', 'pacman:fd', 'Fast find alternative', 'search'), ('fzf', 'pacman:fzf', 'Fuzzy finder', 'search'), ('jq', 'pacman:jq', 'JSON processor', 'data'), ('yq', 'pacman:yq', 'YAML processor', 'data'), ('bat', 'pacman:bat', 'Cat with syntax highlighting', 'files'), ('eza', 'pacman:eza', 'Modern ls replacement', 'files'), ('zoxide', 'pacman:zoxide', 'Smarter cd command', 'navigation'), ('delta', 'pacman:git-delta', 'Better git diffs', 'git'), ('lazygit', 'pacman:lazygit', 'Terminal UI for git', 'git'), ('htop', 'pacman:htop', 'Interactive process viewer', 'system'), ('btop', 'pacman:btop', 'Resource monitor', 'system'), ('dust', 'pacman:dust', 'Disk usage analyzer', 'system'), ('duf', 'pacman:duf', 'Disk usage/free utility', 'system'), ('procs', 'pacman:procs', 'Modern ps replacement', 'system'), ('hyperfine', 'pacman:hyperfine', 'Command benchmarking', 'dev'), ('tokei', 'pacman:tokei', 'Code statistics', 'dev'), ('just', 'pacman:just', 'Command runner', 'dev'), ('watchexec', 'pacman:watchexec', 'File watcher', 'dev'), ('tldr', 'npm:tldr', 'Simplified man pages', 'docs'), ('serve', 'npm:serve', 'Static file server', 'web'), ('http-server', 'npm:http-server', 'Simple HTTP server', 'web'), ('yarn', 'npm:yarn', 'Package manager', 'node'), ('pnpm', 'npm:pnpm', 'Fast package manager', 'node'), ('tsx', 'npm:tsx', 'TypeScript execute', 'node'), ('nodemon', 'npm:nodemon', 'Node.js auto-restart', 'node'), ('prettier', 'npm:prettier', 'Code formatter', 'formatting'), ('eslint', 'npm:eslint', 'JavaScript linter', 'linting'), ('typescript', 'npm:typescript', 'TypeScript compiler', 'node'), ('turbo', 'npm:turbo', 'Monorepo build system', 'node'), ('vercel', 'npm:vercel', 'Vercel CLI', 'deploy'), ('netlify-cli', 'npm:netlify-cli', 'Netlify CLI', 'deploy'), ('wrangler', 'npm:wrangler', 'Cloudflare Workers CLI', 'deploy'), ('cargo-watch', 'cargo:cargo-watch', 'Watch and rebuild', 'rust'), ('cargo-edit', 'cargo:cargo-edit', 'Cargo add/rm/upgrade', 'rust'), ('cargo-expand', 'cargo:cargo-expand', 'Macro expansion', 'rust'), ('cargo-nextest', 'cargo:cargo-nextest', 'Fast test runner', 'rust'), ('cargo-audit', 'cargo:cargo-audit', 'Security audits', 'rust'), ('cargo-outdated', 'cargo:cargo-outdated', 'Check outdated deps', 'rust'), ('diesel', 'cargo:diesel_cli', 'Diesel ORM CLI', 'rust'), ('sqlx', 'cargo:sqlx-cli', 'SQLx CLI', 'rust'), ('bacon', 'cargo:bacon', 'Background code checker', 'rust'), ('sccache', 'cargo:sccache', 'Shared compilation cache', 'rust'), ('yt-dlp', 'pip:yt-dlp', 'Video downloader', 'media'), ('glances', 'pip:glances', 'System monitor', 'system'), ('httpie', 'pip:httpie', 'HTTP client', 'web'), ('black', 'pip:black', 'Python formatter', 'python'), ('ruff', 'pip:ruff', 'Fast Python linter', 'python'), ('mypy', 'pip:mypy', 'Python type checker', 'python'), ('poetry', 'pip:poetry', 'Python packaging', 'python'), ('pipx', 'pip:pipx', 'Install Python apps', 'python'), ('rich-cli', 'pip:rich-cli', 'Rich text in terminal', 'cli'), ('hey', 'go:github.com/rakyll/hey', 'HTTP load generator', 'web'), ('dive', 'go:github.com/wagoodman/dive', 'Docker image explorer', 'docker'), ('lazydocker', 'go:github.com/jesseduffield/lazydocker', 'Docker TUI', 'docker'), ('glow', 'go:github.com/charmbracelet/glow', 'Markdown renderer', 'docs'), ('air', 'go:github.com/cosmtrek/air', 'Go live reload', 'go'), ('golangci-lint', 'go:github.com/golangci/golangci-lint/cmd/golangci-lint', 'Go linter', 'go')]
+REGISTRY = [('ripgrep', 'system:ripgrep', 'Ultra-fast regex search tool', 'search'), ('rg', 'system:ripgrep', 'Alias for ripgrep', 'search'), ('fd', 'system:fd', 'Fast find alternative', 'search'), ('fzf', 'system:fzf', 'Fuzzy finder', 'search'), ('jq', 'system:jq', 'JSON processor', 'data'), ('yq', 'system:yq', 'YAML processor', 'data'), ('bat', 'system:bat', 'Cat with syntax highlighting', 'files'), ('eza', 'system:eza', 'Modern ls replacement', 'files'), ('zoxide', 'system:zoxide', 'Smarter cd command', 'navigation'), ('delta', 'system:git-delta', 'Better git diffs', 'git'), ('lazygit', 'system:lazygit', 'Terminal UI for git', 'git'), ('htop', 'system:htop', 'Interactive process viewer', 'system'), ('btop', 'system:btop', 'Resource monitor', 'system'), ('dust', 'system:dust', 'Disk usage analyzer', 'system'), ('duf', 'system:duf', 'Disk usage/free utility', 'system'), ('procs', 'system:procs', 'Modern ps replacement', 'system'), ('hyperfine', 'system:hyperfine', 'Command benchmarking', 'dev'), ('tokei', 'system:tokei', 'Code statistics', 'dev'), ('just', 'system:just', 'Command runner', 'dev'), ('watchexec', 'system:watchexec', 'File watcher', 'dev'), ('tldr', 'npm:tldr', 'Simplified man pages', 'docs'), ('serve', 'npm:serve', 'Static file server', 'web'), ('http-server', 'npm:http-server', 'Simple HTTP server', 'web'), ('yarn', 'npm:yarn', 'Package manager', 'node'), ('pnpm', 'npm:pnpm', 'Fast package manager', 'node'), ('tsx', 'npm:tsx', 'TypeScript execute', 'node'), ('nodemon', 'npm:nodemon', 'Node.js auto-restart', 'node'), ('prettier', 'npm:prettier', 'Code formatter', 'formatting'), ('eslint', 'npm:eslint', 'JavaScript linter', 'linting'), ('typescript', 'npm:typescript', 'TypeScript compiler', 'node'), ('turbo', 'npm:turbo', 'Monorepo build system', 'node'), ('vercel', 'npm:vercel', 'Vercel CLI', 'deploy'), ('netlify-cli', 'npm:netlify-cli', 'Netlify CLI', 'deploy'), ('wrangler', 'npm:wrangler', 'Cloudflare Workers CLI', 'deploy'), ('cargo-watch', 'cargo:cargo-watch', 'Watch and rebuild', 'rust'), ('cargo-edit', 'cargo:cargo-edit', 'Cargo add/rm/upgrade', 'rust'), ('cargo-expand', 'cargo:cargo-expand', 'Macro expansion', 'rust'), ('cargo-nextest', 'cargo:cargo-nextest', 'Fast test runner', 'rust'), ('cargo-audit', 'cargo:cargo-audit', 'Security audits', 'rust'), ('cargo-outdated', 'cargo:cargo-outdated', 'Check outdated deps', 'rust'), ('diesel', 'cargo:diesel_cli', 'Diesel ORM CLI', 'rust'), ('sqlx', 'cargo:sqlx-cli', 'SQLx CLI', 'rust'), ('bacon', 'cargo:bacon', 'Background code checker', 'rust'), ('sccache', 'cargo:sccache', 'Shared compilation cache', 'rust'), ('yt-dlp', 'pip:yt-dlp', 'Video downloader', 'media'), ('glances', 'pip:glances', 'System monitor', 'system'), ('httpie', 'pip:httpie', 'HTTP client', 'web'), ('black', 'pip:black', 'Python formatter', 'python'), ('ruff', 'pip:ruff', 'Fast Python linter', 'python'), ('mypy', 'pip:mypy', 'Python type checker', 'python'), ('poetry', 'pip:poetry', 'Python packaging', 'python'), ('pipx', 'pip:pipx', 'Install Python apps', 'python'), ('rich-cli', 'pip:rich-cli', 'Rich text in terminal', 'cli'), ('hey', 'go:github.com/rakyll/hey', 'HTTP load generator', 'web'), ('dive', 'go:github.com/wagoodman/dive', 'Docker image explorer', 'docker'), ('lazydocker', 'go:github.com/jesseduffield/lazydocker', 'Docker TUI', 'docker'), ('glow', 'go:github.com/charmbracelet/glow', 'Markdown renderer', 'docs'), ('air', 'go:github.com/cosmtrek/air', 'Go live reload', 'go'), ('golangci-lint', 'go:github.com/golangci/golangci-lint/cmd/golangci-lint', 'Go linter', 'go')]
+
+
+TOOL_BACKENDS = {'arch': 'pacman', 'debian': 'apt', 'debian-trixie': 'apt',
+                 'ubuntu': 'apt', 'fedora': 'dnf'}
+
+
+def tool_registry_backend():
+    mode = os.environ.get('OMG_QEMU_TOOL_REGISTRY_MODE', 'legacy')
+    if mode == 'legacy':
+        return mode, 'pacman'
+    require(mode == 'native', 'unknown tool registry contract')
+    distro = os.environ.get('OMG_QEMU_DISTRO')
+    require(distro in TOOL_BACKENDS, 'native tool registry contract requires a supported guest distro')
+    return mode, TOOL_BACKENDS[distro]
 
 
 def require(condition, reason):
@@ -242,13 +256,31 @@ def prepare(case):
               'features': ['policy'], 'customer': 'QEMU Fixture', 'expires_at': '2000-01-01',
               'validated_at': 0, 'token': 'not-a-jwt', 'machine_id': None}))
         write(data / 'license-clock.highwater', '1790000000\n')
+    if case in {'tool-list', 'tool-search', 'tool-registry'}:
+        tool_profile = tool_registry_backend()
     if case == 'tool-list':
-        for name in ('fixture-rg', 'fixture-jq'):
-            target = data / f'tools/{name}/bin/{name}'
-            write(target, '#!/bin/sh\nexit 0\n', 0o755)
-            link = data / f'bin/{name}'; link.parent.mkdir(exist_ok=True)
-            if absent(link): link.symlink_to(target)
+        tool_links = {}
+        for name, manager in (('fixture-rg', 'cargo'), ('fixture-jq', 'pip')):
+            executable = data / 'tools' / manager / name / 'bin' / name
+            write(executable, '#!/bin/sh\nexit 0\n', 0o755)
+            link = data / 'bin' / name
+            link.parent.mkdir(exist_ok=True)
+            target = str(executable) if manager == 'cargo' else os.path.relpath(executable, link.parent)
+            if absent(link):
+                link.symlink_to(target)
+            require(link.is_symlink() and os.readlink(link) == target, 'unexpected managed fixture link')
+            tool_links[str(link)] = target
         write(data / 'bin/ignored-regular-file', 'not an installed tool\n')
+        outside_link = None
+        if tool_profile[0] == 'native':
+            external = data / 'user-bin' / 'standalone'
+            write(external, '#!/bin/sh\nexit 0\n', 0o755)
+            outside = data / 'bin' / 'ignored-external-link'
+            if absent(outside):
+                outside.symlink_to(external)
+            require(outside.is_symlink() and os.readlink(outside) == str(external),
+                    'unexpected unmanaged fixture link')
+            outside_link = [str(outside), str(external)]
     if case.startswith('team-golden-'):
         path = config / 'golden-paths.toml'
         templates = golden_templates(path) if path.exists() else []
@@ -283,7 +315,11 @@ def prepare(case):
         for path in ('omg.lock', '.git/HEAD', '.git/index'):
             baseline[path] = identity(path)
     if case.startswith('team-golden-'): before['golden'] = templates
-    if case == 'tool-list': before['tools'] = {str(link): os.readlink(link) for link in (data / 'bin').iterdir() if link.is_symlink()}
+    if case in {'tool-list', 'tool-search', 'tool-registry'}:
+        before['tool_profile'] = tool_profile
+    if case == 'tool-list':
+        before['tools'] = tool_links
+        before['unmanaged_tool_link'] = outside_link
     if case == 'init': before['packages'] = native_packages(os.environ['OMG_QEMU_DISTRO'])
     if case in {'rollback', 'rollback-yes'}: before['rollback_distro'] = os.environ['OMG_QEMU_DISTRO']
     write('.qemu-local-before.json', json.dumps(before))
@@ -329,7 +365,7 @@ def check(case, code, stdout, stderr):
     elif case.startswith('team-'):
         team_contract(case, config, stdout, before)
     elif case.startswith('tool-'):
-        tool_contract(case, data, stdout, before)
+        tool_contract(case, stdout, before)
     elif case.startswith('audit-'):
         audit_contract(case, data, config, stdout)
     elif case.startswith('history'):
@@ -529,17 +565,29 @@ def team_contract(case, config, stdout, before):
             require(current == expected and f"Golden path '{selected}' created!" in stdout, 'golden create changed sibling or output identity')
 
 
-def tool_contract(case, data, stdout, before):
+def tool_contract(case, stdout, before):
+    mode, system_manager = tool_registry_backend()
+    require(before['tool_profile'] == [mode, system_manager], 'tool fixture is bound to another registry contract')
+
+    def manager(source):
+        prefix = source.split(':', 1)[0]
+        return system_manager if prefix == 'system' else prefix
+
     if case == 'tool-list':
         expected = {Path(path).name: target for path, target in before['tools'].items()}
         observed = dict(re.findall(r'^\s+(\S+) points to -> (.+)$', stdout, re.M))
         require(observed == expected and len(re.findall(' points to -> ', stdout)) == len(expected), 'tool list disagrees with symlink targets')
-        require(all(os.readlink(path) == target and Path(target).is_file() for path, target in before['tools'].items()), 'tool list changed fixture links/targets')
+        require(all(os.readlink(path) == target and (Path(path).parent / target).is_file()
+                    for path, target in before['tools'].items()), 'tool list changed fixture links/targets')
         require('ignored-regular-file' not in stdout, 'tool list advertised regular file as symlink tool')
+        if before['unmanaged_tool_link'] is not None:
+            path, target = before['unmanaged_tool_link']
+            require(os.readlink(path) == target and Path(target).is_file(), 'tool list changed unmanaged fixture')
+            require(Path(path).name not in stdout, 'tool list advertised an unmanaged command link')
     elif case == 'tool-search':
         require("Searching for 'rip'..." in stdout and 'Found 5 tools:' in stdout, 'tool search advertised wrong query/count')
         results = re.findall(r'\b([\w-]+) \[([^]]+)\] via (\w+)', stdout)
-        expected = [(name, category, source.split(':')[0]) for name, source, description, category in REGISTRY
+        expected = [(name, category, manager(source)) for name, source, description, category in REGISTRY
                     if 'rip' in name.lower() or 'rip' in description.lower() or 'rip' in category.lower()]
         require(results == expected, 'tool search returned wrong bundled matches')
         for name, _, description, category in REGISTRY:
@@ -547,7 +595,7 @@ def tool_contract(case, data, stdout, before):
                 require(description in stdout, 'tool search changed selected description')
     else:
         observed = re.findall(r'^\s+(\S+) \((\w+)\) - (.+)$', stdout, re.M)
-        expected = [(name, source.split(':')[0], description) for name, source, description, _ in sorted(REGISTRY, key=lambda item: item[3])]
+        expected = [(name, manager(source), description) for name, source, description, _ in sorted(REGISTRY, key=lambda item: item[3])]
         require(observed == expected and f'Total: {len(REGISTRY)} tools available' in stdout, 'registry advertised wrong records/managers/order/count')
         categories = re.findall(r'\[([^]]+)\] \((\d+) tools\)', stdout)
         require(categories == [(category, str(sum(item[3] == category for item in REGISTRY))) for category in sorted({item[3] for item in REGISTRY})], 'registry category counts differ')

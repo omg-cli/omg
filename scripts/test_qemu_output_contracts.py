@@ -1613,19 +1613,29 @@ elif case.startswith('team-compliance'):
     print('Compliance Status\nNo local data\nCompliance scoring is not computed locally; view evaluated results on the dashboard')
     if case.endswith('enforce'): print('Enforcement mode requested, but no compliance evaluation engine exists locally; nothing can be enforced yet')
 elif case.startswith('tool-'):
+    def manager(source):
+        prefix = source.split(':', 1)[0]
+        if prefix != 'system':
+            return prefix
+        if os.environ['OMG_QEMU_TOOL_REGISTRY_MODE'] == 'legacy' or mutant == 'legacy-manager':
+            return 'pacman'
+        return {'arch': 'pacman', 'debian': 'apt', 'debian-trixie': 'apt',
+                'ubuntu': 'apt', 'fedora': 'dnf'}[os.environ['OMG_QEMU_DISTRO']]
+
     if case=='tool-list':
         print('OMG Installed Tools:')
         for link in sorted((data/'bin').iterdir()):
-            if link.is_symlink(): print('  '+link.name+' points to -> '+os.readlink(link))
+            if link.is_symlink() and (link.name != 'ignored-external-link' or mutant == 'unmanaged-link'):
+                print('  '+link.name+' points to -> '+os.readlink(link))
     elif case=='tool-search':
         print("Searching for 'rip'...\nFound "+('99' if mutant=='count' else '5')+" tools:")
         for name,source,description,category in REGISTRY:
-            if any('rip' in value.lower() for value in (name,description,category)): print(name+' ['+category+'] via '+source.split(':')[0]+'\n'+description)
+            if any('rip' in value.lower() for value in (name,description,category)): print(name+' ['+category+'] via '+manager(source)+'\n'+description)
     else:
         print('OMG Tool Registry')
         for category in sorted({item[3] for item in REGISTRY}):
             rows=[item for item in REGISTRY if item[3]==category];print('  ['+category+'] ('+str(len(rows))+' tools)')
-            for name,source,description,_ in rows: print('    '+name+' ('+('wrong' if mutant=='manager' else source.split(':')[0])+') - '+description)
+            for name,source,description,_ in rows: print('    '+name+' ('+('wrong' if mutant=='manager' else manager(source))+') - '+description)
         print('Total: 59 tools available')
 elif case.startswith('audit-'):
     if case=='audit-policy': print('OMG Security Policy Status\nMinimum Grade: VERIFIED (PGP/Checksum)\nAUR Allowed: No\nPGP Required: '+('No' if mutant=='count' else 'Yes')+'\nBanned Packages: fixture-banned\nAllowed Licenses: MIT Apache-2.0')
@@ -1765,6 +1775,33 @@ PY
         result, evidence, logs = self.run_inventory(self.local_fixture_with_workspace(), rows, native_commands={'pacman': 'printf "fixture-package\\n"\n'})
         self.assertEqual([row['result'] for row in evidence], ['PASS'] * len(rows),
                          f'{result.stdout}\n{result.stderr}\n{logs}')
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_tool_inventory_binds_guest_backend_and_managed_links(self):
+        cases = ('tool-list', 'tool-search', 'tool-registry')
+        source_rows = {line.split('\t', 1)[0]: line
+                       for line in (ROOT / 'tests/cli_behavior_inventory.tsv').read_text().splitlines()[1:]}
+        rows = [source_rows[case] for case in cases]
+        product = self.local_fixture_product()
+        for distro, native in (('fedora', True), ('fedora', False), ('debian-trixie', True)):
+            with self.subTest(distro=distro, native=native):
+                result, evidence, logs = self.run_inventory(
+                    self.local_fixture_with_workspace(product), rows, distro=distro,
+                    native_tool_registry=native,
+                )
+                self.assertEqual([row['result'] for row in evidence], ['PASS'] * len(rows),
+                                 f'{result.stdout}\n{result.stderr}\n{logs}')
+
+        for case, mutant in (('tool-list', 'unmanaged-link'), ('tool-search', 'legacy-manager'),
+                             ('tool-registry', 'legacy-manager')):
+            with self.subTest(case=case, mutant=mutant):
+                altered = product.replace("mutant = 'none'", 'mutant = ' + repr(mutant), 1)
+                result, evidence, logs = self.run_inventory(
+                    self.local_fixture_with_workspace(altered), [source_rows[case]],
+                    distro='fedora', native_tool_registry=True,
+                )
+                self.assertEqual([row['result'] for row in evidence], ['FAIL'],
+                                 f'{result.stdout}\n{result.stderr}\n{logs}')
 
     @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
     def test_local_family_contracts_reject_wrong_values_and_noop_mutations(self):
@@ -4024,7 +4061,7 @@ fi
                 self.assertEqual({row['case_id']: row['result'] for row in evidence}, expected)
                 self.assertTrue(all(row['network_scope'] == 'network' for row in evidence))
 
-    def run_inventory(self, product, rows, *, native_commands=None, home_files=None, distro='arch', tiers='hermetic', row_timeout=None, allow_mutations=False, fake_tree_binary=False, exact_man=True, binary_name='product', isolation_scope=None, ssh_body=None, parallel_runtime_installs=False):
+    def run_inventory(self, product, rows, *, native_commands=None, home_files=None, distro='arch', tiers='hermetic', row_timeout=None, allow_mutations=False, fake_tree_binary=False, exact_man=True, binary_name='product', isolation_scope=None, ssh_body=None, parallel_runtime_installs=False, native_tool_registry=False):
         def shell_path(path):
             value = path.as_posix()
             return '/' + value[0].lower() + value[2:] if os.name == 'nt' else value
@@ -4130,6 +4167,8 @@ RUNTIME_FIXTURE_REVIEW
                 command += ['--isolate-hermetic', '--network-policy', str(policy)]
             if parallel_runtime_installs:
                 command.append('--parallel-runtime-installs')
+            if native_tool_registry:
+                command.append('--native-tool-registry')
             if exact_man:
                 command += ['--man-page-inventory',
                             shell_path(ROOT / 'tests/man_page_inventory.txt')]

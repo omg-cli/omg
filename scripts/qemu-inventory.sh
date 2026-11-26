@@ -2335,6 +2335,7 @@ allow_credentialed=false
 isolate_hermetic=false
 parallel_runtime_installs=false
 verify_fedora_decline=false
+tool_registry_mode=legacy
 network_scope=unconfined
 network_policy=""
 row_timeout=120
@@ -2358,7 +2359,8 @@ while (($#)); do
     --isolate-hermetic) isolate_hermetic=true; shift ;;
     --parallel-runtime-installs) parallel_runtime_installs=true; shift ;;
     --verify-fedora-decline) verify_fedora_decline=true; shift ;;
-    --help) printf 'Usage: qemu-inventory.sh --work DIR --distro D --tiers CSV --tag TAG --binary GUEST_PATH --tsv FILE [--allow-mutations] [--allow-credentialed] [--verify-fedora-decline] [--row-timeout S]\nRuns TSV-selected rows in the guest at 127.0.0.1 and writes evidence.\n'; exit 0 ;;
+    --native-tool-registry) tool_registry_mode=native; shift ;;
+    --help) printf 'Usage: qemu-inventory.sh --work DIR --distro D --tiers CSV --tag TAG --binary GUEST_PATH --tsv FILE [--allow-mutations] [--allow-credentialed] [--verify-fedora-decline] [--native-tool-registry] [--row-timeout S]\nRuns TSV-selected rows in the guest at 127.0.0.1 and writes evidence.\n'; exit 0 ;;
     *) printf 'error: unknown argument %s\n' "$1" >&2; exit 2 ;;
   esac
 done
@@ -2418,8 +2420,9 @@ sha256sum "${BASH_SOURCE[0]}" "$tsv" "$license_oracle_path" "$local_oracle_path"
 sha256sum "$(dirname "$0")/qemu-runtime-advisory-oracle.py" "$runtime_fixture_path" >> "$out/input-sha256.txt"
 if [[ "$man_page_mode" == exact ]]; then sha256sum "$man_page_inventory" >> "$out/input-sha256.txt"; fi
 jq -n --arg release "$tag" --arg distro "$distro" --arg tiers "$tiers" --arg binary "$binary" --arg man_page_mode "$man_page_mode" \
-  --argjson mutations "$allow_mutations" --argjson credentialed "$allow_credentialed" --argjson deadline "$row_timeout" \
-  '{release:$release,distro:$distro,tiers:$tiers,binary:$binary,man_page_mode:$man_page_mode,allow_mutations:$mutations,allow_credentialed:$credentialed,row_timeout_seconds:$deadline}' > "$out/metadata.json"
+  --arg tool_registry_mode "$tool_registry_mode" --argjson mutations "$allow_mutations" \
+  --argjson credentialed "$allow_credentialed" --argjson deadline "$row_timeout" \
+  '{release:$release,distro:$distro,tiers:$tiers,binary:$binary,man_page_mode:$man_page_mode,tool_registry_mode:$tool_registry_mode,allow_mutations:$mutations,allow_credentialed:$credentialed,row_timeout_seconds:$deadline}' > "$out/metadata.json"
 # -n keeps ssh from forwarding (and draining) this loop's stdin, which is the
 # TSV stream: without it only the first tier-matching row ever executes.
 opts=(-n -i "$guest/client-key" -p "$ssh_port" -o BatchMode=yes -o ConnectTimeout=5
@@ -2947,7 +2950,7 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   quoted_binary=$(jq -rn --arg b "$row_binary" '$b | @sh')
   quoted_binary_dir=$(jq -rn --arg b "${row_binary%/*}" '$b | @sh')
   export -n remote row_program
-  remote="set -eu; export OMG_QEMU_EXECUTABLE=$quoted_binary OMG_QEMU_DISTRO='$distro'; rowdir=\$(mktemp -d \"\$HOME/inventory-$case.XXXXXX\"); cd \"\$rowdir\""
+  remote="set -eu; export OMG_QEMU_EXECUTABLE=$quoted_binary OMG_QEMU_DISTRO='$distro' OMG_QEMU_TOOL_REGISTRY_MODE='$tool_registry_mode'; rowdir=\$(mktemp -d \"\$HOME/inventory-$case.XXXXXX\"); cd \"\$rowdir\""
   defer_runtime=false
   case "$case" in
     runtime-rust-install|runtime-node-install|runtime-go-install|runtime-python-install)

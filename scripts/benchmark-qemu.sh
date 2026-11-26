@@ -1763,6 +1763,13 @@ if [[ -n "$inventory_tiers" && "$rc" == 0 ]]; then
   inv_args=(--work /work --distro "$distro" --tiers "$inventory_tiers" --tag "$tag"
     --binary "/home/bench/omg-${tag}-${arch}-linux-${distro}/omg"
     --native-binary "/opt/omg-qemu/omg-${tag}-${arch}-linux-${distro}/omg" --tsv /work/cases.tsv)
+  # The 0.1.226 release and earlier print pacman in the bundled registry on
+  # every distro. New release and staged builds identify the selected backend.
+  if [[ "$source_kind" == staged ]] ||
+    [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ &&
+       "$(printf '%s\n' v0.1.227 "$tag" | sort -V | head -n 1)" == v0.1.227 ]]; then
+    inv_args+=(--native-tool-registry)
+  fi
   if [[ "$source_kind" == staged ]]; then
     inv_args+=(--man-page-inventory /work/man_page_inventory.txt)
     if [[ "$distro" == fedora ]]; then
