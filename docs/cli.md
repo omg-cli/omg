@@ -1995,6 +1995,7 @@ When a system machine ID is unavailable, OMG stores a private fallback ID and
 shares it across CLI invocations using the same data directory.
 Standard input and the environment variable use the same token format and size
 limits. Account validation diagnostics omit the token.
+Dashboard and telemetry requests stop at redirects.
 
 ### omg daemon
 

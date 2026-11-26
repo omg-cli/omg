@@ -853,7 +853,7 @@ pub async fn validate_license_with_user(
         "Validating dashboard token"
     );
 
-    let response = crate::core::http::shared_client()
+    let response = super::http::service_client()
         .post(super::service_api::VALIDATE_LICENSE)
         .json(&payload)
         .timeout(std::time::Duration::from_secs(10))
@@ -862,6 +862,10 @@ pub async fn validate_license_with_user(
         .context("Failed to connect to dashboard")?;
 
     let status = response.status();
+    anyhow::ensure!(
+        !status.is_redirection(),
+        "Dashboard validation returned HTTP {status}"
+    );
     // The body is remote input: bound it before allocation (csf_08340651).
     let response_text = response
         .bounded_text()
@@ -918,7 +922,7 @@ async fn licensed_get<T: serde::de::DeserializeOwned>(
 ) -> Result<T> {
     let license = require_license()?;
 
-    let response = crate::core::http::shared_client()
+    let response = super::http::service_client()
         .get(url)
         .bearer_auth(&license.key)
         .timeout(std::time::Duration::from_secs(10))

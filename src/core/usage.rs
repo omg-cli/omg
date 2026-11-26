@@ -489,15 +489,18 @@ impl UsageStats {
 
     async fn send_usage(&mut self) -> Result<()> {
         let payload = self.sync_payload();
-        let client = crate::core::http::shared_client();
-        client
+        let client = super::http::service_client();
+        let status = client
             .post(super::service_api::REPORT_USAGE)
             .json(&payload)
             .timeout(std::time::Duration::from_secs(5))
             .send()
             .await?
-            .error_for_status()
-            .context("Usage sync server rejected the update")?;
+            .status();
+        anyhow::ensure!(
+            status.is_success(),
+            "Usage sync server rejected the update (HTTP {status})"
+        );
 
         self.last_sync = jiff::Timestamp::now().as_second();
         // Merge only the sync timestamp into freshly-loaded state under the

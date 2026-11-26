@@ -20,6 +20,16 @@ static SHARED_CLIENT: LazyLock<Client> = LazyLock::new(|| {
         Some(DEFAULT_TIMEOUT),
         DEFAULT_CONNECT_TIMEOUT,
         DEFAULT_READ_TIMEOUT,
+        redirect_policy(),
+    )
+});
+
+static SERVICE_CLIENT: LazyLock<Client> = LazyLock::new(|| {
+    build_client(
+        Some(DEFAULT_TIMEOUT),
+        DEFAULT_CONNECT_TIMEOUT,
+        DEFAULT_READ_TIMEOUT,
+        redirect::Policy::none(),
     )
 });
 
@@ -27,8 +37,14 @@ static SHARED_CLIENT: LazyLock<Client> = LazyLock::new(|| {
 ///
 /// Uses `.read_timeout()` to detect stalled downloads - this timeout resets after
 /// each successful read, unlike `.timeout()` which covers the entire request.
-static DOWNLOAD_CLIENT: LazyLock<Client> =
-    LazyLock::new(|| build_client(None, DOWNLOAD_CONNECT_TIMEOUT, DOWNLOAD_READ_TIMEOUT));
+static DOWNLOAD_CLIENT: LazyLock<Client> = LazyLock::new(|| {
+    build_client(
+        None,
+        DOWNLOAD_CONNECT_TIMEOUT,
+        DOWNLOAD_READ_TIMEOUT,
+        redirect_policy(),
+    )
+});
 
 fn validate_redirect(previous: &[Url], next: &Url) -> Result<(), &'static str> {
     if previous.len() > MAX_REDIRECTS {
@@ -354,10 +370,11 @@ fn build_client(
     timeout: Option<Duration>,
     connect_timeout: Duration,
     read_timeout: Duration,
+    redirects: redirect::Policy,
 ) -> Client {
     let mut builder = Client::builder()
         .user_agent("omg-package-manager")
-        .redirect(redirect_policy())
+        .redirect(redirects)
         .connect_timeout(connect_timeout)
         .read_timeout(read_timeout)
         .pool_max_idle_per_host(32)
@@ -437,6 +454,12 @@ pub fn shared_client() -> &'static Client {
     &SHARED_CLIENT
 }
 
+/// First-party dashboard and telemetry transport. Keep credentials and reports
+/// at the endpoint selected by the caller.
+pub(super) fn service_client() -> &'static Client {
+    &SERVICE_CLIENT
+}
+
 /// Shared HTTP client with extended timeouts for large downloads.
 #[must_use]
 #[inline]
@@ -447,6 +470,66 @@ pub fn download_client() -> &'static Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn service_transport_returns_redirect_responses_without_following() -> anyhow::Result<()>
+    {
+        use reqwest::Method;
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        use crate::core::service_api;
+
+        let endpoints = [
+            (Method::POST, service_api::VALIDATE_LICENSE),
+            (Method::POST, service_api::REPORT_USAGE),
+            (Method::POST, service_api::INSTALL_PING),
+            (Method::POST, service_api::CLI_BATCH),
+            (Method::GET, service_api::TEAM_MEMBERS),
+            (Method::GET, service_api::TEAM_POLICIES),
+            (Method::GET, service_api::TEAM_AUDIT_LOG),
+        ];
+        let client = service_client();
+        let mut cases = 0;
+        for (method, endpoint) in endpoints {
+            for status in [200, 204, 301, 302, 303, 307, 308] {
+                let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
+                let local = listener.local_addr()?;
+                let endpoint = Url::parse(endpoint)?;
+                let url = Url::parse(&format!("http://{local}{}", endpoint.path()))?;
+                let request_prefix = format!("{method} {} HTTP/1.1\r\n", endpoint.path());
+                let response = if status < 300 {
+                    format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                } else {
+                    format!(
+                        "HTTP/1.1 {status}\r\nLocation: /fixture-return\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                };
+                let server = tokio::spawn(async move {
+                    let (mut stream, _) = listener.accept().await?;
+                    let mut request = [0_u8; 1024];
+                    stream
+                        .read_exact(&mut request[..request_prefix.len()])
+                        .await?;
+                    assert_eq!(&request[..request_prefix.len()], request_prefix.as_bytes());
+                    stream.write_all(response.as_bytes()).await?;
+                    stream.shutdown().await?;
+                    Ok::<_, std::io::Error>(())
+                });
+                let response = client
+                    .request(method.clone(), url.clone())
+                    .timeout(Duration::from_secs(3))
+                    .send()
+                    .await?;
+                assert_eq!(response.status().as_u16(), status);
+                assert_eq!(response.url(), &url);
+                server.await??;
+                cases += 1;
+            }
+        }
+        assert_eq!(cases, 49);
+        println!("Verified {cases} service responses across seven routes");
+        Ok(())
+    }
 
     #[test]
     fn resolved_download_addresses_must_all_be_public() {
@@ -608,7 +691,12 @@ mod tests {
 
         // Read timeout must stay well above the 50ms inter-byte gap so CI
         // scheduling jitter cannot look like a stalled download.
-        let client = build_client(None, Duration::from_secs(1), Duration::from_secs(5));
+        let client = build_client(
+            None,
+            Duration::from_secs(1),
+            Duration::from_secs(5),
+            redirect_policy(),
+        );
         let body = client
             .get(format!("http://{address}"))
             .send()

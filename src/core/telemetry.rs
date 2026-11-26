@@ -402,7 +402,7 @@ pub async fn ping_install() -> Result<()> {
     };
 
     // Send ping with timeout
-    let client = crate::core::http::shared_client();
+    let client = super::http::service_client();
     let response = client
         .post(super::service_api::INSTALL_PING)
         .json(&payload)

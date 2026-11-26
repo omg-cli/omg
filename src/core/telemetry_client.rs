@@ -319,7 +319,7 @@ pub async fn send_batch(events: Vec<TelemetryEvent>) -> Result<()> {
 
     let batch = BatchPayload::from_events(events);
 
-    let client = crate::core::http::shared_client();
+    let client = super::http::service_client();
 
     let response = client
         .post(super::service_api::CLI_BATCH)
