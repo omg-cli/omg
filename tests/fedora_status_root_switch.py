@@ -127,6 +127,16 @@ before = inventory()
 config_before = config.read_bytes()
 host_count = len(before[0])
 checks = []
+started_at = time.monotonic()
+
+
+def mark_progress(label):
+    elapsed = time.monotonic() - started_at
+    print(f"Fedora status suite: {label}, {len(checks)} checks, {elapsed:.1f}s",
+          file=sys.stderr, flush=True)
+
+
+mark_progress("starting")
 with tempfile.TemporaryDirectory(prefix="omg-fedora-cache-scope-", dir="/tmp") as directory:
     root = Path(directory)
     root.chmod(0o755)
@@ -2721,7 +2731,6 @@ printf 'fixture python {version}|<%s>\\n' "$@"
     executable.chmod(0o755)
     fixture.seed_runtime_advisory_fixture(root, "python", version, config)
 """
-        phase = "python-project-constraints"
         cases = (
             ("bounded", ">=3.12,<3.13", None, None, "3.12.9"),
             ("compatible-minor", "~=3.12.5", None, None, "3.12.9"),
@@ -2736,6 +2745,20 @@ printf 'fixture python {version}|<%s>\\n' "$@"
             ("dedicated-pin", ">=,3.12", None, "3.11.9", "3.11.9"),
             ("invalid-specifier", ">=,3.12", (".python-version", "3.14.1"), None, None),
             ("unavailable", ">=4", None, None, None),
+        )
+        version_pins = (
+            ("lower-prefix-exact", None, None, "v3.12.7", "3.12.7"),
+            ("upper-prefix-exact", None, None, "V3.12.7", "3.12.7"),
+            ("lower-prefix-minor", None, None, "v3.12", "3.12.9"),
+            ("upper-prefix-minor", None, None, "V3.12", "3.12.9"),
+            ("lower-prefix-major", None, None, "v3", "3.14.1"),
+            ("upper-prefix-major", None, None, "V3", "3.14.1"),
+            ("tool-versions-exact", None, (".tool-versions", "python V3.12.7"), None, "3.12.7"),
+            ("tool-versions-minor", None, (".tool-versions", "python V3.12"), None, "3.12.9"),
+            ("parent-dedicated", None, (".python-version", "V3.13.0"), None, "3.13.0"),
+            ("nearest-dedicated", None, (".python-version", "3.14.1"), "V3.12.7", "3.12.7"),
+            ("plain-exact", None, None, "3.12.7", "3.12.7"),
+            ("plain-minor", None, None, "3.12", "3.12.9"),
         )
         with tempfile.TemporaryDirectory(prefix="python-project-constraints-", dir=work) as directory:
             here = Path(directory)
@@ -2756,7 +2779,9 @@ printf 'fixture python {version}|<%s>\\n' "$@"
                 text = f"[project]\nrequires-python = {json.dumps(value)}\n" if filename == "pyproject.toml" else value
                 (folder / filename).write_text(text)
 
-            for label, constraint, parent, dedicated, expected in cases:
+            pin_labels = {case[0] for case in version_pins}
+            for label, constraint, parent, dedicated, expected in cases + version_pins:
+                phase = "python-version-pins" if label in pin_labels else "python-project-constraints"
                 family = here / label
                 project = family / "project"
                 project.mkdir(parents=True)
@@ -5610,6 +5635,7 @@ exec {shlex.quote(str(binary))} "$@"
                 assert json.loads(persisted.read_text())["status"]["total_packages"] == host_count
                 initial_status = persisted.read_bytes()
                 inspect("initial-host", host_count, host_explicit, host=True)
+                mark_progress("initial host inventory")
                 if consent_oracle is not None:
                     inspect_history_locks()
                     inspect_audit_segments()
@@ -5620,6 +5646,7 @@ exec {shlex.quote(str(binary))} "$@"
                     inspect_secret_scan()
                     inspect_artifact_signature_inputs()
                     inspect_environment_lockfiles()
+                    mark_progress("audit and lockfiles")
                     inspect_team_storage()
                     inspect_team_commands()
                     inspect_team_push_publication()
@@ -5627,17 +5654,21 @@ exec {shlex.quote(str(binary))} "$@"
                     inspect_scaffold_publication()
                     inspect_workspace_lifecycle()
                     inspect_workspace_graph_and_diff()
+                    mark_progress("team and workspace")
                     inspect_task_selection()
                     inspect_task_watch()
+                    mark_progress("task selection and watch")
                     runtime_advisory_fixture = stage_runtime_fixture(root)
                     inspect_task_runtime_admissions()
                     inspect_task_version_requirements()
                     inspect_node_alias_selection()
                     inspect_python_project_constraints()
                     inspect_python_virtualenv_launch()
+                    mark_progress("runtime selection and Python environments")
                     inspect_task_environment_bytes()
                     inspect_task_package_metadata()
                     inspect_mise_task_execution()
+                    mark_progress("task environment and mise")
                 config.write_text(alternate_config)
                 refresh_fixture()
                 expected = ordinary_control([dnf, "--cacheonly", "repoquery",
@@ -5649,6 +5680,7 @@ exec {shlex.quote(str(binary))} "$@"
                     inspect_info_attempts()
                 config.write_text(host_config)
                 inspect("returned-host", host_count, host_explicit, host=True)
+                mark_progress("root switch and return")
                 if consent_oracle is not None:
                     inspect_epoch_read_paths()
                 original_manifest = manifest.read_bytes()
@@ -5937,6 +5969,7 @@ exec {shlex.quote(str(binary))} "$@"
                     packages_state.write_bytes(initial_packages)
                 inspect_upgrade_review(old_rpm)
                 inspect_removal_replay()
+                mark_progress("native install and removal")
             config.write_text(host_config)
             inspect_security_inventory("inventory-host")
             if consent_oracle is not None:
@@ -5952,9 +5985,10 @@ exec {shlex.quote(str(binary))} "$@"
 
 assert config.read_bytes() == config_before
 assert inventory() == before
+mark_progress("completed with host inventory unchanged")
 report = dict(binaries=binaries, checks=checks, total=len(checks),
               passed=sum(entry["passed"] for entry in checks), host_unchanged=True)
 print(json.dumps(report))
-expected_checks = 303 if consent_oracle is None else 1944
+expected_checks = 303 if consent_oracle is None else 1980
 if report["passed"] != report["total"] or report["total"] != expected_checks:
     sys.exit(4)

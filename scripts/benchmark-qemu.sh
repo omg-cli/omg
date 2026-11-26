@@ -1444,10 +1444,12 @@ fi
 if [[ "$distro" == fedora ]]; then
   bash "$HOME/qemu-fedora-advisory-check.sh" "$bin" "$daemon" "$digest" "$HOME/evidence"
   fedora_review_args=()
+  fedora_status_timeout=120
   if [[ "$source_kind" == staged ]]; then
     fedora_review_args+=("$HOME/qemu-runtime-advisory-oracle.py")
+    fedora_status_timeout=240
   fi
-  timeout --kill-after=5s 120s sudo -n unshare --mount --net --propagation private \
+  timeout --kill-after=5s "${fedora_status_timeout}s" sudo -n unshare --mount --net --propagation private \
     python3 -I -B "$HOME/fedora_status_root_switch.py" "$HOME/fedora-status-fixture" "$bin" "$daemon" \
     "${fedora_review_args[@]}" > "$HOME/evidence/fedora-status-root-switch.json"
   if [[ -f "$HOME/fedora_sync_cache.py" ]]; then

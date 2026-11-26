@@ -856,13 +856,13 @@ pub(crate) fn resolve_runtime_bin_dir(
     // JDK `21` directory, while non-feature requests (for example `21.0.5`)
     // name nothing this runtime tree can contain. Fail soft in PATH
     // building: such a pin skips the runtime instead of failing the hook.
-    let request = if runtime == "java" {
-        match crate::runtimes::java::java_feature_number(raw_request) {
+    let request = match runtime {
+        "java" => match crate::runtimes::java::java_feature_number(raw_request) {
             Ok(feature) => feature,
             Err(_) => return Ok(None),
-        }
-    } else {
-        raw_request.to_string()
+        },
+        "python" => crate::runtimes::common::normalize_version(raw_request),
+        _ => raw_request.to_owned(),
     };
 
     // Safe exact lookup: the request itself must be a validated, existing
