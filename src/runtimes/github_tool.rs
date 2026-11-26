@@ -61,7 +61,12 @@ fn version_for_tool(tag: &str, tool: &str) -> Option<String> {
     {
         return None;
     }
-    version_from_tag(tag)
+    let leaf = tag.rsplit('/').next()?;
+    let leaf = leaf
+        .strip_prefix(tool)
+        .and_then(|suffix| suffix.strip_prefix('-'))
+        .unwrap_or(leaf);
+    version_from_tag(leaf)
 }
 
 /// Parse releases into deterministic newest-first versions.
@@ -77,13 +82,13 @@ fn parse_registry_versions(releases: Vec<GithubRelease>, tool: &str) -> Vec<Regi
         .collect()
 }
 
-/// Pick the newest stable version (GitHub lists newest first).
-fn pick_latest_stable(versions: Vec<RegistryVersion>) -> Option<String> {
-    versions
+fn pick_latest_stable(
+    releases: impl IntoIterator<Item = (String, GithubRelease)>,
+) -> Option<(String, GithubRelease)> {
+    releases
         .into_iter()
-        .filter(|version| !version.prerelease)
-        .max_by(|a, b| super::common::version_cmp(&a.version, &b.version))
-        .map(|version| version.version)
+        .filter(|(_, release)| !release.prerelease)
+        .max_by(|(a, _), (b, _)| super::common::version_cmp(a, b).then_with(|| a.cmp(b)))
 }
 
 /// Host OS token candidates, most specific first.
@@ -213,9 +218,13 @@ fn classify_archive(name: &str) -> Option<ArchiveKind> {
 }
 
 /// Score an asset for this host. Higher wins; `None` means unusable.
-fn score_asset(asset_name: &str) -> Option<i64> {
+fn score_asset(asset_name: &str) -> Option<(ArchiveKind, i64)> {
     let name = asset_name.to_ascii_lowercase();
-    if is_sidecar_or_packaging(&name) || is_excluded_platform(&name) {
+    if is_sidecar_or_packaging(&name)
+        || is_excluded_platform(&name)
+        || names_foreign_os(&name)
+        || names_foreign_arch(&name)
+    {
         return None;
     }
     let kind = classify_archive(asset_name)?;
@@ -230,23 +239,15 @@ fn score_asset(asset_name: &str) -> Option<i64> {
         return None;
     }
     let arch_tokens = host_arch_tokens();
-    let arch_rank = arch_tokens
-        .iter()
-        .position(|token| {
-            name.contains(&format!("-{token}"))
-                || name.contains(&format!("_{token}"))
-                || name.contains(&format!(".{token}"))
-                || name.contains(token)
-        })
-        .unwrap_or(arch_tokens.len());
-    if arch_rank >= arch_tokens.len() {
-        return None;
-    }
+    let arch_rank = arch_tokens.iter().position(|token| name.contains(token))?;
     // Prefer gnu over musl on Linux (glibc hosts), archives over bare
     // binaries, and exact-arch matches over genus matches.
     let musl_penalty = i64::from(name.contains("musl"));
     let arch_rank = i64::try_from(arch_rank).unwrap_or(i64::MAX);
-    Some(1_000_000 - i64::from(kind.rank()) * 10_000 - arch_rank * 100 - musl_penalty)
+    Some((
+        kind,
+        1_000_000 - i64::from(kind.rank()) * 10_000 - arch_rank * 100 - musl_penalty,
+    ))
 }
 
 /// Select the best release asset for this host.
@@ -267,8 +268,7 @@ fn select_asset<'a>(
     };
     let mut best: Option<(&GithubAsset, ArchiveKind, i64)> = None;
     for asset in assets.iter().filter(|asset| allowed(asset)) {
-        if let Some(score) = score_asset(&asset.name)
-            && let Some(kind) = classify_archive(&asset.name)
+        if let Some((kind, score)) = score_asset(&asset.name)
             && best.is_none_or(|(_, _, best_score)| score > best_score)
         {
             best = Some((asset, kind, score));
@@ -281,7 +281,7 @@ fn select_asset<'a>(
     // keep only viable assets, prefer the host arch, and break remaining
     // ties by smallest name so multi-variant releases (per-OTP zips) resolve
     // deterministically — the lowest variant has the widest compatibility.
-    let mut fallback: Vec<(&GithubAsset, ArchiveKind)> = assets
+    assets
         .iter()
         .filter(|asset| allowed(asset))
         .filter_map(|asset| {
@@ -293,20 +293,14 @@ fn select_asset<'a>(
             {
                 return None;
             }
-            classify_archive(&asset.name).map(|kind| (asset, kind))
+            let kind = classify_archive(&asset.name)?;
+            let host_arch = host_arch_tokens().iter().any(|token| name.contains(*token));
+            Some((asset, kind, host_arch))
         })
-        .collect();
-    fallback.sort_by(|a, b| {
-        let arch_match = |asset: &GithubAsset| {
-            host_arch_tokens()
-                .iter()
-                .any(|token| asset.name.contains(*token))
-        };
-        arch_match(b.0)
-            .cmp(&arch_match(a.0))
-            .then_with(|| a.0.name.cmp(&b.0.name))
-    });
-    fallback.into_iter().next()
+        .min_by(|(a, _, a_host), (b, _, b_host)| {
+            b_host.cmp(a_host).then_with(|| a.name.cmp(&b.name))
+        })
+        .map(|(asset, kind, _)| (asset, kind))
 }
 
 /// Whether a bare asset name claims a foreign OS (used by the fallback pass
@@ -328,12 +322,28 @@ fn names_foreign_os(name: &str) -> bool {
 /// are excluded first, so `amd64` never rejects an x86_64 asset.
 fn names_foreign_arch(name: &str) -> bool {
     const ALL_ARCH: &[&str] = &[
-        "x86_64", "amd64", "x64", "aarch64", "arm64", "armv7", "armv6", "i386", "i686", "armhf",
-        "ppc64", "s390x", "riscv", "mips", "loong64",
+        "x86_64",
+        "amd64",
+        "x64",
+        "aarch64",
+        "arm64",
+        "armv7",
+        "armv6",
+        "i386",
+        "i686",
+        "armhf",
+        "ppc64",
+        "s390x",
+        "riscv",
+        "mips",
+        "loong64",
+        "loongarch64",
+        "armel",
     ];
-    ALL_ARCH
-        .iter()
-        .any(|token| !host_arch_tokens().contains(token) && name.contains(token))
+    has_token(name, "arm")
+        || ALL_ARCH
+            .iter()
+            .any(|token| !host_arch_tokens().contains(token) && name.contains(token))
 }
 
 /// Generic manager for one [`RegistryTool`].
@@ -379,69 +389,69 @@ impl GenericToolManager {
         name
     }
 
-    /// List available upstream versions (newest first).
-    pub async fn list_available(&self) -> Result<Vec<RegistryVersion>> {
-        let releases = fetch_github_releases(
+    async fn fetch_releases(
+        &self,
+        stop_when: impl Fn(&GithubRelease) -> bool,
+    ) -> Result<Vec<GithubRelease>> {
+        fetch_github_releases(
             self.client,
             &self.releases_url(),
             LIST_PER_PAGE,
             LIST_MAX_PAGES,
-            |_| false,
+            stop_when,
         )
         .await
-        .with_context(|| format!("Failed to fetch {} releases from GitHub", self.spec.name))?;
+        .with_context(|| format!("Failed to fetch {} releases from GitHub", self.spec.name))
+    }
+
+    /// List available upstream versions.
+    pub async fn list_available(&self) -> Result<Vec<RegistryVersion>> {
+        let releases = self.fetch_releases(|_| false).await?;
         Ok(parse_registry_versions(releases, self.spec.name))
     }
 
-    /// Resolve `latest` and partial requests (`1`, `1.2`) against the
-    /// upstream list. Exact versions pass through so the installed fast path
-    /// and the existing not-found UX are preserved.
-    pub async fn resolve_alias(&self, alias: &str) -> Result<String> {
-        let alias = normalize_version(alias);
-        if alias == "latest" {
-            let versions = self.list_available().await?;
-            pick_latest_stable(versions)
-                .with_context(|| format!("No {} versions found upstream", self.spec.name))
-        } else {
-            Ok(alias)
+    async fn release_for_alias(&self, request: &str) -> Result<(String, GithubRelease)> {
+        let releases = self.fetch_releases(|_| false).await?;
+        let releases = releases.into_iter().filter_map(|release| {
+            let version = version_for_tool(&release.tag_name, self.spec.name)?;
+            Some((version, release))
+        });
+        if request == "latest" {
+            return pick_latest_stable(releases)
+                .with_context(|| format!("No {} versions found upstream", self.spec.name));
         }
-    }
 
-    /// Resolve a partial version against the upstream list.
-    async fn resolve_requested_version(&self, version: &str) -> Result<String> {
-        if !super::common::is_partial_version(version) {
-            return Ok(version.to_owned());
-        }
-        let available = self.list_available().await?;
-        let names: Vec<String> = available
+        let releases: Vec<_> = releases.collect();
+        let names: Vec<_> = releases
             .iter()
-            .map(|version| version.version.clone())
+            .map(|(version, _)| version.clone())
             .collect();
-        Ok(super::resolve_version_request(&names, version))
-    }
-
-    /// Fetch the release whose derived version equals `version`.
-    async fn release_for_version(&self, version: &str) -> Result<GithubRelease> {
-        let releases = fetch_github_releases(
-            self.client,
-            &self.releases_url(),
-            LIST_PER_PAGE,
-            LIST_MAX_PAGES,
-            |release| {
-                version_for_tool(&release.tag_name, self.spec.name).as_deref() == Some(version)
-            },
-        )
-        .await
-        .with_context(|| format!("Failed to fetch {} releases from GitHub", self.spec.name))?;
+        let selected = super::common::resolve_partial_version(&names, request)
+            .with_context(|| self.release_not_found(request))?;
         releases
             .into_iter()
-            .find(|release| version_for_tool(&release.tag_name, self.spec.name).as_deref() == Some(version))
-            .with_context(|| {
-                format!(
-                    "Version {version} not found for {}. Check available versions with: omg list {0} --available",
-                    self.spec.name
-                )
-            })
+            .filter(|(version, _)| version == &selected)
+            .min_by_key(|(_, release)| release.prerelease)
+            .with_context(|| self.release_not_found(request))
+    }
+
+    /// Fetch the release whose derived version equals \`version\`.
+    async fn release_for_version(&self, version: &str) -> Result<GithubRelease> {
+        let matches = |release: &GithubRelease| {
+            version_for_tool(&release.tag_name, self.spec.name).as_deref() == Some(version)
+        };
+        self.fetch_releases(matches)
+            .await?
+            .into_iter()
+            .find(matches)
+            .with_context(|| self.release_not_found(version))
+    }
+
+    fn release_not_found(&self, version: &str) -> String {
+        format!(
+            "Version {version} not found for {}. Check available versions with: omg list {0} --available",
+            self.spec.name
+        )
     }
 
     /// Resolve the SHA-256 for an asset: GitHub's asset digest first, then a
@@ -466,10 +476,14 @@ impl GenericToolManager {
         let sidecar = sidecar.or_else(|| {
             release.assets.iter().find(|candidate| {
                 let name = candidate.name.to_ascii_lowercase();
-                name == "checksums.txt"
-                    || name.ends_with("_checksums.txt")
-                    || name == "sha256sums"
-                    || name == "sha256sums.txt"
+                matches!(
+                    name.as_str(),
+                    "checksums.txt"
+                        | "checksums.sha256"
+                        | "sha256.sum"
+                        | "sha256sums"
+                        | "sha256sums.txt"
+                ) || name.ends_with("_checksums.txt")
                     || name.ends_with("_sha256sums")
             })
         });
@@ -486,7 +500,7 @@ impl GenericToolManager {
             .browser_download_url
             .clone()
             .with_context(|| format!("Checksum sidecar has no download URL: {sidecar_name}"))?;
-        let text = crate::core::http::fetch_public_download_with_timeout(
+        let response = crate::core::http::fetch_public_download_with_timeout(
             &url,
             GITHUB_USER_AGENT,
             Some(std::time::Duration::from_secs(30)),
@@ -495,24 +509,38 @@ impl GenericToolManager {
         .with_context(|| format!("Failed to fetch checksum sidecar {sidecar_name}"))?
         .error_for_status()
         .map_err(reqwest::Error::without_url)
-        .with_context(|| format!("Checksum sidecar request failed: {sidecar_name}"))?
-        .bounded_text()
-        .await
-        .with_context(|| format!("Failed to read checksum sidecar {sidecar_name}"))?;
+        .with_context(|| format!("Checksum sidecar request failed: {sidecar_name}"))?;
+        anyhow::ensure!(
+            response.status() == reqwest::StatusCode::OK,
+            "Checksum sidecar {sidecar_name} returned HTTP {}",
+            response.status()
+        );
+        let text = response
+            .bounded_text()
+            .await
+            .with_context(|| format!("Failed to read checksum sidecar {sidecar_name}"))?;
         checksum_document(&text, &asset.name, asset_specific)
     }
 
     /// Install a version: resolve, download, verify, extract, activate.
     pub async fn install(&self, version: &str) -> Result<()> {
-        let version = self.resolve_alias(version).await?;
-        let version = self.resolve_requested_version(&version).await?;
-        crate::core::security::validate_runtime_version(&version)?;
+        let requested = normalize_version(version);
+        crate::core::security::validate_runtime_version(&requested)?;
+        let (version, release) =
+            if requested == "latest" || super::common::is_partial_version(&requested) {
+                let (version, release) = self.release_for_alias(&requested).await?;
+                (version, Some(release))
+            } else {
+                (requested, None)
+            };
+        let _install_lease = super::common::try_lock_runtime_install(&self.versions_dir, &version)?;
         let version_dir = self.versions_dir.join(&version);
 
         if super::common::is_valid_version_dir(&version_dir) {
             print_already_installed(&self.display(), &version);
             return self.use_version(&version);
         }
+        super::common::require_unoccupied_install_destination(&version_dir)?;
 
         println!(
             "{} Installing {} {}...\n",
@@ -521,13 +549,17 @@ impl GenericToolManager {
             style::caution(&version)
         );
 
-        println!(
-            "{} Fetching {} {} release metadata...",
-            style::informative("→"),
-            self.display(),
-            version
-        );
-        let mut release = self.release_for_version(&version).await?;
+        let mut release = if let Some(release) = release {
+            release
+        } else {
+            println!(
+                "{} Fetching {} {} release metadata...",
+                style::informative("→"),
+                self.display(),
+                version
+            );
+            self.release_for_version(&version).await?
+        };
         if let Some(assets) = publisher_assets(
             self.spec.name,
             &version,
@@ -559,11 +591,8 @@ impl GenericToolManager {
         })?;
         let checksum = self.checksum_for_asset(&release, asset).await?;
 
-        fs::create_dir_all(&self.versions_dir)?;
         println!("{} Downloading {}...", style::informative("→"), asset.name);
-        let downloads = tempfile::Builder::new()
-            .prefix(".download-")
-            .tempdir_in(&self.versions_dir)?;
+        let downloads = super::common::begin_download(&self.versions_dir)?;
         let download_path = downloads.path().join(&asset.name);
         download_with_progress(self.client, &url, &download_path, &checksum).await?;
         self.publish_download(&download_path, &url, &version, kind)
@@ -704,6 +733,7 @@ impl GenericToolManager {
     /// Switch to an installed version.
     pub fn use_version(&self, version: &str) -> Result<()> {
         let version = normalize_version(version);
+        crate::core::security::validate_runtime_version(&version)?;
         let admission = self.security.installed(
             self.spec.name,
             &self.versions_dir.join(&version),
@@ -878,10 +908,15 @@ mod tests {
         .expect("complete owned generic tool archive");
         let archive_path =
             format!("/omg-fixtures/registry/releases/download/v{version}/{filename}");
+        let checksum_path =
+            format!("/omg-fixtures/registry/releases/download/v{version}/checksums.sha256");
+        let checksum = format!("{} *{filename}\n", hex::encode(Sha256::digest(&archive)));
         let metadata = serde_json::to_vec(&serde_json::json!([{
             "tag_name": format!("v{version}"), "prerelease": false,
-            "assets": [{"name": filename, "browser_download_url": format!("https://github.com{archive_path}"),
-                "digest": format!("sha256:{}", hex::encode(Sha256::digest(&archive)))}]
+            "assets": [
+                {"name": filename, "browser_download_url": format!("https://github.com{archive_path}")},
+                {"name": "checksums.sha256", "browser_download_url": format!("https://github.com{checksum_path}")}
+            ]
         }])).expect("controlled generic publisher metadata");
         super::super::test_https::fixed_public_routes(&[
             (
@@ -889,6 +924,7 @@ mod tests {
                 "/repos/omg-fixtures/registry/releases?per_page=30&page=1",
                 &metadata,
             ),
+            ("github.com", &checksum_path, checksum.as_bytes()),
             ("github.com", &archive_path, &archive),
         ]);
 
@@ -1032,6 +1068,79 @@ mod tests {
         let path = owner.join("authenticated-runtime.archive");
         fs::write(&path, archive).expect("owned authenticated archive");
         Ok((path, url, kind))
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn registry_alias_uses_the_selected_release_from_one_catalog() -> Result<()> {
+        use super::super::test_https::HttpsFixture;
+        let owner = tempfile::tempdir()?;
+        let metadata = serde_json::to_vec(&serde_json::json!([
+            {"tag_name": "v1.2.3", "prerelease": true, "assets": []},
+            {"tag_name": "1.2.3", "assets": [{
+                "name": format!("fixture-tool-{}-{}", std::env::consts::OS, std::env::consts::ARCH),
+                "browser_download_url": "https://github.com/omg-fixtures/registry/fixture-tool",
+                "digest": "sha256:malformed"
+            }]}
+        ]))?;
+        let catalog = "/repos/omg-fixtures/registry/releases?per_page=30&page=1";
+        for request in ["latest", "1.2"] {
+            let version_dir = owner.path().join(request);
+            let fixture =
+                HttpsFixture::new("api.github.com", vec![(catalog.into(), metadata.clone())])
+                    .await?;
+            let manager = GenericToolManager {
+                security: super::super::security::RuntimeSecurity::fixture(),
+                spec: &INSTALL_FIXTURE,
+                versions_dir: version_dir.clone(),
+                client: Box::leak(Box::new(fixture.client(true)?)),
+            };
+            let error = manager
+                .install(request)
+                .await
+                .expect_err("fixture digest must refuse");
+            assert!(
+                format!("{error:#}").contains("Invalid SHA-256 digest"),
+                "{request} must use the stable asset from its sole catalog response: {error:#}"
+            );
+            assert_eq!(
+                fixture.finish().await?,
+                vec![format!("GET {catalog} HTTP/1.1")]
+            );
+            assert!(!version_dir.join("1.2.3").exists());
+            assert!(!version_dir.join("current").exists());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn registry_tags_accept_the_publishers_own_name_prefix() {
+        assert_eq!(version_for_tool("jq-1.8.2", "jq").as_deref(), Some("1.8.2"));
+        assert_eq!(
+            version_for_tool("jq-v1.8.2", "jq").as_deref(),
+            Some("1.8.2")
+        );
+        assert!(version_for_tool("jq-1.8.2", "yq").is_none());
+        assert!(version_for_tool("kyaml/v0.21.1", "kustomize").is_none());
+        assert_eq!(
+            version_for_tool("kustomize/v5.8.3", "kustomize").as_deref(),
+            Some("5.8.3")
+        );
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn registry_refuses_the_foreign_architectures_publishers_label_explicitly() {
+        for name in [
+            "jq-linux-armel",
+            "just-1.59.0-loongarch64-unknown-linux-musl.tar.gz",
+            "ruff-arm-unknown-linux-musleabihf.tar.gz",
+        ] {
+            assert!(select_asset(&[asset(name)], None, None).is_none(), "{name}");
+        }
     }
 
     #[tokio::test]
@@ -1322,16 +1431,11 @@ mod tests {
             Some("5.8.1")
         );
         assert_eq!(
-            pick_latest_stable(vec![
-                RegistryVersion {
-                    version: "1.0.9".into(),
-                    prerelease: false
-                },
-                RegistryVersion {
-                    version: "2.0.0".into(),
-                    prerelease: false
-                }
+            pick_latest_stable([
+                registry_test_release("1.0.9", false),
+                registry_test_release("2.0.0", false),
             ])
+            .map(|(version, _)| version)
             .as_deref(),
             Some("2.0.0")
         );
@@ -1375,19 +1479,26 @@ mod tests {
         assert_eq!(kind, ArchiveKind::Zip);
     }
 
+    fn registry_test_release(version: &str, prerelease: bool) -> (String, GithubRelease) {
+        (
+            version.to_owned(),
+            GithubRelease {
+                tag_name: version.to_owned(),
+                prerelease,
+                assets: Vec::new(),
+            },
+        )
+    }
+
     #[test]
     fn latest_stable_skips_prereleases() {
-        let versions = vec![
-            RegistryVersion {
-                version: "2.0.0-rc1".to_owned(),
-                prerelease: true,
-            },
-            RegistryVersion {
-                version: "1.9.0".to_owned(),
-                prerelease: false,
-            },
+        let versions = [
+            registry_test_release("2.0.0-rc1", true),
+            registry_test_release("1.9.0", false),
         ];
-        assert_eq!(pick_latest_stable(versions).as_deref(), Some("1.9.0"));
+        let (version, release) = pick_latest_stable(versions).expect("stable release exists");
+        assert_eq!(version, "1.9.0");
+        assert!(!release.prerelease);
     }
 
     #[test]
