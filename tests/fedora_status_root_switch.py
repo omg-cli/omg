@@ -703,6 +703,126 @@ exec {shlex.quote(str(native_executable))} "$@"
 
 
 
+    def inspect_daemon_audit_recovery():
+        layouts = ("healthy", "archive-only", "damaged", "missing-hash", "marked-damaged", "damaged-with-archive")
+
+        def record(layout, label, result, passed):
+            checks.append(dict(phase="daemon-audit-recovery", case=f"{layout}-{label}",
+                               passed=passed, status=result.returncode,
+                               diagnostic=(result.stdout + result.stderr)[-1000:]))
+
+        def verified(result, count):
+            return (result.returncode == 0 and "Local audit chain consistency verified" in result.stdout
+                    and f"Total: {count} entries" in result.stdout and f"Valid: {count} entries" in result.stdout)
+
+        for layout in layouts:
+            home = Path(tempfile.mkdtemp(prefix=f"audit-recovery-{layout}-", dir=work))
+            os.chown(home, account.pw_uid, account.pw_gid)
+            run = home / "run"
+            data = home / "data"
+            directory = data / "audit"
+            for path in (run, data, directory):
+                path.mkdir(mode=0o700)
+                os.chown(path, account.pw_uid, account.pw_gid)
+            audit = directory / "audit.jsonl"
+            marker = directory / "incomplete"
+            entries = audit_fixture_segment("recover", 2)
+            archive = directory / "audit.jsonl.1"
+            with_archive = layout in ("archive-only", "damaged-with-archive")
+            if with_archive:
+                write_audit_fixture_segment(archive, entries)
+            if layout != "archive-only":
+                if layout == "missing-hash":
+                    entries[-1].pop("hash")
+                write_audit_fixture_segment(audit, entries)
+                if layout in ("damaged", "marked-damaged", "damaged-with-archive"):
+                    with audit.open("ab") as file:
+                        file.write(b"{unfinished event\n")
+            if layout == "marked-damaged":
+                marker.write_bytes(b"existing loss marker\n")
+                marker.chmod(0o600)
+                os.chown(marker, account.pw_uid, account.pw_gid)
+            mode = dict(env, HOME=str(home), XDG_RUNTIME_DIR=str(run), OMG_SOCKET_PATH=str(run / "omg.sock"),
+                        OMG_DATA_DIR=str(data), OMG_DAEMON_DATA_DIR=str(data))
+            direct = dict(mode, OMG_DISABLE_DAEMON="1")
+            needs_recovery = layout not in ("healthy", "archive-only")
+            before = audit.read_bytes() if audit.exists() else None
+            original_archive = archive.read_bytes() if archive.exists() else None
+            original_marker = marker.read_bytes() if marker.exists() else None
+            initial = command([cli, "audit", "verify"], direct, ordinary)
+            if needs_recovery:
+                expected = {"missing-hash": "missing hash", "marked-damaged": "Audit collection is incomplete"}
+                before_ok = initial.returncode == 1 and expected.get(layout, "Corrupt audit log") in initial.stderr
+            else:
+                before_ok = verified(initial, 2)
+            record(layout, "verify-before", initial, before_ok)
+            initial = command([cli, "audit", "log", "--limit", "0"], direct, ordinary)
+            if needs_recovery:
+                error = "missing hash" if layout == "missing-hash" else "Corrupt audit log"
+                before_ok = initial.returncode == 1 and error in initial.stderr
+            else:
+                before_ok = initial.returncode == 0 and "No audit entries found." in initial.stdout
+            record(layout, "read-before", initial, before_ok)
+
+            def scan_written():
+                return audit.is_file() and b'"event_type":"security_audit"' in audit.read_bytes()
+
+            with (home / "daemon-output").open("w+") as log:
+                with subprocess.Popen([server], cwd=home, env=mode, stdout=log, stderr=subprocess.STDOUT,
+                                      stdin=subprocess.DEVNULL, **ordinary) as process:
+                    try:
+                        wait_for(lambda: (run / "omg.status").exists()
+                                 and (data / "status-cache.json").exists() and scan_written(), process)
+                        assert stat.S_ISSOCK((run / "omg.sock").stat().st_mode)
+                        result = command([cli, "metrics"], mode, ordinary)
+                        record(layout, "live-daemon", result, result.returncode == 0
+                               and re.search(r"(?m)^omg_requests_total [0-9]+$", result.stdout) is not None)
+                    except Exception as error:
+                        log.seek(0)
+                        raise AssertionError((layout, log.read()[-2500:])) from error
+                    finally:
+                        if process.poll() is None:
+                            process.send_signal(signal.SIGTERM)
+                            try:
+                                process.wait(8)
+                            except subprocess.TimeoutExpired:
+                                process.kill()
+                                process.wait(4)
+                log.seek(0)
+                assert process.returncode == 0, (layout, process.returncode, log.read()[-2500:])
+
+            quarantined = sorted(directory.glob("audit.jsonl.corrupt-*"))
+            active_bytes = audit.read_bytes()
+            active_rows = [json.loads(row) for row in active_bytes.splitlines()]
+            if needs_recovery:
+                assert len(quarantined) == 1 and quarantined[0].read_bytes() == before
+                assert marker.is_file() and stat.S_IMODE(marker.stat().st_mode) == 0o600
+                if original_marker is not None:
+                    assert marker.read_bytes() == original_marker
+            else:
+                assert not quarantined and not marker.exists()
+            if layout == "healthy":
+                assert active_bytes.startswith(before) and active_rows[:2] == entries
+                scans = active_rows[2:]
+            else:
+                assert active_rows[0]["prev_hash"] == "genesis"
+                scans = active_rows
+            assert scans and all(row["event_type"] == "security_audit" for row in scans)
+            assert (archive.read_bytes() if archive.exists() else None) == original_archive
+
+            result = command([cli, "audit", "verify"], direct, ordinary)
+            verify_ok = (result.returncode == 1 and "Audit collection is incomplete" in result.stderr
+                         if needs_recovery else verified(result, len(active_rows) + (2 if with_archive else 0)))
+            record(layout, "verify-recovered", result, verify_ok)
+            result = command([cli, "audit", "log", "--limit", "1"], direct, ordinary)
+            record(layout, "read-recovered", result, result.returncode == 0
+                   and active_rows[-1]["description"] in result.stdout and "SecurityAudit" in result.stdout)
+            export = home / "audit.json"
+            result = command([cli, "audit", "log", "--limit", "1", "--export", export], direct, ordinary)
+            record(layout, "export-recovered", result, result.returncode == 0 and export.is_file()
+                   and stat.S_IMODE(export.stat().st_mode) == 0o600
+                   and json.loads(export.read_text()) == active_rows[-1:])
+
     def inspect_audit_record_windows():
         phases = ("short", "large", "long-record", "crlf", "separator-window", "missing-hash")
         cases = (
@@ -1865,6 +1985,7 @@ exec {shlex.quote(str(binary))} "$@"
                     inspect_audit_log_selection()
                     inspect_audit_marker_snapshot()
                     inspect_audit_record_windows()
+                    inspect_daemon_audit_recovery()
                 config.write_text(alternate_config)
                 refresh_fixture()
                 expected = ordinary_control([dnf, "--cacheonly", "repoquery",
@@ -2182,6 +2303,6 @@ assert inventory() == before
 report = dict(binaries=binaries, checks=checks, total=len(checks),
               passed=sum(entry["passed"] for entry in checks), host_unchanged=True)
 print(json.dumps(report))
-expected_checks = 303 if consent_oracle is None else 870
+expected_checks = 303 if consent_oracle is None else 906
 if report["passed"] != report["total"] or report["total"] != expected_checks:
     sys.exit(4)

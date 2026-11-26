@@ -13,6 +13,10 @@ use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -1036,8 +1040,33 @@ static AUDIT_LOGGER: std::sync::LazyLock<std::sync::Mutex<Option<AuditLogger>>> 
     std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
 // Queue overflow must find the active collection without waiting for the
 // writer's logger mutex, which can be held through file locking and fsync.
-static AUDIT_INCOMPLETE_MARKER: std::sync::LazyLock<std::sync::RwLock<Option<PathBuf>>> =
-    std::sync::LazyLock::new(|| std::sync::RwLock::new(None));
+static AUDIT_INCOMPLETE_MARKER: std::sync::LazyLock<
+    std::sync::RwLock<Option<Arc<AuditIncompleteMarker>>>,
+> = std::sync::LazyLock::new(|| std::sync::RwLock::new(None));
+
+struct AuditIncompleteMarker {
+    path: PathBuf,
+    synced: AtomicBool,
+}
+
+impl AuditIncompleteMarker {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            synced: AtomicBool::new(false),
+        }
+    }
+
+    fn persist(&self) -> io::Result<()> {
+        if self.synced.load(Ordering::Acquire) && self.path.symlink_metadata().is_ok() {
+            return Ok(());
+        }
+        self.synced.store(false, Ordering::Release);
+        mark_audit_incomplete_at(&self.path)?;
+        self.synced.store(true, Ordering::Release);
+        Ok(())
+    }
+}
 
 const AUDIT_QUEUE_CAPACITY: usize = 1024;
 
@@ -1121,9 +1150,11 @@ fn recover_audit_logger(log_path: &Path) -> Result<AuditLogger, AuditError> {
                     path: marker.display().to_string(),
                     source,
                 })?;
-                sync_audit_directory(parent)?;
                 let quarantined = quarantine_corrupt_audit_log(log_path)?;
-                sync_audit_directory(parent)?;
+                sync_audit_directory(parent).map_err(|source| AuditError::Write {
+                    path: parent.display().to_string(),
+                    source,
+                })?;
                 let logger = AuditLogger::new_in_with_limits_unlocked(
                     log_path,
                     DEFAULT_MAX_AUDIT_BYTES,
@@ -1159,19 +1190,16 @@ fn recover_audit_logger(log_path: &Path) -> Result<AuditLogger, AuditError> {
 
 // Directory fsync persists the marker name and quarantine rename on Unix.
 // Windows does not support opening a directory with File::open for fsync.
-fn sync_audit_directory(path: &Path) -> Result<(), AuditError> {
+fn sync_audit_directory(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
-        File::open(path)
-            .and_then(|directory| directory.sync_all())
-            .map_err(|source| AuditError::Write {
-                path: path.display().to_string(),
-                source,
-            })?;
+        File::open(path)?.sync_all()
     }
     #[cfg(not(unix))]
-    let _ = path;
-    Ok(())
+    {
+        let _ = path;
+        Ok(())
+    }
 }
 
 /// Open the global audit logger before accepting daemon requests.
@@ -1185,13 +1213,11 @@ pub fn init_audit_logger() -> Result<(), AuditError> {
 /// Isolated daemon state must not recover an ambient process data directory.
 pub(crate) fn init_audit_logger_in(log_path: impl AsRef<Path>) -> Result<(), AuditError> {
     let logger = recover_audit_logger(log_path.as_ref())?;
-    let marker = logger.log_path.with_file_name("incomplete");
-    *AUDIT_LOGGER
+    let mut guard = AUDIT_LOGGER
         .lock()
-        .map_err(|_| AuditError::LoggerPoisoned)? = Some(logger);
-    *AUDIT_INCOMPLETE_MARKER
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(marker);
+        .map_err(|_| AuditError::LoggerPoisoned)?;
+    remember_audit_marker(&logger);
+    *guard = Some(logger);
     Ok(())
 }
 
@@ -1222,7 +1248,9 @@ fn record_global(
                 *guard = Some(logger);
             }
             Err(error) => {
-                mark_audit_incomplete_at_or_log(&log_path.with_file_name("incomplete"));
+                report_loss_marker_failure(mark_audit_incomplete_at(
+                    &log_path.with_file_name("incomplete"),
+                ));
                 let error = tracing_safe_audit_text(&error.to_string());
                 tracing::warn!(
                     "Audit logger unavailable, dropping event {event} for {safe_resource}: {error}"
@@ -1232,21 +1260,22 @@ fn record_global(
         }
     }
     let Some(logger) = guard.as_mut() else {
-        mark_audit_incomplete_at_or_log(&paths::data_dir().join("audit/incomplete"));
+        report_loss_marker_failure(mark_audit_incomplete_at(
+            &paths::data_dir().join("audit/incomplete"),
+        ));
         return;
     };
     if let Err(error) = logger.log(event, severity, resource, description) {
-        mark_audit_incomplete_at_or_log(&logger.log_path.with_file_name("incomplete"));
+        mark_audit_incomplete();
         let error = tracing_safe_audit_text(&error.to_string());
         tracing::warn!("Failed to persist audit event {event} for {safe_resource}: {error}");
     }
 }
 
-/// Queue an audit event without performing filesystem I/O on the caller.
+/// Queue an audit event for the writer thread.
 ///
-/// The bounded queue deliberately drops events after emitting a tracing error
-/// when saturated: untrusted daemon clients cannot create unbounded memory or
-/// blocked-task growth by flooding the audit path.
+/// The bounded queue drops events when saturated. A dropped event triggers
+/// synchronous recording of the loss marker and a tracing error.
 pub fn audit_log_nonblocking(
     event: AuditEventType,
     severity: AuditSeverity,
@@ -2769,44 +2798,50 @@ fn mark_audit_incomplete() {
         let guard = AUDIT_INCOMPLETE_MARKER
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        guard
-            .as_ref()
-            .cloned()
-            .unwrap_or_else(|| paths::data_dir().join("audit/incomplete"))
+        guard.as_ref().cloned()
     };
-    mark_audit_incomplete_at_or_log(&marker);
+    let result = match marker {
+        Some(marker) => marker.persist(),
+        None => mark_audit_incomplete_at(&paths::data_dir().join("audit/incomplete")),
+    };
+    report_loss_marker_failure(result);
 }
 
 fn remember_audit_marker(logger: &AuditLogger) {
     *AUDIT_INCOMPLETE_MARKER
         .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) =
-        Some(logger.log_path.with_file_name("incomplete"));
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(
+        AuditIncompleteMarker::new(logger.log_path.with_file_name("incomplete")),
+    ));
 }
 
-fn mark_audit_incomplete_at_or_log(path: &Path) {
-    if let Err(error) = mark_audit_incomplete_at(path) {
+fn report_loss_marker_failure(result: io::Result<()>) {
+    if let Err(error) = result {
         let error = tracing_safe_audit_text(&error.to_string());
         tracing::error!("Cannot persist audit incompleteness marker: {error}");
     }
 }
 
 fn mark_audit_incomplete_at(path: &Path) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        paths::create_private_data_directory(parent)?;
-    }
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    paths::create_private_data_directory(parent)?;
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
     options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
-    match options.open(path) {
-        Ok(mut file) => {
-            file.write_all(b"Audit events were lost; this collection is incomplete.\n")?;
-            file.sync_all()
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
-        Err(error) => Err(error),
-    }
+    let file_result = match options.open(path) {
+        Ok(mut file) => file
+            .write_all(b"Audit events were lost; this collection is incomplete.\n")
+            .and_then(|()| file.sync_all()),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => return Err(error),
+    };
+    // Sync the name even if writing the marker text failed.
+    let directory_result = sync_audit_directory(parent);
+    file_result.and(directory_result)
 }
 
 #[cfg(test)]
@@ -3131,6 +3166,70 @@ mod completeness_tests {
             "invalid hashes must not be counted as verified legacy records"
         );
         assert_eq!(std::fs::read_to_string(&path)?, format!("{damaged}\n"));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn loss_marker_requires_a_synced_directory_even_when_it_already_exists() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        const NAME: &str = "core::security::audit::completeness_tests::loss_marker_requires_a_synced_directory_even_when_it_already_exists";
+        if crate::config::Settings::rerun_test_unprivileged(NAME)
+            || crate::core::testing::run_isolated_test(NAME)
+        {
+            return Ok(());
+        }
+        anyhow::ensure!(!crate::core::is_root(), "ordinary fixture user required");
+        let sandbox = tempfile::tempdir()?;
+        let directory = sandbox.path().join("audit");
+        std::fs::create_dir(&directory)?;
+        let marker = directory.join("incomplete");
+
+        // The directory permits creating a file, but cannot be opened for fsync.
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o300))?;
+        let first = super::mark_audit_incomplete_at(&marker);
+        let retry = super::mark_audit_incomplete_at(&marker);
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))?;
+
+        assert_eq!(
+            first.expect_err("marker directory sync must fail").kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            retry
+                .expect_err("an existing marker still needs directory sync")
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        let contents = std::fs::read(&marker)?;
+        let remembered = super::AuditIncompleteMarker::new(marker.clone());
+        remembered.persist()?;
+        assert_eq!(std::fs::read(&marker)?, contents);
+
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o300))?;
+        let cached = remembered.persist();
+        std::fs::remove_file(&marker)?;
+        let replacement = remembered.persist();
+        let replacement_retry = remembered.persist();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))?;
+
+        cached?;
+        assert_eq!(
+            replacement
+                .expect_err("a recreated marker must sync")
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            replacement_retry
+                .expect_err("failed sync must remain retryable")
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        remembered.persist()?;
+        assert_eq!(std::fs::read(&marker)?, contents);
+        assert!(super::ensure_complete_collection(&marker).is_err());
         Ok(())
     }
 
