@@ -810,6 +810,7 @@ impl DnfPackageManager {
             |comment| self.replay_removal_plan(plan, comment),
         )
         .await
+        .map(|_| ())
     }
 
     async fn replay_removal_plan(
@@ -855,12 +856,28 @@ impl DnfPackageManager {
             operation,
         )
         .await
+        .map(|_| ())
     }
     fn cached_update_args() -> Vec<String> {
         ["--setopt=cacheonly=metadata", "upgrade", "-y"]
             .into_iter()
             .map(str::to_owned)
             .collect()
+    }
+
+    /// Return the recorded package-change count when this caller owns history.
+    pub(crate) async fn update_with_history(
+        &self,
+        cached: bool,
+        history: Option<&crate::core::history::HistoryManager>,
+    ) -> Result<Option<usize>> {
+        let args = if cached {
+            Self::cached_update_args()
+        } else {
+            vec!["upgrade".to_owned(), "-y".to_owned()]
+        };
+        self.recorded_mutation(crate::core::history::TransactionType::Update, args, history)
+            .await
     }
 
     #[must_use]
@@ -1931,11 +1948,11 @@ impl DnfPackageManager {
                 ))?;
             let path = directory.path().join("transaction.json");
             let metadata = match path.symlink_metadata() {
-                // DNF returns before storing a manifest when the solver's
-                // transaction is empty. Other missing manifests are errors.
+                // DNF prints the empty-transaction line after any skipped packages.
                 Err(error)
                     if error.kind() == std::io::ErrorKind::NotFound
-                        && output.trim_ascii() == b"Nothing to do." =>
+                        && output.trim_ascii_end().rsplit(|&byte| byte == b'\n').next()
+                            == Some(b"Nothing to do.".as_slice()) =>
                 {
                     return Ok(None);
                 }
@@ -2661,7 +2678,7 @@ impl DnfPackageManager {
         kind: crate::core::history::TransactionType,
         args: Vec<String>,
         history: Option<&crate::core::history::HistoryManager>,
-    ) -> Result<()> {
+    ) -> Result<Option<usize>> {
         Self::record_native_mutation(kind, history, |comment| {
             let mut args = args;
             if let Some(comment) = comment {
@@ -2676,13 +2693,13 @@ impl DnfPackageManager {
         kind: crate::core::history::TransactionType,
         history: Option<&crate::core::history::HistoryManager>,
         operation: impl FnOnce(Option<String>) -> F,
-    ) -> Result<()>
+    ) -> Result<Option<usize>>
     where
         F: Future<Output = Result<()>>,
     {
         let Some(history) = history.filter(|_| !crate::core::privilege::parent_owns_history())
         else {
-            return operation(None).await;
+            return operation(None).await.map(|()| None);
         };
         let before = Self::native_history(None)
             .await?
@@ -2699,7 +2716,7 @@ impl DnfPackageManager {
         // Observing a non-terminal journal row must not initiate another
         // package mutation. A redo would need its own correlation and native
         // state proof, plus explicit confirmation/elevation/deadline policy.
-        Self::record_native_result(kind, history, operation, observed)
+        Self::record_native_result(kind, history, operation, observed).map(Some)
     }
 
     fn record_native_result(
@@ -2707,9 +2724,9 @@ impl DnfPackageManager {
         history: &crate::core::history::HistoryManager,
         operation: Result<()>,
         observed: Result<NativeOutcome>,
-    ) -> Result<()> {
+    ) -> Result<usize> {
         let persistence = match observed {
-            Ok(NativeOutcome::NoTransaction) if operation.is_ok() => Ok(()),
+            Ok(NativeOutcome::NoTransaction) if operation.is_ok() => Ok(0),
             Ok(NativeOutcome::NoTransaction | NativeOutcome::Failed) => history
                 .add_transaction(kind, Vec::new(), false)
                 .and_then(|()| {
@@ -2717,9 +2734,12 @@ impl DnfPackageManager {
                         operation.is_err(),
                         "DNF reported a failed journal transaction after command success"
                     );
-                    Ok(())
+                    Ok(0)
                 }),
-            Ok(NativeOutcome::Committed(changes)) => history.add_transaction(kind, changes, true),
+            Ok(NativeOutcome::Committed(changes)) => {
+                let count = changes.len();
+                history.add_transaction(kind, changes, true).map(|()| count)
+            }
             Ok(NativeOutcome::Interrupted {
                 id,
                 comment,
@@ -2734,8 +2754,8 @@ impl DnfPackageManager {
             Err(error) => Err(error),
         };
         match (operation, persistence) {
-            (Ok(()), Ok(())) => Ok(()),
-            (Err(error), Ok(())) => Err(error),
+            (Ok(()), Ok(count)) => Ok(count),
+            (Err(error), Ok(_)) => Err(error),
             (Ok(()), Err(error)) => {
                 Err(error.context("DNF operation succeeded but its history could not be recorded"))
             }
@@ -2982,6 +3002,7 @@ impl DnfPackageManager {
                     history,
                 )
                 .await
+                .map(|_| ())
             }
             DnfCleanup::PackageCache => {
                 self.execute_dnf(vec!["clean".to_owned(), "packages".to_owned()])
@@ -3171,7 +3192,9 @@ impl PackageManager for DnfPackageManager {
             }
             let mut args = vec![action.to_owned(), "-y".to_owned()];
             args.extend_from_slice(packages);
-            self.recorded_mutation(kind, args, history).await
+            self.recorded_mutation(kind, args, history)
+                .await
+                .map(|_| ())
         }))
     }
 
@@ -3180,12 +3203,7 @@ impl PackageManager for DnfPackageManager {
         history: Option<&'a crate::core::history::HistoryManager>,
     ) -> Option<Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>> {
         Some(Box::pin(async move {
-            self.recorded_mutation(
-                crate::core::history::TransactionType::Update,
-                Self::cached_update_args(),
-                history,
-            )
-            .await
+            self.update_with_history(true, history).await.map(|_| ())
         }))
     }
 
@@ -5130,13 +5148,16 @@ mod tests {
             new_version: None,
             source: "dnf".into(),
         }];
-        result(
-            TransactionType::Remove,
-            &history,
-            Ok(()),
-            Ok(NativeOutcome::NoTransaction),
-        )
-        .unwrap();
+        assert_eq!(
+            result(
+                TransactionType::Remove,
+                &history,
+                Ok(()),
+                Ok(NativeOutcome::NoTransaction),
+            )
+            .unwrap(),
+            0
+        );
         assert!(
             history.load().unwrap().is_empty(),
             "no-op must not invent history"
@@ -5189,6 +5210,15 @@ mod tests {
             2,
             "invalid journal must not invent changes"
         );
+        let count = result(
+            TransactionType::Update,
+            &history,
+            Ok(()),
+            Ok(NativeOutcome::Committed(committed_changes)),
+        )
+        .unwrap();
+        assert_eq!(count, history.load().unwrap()[2].changes.len());
+        assert_eq!(count, 1);
     }
 
     #[tokio::test]
@@ -5369,7 +5399,13 @@ mod tests {
     async fn stored_query_accepts_a_missing_manifest_only_for_native_noop() -> Result<()> {
         for (script, no_changes) in [
             ("printf 'Nothing to do.\\n'", true),
+            (
+                "printf 'Package Arch Version Repository Size\\nSkipping packages with broken dependencies:\\n package noarch 2-1 test 7 B\\n\\nNothing to do.\\n'",
+                true,
+            ),
             ("printf 'Preparing transaction\\n'", false),
+            ("printf 'Nothing to do.\\nPreparing transaction\\n'", false),
+            ("printf 'Warning: Nothing to do.\\n'", false),
             ("printf 'Nothing to do.\\n'; exit 1", false),
             (
                 "mkdir \"$1/transaction.json\"; printf 'Nothing to do.\\n'",

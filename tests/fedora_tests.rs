@@ -2188,17 +2188,32 @@ mod dnf_operations {
         let before = snapshot()?;
         let fixture = tempfile::tempdir_in(dirs::cache_dir().expect("user cache directory"))?;
         let history = HistoryManager::new_in(fixture.path().join("history.json"))?;
-        let update = || {
-            std::process::Command::new(assert_cmd::cargo::cargo_bin!("omg"))
+        let cli = assert_cmd::cargo::cargo_bin!("omg");
+        let update_args = ["update", "--yes"];
+        let prepare = |command: &mut std::process::Command| {
+            command
+                .env("OMG_NATIVE_TEST_DATA_DIR", "1")
                 .env("OMG_DATA_DIR", fixture.path())
-                .stdin(std::process::Stdio::null())
-                .args(["update", "--yes"])
-                .output()
+                .env("NO_COLOR", "1")
+                .stdin(std::process::Stdio::null());
         };
-        let applied = update()?;
+        let mut attended = std::process::Command::new("python3");
+        prepare(&mut attended);
+        let applied = attended
+            .arg(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/scripts/attend-unknown-fixture.py"
+            ))
+            .arg("--receipt")
+            .arg(fixture.path().join("update-review.json"))
+            .arg("--")
+            .arg(cli)
+            .args(update_args)
+            .output()?;
         anyhow::ensure!(
             applied.status.success(),
-            "Update failed: {}",
+            "Update failed: {}\n{}",
+            String::from_utf8_lossy(&applied.stdout),
             String::from_utf8_lossy(&applied.stderr)
         );
         let after = snapshot()?;
@@ -2212,6 +2227,15 @@ mod dnf_operations {
                 && records[0].success
                 && records[0].transaction_type == TransactionType::Update,
             "Expected one successful update record: {records:?}"
+        );
+        let count = records[0].changes.len();
+        let label = if count == 1 { "change" } else { "changes" };
+        let update_output = std::str::from_utf8(&applied.stdout)?;
+        assert!(
+            update_output.contains(&format!(
+                "System updated successfully · {count} package {label}"
+            )),
+            "{update_output}"
         );
         let mut removed: Vec<_> = before
             .difference(&after)
@@ -2259,12 +2283,15 @@ mod dnf_operations {
             added.len()
         );
         println!("OMG update record: {}", serde_json::to_string(&records)?);
-        let noop = update()?;
+        let mut command = std::process::Command::new(cli);
+        prepare(&mut command);
+        let noop = command.args(update_args).output()?;
         anyhow::ensure!(
             noop.status.success(),
             "No-op update failed: {}",
             String::from_utf8_lossy(&noop.stderr)
         );
+        assert!(!std::str::from_utf8(&noop.stdout)?.contains("System updated successfully"));
         anyhow::ensure!(
             snapshot()? == after && history.load()?.len() == 1,
             "No-op update changed package state or invented history"
