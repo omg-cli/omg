@@ -39,8 +39,26 @@ env:
   RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
 
 jobs:
+  scope:
+    name: Distro E2E scope
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      required: ${{ steps.changes.outputs.required }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+      - name: Inspect push scope
+        id: changes
+        run: python3 scripts/ci-change-scope.py --distro-e2e
+
   container-e2e:
     name: "Distro E2E (${{ matrix.distro }} / ${{ matrix.arch }})"
+    needs: scope
+    if: ${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.required != 'false') }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 25
     container:
@@ -189,6 +207,8 @@ jobs:
 
   systemd-daemon-e2e:
     name: "Native systemd + daemon E2E (Ubuntu x86_64)"
+    needs: scope
+    if: ${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.required != 'false') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
