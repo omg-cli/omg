@@ -302,7 +302,12 @@ for apt_distro in debian ubuntu; do
   grep -Fxq 'OMG_PROBE_INDEX_CMD=apt-cache show tree >/dev/null' "$FAKE_ENGINE_ARGS" || fail 'APT cases fetched metadata instead of checking the seeded index'
   apt_recipe="$(dirname "$apt_results")/$apt_distro-cache-seed.Dockerfile"
   grep -q "^FROM $image_tag@sha256:" "$apt_recipe" || fail 'APT 7 used the wrong host image'
-  grep -Fq 'apt-get "$@" update --error-on=any' "$apt_recipe" || fail 'APT metadata seed accepted a partial refresh'
+  if [[ "$apt_distro" == ubuntu ]]; then
+    grep -Fq 'RUN bash /tmp/omg-ubuntu-apt-setup.sh' "$apt_recipe" || fail 'Ubuntu skipped the signed mirror fallback'
+    cmp "$repo_root/.github/actions/ubuntu-apt/setup.sh" "$(dirname "$apt_results")/ubuntu-cache-seed-setup.sh" || fail 'Ubuntu did not preserve its exact archive setup script'
+  else
+    grep -Fq 'apt-get "$@" update --error-on=any' "$apt_recipe" || fail 'APT metadata seed accepted a partial refresh'
+  fi
   export FAKE_RUN_EXIT=1
   assert_rc 1 "$runner" --release v9.9.9 --distro "$apt_distro" --apt-abi 7 \
     --case release-package-search-tree --container-engine fake-engine \

@@ -650,12 +650,24 @@ RUN dnf install -y --setopt=install_weak_deps=False python3
 RUN dnf makecache --refresh
 DOCKERFILE
       ;;
-    debian|ubuntu)
+    debian)
       build_timeout=240
       cat >> "$recipe" <<'DOCKERFILE' || return 1
 RUN set -- -o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 \
  && apt-get "$@" update --error-on=any \
  && DEBIAN_FRONTEND=noninteractive apt-get "$@" install -y --no-install-recommends ca-certificates python3 \
+ && apt-cache show tree >/dev/null
+DOCKERFILE
+      ;;
+    ubuntu)
+      build_timeout=480
+      cp "$repo_root/.github/actions/ubuntu-apt/setup.sh" "$context/setup-ubuntu-apt.sh" || return 1
+      cp "$context/setup-ubuntu-apt.sh" "$run_evidence/$seed-setup.sh" || return 1
+      cat >> "$recipe" <<'DOCKERFILE' || return 1
+COPY setup-ubuntu-apt.sh /tmp/omg-ubuntu-apt-setup.sh
+RUN bash /tmp/omg-ubuntu-apt-setup.sh \
+ && rm /tmp/omg-ubuntu-apt-setup.sh \
+ && DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=2 -o Acquire::https::Timeout=30 install -y --no-install-recommends python3 \
  && apt-cache show tree >/dev/null
 DOCKERFILE
       ;;
