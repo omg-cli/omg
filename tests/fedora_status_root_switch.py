@@ -2242,13 +2242,13 @@ standalone.chmod(0o755)
             notice = struct.Struct("iIII")
 
             def run(label, executable, chosen, expected, *, pins=(), path=(), venv=None,
-                    ancestor=False, mise=False, raw_path=False, no_path=False):
+                    ancestor=False, mise=False, raw_path=False, no_path=False, pin_request=None):
                 folder = here / label
                 folder.mkdir()
                 project = folder / "project" if ancestor else folder
                 project.mkdir(exist_ok=True)
                 for name in pins:
-                    (folder / f".{name}-version").write_text(runtimes[name][0] + "\n")
+                    (folder / f".{name}-version").write_text((pin_request or runtimes[name][0]) + "\n")
                 if venv:
                     venv_home = project / ".venv"
                     (venv_home / "bin").mkdir(parents=True)
@@ -2260,8 +2260,8 @@ standalone.chmod(0o755)
                     else:
                         entry.symlink_to(interpreter)
                 if mise:
-                    (project / "mise.toml").write_text("""[tasks.fixture]
-run = 'node "$@"'
+                    (project / "mise.toml").write_text(f"""[tasks.fixture]
+run = '{chosen} "$@"'
 """)
 
                 path_values = [str(bins[name]) for name in path] + [str(here/"bin"), base_env["PATH"]]
@@ -2310,7 +2310,7 @@ run = 'node "$@"'
             for name, (_, executable, _) in runtimes.items():
                 run(f"{name}-selected", executable, name, {name: 3}, pins=(name,))
                 run(f"{name}-path-only", executable, name, {name: 3}, path=(name,))
-                run(f"{name}-selected-and-on-path", executable, name, {name: 6 if name in ("node", "bun") else 3},
+                run(f"{name}-selected-and-on-path", executable, name, {name: 3},
                     pins=(name,), path=(name,))
                 run(f"{name}-ordinary-task", "fixture-task-tool", "ordinary", {name: 3}, pins=(name,))
             run("nodejs-alias", "nodejs", "node", {"node": 3}, pins=("node",))
@@ -2333,6 +2333,26 @@ run = 'node "$@"'
             run("runtime-in-mise-task", "fixture", "node", {"node": 3}, pins=("node",), mise=True)
             run("managed-runtime-opaque-path", "node", "node", {"node": 3}, pins=("node",), raw_path=True)
             run("managed-runtime-initially-unset-path", "node", "node", {"node": 3}, pins=("node",), no_path=True)
+
+            phase = "task-runtime-admission-probes"
+            for name in ("node", "bun"):
+                version, executable, _ = runtimes[name]
+                major, minor, _ = version.split(".")
+                for spelling, request in (
+                    ("exact", version),
+                    ("v-prefixed", f"v{version}"),
+                    ("minor", f"{major}.{minor}"),
+                    ("caret", f"^{major}.{minor}.0"),
+                ):
+                    cases = (
+                        ("direct-with-path", executable, name, (name,), False),
+                        ("ordinary-with-path", "fixture-task-tool", "ordinary", (name,), False),
+                        ("mise-with-path", "fixture", name, (name,), True),
+                        ("selected-only", executable, name, (), False),
+                    )
+                    for mode, command, output, path, mise in cases:
+                        run(f"{name}-{spelling}-{mode}", command, output, {name: 3},
+                            pins=(name,), path=path, mise=mise, pin_request=request)
 
 
     def inspect_task_environment_bytes():
@@ -5354,6 +5374,6 @@ assert inventory() == before
 report = dict(binaries=binaries, checks=checks, total=len(checks),
               passed=sum(entry["passed"] for entry in checks), host_unchanged=True)
 print(json.dumps(report))
-expected_checks = 303 if consent_oracle is None else 1674
+expected_checks = 303 if consent_oracle is None else 1706
 if report["passed"] != report["total"] or report["total"] != expected_checks:
     sys.exit(4)

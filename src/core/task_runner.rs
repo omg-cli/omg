@@ -1398,26 +1398,20 @@ fn find_rust_toolchain_file(start: &Path) -> Option<PathBuf> {
 
 fn ensure_node_runtime(version: &str) -> Result<String> {
     let normalized = version.trim_start_matches('v');
-
-    // A system executable is usable only when its reported version satisfies
-    // the project pin. Merely finding `node` used to bypass the pin entirely.
-    if system_runtime_satisfies("node", normalized) {
-        return Ok(normalized.to_string());
-    }
-
-    // Check OMG-managed Node
     let node_manager = NodeManager::new();
     let installed = node_manager
         .list_installed()
         .context("Failed to list installed Node.js versions")?;
+    // Task PATH selection prefers a matching managed installation. Consult
+    // the ambient runtime only when that inventory cannot satisfy the pin.
     if installed
         .iter()
         .any(|installed_version| runtime_version_satisfies(installed_version, normalized))
+        || system_runtime_satisfies("node", normalized)
     {
         return Ok(normalized.to_string());
     }
 
-    // Check nvm-managed Node
     if let Some(nvm_version) = nvm_resolve_version(normalized)? {
         return Ok(nvm_version);
     }
@@ -1434,14 +1428,6 @@ fn ensure_node_runtime(version: &str) -> Result<String> {
 
 fn ensure_bun_runtime(version: &str) -> Result<String> {
     let normalized = version.trim_start_matches('v');
-
-    // Check the executable's version instead of treating any Bun on PATH as
-    // a match for the project's pin.
-    if system_runtime_satisfies("bun", normalized) {
-        return Ok(normalized.to_string());
-    }
-
-    // Check OMG-managed Bun
     let bun_manager = BunManager::new();
     let installed = bun_manager
         .list_installed()
@@ -1449,6 +1435,7 @@ fn ensure_bun_runtime(version: &str) -> Result<String> {
     if installed
         .iter()
         .any(|installed_version| runtime_version_satisfies(installed_version, normalized))
+        || system_runtime_satisfies("bun", normalized)
     {
         return Ok(normalized.to_string());
     }
