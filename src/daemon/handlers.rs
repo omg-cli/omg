@@ -848,13 +848,30 @@ pub async fn handle_request(state: Arc<DaemonState>, request: Request) -> Respon
         };
     }
 
-    if let Request::Search { query, .. } | Request::Suggest { query, .. } = &request {
+    if let Request::Search { id, query, .. } | Request::Suggest { id, query, .. } = &request {
         if query.len() > MAX_QUERY_LENGTH {
             let message = match &request {
                 Request::Suggest { .. } => "Query too long".to_string(),
                 _ => format!("Query too long (max {MAX_QUERY_LENGTH} characters)"),
             };
             return validation_error(request.id(), message);
+        }
+        // These responses are independent of the installed and repository catalogs.
+        let empty_result = match &request {
+            Request::Search { .. } if query.is_empty() => {
+                GLOBAL_METRICS.inc_search_requests();
+                Some(ResponseResult::Search(SearchResult {
+                    packages: Vec::new(),
+                    total: 0,
+                }))
+            }
+            Request::Suggest { limit, .. } if query.is_empty() || *limit == Some(0) => {
+                Some(ResponseResult::Suggest(Vec::new()))
+            }
+            _ => None,
+        };
+        if let Some(result) = empty_result {
+            return Response::Success { id: *id, result };
         }
         if let Err(error) = state.heal_rpm_index_if_changed().await {
             return internal_error(
@@ -2685,6 +2702,41 @@ pub(super) mod tests {
                 ..
             }
         ));
+        let Response::Success {
+            result: ResponseResult::Search(empty),
+            ..
+        } = handle_request(
+            Arc::clone(&state),
+            Request::Search {
+                id: 4,
+                query: String::new(),
+                limit: None,
+            },
+        )
+        .await
+        else {
+            panic!("empty search should succeed without reading the package catalog");
+        };
+        assert_eq!(empty.total, 0);
+        assert!(empty.packages.is_empty());
+        for (query, limit) in [("", None), ("retired", Some(0))] {
+            let Response::Success {
+                result: ResponseResult::Suggest(empty),
+                ..
+            } = handle_request(
+                Arc::clone(&state),
+                Request::Suggest {
+                    id: 5,
+                    query: query.into(),
+                    limit,
+                },
+            )
+            .await
+            else {
+                panic!("empty suggestions should succeed without reading the package catalog");
+            };
+            assert!(empty.is_empty());
+        }
         for request in [
             Request::Search {
                 id: 2,
