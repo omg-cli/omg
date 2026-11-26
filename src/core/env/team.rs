@@ -365,14 +365,12 @@ impl TeamWorkspace {
 
         // Load team lock if exists
         let lock_path = self.root.join("omg.lock");
-        let lock_hash = if lock_path.exists() {
+        let (in_sync, lock_hash) = if lock_path.exists() {
             let lock = EnvironmentState::load(&lock_path)?;
-            lock.hash
+            (current_env.matches_inventory(&lock), lock.hash)
         } else {
-            String::new()
+            (true, String::new())
         };
-
-        let in_sync = lock_hash.is_empty() || current_env.hash == lock_hash;
 
         let member = TeamMember {
             id: config.member_id.clone(),

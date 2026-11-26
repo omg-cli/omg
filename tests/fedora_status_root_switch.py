@@ -705,6 +705,151 @@ exec {shlex.quote(str(native_executable))} "$@"
 
 
 
+    def inspect_environment_lockfiles():
+        phase = "environment-lockfiles"
+        with tempfile.TemporaryDirectory(prefix="environment-locks-", dir=work) as directory:
+            here = Path(directory)
+            os.chown(here, account.pw_uid, account.pw_gid)
+            isolated = dict(disabled, HOME=str(here), XDG_DATA_HOME=str(here/"data"),
+                            XDG_CONFIG_HOME=str(here/"config"), XDG_CACHE_HOME=str(here/"cache"),
+                            XDG_STATE_HOME=str(here/"state"))
+            lock = here / "omg.lock"
+            native = sorted(set(checked([dnf, "--cacheonly", "--setopt=disable_excludes=*",
+                                         "repoquery", "--userinstalled", "--qf", r"%{name}\n"],
+                                        isolated, ordinary).splitlines()))
+            assert len(native) >= 2
+
+            def checksum(packages, runtimes):
+                canonical = "".join(f"{name}:{version};" for name, version in sorted(runtimes.items()))
+                canonical += "".join(f"{name};" for name in sorted({p.strip() for p in packages if p.strip()}))
+                return hashlib.sha256(canonical.encode()).hexdigest()
+
+            def body(packages, runtimes=None, schema="1", digest=None, timestamp=1_700_000_000):
+                runtimes = runtimes or {}
+                digest = digest if digest is not None else checksum(packages, runtimes)
+                prefix = "" if schema is None else f"schema_version = {schema}\n"
+                rows = [f"packages = {json.dumps(packages, ensure_ascii=False)}",
+                        f"timestamp = {timestamp}", f"hash = {json.dumps(digest)}", "[runtimes]"]
+                rows.extend(f"{json.dumps(name)} = {json.dumps(version)}" for name, version in runtimes.items())
+                return prefix + "\n".join((*rows, ""))
+
+            def run(label, args, markers=(), *, fails=False, inspect=None, forbidden=()):
+                result = command([cli, *args], isolated, ordinary)
+                text = result.stdout + result.stderr
+                try:
+                    matches = (
+                        (result.returncode != 0) == fails
+                        and all(marker in text for marker in markers)
+                        and all(marker not in text for marker in forbidden)
+                        and (inspect is None or inspect(result))
+                    )
+                except (OSError, ValueError, KeyError, TypeError):
+                    matches = False
+                checks.append(dict(phase=phase, case=label, passed=matches, status=result.returncode,
+                                   diagnostic=text[-1200:]))
+
+            def captured(_):
+                state = tomllib.loads(lock.read_text())
+                return (state["schema_version"] == 1 and state["packages"] == native
+                        and state["hash"] == checksum(state["packages"], state["runtimes"])
+                        and lock.stat().st_mode & 0o777 == 0o600)
+
+            def exported(result):
+                state = tomllib.loads(result.stdout)["environment"]
+                return (state["schema_version"] == 1
+                        and state["packages"]["fedora-x86_64"] == {name: name for name in native})
+
+            def team_state(in_sync):
+                status = json.loads((here/".omg/team-status.json").read_text())
+                member, = status["members"]
+                return (member["in_sync"] == in_sync and
+                        (member["drift_summary"] is None) == in_sync)
+
+            run("capture", ("env", "capture"), ("Environment state captured",), inspect=captured)
+            original = lock.read_text()
+            original_hash = tomllib.loads(original)["hash"]
+            run("check-capture", ("env", "check"), ("Environment is in sync",))
+            run("ci-capture", ("ci", "validate"), ("Environment matches omg.lock",))
+            run("export-capture", ("env", "export", "--source-target", "fedora-x86_64"), inspect=exported)
+            run("diff-current", ("diff", "omg.lock"), ("Environments are identical",))
+            run("diff-self", ("diff", "--from", "omg.lock", "omg.lock"), ("Environments are identical",))
+            run("recapture", ("env", "capture"), ("Environment state captured",),
+                inspect=lambda result: captured(result) and tomllib.loads(lock.read_text())["hash"] == original_hash)
+
+            runtimes = tomllib.loads(original)["runtimes"]
+            legacy = body(native, runtimes, schema=None)
+            lock.write_text(legacy)
+            run("check-unversioned", ("env", "check"), ("Environment is in sync",))
+            run("ci-unversioned", ("ci", "validate"), ("Environment matches omg.lock",))
+            (here/"captured.lock").write_text(original)
+            run("diff-unversioned", ("diff", "--from", "omg.lock", "captured.lock"), ("Environments are identical",))
+            reordered = body([" " + item + " " for item in reversed(native)] + [native[0]], runtimes)
+            lock.write_text(reordered)
+            run("check-normalized", ("env", "check"), ("Environment is in sync",))
+            run("ci-normalized", ("ci", "validate"), ("Environment matches omg.lock",))
+
+            lock.write_text(body([*native, "fixture-expected-package"], runtimes))
+            run("ci-real-drift", ("ci", "validate"), ("Environment drift detected",), fails=True)
+            run("check-real-drift", ("env", "check"), ("Environment drift detected", "fixture-expected-package"),
+                fails=True)
+            lock.write_text(original)
+            run("team-init", ("team", "init", "fixture/fedora"), ("fixture/fedora",),
+                inspect=lambda _: (here/".omg/team.toml").is_file())
+            run("team-matches", ("team", "status"), inspect=lambda _: team_state(True))
+
+            (here/"two.lock").write_text(body(["fixture-a", "fixture-b"]))
+            (here/"one.lock").write_text(body(["fixture-a;fixture-b"]))
+            run("diff-checksum-equal-inventories-differ", ("diff", "--from", "two.lock", "one.lock"),
+                ("Package differences", "1 packages added", "2 packages removed"),
+                forbidden=("Environments are identical",))
+            run("diff-checksum-equal-reversed", ("diff", "--from", "one.lock", "two.lock"),
+                ("Package differences", "2 packages added", "1 packages removed"),
+                forbidden=("Environments are identical",))
+            joined = [";".join(native[:2]), *native[2:]]
+            assert checksum(joined, runtimes) == original_hash
+            lock.write_text(body(joined, runtimes))
+            run("diff-checksum-equal-current", ("diff", "omg.lock"), ("Package differences",),
+                forbidden=("Environments are identical",))
+            run("ci-checksum-equal-current", ("ci", "validate"), ("Environment drift detected",), fails=True)
+            run("team-checksum-equal-current", ("team", "status"), inspect=lambda _: team_state(False))
+            run("check-checksum-equal-current", ("env", "check"), ("Environment drift detected",), fails=True)
+
+            (here/"runtime.lock").write_text(body([], {"fixture": "17"}))
+            (here/"native.lock").write_text(body(["fixture:17"]))
+            run("diff-checksum-equal-runtime-versus-package", ("diff", "--from", "runtime.lock", "native.lock"),
+                ("Runtime differences", "Package differences"), forbidden=("Environments are identical",))
+            (here/"plain.lock").write_text(body([]))
+            (here/"control.lock").write_text(body(["fixture-package\ncontinued"]))
+            run("diff-sanitizes-package-row", ("diff", "--from", "plain.lock", "control.lock"),
+                ("fixture-package", "continued"), forbidden=("fixture-package\ncontinued",))
+            (here/"control.lock").write_text(body([], {"fixture-runtime": "v1\ncontinued"}))
+            run("diff-sanitizes-runtime-row", ("diff", "--from", "plain.lock", "control.lock"),
+                ("fixture-runtime", "continued"), forbidden=("v1\ncontinued",))
+
+            lock.unlink()
+            run("missing-env", ("env", "check"), ("No omg.lock file found",), fails=True)
+            run("missing-ci", ("ci", "validate"), ("No omg.lock found",), fails=True)
+            run("missing-export", ("env", "export", "--source-target", "fedora-x86_64"),
+                ("Failed to inspect lockfile",), fails=True)
+            lock.write_text("packages = [\n")
+            run("invalid-toml", ("env", "check"), ("Failed to parse lockfile",), fails=True)
+            lock.write_bytes(b"\xff\xfe")
+            run("invalid-utf8", ("env", "check"), ("Lockfile is not UTF-8",), fails=True)
+            lock.write_text(body(native, runtimes, digest="0" * 64))
+            run("incorrect-checksum", ("env", "check"), ("Lockfile integrity check failed",), fails=True)
+            lock.write_text(body(native, runtimes, schema="99"))
+            run("future-schema", ("env", "check"), ("newer omg", "99"), fails=True)
+            lock.write_text("schema_version = 99\nfuture = true\n")
+            run("future-schema-different-layout", ("env", "check"), ("newer omg", "99"), fails=True)
+            lock.write_text(body(native, runtimes, schema='"1"'))
+            run("wrong-schema-type", ("env", "check"), ("Failed to parse lockfile",), fails=True)
+            lock.unlink()
+            lock.symlink_to("captured.lock")
+            run("symlink-lock", ("env", "check"), ("not a regular file",), fails=True)
+            lock.unlink()
+            lock.mkdir()
+            run("directory-lock", ("env", "check"), ("not a regular file",), fails=True)
+
     def inspect_artifact_signature_inputs():
         phase = "artifact-signature-inputs"
         identity_args = ("--certificate-identity", "signer@example.invalid")
@@ -2254,6 +2399,7 @@ exec {shlex.quote(str(binary))} "$@"
                     inspect_daemon_audit_recovery()
                     inspect_secret_scan()
                     inspect_artifact_signature_inputs()
+                    inspect_environment_lockfiles()
                 config.write_text(alternate_config)
                 refresh_fixture()
                 expected = ordinary_control([dnf, "--cacheonly", "repoquery",
@@ -2571,6 +2717,6 @@ assert inventory() == before
 report = dict(binaries=binaries, checks=checks, total=len(checks),
               passed=sum(entry["passed"] for entry in checks), host_unchanged=True)
 print(json.dumps(report))
-expected_checks = 303 if consent_oracle is None else 1011
+expected_checks = 303 if consent_oracle is None else 1047
 if report["passed"] != report["total"] or report["total"] != expected_checks:
     sys.exit(4)

@@ -40,7 +40,7 @@ pub async fn run(from: Option<&str>, to: &str) -> Result<()> {
 
     println!();
 
-    if from_state.hash == to_state.hash {
+    if from_state.matches_inventory(&to_state) {
         println!(
             "  {} Environments are identical!",
             style::maybe_color("✓", |t| t.green().to_string())
@@ -79,7 +79,7 @@ pub async fn run(from: Option<&str>, to: &str) -> Result<()> {
                 println!(
                     "      {} {}",
                     style::maybe_color("+", |t| t.green().to_string()),
-                    pkg
+                    style::sanitize_terminal_text(pkg)
                 );
             }
             if package_diff.added.len() > 10 {
@@ -97,7 +97,7 @@ pub async fn run(from: Option<&str>, to: &str) -> Result<()> {
                 println!(
                     "      {} {}",
                     style::maybe_color("-", |t| t.red().to_string()),
-                    pkg
+                    style::sanitize_terminal_text(pkg)
                 );
             }
             if package_diff.removed.len() > 10 {
@@ -147,6 +147,7 @@ fn target_lockfile_hint(target: &str) -> String {
 
 fn diff_runtimes(from: &BTreeMap<String, String>, to: &BTreeMap<String, String>) -> Vec<String> {
     let mut changes = Vec::new();
+    let clean = style::sanitize_terminal_text;
 
     let all_runtimes: HashSet<_> = from.keys().chain(to.keys()).collect();
 
@@ -156,25 +157,25 @@ fn diff_runtimes(from: &BTreeMap<String, String>, to: &BTreeMap<String, String>)
             (Some(from_ver), Some(to_ver)) if from_ver != to_ver => {
                 changes.push(format!(
                     "{} {} → {}",
-                    style::path(runtime),
-                    style::dim(from_ver),
-                    style::version(to_ver)
+                    style::path(&clean(runtime)),
+                    style::dim(&clean(from_ver)),
+                    style::version(&clean(to_ver))
                 ));
             }
             (Some(from_ver), None) => {
                 changes.push(format!(
                     "{} {} → {}",
                     style::maybe_color("-", |t| t.red().to_string()),
-                    runtime,
-                    style::dim(&format!("(removed, was {from_ver})"))
+                    clean(runtime),
+                    style::dim(&format!("(removed, was {})", clean(from_ver)))
                 ));
             }
             (None, Some(to_ver)) => {
                 changes.push(format!(
                     "{} {} {}",
                     style::maybe_color("+", |t| t.green().to_string()),
-                    runtime,
-                    style::version(&format!("(added @ {to_ver})"))
+                    clean(runtime),
+                    style::version(&format!("(added @ {})", clean(to_ver)))
                 ));
             }
             _ => {}

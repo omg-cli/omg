@@ -44,10 +44,10 @@ pub async fn validate() -> Result<()> {
 
     let lock_path = std::path::Path::new("omg.lock");
     require_ci_lockfile(lock_path)?;
-    let state = crate::core::env::fingerprint::EnvironmentState::capture().await?;
     let lock = crate::core::env::fingerprint::EnvironmentState::load(lock_path)?;
+    let state = crate::core::env::fingerprint::EnvironmentState::capture().await?;
 
-    if state.hash == lock.hash {
+    if state.matches_inventory(&lock) {
         println!(
             "  {} Environment matches omg.lock",
             style::maybe_color("✓", |t| t.green().to_string())

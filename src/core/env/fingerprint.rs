@@ -6,7 +6,7 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::Path;
 use tokio::task;
@@ -98,6 +98,11 @@ impl EnvironmentState {
         hex::encode(hasher.finalize())
     }
 
+    /// Compare the normalized inventory from capture or load.
+    pub(crate) fn matches_inventory(&self, other: &Self) -> bool {
+        self.runtimes == other.runtimes && self.packages == other.packages
+    }
+
     /// Save state to omg.lock file
     pub fn save<P: AsRef<Path>>(&self, path: P) -> Result<()> {
         let mut normalized = self.clone();
@@ -118,60 +123,80 @@ impl EnvironmentState {
 
     /// Parse and verify lockfile content before it is persisted.
     pub fn parse_lockfile(content: &str) -> Result<Self> {
-        // Reject files written by a newer schema BEFORE parsing, so unknown
-        // future fields produce an actionable message instead of accidental
-        // best-effort deserialization.
-        if let Ok(raw) = toml::from_str::<toml::Value>(content) {
-            let file_version = raw
-                .get("schema_version")
-                .and_then(toml::Value::as_integer)
-                .unwrap_or_else(|| i64::from(Self::SCHEMA_VERSION));
-            if file_version > i64::from(Self::SCHEMA_VERSION) {
-                anyhow::bail!(
-                    "Lockfile was written by a newer omg (schema version {file_version}). \
-                     Upgrade omg to read it."
-                );
-            }
+        let parsed = toml::from_str::<Self>(content);
+        // A future schema can change field types or remove required fields.
+        // Read its version separately only when the typed parse fails.
+        let file_version = match &parsed {
+            Ok(state) => Some(i64::from(state.schema_version)),
+            Err(_) => toml::from_str::<toml::Value>(content)
+                .ok()
+                .and_then(|raw| raw.get("schema_version").and_then(toml::Value::as_integer)),
+        };
+        if let Some(file_version) = file_version
+            && file_version > i64::from(Self::SCHEMA_VERSION)
+        {
+            anyhow::bail!(
+                "Lockfile was written by a newer omg (schema version {file_version}). \
+                 Upgrade omg to read it."
+            );
         }
-        let mut state: Self = toml::from_str(content).context("Failed to parse lockfile")?;
-        // Corruption check, not authentication: the hash is recomputed from
-        // the same content, so anyone who can write the file can forge it.
-        // Trust comes from the transport (gist ownership, file ownership),
-        // never from this comparison.
-        let stored_hash = state.hash.clone();
+
+        let mut state = parsed.context("Failed to parse lockfile")?;
         state.normalize();
-        let calculated_hash = state.calculate_hash();
-        if stored_hash != calculated_hash {
-            anyhow::bail!("Lockfile integrity check failed: stored hash does not match contents");
-        }
-        state.hash = calculated_hash;
+        anyhow::ensure!(
+            state.hash == state.calculate_hash(),
+            "Lockfile integrity check failed: stored hash does not match contents"
+        );
         Ok(state)
     }
 
     fn normalize(&mut self) {
-        let (runtimes, packages) = self.normalized_parts();
-        self.runtimes = runtimes.into_iter().collect();
-        self.packages = packages;
-    }
-
-    fn normalized_parts(&self) -> (Vec<(String, String)>, Vec<String>) {
-        let mut runtimes: Vec<(String, String)> = self
+        if self
             .runtimes
             .iter()
-            .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
-            .collect();
-        runtimes.sort_by(|a, b| a.0.cmp(&b.0));
+            .any(|(name, version)| name.trim() != name || version.trim() != version)
+        {
+            self.runtimes = std::mem::take(&mut self.runtimes)
+                .into_iter()
+                .map(|(mut name, mut version)| {
+                    trim_owned(&mut name);
+                    trim_owned(&mut version);
+                    (name, version)
+                })
+                .collect();
+        }
+        self.packages.retain_mut(|package| {
+            trim_owned(package);
+            !package.is_empty()
+        });
+        self.packages.sort_unstable();
+        self.packages.dedup();
+    }
 
-        let mut packages: Vec<String> = self
+    fn normalized_parts(&self) -> (Vec<(&str, &str)>, Vec<&str>) {
+        let mut runtimes: Vec<_> = self
+            .runtimes
+            .iter()
+            .map(|(name, version)| (name.trim(), version.trim()))
+            .collect();
+        runtimes.sort_by_key(|(name, _)| *name);
+
+        let mut packages: Vec<_> = self
             .packages
             .iter()
-            .map(|pkg| pkg.trim().to_string())
-            .filter(|pkg| !pkg.is_empty())
+            .map(|package| package.trim())
+            .filter(|package| !package.is_empty())
             .collect();
         packages.sort_unstable();
         packages.dedup();
-
         (runtimes, packages)
+    }
+}
+
+fn trim_owned(value: &mut String) {
+    let trimmed = value.trim();
+    if trimmed.len() != value.len() {
+        *value = trimmed.to_owned();
     }
 }
 
@@ -343,19 +368,23 @@ impl DriftReport {
             }
         }
 
-        // Check packages
-        for pkg in &expected.packages {
-            if !actual.packages.contains(pkg) {
-                report.missing_packages.push(pkg.clone());
-                report.has_drift = true;
-            }
-        }
-
-        for pkg in &actual.packages {
-            if !expected.packages.contains(pkg) {
-                report.extra_packages.push(pkg.clone());
-                report.has_drift = true;
-            }
+        if expected.packages != actual.packages {
+            let expected_names: HashSet<_> = expected.packages.iter().map(String::as_str).collect();
+            let actual_names: HashSet<_> = actual.packages.iter().map(String::as_str).collect();
+            report.missing_packages = expected
+                .packages
+                .iter()
+                .filter(|package| !actual_names.contains(package.as_str()))
+                .cloned()
+                .collect();
+            report.extra_packages = actual
+                .packages
+                .iter()
+                .filter(|package| !expected_names.contains(package.as_str()))
+                .cloned()
+                .collect();
+            report.has_drift |=
+                !report.missing_packages.is_empty() || !report.extra_packages.is_empty();
         }
 
         report
@@ -470,6 +499,62 @@ mod tests {
             .join("\n"),
             crate::cli::style::positive("✓") + " No drift detected. Environment matches lockfile."
         );
+    }
+
+    #[test]
+    fn inventory_equality_does_not_depend_on_a_stored_checksum() {
+        let expected = EnvironmentState {
+            schema_version: EnvironmentState::SCHEMA_VERSION,
+            runtimes: BTreeMap::new(),
+            packages: vec!["fixture-first".into(), "fixture-second".into()],
+            timestamp: 0,
+            hash: "same-fixture-digest".into(),
+        };
+        let different = EnvironmentState {
+            packages: vec!["fixture-first".into()],
+            ..expected.clone()
+        };
+        assert!(!expected.matches_inventory(&different));
+        let recaptured = EnvironmentState {
+            timestamp: 1,
+            hash: "other-fixture-digest".into(),
+            ..expected.clone()
+        };
+        assert!(expected.matches_inventory(&recaptured));
+    }
+
+    #[test]
+    fn drift_comparison_preserves_order_and_membership() {
+        let expected = EnvironmentState {
+            schema_version: EnvironmentState::SCHEMA_VERSION,
+            runtimes: BTreeMap::new(),
+            packages: ["fixture-z", "common", "fixture-a", "fixture-z"]
+                .map(str::to_owned)
+                .to_vec(),
+            timestamp: 0,
+            hash: String::new(),
+        };
+        let actual = EnvironmentState {
+            packages: ["fixture-x", "fixture-b", "common"]
+                .map(str::to_owned)
+                .to_vec(),
+            ..expected.clone()
+        };
+        let drift = DriftReport::compare(&expected, &actual);
+        assert!(drift.has_drift);
+        assert_eq!(
+            drift.missing_packages,
+            ["fixture-z", "fixture-a", "fixture-z"]
+        );
+        assert_eq!(drift.extra_packages, ["fixture-x", "fixture-b"]);
+
+        let reordered = EnvironmentState {
+            packages: ["common", "fixture-a", "fixture-z"]
+                .map(str::to_owned)
+                .to_vec(),
+            ..expected.clone()
+        };
+        assert!(!DriftReport::compare(&expected, &reordered).has_drift);
     }
 
     #[test]
