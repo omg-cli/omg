@@ -7739,12 +7739,40 @@ env.OMG_FIXTURE_TASK = "changed"
         import pty
         import select
         import termios
+        from threading import Thread
 
         enter = b"\x1b[?1049h"
         leave = b"\x1b[?1049l"
         hide = b"\x1b[?25l"
         show = b"\x1b[?25h"
         report = b"\x1b[6n"
+        def read_frame(reader):
+            header = reader.read(4)
+            assert len(header) == 4, header
+            length = int.from_bytes(header, "big")
+            assert 0 < length <= 10 * 1024 * 1024, length
+            body = reader.read(length)
+            assert len(body) == length, (len(body), length)
+            return header + body
+
+        def relay_status(listener, upstream, events):
+            try:
+                for available in (True, False, True):
+                    with listener.accept()[0] as peer:
+                        peer.settimeout(8)
+                        with peer.makefile("rb") as reader:
+                            request = read_frame(reader)
+                        if available:
+                            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as daemon_stream:
+                                daemon_stream.settimeout(8)
+                                daemon_stream.connect(upstream)
+                                daemon_stream.sendall(request)
+                                with daemon_stream.makefile("rb") as reader:
+                                    peer.sendall(read_frame(reader))
+                        events.append("forwarded" if available else "closed-before-reply")
+            except (OSError, AssertionError) as error:
+                events.append(str(error))
+
         cases = (
             ("quit", (b"q",), 1, {}),
             ("interrupt", (b"\x03",), 1, {}),
@@ -7758,6 +7786,7 @@ env.OMG_FIXTURE_TASK = "changed"
             ("search-enter", (b"2", b"/", b"git\r", b"q"), 1, {2: b"Version control"}),
             ("search-replace", (b"2", b"/", b"vim-enhanced\r", b"/", b"git\r", b"\r", b"\x1b", b"q"), 1,
              {2: b"Text editor", 4: b"Version control", 5: b"Install git?"}),
+            ("daemon-transitions", (b"q",), 1, {}),
         )
         for label, keys, sessions, markers in cases:
             master, slave = pty.openpty()
@@ -7766,6 +7795,8 @@ env.OMG_FIXTURE_TASK = "changed"
             replies = 0
             observed = []
             attributes = None
+            transitions = []
+            relay_events = []
             before = termios.tcgetattr(slave)
 
             def attach_tty():
@@ -7791,12 +7822,45 @@ env.OMG_FIXTURE_TASK = "changed"
                 mode = dict(disabled, TERM="xterm-256color", OMG_NO_UPDATE_CHECK="1")
                 if label == "resume-after-error" or label.startswith("search-"):
                     mode.update(OMG_TEST_MODE="1", OMG_TEST_DISTRO="fedora")
-                with subprocess.Popen([str(cli), "dash"], cwd=work, env=mode, stdin=slave,
-                                      stdout=slave, stderr=slave, start_new_session=True,
-                                      preexec_fn=attach_tty, **ordinary) as process:
+                with ExitStack() as stack:
+                    if label == "daemon-transitions":
+                        upstream = env["OMG_SOCKET_PATH"]
+                        relay_path = Path(upstream).with_name("dashboard-forward.sock")
+                        listener = stack.enter_context(socket.socket(socket.AF_UNIX, socket.SOCK_STREAM))
+                        listener.bind(str(relay_path))
+                        stack.callback(relay_path.unlink)
+                        os.chmod(relay_path, 0o600)
+                        os.chown(relay_path, account.pw_uid, account.pw_gid)
+                        listener.listen()
+                        listener.settimeout(16)
+                        mode.pop("OMG_DISABLE_DAEMON")
+                        mode["OMG_SOCKET_PATH"] = str(relay_path)
+                    process = stack.enter_context(subprocess.Popen(
+                        [str(cli), "dash"], cwd=work, env=mode, stdin=slave,
+                        stdout=slave, stderr=slave, start_new_session=True,
+                        preexec_fn=attach_tty, **ordinary))
                     try:
                         read_terminal(time.monotonic() + 8,
                                       lambda: hide in output or process.poll() is not None)
+                        if label == "daemon-transitions":
+                            relay = Thread(target=relay_status, args=(listener, upstream, relay_events), daemon=True)
+                            relay.start()
+                            def observe(marker, offset, seconds=8):
+                                read_terminal(time.monotonic() + seconds,
+                                              lambda: marker in output[offset:] or process.poll() is not None)
+                                return output.find(marker, offset)
+
+                            live = observe(b"Connected", 0)
+                            lost = observe(b"Offline", live + len(b"Connected")) if live >= 0 else -1
+                            cleared = -1
+                            if lost >= 0 and process.poll() is None:
+                                offset = len(output)
+                                os.write(master, b"3")
+                                cleared = observe(b"Daemon status unavailable", offset, seconds=3)
+                                os.write(master, b"1")
+                            recovered = observe(b"Connected", len(output)) if lost >= 0 else -1
+                            transitions = [live >= 0, lost >= 0 and cleared >= 0, recovered >= 0]
+                            relay.join(timeout=4)
                         for index, key in enumerate(keys):
                             if process.poll() is not None:
                                 break
@@ -7839,6 +7903,13 @@ env.OMG_FIXTURE_TASK = "changed"
                 dict(phase="dashboard-terminal", case=f"{label}-cursor",
                      passed=last_exit >= 0 and restored.rfind(show) > restored.rfind(hide)),
             ))
+
+            if label == "daemon-transitions":
+                for index, state in enumerate(("live", "unavailable", "recovered")):
+                    checks.append(dict(phase="dashboard-terminal", case=f"{label}-{state}",
+                                       passed=index < len(transitions) and transitions[index]
+                                       and relay_events == ["forwarded", "closed-before-reply", "forwarded"],
+                                       value=relay_events, diagnostic=output[-2000:].decode(errors="replace")))
 
     def inspect_info_json_writes():
         cases = (
@@ -9113,6 +9184,6 @@ mark_progress("completed with host inventory unchanged")
 report = dict(binaries=binaries, checks=checks, total=len(checks),
               passed=sum(entry["passed"] for entry in checks), host_unchanged=True)
 print(json.dumps(report))
-expected_checks = 303 if consent_oracle is None else 2879
+expected_checks = 303 if consent_oracle is None else 2886
 if report["passed"] != report["total"] or report["total"] != expected_checks:
     sys.exit(4)

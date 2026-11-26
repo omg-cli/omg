@@ -63,11 +63,12 @@ fn truncate_width(text: &str, max_width: usize) -> Cow<'_, str> {
 /// Right-pad/truncate `text` to exactly `min_width` display columns.
 #[must_use]
 fn pad_display_width(text: &str, min_width: usize) -> Cow<'_, str> {
+    let text = truncate_width(text, min_width);
     let width = text.width();
-    if width >= min_width {
-        truncate_width(text, min_width)
-    } else {
+    if width < min_width {
         Cow::Owned(format!("{}{}", text, " ".repeat(min_width - width)))
+    } else {
+        text
     }
 }
 
@@ -408,67 +409,65 @@ fn draw_health_cards(f: &mut Frame, area: Rect, app: &App) {
         ])
         .split(area);
 
-    let total_packages = app.get_total_packages();
-    let updates = app.get_updates_available();
-    let orphans = app.get_orphan_packages();
+    let reported = app.status.is_some();
     let vulns = app.get_security_findings_summary();
 
-    // Packages card
-    if let Some(c) = cards.first() {
-        f.render_widget(
-            stat_card(
-                "Inventory",
-                "󰏗",
-                colors::ACCENT_BLUE,
-                total_packages.to_string(),
+    if let Some(card) = cards.first() {
+        let (value, color, caption) = if reported {
+            (
+                app.get_total_packages().to_string(),
                 colors::FG_PRIMARY,
                 "System Packages",
-            ),
-            *c,
+            )
+        } else {
+            ("—".to_owned(), colors::FG_MUTED, "Inventory unavailable")
+        };
+        f.render_widget(
+            stat_card("Inventory", "󰏗", colors::ACCENT_BLUE, value, color, caption),
+            *card,
         );
     }
 
-    // Updates card
-    if let Some(c) = cards.get(1) {
-        let color = if updates > 0 {
-            colors::ACCENT_YELLOW
-        } else {
-            colors::ACCENT_GREEN
-        };
-        f.render_widget(
-            stat_card(
-                "Maintainability",
-                if updates > 0 { "󰚰" } else { "󰄬" },
-                color,
+    if let Some(card) = cards.get(1) {
+        let updates = app.get_updates_available();
+        let (icon, color, value, caption) = if !reported {
+            ("󰚰", colors::FG_MUTED, "—".to_owned(), "Updates unavailable")
+        } else if updates == 0 {
+            (
+                "󰄬",
+                colors::ACCENT_GREEN,
                 updates.to_string(),
-                color,
-                if updates > 0 {
-                    "Updates Available"
-                } else {
-                    "System Up-to-date"
-                },
-            ),
-            *c,
+                "System Up-to-date",
+            )
+        } else {
+            (
+                "󰚰",
+                colors::ACCENT_YELLOW,
+                updates.to_string(),
+                "Updates Available",
+            )
+        };
+        f.render_widget(
+            stat_card("Maintainability", icon, color, value, color, caption),
+            *card,
         );
     }
 
-    // Orphans card
-    if let Some(c) = cards.get(2) {
-        let color = if orphans > 0 {
-            colors::ACCENT_ORANGE
-        } else {
-            colors::ACCENT_GREEN
-        };
-        f.render_widget(
-            stat_card(
-                "Hygiene",
-                if orphans > 0 { "󰃤" } else { "󰄬" },
-                color,
-                orphans.to_string(),
-                color,
+    if let Some(card) = cards.get(2) {
+        let orphans = app.get_orphan_packages();
+        let (icon, color, value, caption) = match (reported, orphans) {
+            (false, _) => ("󰃤", colors::FG_MUTED, "—".to_owned(), "Orphans unavailable"),
+            (true, 0) => ("󰄬", colors::ACCENT_GREEN, "0".to_owned(), "Orphan Packages"),
+            (true, count) => (
+                "󰃤",
+                colors::ACCENT_ORANGE,
+                count.to_string(),
                 "Orphan Packages",
             ),
-            *c,
+        };
+        f.render_widget(
+            stat_card("Hygiene", icon, color, value, color, caption),
+            *card,
         );
     }
 
@@ -564,8 +563,9 @@ fn draw_system_info(f: &mut Frame, area: Rect, app: &App) {
     // Disk info
     let disk_used_gb = app.system_metrics.disk_usage / 1024 / 1024;
     let disk_free_gb = app.system_metrics.disk_free / 1024 / 1024;
-    let disk_total = disk_used_gb + disk_free_gb;
-    let disk_percent = (disk_used_gb * 100).checked_div(disk_total).unwrap_or(0) as u16;
+    let used = u128::from(app.system_metrics.disk_usage);
+    let total = used + u128::from(app.system_metrics.disk_free);
+    let disk_percent = (used * 100).checked_div(total).unwrap_or(0);
 
     let disk_lines = vec![
         Line::from(""),
@@ -633,6 +633,7 @@ fn draw_system_info(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_quick_actions(f: &mut Frame, area: Rect, app: &App) {
+    let reported = app.status.is_some();
     let updates = app.get_updates_available();
     let orphans = app.get_orphan_packages();
 
@@ -645,7 +646,9 @@ fn draw_quick_actions(f: &mut Frame, area: Rect, app: &App) {
                     .fg(colors::ACCENT_YELLOW),
             ),
             Span::styled(" Update System", Style::default().fg(colors::FG_PRIMARY)),
-            if updates > 0 {
+            if !reported {
+                Span::raw("")
+            } else if updates > 0 {
                 Span::styled(
                     format!(" ({updates})"),
                     Style::default()
@@ -682,7 +685,9 @@ fn draw_quick_actions(f: &mut Frame, area: Rect, app: &App) {
                     .fg(colors::ACCENT_ORANGE),
             ),
             Span::styled(" Remove Orphans", Style::default().fg(colors::FG_PRIMARY)),
-            if orphans > 0 {
+            if !reported {
+                Span::raw("")
+            } else if orphans > 0 {
                 Span::styled(
                     format!(" ({orphans})"),
                     Style::default().fg(colors::ACCENT_ORANGE),
@@ -798,7 +803,7 @@ fn draw_packages(f: &mut Frame, area: Rect, app: &App) {
 
     if let Some(error) = &app.search_error {
         let error_panel = Paragraph::new(Line::from(Span::styled(
-            format!(" Search failed: {error}"),
+            format!(" Search failed: {}", sanitize_control_chars(error)),
             Style::default().fg(colors::ACCENT_RED),
         )))
         .block(styled_block(" Packages"))
@@ -927,7 +932,7 @@ fn draw_runtimes(f: &mut Frame, area: Rect, app: &App) {
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
-                    format!("{version:<15}"),
+                    format!("{:<15}", sanitize_control_chars(version)),
                     Style::default().fg(colors::ACCENT_GREEN),
                 ),
                 Span::styled("● Active", Style::default().fg(colors::ACCENT_GREEN)),
@@ -937,7 +942,11 @@ fn draw_runtimes(f: &mut Frame, area: Rect, app: &App) {
 
     let runtime_list = if items.is_empty() {
         List::new(vec![ListItem::new(Line::from(Span::styled(
-            "No runtimes detected. Use 'omg use <runtime> <version>' to install.",
+            if app.status.is_some() {
+                "No runtimes detected. Use 'omg use <runtime> <version>' to install."
+            } else {
+                "Daemon status unavailable."
+            },
             Style::default().fg(colors::FG_MUTED),
         )))])
     } else {
@@ -1144,7 +1153,7 @@ fn draw_activity(f: &mut Frame, area: Rect, app: &App) {
                 if j > 0 {
                     changes.push_str(", ");
                 }
-                changes.push_str(&c.name);
+                changes.push_str(&sanitize_control_chars(&c.name));
             }
 
             let style = if index == app.selected_index {
@@ -1224,7 +1233,10 @@ fn draw_team(f: &mut Frame, area: Rect, app: &App) {
                     if status.lock_hash.is_empty() {
                         "none".to_string()
                     } else {
-                        status.lock_hash.chars().take(8).collect::<String>()
+                        sanitize_control_chars(&status.lock_hash)
+                            .chars()
+                            .take(8)
+                            .collect()
                     },
                     Style::default().fg(colors::FG_PRIMARY),
                 ),
@@ -1385,7 +1397,7 @@ fn draw_status_bar(f: &mut Frame, area: Rect, app: &App) {
     let mut spans = vec![Span::styled(" ", Style::default())];
     if let Some(error) = &app.action_error {
         spans.push(Span::styled(
-            format!("{error} "),
+            format!("{} ", sanitize_control_chars(error)),
             Style::default().fg(colors::ACCENT_RED),
         ));
         spans.push(Span::styled(
@@ -2001,6 +2013,71 @@ mod tests {
         assert_eq!(truncate_width("幅幅幅", 3), "幅…");
         assert_eq!(truncate_width("e\u{301}x", 2), "e\u{301}x");
         assert_eq!(pad_display_width("幅", 3), "幅 ");
+    }
+
+    fn render_app(app: &App) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(160, 45)).expect("dashboard display");
+        terminal
+            .draw(|frame| draw(frame, app))
+            .expect("draw dashboard");
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect()
+    }
+
+    #[test]
+    fn offline_dashboard_reports_unavailable_package_and_runtime_data() {
+        let app = app_on(Tab::Dashboard);
+        let dashboard = render_app(&app);
+        assert!(dashboard.contains("Inventory unavailable"));
+        assert!(dashboard.contains("Updates unavailable"));
+        assert!(dashboard.contains("Orphans unavailable"));
+        assert!(!dashboard.contains("System Up-to-date"));
+        assert!(!dashboard.contains("Update System ✓"));
+        assert!(!dashboard.contains("Remove Orphans ✓"));
+
+        let runtimes = render_app(&app.with_tab(Tab::Runtimes));
+        assert!(runtimes.contains("Daemon status unavailable"));
+        assert!(!runtimes.contains("No runtimes detected"));
+    }
+
+    #[test]
+    fn disk_utilization_uses_capacity_before_rounding() {
+        let mut app = app_on(Tab::Dashboard);
+        app.system_metrics.disk_usage = 384 * 1024;
+        app.system_metrics.disk_free = 128 * 1024;
+        let dashboard = render_app(&app);
+        assert!(dashboard.contains("Usage: 75%"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_runtimes_render_clean_versions_and_known_empty_state() {
+        use crate::daemon::protocol::StatusResult;
+
+        let mut app = app_on(Tab::Runtimes);
+        app.daemon_connected = true;
+        app.status = Some(StatusResult {
+            total_packages: 18,
+            explicit_packages: 7,
+            orphan_packages: 0,
+            updates_available: 0,
+            security_vulnerabilities: 0,
+            vulnerabilities_scanned: false,
+            security_unknown_packages: None,
+            runtime_versions: vec![("node".into(), "22.\u{202e}4.0".into())],
+        });
+        assert!(render_app(&app).contains("22.4.0"));
+
+        app.status.as_mut().unwrap().runtime_versions.clear();
+        assert!(render_app(&app).contains("No runtimes detected"));
+        let dashboard = render_app(&app.with_tab(Tab::Dashboard));
+        assert!(dashboard.contains("System Up-to-date"));
+        assert!(!dashboard.contains("Updates unavailable"));
     }
 
     #[test]

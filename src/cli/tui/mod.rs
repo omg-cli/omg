@@ -41,7 +41,7 @@ enum BackgroundUpdate {
     Search(SearchCompletion),
     Team(Option<crate::core::env::team::TeamStatus>),
     #[cfg(unix)]
-    Daemon(bool, Option<crate::daemon::protocol::StatusResult>),
+    Daemon(Option<crate::daemon::protocol::StatusResult>),
 }
 
 enum SearchRequest {
@@ -222,12 +222,10 @@ async fn run_app(session: &mut TerminalSession, app: &mut app::App) -> Result<()
                         }
                     }
                     #[cfg(unix)]
-                    BackgroundUpdate::Daemon(connected, status) => {
+                    BackgroundUpdate::Daemon(status) => {
                         daemon_refresh = None;
-                        app.daemon_connected = connected;
-                        if let Some(status) = status {
-                            app.status = Some(status);
-                        }
+                        app.daemon_connected = status.is_some();
+                        app.status = status;
                     }
                 }
                 None
@@ -323,8 +321,8 @@ async fn run_app(session: &mut TerminalSession, app: &mut app::App) -> Result<()
             last_daemon_refresh = Instant::now();
             let sender = background_tx.clone();
             daemon_refresh = Some(AbortOnDropHandle::new(tokio::spawn(async move {
-                let (connected, status) = app::App::fetch_daemon_status().await;
-                let _ = sender.send(BackgroundUpdate::Daemon(connected, status));
+                let status = app::App::fetch_daemon_status().await;
+                let _ = sender.send(BackgroundUpdate::Daemon(status));
             })));
         }
 

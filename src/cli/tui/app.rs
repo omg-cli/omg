@@ -230,18 +230,14 @@ impl App {
     }
 
     #[cfg(unix)]
-    pub(crate) async fn fetch_daemon_status() -> (bool, Option<StatusResult>) {
-        let Ok(mut client) = crate::core::client::DaemonClient::connect().await else {
-            return (false, None);
-        };
-        let status = match client
-            .call(crate::daemon::protocol::Request::Status { id: 0 })
-            .await
-        {
-            Ok(crate::daemon::protocol::ResponseResult::Status(status)) => Some(status),
+    pub(crate) async fn fetch_daemon_status() -> Option<StatusResult> {
+        use crate::daemon::protocol::{Request, ResponseResult};
+
+        let mut client = crate::core::client::DaemonClient::connect().await.ok()?;
+        match client.call(Request::Status { id: 0 }).await.ok()? {
+            ResponseResult::Status(status) => Some(status),
             _ => None,
-        };
-        (true, status)
+        }
     }
 
     fn load_local_team_status(&mut self) {
@@ -303,16 +299,25 @@ impl App {
 
     /// Read the cumulative `cpu` line of `/proc/stat` as `(total, idle)`.
     fn sample_cpu_totals() -> Option<(u64, u64)> {
-        let stat = std::fs::read_to_string("/proc/stat").ok()?;
-        let line = stat.lines().next()?;
-        let mut fields = line.split_whitespace();
+        use std::io::{BufRead as _, BufReader};
+
+        let mut aggregate = String::new();
+        BufReader::new(std::fs::File::open("/proc/stat").ok()?)
+            .read_line(&mut aggregate)
+            .ok()?;
+        Self::parse_cpu_totals(&aggregate)
+    }
+
+    fn parse_cpu_totals(aggregate: &str) -> Option<(u64, u64)> {
+        let mut fields = aggregate.split_whitespace();
         if fields.next()? != "cpu" {
             return None;
         }
 
         let mut total = 0u64;
         let mut idle = None;
-        for (index, field) in fields.enumerate() {
+        // Guest and guest_nice are already part of user and nice.
+        for (index, field) in fields.take(8).enumerate() {
             let value = field.parse::<u64>().ok()?;
             total = total.checked_add(value)?;
             if index == 3 {
@@ -322,26 +327,23 @@ impl App {
         Some((total, idle?))
     }
 
-    /// Usage percent since the previous sample; the very first sample only
-    /// establishes the baseline and reports the previous reading.
+    /// Derive CPU usage from consecutive valid aggregate samples.
     fn cpu_usage_delta(previous: &mut Option<(u64, u64)>, sample: Option<(u64, u64)>) -> f32 {
         let Some(sample) = sample else {
             return 0.0;
         };
-        let usage = match *previous {
-            Some((prev_total, prev_idle)) => {
-                let d_total = sample.0.saturating_sub(prev_total);
-                let d_idle = sample.1.saturating_sub(prev_idle);
-                if d_total > 0 {
-                    (d_total - d_idle) as f32 / d_total as f32 * 100.0
-                } else {
-                    0.0
-                }
-            }
-            None => 0.0,
+        let Some((old_total, old_idle)) = previous.replace(sample) else {
+            return 0.0;
         };
-        *previous = Some(sample);
-        usage
+        match (
+            sample.0.checked_sub(old_total),
+            sample.1.checked_sub(old_idle),
+        ) {
+            (Some(total), Some(idle)) if total > 0 && idle <= total => {
+                (total - idle) as f32 / total as f32 * 100.0
+            }
+            _ => 0.0,
+        }
     }
 
     fn get_memory_usage() -> f32 {
@@ -869,6 +871,31 @@ mod tests {
 
         let steady = App::cpu_usage_delta(&mut previous, Some((140, 70)));
         assert!(steady.abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn cpu_totals_exclude_the_guest_breakdown() {
+        assert_eq!(
+            App::parse_cpu_totals("cpu 100 20 30 40 5 6 7 8 70 15"),
+            Some((216, 40))
+        );
+        assert_eq!(App::parse_cpu_totals("cpu 100 20 30 40"), Some((190, 40)));
+        assert_eq!(App::parse_cpu_totals("cpu0 100 20 30 40"), None);
+        assert_eq!(App::parse_cpu_totals("cpu 100 20 30"), None);
+    }
+
+    #[test]
+    fn cpu_usage_delta_recovers_after_counter_regressions() {
+        let mut previous = Some((100, 60));
+        for (total, idle) in [(110, 75), (90, 50), (100, 45)] {
+            assert!(
+                App::cpu_usage_delta(&mut previous, Some((total, idle))).abs() < f32::EPSILON,
+                "inconsistent CPU counters must establish a new baseline"
+            );
+            assert_eq!(previous, Some((total, idle)));
+        }
+        let usage = App::cpu_usage_delta(&mut previous, Some((120, 50)));
+        assert!((usage - 75.0).abs() < f32::EPSILON);
     }
 
     #[test]
