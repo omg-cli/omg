@@ -3303,6 +3303,137 @@ exit 95
                 checked(["/usr/bin/umount", native])
 
 
+    def inspect_named_tool_updates():
+        import errno
+        import pty
+        import select
+
+        phase = "named-tool-updates"
+        tools = (
+            ("black", "pip", "black", "python"),
+            ("glances", "pip", "glances", "python"),
+            ("httpie", "pip", "httpie", "python"),
+            ("ruff", "pip", "ruff", "python"),
+            ("yt-dlp", "pip", "yt-dlp", "python"),
+            ("rich-cli", "pip", "rich-cli", "python"),
+            ("diesel", "cargo", "diesel_cli", "rust"),
+        )
+        layouts = ("missing", "empty", "incomplete", "installed")
+        system_tools = ("fd", "dust", "rg", "delta", "jq", "procs", "ripgrep", "duf")
+        with tempfile.TemporaryDirectory(prefix="named-tool-updates-", dir=work) as directory:
+            here = Path(directory)
+            os.chown(here, account.pw_uid, account.pw_gid)
+
+            def owned_environment(home):
+                home.mkdir()
+                os.chown(home, account.pw_uid, account.pw_gid)
+                return dict(disabled, HOME=str(home), OMG_DATA_DIR=str(home/"data"),
+                            OMG_CONFIG_DIR=str(home/"config"/"omg"), OMG_NATIVE_TEST_DATA_DIR="1",
+                            XDG_CONFIG_HOME=str(home/"config"), XDG_DATA_HOME=str(home/"xdg-data"),
+                            XDG_CACHE_HOME=str(home/"cache"), XDG_STATE_HOME=str(home/"state"),
+                            TERM="xterm")
+
+            for tool, manager, installed_name, runtime in tools:
+                for layout in layouts:
+                    home = here / f"{tool}-{layout}"
+                    env = owned_environment(home)
+                    data = home / "data"
+                    current = data / "tools" / manager / installed_name
+                    command_link = data / "bin" / tool
+                    executable = current / "bin" / tool
+                    if layout != "missing":
+                        current.mkdir(parents=True)
+                    if layout in ("incomplete", "installed"):
+                        executable.parent.mkdir()
+                        executable.write_text("#!/bin/sh\nprintf 'previous tool\\n'\n")
+                        executable.chmod(0o755)
+                        command_link.parent.mkdir()
+                        command_link.symlink_to(executable)
+                    if layout == "incomplete":
+                        (current / ".omg-installing").write_text("publication incomplete\n")
+                    if data.exists():
+                        for path in (data, *data.rglob("*")):
+                            os.chown(path, account.pw_uid, account.pw_gid, follow_symlinks=False)
+                    snapshot = sorted((str(path.relative_to(data)), path.is_symlink(),
+                                       os.readlink(path) if path.is_symlink() else
+                                       path.read_bytes() if path.is_file() else None)
+                                      for path in data.rglob("*") if not path.name.startswith(".omg-tool"))
+                    result = subprocess.run([cli, "tool", "update", tool], cwd=home, env=env,
+                                            stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                                            timeout=8, **ordinary)
+                    after = sorted((str(path.relative_to(data)), path.is_symlink(),
+                                    os.readlink(path) if path.is_symlink() else
+                                    path.read_bytes() if path.is_file() else None)
+                                   for path in data.rglob("*") if not path.name.startswith(".omg-tool"))
+                    preserved = all(item in after for item in snapshot) and not any(
+                        ".staging-" in item[0] for item in after)
+                    expected = (f"requires a selected OMG-managed {runtime}" if layout == "installed"
+                                else f"Tool '{tool}' is not installed")
+                    checks.append(dict(
+                        phase=phase, case=f"{tool}-{layout}", status=result.returncode,
+                        passed=(result.returncode != 0 and expected in result.stderr and preserved
+                                and "Update complete!" not in result.stdout),
+                        preserved=preserved, diagnostic=(result.stdout + result.stderr)[-1200:],
+                    ))
+
+            def decline_system_update(name):
+                home = here / f"system-{name}"
+                env = owned_environment(home)
+                pid, descriptor = pty.fork()
+                if pid == 0:
+                    os.chown(os.ttyname(0), account.pw_uid, account.pw_gid)
+                    os.setgroups([])
+                    os.setgid(account.pw_gid)
+                    os.setuid(account.pw_uid)
+                    os.chdir(home)
+                    os.execve(cli, [str(cli), "tool", "update", name], env)
+                transcript = bytearray()
+                declined = False
+                status = None
+                try:
+                    deadline = time.monotonic() + 8
+                    while time.monotonic() < deadline:
+                        if not select.select([descriptor], [], [], 0.05)[0]:
+                            continue
+                        try:
+                            chunk = os.read(descriptor, 4096)
+                        except OSError as error:
+                            if error.errno == errno.EIO:
+                                break
+                            raise
+                        if not chunk:
+                            break
+                        transcript.extend(chunk)
+                        assert len(transcript) <= 65536, name
+                        if not declined and b"Proceed with installation of 1 package(s)?" in transcript:
+                            os.write(descriptor, b"n\n")
+                            declined = True
+                    while time.monotonic() < deadline:
+                        child, completed = os.waitpid(pid, os.WNOHANG)
+                        if child == pid:
+                            status = os.waitstatus_to_exitcode(completed)
+                            break
+                        time.sleep(0.01)
+                finally:
+                    os.close(descriptor)
+                    if status is None:
+                        try:
+                            os.kill(pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                        os.waitpid(pid, 0)
+                text = transcript.decode(errors="replace")
+                checks.append(dict(
+                    phase=phase, case=f"{name}-cancelled", status=status,
+                    passed=(declined and status == 0 and "Installation cancelled" in text
+                            and "Update complete!" not in text),
+                    diagnostic=text[-1200:],
+                ))
+
+            for tool in system_tools:
+                decline_system_update(tool)
+
+
     def inspect_task_environment_bytes():
         phase = "task-environment-bytes"
         raw = b"test-\xff-value"
@@ -6014,6 +6145,7 @@ exec {shlex.quote(str(binary))} "$@"
                     inspect_python_tool_prerequisites()
                     inspect_managed_tool_inventory()
                     inspect_fedora_system_tool_registry()
+                    inspect_named_tool_updates()
                     mark_progress("runtime selection and Python environments")
                     inspect_task_environment_bytes()
                     inspect_task_package_metadata()
@@ -6339,6 +6471,6 @@ mark_progress("completed with host inventory unchanged")
 report = dict(binaries=binaries, checks=checks, total=len(checks),
               passed=sum(entry["passed"] for entry in checks), host_unchanged=True)
 print(json.dumps(report))
-expected_checks = 303 if consent_oracle is None else 2132
+expected_checks = 303 if consent_oracle is None else 2168
 if report["passed"] != report["total"] or report["total"] != expected_checks:
     sys.exit(4)

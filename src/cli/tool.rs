@@ -1578,18 +1578,34 @@ pub async fn update(name: &str) -> Result<()> {
         style::package(name)
     );
 
-    // Find the tool in registry or installed
-    match find_registry_entry(name) {
-        Some(resolved) => {
-            let (manager, pkg, _) = resolved?;
-            install_managed(manager, pkg, name, &tools_dir, &bin_dir).await?;
-            println!("\n{}", style::success("Update complete!"));
-        }
-        None => {
-            anyhow::bail!("Tool '{name}' not found in registry. Cannot determine update source.");
-        }
+    let (manager, pkg, _) = find_registry_entry(name).with_context(|| {
+        format!("Tool '{name}' not found in registry. Cannot determine update source.")
+    })??;
+
+    if manager == "system" {
+        return install_managed(manager, pkg, name, &tools_dir, &bin_dir).await;
     }
 
+    let installed = match tools_dir.canonicalize() {
+        Ok(root) => {
+            let manager_dir = root.join(manager);
+            let current = manager_dir.join(name);
+            let legacy = manager_dir.join(pkg);
+            let matches_install = |path: &Path| {
+                looks_like_tool_install(path) && path.canonicalize().is_ok_and(|real| real == path)
+            };
+            matches_install(&current) || (current != legacy && matches_install(&legacy))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error).context("Failed to resolve managed tools directory"),
+    };
+    anyhow::ensure!(
+        installed,
+        "Tool '{name}' is not installed; run omg tool install {name} first"
+    );
+
+    install_managed(manager, pkg, name, &tools_dir, &bin_dir).await?;
+    println!("\n{}", style::success("Update complete!"));
     Ok(())
 }
 
