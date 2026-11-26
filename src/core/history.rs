@@ -76,7 +76,35 @@ impl HistoryManager {
     /// Creates a manager backed by the default history file in the data
     /// directory.
     pub fn new() -> Result<Self> {
-        Self::new_in(crate::core::paths::data_dir().join("history.json"))
+        Self::new_in(Self::default_log_path())
+    }
+
+    fn default_log_path() -> PathBuf {
+        crate::core::paths::data_dir().join("history.json")
+    }
+
+    /// Reads the default history without initializing a new store.
+    pub(crate) fn load_existing() -> Result<Vec<Transaction>> {
+        let manager = Self {
+            log_path: Self::default_log_path(),
+        };
+        // Writers create the lock before publishing either history file.
+        for path in [
+            &manager.lock_path(),
+            &manager.log_path,
+            &manager.archive_path(),
+        ] {
+            match path.symlink_metadata() {
+                Ok(_) => return manager.load(),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("Failed to inspect package history: {}", path.display())
+                    });
+                }
+            }
+        }
+        Ok(Vec::new())
     }
 
     /// Creates a manager backed by an explicit history file path (tests,
@@ -474,8 +502,12 @@ impl HistoryManager {
         }
     }
 
+    fn lock_path(&self) -> PathBuf {
+        self.log_path.with_extension("lock")
+    }
+
     fn with_history_lock<T>(&self, op: impl FnOnce() -> Result<T>) -> Result<T> {
-        let lock_path = self.log_path.with_extension("lock");
+        let lock_path = self.lock_path();
         let mut options = fs::OpenOptions::new();
         options.create(true).read(true).write(true).truncate(false);
         #[cfg(unix)]
@@ -505,6 +537,41 @@ impl HistoryManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn reading_default_history_leaves_missing_state_untouched() -> Result<()> {
+        const NAME: &str =
+            "core::history::tests::reading_default_history_leaves_missing_state_untouched";
+        if crate::config::Settings::rerun_test_unprivileged(NAME)
+            || crate::core::testing::run_isolated_test(NAME)
+        {
+            return Ok(());
+        }
+        let directory = tempfile::tempdir()?;
+        let store = directory.path().join("state");
+        temp_env::with_var("OMG_DATA_DIR", Some(&store), || -> Result<()> {
+            assert!(HistoryManager::load_existing()?.is_empty());
+            assert!(!store.exists());
+
+            fs::write(&store, b"invalid store")?;
+            let error = HistoryManager::load_existing().expect_err("a file cannot store history");
+            assert!(
+                error
+                    .to_string()
+                    .contains("Failed to inspect package history")
+            );
+            assert_eq!(fs::read(&store)?, b"invalid store");
+            fs::remove_file(&store)?;
+
+            let manager = HistoryManager::new_in(store.join("history.json"))?;
+            manager.save(&[])?;
+            let before = fs::read(&manager.log_path)?;
+            assert!(HistoryManager::load_existing()?.is_empty());
+            assert_eq!(fs::read(&manager.log_path)?, before);
+            Ok(())
+        })
+    }
 
     #[cfg(unix)]
     #[test]
