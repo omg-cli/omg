@@ -28,7 +28,7 @@ OMG prints the selected ecosystem and source file before it runs the task. To pa
 omg run test -- --coverage
 ```
 
-Task names can contain ASCII letters, digits, `-`, `_`, and `.`. A colon in a requested name, such as `test:watch`, is rejected by the current CLI. Run that script with its native tool instead.
+Task names can contain ASCII letters, digits, `-`, `_`, `.`, and `:`, as in `test:watch`. A task name cannot start with `-`.
 
 ## Project files OMG reads
 
@@ -49,7 +49,7 @@ OMG detects most tasks in the current directory. It does not search all subdirec
 | `Taskfile.yml` or `Taskfile.yaml` | `list`; other names use the fallback path | `task` |
 | `Rakefile` | `tasks`; other names use the fallback path | `rake` |
 
-The Taskfile and Rakefile integrations do not parse their task lists. `omg run build` can still try `task build` or `rake build` when no discovered task has that name. The fallback can also try an executable with the requested name. Check the project file before relying on a fallback.
+The Taskfile and Rakefile integrations do not parse their task lists. `omg run build` can still try `task build` or `rake build` when no discovered task has that name. With no ecosystem option, the final fallback can try an executable with the requested name. With `--using`, OMG only tries tasks and fallbacks for the selected ecosystem.
 
 `deno.jsonc` is not read by the current task detector. For a JSONC-only project, use `deno task` directly.
 
@@ -71,7 +71,7 @@ test = "rust"
 build = "node"
 ```
 
-`--all` runs every detected match for one task name, one after another. If one fails, execution stops. `--all` and `--using` cannot be combined.
+`--all` runs every detected match for one task name in sequence, regardless of project preferences. It exits with an error if no task matches or if a task fails. `--all` and `--using` cannot be combined.
 
 ## Choose a JavaScript package manager
 

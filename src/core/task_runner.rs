@@ -57,6 +57,14 @@ impl std::fmt::Display for Ecosystem {
 }
 
 impl Ecosystem {
+    fn for_js_manager(package_manager: &str) -> Self {
+        if package_manager == "bun" {
+            Self::Bun
+        } else {
+            Self::Node
+        }
+    }
+
     const fn priority(&self) -> i32 {
         match self {
             Self::Rust => 100,
@@ -107,6 +115,17 @@ pub struct OmgProjectConfig {
 pub struct TaskDetector {
     pub current_dir: PathBuf,
     pub config: OmgProjectConfig,
+}
+
+struct TaskInventory {
+    tasks: Vec<Task>,
+    js_package_manager: Option<String>,
+}
+
+enum TaskSelection {
+    Detected(Vec<Task>),
+    Fallback { command: String, args: Vec<String> },
+    Direct,
 }
 
 fn read_optional_file(path: &Path) -> Result<Option<String>> {
@@ -173,45 +192,35 @@ impl TaskDetector {
             .with_context(|| format!("Failed to parse {}", config_path.display()))
     }
 
-    fn detect_js_tasks(&self, tasks: &mut Vec<Task>) -> Result<()> {
-        let Some(package_manager) = detect_js_package_manager(&self.current_dir)? else {
-            return Ok(());
+    fn detect_js_tasks(&self, tasks: &mut Vec<Task>) -> Result<Option<String>> {
+        let Some(package) = read_js_manifest(&self.current_dir)? else {
+            return Ok(None);
         };
-        let js_ecosystem = if package_manager == "bun" {
-            Ecosystem::Bun
-        } else {
-            Ecosystem::Node
-        };
+        let package_manager = js_package_manager_for(&self.current_dir, &package)?;
+        let ecosystem = Ecosystem::for_js_manager(&package_manager);
 
-        let path = self.current_dir.join("package.json");
-        let mut has_install_script = false;
-        if let Some(content) = read_optional_file(&path)? {
-            let pkg: PackageJson = serde_json::from_str(&content)
-                .with_context(|| format!("Failed to parse {}", path.display()))?;
-            if let Some(scripts) = pkg.scripts {
-                has_install_script = scripts.contains_key("install");
-                for (name, _) in scripts {
-                    tasks.push(Task {
-                        name: name.clone(),
-                        command: package_manager.clone(),
-                        args: vec!["run".to_string(), name],
-                        source: "package.json".to_string(),
-                        ecosystem: js_ecosystem.clone(),
-                    });
-                }
-            }
+        let scripts = package.scripts.unwrap_or_default();
+        let has_install_script = scripts.contains_key("install");
+        for (name, _) in scripts {
+            tasks.push(Task {
+                name: name.clone(),
+                command: package_manager.clone(),
+                args: vec!["run".to_string(), name],
+                source: "package.json".to_string(),
+                ecosystem: ecosystem.clone(),
+            });
         }
-
         if !has_install_script {
             tasks.push(Task {
                 name: "install".to_string(),
-                command: package_manager,
+                command: package_manager.clone(),
                 args: vec!["install".to_string()],
                 source: "package.json".to_string(),
-                ecosystem: js_ecosystem,
+                ecosystem,
             });
         }
-        Ok(())
+
+        Ok(Some(package_manager))
     }
 
     fn detect_deno_tasks(&self, tasks: &mut Vec<Task>) -> Result<()> {
@@ -424,9 +433,13 @@ impl TaskDetector {
     }
 
     pub fn detect(&self) -> Result<Vec<Task>> {
+        Ok(self.inventory()?.tasks)
+    }
+
+    fn inventory(&self) -> Result<TaskInventory> {
         let mut tasks = Vec::new();
 
-        self.detect_js_tasks(&mut tasks)?;
+        let js_package_manager = self.detect_js_tasks(&mut tasks)?;
         self.detect_deno_tasks(&mut tasks)?;
         self.detect_php_tasks(&mut tasks)?;
         self.detect_rust_tasks(&mut tasks);
@@ -457,31 +470,43 @@ impl TaskDetector {
             });
         }
 
-        Ok(tasks)
+        Ok(TaskInventory {
+            tasks,
+            js_package_manager,
+        })
     }
 
     pub fn resolve(&self, task_name: &str, using: Option<&str>, all: bool) -> Result<Vec<Task>> {
-        let all_tasks = self.detect()?;
-        let mut matches: Vec<Task> = all_tasks
-            .into_iter()
-            .filter(|t| t.name == task_name)
+        let inventory = self.inventory()?;
+        let matches = self.resolve_detected(&inventory, task_name, using, all)?;
+        if let Some(ecosystem_name) = using
+            && matches.is_empty()
+            && inventory.tasks.iter().any(|task| task.name == task_name)
+        {
+            anyhow::bail!("No task '{task_name}' found for ecosystem '{ecosystem_name}'");
+        }
+        Ok(matches)
+    }
+
+    fn resolve_detected(
+        &self,
+        inventory: &TaskInventory,
+        task_name: &str,
+        using: Option<&str>,
+        all: bool,
+    ) -> Result<Vec<Task>> {
+        let mut matches: Vec<Task> = inventory
+            .tasks
+            .iter()
+            .filter(|task| {
+                task.name == task_name && using.is_none_or(|name| task.ecosystem.matches(name))
+            })
+            .cloned()
             .collect();
-
-        if matches.is_empty() {
-            // Fallback logic moved here for better encapsulation
-            return Ok(Vec::new());
+        if all {
+            return Ok(matches);
         }
 
-        // 1. Filter by ecosystem if 'using' is provided
-        if let Some(ecosystem_name) = using {
-            matches.retain(|t| t.ecosystem.matches(ecosystem_name));
-
-            if matches.is_empty() {
-                anyhow::bail!("No task '{task_name}' found for ecosystem '{ecosystem_name}'");
-            }
-        }
-
-        // 2. Filter by .omg.toml mapping
         if let Some(preferred_ecosystem) = self.config.scripts.get(task_name)
             && matches
                 .iter()
@@ -490,12 +515,6 @@ impl TaskDetector {
             matches.retain(|task| task.ecosystem.matches(preferred_ecosystem));
         }
 
-        // 3. If --all, return all matches
-        if all {
-            return Ok(matches);
-        }
-
-        // 4. If multiple matches, resolve ambiguity
         if matches.len() > 1 {
             // Sort by priority
             matches.sort_by_key(|m| std::cmp::Reverse(m.ecosystem.priority()));
@@ -532,6 +551,73 @@ impl TaskDetector {
 
         Ok(matches)
     }
+
+    fn select_task(
+        &self,
+        inventory: &TaskInventory,
+        task_name: &str,
+        using: Option<&str>,
+        all: bool,
+    ) -> Result<TaskSelection> {
+        let detected = self.resolve_detected(inventory, task_name, using, all)?;
+        if !detected.is_empty() {
+            return Ok(TaskSelection::Detected(detected));
+        }
+        if all {
+            anyhow::bail!("No project task '{task_name}' found in detected ecosystems");
+        }
+
+        let js_manager = inventory.js_package_manager.as_deref().unwrap_or_default();
+        let fallbacks: &[(&[&str], &str, &[&str], Ecosystem)] = &[
+            (&["Makefile"], "make", &[], Ecosystem::Make),
+            (
+                &["package.json"],
+                js_manager,
+                &["run"],
+                Ecosystem::for_js_manager(js_manager),
+            ),
+            (
+                &["Taskfile.yml", "Taskfile.yaml"],
+                "task",
+                &[],
+                Ecosystem::Go,
+            ),
+            (&["Rakefile"], "rake", &[], Ecosystem::Ruby),
+            (&["Pipfile"], "pipenv", &["run"], Ecosystem::Python),
+            (&["deno.json"], "deno", &["task"], Ecosystem::Deno),
+            (
+                &["composer.json"],
+                "composer",
+                &["run-script"],
+                Ecosystem::Php,
+            ),
+        ];
+
+        for (markers, command, prefix, ecosystem) in fallbacks {
+            if !command.is_empty()
+                && using.is_none_or(|name| ecosystem.matches(name))
+                && markers
+                    .iter()
+                    .any(|marker| self.current_dir.join(marker).exists())
+            {
+                let args = prefix
+                    .iter()
+                    .copied()
+                    .chain([task_name])
+                    .map(str::to_owned)
+                    .collect();
+                return Ok(TaskSelection::Fallback {
+                    command: (*command).to_owned(),
+                    args,
+                });
+            }
+        }
+
+        if let Some(ecosystem_name) = using {
+            anyhow::bail!("No task '{task_name}' found for ecosystem '{ecosystem_name}'");
+        }
+        Ok(TaskSelection::Direct)
+    }
 }
 
 pub fn detect_tasks() -> Result<Vec<Task>> {
@@ -548,84 +634,58 @@ fn needs_arg_separator(command: &str) -> bool {
 }
 
 fn validate_task_name(task_name: &str) -> Result<()> {
-    if task_name
-        .chars()
-        .any(|c| !c.is_ascii_alphanumeric() && !matches!(c, '-' | '_' | ':' | '.'))
+    if task_name.is_empty()
+        || task_name.starts_with('-')
+        || task_name
+            .chars()
+            .any(|c| !c.is_ascii_alphanumeric() && !matches!(c, '-' | '_' | ':' | '.'))
     {
         anyhow::bail!("Invalid task name: {task_name}");
     }
     Ok(())
 }
 
-/// Execute a task with advanced options.
-///
-/// Task resolution order:
-/// 1. Detected tasks from project manifests (`package.json`, `Cargo.toml`, …).
-/// 2. Ordered manifest-driven fallbacks (`make`, `npm run`, `task`, …).
-/// 3. As a final resort, `task_name` itself is executed as a command resolved
-///    from `PATH`. This passthrough is intentional and bounded: the name was
-///    validated against `[A-Za-z0-9._:-]` up front, so `omg run <tool>` behaves
-///    like invoking `<tool>` directly.
+/// Execute detected tasks or a compatible manifest fallback.
 pub fn run_task_advanced(
     task_name: &str,
     extra_args: &[String],
     using: Option<&str>,
     all: bool,
 ) -> Result<()> {
-    // SECURITY: Validate task name
     validate_task_name(task_name)?;
 
     let current_dir = std::env::current_dir()?;
     let detector = TaskDetector::new(current_dir.clone())?;
-    let matches = detector.resolve(task_name, using, all)?;
+    let selection = detector.select_task(&detector.inventory()?, task_name, using, all)?;
+    execute_task_selection(&current_dir, task_name, extra_args, selection)
+}
 
-    if matches.is_empty() {
-        let current_dir = std::env::current_dir()?;
-
-        // Ordered fallback table: (marker_files, command, args_before_task).
-        // Reuse the package-manager detector so known and fallback scripts
-        // cannot diverge merely because the requested script was not listed.
-        let js_package_manager =
-            detect_js_package_manager(&current_dir)?.unwrap_or_else(|| "npm".to_string());
-        let fallbacks: &[(&[&str], &str, &[&str])] = &[
-            (&["Makefile"], "make", &[]),
-            (&["package.json"], js_package_manager.as_str(), &["run"]),
-            (&["Taskfile.yml", "Taskfile.yaml"], "task", &[]),
-            (&["Rakefile"], "rake", &[]),
-            (&["Pipfile"], "pipenv", &["run"]),
-            (&["deno.json"], "deno", &["task"]),
-            (&["composer.json"], "composer", &["run-script"]),
-        ];
-
-        for (markers, cmd, prefix_args) in fallbacks {
-            if markers.iter().any(|f| current_dir.join(f).exists()) {
-                let display_cmd = if prefix_args.is_empty() {
-                    format!("{cmd} {task_name}")
-                } else {
-                    format!("{cmd} {} {task_name}", prefix_args.join(" "))
-                };
-                println!(
-                    "{} Task '{task_name}' not found, trying '{display_cmd}'...",
-                    style::caution("→")
-                );
-                let mut args: Vec<String> = prefix_args
-                    .iter()
-                    .map(std::string::ToString::to_string)
-                    .collect();
-                args.push(task_name.to_string());
-                return execute_process(
-                    cmd,
-                    &with_arg_separator(cmd, args, extra_args),
-                    extra_args,
-                    None,
-                );
-            }
+fn execute_task_selection(
+    directory: &Path,
+    task_name: &str,
+    extra_args: &[String],
+    selection: TaskSelection,
+) -> Result<()> {
+    let tasks = match selection {
+        TaskSelection::Detected(tasks) => tasks,
+        TaskSelection::Fallback { command, args } => {
+            println!(
+                "{} Task '{task_name}' not found, trying '{} {}'...",
+                style::caution("→"),
+                command,
+                args.join(" ")
+            );
+            return execute_process(
+                &command,
+                &with_arg_separator(&command, args, extra_args),
+                extra_args,
+                directory,
+            );
         }
+        TaskSelection::Direct => return execute_process(task_name, &[], extra_args, directory),
+    };
 
-        return execute_process(task_name, &[], extra_args, None);
-    }
-
-    for task in matches {
+    for task in tasks {
         println!(
             "{} Running task '{}' via {} ({})...",
             style::runtime("OMG"),
@@ -635,13 +695,13 @@ pub fn run_task_advanced(
         );
 
         if task.ecosystem == Ecosystem::Mise {
-            execute_native_mise_task(&current_dir, &task.name, extra_args)?;
+            execute_native_mise_task(directory, &task.name, extra_args)?;
         } else {
             execute_process(
                 &task.command,
                 &with_arg_separator(&task.command, task.args, extra_args),
                 extra_args,
-                None,
+                directory,
             )?;
         }
     }
@@ -776,34 +836,38 @@ fn ensure_java_runtime(version: &str) -> Result<String> {
     ensure_runtime_impl!("Java", version.trim().to_string(), manager)
 }
 
-fn detect_js_package_manager(current_dir: &std::path::Path) -> Result<Option<String>> {
+fn read_js_manifest(current_dir: &Path) -> Result<Option<PackageJson>> {
     let path = current_dir.join("package.json");
     let Some(content) = read_optional_file(&path)? else {
         return Ok(None);
     };
-    let pkg: PackageJson = serde_json::from_str(&content)
-        .with_context(|| format!("Failed to parse {}", path.display()))?;
+    serde_json::from_str(&content)
+        .with_context(|| format!("Failed to parse {}", path.display()))
+        .map(Some)
+}
 
-    if let Some(package_manager) = pkg.package_manager {
-        return parse_package_manager_name(&package_manager).map(Some);
-    }
-
-    if current_dir.join("bun.lockb").exists() {
-        return Ok(Some("bun".to_string()));
-    }
-    if current_dir.join("pnpm-lock.yaml").exists() {
-        return Ok(Some("pnpm".to_string()));
-    }
-    if current_dir.join("yarn.lock").exists() {
-        return Ok(Some("yarn".to_string()));
-    }
-    if current_dir.join("package-lock.json").exists()
-        || current_dir.join("npm-shrinkwrap.json").exists()
-    {
-        return Ok(Some("npm".to_string()));
+fn js_package_manager_for(current_dir: &Path, package: &PackageJson) -> Result<String> {
+    if let Some(package_manager) = &package.package_manager {
+        return parse_package_manager_name(package_manager);
     }
 
-    Ok(Some("npm".to_string()))
+    for (marker, manager) in [
+        ("bun.lockb", "bun"),
+        ("pnpm-lock.yaml", "pnpm"),
+        ("yarn.lock", "yarn"),
+    ] {
+        if current_dir.join(marker).exists() {
+            return Ok(manager.to_string());
+        }
+    }
+
+    Ok("npm".to_string())
+}
+
+fn detect_js_package_manager(current_dir: &Path) -> Result<Option<String>> {
+    read_js_manifest(current_dir)?
+        .map(|package| js_package_manager_for(current_dir, &package))
+        .transpose()
 }
 
 fn detect_js_runtime(current_dir: &std::path::Path) -> Result<Option<(String, String)>> {
@@ -951,12 +1015,9 @@ fn execute_process(
     cmd: &str,
     args: &[String],
     extra_args: &[String],
-    task_env: Option<&crate::config::mise_env::MiseEnv>,
+    directory: &Path,
 ) -> Result<()> {
-    let directory = std::env::current_dir()?;
-    execute_process_in(
-        cmd, args, extra_args, task_env, &directory, &directory, &directory,
-    )
+    execute_process_in(cmd, args, extra_args, None, directory, directory, directory)
 }
 
 fn execute_process_in(
@@ -1579,6 +1640,8 @@ pub fn run_task_watch(task_name: &str, extra_args: &[String]) -> Result<()> {
     use std::sync::mpsc::channel;
     use std::time::Duration;
 
+    validate_task_name(task_name)?;
+
     println!(
         "{} Watch mode: {} (Ctrl+C to stop)\n",
         style::runtime("OMG"),
@@ -1700,6 +1763,9 @@ fn parse_parallel_task_names(tasks: &str) -> Result<Vec<String>> {
             task_names.len()
         );
     }
+    for name in &task_names {
+        validate_task_name(name)?;
+    }
     Ok(task_names)
 }
 
@@ -1730,12 +1796,30 @@ pub async fn run_tasks_parallel(tasks_str: &str, extra_args: &[String]) -> Resul
         style::package(&task_names.join(", "))
     );
 
-    let handles: Vec<_> = task_names
+    let (directory, selections) = run_on_blocking_worker(move || {
+        let directory = std::env::current_dir()?;
+        let detector = TaskDetector::new(directory.clone())?;
+        let inventory = detector.inventory()?;
+        let selections = task_names
+            .into_iter()
+            .map(|task| {
+                let selection = detector.select_task(&inventory, &task, None, false);
+                (task, selection)
+            })
+            .collect::<Vec<_>>();
+        Ok((directory, selections))
+    })
+    .await?;
+
+    let handles: Vec<_> = selections
         .into_iter()
-        .map(|task| {
+        .map(|(task, selection)| {
             let args = extra_args.to_vec();
+            let directory = directory.clone();
             tokio::task::spawn_blocking(move || {
-                let result = run_task(&task, &args);
+                let result = selection.and_then(|selection| {
+                    execute_task_selection(&directory, &task, &args, selection)
+                });
                 (task, result)
             })
         })

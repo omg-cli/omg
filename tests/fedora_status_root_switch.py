@@ -1863,6 +1863,122 @@ exec {shlex.quote(git)} "$@"
             run("nonregular-reference-lock", ("diff", "main"), ("Reference omg.lock must be a regular file",), fails=True)
 
 
+    def inspect_task_selection():
+        phase = "task-selection"
+        with tempfile.TemporaryDirectory(prefix="task-selection-", dir=work) as directory:
+            here = Path(directory)
+            os.chown(here, account.pw_uid, account.pw_gid)
+            bin_dir = here / "bin"
+            bin_dir.mkdir()
+            trace = here / "trace"
+            for manager in ("make", "composer", "task", "rake", "fixture-direct"):
+                script = bin_dir / manager
+                script.write_text(f"""#!/bin/sh
+printf '%s|%s|%s\\n' {manager} "$#" "$*" >> "$OMG_FIXTURE_TASK_TRACE"
+if [ "$OMG_FIXTURE_TASK_FAIL" = {manager} ]; then exit 17; fi
+""")
+                script.chmod(0o755)
+            env = dict(disabled, HOME=str(here), PATH=f"{bin_dir}:{base_env['PATH']}",
+                       OMG_FIXTURE_TASK_TRACE=str(trace), XDG_DATA_HOME=str(here/"data"),
+                       XDG_CONFIG_HOME=str(here/"config"), XDG_CACHE_HOME=str(here/"cache"),
+                       XDG_STATE_HOME=str(here/"state"))
+            makefile = here/"Makefile"
+            composer = here/"composer.json"
+            preferred = here/".omg.toml"
+
+            def records(*expected, unordered=False):
+                result = trace.read_text().splitlines() if trace.exists() else []
+                return (sorted(result) == sorted(expected)) if unordered else (result == list(expected))
+
+            def run(label, args, markers=(), *, fails=False, inspect=None, child_env=env):
+                trace.unlink(missing_ok=True)
+                try:
+                    result = command([cli, "run", *args], child_env, ordinary, timeout=6)
+                except subprocess.TimeoutExpired:
+                    checks.append(dict(phase=phase, case=label, passed=False, status=None,
+                                       diagnostic="command exceeded local deadline"))
+                    return
+                output = result.stdout + result.stderr
+                okay = ((result.returncode != 0) == fails and all(marker in output for marker in markers)
+                        and (inspect is None or inspect()))
+                checks.append(dict(phase=phase, case=label, passed=okay, status=result.returncode,
+                                   diagnostic=output[-1200:]))
+
+            run("direct-task", ("fixture-direct",), inspect=lambda: records("fixture-direct|0|"))
+            run("direct-task-arguments", ("fixture-direct", "--", "one value", "--flag"),
+                inspect=lambda: records("fixture-direct|2|one value --flag"))
+            run("using-requires-ecosystem", ("fixture-direct", "--using", "make"),
+                ("No task 'fixture-direct' found for ecosystem 'make'",), fails=True,
+                inspect=lambda: records())
+            run("all-requires-ecosystem", ("fixture-direct", "--all"), ("No project task",),
+                fails=True, inspect=lambda: records())
+            run("parallel-empty-entry", ("fixture-direct,", "--parallel"), ("must not be empty",),
+                fails=True, inspect=lambda: records())
+            run("parallel-over-limit", (",".join(["fixture-direct"]*17), "--parallel"),
+                ("At most 16 parallel tasks",), fails=True, inspect=lambda: records())
+            run("parallel-invalid-name-preflight", ("fixture-direct,bad/name", "--parallel"),
+                ("Invalid task name",), fails=True, inspect=lambda: records())
+            run("watch-invalid-name-preflight", ("bad/name", "--watch"),
+                ("Invalid task name",), fails=True, inspect=lambda: records())
+            run("using-and-all-conflict", ("fixture-direct", "--using", "make", "--all"),
+                ("cannot be used with",), fails=True, inspect=lambda: records())
+
+            make_source = "test:\n\t@true\nbuild:\n\t@true\n"
+            composer_source = '{"scripts":{"test":"fixture","lint":"fixture"}}\n'
+            makefile.write_text(make_source)
+            composer.write_text(composer_source)
+            (here/"Taskfile.yml").write_text("version: '3'\ntasks: {}\n")
+            (here/"Rakefile").write_text("# fixture\n")
+            run("detected-default-priority", ("test",), inspect=lambda: records("composer|2|run-script test"))
+            run("detected-make-selection", ("test", "--using", "make"), inspect=lambda: records("make|1|test"))
+            run("detected-make-alias", ("test", "--using", "makefile"), inspect=lambda: records("make|1|test"))
+            run("detected-composer-alias", ("test", "--using", "composer"),
+                inspect=lambda: records("composer|2|run-script test"))
+            run("detected-argv-separator", ("test", "--using", "php", "--", "one value", "--flag"),
+                inspect=lambda: records("composer|5|run-script test -- one value --flag"))
+            preferred.write_text('[scripts]\ntest = "make"\n')
+            run("project-preference", ("test",), inspect=lambda: records("make|1|test"))
+            run("explicit-overrides-preference", ("test", "--using", "php"),
+                inspect=lambda: records("composer|2|run-script test"))
+            run("all-ignores-preference", ("test", "--all"),
+                inspect=lambda: records("composer|2|run-script test", "make|1|test"))
+            preferred.unlink()
+            run("all-stops-on-peer-failure", ("test", "--all"), ("Task failed with exit code",),
+                fails=True, child_env=dict(env, OMG_FIXTURE_TASK_FAIL="composer"),
+                inspect=lambda: records("composer|2|run-script test"))
+            run("fallback-default-make", ("dynamic",), ("trying 'make dynamic'",),
+                inspect=lambda: records("make|1|dynamic"))
+            run("fallback-selected-composer", ("dynamic", "--using", "composer"),
+                ("trying 'composer run-script dynamic'",), inspect=lambda: records("composer|2|run-script dynamic"))
+            run("fallback-selected-task", ("dynamic", "--using", "task"),
+                ("trying 'task dynamic'",), inspect=lambda: records("task|1|dynamic"))
+            run("fallback-selected-rake", ("dynamic", "--using", "ruby"),
+                ("trying 'rake dynamic'",), inspect=lambda: records("rake|1|dynamic"))
+            run("using-does-not-choose-different-fallback", ("dynamic", "--using", "node"),
+                ("No task 'dynamic' found for ecosystem 'node'",), fails=True, inspect=lambda: records())
+            run("unknown-ecosystem-does-not-run-fallback", ("dynamic", "--using", "example"),
+                ("No task 'dynamic' found for ecosystem 'example'",), fails=True, inspect=lambda: records())
+            run("explicit-ecosystem-can-use-its-fallback", ("lint", "--using", "make"),
+                inspect=lambda: records("make|1|lint"))
+            run("all-requires-detected-match", ("dynamic", "--all"), ("No project task",),
+                fails=True, inspect=lambda: records())
+            run("single-task-with-parallel-flag", ("build", "--parallel"), inspect=lambda: records("make|1|build"))
+            run("parallel-success", ("build,lint", "--parallel"), ("All tasks completed successfully",),
+                inspect=lambda: records("make|1|build", "composer|2|run-script lint", unordered=True))
+            run("parallel-nonzero-and-peer-success", ("build,lint", "--parallel"), ("Some tasks failed",),
+                fails=True, child_env=dict(env, OMG_FIXTURE_TASK_FAIL="composer"),
+                inspect=lambda: records("make|1|build", "composer|2|run-script lint", unordered=True))
+
+            preferred.write_text("scripts = [\n")
+            run("invalid-project-config", ("build",), ("Failed to parse", ".omg.toml"), fails=True,
+                inspect=lambda: records())
+            preferred.unlink()
+            composer.write_text("{\n")
+            run("invalid-composer-config", ("build",), ("Failed to parse", "composer.json"), fails=True,
+                inspect=lambda: records())
+            composer.write_text(composer_source)
+            run("restored-config", ("build",), inspect=lambda: records("make|1|build"))
+
     def inspect_environment_lockfiles():
         phase = "environment-lockfiles"
         with tempfile.TemporaryDirectory(prefix="environment-locks-", dir=work) as directory:
@@ -3565,6 +3681,7 @@ exec {shlex.quote(str(binary))} "$@"
                     inspect_scaffold_publication()
                     inspect_workspace_lifecycle()
                     inspect_workspace_graph_and_diff()
+                    inspect_task_selection()
                 config.write_text(alternate_config)
                 refresh_fixture()
                 expected = ordinary_control([dnf, "--cacheonly", "repoquery",
@@ -3882,6 +3999,6 @@ assert inventory() == before
 report = dict(binaries=binaries, checks=checks, total=len(checks),
               passed=sum(entry["passed"] for entry in checks), host_unchanged=True)
 print(json.dumps(report))
-expected_checks = 303 if consent_oracle is None else 1288
+expected_checks = 303 if consent_oracle is None else 1320
 if report["passed"] != report["total"] or report["total"] != expected_checks:
     sys.exit(4)
