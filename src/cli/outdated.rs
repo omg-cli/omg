@@ -5,7 +5,7 @@ use serde::Serialize;
 
 use crate::cli::tea::{Cmd, UpdateType};
 use crate::core::packages::PackageService;
-use crate::package_managers::get_package_manager;
+use crate::package_managers::{Backend, get_package_manager, resolve_backend};
 
 #[derive(Debug, Serialize)]
 pub struct OutdatedPackage {
@@ -57,8 +57,10 @@ pub async fn run(json: bool) -> Result<()> {
     }
 
     let pm = get_package_manager()?;
-    let service = PackageService::new(pm)?;
-    let updates = service.list_updates().await?;
+    let updates = match resolve_backend()? {
+        Backend::Fedora => pm.list_updates().await?,
+        _ => PackageService::new(pm)?.list_updates().await?,
+    };
 
     if updates.is_empty() {
         if json {

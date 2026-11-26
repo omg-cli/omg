@@ -608,6 +608,76 @@ exec {shlex.quote(str(native_executable))} "$@"
                 checks.append(dict(phase=phase, case=f"blocked-update-native-{label}", passed=passed,
                                    status=result.returncode, diagnostic=(result.stderr or result.stdout)[-900:]))
 
+
+    def inspect_read_only_updates(phase, update_count):
+        cases = (
+            ("outdated-json", ["--json", "outdated"]),
+            ("outdated-text", ["outdated"]),
+            ("counter-json", ["--json", "uc"]),
+            ("status-json", ["--json", "status"]),
+            ("check-text", ["update", "--check"]),
+            ("history-json", ["--json", "history"]),
+        )
+        native = ordinary_control([dnf, "--cacheonly", "repoquery", "--upgrades",
+                                   "--qf", "%{name}\t%{evr}\\n", package])
+        matches = [tuple(row.split("\t")) for row in native.splitlines()]
+        assert len(matches) == update_count
+        installed = ordinary_control([dnf, "--cacheonly", "repoquery", "--installed",
+                                      "--qf", r"%{evr}\n", package]).splitlines()
+        assert len(installed) == 1, installed
+        sandbox = Path(tempfile.mkdtemp(prefix=f"{phase}-", dir=work))
+        os.chown(sandbox, account.pw_uid, account.pw_gid)
+        blocked_data = sandbox / "unavailable-history"
+        blocked_data.write_text("ordinary file")
+        policy = sandbox / "config/omg/policy.toml"
+        policy.parent.mkdir(parents=True)
+        policy.write_text("blocked = [")
+        os.chown(policy, account.pw_uid, account.pw_gid)
+        policy.chmod(0o600)
+        environments = (
+            ("default", disabled),
+            ("invalid-policy", dict(disabled, XDG_CONFIG_HOME=str(sandbox / "config"))),
+            ("blocked-history", dict(disabled, OMG_DATA_DIR=str(blocked_data))),
+        )
+        for role, mode in environments:
+            for label, args in cases:
+                result = command([cli, *args], mode, ordinary)
+                try:
+                    if label == "outdated-json":
+                        value = json.loads(result.stdout)
+                        rows = [(row["name"], row["new_version"]) for row in value]
+                        correct = rows == matches and all(row["current_version"] == installed[0] for row in value)
+                    elif label == "outdated-text":
+                        if update_count:
+                            correct = all(f"{name} {installed[0]} → {evr}" in result.stdout for name, evr in matches)
+                        else:
+                            correct = "up to date" in result.stdout.lower()
+                    elif label == "counter-json":
+                        value = json.loads(result.stdout)
+                        correct = (isinstance(value, dict) and type(value.get("count")) is int
+                                   and value == {"count": update_count})
+                    elif label == "status-json":
+                        status = json.loads(result.stdout)
+                        correct = (type(status["updates_available"]) is int and status["updates_available"] == update_count
+                                   and type(status["total_packages"]) is int and status["total_packages"] == 1)
+                    elif label == "check-text":
+                        if update_count:
+                            correct = "1 update available" in result.stdout and package in result.stdout
+                        else:
+                            correct = "System is up to date" in result.stdout
+                    elif role == "blocked-history":
+                        correct = (result.returncode == 1 and not result.stdout.strip()
+                                   and "Failed to create package history directory" in result.stderr)
+                    else:
+                        correct = isinstance(json.loads(result.stdout), list)
+                except (ValueError, KeyError, TypeError):
+                    correct = False
+                expected_status = int(label == "history-json" and role == "blocked-history")
+                checks.append(dict(phase=phase, case=f"{role}-{label}", passed=correct and result.returncode == expected_status,
+                                   status=result.returncode, diagnostic=(result.stderr or result.stdout)[-900:]))
+        assert blocked_data.read_text() == "ordinary file"
+        assert policy.read_text() == "blocked = ["
+
     def inspect_independent_counters(phase, expected_orphans, expected_updates):
         for option, expected in (("--unneeded", expected_orphans), ("--upgrades", expected_updates)):
             packages = ordinary_control([dnf, "--cacheonly", "repoquery", option, "--qf", r"%{name}\n"])
@@ -1607,6 +1677,7 @@ exec {shlex.quote(str(binary))} "$@"
                     inspect_overlapping_status("status-metadata-only", 0)
                     inspect_status_inventory_scope("status-metadata-only", 0, custom_state)
                     inspect_independent_counters("independent-counters-empty", 0, 0)
+                    inspect_read_only_updates("update-read-no-upgrades", 0)
 
                 manifest.write_bytes(original_manifest)
                 sign_manifest()
@@ -1620,6 +1691,7 @@ exec {shlex.quote(str(binary))} "$@"
                     mark("dependency")
                     try:
                         inspect_independent_counters("independent-counters-populated", 1, 1)
+                        inspect_read_only_updates("update-read-upgrades", 1)
                     finally:
                         mark("user")
                     pending = custom_state / "omg-fixture.new"
@@ -1717,6 +1789,6 @@ assert inventory() == before
 report = dict(binaries=binaries, checks=checks, total=len(checks),
               passed=sum(entry["passed"] for entry in checks), host_unchanged=True)
 print(json.dumps(report))
-expected_checks = 303 if consent_oracle is None else 648
+expected_checks = 303 if consent_oracle is None else 684
 if report["passed"] != report["total"] or report["total"] != expected_checks:
     sys.exit(4)
