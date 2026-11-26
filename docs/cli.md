@@ -1475,8 +1475,9 @@ Creation and deletion share a persistent `.index.lock` in the snapshots director
 A competing mutation fails with a retry message. Both commands stage the updated
 index before changing snapshot files. The index and each snapshot have a 16 MiB
 size limit. Restore checks the snapshot ID, state schema, and inventory checksum
-before planning changes. Preview lists package changes in name order. A crash
-between snapshot and index publication can require recovery.
+before planning changes. Preview lists package changes in name order. A durable
+pending record lets the next snapshot command finish an interrupted create or delete.
+When a writer holds the index lock during recovery, retry after it finishes.
 
 ---
 

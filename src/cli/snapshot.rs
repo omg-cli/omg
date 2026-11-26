@@ -10,6 +10,8 @@ use crate::core::env::fingerprint::EnvironmentState;
 use crate::core::{paths, safe_ops};
 
 const MAX_SNAPSHOT_BYTES: u64 = 16 * 1024 * 1024;
+const PENDING_CREATE: &str = ".create.pending";
+const PENDING_DELETE: &str = ".delete.pending";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Snapshot {
@@ -24,12 +26,33 @@ struct SnapshotIndex {
     snapshots: Vec<SnapshotMeta>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct SnapshotMeta {
     id: String,
     message: Option<String>,
     created_at: i64,
     hash: String,
+}
+
+impl Snapshot {
+    fn metadata(&self) -> SnapshotMeta {
+        SnapshotMeta {
+            id: self.id.clone(),
+            message: self.message.clone(),
+            created_at: self.created_at,
+            hash: self.state.hash.clone(),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct SnapshotDeletion {
+    id: String,
+}
+
+enum SnapshotUpdate {
+    Create(SnapshotMeta),
+    Delete(SnapshotDeletion),
 }
 
 fn snapshots_dir() -> PathBuf {
@@ -86,7 +109,8 @@ fn load_index_for_update() -> Result<(fs::File, SnapshotIndex)> {
             return Err(error).context("Failed to acquire snapshot index lock");
         }
     }
-    let index = load_index()?;
+    let mut index = load_index()?;
+    recover_pending(&directory, &mut index)?;
     Ok((lock, index))
 }
 
@@ -105,7 +129,149 @@ fn stage_index(index: &SnapshotIndex) -> Result<safe_ops::StagedFileWrite> {
         .context("Failed to stage snapshot index")
 }
 
+fn path_present(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => anyhow::bail!("Failed to inspect {}: {error}", path.display()),
+    }
+}
+
+fn recover_before_read() -> Result<()> {
+    let directory = snapshots_dir();
+    if path_present(&directory.join(PENDING_CREATE))?
+        || path_present(&directory.join(PENDING_DELETE))?
+    {
+        let (_lock, _) = load_index_for_update()?;
+    }
+    Ok(())
+}
+
+fn recover_pending(directory: &Path, index: &mut SnapshotIndex) -> Result<()> {
+    let creation = directory.join(PENDING_CREATE);
+    let deletion = directory.join(PENDING_DELETE);
+    let has_creation = path_present(&creation)?;
+    let has_deletion = path_present(&deletion)?;
+    anyhow::ensure!(
+        !(has_creation && has_deletion),
+        "Multiple pending snapshot updates require review"
+    );
+
+    let update = if has_creation {
+        let content =
+            safe_ops::read_bounded_regular_file(&creation, "Pending snapshot", MAX_SNAPSHOT_BYTES)?;
+        let snapshot: Snapshot =
+            serde_json::from_str(&content).context("Failed to parse pending snapshot")?;
+        let metadata = snapshot.metadata();
+        snapshot.state.verify_saved_inventory("Pending snapshot")?;
+        SnapshotUpdate::Create(metadata)
+    } else if has_deletion {
+        let content = safe_ops::read_bounded_regular_file(
+            &deletion,
+            "Pending snapshot deletion",
+            MAX_SNAPSHOT_BYTES,
+        )?;
+        SnapshotUpdate::Delete(
+            serde_json::from_str(&content).context("Failed to parse pending snapshot deletion")?,
+        )
+    } else {
+        return Ok(());
+    };
+    publish_update(directory, index, update, None)
+}
+
+// The index lock serializes both regular writes and recovery. Keep the durable
+// pending record until the snapshot and index are both visible and synced.
+fn publish_update(
+    directory: &Path,
+    index: &mut SnapshotIndex,
+    update: SnapshotUpdate,
+    new_record: Option<&[u8]>,
+) -> Result<()> {
+    let is_creation = matches!(update, SnapshotUpdate::Create(_));
+    let (id, pending_name) = match &update {
+        SnapshotUpdate::Create(entry) => (&entry.id, PENDING_CREATE),
+        SnapshotUpdate::Delete(entry) => (&entry.id, PENDING_DELETE),
+    };
+    validate_snapshot_id(id)?;
+    let path = directory.join(format!("{id}.json"));
+    let pending = directory.join(pending_name);
+    match update {
+        SnapshotUpdate::Create(entry) => {
+            let existing = index.snapshots.iter().find(|saved| saved.id == entry.id);
+            if new_record.is_some() {
+                anyhow::ensure!(
+                    existing.is_none() && !path_present(&path)?,
+                    "Snapshot '{}' already exists; refusing to overwrite it",
+                    entry.id
+                );
+            }
+            if let Some(saved) = existing {
+                anyhow::ensure!(
+                    *saved == entry,
+                    "Pending snapshot '{}' conflicts with the index",
+                    entry.id
+                );
+            } else {
+                index.snapshots.push(entry);
+            }
+        }
+        SnapshotUpdate::Delete(entry) => index.snapshots.retain(|saved| saved.id != entry.id),
+    }
+
+    let index_write = stage_index(index)?;
+    if let Some(content) = new_record {
+        anyhow::ensure!(
+            safe_ops::atomic_write_new_private_file(&pending, content)?,
+            "A snapshot update is already pending"
+        );
+    }
+
+    if is_creation {
+        link_pending_snapshot(&pending, &path)?;
+    } else if let Err(error) = fs::remove_file(&path)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(error).with_context(|| format!("Failed to remove snapshot {}", path.display()));
+    }
+    index_write
+        .publish()
+        .context("Failed to publish snapshot index")?;
+    fs::remove_file(&pending).context("Failed to clear pending snapshot update")?;
+    safe_ops::sync_parent_directory_sync(&pending)
+}
+
+fn link_pending_snapshot(pending: &Path, path: &Path) -> Result<()> {
+    match fs::hard_link(pending, path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let staged = safe_ops::read_bounded_regular_bytes(
+                pending,
+                "Pending snapshot",
+                MAX_SNAPSHOT_BYTES,
+            )?
+            .0;
+            let existing = safe_ops::read_bounded_regular_bytes(
+                path,
+                "Existing snapshot",
+                MAX_SNAPSHOT_BYTES,
+            )?
+            .0;
+            anyhow::ensure!(
+                staged == existing,
+                "Pending snapshot conflicts with existing file {}",
+                path.display()
+            );
+            Ok(())
+        }
+        Err(error) => {
+            Err(error).with_context(|| format!("Failed to publish snapshot {}", path.display()))
+        }
+    }
+}
+
 fn load_snapshot(path: &Path, id: &str) -> Result<EnvironmentState> {
+    recover_before_read()?;
     if let Err(error) = fs::symlink_metadata(path) {
         if error.kind() == std::io::ErrorKind::NotFound {
             anyhow::bail!("Snapshot '{id}' not found");
@@ -135,7 +301,6 @@ pub async fn create(message: Option<String>) -> Result<()> {
     let (_index_lock, mut index) = load_index_for_update()?;
 
     let id = generate_snapshot_id();
-    let snapshot_path = snapshots_dir().join(format!("{id}.json"));
     let snapshot = Snapshot {
         id: id.clone(),
         message: message.clone(),
@@ -143,21 +308,13 @@ pub async fn create(message: Option<String>) -> Result<()> {
         state,
     };
 
-    index.snapshots.push(SnapshotMeta {
-        id: id.clone(),
-        message: message.clone(),
-        created_at: snapshot.created_at,
-        hash: snapshot.state.hash.clone(),
-    });
     let content = encode_snapshot_file(&snapshot, "Snapshot file")?;
-    let index_write = stage_index(&index)?;
-    anyhow::ensure!(
-        safe_ops::atomic_write_new_private_file(&snapshot_path, &content)?,
-        "Snapshot '{id}' already exists; refusing to overwrite it"
-    );
-    index_write
-        .publish()
-        .context("Failed to publish snapshot index")?;
+    publish_update(
+        &snapshots_dir(),
+        &mut index,
+        SnapshotUpdate::Create(snapshot.metadata()),
+        Some(&content),
+    )?;
 
     println!("  {} Snapshot created!", style::positive("✓"));
     println!("  ID: {}", style::accent(&id));
@@ -179,6 +336,7 @@ pub async fn create(message: Option<String>) -> Result<()> {
 pub fn list() -> Result<()> {
     println!("{} Snapshots\n", style::runtime("OMG"));
 
+    recover_before_read()?;
     let index = load_index()?;
 
     if index.snapshots.is_empty() {
@@ -222,15 +380,7 @@ pub fn list() -> Result<()> {
 
 /// Restore a snapshot
 pub async fn restore(id: &str, dry_run: bool, yes: bool) -> Result<()> {
-    // SECURITY: Validate snapshot ID
-    anyhow::ensure!(
-        !id.is_empty()
-            && id
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-'),
-        "Invalid snapshot ID: {}",
-        style::sanitize_terminal_text(id)
-    );
+    validate_snapshot_id(id)?;
 
     println!(
         "{} {} snapshot {}\n",
@@ -398,29 +548,28 @@ fn short_hash(hash: &str) -> String {
 
 /// Delete a snapshot
 pub fn delete(id: &str) -> Result<()> {
-    // SECURITY: Validate snapshot ID
-    anyhow::ensure!(
-        !id.is_empty()
-            && id
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-'),
-        "Invalid snapshot ID: {}",
-        style::sanitize_terminal_text(id)
-    );
+    validate_snapshot_id(id)?;
 
     let (_index_lock, mut index) = load_index_for_update()?;
-    let snapshot_path = snapshots_dir().join(format!("{id}.json"));
+    let directory = snapshots_dir();
+    let snapshot_path = directory.join(format!("{id}.json"));
+    let is_snapshot = match fs::symlink_metadata(&snapshot_path) {
+        Ok(metadata) => metadata.is_file() || metadata.file_type().is_symlink(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            anyhow::bail!("Snapshot '{id}' not found");
+        }
+        Err(error) => return Err(error).context("Failed to inspect snapshot before deletion"),
+    };
+    anyhow::ensure!(is_snapshot, "Snapshot '{id}' is not a regular file");
 
-    if !snapshot_path.exists() {
-        anyhow::bail!("Snapshot '{id}' not found");
-    }
-
-    index.snapshots.retain(|s| s.id != id);
-    let index_write = stage_index(&index)?;
-    fs::remove_file(&snapshot_path)?;
-    index_write
-        .publish()
-        .context("Failed to publish snapshot index")?;
+    let deletion = SnapshotDeletion { id: id.to_owned() };
+    let content = encode_snapshot_file(&deletion, "Pending snapshot deletion")?;
+    publish_update(
+        &directory,
+        &mut index,
+        SnapshotUpdate::Delete(deletion),
+        Some(&content),
+    )?;
 
     println!(
         "{} Deleted snapshot {}",
@@ -428,6 +577,19 @@ pub fn delete(id: &str) -> Result<()> {
         style::caution(id)
     );
 
+    Ok(())
+}
+
+fn validate_snapshot_id(id: &str) -> Result<()> {
+    anyhow::ensure!(
+        !id.is_empty()
+            && !id.eq_ignore_ascii_case("index")
+            && id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-'),
+        "Invalid snapshot ID: {}",
+        style::sanitize_terminal_text(id)
+    );
     Ok(())
 }
 

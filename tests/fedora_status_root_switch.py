@@ -4421,6 +4421,146 @@ for version in versions:
                 config.write_text(alternate_config)
 
 
+    def inspect_snapshot_recovery():
+        phase = "fedora-snapshot-recovery"
+        query = [dnf, "--cacheonly", "--setopt=disable_excludes=*",
+                 "repoquery", "--userinstalled", "--qf", r"%{name}\n"]
+        expected = sorted(set(ordinary_control(query).splitlines()))
+        assert expected == [package], expected
+        checksum = hashlib.sha256((";".join(expected) + ";").encode()).hexdigest()
+        state = dict(schema_version=1, runtimes={}, packages=expected, timestamp=0, hash=checksum)
+
+        def record(identifier, message):
+            return dict(id=identifier, message=message, created_at=0, state=state)
+
+        def metadata(snapshot):
+            return dict(id=snapshot["id"], message=snapshot["message"],
+                        created_at=snapshot["created_at"], hash=checksum)
+
+        def write(path, value):
+            path.write_bytes(json.dumps(value).encode())
+            path.chmod(0o600)
+            os.chown(path, account.pw_uid, account.pw_gid)
+
+        @contextmanager
+        def arrange(action, step):
+            with tempfile.TemporaryDirectory(prefix="snapshot-recovery-", dir=work) as directory:
+                data = Path(directory)
+                os.chown(data, account.pw_uid, account.pw_gid)
+                snapshots = data / "snapshots"
+                snapshots.mkdir(mode=0o700)
+                os.chown(snapshots, account.pw_uid, account.pw_gid)
+                index = snapshots / "index.json"
+                keep, target = record("keep", "keep snapshot"), record("target", "recovered snapshot")
+                write(snapshots / "keep.json", keep)
+                prepared = snapshots / f".{action}.pending"
+                stored = snapshots / "target.json"
+                if step != "finished":
+                    write(prepared, target if action == "create" else {"id": "target"})
+                if action == "create" and step != "prepared":
+                    if prepared.exists():
+                        os.link(prepared, stored)
+                    else:
+                        write(stored, target)
+                if action == "delete" and step == "prepared":
+                    write(stored, target)
+                rows = [metadata(keep)]
+                if (action == "create" and step in ("index-updated", "finished")
+                        or action == "delete" and step in ("prepared", "file-updated")):
+                    rows.append(metadata(target))
+                write(index, {"snapshots": rows})
+                return_env = dict(disabled, OMG_DATA_DIR=str(data))
+                yield snapshots, index, prepared, stored, target, return_env
+
+        operations = (
+            ("list", ["list"]),
+            ("restore", ["restore", "target", "--dry-run"]),
+            ("create", ["create", "-m", "next snapshot"]),
+            ("delete", ["delete", "keep"]),
+        )
+
+        for action in ("create", "delete"):
+            for step in ("prepared", "file-updated", "index-updated", "finished"):
+                for operation, args in operations:
+                    with arrange(action, step) as (snapshots, index, prepared, stored, target, recovery_env):
+                        result = command([cli, "snapshot", *args], recovery_env, ordinary, timeout=12)
+                        rows = json.loads(index.read_bytes())["snapshots"]
+                        ids = [row["id"] for row in rows]
+                        count = (operation != "delete") + (operation == "create") + (action == "create")
+                        expected_output = {
+                            "list": f"{count} snapshots total",
+                            "restore": "Environment already matches snapshot",
+                            "create": "Snapshot created!",
+                            "delete": "Deleted snapshot keep",
+                        }[operation]
+                        success = (result.returncode == 0 and expected_output in result.stdout
+                                   and not result.stderr)
+                        if operation == "list":
+                            success = success and ("recovered snapshot" in result.stdout) == (action == "create")
+                        if operation == "restore" and action == "delete":
+                            success = result.returncode != 0 and "not found" in result.stderr
+                        if action == "create":
+                            target_ok = (stored.is_file() and json.loads(stored.read_bytes()) == target
+                                         and any(row == metadata(target) for row in rows))
+                        else:
+                            target_ok = not stored.exists() and "target" not in ids
+                        observed = {entry.stem for entry in snapshots.glob("*.json") if entry != index}
+                        consistent = (observed == set(ids) and len(ids) == count
+                                      and ("keep" in ids) == (operation != "delete"))
+                        checks.append(dict(phase=phase, case=f"{action}-{step}-{operation}",
+                                           passed=success and target_ok and consistent and not prepared.exists(),
+                                           status=result.returncode, diagnostic=(result.stdout[-600:],
+                                               result.stderr[-700:], ids, sorted(observed), prepared.exists())))
+
+        for action in ("create", "delete"):
+            for operation, args in operations[:2]:
+                with arrange(action, "prepared") as (snapshots, index, prepared, stored, _, recovery_env):
+                    lock_path = snapshots / ".index.lock"
+                    lock_path.touch()
+                    os.chown(lock_path, account.pw_uid, account.pw_gid)
+                    original = index.read_bytes(), prepared.read_bytes(), stored.exists()
+                    with lock_path.open("r+b") as lock:
+                        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        result = command([cli, "snapshot", *args], recovery_env, ordinary, timeout=12)
+                    unchanged = original == (index.read_bytes(), prepared.read_bytes(), stored.exists())
+                    checks.append(dict(phase=phase, case=f"{action}-held-lock-{operation}",
+                                       passed=result.returncode != 0 and "mutation is running" in result.stderr
+                                       and unchanged, status=result.returncode,
+                                       diagnostic=(result.stdout[-600:], result.stderr[-700:])))
+
+        with arrange("create", "prepared") as (snapshots, index, prepared, stored, target, recovery_env):
+            write(stored, dict(target, message="different complete snapshot"))
+            original = index.read_bytes(), prepared.read_bytes(), stored.read_bytes()
+            result = command([cli, "snapshot", "list"], recovery_env, ordinary, timeout=12)
+            unchanged = original == (index.read_bytes(), prepared.read_bytes(), stored.read_bytes())
+            checks.append(dict(phase=phase, case="create-conflict-preserves-both-files",
+                               passed=result.returncode != 0 and "conflict" in result.stderr.lower() and unchanged,
+                               status=result.returncode, diagnostic=(result.stdout[-600:], result.stderr[-700:])))
+
+        with arrange("create", "prepared") as (snapshots, index, prepared, _, _, recovery_env):
+            deletion = snapshots / ".delete.pending"
+            write(deletion, {"id": "keep"})
+            original = index.read_bytes(), prepared.read_bytes(), deletion.read_bytes()
+            result = command([cli, "snapshot", "list"], recovery_env, ordinary, timeout=12)
+            unchanged = original == (index.read_bytes(), prepared.read_bytes(), deletion.read_bytes())
+            checks.append(dict(phase=phase, case="ambiguous-recovery-preserves-both-records",
+                               passed=result.returncode != 0 and "multiple pending" in result.stderr.lower() and unchanged,
+                               status=result.returncode, diagnostic=(result.stdout[-600:], result.stderr[-700:])))
+
+        for operation, args in (("restore", ["restore", "index", "--dry-run"]),
+                                ("delete", ["delete", "index"])):
+            with arrange("create", "finished") as (_, index, _, stored, _, recovery_env):
+                original = index.read_bytes(), stored.read_bytes()
+                result = command([cli, "snapshot", *args], recovery_env, ordinary, timeout=12)
+                checks.append(dict(phase=phase, case=f"reserved-id-{operation}",
+                                   passed=result.returncode != 0 and "Invalid snapshot ID" in result.stderr
+                                   and original == (index.read_bytes(), stored.read_bytes()),
+                                   status=result.returncode, diagnostic=(result.stdout[-600:],
+                                                                        result.stderr[-700:])))
+
+        assert sorted(set(ordinary_control(query).splitlines())) == expected
+
+
     def inspect_task_environment_bytes():
         phase = "task-environment-bytes"
         raw = b"test-\xff-value"
@@ -7154,6 +7294,7 @@ exec {shlex.quote(str(binary))} "$@"
                     inspect_info_attempts()
                     inspect_migration()
                     inspect_snapshots()
+                    inspect_snapshot_recovery()
                 config.write_text(host_config)
                 inspect("returned-host", host_count, host_explicit, host=True)
                 mark_progress("root switch and return")
@@ -7465,6 +7606,6 @@ mark_progress("completed with host inventory unchanged")
 report = dict(binaries=binaries, checks=checks, total=len(checks),
               passed=sum(entry["passed"] for entry in checks), host_unchanged=True)
 print(json.dumps(report))
-expected_checks = 303 if consent_oracle is None else 2394
+expected_checks = 303 if consent_oracle is None else 2434
 if report["passed"] != report["total"] or report["total"] != expected_checks:
     sys.exit(4)
