@@ -198,6 +198,7 @@ pub fn execute_native_omarchy_operation(
             super::get_update_list()?
                 .into_iter()
                 .map(|item| PackageChange {
+                    architecture: None,
                     name: item.name,
                     old_version: Some(item.old_version),
                     new_version: Some(item.new_version),
@@ -219,6 +220,7 @@ pub fn execute_native_omarchy_operation(
                 })?)
             };
             changes.push(PackageChange {
+                architecture: None,
                 name: name.clone(),
                 old_version: previous
                     .as_ref()
@@ -766,6 +768,7 @@ fn orphan_history_change(
     old_version: Option<String>,
 ) -> crate::core::history::PackageChange {
     crate::core::history::PackageChange {
+        architecture: None,
         name,
         old_version,
         new_version: None,

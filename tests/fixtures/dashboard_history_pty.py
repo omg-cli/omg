@@ -17,22 +17,34 @@ binary = sys.argv[1]
 mode = sys.argv[2] if len(sys.argv) > 2 else "history"
 data = Path(os.environ["OMG_DATA_DIR"])
 package = "omg-history-lock-fixture"
-if mode == "history":
+
+
+def write_history():
     (data / "history.json").write_text(json.dumps([{
         "id": "history-lock-fixture",
         "timestamp": "2026-01-01T00:00:00Z",
         "transaction_type": "Install",
         "success": True,
-        "changes": [{"name": package, "new_version": "1", "source": "local"}],
+        "changes": [
+            {"name": package, "architecture": architecture, "new_version": "1", "source": "dnf"}
+            for architecture in ("i686", "x86_64")
+        ],
     }]), encoding="utf-8")
 
-with (data / "history.lock").open("wb") as lock:
+
+if mode == "history":
+    write_history()
+
+history_lock = data / "history.lock"
+lock_context = contextlib.nullcontext() if mode == "visibility" else history_lock.open("wb")
+with lock_context as lock:
     if mode == "history":
         fcntl.flock(lock, fcntl.LOCK_EX)
     pid, terminal = pty.fork()
     if pid == 0:
         fcntl.ioctl(0, termios.TIOCSWINSZ, struct.pack("HHHH", 45, 160, 0, 0))
-        os.execv(binary, [binary, "dash"])
+        command = ["team", "dashboard"] if mode == "visibility" else ["dash"]
+        os.execv(binary, [binary, *command])
 
     transcript = bytearray()
     cursor_replies = 0
@@ -70,11 +82,29 @@ with (data / "history.lock").open("wb") as lock:
             time.sleep(0.25)
             fcntl.flock(lock, fcntl.LOCK_UN)
             os.write(terminal, b"5")
-            read_until(package.encode())
+            read_until(f"{package}.i686, {package}.x86_64".encode())
 
             fcntl.flock(lock, fcntl.LOCK_EX)
             os.write(terminal, b"r")
             time.sleep(0.25)
+        elif mode == "visibility":
+            read_until(b"Not in a team workspace")
+            os.write(terminal, b"5")
+            read_until(b"No activity recorded yet")
+            assert not history_lock.exists()
+            tab_started = len(transcript)
+            os.write(terminal, b"3")
+            read_until(b"Runtimes", tab_started)
+            write_history()
+            os.write(terminal, b"r")
+            quiet_until = time.monotonic() + 1
+            while time.monotonic() < quiet_until:
+                read_output(0.05)
+                assert not history_lock.exists(), "Runtimes refresh opened package history"
+            tab_started = len(transcript)
+            os.write(terminal, b"5")
+            read_until(f"{package}.i686, {package}.x86_64".encode(), tab_started)
+            assert history_lock.exists(), "entering Activity did not load the new history"
         else:
             assert mode == "action"
             read_until(b"Updates unknown")

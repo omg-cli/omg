@@ -930,7 +930,10 @@ pub struct UpdateInfo {
     pub repo: String,
 }
 
-pub(crate) fn update_package_name<'a>(name: &'a str, architecture: Option<&str>) -> Cow<'a, str> {
+pub(crate) fn qualified_package_name<'a>(
+    name: &'a str,
+    architecture: Option<&str>,
+) -> Cow<'a, str> {
     match architecture {
         Some(architecture) => Cow::Owned(format!("{name}.{architecture}")),
         None => Cow::Borrowed(name),
