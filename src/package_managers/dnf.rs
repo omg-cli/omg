@@ -30,6 +30,8 @@ use crate::package_managers::types::{
 
 mod catalog_cache;
 mod install_reasons;
+#[cfg(unix)]
+mod native_journal;
 mod rpm_database;
 mod rpm_evr;
 
@@ -418,6 +420,52 @@ pub(crate) struct InstalledPackageDetails {
     pub(crate) version: String,
     pub(crate) identity: String,
     pub(crate) reason: String,
+}
+
+struct NativeHistoryCursor {
+    id: u64,
+    #[cfg(unix)]
+    sqlite: Option<native_journal::Position>,
+}
+
+impl NativeHistoryCursor {
+    async fn capture() -> Result<Self> {
+        #[cfg(unix)]
+        if let Some(sqlite) = tokio::task::spawn_blocking(native_journal::Position::capture).await?
+        {
+            return Ok(Self {
+                id: sqlite.id(),
+                sqlite: Some(sqlite),
+            });
+        }
+
+        let id = DnfPackageManager::native_history(None)
+            .await?
+            .iter()
+            .map(|transaction| transaction.id)
+            .max()
+            .unwrap_or(0);
+        Ok(Self {
+            id,
+            #[cfg(unix)]
+            sqlite: None,
+        })
+    }
+
+    async fn observe(self, comment: &str) -> Result<NativeOutcome> {
+        #[cfg(unix)]
+        if let Some(sqlite) = self.sqlite {
+            let query_comment = comment.to_owned();
+            if let Some(transactions) =
+                tokio::task::spawn_blocking(move || sqlite.observe(&query_comment)).await??
+            {
+                return DnfPackageManager::native_outcome(&transactions, comment);
+            }
+        }
+
+        let transactions = DnfPackageManager::native_history(Some(self.id)).await?;
+        DnfPackageManager::native_outcome(&transactions, comment)
+    }
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -2635,18 +2683,10 @@ impl DnfPackageManager {
         else {
             return operation(None).await;
         };
-        let before = Self::native_history(None)
-            .await?
-            .iter()
-            .map(|transaction| transaction.id)
-            .max()
-            .unwrap_or(0);
+        let before = NativeHistoryCursor::capture().await?;
         let comment = format!("omg-{}", uuid::Uuid::new_v4());
         let operation = operation(Some(format!("--comment={comment}"))).await;
-        let observed = match Self::native_history(Some(before)).await {
-            Ok(transactions) => Self::native_outcome(&transactions, &comment),
-            Err(error) => Err(error),
-        };
+        let observed = before.observe(&comment).await;
         // Observing a non-terminal journal row must not initiate another
         // package mutation. A redo would need its own correlation and native
         // state proof, plus explicit confirmation/elevation/deadline policy.

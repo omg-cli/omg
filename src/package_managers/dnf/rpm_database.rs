@@ -62,7 +62,12 @@ impl RpmDatabase {
                 None,
             ));
         }
-        let config = if uses_default_paths(include_state_dir) {
+        let extra = if include_state_dir {
+            ["system_state_dir"].as_slice()
+        } else {
+            &[]
+        };
+        let config = if uses_default_paths(extra) {
             None
         } else {
             Some(read_dnf_settings_with(&["--cacheonly"], run)?)
@@ -81,14 +86,25 @@ impl RpmDatabase {
     }
 }
 
-fn uses_default_paths(include_state_dir: bool) -> bool {
+#[cfg(unix)]
+pub(super) fn uses_default_journal() -> bool {
+    uses_default_paths(&[
+        "system_state_dir",
+        "transaction_history_dir",
+        "history_record",
+        "use_host_config",
+        "persistence",
+    ])
+}
+
+fn uses_default_paths(extra: &[&str]) -> bool {
     let mut candidates = CONFIG_DROP_INS.iter().map(Path::new);
     let mut plugin_configs = PLUGIN_CONFIGS.iter().map(Path::new);
-    !can_configure_paths(Path::new("/etc/dnf/dnf.conf"), include_state_dir)
+    !can_configure_paths(Path::new("/etc/dnf/dnf.conf"), extra)
         && candidates.all(|dir| {
             !directory_has(dir, |path| {
                 path.extension().is_some_and(|ext| ext == "conf")
-                    && can_configure_paths(path, include_state_dir)
+                    && can_configure_paths(path, extra)
             })
         })
         && plugin_configs.all(|dir| {
@@ -105,7 +121,7 @@ fn directory_has(dir: &Path, matches: impl Fn(&Path) -> bool) -> bool {
     }
 }
 
-fn can_configure_paths(path: &Path, include_state_dir: bool) -> bool {
+fn can_configure_paths(path: &Path, extra: &[&str]) -> bool {
     const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
     let metadata = match fs::metadata(path) {
         Ok(metadata) => metadata,
@@ -134,7 +150,7 @@ fn can_configure_paths(path: &Path, include_state_dir: bool) -> bool {
                 | "pluginpath"
                 | "pluginconfpath"
                 | "plugin_conf_dir"
-        ) || (include_state_dir && key == "system_state_dir")
+        ) || extra.contains(&key)
     })
 }
 
@@ -274,12 +290,12 @@ mod tests {
     fn installed_root_scan_detects_configuration_overrides() -> Result<()> {
         let fixture = tempfile::tempdir()?;
         let config = fixture.path().join("dnf.conf");
-        assert!(!can_configure_paths(&config, false));
+        assert!(!can_configure_paths(&config, &[]));
         fs::write(
             &config,
             "[main]\n# installroot = /imaginary\nreposdir=/repo\n",
         )?;
-        assert!(!can_configure_paths(&config, false));
+        assert!(!can_configure_paths(&config, &[]));
         for option in [
             "installroot",
             "config_file_path",
@@ -287,13 +303,13 @@ mod tests {
             "plugin_conf_dir",
         ] {
             fs::write(&config, format!("[main]\n  {option} = /override\n"))?;
-            assert!(can_configure_paths(&config, false), "missing {option}");
+            assert!(can_configure_paths(&config, &[]), "missing {option}");
         }
         fs::write(&config, "[main]\nsystem_state_dir=/state\n")?;
-        assert!(!can_configure_paths(&config, false));
-        assert!(can_configure_paths(&config, true));
+        assert!(!can_configure_paths(&config, &[]));
+        assert!(can_configure_paths(&config, &["system_state_dir"]));
         fs::write(&config, [0xff])?;
-        assert!(can_configure_paths(&config, false));
+        assert!(can_configure_paths(&config, &[]));
         Ok(())
     }
 
