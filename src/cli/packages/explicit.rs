@@ -121,11 +121,12 @@ pub fn explicit_sync_with_json(count: bool, json: bool) -> Result<()> {
 
     #[cfg(feature = "fedora")]
     if backend == crate::package_managers::Backend::Fedora {
-        let packages: Vec<String> =
-            crate::package_managers::dnf::DnfPackageManager::read_user_installed_names()
-                .context("Failed to list explicitly installed Fedora packages")?
-                .into_iter()
-                .collect();
+        let packages: Vec<String> = crate::cli::tea::run_blocking_future(
+            crate::package_managers::dnf::DnfPackageManager::read_user_installed_names(),
+        )?
+        .context("Failed to list explicitly installed Fedora packages")?
+        .into_iter()
+        .collect();
         return if count {
             print_count(packages.len(), json)
         } else {

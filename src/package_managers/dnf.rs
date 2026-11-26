@@ -54,8 +54,6 @@ mod rpm_tags {
 pub struct DnfPackageManager {
     /// Path to RPM `SQLite` database
     rpm_db_path: PathBuf,
-    /// Path to yum repository configuration (used by the `dnf` CLI)
-    repos_dir: PathBuf,
     /// Complete RPM inventory bound to database/WAL identity and SQLite commits.
     /// Install reasons belong to DNF's separate state and are queried on demand.
     installed_cache: Arc<RwLock<Option<InstalledSnapshot>>>,
@@ -453,16 +451,6 @@ struct VersionedPackage {
     repository: String,
 }
 
-impl VersionedPackage {
-    fn full_nevra(&self) -> String {
-        let epoch = if self.version.contains(':') { "" } else { "0:" };
-        format!(
-            "{}-{epoch}{}.{}",
-            self.name, self.version, self.architecture
-        )
-    }
-}
-
 struct PlannedDnfAdvisories;
 
 enum AdvisoryLookup<'a> {
@@ -839,7 +827,6 @@ impl DnfPackageManager {
     pub fn new() -> Self {
         Self {
             rpm_db_path: PathBuf::from("/var/lib/rpm/rpmdb.sqlite"),
-            repos_dir: PathBuf::from("/etc/yum.repos.d"),
             installed_cache: Arc::new(RwLock::new(None)),
         }
     }
@@ -987,10 +974,7 @@ impl DnfPackageManager {
     }
 
     async fn current_explicit_package_names(packages: &[InstalledPackage]) -> Result<Vec<String>> {
-        let user_installed = tokio::task::spawn_blocking(Self::read_user_installed_names)
-            .await
-            .context("DNF install-reason worker failed")?;
-        Self::explicit_package_names(packages, user_installed)
+        Self::explicit_package_names(packages, Self::read_user_installed_names().await)
     }
 
     /// Read RPM database, trying `SQLite` first then falling back to subprocess
@@ -1030,10 +1014,13 @@ impl DnfPackageManager {
     /// Fallback for systems without `SQLite` RPM database (`BerkeleyDB`, `NDB`).
     fn read_rpm_via_query() -> Result<Vec<InstalledPackage>> {
         let output = crate::core::privilege::system_command("rpm")?
+            // Match the system inventory used by the direct database reader.
+            .env("HOME", "/")
+            .env("LC_ALL", "C")
             .args([
                 "-qa",
                 "--queryformat",
-                "%{NAME}\t%{VERSION}\t%{RELEASE}\t%{SUMMARY}\t%{EPOCHNUM}\t%{ARCH}\n",
+                "%{NAME}\t%{VERSION}\t%{RELEASE}\t%{EPOCHNUM}\t%{ARCH}\t%{SUMMARY}\n",
             ])
             .output()
             .context("Failed to execute rpm -qa")?;
@@ -1072,31 +1059,25 @@ impl DnfPackageManager {
     /// names concatenate into one row.
     const USER_INSTALLED_QUERY_FORMAT: &str = "%{name}\\n";
 
-    pub(crate) fn read_user_installed_names() -> Result<HashSet<String>> {
-        // Installation reasons are local DNF state. Keep this read offline and
-        // include packages hidden by repository exclude rules.
-        let output = crate::core::privilege::system_command("dnf")?
-            .args([
-                "--cacheonly",
-                "--disable-repo=*",
-                "--setopt=disable_excludes=*",
-                "repoquery",
-                "--userinstalled",
-                "--qf",
-                Self::USER_INSTALLED_QUERY_FORMAT,
-            ])
-            .output()
-            .context("Failed to execute dnf repoquery --userinstalled")?;
-        if !output.status.success() {
-            let stderr =
-                crate::cli::style::sanitize_terminal_text(&String::from_utf8_lossy(&output.stderr));
-            anyhow::bail!("dnf repoquery --userinstalled failed: {}", stderr.trim());
-        }
-        Self::parse_user_installed_names(&output.stdout)
+    pub(crate) async fn read_user_installed_names() -> Result<HashSet<String>> {
+        // --userinstalled reads the system repo only. An unmatched repo glob
+        // would reject a valid local inventory on a host with no configured repos.
+        let mut command =
+            tokio::process::Command::from(crate::core::privilege::system_command("dnf")?);
+        command.stderr(std::process::Stdio::piped()).args([
+            "--cacheonly",
+            "--setopt=disable_excludes=*",
+            "repoquery",
+            "--userinstalled",
+            "--qf",
+            Self::USER_INSTALLED_QUERY_FORMAT,
+        ]);
+        Self::parse_user_installed_names(&Self::query_output(command).await?)
     }
 
     fn parse_rpm_qa_line(line: &str) -> Result<InstalledPackage> {
-        let fields: Vec<&str> = line.split('\t').collect();
+        // The free-form summary can contain tabs, so keep the final field intact.
+        let fields: Vec<&str> = line.splitn(6, '\t').collect();
         if fields.len() != 6 {
             anyhow::bail!(
                 "malformed rpm -qa output: expected 6 fields, got {}",
@@ -1104,17 +1085,17 @@ impl DnfPackageManager {
             );
         }
 
-        let epoch: u32 = fields[4].parse().context("Malformed RPM epoch")?;
+        let epoch: u32 = fields[3].parse().context("Malformed RPM epoch")?;
         let missing = |value: &str| value.is_empty() || value == "(none)";
         anyhow::ensure!(
             ![fields[0], fields[1], fields[2]].into_iter().any(missing),
             "Incomplete package identity in rpm -qa output"
         );
-        let architecture = if missing(fields[5]) {
+        let architecture = if missing(fields[4]) {
             anyhow::ensure!(fields[0] == "gpg-pubkey", "RPM architecture is missing");
             String::new()
         } else {
-            fields[5].to_owned()
+            fields[4].to_owned()
         };
         Ok(InstalledPackage {
             name: fields[0].to_string(),
@@ -1125,7 +1106,7 @@ impl DnfPackageManager {
             },
             release: fields[2].to_string(),
             architecture,
-            summary: fields[3].to_string(),
+            summary: fields[5].to_owned(),
         })
     }
 
@@ -1718,10 +1699,36 @@ impl DnfPackageManager {
     }
 
     async fn controlled_query_output(
+        command: tokio::process::Command,
+        deadline: std::time::Duration,
+        cancelled: Option<tokio::sync::oneshot::Receiver<()>>,
+    ) -> Result<Vec<u8>> {
+        let output = Self::capture_query(command, deadline, cancelled).await?;
+        Self::require_query_success(&output)?;
+        Ok(output.stdout)
+    }
+
+    fn require_query_success(output: &std::process::Output) -> Result<()> {
+        if output.status.success() {
+            return Ok(());
+        }
+        let diagnostics = String::from_utf8_lossy(&output.stderr);
+        if let Some(detail) = diagnostics
+            .lines()
+            .map(str::trim)
+            .rfind(|line| !line.is_empty())
+        {
+            let detail = crate::cli::style::sanitize_terminal_text(detail);
+            anyhow::bail!("DNF query failed: {}: {detail}", output.status);
+        }
+        anyhow::bail!("DNF query failed: {}", output.status);
+    }
+
+    async fn capture_query(
         mut command: tokio::process::Command,
         deadline: std::time::Duration,
         mut cancelled: Option<tokio::sync::oneshot::Receiver<()>>,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<std::process::Output> {
         use tokio::io::AsyncReadExt;
         const MAX_OUTPUT_BYTES: u64 = 64 * 1024 * 1024;
         const MAX_DIAGNOSTIC_BYTES: u64 = 64 * 1024;
@@ -1767,21 +1774,13 @@ impl DnfPackageManager {
                     }
                     Ok(bytes)
                 };
-                let (bytes, diagnostics) = tokio::try_join!(output, diagnostics)?;
+                let (stdout, stderr) = tokio::try_join!(output, diagnostics)?;
                 let status = child.wait().await.context("Could not wait for DNF query")?;
-                if !status.success() {
-                    let diagnostics = String::from_utf8_lossy(&diagnostics);
-                    if let Some(detail) = diagnostics
-                        .lines()
-                        .map(str::trim)
-                        .rfind(|line| !line.is_empty())
-                    {
-                        let detail = crate::cli::style::sanitize_terminal_text(detail);
-                        anyhow::bail!("DNF query failed: {status}: {detail}");
-                    }
-                    anyhow::bail!("DNF query failed: {status}");
-                }
-                Ok(bytes)
+                Ok(std::process::Output {
+                    status,
+                    stdout,
+                    stderr,
+                })
             };
             let cancellation = async {
                 match cancelled {
@@ -2777,7 +2776,6 @@ impl DnfPackageManager {
     fn cache_handle(&self) -> Self {
         Self {
             rpm_db_path: self.rpm_db_path.clone(),
-            repos_dir: self.repos_dir.clone(),
             installed_cache: Arc::clone(&self.installed_cache),
         }
     }
@@ -2800,12 +2798,38 @@ impl DnfPackageManager {
             .collect())
     }
 
-    pub(crate) async fn orphan_builds() -> Result<Vec<String>> {
-        Ok(Self::unneeded_packages()
-            .await?
-            .iter()
-            .map(VersionedPackage::full_nevra)
-            .collect())
+    pub(crate) async fn preview_orphan_cleanup() -> Result<(String, String)> {
+        let mut command =
+            tokio::process::Command::from(crate::core::privilege::system_command("dnf")?);
+        command
+            .env("LC_ALL", "C")
+            .stderr(std::process::Stdio::piped())
+            .args([
+                "--cacheonly",
+                "--color=never",
+                "--setopt=assumeyes=false",
+                "--assumeno",
+                "autoremove",
+            ]);
+        let output = Self::capture_query(command, std::time::Duration::from_mins(1), None).await?;
+        Self::orphan_cleanup_preview_output(&output)
+    }
+
+    fn orphan_cleanup_preview_output(output: &std::process::Output) -> Result<(String, String)> {
+        let plan = String::from_utf8_lossy(&output.stdout);
+        let diagnostics = String::from_utf8_lossy(&output.stderr);
+        // DNF5 exits 1 after displaying a nonempty plan that --assumeno declined.
+        if output.status.code() == Some(1)
+            && !plan.trim().is_empty()
+            && let Some(prefix) = diagnostics
+                .trim_end()
+                .strip_suffix("Operation aborted by the user.")
+            && (prefix.is_empty() || prefix.ends_with('\n'))
+        {
+            return Ok((plan.into_owned(), prefix.trim_end().to_owned()));
+        }
+        Self::require_query_success(output)?;
+        Ok((plan.into_owned(), diagnostics.into_owned()))
     }
 
     pub(crate) async fn cleanup(
@@ -2885,7 +2909,6 @@ impl PackageManager for DnfPackageManager {
             // packages. Installed inventory needs no repository metadata.
             command.args([
                 "--cacheonly",
-                "--disable-repo=*",
                 "--setopt=disable_excludes=*",
                 "repoquery",
                 "--installed",
@@ -4168,7 +4191,9 @@ mod tests {
         let candidate = DnfPackageManager::parse_available_upgrades(
             b"Available upgrades\nlib.compat.noarch   2:1-1   updates\n",
         )?;
-        assert_eq!(candidate[0].full_nevra(), "lib.compat-2:1-1.noarch");
+        assert_eq!(candidate[0].name, "lib.compat");
+        assert_eq!(candidate[0].version, "2:1-1");
+        assert_eq!(candidate[0].architecture, "noarch");
         assert_eq!(candidate[0].repository, "updates");
         for invalid in [
             b"Unexpected heading".as_slice(),
@@ -5060,6 +5085,42 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn orphan_cleanup_preview_preserves_plan_and_protected_package_diagnostics() -> Result<()> {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        let output = |code, stdout: &str, stderr: &str| std::process::Output {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: stderr.as_bytes().to_vec(),
+        };
+        let preview = DnfPackageManager::orphan_cleanup_preview_output;
+        let protected = "Unneeded protected package: leaf-0:1-1.noarch";
+        assert_eq!(
+            preview(&output(0, "Nothing to do.\n", protected))?,
+            ("Nothing to do.\n".into(), protected.into())
+        );
+
+        let plan = "Removing:\n leaf noarch 0:1-1\n";
+        let abort = "Operation aborted by the user.\n";
+        let diagnostics = format!("{protected}\n{abort}");
+        assert_eq!(
+            preview(&output(1, plan, &diagnostics))?,
+            (plan.into(), protected.into())
+        );
+
+        for failure in [
+            output(7, plan, abort),
+            output(1, "", abort),
+            output(1, plan, "Failed to resolve the transaction\n"),
+            output(1, plan, &format!("Invalid diagnostic: {abort}")),
+        ] {
+            assert!(preview(&failure).is_err());
+        }
+        Ok(())
+    }
+
     #[tokio::test]
     async fn stored_query_cancellation_reaps_child_before_removing_private_namespace() -> Result<()>
     {
@@ -5788,12 +5849,13 @@ mod tests {
     #[test]
     fn test_parse_rpm_qa_line_reads_installed_package() {
         let pkg = DnfPackageManager::parse_rpm_qa_line(
-            "bash\t5.2.15\t1.fc39\tThe GNU Bourne Again shell\t0\tx86_64",
+            "bash\t5.2.15\t1.fc39\t0\tx86_64\tThe GNU Bourne Again shell\twith completion",
         )
         .expect("valid rpm -qa line");
         assert_eq!(pkg.name, "bash");
         assert_eq!(pkg.version, "5.2.15");
         assert_eq!(pkg.architecture, "x86_64");
+        assert_eq!(pkg.summary, "The GNU Bourne Again shell\twith completion");
     }
 
     #[test]
@@ -5815,8 +5877,8 @@ mod tests {
 
     #[test]
     fn rpm_query_rejects_incomplete_installed_identity() {
-        let complete = ["bash", "5.2.15", "1.fc39", "GNU shell", "0", "x86_64"];
-        for field in [0, 1, 2, 5] {
+        let complete = ["bash", "5.2.15", "1.fc39", "0", "x86_64", "GNU shell"];
+        for field in [0, 1, 2, 4] {
             for missing in ["", "(none)"] {
                 let mut fields = complete;
                 fields[field] = missing;
@@ -5855,7 +5917,7 @@ mod tests {
         ]);
         let stored_key = DnfPackageManager::parse_package_from_blob(&header)?;
         let queried_key = DnfPackageManager::parse_rpm_qa_line(
-            "gpg-pubkey\t3b94a80e\t6665a2fc\tOpenPGP key\t0\t(none)",
+            "gpg-pubkey\t3b94a80e\t6665a2fc\t0\t(none)\tOpenPGP key",
         )?;
         for key in [stored_key, queried_key] {
             assert_eq!(key.identity(), "gpg-pubkey");
@@ -6015,6 +6077,6 @@ mod tests {
 #[test]
 fn ordinary_rpm_inventory_preserves_epoch() {
     let package =
-        DnfPackageManager::parse_rpm_qa_line("example\t1.0\t1.fc44\tsummary\t2\tx86_64").unwrap();
+        DnfPackageManager::parse_rpm_qa_line("example\t1.0\t1.fc44\t2\tx86_64\tsummary").unwrap();
     assert_eq!(package.version, "2:1.0");
 }

@@ -442,11 +442,11 @@ type StatusSnapshot = (
 /// A missing daemon or binary cache falls back to a direct query, but a failed
 /// direct query is an error rather than a fake "healthy" zero report.
 fn read_status_snapshot() -> Result<StatusSnapshot> {
-    crate::package_managers::resolve_backend()?;
+    let backend = crate::package_managers::resolve_backend()?;
     // Use the same isolated fixture as JSON and async status. Native fast
     // readers may provide their own fixed test records and must not override
     // the explicit adapter (or read a real daemon cache in root-run tests).
-    if crate::core::paths::test_mode() {
+    if backend == crate::package_managers::Backend::Mock {
         let counts = crate::package_managers::get_system_status()?;
         return Ok((counts.0, counts.1, counts.2, counts.3, None, None));
     }
@@ -454,7 +454,9 @@ fn read_status_snapshot() -> Result<StatusSnapshot> {
     // ULTRA FAST: Try binary status file first (zero IPC, sub-ms). The path is
     // environment-selected, so read through the same parent-directory
     // validation the daemon applies before binding (csf_fdd4999c).
-    if let Some(fast) = crate::core::fast_status::FastStatus::read_default() {
+    if backend != crate::package_managers::Backend::Fedora
+        && let Some(fast) = crate::core::fast_status::FastStatus::read_default()
+    {
         return Ok((
             fast.total_packages as usize,
             fast.explicit_packages as usize,
@@ -479,7 +481,17 @@ fn read_status_snapshot() -> Result<StatusSnapshot> {
 
     // Try the daemon on Unix, then fall back to the platform's direct query.
     #[cfg(unix)]
-    if let Ok(mut client) = crate::core::client::SyncDaemonClient::acquire()
+    let daemon = match backend {
+        #[cfg(feature = "fedora")]
+        crate::package_managers::Backend::Fedora => {
+            crate::core::client::SyncDaemonClient::acquire_with_timeout(
+                std::time::Duration::from_millis(500),
+            )
+        }
+        _ => crate::core::client::SyncDaemonClient::acquire(),
+    };
+    #[cfg(unix)]
+    if let Ok(mut client) = daemon
         && let Ok(crate::daemon::protocol::ResponseResult::Status(res)) =
             client.call(&crate::daemon::protocol::Request::Status { id: 0 })
     {
@@ -492,6 +504,12 @@ fn read_status_snapshot() -> Result<StatusSnapshot> {
             Some(res.runtime_versions),
         ));
     }
+
+    #[cfg(feature = "fedora")]
+    anyhow::ensure!(
+        backend != crate::package_managers::Backend::Fedora,
+        "Fedora status requires a live DNF query"
+    );
 
     #[cfg(any(feature = "debian", feature = "debian-pure"))]
     if crate::core::env::distro::is_debian_like() {

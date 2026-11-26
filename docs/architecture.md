@@ -126,6 +126,8 @@ The unprivileged audit log defaults to `~/.local/share/omg/audit/audit.jsonl`; r
 
 Every five minutes the daemon probes installed runtime versions, refreshes vulnerability counts where that scan is supported, updates the in-memory status cache, writes `omg.status`, and atomically replaces the JSON status snapshot. Arch advisory matching applies to Arch packages.
 
+Fedora status reads current package counts from RPM and DNF. The daemon can reuse advisory coverage while the RPM inventory matches the scanned inventory. `omg status --fast` queries only the installed and explicitly installed counts on Fedora.
+
 On SIGINT or SIGTERM the daemon finishes active client requests, stops workers, stops accepting connections, removes the socket, and exits. Restart it with `omg daemon`. Derived caches fill again as requests arrive.
 
 ## Related pages

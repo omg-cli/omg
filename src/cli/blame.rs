@@ -132,8 +132,7 @@ fn build_blame_output(package: &str) -> Result<Cmd<()>> {
 }
 
 fn transaction_history(package: &str) -> Result<Vec<Cmd<()>>> {
-    let history = HistoryManager::new()?;
-    let transactions = history.load()?;
+    let transactions = HistoryManager::load_existing()?;
     Ok(history_report(&transactions, package))
 }
 

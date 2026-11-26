@@ -452,7 +452,7 @@ check_doctor_native_backend() {
           return 2
         fi
         local dnf_exec_line
-        if ! dnf_exec_line=$(grep -Em 1 'execve\("(/usr/bin|/usr/sbin)/dnf5", \["[^"]+", "--cacheonly", "--disable-repo=\*", "check"\], .*\) = 0$' "$exec_receipt"); then
+        if ! dnf_exec_line=$(grep -Em 1 'execve\("(/usr/bin|/usr/sbin)/dnf5", \["[^"]+", "--cacheonly", "check"\], .*\) = 0$' "$exec_receipt"); then
           printf 'assertion failed: doctor did not execute the trusted offline DNF5 package database check\n' >&2
           return 1
         fi
