@@ -987,9 +987,11 @@ impl DnfPackageManager {
     }
 
     async fn current_explicit_package_names(packages: &[InstalledPackage]) -> Result<Vec<String>> {
-        let user_installed = tokio::task::spawn_blocking(Self::read_user_installed_names)
+        let mut command = tokio::process::Command::from(Self::user_installed_command()?);
+        command.stderr(std::process::Stdio::piped());
+        let user_installed = Self::query_output(command)
             .await
-            .context("DNF install-reason worker failed")?;
+            .and_then(|output| Self::parse_user_installed_names(&output));
         Self::explicit_package_names(packages, user_installed)
     }
 
@@ -1072,19 +1074,24 @@ impl DnfPackageManager {
     /// names concatenate into one row.
     const USER_INSTALLED_QUERY_FORMAT: &str = "%{name}\\n";
 
-    pub(crate) fn read_user_installed_names() -> Result<HashSet<String>> {
+    fn user_installed_command() -> Result<std::process::Command> {
         // Installation reasons are local DNF state. Keep this read offline and
         // include packages hidden by repository exclude rules.
-        let output = crate::core::privilege::system_command("dnf")?
-            .args([
-                "--cacheonly",
-                "--disable-repo=*",
-                "--setopt=disable_excludes=*",
-                "repoquery",
-                "--userinstalled",
-                "--qf",
-                Self::USER_INSTALLED_QUERY_FORMAT,
-            ])
+        let mut command = crate::core::privilege::system_command("dnf")?;
+        command.args([
+            "--cacheonly",
+            "--disable-repo=*",
+            "--setopt=disable_excludes=*",
+            "repoquery",
+            "--userinstalled",
+            "--qf",
+            Self::USER_INSTALLED_QUERY_FORMAT,
+        ]);
+        Ok(command)
+    }
+
+    pub(crate) fn read_user_installed_names() -> Result<HashSet<String>> {
+        let output = Self::user_installed_command()?
             .output()
             .context("Failed to execute dnf repoquery --userinstalled")?;
         if !output.status.success() {
