@@ -58,9 +58,9 @@ prove that no package change occurred.
 
 ## How the file is maintained
 
-- **Bounded live file.** The live file is capped at 1,000 entries
-  (`MAX_HISTORY_TRANSACTIONS`). Retired entries move to a sibling JSONL archive rather than
-  being dropped, so older transactions remain readable.
+- **Bounded live file.** When the live file would exceed 1,000 entries, OMG keeps the newest
+  900 in the live file and moves older entries to the sibling JSONL archive. The archive
+  preserves every retired transaction.
 - **Atomic writes.** The live file is replaced through a temporary file and a rename, so a
   reader never sees a half-written file.
 - **Cross-process locking.** A sibling lock coordinates readers and writers, so two OMG
