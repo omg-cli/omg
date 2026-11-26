@@ -3434,6 +3434,165 @@ exit 95
                 decline_system_update(tool)
 
 
+    def inspect_install_picker():
+        import errno
+        import pty
+        import select
+        import struct
+        import termios
+
+        phase = "fedora-install-picker"
+        identity = f"{package}.noarch"
+        queries = (
+            ("name", package, "install", True),
+            ("alias", package, "i", True),
+            ("info", package, "info", True),
+            ("uppercase", package.upper(), "install", True),
+            ("qualified", identity, "install", True),
+            ("prefix", "^omg-observer", "install", True),
+            ("suffix", "observer-fixture.noarch$", "install", True),
+            ("absent", "no-such-fixture-zz", "install", False),
+        )
+
+        with tempfile.TemporaryDirectory(prefix="install-picker-", dir=root) as directory:
+            here = Path(directory)
+            here.chmod(0o755)
+            target = Path(dnf).resolve(strict=True)
+            native = here / target.name
+            shutil.copy2(target, native)
+            witness = here / "queries"
+            witness.touch(mode=0o600)
+            os.chown(witness, account.pw_uid, account.pw_gid)
+            tracker = here / "dnf-track"
+            tracker.write_text(f"""#!/usr/bin/bash
+available=0
+format=
+for argument in "$@"; do
+    case "$argument" in
+        --available) available=1 ;;
+        '%{{name}}.%{{arch}}'*) format="$argument" ;;
+    esac
+done
+if [[ "$available" == 1 && -n "$format" ]]; then
+    if [[ "$format" == '%{{name}}.%{{arch}}'$'\\036' ]]; then
+        printf 'names\\n' >> {shlex.quote(str(witness))}
+    else
+        printf 'rich\\n' >> {shlex.quote(str(witness))}
+    fi
+fi
+exec {shlex.quote(str(native))} "$@"
+""")
+            tracker.chmod(0o755)
+            terminal_env = dict(disabled, TERM="xterm-256color")
+
+            def run_picker(keys, expect_selection, wait_for_no_match):
+                child, master = pty.fork()
+                if child == 0:
+                    fcntl.ioctl(0, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 100, 0, 0))
+                    os.chown(os.ttyname(0), account.pw_uid, account.pw_gid)
+                    os.setgroups([])
+                    os.setgid(account.pw_gid)
+                    os.setuid(account.pw_uid)
+                    os.chdir(work)
+                    os.execve(cli, [str(cli), "install", "--dry-run"], terminal_env)
+
+                output = bytearray()
+                sent = False
+                cancelled_empty_result = False
+                status = None
+                try:
+                    deadline = time.monotonic() + 10
+                    while time.monotonic() < deadline:
+                        if not select.select([master], [], [], 0.05)[0]:
+                            continue
+                        try:
+                            chunk = os.read(master, 8192)
+                        except OSError as error:
+                            if error.errno == errno.EIO:
+                                break
+                            raise
+                        if not chunk:
+                            break
+                        output.extend(chunk)
+                        assert len(output) <= 262144
+                        if not sent and b"\x1b[?25l" in output:
+                            os.write(master, keys)
+                            sent = True
+                        if (wait_for_no_match and not cancelled_empty_result
+                                and re.search(rb"No(?:\x1b\[[0-9;]*H| )matching(?:\x1b\[[0-9;]*H| )packages", output)):
+                            os.write(master, b"\x1b")
+                            cancelled_empty_result = True
+                    while time.monotonic() < deadline:
+                        reaped, result = os.waitpid(child, os.WNOHANG)
+                        if reaped == child:
+                            status = os.waitstatus_to_exitcode(result)
+                            break
+                        time.sleep(0.01)
+                finally:
+                    os.close(master)
+                    if status is None:
+                        try:
+                            os.kill(child, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                        os.waitpid(child, 0)
+                text = output.decode(errors="replace")
+                restored = b"\x1b[?1049l" in output
+                if expect_selection:
+                    outcome = ("Install Preview" in text and identity in text
+                               and "No changes will be made (dry run)" in text)
+                else:
+                    outcome = ("Installation cancelled" in text and "Install Preview" not in text
+                               and (not wait_for_no_match or cancelled_empty_result))
+                return status, restored, status == 0 and sent and restored and outcome, text
+
+            checked(["/usr/bin/mount", "--bind", tracker, target])
+            try:
+                for label, configuration, repository, visible in (
+                    ("host", host_config, repo_config, True),
+                    ("installroot", alternate_config, repo_config, True),
+                    ("excluded", host_config, repo_config + f"excludepkgs={package}\n", False),
+                ):
+                    config.write_text(configuration)
+                    repo_file.write_text(repository)
+                    refresh_fixture()
+
+                    for name, query, command_name, has_match in queries:
+                        cursor = len(witness.read_text().splitlines())
+                        result = command([cli, "complete", "--shell", "bash", "--current", query,
+                                          "--last", command_name, "--full", f"omg {command_name}"],
+                                         disabled, ordinary)
+                        evidence = witness.read_text().splitlines()[cursor:]
+                        expected = [identity] if visible and has_match else []
+                        correct = result.returncode == 0 and result.stdout.splitlines() == expected
+                        checks.append(dict(phase=phase, case=f"{label}-complete-{name}",
+                                           status=result.returncode, behavior=correct, queries=evidence,
+                                           passed=correct and evidence == ["names"],
+                                           diagnostic=(result.stdout + result.stderr)[-1000:]))
+
+                    typed = package.encode()
+                    for name, keys, may_select in (
+                        ("escape", b"\x1b", False),
+                        ("interrupt", typed + b"\x03", False),
+                        ("dry-run", typed + b"\r", True),
+                        ("backspace-dry-run", typed + b"z\x7f\r", True),
+                    ):
+                        cursor = len(witness.read_text().splitlines())
+                        status, restored, correct, output = run_picker(keys, visible and may_select,
+                                                                      not visible and may_select)
+                        evidence = witness.read_text().splitlines()[cursor:]
+                        checks.append(dict(phase=phase, case=f"{label}-tty-{name}", status=status,
+                                           behavior=correct, restored=restored, queries=evidence,
+                                           passed=correct and evidence[:1] == ["names"]
+                                           and evidence.count("names") == 1,
+                                           diagnostic=output[-1600:]))
+            finally:
+                checked(["/usr/bin/umount", target])
+                config.write_text(host_config)
+                repo_file.write_text(repo_config)
+                refresh_fixture()
+
+
     def inspect_task_environment_bytes():
         phase = "task-environment-bytes"
         raw = b"test-\xff-value"
@@ -6105,6 +6264,8 @@ exec {shlex.quote(str(binary))} "$@"
                     restore_test_summary(original)
 
             refresh_fixture()
+            if consent_oracle is not None:
+                inspect_install_picker()
             host_explicit = len(set(ordinary_control([dnf, "--cacheonly", "--setopt=disable_excludes=*",
                                                       "repoquery", "--userinstalled", "--qf", r"%{name}\n"]).splitlines()))
             assert host_count > 1 and host_explicit > 1
@@ -6471,6 +6632,6 @@ mark_progress("completed with host inventory unchanged")
 report = dict(binaries=binaries, checks=checks, total=len(checks),
               passed=sum(entry["passed"] for entry in checks), host_unchanged=True)
 print(json.dumps(report))
-expected_checks = 303 if consent_oracle is None else 2168
+expected_checks = 303 if consent_oracle is None else 2204
 if report["passed"] != report["total"] or report["total"] != expected_checks:
     sys.exit(4)

@@ -142,22 +142,24 @@ async fn complete_package_names(
 }
 
 pub(crate) async fn available_package_names() -> Result<Vec<String>> {
-    let backend = crate::package_managers::resolve_backend()?;
+    use crate::package_managers::{Backend, get_package_manager, resolve_backend};
+
+    let backend = resolve_backend()?;
     // Official lookup failures fail closed; AUR names remain optional enrichment.
-    let names = if matches!(
-        backend,
-        crate::package_managers::Backend::Fedora
-            | crate::package_managers::Backend::MacOS
-            | crate::package_managers::Backend::Mock
-    ) {
-        crate::package_managers::get_package_manager()?
+    let names = match backend {
+        #[cfg(feature = "fedora")]
+        Backend::Fedora => {
+            crate::package_managers::DnfPackageManager::new()
+                .package_names()
+                .await?
+        }
+        Backend::MacOS | Backend::Mock => get_package_manager()?
             .package_index()
             .await?
             .into_iter()
             .map(|package| package.name)
-            .collect()
-    } else {
-        tokio::task::spawn_blocking(official_package_names).await??
+            .collect(),
+        _ => tokio::task::spawn_blocking(official_package_names).await??,
     };
     let names = catalog_completion_names(backend, names);
 

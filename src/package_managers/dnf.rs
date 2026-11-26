@@ -50,6 +50,17 @@ pub(crate) use tests::search_parity_data;
 const MAX_QUERY_BYTES: u64 = 64 * 1024 * 1024;
 const REPOSITORY_RECORD_SEPARATOR: char = '\x1e';
 
+fn validate_repository_package_name(name: &str) -> Result<()> {
+    anyhow::ensure!(
+        !name.is_empty()
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"+._-".contains(&byte)),
+        "DNF repository row has invalid package name"
+    );
+    Ok(())
+}
+
 struct AvailablePackageRow<'a> {
     name: &'a str,
     version: &'a str,
@@ -62,13 +73,7 @@ impl<'a> AvailablePackageRow<'a> {
         let name = fields.next().context("DNF repository row has no name")?;
         let version = fields.next().context("DNF repository row has no version")?;
         let summary = fields.next().context("DNF repository row has no summary")?;
-        anyhow::ensure!(
-            !name.is_empty()
-                && name
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || b"+._-".contains(&byte)),
-            "DNF repository row has invalid package name"
-        );
+        validate_repository_package_name(name)?;
         anyhow::ensure!(
             !version.is_empty() && !version.chars().any(char::is_whitespace),
             "DNF repository row has invalid version"
@@ -399,6 +404,7 @@ impl InstalledPackage {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RepositoryQuery<'a> {
     Available(Option<&'a str>),
+    AvailableNames,
     Installed,
     Upgrades,
     Unneeded,
@@ -1549,17 +1555,30 @@ impl DnfPackageManager {
         Ok(packages)
     }
 
-    fn available_package_rows(
-        output: &[u8],
-    ) -> Result<impl Iterator<Item = Result<AvailablePackageRow<'_>>>> {
+    fn repository_records(output: &[u8]) -> Result<impl Iterator<Item = &str>> {
         let text = std::str::from_utf8(output).context("DNF repository output is not UTF-8")?;
         anyhow::ensure!(
             text.is_empty() || text.ends_with(REPOSITORY_RECORD_SEPARATOR),
             "DNF repository row has no record terminator"
         );
-        Ok(text
-            .split_terminator(REPOSITORY_RECORD_SEPARATOR)
-            .map(AvailablePackageRow::parse))
+        Ok(text.split_terminator(REPOSITORY_RECORD_SEPARATOR))
+    }
+
+    fn available_package_rows(
+        output: &[u8],
+    ) -> Result<impl Iterator<Item = Result<AvailablePackageRow<'_>>>> {
+        Ok(Self::repository_records(output)?.map(AvailablePackageRow::parse))
+    }
+
+    pub(crate) async fn package_names(&self) -> Result<Vec<String>> {
+        let installed = self.load_installed_packages().await?;
+        let output = Self::repository_output(RepositoryQuery::AvailableNames).await?;
+        let mut names: Vec<_> = installed.iter().map(InstalledPackage::identity).collect();
+        for name in Self::repository_records(&output)? {
+            validate_repository_package_name(name)?;
+            names.push(name.to_owned());
+        }
+        Ok(names)
     }
 
     fn parse_available_packages(output: &[u8]) -> Result<Vec<Package>> {
@@ -1870,6 +1889,7 @@ impl DnfPackageManager {
     fn repository_query_format(query: &RepositoryQuery<'_>) -> &'static str {
         match query {
             RepositoryQuery::Available(_) => "%{name}.%{arch}\t%{evr}\t%{summary}\x1e",
+            RepositoryQuery::AvailableNames => "%{name}.%{arch}\x1e",
             RepositoryQuery::InstalledSizes(_) => "%{full_nevra}\t%{installsize}\\n",
             RepositoryQuery::InstalledReasons(_) => "%{full_nevra}\t%{reason}\\n",
             RepositoryQuery::InstalledDetails(_) => "%{name}\t%{evr}\t%{full_nevra}\t%{reason}\\n",
@@ -1901,7 +1921,7 @@ impl DnfPackageManager {
     fn repository_query_args(query: RepositoryQuery<'_>) -> Result<Vec<String>> {
         let query_format = Self::repository_query_format(&query);
         let selection = match query {
-            RepositoryQuery::Available(_) => "--available",
+            RepositoryQuery::Available(_) | RepositoryQuery::AvailableNames => "--available",
             RepositoryQuery::Installed
             | RepositoryQuery::InstalledSizes(_)
             | RepositoryQuery::InstalledReasons(_)
@@ -1932,11 +1952,17 @@ impl DnfPackageManager {
         args.extend(["repoquery", selection, "--queryformat", query_format].map(str::to_owned));
         if matches!(
             query,
-            RepositoryQuery::Available(_) | RepositoryQuery::Installed | RepositoryQuery::Upgrades
+            RepositoryQuery::Available(_)
+                | RepositoryQuery::AvailableNames
+                | RepositoryQuery::Installed
+                | RepositoryQuery::Upgrades
         ) {
             args.push("--latest-limit=1".to_owned());
         }
-        if matches!(query, RepositoryQuery::Available(_)) {
+        if matches!(
+            query,
+            RepositoryQuery::Available(_) | RepositoryQuery::AvailableNames
+        ) {
             args.push(format!("--arch={},noarch", std::env::consts::ARCH));
         }
         let package = match query {
@@ -1953,7 +1979,8 @@ impl DnfPackageManager {
                 args.push(format!("--whatrequires={package}"));
                 None
             }
-            RepositoryQuery::Installed
+            RepositoryQuery::AvailableNames
+            | RepositoryQuery::Installed
             | RepositoryQuery::Upgrades
             | RepositoryQuery::Unneeded
             | RepositoryQuery::InstalledSizes(InstalledSizeQuery::All) => None,
@@ -4530,6 +4557,7 @@ mod tests {
         let queries = [
             RepositoryQuery::Available(None),
             RepositoryQuery::Available(Some("tree")),
+            RepositoryQuery::AvailableNames,
             RepositoryQuery::Installed,
             RepositoryQuery::Upgrades,
             RepositoryQuery::Unneeded,
@@ -4541,9 +4569,10 @@ mod tests {
         ];
         for query in &queries {
             let format = DnfPackageManager::repository_query_format(query);
-            assert!(
+            assert_eq!(
                 format.contains('\t'),
-                "dnf5 needs real TAB separators: {format:?}"
+                !matches!(query, RepositoryQuery::AvailableNames),
+                "dnf5 needs real TAB separators between fields: {format:?}"
             );
             assert!(
                 !format.contains('\n'),
@@ -4551,7 +4580,9 @@ mod tests {
             );
             assert!(
                 match query {
-                    RepositoryQuery::Available(_) => format.ends_with(REPOSITORY_RECORD_SEPARATOR),
+                    RepositoryQuery::Available(_) | RepositoryQuery::AvailableNames => {
+                        format.ends_with(REPOSITORY_RECORD_SEPARATOR)
+                    }
                     _ => format.ends_with("\\n"),
                 },
                 "dnf5 row terminator does not match its parser: {format:?}"
