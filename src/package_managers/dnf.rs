@@ -3152,7 +3152,8 @@ impl DnfPackageManager {
 
         let targets = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
         crate::core::security::audit::record_operation("dnf", &targets, "attempt")?;
-        let status = cmd.args(args).status()?;
+        cmd.args(args);
+        let status = Self::run_native_command(cmd)?;
         crate::core::security::audit::record_operation(
             "dnf",
             &targets,
@@ -3169,6 +3170,98 @@ impl DnfPackageManager {
         } else {
             anyhow::bail!("dnf command failed with status {status}")
         }
+    }
+
+    /// Run a foreground DNF transaction on its blocking owner. Leave the
+    /// native input and output streams connected for prompts and progress.
+    pub(crate) fn run_native_command(
+        command: std::process::Command,
+    ) -> std::io::Result<std::process::ExitStatus> {
+        std::thread::Builder::new()
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?;
+                runtime.block_on(Self::native_command_status(command.into()))
+            })?
+            .join()
+            .map_err(|_| std::io::Error::other("DNF command owner panicked"))?
+    }
+
+    async fn native_command_status(
+        mut command: tokio::process::Command,
+    ) -> std::io::Result<std::process::ExitStatus> {
+        let mut child = command.stderr(std::process::Stdio::piped()).spawn()?;
+        let stderr = child.stderr.take().expect("DNF stderr is piped");
+        #[cfg(unix)]
+        let forward = {
+            use nix::sys::signal::{SigSet, Signal};
+            // Only the relay thread blocks SIGPIPE. DNF has already spawned,
+            // and the thread exits without unblocking a pending write signal.
+            let mut signals = SigSet::empty();
+            signals.add(Signal::SIGPIPE);
+            signals.thread_block().is_ok()
+        };
+        #[cfg(not(unix))]
+        let forward = true;
+        let diagnostics = Self::forward_native_diagnostics(stderr, forward);
+        tokio::pin!(diagnostics);
+        let (status, diagnostic_result) = tokio::select! {
+            result = &mut diagnostics => (child.wait().await?, result),
+            status = child.wait() => {
+                // A descendant can inherit stderr after DNF itself has exited.
+                let result = tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    &mut diagnostics,
+                ).await.unwrap_or(Ok(()));
+                (status?, result)
+            }
+        };
+        if let Err(error) = diagnostic_result {
+            tracing::debug!(%error, "Could not forward DNF diagnostics");
+        }
+        Ok(status)
+    }
+
+    async fn forward_native_diagnostics(
+        mut stderr: tokio::process::ChildStderr,
+        forward: bool,
+    ) -> std::io::Result<()> {
+        use std::io::Write as _;
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+
+        if !forward {
+            tokio::io::copy(&mut stderr, &mut tokio::io::sink()).await?;
+            return Ok(());
+        }
+        const MAX_LINE_BYTES: u64 = 64 * 1024;
+        let mut reader = BufReader::new(stderr);
+        let mut terminal = std::io::stderr();
+        let mut line = Vec::new();
+        let mut discarding_line = false;
+        loop {
+            line.clear();
+            let count = (&mut reader)
+                .take(MAX_LINE_BYTES + 1)
+                .read_until(b'\n', &mut line)
+                .await?;
+            if count == 0 {
+                break;
+            }
+            if discarding_line || count as u64 > MAX_LINE_BYTES {
+                discarding_line = !line.ends_with(b"\n");
+                continue;
+            }
+            let raw = String::from_utf8_lossy(&line);
+            let mut safe = Self::safe_query_diagnostic(raw.trim_end_matches(['\r', '\n']));
+            safe.push('\n');
+            if terminal.write_all(safe.as_bytes()).is_err() {
+                // A closed log sink cannot interrupt a running transaction.
+                tokio::io::copy(&mut reader, &mut tokio::io::sink()).await?;
+                return Ok(());
+            }
+        }
+        terminal.flush()
     }
 }
 
@@ -5454,6 +5547,37 @@ mod tests {
                 .to_string()
                 .contains("DNF query failed")
         );
+    }
+
+    #[tokio::test]
+    async fn native_command_does_not_wait_for_descendants_stderr() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let pid_file = fixture.path().join("child.pid");
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .args([
+                "-c",
+                "sleep 10 & printf '%s\\n' \"$!\" > \"$1\"; exit 7",
+                "--",
+            ])
+            .arg(&pid_file);
+        let status = tokio::time::timeout(
+            std::time::Duration::from_secs(4),
+            tokio::task::spawn_blocking(move || DnfPackageManager::run_native_command(command)),
+        )
+        .await;
+        let child_pid: i32 = std::fs::read_to_string(pid_file)?.trim().parse()?;
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(child_pid),
+            nix::sys::signal::Signal::SIGTERM,
+        );
+        assert_eq!(
+            status
+                .context("DNF did not return after the owned command exited")???
+                .code(),
+            Some(7)
+        );
+        Ok(())
     }
 
     #[tokio::test]
