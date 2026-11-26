@@ -13,6 +13,8 @@ import unittest
 import zipfile
 from unittest.mock import patch
 
+import github_artifact_transport as transport
+
 SPEC = importlib.util.spec_from_file_location(
     'native_build', Path(__file__).with_name('native-build-artifact.py'))
 BUILD = importlib.util.module_from_spec(SPEC)
@@ -415,8 +417,8 @@ class NativeBuildAdmission(unittest.TestCase):
         path = 'repos/omg-cli/omg/actions/artifacts/123/zip'
         timeout = subprocess.TimeoutExpired(['gh', 'api', path], 90)
         response = b'HTTP/1.1 200 OK\r\n\r\nverified bundle'
-        limit = BUILD.MAX_DOWNLOAD + BUILD.MAX_HTTP_HEADERS
-        with patch.object(BUILD, 'api', side_effect=[timeout, response]) as request, \
+        limit = BUILD.MAX_DOWNLOAD + transport.MAX_HTTP_HEADERS
+        with patch.object(transport, 'api', side_effect=[timeout, response]) as request, \
                 patch.object(BUILD.time, 'sleep') as sleep:
             self.assertEqual(BUILD.download_artifact(path), b'verified bundle')
         self.assertEqual(request.call_count, 2)
@@ -424,7 +426,7 @@ class NativeBuildAdmission(unittest.TestCase):
         self.assertTrue(request.call_args.kwargs['include_status'])
         sleep.assert_called_once_with(1)
 
-        with patch.object(BUILD, 'api', side_effect=timeout) as request, \
+        with patch.object(transport, 'api', side_effect=timeout) as request, \
                 patch.object(BUILD.time, 'sleep') as sleep:
             with self.assertRaises(subprocess.TimeoutExpired):
                 BUILD.download_artifact(path)
@@ -432,7 +434,7 @@ class NativeBuildAdmission(unittest.TestCase):
         self.assertEqual([call.args for call in sleep.call_args_list], [(1,), (2,)])
 
         rejected = subprocess.CalledProcessError(22, ['gh', 'api', path])
-        with patch.object(BUILD, 'api', side_effect=rejected) as request:
+        with patch.object(transport, 'api', side_effect=rejected) as request:
             with self.assertRaises(subprocess.CalledProcessError):
                 BUILD.download_artifact(path)
         self.assertEqual(request.call_count, 1)
@@ -612,7 +614,7 @@ class NativeBuildAdmission(unittest.TestCase):
                                GITHUB_RUN_ATTEMPT=str(run['run_attempt']))
                 event = {'number': 440, 'pull_request': {'head': {'sha': 'c'*40}}}
                 response = b'HTTP/1.1 200 OK\r\n\r\n' + data
-                with patch.object(BUILD, 'api_json', side_effect=lookup), patch.object(BUILD, 'api', return_value=response), \
+                with patch.object(BUILD, 'api_json', side_effect=lookup), patch.object(transport, 'api', return_value=response), \
                         patch.object(BUILD, 'command_output', return_value='a'*40), patch.object(BUILD.time, 'sleep'), \
                         patch.object(BUILD.time, 'monotonic', side_effect=range(0, 10000, 100)):
                     if mode in ('valid', 'in-progress', 'queued', 'queued-artifact',
@@ -737,7 +739,7 @@ class NativeBuildAdmission(unittest.TestCase):
                                GITHUB_RUN_ATTEMPT=str(selected_run['run_attempt']))
                 event = {'number': 440, 'pull_request': {'head': {'sha': 'c'*40}}}
                 response = b'HTTP/1.1 200 OK\r\n\r\n' + data
-                with patch.object(BUILD, 'api_json', side_effect=lookup), patch.object(BUILD, 'api', return_value=response), \
+                with patch.object(BUILD, 'api_json', side_effect=lookup), patch.object(transport, 'api', return_value=response), \
                         patch.object(BUILD, 'command_output', return_value='a'*40), patch.object(BUILD.time, 'sleep'), \
                         patch.object(BUILD.time, 'monotonic', side_effect=range(0, 10000, 100)):
                     if mode == 'valid':
