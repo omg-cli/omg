@@ -12,7 +12,7 @@ pub use crate::package_managers::types::UpdateInfo as UpdateEntry;
 /// Every frame is `[u32 LE version][bitcode payload]`. Peers reject frames
 /// whose version differs instead of attempting a decode that could
 /// silently mis-map same-shaped variants.
-pub const PROTOCOL_VERSION: u32 = 7;
+pub const PROTOCOL_VERSION: u32 = 8;
 
 /// Frame layout error for [`encode_frame`] / [`split_frame`].
 #[derive(Debug, thiserror::Error)]
@@ -448,6 +448,7 @@ pub struct StatusMetadata {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusAdvisorySummary {
     pub installed_packages: usize,
+    pub inventory_fingerprint: [u8; 32],
     pub findings: usize,
     pub unknown_packages: usize,
 }

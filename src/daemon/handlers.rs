@@ -1531,12 +1531,14 @@ async fn handle_status_metadata(state: &DaemonState, id: RequestId) -> Response 
     let rpm_advisories = if state.uses_rpm_catalog()
         && let Some((cached, observation)) = state.cache.observed_status()
         && let Some((findings, unknown_packages)) = cached.scanned_vulnerability_summary()
+        && let Some(inventory_fingerprint) = observation.rpm_inventory_fingerprint()
         && state
             .observed_rpm_status_is_current(&cached, observation)
             .await
     {
         Some(StatusAdvisorySummary {
             installed_packages: cached.total_packages,
+            inventory_fingerprint,
             findings,
             unknown_packages,
         })
@@ -2026,6 +2028,13 @@ pub(super) mod tests {
             );
             Ok(self.revision.load(Ordering::Acquire) == self.observed)
         }
+
+        #[cfg(feature = "fedora")]
+        fn rpm_inventory_fingerprint(&self) -> Option<[u8; 32]> {
+            let mut fingerprint = [0; 32];
+            fingerprint[..8].copy_from_slice(&self.observed.to_be_bytes());
+            Some(fingerprint)
+        }
     }
 
     impl PackageManager for InfoSelectionBackend {
@@ -2328,6 +2337,10 @@ pub(super) mod tests {
             .await?
             .rpm_advisories
             .context("current inventory should carry its advisory summary")?;
+        assert_eq!(
+            Some(advisory.inventory_fingerprint),
+            observation.rpm_inventory_fingerprint()
+        );
         assert_eq!(
             (
                 advisory.installed_packages,

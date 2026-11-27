@@ -213,6 +213,10 @@ impl super::InstalledCatalogObservation for RpmInstalledCatalogObservation {
         Ok(self.source.sqlite_path()?.as_ref() == Some(&self.path)
             && self.database.is_current(&self.path))
     }
+
+    fn rpm_inventory_fingerprint(&self) -> Option<[u8; 32]> {
+        Some(self.database.inventory_fingerprint)
+    }
 }
 
 impl RpmDatabaseObservation {
@@ -1033,6 +1037,34 @@ impl DnfPackageManager {
     async fn load_installed_packages(&self) -> Result<Arc<Vec<InstalledPackage>>> {
         let manager = self.cache_handle();
         tokio::task::spawn_blocking(move || manager.load_installed_packages_blocking()).await?
+    }
+
+    pub(crate) async fn status_with_inventory(
+        &self,
+        fast: bool,
+    ) -> Result<(PackageStatus, Option<[u8; 32]>)> {
+        let installed = self.load_installed_packages().await?;
+        let inventory_fingerprint = self
+            .cache_read()
+            .as_ref()
+            .filter(|snapshot| Arc::ptr_eq(&snapshot.packages, &installed))
+            .map(|snapshot| snapshot.observation.inventory_fingerprint);
+        let reasons = Self::current_explicit_package_names(&installed);
+        let (explicit, maintenance) = if fast {
+            (reasons.await?, None)
+        } else {
+            let (explicit, orphans, updates) =
+                tokio::try_join!(reasons, Self::orphan_count(), Self::update_count())?;
+            (explicit, Some((orphans, updates)))
+        };
+        Ok((
+            PackageStatus {
+                total: installed.len(),
+                explicit: explicit.len(),
+                maintenance,
+            },
+            inventory_fingerprint,
+        ))
     }
 
     fn load_installed_packages_blocking(&self) -> Result<Arc<Vec<InstalledPackage>>> {
@@ -4118,22 +4150,9 @@ impl PackageManager for DnfPackageManager {
         fast: bool,
     ) -> Pin<Box<dyn Future<Output = Result<PackageStatus>> + Send + '_>> {
         Box::pin(async move {
-            let installed = self.load_installed_packages().await?;
-            let total = installed.len();
-            let reasons = Self::current_explicit_package_names(&installed);
-            let (explicit, maintenance) = if fast {
-                (reasons.await?, None)
-            } else {
-                let (explicit, orphans, updates) =
-                    tokio::try_join!(reasons, Self::orphan_count(), Self::update_count())?;
-                (explicit, Some((orphans, updates)))
-            };
-
-            Ok(PackageStatus {
-                total,
-                explicit: explicit.len(),
-                maintenance,
-            })
+            self.status_with_inventory(fast)
+                .await
+                .map(|(status, _)| status)
         })
     }
 
