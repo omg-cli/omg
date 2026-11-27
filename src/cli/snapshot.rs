@@ -168,7 +168,12 @@ pub async fn create(message: Option<String>) -> Result<()> {
         }
     }
 
-    save_index(&index_path, index_content)?;
+    save_index(&index_path, index_content).with_context(|| {
+        format!(
+            "Could not confirm the index update for snapshot '{id}'. \
+             Recover the saved snapshot with `omg snapshot restore {id}`"
+        )
+    })?;
 
     println!("  {} Snapshot created!", style::positive("✓"));
     println!("  ID: {}", style::accent(&id));
@@ -421,16 +426,29 @@ pub fn delete(id: &str) -> Result<()> {
 
     let (_index_lock, mut index) = load_index_for_update()?;
     let snapshot_path = snapshots_dir().join(format!("{id}.json"));
+    let has_payload = match fs::symlink_metadata(&snapshot_path) {
+        Ok(metadata) => {
+            anyhow::ensure!(!metadata.is_dir(), "Snapshot '{id}' path is a directory");
+            true
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error.into()),
+    };
+    let entries_before = index.snapshots.len();
+    index.snapshots.retain(|snapshot| snapshot.id != id);
+    let listed = index.snapshots.len() != entries_before;
+    anyhow::ensure!(has_payload || listed, "Snapshot '{id}' not found");
 
-    if !snapshot_path.exists() {
-        anyhow::bail!("Snapshot '{id}' not found");
+    // Commit the index first so a failed write cannot discard the saved file.
+    if listed {
+        let index_path = index_path();
+        let index_content = encode_index(&index, &index_path)?;
+        save_index(&index_path, index_content)?;
     }
-
-    index.snapshots.retain(|s| s.id != id);
-    let index_path = index_path();
-    let index_content = encode_index(&index, &index_path)?;
-    fs::remove_file(&snapshot_path)?;
-    save_index(&index_path, index_content)?;
+    if has_payload {
+        fs::remove_file(&snapshot_path)?;
+        crate::core::safe_ops::sync_parent_directory_sync(&snapshot_path)?;
+    }
 
     println!(
         "{} Deleted snapshot {}",
