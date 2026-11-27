@@ -765,11 +765,12 @@ fn installed_tool_names_in(tools_dir: &Path) -> Result<Vec<String>> {
 
 fn installed_tool_locations(tools_dir: &Path) -> Result<BTreeMap<PathBuf, String>> {
     let mut installations = BTreeMap::new();
-    let tools_dir = match tools_dir.canonicalize() {
-        Ok(path) => path,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(installations),
-        Err(error) => return Err(error).context("Failed to resolve managed tools directory"),
-    };
+    if !inspect_managed_tool_dir(tools_dir)? {
+        return Ok(installations);
+    }
+    let tools_dir = tools_dir
+        .canonicalize()
+        .context("Failed to resolve managed tools directory")?;
     let mut legacy_registry_paths = std::collections::HashSet::new();
 
     for (name, _, _, _) in TOOL_REGISTRY {
@@ -889,8 +890,6 @@ pub async fn install(name: &str) -> Result<()> {
     );
 
     let (tools_dir, bin_dir) = get_dirs();
-    crate::core::paths::create_private_data_directory(&tools_dir)?;
-    crate::core::paths::create_private_data_directory(&bin_dir)?;
 
     // 1. Check Registry
     if let Some(resolved) = find_registry_entry(name) {
@@ -959,7 +958,28 @@ enum ManagedToolChange<'a> {
     Update(&'a str),
 }
 
+fn inspect_managed_tool_dir(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            anyhow::ensure!(
+                metadata.is_dir(),
+                "Refusing unsafe managed tool directory: {}",
+                path.display()
+            );
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "Failed to inspect managed tool directory {}",
+                path.display()
+            )
+        }),
+    }
+}
+
 fn lock_managed_tool_storage(tools_dir: &Path) -> Result<crate::runtimes::common::RuntimeLease> {
+    inspect_managed_tool_dir(tools_dir)?;
     crate::runtimes::common::try_lock_runtime_file(tools_dir, ".mutation.lock")
         .context("Could not lock managed tool storage")
 }
@@ -1042,6 +1062,8 @@ async fn change_managed_with_advisories(
         let _permit = permit;
         let outcome = (|| {
             let _lease = lock_managed_tool_storage(&tools_dir)?;
+            inspect_managed_tool_dir(&bin_dir)?;
+            inspect_managed_tool_dir(&tools_dir.join(&manager))?;
             if updating {
                 require_managed_tool_installation(&tools_dir, &manager, &pkg, &install_name)?;
             }
@@ -1104,11 +1126,12 @@ fn install_managed_blocking(
     // Stage the new version in a hidden sibling directory so a failed install
     // never destroys the previously working tool (W4-A-01): the old install is
     // only replaced after the package manager has succeeded.
-    let staging_dir = tools_dir.join(manager).join(format!(
-        ".{install_name}.staging-{}",
-        unique_install_suffix()
-    ));
-    fs::create_dir_all(&staging_dir)?;
+    let manager_dir = tools_dir.join(manager);
+    crate::core::paths::create_private_data_directory(&manager_dir)?;
+    let staging = tempfile::Builder::new()
+        .prefix(&format!(".{install_name}.staging-"))
+        .tempdir_in(&manager_dir)?;
+    let staging_dir = staging.path().to_path_buf();
 
     let pb = style::spinner(&format!("Installing {pkg} via {manager}..."));
 
@@ -1159,17 +1182,14 @@ fn install_managed_blocking(
 
     if let Err(error) = outcome {
         pb.finish_and_clear();
-        let _ = fs::remove_dir_all(&staging_dir);
         return Err(error);
     }
     if let Err(error) = validate_tool_binary_containment(&staging_dir) {
         pb.finish_and_clear();
-        let _ = fs::remove_dir_all(&staging_dir);
         return Err(error);
     }
     if let Err(error) = relocate_venv_entry_points(&staging_dir, &install_dir) {
         pb.finish_and_clear();
-        let _ = fs::remove_dir_all(&staging_dir);
         return Err(error);
     }
     if let Err(error) = write_security_receipt(&staging_dir, manager, pkg).and_then(|()| {
@@ -1178,9 +1198,11 @@ fn install_managed_blocking(
             .map_or(Ok(()), |admission| admission.verify(&staging_dir))
     }) {
         pb.finish_and_clear();
-        let _ = fs::remove_dir_all(&staging_dir);
         return Err(error);
     }
+
+    inspect_managed_tool_dir(bin_dir)?;
+    crate::core::paths::create_private_data_directory(bin_dir)?;
 
     // Keep the backup until shared-bin activation also succeeds. Directory
     // promotion and command linking are one logical transaction.
@@ -1195,14 +1217,12 @@ fn install_managed_blocking(
         })?;
         if let Err(error) = fs::rename(&staging_dir, &install_dir) {
             let _ = fs::rename(&backup, &install_dir);
-            let _ = fs::remove_dir_all(&staging_dir);
             pb.finish_and_clear();
             return Err(error)
                 .with_context(|| format!("Failed to promote staged install of '{install_name}'"));
         }
         backup_dir = Some(backup);
     } else if let Err(error) = fs::rename(&staging_dir, &install_dir) {
-        let _ = fs::remove_dir_all(&staging_dir);
         pb.finish_and_clear();
         return Err(error)
             .with_context(|| format!("Failed to promote staged install of '{install_name}'"));
@@ -1488,27 +1508,40 @@ pub async fn remove(name: &str) -> Result<()> {
     }
 
     anyhow::ensure!(
-        tools_dir.try_exists()?,
+        inspect_managed_tool_dir(&tools_dir)?,
         "Tool '{name}' not found in managed storage"
     );
     let _lease = lock_managed_tool_storage(&tools_dir)?;
-    let mut found = false;
-    let mut removed_installs = Vec::new();
+    inspect_managed_tool_dir(&bin_dir)?;
+    let canonical_tools = tools_dir
+        .canonicalize()
+        .context("Failed to resolve managed tools directory")?;
+    let mut removals = Vec::new();
     for (manager, install_path) in candidates {
+        inspect_managed_tool_dir(&tools_dir.join(manager))?;
         if crate::runtimes::common::is_runtime_payload_dir(&install_path) {
-            println!(
-                "{} Removing {} from {}...",
-                style::header("OMG"),
-                name,
-                manager
+            let relative = install_path.strip_prefix(&tools_dir)?;
+            anyhow::ensure!(
+                install_path.canonicalize()? == canonical_tools.join(relative),
+                "Refusing managed tool path outside its storage: {}",
+                install_path.display()
             );
-            fs::remove_dir_all(&install_path)?;
-            removed_installs.push(install_path);
-            found = true;
+            removals.push((manager, install_path));
         }
     }
-
-    anyhow::ensure!(found, "Tool '{name}' not found in managed storage");
+    anyhow::ensure!(
+        !removals.is_empty(),
+        "Tool '{name}' not found in managed storage"
+    );
+    for (manager, install_path) in &removals {
+        println!(
+            "{} Removing {} from {}...",
+            style::header("OMG"),
+            name,
+            manager
+        );
+        fs::remove_dir_all(install_path)?;
+    }
 
     // Cleanup symlinks (broken links)
     println!("  {} Cleaning symlinks...", style::dim("→"));
@@ -1530,7 +1563,7 @@ pub async fn remove(name: &str) -> Result<()> {
                             normalized.push(component.as_os_str());
                         }
                     }
-                    if !removed_installs.iter().any(|install| {
+                    if !removals.iter().any(|(_, install)| {
                         normalized
                             .strip_prefix(install)
                             .is_ok_and(|relative| relative.components().next().is_some())
@@ -3526,11 +3559,12 @@ esac
             let (fixture, advisories) =
                 crate::runtimes::tool_artifacts::managed_go_publication_fixture()?;
             let bin = fixture.path().join("bin");
+            fs::create_dir(&bin)?;
+            let launcher = bin.join("fixture-tool");
+            let destination = fixture.path().join("tools/go/fixture-tool");
             let expect_success = case == "available";
-            if expect_success {
-                fs::create_dir(&bin)?;
-            } else {
-                fs::write(&bin, b"keep this entry")?;
+            if !expect_success {
+                fs::write(&launcher, b"keep this entry")?;
             }
             let result = change_managed_with_advisories(
                 "go",
@@ -3544,15 +3578,37 @@ esac
             .await;
             if expect_success {
                 result?;
-                assert!(bin.join("fixture-tool").is_file());
-            } else {
-                let error = result.expect_err("a file cannot contain a command symlink");
-                assert!(
-                    format!("{error:#}").contains("Failed to symlink binary"),
-                    "{error:#}"
+                assert_eq!(
+                    fs::read_link(&launcher)?,
+                    destination.join("bin/fixture-tool")
                 );
-                assert_eq!(fs::read(&bin)?, b"keep this entry");
-                assert!(!fixture.path().join("tools/go/fixture-tool").exists());
+                assert_eq!(
+                    fs::read(&launcher)?,
+                    b"#!/bin/sh\necho reviewed-tool-success\n"
+                );
+                assert!(
+                    destination
+                        .join(".omg-package-advisory-review.json")
+                        .is_file()
+                );
+            } else {
+                let error = result.expect_err("an occupied launcher must prevent activation");
+                let diagnostic = format!("{error:#}");
+                assert!(
+                    diagnostic
+                        .contains("Failed to activate managed tool. No installation published"),
+                    "{diagnostic}"
+                );
+                assert!(
+                    diagnostic.contains("No executable tool commands could be linked"),
+                    "{diagnostic}"
+                );
+                assert_eq!(fs::read(&launcher)?, b"keep this entry");
+                assert!(!destination.exists());
+                assert_eq!(
+                    fs::read_dir(destination.parent().expect("tool manager directory"))?.count(),
+                    0
+                );
             }
             return Ok(());
         }
@@ -3568,9 +3624,16 @@ esac
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
             assert!(
-                output.status.success() && stdout.contains("1 passed"),
+                output.status.success()
+                    && stdout.contains("test result: ok. 1 passed; 0 failed; 0 ignored;"),
                 "{stdout}\n{stderr}"
             );
+            if !expect_success {
+                assert!(
+                    stdout.contains("Refusing to replace existing command fixture-tool"),
+                    "{stdout}"
+                );
+            }
             assert_eq!(
                 stdout.contains("Installation successful"),
                 expect_success,

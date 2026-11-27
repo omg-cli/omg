@@ -3437,6 +3437,138 @@ print("fixture python " + json.dumps({
                 ))
 
 
+
+    def inspect_managed_tool_storage_paths():
+        phase = "managed-tool-storage-paths"
+        cases = (
+            ("tools-link", "typescript", "npm", "typescript"),
+            ("tools-dangling", "typescript", "npm", "typescript"),
+            ("bin-link", "typescript", "npm", "typescript"),
+            ("bin-dangling", "typescript", "npm", "typescript"),
+            ("manager-link", "typescript", "npm", "typescript"),
+            ("cargo-manager-link", "diesel", "cargo", "diesel_cli"),
+            ("pip-manager-link", "black", "pip", "black"),
+            ("go-manager-link", "hey", "go", "hey"),
+            ("nested-legacy-link", "hey", "go", "github.com/rakyll/hey"),
+            ("configured-data-link", "typescript", "npm", "typescript"),
+            ("direct-path", "typescript", "npm", "typescript"),
+        )
+        with tempfile.TemporaryDirectory(prefix="managed-tool-storage-paths-", dir=work) as directory:
+            here = Path(directory)
+            os.chown(here, account.pw_uid, account.pw_gid)
+            for label, tool, manager, installed_name in cases:
+                home = here / label
+                data = home / "data"
+                outside = home / "independent"
+                outside.mkdir(parents=True)
+                marker = outside / "owned-file"
+                marker.write_text("independent file\n")
+                if label == "configured-data-link":
+                    volume = home / "configured-volume"
+                    volume.mkdir()
+                    data.symlink_to(volume)
+                else:
+                    data.mkdir()
+                tools_dir = data / "tools"
+                bin_dir = data / "bin"
+                manager_dir = tools_dir / manager
+                install = manager_dir / installed_name
+                payload = install / "bin/owned"
+                link = bin_dir / "owned"
+                if label == "tools-link":
+                    store = outside / "tools"
+                    store.mkdir()
+                    tools_dir.symlink_to(store)
+                elif label == "tools-dangling":
+                    tools_dir.symlink_to(outside / "absent-tools")
+                else:
+                    tools_dir.mkdir()
+                if label == "bin-link":
+                    launchers = outside / "bin"
+                    launchers.mkdir()
+                    bin_dir.symlink_to(launchers)
+                elif label == "bin-dangling":
+                    bin_dir.symlink_to(outside / "absent-bin")
+                else:
+                    bin_dir.mkdir()
+                if label.endswith("manager-link"):
+                    payload_store = outside / "manager"
+                    payload_store.mkdir()
+                    manager_dir.symlink_to(payload_store)
+                if label == "nested-legacy-link":
+                    manager_dir.mkdir()
+                    legacy = outside / "legacy"
+                    legacy.mkdir()
+                    (manager_dir / "github.com").symlink_to(legacy)
+                if label != "tools-dangling":
+                    payload.parent.mkdir(parents=True, exist_ok=True)
+                    payload.write_text("#!/bin/sh\nprintf 'existing tool'\n")
+                    payload.chmod(0o755)
+                    if label != "bin-dangling":
+                        link.symlink_to(payload)
+                for item in (home, *home.rglob("*")):
+                    os.chown(item, account.pw_uid, account.pw_gid, follow_symlinks=False)
+                home.chmod(0o700)
+                env = dict(disabled, HOME=str(home), OMG_DATA_DIR=str(data),
+                           OMG_CONFIG_DIR=str(home/"config"/"omg"), OMG_NATIVE_TEST_DATA_DIR="1",
+                           XDG_CONFIG_HOME=str(home/"config"), XDG_DATA_HOME=str(home/"xdg-data"),
+                           XDG_CACHE_HOME=str(home/"cache"), XDG_STATE_HOME=str(home/"state"))
+
+                def snapshot(root):
+                    return sorted((str(item.relative_to(root)),
+                                   ("link", os.readlink(item)) if item.is_symlink()
+                                   else ("file", item.read_bytes()) if item.is_file()
+                                   else ("directory", None))
+                                  for item in root.rglob("*")
+                                  if item.name != ".mutation.lock")
+
+                def managed_state():
+                    return [(os.readlink(root) if root.is_symlink() else None, snapshot(root))
+                            for root in (tools_dir, bin_dir)]
+
+                expected_outside = snapshot(outside)
+                expected_managed = managed_state()
+                allowed = label in ("configured-data-link", "direct-path")
+                prereq = ("NPM admission requires an active OMG-managed Node runtime" if manager == "npm"
+                          else "Package installation requires a selected OMG-managed go")
+
+                def run(verb):
+                    args = [cli, "tool", verb]
+                    if verb != "list":
+                        args.append(tool)
+                    result = command(args, env, ordinary, timeout=8)
+                    output = result.stdout + result.stderr
+                    if verb == "list":
+                        if label.startswith("tools-"):
+                            matches = result.returncode == 1 and "Refusing unsafe managed tool directory" in output
+                        elif allowed:
+                            matches = (result.returncode == 0 and
+                                       f"  owned points to -> {payload}" in result.stdout.splitlines())
+                        elif label.startswith("bin-"):
+                            matches = result.returncode == 0 and "No managed tool commands are linked" in output
+                        else:
+                            matches = result.returncode == 0 and "No tools installed via omg tool" in output
+                    elif allowed and verb == "remove":
+                        matches = (result.returncode == 0 and "Removal complete" in output
+                                   and not install.exists() and not os.path.lexists(link))
+                    elif allowed or (label == "nested-legacy-link" and verb != "remove"):
+                        diagnostic = (f"Tool '{tool}' is not installed" if verb == "update" and not allowed else prereq)
+                        matches = result.returncode == 1 and diagnostic in output
+                    else:
+                        diagnostic = ("Refusing managed tool path outside its storage" if label == "nested-legacy-link"
+                                      else "Refusing unsafe managed tool directory")
+                        matches = result.returncode == 1 and diagnostic in output
+
+                    preserved = (snapshot(outside) == expected_outside
+                                 and not (outside/"tools/.mutation.lock").exists()
+                                 and (verb == "remove" and allowed or managed_state() == expected_managed))
+                    checks.append(dict(phase=phase, case=f"{label}-{verb}", status=result.returncode,
+                                       passed=matches and preserved, preserved=preserved, diagnostic=output[-1100:]))
+
+                for verb in ("list", "install", "update", "remove"):
+                    run(verb)
+
+
     def inspect_fedora_system_tool_registry():
         phase = "fedora-system-tool-registry"
         cases = (
@@ -9811,6 +9943,7 @@ exec {shlex.quote(str(binary))} "$@"
                     inspect_python_tool_prerequisites()
                     inspect_managed_tool_inventory()
                     inspect_managed_tool_mutation_lease()
+                    inspect_managed_tool_storage_paths()
                     inspect_fedora_system_tool_registry()
                     inspect_named_tool_updates()
                     inspect_config_files()
@@ -10167,6 +10300,6 @@ mark_progress("completed with host inventory unchanged")
 report = dict(binaries=binaries, checks=checks, total=len(checks),
               passed=sum(entry["passed"] for entry in checks), host_unchanged=True)
 print(json.dumps(report))
-expected_checks = 303 if consent_oracle is None else 3195
+expected_checks = 303 if consent_oracle is None else 3239
 if report["passed"] != report["total"] or report["total"] != expected_checks:
     sys.exit(4)
