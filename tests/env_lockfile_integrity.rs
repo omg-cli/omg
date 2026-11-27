@@ -573,6 +573,11 @@ fn snapshot_restores_installed_php_offline_without_replacing_its_payload() {
     assert!(
         broken
             .combined_output()
+            .contains("stopped while switching php to 8.4")
+    );
+    assert!(
+        broken
+            .combined_output()
             .contains("Failed to inspect runtime binary:")
     );
     assert!(broken.combined_output().contains("8.4/bin/php"));

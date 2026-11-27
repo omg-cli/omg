@@ -58,7 +58,7 @@ COPY vendor/ vendor/
 # Keep toolchain, path, profile and default Arch features identical to the build.
 RUN cargo chef cook --release --locked -j 2 --recipe-path /tmp/omg-recipe.json
 COPY --from=sources /opt/omg/ /opt/omg/
-RUN cargo build --release --locked -j 2
+RUN cargo build --release --locked -j 2 --bin omg
 
 FROM native AS runtime
 COPY --from=builder /opt/omg/target/release/omg /usr/local/bin/omg

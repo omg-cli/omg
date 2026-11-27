@@ -527,6 +527,13 @@ mod why_contracts {
 mod snapshot_contracts {
     use super::*;
 
+    fn write_snapshot_with_checksum(path: &std::path::Path, snapshot: serde_json::Value) {
+        let mut snapshot: omg_lib::cli::snapshot::Snapshot =
+            serde_json::from_value(snapshot).expect("valid snapshot fixture");
+        snapshot.state.hash = snapshot.state.calculate_hash();
+        fs::write(path, serde_json::to_vec_pretty(&snapshot).unwrap()).expect("write snapshot");
+    }
+
     #[test]
     fn oversized_inventory_cannot_publish_a_manifest_or_snapshot() {
         let project = TestProject::new();
@@ -804,8 +811,7 @@ mod snapshot_contracts {
             serde_json::from_str(&fs::read_to_string(&snap_path).expect("snapshot readable"))
                 .expect("valid snapshot JSON");
         snap["state"]["packages"] = serde_json::json!([FAKE_PKG]);
-        fs::write(&snap_path, serde_json::to_string_pretty(&snap).unwrap())
-            .expect("rewrite snapshot");
+        write_snapshot_with_checksum(&snap_path, snap);
         let before = fs::read_to_string(&snap_path).expect("snapshot readable");
 
         let result = project.run(&["snapshot", "restore", &id, "--dry-run"]);
@@ -841,12 +847,61 @@ mod snapshot_contracts {
     }
 
     #[test]
+    fn restore_checks_the_saved_checksum_and_schema() {
+        use omg_lib::core::env::fingerprint::EnvironmentState;
+
+        let project = TestProject::new();
+        let id = create_snapshot(&project, "checksum contract");
+        let path = project.data_dir.path().join(format!("snapshots/{id}.json"));
+        let original: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let args = ["snapshot", "restore", id.as_str(), "--dry-run"];
+        for (field, value, diagnostic) in [
+            (
+                "hash",
+                serde_json::json!("0".repeat(64)),
+                "saved checksum does not match",
+            ),
+            (
+                "schema_version",
+                serde_json::json!(EnvironmentState::SCHEMA_VERSION + 1),
+                "requires a newer omg",
+            ),
+        ] {
+            let mut fixture = original.clone();
+            fixture["state"][field] = value;
+            let bytes = serde_json::to_vec(&fixture).unwrap();
+            fs::write(&path, &bytes).unwrap();
+            let restored = project.run(&args);
+            restored.assert_failure();
+            assert!(restored.stderr.contains(diagnostic), "{}", restored.stderr);
+            assert!(!restored.stdout.contains("Changes to apply"));
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+        }
+
+        let mut legacy = original;
+        legacy["state"]
+            .as_object_mut()
+            .unwrap()
+            .remove("schema_version");
+        fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        let restored = project.run(&args);
+        restored.assert_success();
+        restored.assert_stdout_contains("Environment already matches snapshot!");
+    }
+
+    #[test]
     fn restore_rejects_invalid_plan_entries_before_applying() {
         let project = TestProject::new();
         let id = create_snapshot(&project, "base");
         let path = project.data_dir.path().join(format!("snapshots/{id}.json"));
         let clean: serde_json::Value =
             serde_json::from_slice(&fs::read(&path).expect("snapshot bytes")).expect("snapshot");
+        fs::write(
+            project.data_dir.path().join("mock_state_pacman.json"),
+            b"invalid inventory",
+        )
+        .expect("make the current inventory unreadable");
 
         for (key, value, diagnostic) in [
             (
@@ -862,7 +917,7 @@ mod snapshot_contracts {
         ] {
             let mut snapshot = clean.clone();
             snapshot["state"][key] = value;
-            fs::write(&path, serde_json::to_string(&snapshot).unwrap()).expect("write snapshot");
+            write_snapshot_with_checksum(&path, snapshot);
 
             for flag in ["--dry-run", "--yes"] {
                 let result = project.run(&["snapshot", "restore", &id, flag]);
@@ -871,6 +926,43 @@ mod snapshot_contracts {
                 assert!(!result.stdout.contains("Applying changes"));
             }
         }
+
+        write_snapshot_with_checksum(&path, clean);
+        let result = project.run(&["snapshot", "restore", &id, "--dry-run"]);
+        result.assert_failure();
+        assert!(
+            result
+                .stderr
+                .contains("Failed to inspect the current environment for snapshot restore"),
+            "{}",
+            result.stderr
+        );
+        assert!(result.stderr.contains("failed to parse mock state"));
+    }
+
+    #[test]
+    fn restore_reports_install_failure_before_removing_packages() {
+        let project = TestProject::new();
+        let id = create_snapshot(&project, "missing install fixture");
+        let path = project.data_dir.path().join(format!("snapshots/{id}.json"));
+        let mut snapshot: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        snapshot["state"]["packages"] = serde_json::json!([FAKE_PKG]);
+        write_snapshot_with_checksum(&path, snapshot);
+        project.mock_install("extra-fixture", "1.0").unwrap();
+
+        let result = project.run(&["snapshot", "restore", &id, "--yes"]);
+        result.assert_failure();
+        assert!(
+            result
+                .stderr
+                .contains("Snapshot restore stopped while installing packages"),
+            "{}",
+            result.stderr
+        );
+        assert!(result.stderr.contains(FAKE_PKG));
+        assert!(!result.stdout.contains("Snapshot restore complete"));
+        assert!(read_mock_state(&project).0.contains_key("extra-fixture"));
     }
 
     /// Contract: a non-interactive restore with pending package changes
@@ -884,7 +976,7 @@ mod snapshot_contracts {
         let mut snap: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&snap_path).expect("readable")).expect("json");
         snap["state"]["packages"] = serde_json::json!([FAKE_PKG]);
-        fs::write(&snap_path, serde_json::to_string_pretty(&snap).unwrap()).expect("rewrite");
+        write_snapshot_with_checksum(&snap_path, snap);
 
         // The harness always pipes stdin, which console::user_attended()
         // treats as non-interactive; spawn the child with the same isolated
@@ -936,8 +1028,9 @@ mod snapshot_contracts {
         let mut snap: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&snap_path).expect("readable")).expect("json");
         snap["state"]["packages"] = serde_json::json!([FAKE_PKG]);
-        fs::write(&snap_path, serde_json::to_string_pretty(&snap).unwrap()).expect("rewrite");
+        write_snapshot_with_checksum(&snap_path, snap);
 
+        project.mock_install("extra-fixture", "1.0").unwrap();
         let result = project.run(&["snapshot", "restore", &id, "--yes"]);
 
         result.assert_success();
@@ -956,6 +1049,7 @@ mod snapshot_contracts {
         );
 
         let (installed, _) = read_mock_state(&project);
+        assert!(!installed.contains_key("extra-fixture"));
         let version = installed
             .get(FAKE_PKG)
             .unwrap_or_else(|| panic!("{FAKE_PKG} must be recorded installed, got {installed:?}"));

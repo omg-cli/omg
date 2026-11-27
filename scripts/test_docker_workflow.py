@@ -29,7 +29,10 @@ class DockerProvenanceTests(unittest.TestCase):
         builder = recipe.split('FROM toolchain AS builder\n', 1)[1].split('\nFROM ', 1)[0]
         self.assertIn('FROM sources AS planner\n', recipe)
         self.assertIn('COPY --from=sources /opt/omg/ /opt/omg/', builder)
-        self.assertIn('RUN cargo build --release --locked -j 2', builder)
+        self.assertRegex(builder, r'(?m)^RUN cargo build --release --locked -j 2 --bin omg$')
+        runtime = recipe.split('FROM native AS runtime\n', 1)[1]
+        self.assertEqual(re.findall(r'(?m)^COPY --from=builder (.+)$', runtime),
+                         ['/opt/omg/target/release/omg /usr/local/bin/omg'])
 
     def test_arch_image_pr_gate_includes_contracts_and_vendored_sources(self):
         paths = WORKFLOW.read_text(encoding='utf-8').split('  pull_request:\n', 1)[1].split(
