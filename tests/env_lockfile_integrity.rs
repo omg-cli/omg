@@ -833,3 +833,50 @@ fn snapshot_index_access_failures_never_report_empty_or_delete_saved_state() {
         project.close_checked();
     }
 }
+
+#[test]
+#[cfg(unix)]
+fn snapshot_delete_recovers_old_index_entries_and_unlisted_files() {
+    let project = TestProject::new();
+    let directory = project.data_dir.path().join("snapshots");
+    let index = directory.join("index.json");
+    let unlisted = directory.join("unlisted.json");
+    std::fs::create_dir_all(directory.join("directory.json")).unwrap();
+    std::fs::write(&unlisted, b"saved bytes").unwrap();
+    let rows = ["missing", "directory"].map(|id| {
+        serde_json::json!({
+            "id": id,
+            "message": null,
+            "created_at": 1_700_000_000,
+            "hash": sample_state().hash,
+        })
+    });
+    let before = serde_json::to_vec(&serde_json::json!({"snapshots": rows})).unwrap();
+    std::fs::write(&index, &before).unwrap();
+
+    let refused = project.run(&["snapshot", "delete", "directory"]);
+    assert_eq!(refused.exit_code, 1, "{}", refused.combined_output());
+    assert!(refused.combined_output().contains("path is a directory"));
+    let too_long = "a".repeat(300);
+    let refused = project.run(&["snapshot", "delete", &too_long]);
+    assert_eq!(refused.exit_code, 1, "{}", refused.combined_output());
+    let refused = project.run(&["snapshot", "delete", "unknown"]);
+    assert_eq!(refused.exit_code, 1, "{}", refused.combined_output());
+    assert!(
+        refused
+            .combined_output()
+            .contains("Snapshot 'unknown' not found")
+    );
+
+    project
+        .run(&["snapshot", "delete", "unlisted"])
+        .assert_success();
+    assert!(!unlisted.exists());
+    assert_eq!(std::fs::read(&index).unwrap(), before);
+    project
+        .run(&["snapshot", "delete", "missing"])
+        .assert_success();
+    let after: serde_json::Value = serde_json::from_slice(&std::fs::read(&index).unwrap()).unwrap();
+    assert_eq!(after["snapshots"], serde_json::json!([rows[1]]));
+    project.close_checked();
+}
