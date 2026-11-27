@@ -199,10 +199,9 @@ pub(crate) fn validate_install_request(packages: &[String], allow_local_file: bo
 async fn install_dry_run(packages: &[String]) -> Result<()> {
     #[cfg(feature = "fedora")]
     if crate::package_managers::resolve_backend()? == crate::package_managers::Backend::Fedora {
-        let (plan, diagnostics) =
-            crate::package_managers::DnfPackageManager::preview_install(packages).await?;
+        let preview = crate::package_managers::DnfPackageManager::preview_install(packages).await?;
         crate::cli::modern_ui::print_phase_header("📋", "Install Preview", "dry run");
-        super::common::print_dnf_preview(&plan, &diagnostics);
+        super::common::print_dnf_preview(&preview);
         crate::cli::ui::print_dry_run_footer();
         return Ok(());
     }

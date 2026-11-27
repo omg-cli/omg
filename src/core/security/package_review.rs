@@ -147,10 +147,11 @@ pub(crate) async fn review_async(
             "Package advisory review exceeds the terminal bound"
         );
         let id = risk.id().to_owned();
+        let kind = risk.kind();
         let cancelled = Arc::new(AtomicBool::new(false));
         let _cancel_on_drop = CancelPrompt(Arc::clone(&cancelled));
         tokio::task::spawn_blocking(move || {
-            crate::core::privilege::confirm_security_review(&details, &id, uid, &|| {
+            crate::core::privilege::confirm_security_review(&details, &id, kind, uid, &|| {
                 ensure!(
                     !cancelled.load(Ordering::Acquire),
                     "Package admission cancelled"

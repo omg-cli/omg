@@ -1,6 +1,6 @@
 //! Acknowledgement of disclosed advisory risk never changes its classification.
 
-use super::scan::{AdvisoryProvenance, FindingApplicability, Vulnerability};
+use super::scan::{AdvisoryProvenance, FindingApplicability, MinimumSeverity, Vulnerability};
 use super::vulnerability::{PackageAssessment, UnknownCoverage};
 use crate::package_managers::types::SecurityOrigin;
 use sha2::{Digest, Sha256};
@@ -10,7 +10,43 @@ use std::fmt::Write as _;
 pub(crate) struct AdvisoryRiskReview {
     id: String,
     details: String,
+    kind: AdvisoryReviewKind,
     legacy_identity: Option<AdvisoryRiskIdentity>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AdvisoryReviewKind {
+    CoverageUnknown,
+    Advisory,
+    AdvisoryWithUnknownCoverage,
+    CriticalAdvisory,
+}
+
+impl AdvisoryReviewKind {
+    pub(crate) const fn confirmation_phrase(self) -> &'static str {
+        match self {
+            Self::Advisory => "proceed",
+            Self::CoverageUnknown | Self::AdvisoryWithUnknownCoverage | Self::CriticalAdvisory => {
+                "install-unsafe"
+            }
+        }
+    }
+}
+
+fn is_critical_finding(finding: &Vulnerability) -> bool {
+    finding.meets_minimum(MinimumSeverity::Critical)
+        || finding
+            .id
+            .strip_prefix("MAL-")
+            .and_then(|id| id.split_once('-'))
+            .is_some_and(|(year, number)| {
+                year.len() == 4
+                    && !number.is_empty()
+                    && year
+                        .bytes()
+                        .chain(number.bytes())
+                        .all(|byte| byte.is_ascii_digit())
+            })
 }
 
 #[derive(Clone)]
@@ -121,9 +157,15 @@ impl AdvisoryRiskReview {
             details.len() <= 60 * 1024,
             "Advisory review exceeds terminal display limit; split the transaction"
         );
+        let kind = match risk.as_ref().map(Self::kind) {
+            Some(AdvisoryReviewKind::CriticalAdvisory) => AdvisoryReviewKind::CriticalAdvisory,
+            Some(_) => AdvisoryReviewKind::AdvisoryWithUnknownCoverage,
+            None => AdvisoryReviewKind::CoverageUnknown,
+        };
         Ok(Some(Self {
             id,
             details,
+            kind,
             legacy_identity: risk.and_then(|review| review.legacy_identity),
         }))
     }
@@ -286,9 +328,19 @@ impl AdvisoryRiskReview {
             details.len() <= 60 * 1024,
             "Advisory review exceeds terminal display limit; split the transaction"
         );
+        let kind = if assessments
+            .iter()
+            .flat_map(|assessment| &assessment.findings)
+            .any(is_critical_finding)
+        {
+            AdvisoryReviewKind::CriticalAdvisory
+        } else {
+            AdvisoryReviewKind::Advisory
+        };
         Ok(Some(Self {
             id,
             details,
+            kind,
             legacy_identity: Some(AdvisoryRiskIdentity { records }),
         }))
     }
@@ -298,6 +350,10 @@ impl AdvisoryRiskReview {
     }
     pub(crate) fn details(&self) -> &str {
         &self.details
+    }
+
+    pub(crate) const fn kind(&self) -> AdvisoryReviewKind {
+        self.kind
     }
 
     pub(crate) fn legacy_identity(&self) -> Option<&AdvisoryRiskIdentity> {
@@ -414,6 +470,57 @@ mod tests {
             native_advisory: None,
             affected_installed: Vec::new(),
         }
+    }
+
+    #[test]
+    fn review_kind_comes_from_coverage_and_finding_metadata() -> anyhow::Result<()> {
+        use super::super::{scan::AdvisorySeverity, vulnerability::PackageCoverage};
+
+        let mut assessment = package("critical-review-fixture");
+        let kind = |item: &PackageAssessment| -> anyhow::Result<_> {
+            Ok(
+                AdvisoryRiskReview::new_with_unknown(std::slice::from_ref(item), "install")?
+                    .context("advisory review required")?
+                    .kind(),
+            )
+        };
+        assert_eq!(kind(&assessment)?, AdvisoryReviewKind::CoverageUnknown);
+
+        let mut advisory = finding("CVE-2026-10001", FindingApplicability::Possible);
+        advisory.summary =
+            "A moderate finding. No active zero-day exploitation was established.".into();
+        assessment.findings.push(advisory.clone());
+        assert_eq!(
+            kind(&assessment)?,
+            AdvisoryReviewKind::AdvisoryWithUnknownCoverage
+        );
+
+        assessment.coverage = PackageCoverage::Assessed {
+            provenance: AdvisoryProvenance::Osv {
+                ecosystem: "npm".into(),
+            },
+        };
+        assert_eq!(kind(&assessment)?, AdvisoryReviewKind::Advisory);
+
+        for critical in [
+            Vulnerability {
+                score: Some("9.8".into()),
+                ..advisory.clone()
+            },
+            Vulnerability {
+                advisory_severity: Some(AdvisorySeverity::Critical),
+                ..advisory
+            },
+            finding("MAL-2026-1234", FindingApplicability::Applicable),
+        ] {
+            assessment.findings[0] = critical;
+            assert_eq!(kind(&assessment)?, AdvisoryReviewKind::CriticalAdvisory);
+        }
+        for invalid_id in ["MAL-fixture", "MAL-2026-", "MAL-2026-fixture"] {
+            assessment.findings[0] = finding(invalid_id, FindingApplicability::Possible);
+            assert_eq!(kind(&assessment)?, AdvisoryReviewKind::Advisory);
+        }
+        Ok(())
     }
 
     #[test]

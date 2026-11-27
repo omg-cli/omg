@@ -65,9 +65,9 @@ async fn remove_fedora(packages: &[String], yes: bool, dry_run: bool) -> Result<
     use crate::package_managers::DnfPackageManager;
 
     if dry_run {
-        let (plan, diagnostics) = DnfPackageManager::preview_removal(packages).await?;
+        let preview = DnfPackageManager::preview_removal(packages).await?;
         crate::cli::modern_ui::print_phase_header("🗑️", "Remove Preview", "dry run");
-        super::common::print_dnf_preview(&plan, &diagnostics);
+        super::common::print_dnf_preview(&preview);
         crate::cli::ui::print_dry_run_footer();
         return Ok(());
     }

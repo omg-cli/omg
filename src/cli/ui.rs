@@ -628,28 +628,38 @@ fn highlight_security_details(details: &str, critical: bool) -> String {
         .join("\n")
 }
 
-/// Render the Charm/Lipgloss interactive security review card shown before
-/// admitting a vulnerable package or runtime.
+/// Render the interactive review for an advisory or coverage gap.
 #[must_use]
-pub fn render_security_review_card(
+pub(crate) fn render_security_review_card(
     details: &str,
     short_id: &str,
-    critical: bool,
-    phrase: &str,
+    kind: crate::core::security::advisory_review::AdvisoryReviewKind,
 ) -> String {
-    let (tone, badge, title) = if critical {
-        (
+    use crate::core::security::advisory_review::AdvisoryReviewKind;
+    let (tone, badge, title) = match kind {
+        AdvisoryReviewKind::CriticalAdvisory => (
             BadgeTone::Critical,
-            "0-DAY / CRITICAL",
-            "Actively Exploited or Critical Risk",
-        )
-    } else {
-        (
+            "CRITICAL ADVISORY",
+            "Review Before Installing",
+        ),
+        AdvisoryReviewKind::Advisory => (
             BadgeTone::Warning,
             "SECURITY ADVISORY",
             "Warning — Review Before Installing",
-        )
+        ),
+        AdvisoryReviewKind::AdvisoryWithUnknownCoverage => (
+            BadgeTone::Warning,
+            "SECURITY ADVISORY",
+            "Findings and Incomplete Coverage",
+        ),
+        AdvisoryReviewKind::CoverageUnknown => (
+            BadgeTone::Warning,
+            "COVERAGE UNKNOWN",
+            "Review the Coverage Gap",
+        ),
     };
+    let critical = kind == AdvisoryReviewKind::CriticalAdvisory;
+    let phrase = kind.confirmation_phrase();
     let footer = format!("Review ID: {short_id}  •  Enter cancels safely  •  --yes cannot bypass");
     let highlighted_details = highlight_security_details(details, critical);
     let mut card = render_panel(tone, badge, title, &highlighted_details, Some(&footer));
@@ -790,18 +800,34 @@ mod tests {
 
     #[test]
     fn charm_security_review_card_renders_cleanly_in_plain_and_color_modes() {
+        use crate::core::security::advisory_review::AdvisoryReviewKind;
         temp_env::with_var("NO_COLOR", Some("1"), || {
             let card = render_security_review_card(
                 "pkg 1.0 has CVE-2026-0001 (KEV)",
                 "abcdef12",
-                true,
-                "install-unsafe",
+                AdvisoryReviewKind::CriticalAdvisory,
             );
             assert!(!card.contains('\u{1b}'));
-            assert!(card.contains("[0-DAY / CRITICAL]"));
+            assert!(card.contains("[CRITICAL ADVISORY]"));
             assert!(card.contains("Review ID: abcdef12"));
             assert!(card.contains("Type 'install-unsafe' within 60s to continue"));
             assert!(card.contains("(default: cancel): "));
+            let unknown = render_security_review_card(
+                "Advisory coverage is unknown, including zero-day coverage.",
+                "87654321",
+                AdvisoryReviewKind::CoverageUnknown,
+            );
+            assert!(unknown.contains("[COVERAGE UNKNOWN]"));
+            assert!(unknown.contains("Type 'install-unsafe' within 60s to continue"));
+            assert!(!unknown.contains("[CRITICAL ADVISORY]"));
+            let mixed = render_security_review_card(
+                "A disclosed finding and incomplete advisory coverage",
+                "87654321",
+                AdvisoryReviewKind::AdvisoryWithUnknownCoverage,
+            );
+            assert!(mixed.contains("[SECURITY ADVISORY]"));
+            assert!(mixed.contains("Findings and Incomplete Coverage"));
+            assert!(mixed.contains("Type 'install-unsafe' within 60s to continue"));
         });
         temp_env::with_vars(
             [("NO_COLOR", None::<&str>), ("OMG_COLORS", Some("always"))],
@@ -809,8 +835,7 @@ mod tests {
                 let card = render_security_review_card(
                     "pkg 1.0 has CVE-2026-0002 https://www.cve.org/CVERecord?id=CVE-2026-0002",
                     "12345678",
-                    false,
-                    "proceed",
+                    AdvisoryReviewKind::Advisory,
                 );
                 assert!(
                     card.contains("\u{1b}[38;2;"),
@@ -828,10 +853,9 @@ mod tests {
                 let crit = render_security_review_card(
                     "MAL-2026-0001 KEV HIGH https://osv.dev/vulnerability/MAL-2026-0001/very/long/url/that/exceeds/standard/panel/width/for/overflow/coverage",
                     "deadbeef",
-                    true,
-                    "install-unsafe",
+                    AdvisoryReviewKind::CriticalAdvisory,
                 );
-                assert!(crit.contains("0-DAY / CRITICAL"));
+                assert!(crit.contains("CRITICAL ADVISORY"));
                 assert!(crit.contains("install-unsafe"));
             },
         );
@@ -842,8 +866,11 @@ mod tests {
                 ("OMG_UNICODE", Some("0")),
             ],
             || {
-                let ascii =
-                    render_security_review_card("pkg 1.0 warning", "11223344", false, "proceed");
+                let ascii = render_security_review_card(
+                    "pkg 1.0 warning",
+                    "11223344",
+                    AdvisoryReviewKind::Advisory,
+                );
                 let plain_ascii = console::strip_ansi_codes(&ascii);
                 assert!(plain_ascii.contains("+---"));
                 assert!(plain_ascii.contains("> Type"));
