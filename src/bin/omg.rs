@@ -414,7 +414,9 @@ async fn run_counter(counter: FastCounter, json: bool) -> Result<()> {
             FastCounter::Orphan => {
                 Some(omg_lib::package_managers::DnfPackageManager::orphan_count().await?)
             }
-            FastCounter::Updates => Some(manager.list_updates().await?.len()),
+            FastCounter::Updates => {
+                Some(omg_lib::package_managers::DnfPackageManager::update_count().await?)
+            }
             FastCounter::Explicit | FastCounter::Total => None,
         };
         if let Some(count) = count {

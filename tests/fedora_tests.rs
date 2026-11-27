@@ -2121,8 +2121,29 @@ mod dnf_integration {
                 ))
             })
             .collect::<Result<Vec<_>>>()?;
+        for (row, entry) in rows.iter().zip(&cli) {
+            if !expected.contains(entry) {
+                assert!(
+                    row["replaces"]
+                        .as_array()
+                        .is_some_and(|replaces| !replaces.is_empty()),
+                    "extra update row without outgoing RPMs: {row}"
+                );
+            }
+        }
+        cli.retain(|entry| expected.contains(entry));
         cli.sort();
         assert_eq!(cli, expected, "CLI outdated JSON differs from native DNF");
+        let count = std::process::Command::new(assert_cmd::cargo::cargo_bin!("omg"))
+            .args(["uc", "--json"])
+            .output()?;
+        assert!(
+            count.status.success(),
+            "{}",
+            String::from_utf8_lossy(&count.stderr)
+        );
+        let count: serde_json::Value = serde_json::from_slice(&count.stdout)?;
+        assert_eq!(count["count"], rows.len());
 
         let native_preview = std::process::Command::new("dnf")
             .env("LC_ALL", "C")

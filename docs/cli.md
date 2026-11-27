@@ -489,6 +489,11 @@ omg why openssl --reverse
 
 Show packages with available updates.
 
+On Fedora, this includes replacement candidates listed by DNF. JSON rows
+identify outgoing builds in `replaces`. For a replacement without a same-name
+update, `current_version` is the first outgoing build's version. Use
+`omg update --check` to see the transaction DNF resolves.
+
 ```bash
 omg outdated [OPTIONS]
 ```
