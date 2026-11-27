@@ -60,7 +60,8 @@ retries = 0
 test-threads = "num-cpus"
 fail-fast = false
 status-level = "all"
-final-status-level = "all"
+# Successful cases are already printed live and retained in JUnit.
+final-status-level = "slow"
 # CI preserves the first failure, including tests not yet bound to contracts.
 retries = 0
 slow-timeout = { period = "60s", terminate-after = 3 }
