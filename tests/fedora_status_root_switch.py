@@ -8685,6 +8685,7 @@ program.chmod(0o755)
 cli = npm / "bin/npm-cli.js"
 cli.write_text(
     '#!/bin/sh\nset -eu\nhome=' + shlex.quote(str(home)) + '\n'
+    'printf "%s\\n" "$@" > "$home/manager-arguments"\n'
     'while [ "${1#--}" != "$1" ]; do shift; done\n'
     'printf "%s\\n" "$1" >> "$home/manager-phases"\n'
     '[ "$1" = install ] && [ "$2" = --prefix ] || exit 81\n'
@@ -8822,24 +8823,37 @@ pi.mkdir()
                         (home / "materialize-early").touch()
                 versions = home / "data/versions/pi"
                 phases = home / "manager-phases"
+                argv = home / "manager-arguments"
                 original = (home / "witness-lock.json").read_bytes()
                 for shorthand, args in (
                     ("positional", ["use", "pi", version]),
                     ("project-pin", ["use", "pi"]),
                 ):
                     phases.unlink(missing_ok=True)
+                    argv.unlink(missing_ok=True)
                     result = command([cli, *args], mode, ordinary, timeout=60)
                     children = sorted(path.name for path in versions.iterdir())
                     observed = phases.read_text().splitlines() if phases.exists() else []
+                    arguments = argv.read_text().splitlines() if argv.exists() else []
+                    fetch_options = [arg for arg in arguments if arg.startswith("--fetch-")]
+                    bounded = fetch_options == [
+                        "--fetch-retries=1", "--fetch-retry-mintimeout=1000",
+                        "--fetch-retry-maxtimeout=1000", "--fetch-timeout=30000",
+                    ]
+                    source_controls = all(arguments.count(option) == 1 for option in (
+                        "--registry=https://registry.npmjs.org/", "--allow-git=none",
+                        "--allow-file=none", "--allow-directory=none", "--allow-remote=none",
+                    ))
                     checks.append(dict(
                         phase=phase, case=f"{variant}-{shorthand}", status=result.returncode,
                         passed=(result.returncode == 1 and diagnostic in result.stderr
                                 and observed == ["install"] and "Now using Pi" not in result.stdout
+                                and (not legacy or bounded and source_controls)
                                 and all(item in (".mutation.lock", "current") for item in children)
                                 and os.readlink(versions / "current") == "0.82.0"
                                 and (home / "witness-lock.json").read_bytes() == original),
                         diagnostic=result.stderr[-1500:], output=result.stdout[-350:],
-                        value=(children, observed),
+                        value=(children, observed, fetch_options),
                     ))
 
     def inspect_dashboard_terminal():

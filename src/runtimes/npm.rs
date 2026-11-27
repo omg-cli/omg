@@ -10,10 +10,14 @@ use crate::core::security::npm::{
 };
 use anyhow::{Context, Result};
 use std::collections::BTreeMap;
-use std::io::{Read as _, Seek as _};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
+
+const RESOLUTION_TIMEOUT: Duration = Duration::from_secs(90);
+const FROZEN_INSTALL_TIMEOUT: Duration = Duration::from_mins(5);
+const SIGNATURE_TIMEOUT: Duration = Duration::from_secs(90);
+const REBUILD_TIMEOUT: Duration = Duration::from_mins(10);
 
 pub(crate) struct ManagedNpm {
     versions_dir: PathBuf,
@@ -88,6 +92,10 @@ impl ManagedNpm {
             "--allow-file=none",
             "--allow-directory=none",
             "--allow-remote=none",
+            "--fetch-retries=1",
+            "--fetch-retry-mintimeout=1000",
+            "--fetch-retry-maxtimeout=1000",
+            "--fetch-timeout=30000",
         ]);
         Ok(command)
     }
@@ -180,16 +188,24 @@ fn published_npm_plan(
     })?
 }
 
-fn is_npm_remote_refusal(output: &mut std::fs::File) -> Result<bool> {
-    const MAX_ERROR_BYTES: u64 = 64 * 1024;
-    output.rewind()?;
-    let mut data = Vec::new();
-    output.take(MAX_ERROR_BYTES + 1).read_to_end(&mut data)?;
-    if data.len() > MAX_ERROR_BYTES as usize {
-        return Ok(false);
-    }
-    Ok(serde_json::from_slice::<serde_json::Value>(&data)
-        .is_ok_and(|error| error["error"]["code"].as_str() == Some("EALLOWREMOTE")))
+fn is_npm_remote_refusal(output: &[u8]) -> bool {
+    const MAX_ERROR_BYTES: usize = 64 * 1024;
+    output.len() <= MAX_ERROR_BYTES
+        && serde_json::from_slice::<serde_json::Value>(output)
+            .is_ok_and(|error| error["error"]["code"].as_str() == Some("EALLOWREMOTE"))
+}
+
+fn verify_registry_signatures(runtime: &ManagedNpm, prefix: &Path, package: &str) -> Result<()> {
+    let mut command = runtime.command(prefix, package)?;
+    command
+        .args(["audit", "signatures", "--prefix"])
+        .arg(prefix);
+    super::tool_artifacts::run_with_timeout(
+        command,
+        &format!("NPM signature/provenance verification for '{package}'"),
+        SIGNATURE_TIMEOUT,
+    )?;
+    Ok(())
 }
 
 fn prepare_npm_lock(
@@ -265,39 +281,47 @@ fn install_reviewed_npm_with_registry<'a>(
         .context("npm staging path is not UTF-8")?;
     runtime.verify()?;
     node_admission.verify(&runtime.version_dir)?;
-    let mut resolution_output = tempfile::tempfile_in(staging_dir)?;
-    let status = runtime
-        .command(staging_dir, package)?
-        .args([
-            "install",
-            "--prefix",
-            install_path,
-            "--package-lock-only",
-            "--save-exact",
-            "--ignore-scripts",
-            "--package-lock=true",
-            "--json",
-            "--",
-            package,
-        ])
-        .stdout(resolution_output.try_clone()?)
-        .stderr(std::process::Stdio::inherit())
-        .status()?;
+    let mut resolve = runtime.command(staging_dir, package)?;
+    resolve.args([
+        "install",
+        "--prefix",
+        install_path,
+        "--package-lock-only",
+        "--save-exact",
+        "--ignore-scripts",
+        "--package-lock=true",
+        "--json",
+        "--",
+        package,
+    ]);
+    let resolution = super::tool_artifacts::capture_with_timeout(
+        resolve,
+        "NPM lock resolution",
+        RESOLUTION_TIMEOUT,
+    )?;
     anyhow::ensure!(
         !staging_dir.join("node_modules").try_exists()?,
         "NPM lock resolution materialized packages before advisory review"
     );
     let lock_path = staging_dir.join("package-lock.json");
-    if !status.success() {
+    if !resolution.status.success() {
         let no_lock = match std::fs::symlink_metadata(&lock_path) {
             Ok(_) => false,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
             Err(error) => return Err(error.into()),
         };
         let requested = NpmRegistryPackage::from_exact_spec(&spec);
-        let legacy_refusal = no_lock && is_npm_remote_refusal(&mut resolution_output)?;
+        let legacy_refusal = no_lock && is_npm_remote_refusal(&resolution.stdout);
         let Some(requested) = requested.filter(|_| legacy_refusal) else {
-            anyhow::bail!("NPM install resolution of '{package}' failed; no package was admitted");
+            let diagnostic = super::tool_artifacts::manager_diagnostic(&resolution.stderr);
+            let detail = if diagnostic.is_empty() {
+                format!("NPM resolver exited with {}", resolution.status)
+            } else {
+                diagnostic
+            };
+            return Err(anyhow::anyhow!(detail)).with_context(|| {
+                format!("NPM install resolution of '{package}' failed; no package was admitted")
+            });
         };
         let plan = published_npm_plan(requested, manifest)
             .context("Failed to load the published npm shrinkwrap")?;
@@ -330,42 +354,27 @@ fn install_reviewed_npm_with_registry<'a>(
         Ok(())
     };
     unchanged()?;
-    let installed = runtime
-        .command(staging_dir, package)?
-        .args(["ci", "--prefix", install_path, "--ignore-scripts"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::inherit())
-        .status()?;
-    anyhow::ensure!(
-        installed.success(),
-        "NPM frozen install of '{package}' failed"
-    );
+    let mut install = runtime.command(staging_dir, package)?;
+    install.args(["ci", "--prefix", install_path, "--ignore-scripts"]);
+    super::tool_artifacts::run_with_timeout(
+        install,
+        &format!("NPM frozen install of '{package}'"),
+        FROZEN_INSTALL_TIMEOUT,
+    )?;
     lock.verify_installed(staging_dir, &spec)?;
     unchanged()?;
     if require_signatures {
-        let signed = runtime
-            .command(staging_dir, package)?
-            .args(["audit", "signatures", "--prefix", install_path])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::inherit())
-            .status()?;
-        anyhow::ensure!(
-            signed.success(),
-            "NPM signature/provenance verification failed for '{package}'; refusing to activate it"
-        );
+        verify_registry_signatures(&runtime, staging_dir, package)?;
     }
     unchanged()?;
     if allow_scripts {
-        let rebuilt = runtime
-            .command(staging_dir, package)?
-            .args(["rebuild", "--prefix", install_path])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::inherit())
-            .status()?;
-        anyhow::ensure!(
-            rebuilt.success(),
-            "NPM lifecycle-script rebuild failed for '{package}'; refusing to activate it"
-        );
+        let mut rebuild = runtime.command(staging_dir, package)?;
+        rebuild.args(["rebuild", "--prefix", install_path]);
+        super::tool_artifacts::run_with_timeout(
+            rebuild,
+            &format!("NPM lifecycle-script rebuild for '{package}'"),
+            REBUILD_TIMEOUT,
+        )?;
         unchanged()?;
     }
     lock.verify_installed(staging_dir, &spec)?;
@@ -638,17 +647,7 @@ pub(crate) fn review_installed_npm<'a>(
     unchanged()?;
     let require_signatures = !package_is_allowed(ALLOW_UNVERIFIED_ENV, &format!("npm:{package}"));
     if require_signatures {
-        let status = runtime
-            .command(prefix, package)?
-            .args(["audit", "signatures", "--prefix"])
-            .arg(prefix)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::inherit())
-            .status()?;
-        anyhow::ensure!(
-            status.success(),
-            "NPM signature/provenance verification failed for '{package}'; refusing to activate it"
-        );
+        verify_registry_signatures(&runtime, prefix, package)?;
     }
     unchanged()?;
     write_receipt(

@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::Read as _;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -114,12 +114,47 @@ pub(crate) fn run_with_timeout(
     )
 }
 
+pub(super) fn capture_with_timeout(
+    command: Command,
+    phase: &str,
+    timeout: Duration,
+) -> Result<Output> {
+    capture_owned(
+        command,
+        phase,
+        Instant::now() + timeout,
+        &mut observe_child_exit,
+    )
+}
+
+pub(super) fn manager_diagnostic(stderr: &[u8]) -> String {
+    crate::cli::style::sanitize_terminal_text(&String::from_utf8_lossy(stderr))
+        .chars()
+        .take(2000)
+        .collect()
+}
+
 fn run_owned(
-    mut command: Command,
+    command: Command,
     phase: &str,
     deadline: Instant,
     observe: &mut dyn FnMut(u32) -> Result<ChildObservation>,
 ) -> Result<Vec<u8>> {
+    let output = capture_owned(command, phase, deadline, observe)?;
+    ensure!(
+        output.status.success(),
+        "{phase} failed: {}",
+        manager_diagnostic(&output.stderr)
+    );
+    Ok(output.stdout)
+}
+
+fn capture_owned(
+    mut command: Command,
+    phase: &str,
+    deadline: Instant,
+    observe: &mut dyn FnMut(u32) -> Result<ChildObservation>,
+) -> Result<Output> {
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -241,15 +276,11 @@ fn run_owned(
             "{phase} exceeded the bounded output allowance"
         );
         ensure!(Instant::now() < deadline, "{phase} exceeded its deadline");
-        ensure!(
-            status?.success(),
-            "{phase} failed: {}",
-            crate::cli::style::sanitize_terminal_text(&String::from_utf8_lossy(&err))
-                .chars()
-                .take(2000)
-                .collect::<String>()
-        );
-        Ok(out)
+        Ok(Output {
+            status: status?,
+            stdout: out,
+            stderr: err,
+        })
     })
 }
 
@@ -1487,6 +1518,20 @@ esac
             b"complete"
         );
         assert!(interrupted);
+        Ok(())
+    }
+
+    #[test]
+    fn captured_manager_failure_keeps_the_exit_code_and_separate_streams() -> Result<()> {
+        let mut command = Command::new("/bin/sh");
+        command.args([
+            "-c",
+            r#"printf '%s' '{"error":{"code":"EALLOWREMOTE"}}'; printf '%s' 'resolver detail' >&2; exit 17"#,
+        ]);
+        let output = capture_with_timeout(command, "controlled resolver", Duration::from_secs(2))?;
+        assert_eq!(output.status.code(), Some(17));
+        assert_eq!(output.stdout, br#"{"error":{"code":"EALLOWREMOTE"}}"#);
+        assert_eq!(output.stderr, b"resolver detail");
         Ok(())
     }
 
