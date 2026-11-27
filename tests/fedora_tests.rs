@@ -2145,18 +2145,25 @@ mod dnf_integration {
             "native DNF upgrade preview failed: {diagnostics}"
         );
         anyhow::ensure!(!native_plan.is_empty(), "native DNF upgrade plan is empty");
-        let preview = std::process::Command::new(assert_cmd::cargo::cargo_bin!("omg"))
-            .args(["update", "--dry-run", "--yes"])
-            .env("NO_COLOR", "1")
-            .output()?;
-        assert!(
-            preview.status.success(),
-            "{}",
-            String::from_utf8_lossy(&preview.stderr)
-        );
-        let stdout = std::str::from_utf8(&preview.stdout)?;
-        assert!(stdout.contains(native_plan), "{stdout}");
-        assert!(stdout.contains("No changes made (dry run)"), "{stdout}");
+        for flag in ["--dry-run", "--check"] {
+            let preview = std::process::Command::new(assert_cmd::cargo::cargo_bin!("omg"))
+                .args(["update", flag, "--yes"])
+                .env("NO_COLOR", "1")
+                .output()?;
+            assert!(
+                preview.status.success(),
+                "{flag}: {}",
+                String::from_utf8_lossy(&preview.stderr)
+            );
+            let stdout = std::str::from_utf8(&preview.stdout)?;
+            assert!(stdout.contains(native_plan), "{flag}: {stdout}");
+            assert_eq!(
+                stdout.contains("No changes made (dry run)"),
+                flag == "--dry-run",
+                "{flag}: {stdout}"
+            );
+        }
+        assert_eq!(native_query("--installed")?, installed);
         Ok(())
     }
 

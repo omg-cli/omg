@@ -459,6 +459,13 @@ struct NativeTransactionPackage {
     action: String,
 }
 
+#[derive(Debug)]
+pub(crate) struct DnfTransactionPreview {
+    pub(crate) plan: String,
+    pub(crate) diagnostics: String,
+    pub(crate) has_changes: bool,
+}
+
 pub(crate) struct PreparedDnfRemoval {
     directory: tempfile::TempDir,
     packages: Vec<super::types::RemovalPackage>,
@@ -3298,15 +3305,15 @@ impl DnfPackageManager {
             .collect())
     }
 
-    pub(crate) async fn preview_orphan_cleanup() -> Result<(String, String)> {
+    pub(crate) async fn preview_orphan_cleanup() -> Result<DnfTransactionPreview> {
         Self::preview_declined_transaction(["--cacheonly", "autoremove"]).await
     }
 
-    pub(crate) async fn preview_cached_upgrade() -> Result<(String, String)> {
+    pub(crate) async fn preview_cached_upgrade() -> Result<DnfTransactionPreview> {
         Self::preview_declined_transaction(CACHED_UPGRADE_PREVIEW_ARGS).await
     }
 
-    pub(crate) async fn preview_removal(packages: &[String]) -> Result<(String, String)> {
+    pub(crate) async fn preview_removal(packages: &[String]) -> Result<DnfTransactionPreview> {
         Self::validate_package_selectors(packages)?;
         Self::preview_declined_transaction(
             ["--cacheonly", "remove"]
@@ -3316,7 +3323,7 @@ impl DnfPackageManager {
         .await
     }
 
-    pub(crate) async fn preview_install(packages: &[String]) -> Result<(String, String)> {
+    pub(crate) async fn preview_install(packages: &[String]) -> Result<DnfTransactionPreview> {
         Self::validate_install_selectors(packages)?;
         Self::preview_declined_transaction(
             std::iter::once("install").chain(packages.iter().map(String::as_str)),
@@ -3326,7 +3333,7 @@ impl DnfPackageManager {
 
     async fn preview_declined_transaction<'a>(
         args: impl IntoIterator<Item = &'a str>,
-    ) -> Result<(String, String)> {
+    ) -> Result<DnfTransactionPreview> {
         let mut command: tokio::process::Command = Self::native_package_command("dnf")?.into();
         command
             .env("LC_ALL", "C")
@@ -3343,7 +3350,7 @@ impl DnfPackageManager {
         Self::transaction_preview_output(&output)
     }
 
-    fn transaction_preview_output(output: &std::process::Output) -> Result<(String, String)> {
+    fn transaction_preview_output(output: &std::process::Output) -> Result<DnfTransactionPreview> {
         let redact = |text: &str| {
             let mut output = String::with_capacity(text.len());
             for line in text.split_inclusive('\n') {
@@ -3365,14 +3372,22 @@ impl DnfPackageManager {
                 .strip_suffix("Operation aborted by the user.")
             && (prefix.is_empty() || prefix.ends_with('\n'))
         {
-            return Ok((redact(&plan), redact(prefix.trim_end())));
+            return Ok(DnfTransactionPreview {
+                plan: redact(&plan),
+                diagnostics: redact(prefix.trim_end()),
+                has_changes: true,
+            });
         }
         if !output.status.success() && !diagnostics.trim().is_empty() {
             let diagnostics = redact(diagnostics.trim());
             anyhow::bail!("DNF query failed ({})\n{diagnostics}", output.status);
         }
         Self::require_query_success("DNF", output)?;
-        Ok((redact(&plan), redact(&diagnostics)))
+        Ok(DnfTransactionPreview {
+            plan: redact(&plan),
+            diagnostics: redact(&diagnostics),
+            has_changes: false,
+        })
     }
 
     pub(crate) async fn cleanup(
@@ -6185,8 +6200,9 @@ mod tests {
         let preview =
             DnfPackageManager::capture_query("DNF", preview, deadline, None, false).await?;
         assert!(preview.stderr.len() <= 64 * 1024);
-        let (plan, _) = DnfPackageManager::transaction_preview_output(&preview)?;
-        assert_eq!(plan, "Removing:\n leaf noarch 0:1-1\n");
+        let preview = DnfPackageManager::transaction_preview_output(&preview)?;
+        assert!(preview.has_changes);
+        assert_eq!(preview.plan, "Removing:\n leaf noarch 0:1-1\n");
 
         let mut authenticated_mirror = tokio::process::Command::new("/bin/sh");
         authenticated_mirror.stderr(std::process::Stdio::piped()).args([
@@ -6226,18 +6242,18 @@ mod tests {
         };
         let preview = DnfPackageManager::transaction_preview_output;
         let protected = "Unneeded protected package: leaf-0:1-1.noarch";
-        assert_eq!(
-            preview(&output(0, "Nothing to do.\n", protected))?,
-            ("Nothing to do.\n".into(), protected.into())
-        );
+        let no_changes = preview(&output(0, "Nothing to do.\n", protected))?;
+        assert!(!no_changes.has_changes);
+        assert_eq!(no_changes.plan, "Nothing to do.\n");
+        assert_eq!(no_changes.diagnostics, protected);
 
         let plan = "Removing:\n leaf noarch 0:1-1\n";
         let abort = "Operation aborted by the user.\n";
         let diagnostics = format!("{protected}\n{abort}");
-        assert_eq!(
-            preview(&output(1, plan, &diagnostics))?,
-            (plan.into(), protected.into())
-        );
+        let declined = preview(&output(1, plan, &diagnostics))?;
+        assert!(declined.has_changes);
+        assert_eq!(declined.plan, plan);
+        assert_eq!(declined.diagnostics, protected);
 
         for failure in [
             output(7, plan, abort),
@@ -6260,12 +6276,12 @@ mod tests {
         let mirror = "https://fixture-user:fixture-pass@mirror.example/repo?secret=fixture-token";
         let message = format!("Repository example ({mirror})");
         let failed_preview = preview(&output(7, "", &message)).unwrap_err().to_string();
-        let (plan, diagnostics) = preview(&output(
+        let declined = preview(&output(
             1,
             &format!("{message}\n"),
             &format!("{message}\n{abort}"),
         ))?;
-        for text in [failed_preview, plan, diagnostics] {
+        for text in [failed_preview, declined.plan, declined.diagnostics] {
             assert!(text.contains("https://mirror.example/repo"), "{text}");
             assert!(!text.contains("fixture-"), "{text}");
         }

@@ -426,8 +426,8 @@ async fn handle_fedora_clean(
     // explicit confirmation to the native transaction instead.
     if orphans {
         if dry_run {
-            let (plan, diagnostics) = DnfPackageManager::preview_orphan_cleanup().await?;
-            super::common::print_dnf_preview(&plan, &diagnostics);
+            let preview = DnfPackageManager::preview_orphan_cleanup().await?;
+            super::common::print_dnf_preview(&preview);
         } else {
             let history = crate::core::history::HistoryManager::new()?;
             manager

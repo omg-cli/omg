@@ -296,9 +296,10 @@ omg update --fast
 3. Build and update AUR packages
 4. Record transaction in history
 
-On Fedora, `--check` and `--dry-run` use the caller's DNF cache. Applying
-updates with `--no-sync` or `--turbo` uses the system DNF cache for the
-privileged plan and runs the package security review before replay.
+On Fedora, `--check` and `--dry-run` show the transaction DNF resolves from
+the caller's cache, including package replacements. Applying updates with
+`--no-sync` or `--turbo` uses the system DNF cache for the privileged plan.
+The package security review runs before replay.
 
 On Omarchy, a full `omg update` coordinates Omarchy's system update commands,
 including snapshots, keyrings, migrations, service restarts, and boot checks.
