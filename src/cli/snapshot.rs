@@ -263,11 +263,16 @@ pub async fn restore(id: &str, dry_run: bool, yes: bool) -> Result<()> {
     let content = files::read_utf8(&snapshot_path, "snapshot file", Symlinks::Refuse)?;
     let snapshot: Snapshot = serde_json::from_str(&content)
         .with_context(|| format!("Failed to parse snapshot: {}", snapshot_path.display()))?;
+    anyhow::ensure!(
+        snapshot.state.schema_version <= EnvironmentState::SCHEMA_VERSION,
+        "Snapshot '{id}' uses schema {}, which requires a newer omg",
+        snapshot.state.schema_version
+    );
+    anyhow::ensure!(
+        snapshot.state.hash == snapshot.state.calculate_hash(),
+        "Snapshot '{id}' failed its integrity check because the saved checksum does not match"
+    );
 
-    // Capture current state
-    let current = EnvironmentState::capture().await?;
-
-    let mut runtime_changes = Vec::new();
     for (runtime, target_ver) in &snapshot.state.runtimes {
         crate::cli::runtimes::validate_restore_version(runtime, target_ver).with_context(|| {
             format!(
@@ -275,11 +280,22 @@ pub async fn restore(id: &str, dry_run: bool, yes: bool) -> Result<()> {
                 style::sanitize_terminal_text(runtime)
             )
         })?;
-        let current_ver = current.runtimes.get(runtime);
-        if current_ver != Some(target_ver) {
-            runtime_changes.push((runtime.clone(), current_ver.cloned(), target_ver.clone()));
-        }
     }
+    crate::cli::packages::validate_install_request(&snapshot.state.packages, false)
+        .context("Invalid snapshot package targets")?;
+
+    let current = EnvironmentState::capture()
+        .await
+        .context("Failed to inspect the current environment for snapshot restore")?;
+    let runtime_changes: Vec<_> = snapshot
+        .state
+        .runtimes
+        .iter()
+        .filter_map(|(runtime, target_ver)| {
+            let current_ver = current.runtimes.get(runtime);
+            (current_ver != Some(target_ver)).then_some((runtime, current_ver, target_ver))
+        })
+        .collect();
 
     let current_pkgs: BTreeSet<_> = current.packages.iter().collect();
     let target_pkgs: BTreeSet<_> = snapshot.state.packages.iter().collect();
@@ -291,16 +307,13 @@ pub async fn restore(id: &str, dry_run: bool, yes: bool) -> Result<()> {
         .difference(&target_pkgs)
         .map(|s| (*s).clone())
         .collect();
-    crate::cli::packages::validate_install_request(&to_install, false)
-        .context("Invalid snapshot package targets")?;
-
     println!("  {}", style::emphasis("Changes to apply:"));
     println!();
 
     if !runtime_changes.is_empty() {
         println!("  Runtimes:");
         for (runtime, from, to) in &runtime_changes {
-            let from_str = from.as_deref().unwrap_or("(none)");
+            let from_str = from.map_or("(none)", String::as_str);
             println!(
                 "    {} {} → {}",
                 style::caution(&style::sanitize_terminal_text(runtime)),
@@ -392,19 +405,25 @@ pub async fn restore(id: &str, dry_run: bool, yes: bool) -> Result<()> {
 
     for (runtime, _, target_ver) in &runtime_changes {
         println!("    Switching {runtime} to {target_ver}...");
-        crate::cli::runtimes::restore_version(runtime, target_ver).await?;
+        crate::cli::runtimes::restore_version(runtime, target_ver)
+            .await
+            .with_context(|| {
+                format!("Snapshot '{id}' stopped while switching {runtime} to {target_ver}")
+            })?;
     }
 
-    if has_package_changes {
-        if !to_install.is_empty() {
-            println!("    Installing {} packages...", to_install.len());
-            crate::cli::packages::install(&to_install, true, false, false).await?;
-        }
+    if !to_install.is_empty() {
+        println!("    Installing {} packages...", to_install.len());
+        crate::cli::packages::install(&to_install, true, false, false)
+            .await
+            .context("Snapshot restore stopped while installing packages")?;
+    }
 
-        if !to_remove.is_empty() {
-            println!("    Removing {} packages...", to_remove.len());
-            crate::cli::packages::remove(&to_remove, false, true, false).await?;
-        }
+    if !to_remove.is_empty() {
+        println!("    Removing {} packages...", to_remove.len());
+        crate::cli::packages::remove(&to_remove, false, true, false)
+            .await
+            .context("Snapshot restore stopped while removing packages")?;
     }
 
     println!();
