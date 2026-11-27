@@ -648,6 +648,12 @@ class CiDeduplicationTests(unittest.TestCase):
         self.assertIn("CARGO_TARGET_DIR: ${{ github.workspace }}/target", portable)
         self.assertIn("cargo clippy --all-targets", portable)
         self.assertIn("--features debian-pure", portable)
+        self.assertIn(
+            "OMG_PORTABLE_CLIPPY_PROFILE: ${{ needs.quick-gate.outputs."
+            "mutation-baseline-required == 'true' && 'ci' || 'dev' }}",
+            portable,
+        )
+        self.assertEqual(portable.count('--profile "$OMG_PORTABLE_CLIPPY_PROFILE"'), 2)
         self.assertIn("python3 scripts/run-native-contracts.py --features pgp,license", portable)
         makefile = (CI_YML.parents[2] / "Makefile").read_text(encoding="utf-8")
         self.assertIn(
