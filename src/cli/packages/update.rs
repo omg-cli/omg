@@ -45,15 +45,25 @@ pub async fn update(
         return arch::update(check_only, yes, dry_run, no_sync, aur_only).await;
     }
     #[cfg(feature = "fedora")]
-    if dry_run
+    if (check_only || dry_run)
         && crate::package_managers::resolve_backend()? == crate::package_managers::Backend::Fedora
     {
         anyhow::ensure!(!aur_only, "--aur-only is supported only on Arch Linux");
-        let (plan, diagnostics) =
-            crate::package_managers::DnfPackageManager::preview_cached_upgrade().await?;
-        crate::cli::modern_ui::print_phase_header("🔄", "Update", "Dry run · cached");
-        super::common::print_dnf_preview(&plan, &diagnostics);
-        crate::cli::ui::print_dry_run_footer();
+        let preview = crate::package_managers::DnfPackageManager::preview_cached_upgrade().await?;
+        let detail = if dry_run {
+            "Dry run · cached"
+        } else {
+            "Checking for updates · cached"
+        };
+        crate::cli::modern_ui::print_phase_header("🔄", "Update", detail);
+        super::common::print_dnf_preview(&preview);
+        if dry_run {
+            crate::cli::ui::print_dry_run_footer();
+        } else if preview.has_changes {
+            crate::cli::modern_ui::print_info("Run omg update to install updates");
+        } else {
+            crate::cli::modern_ui::print_up_to_date();
+        }
         return Ok(());
     }
     dispatch_backend! {

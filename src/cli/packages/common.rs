@@ -23,11 +23,11 @@ pub(crate) const fn dnf_search_label(
 }
 
 #[cfg(feature = "fedora")]
-pub(super) fn print_dnf_preview(plan: &str, diagnostics: &str) {
-    for line in plan.lines() {
+pub(super) fn print_dnf_preview(preview: &crate::package_managers::dnf::DnfTransactionPreview) {
+    for line in preview.plan.lines() {
         println!("{}", crate::cli::style::sanitize_terminal_text(line));
     }
-    for line in diagnostics.lines() {
+    for line in preview.diagnostics.lines() {
         eprintln!("{}", crate::cli::style::sanitize_terminal_text(line));
     }
 }
@@ -228,6 +228,19 @@ pub(crate) async fn update_official_only(
         )
         .await?
     };
+    #[cfg(feature = "fedora")]
+    if fedora && official_updates.is_empty() {
+        // The upgrade solver can replace an installed package under a new name
+        // even when the same-name upgrade list is empty.
+        let preview = crate::package_managers::DnfPackageManager::preview_cached_upgrade().await?;
+        if preview.has_changes {
+            print_dnf_preview(&preview);
+            if confirm_proceed_with_upgrade(yes).await? {
+                apply_fedora_upgrade(cached_fedora_upgrade, "DNF upgrade plan").await?;
+            }
+            return Ok(());
+        }
+    }
     crate::cli::modern_ui::print_source_lane(
         "official",
         official_updates.len(),
