@@ -8,6 +8,9 @@ use crate::core::packages::PackageService;
 use crate::package_managers::get_package_manager;
 use crate::package_managers::types::qualified_package_name;
 
+#[cfg(feature = "fedora")]
+use anyhow::Context;
+
 #[derive(Debug, Serialize)]
 pub struct OutdatedPackage {
     pub name: String,
@@ -17,11 +20,44 @@ pub struct OutdatedPackage {
     pub new_version: String,
     pub update_type: UpdateType,
     pub repo: String,
+    #[cfg(feature = "fedora")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    replaces: Vec<crate::package_managers::dnf::ReplacedRpm>,
 }
 
 impl OutdatedPackage {
     fn package_label(&self) -> std::borrow::Cow<'_, str> {
         qualified_package_name(&self.name, self.architecture.as_deref())
+    }
+
+    fn other_update_line(&self) -> String {
+        #[cfg(feature = "fedora")]
+        if !self.replaces.is_empty() {
+            let replaced = self
+                .replaces
+                .iter()
+                .map(|package| {
+                    format!(
+                        "{}.{} {}",
+                        package.name, package.architecture, package.version
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            return format!(
+                "{} {} ({}) replaces {replaced}",
+                self.package_label(),
+                self.new_version,
+                self.repo
+            );
+        }
+        format!(
+            "{} {} → {} ({})",
+            self.package_label(),
+            self.current_version,
+            self.new_version,
+            self.repo
+        )
     }
 }
 
@@ -66,10 +102,75 @@ pub async fn run(json: bool) -> Result<()> {
     }
 
     let pm = get_package_manager()?;
+    #[cfg(feature = "fedora")]
+    let fedora = pm.name() == "dnf";
     let service = PackageService::builder(pm).without_history().build()?;
+    #[cfg(feature = "fedora")]
+    let (updates, mut replacement_candidates) = if fedora {
+        tokio::try_join!(
+            service.list_updates(),
+            crate::package_managers::DnfPackageManager::replacement_candidates(),
+        )?
+    } else {
+        (
+            service.list_updates().await?,
+            std::collections::BTreeMap::new(),
+        )
+    };
+    #[cfg(not(feature = "fedora"))]
     let updates = service.list_updates().await?;
 
-    if updates.is_empty() {
+    let mut outdated: Vec<OutdatedPackage> = updates
+        .into_iter()
+        .map(|u| {
+            #[cfg(feature = "fedora")]
+            let replaces = u
+                .architecture
+                .as_ref()
+                .and_then(|arch| replacement_candidates.remove(&(u.name.clone(), arch.clone())))
+                .filter(|candidate| {
+                    candidate.new_version == u.new_version && candidate.repo == u.repo
+                })
+                .map_or_else(Vec::new, |candidate| candidate.replaces);
+            let update_type = classify_update(&u.old_version, &u.new_version);
+            #[cfg(feature = "fedora")]
+            let update_type = if replaces.is_empty() {
+                update_type
+            } else {
+                UpdateType::Unknown
+            };
+            OutdatedPackage {
+                update_type,
+                name: u.name,
+                architecture: u.architecture,
+                current_version: u.old_version,
+                new_version: u.new_version,
+                repo: u.repo,
+                #[cfg(feature = "fedora")]
+                replaces,
+            }
+        })
+        .collect();
+    #[cfg(feature = "fedora")]
+    for ((name, architecture), candidate) in replacement_candidates {
+        let current_version = candidate
+            .replaces
+            .first()
+            .context("DNF replacement candidate has no installed version")?
+            .version
+            .clone();
+        outdated.push(OutdatedPackage {
+            name,
+            architecture: Some(architecture),
+            current_version,
+            new_version: candidate.new_version,
+            update_type: UpdateType::Unknown,
+            repo: candidate.repo,
+            replaces: candidate.replaces,
+        });
+    }
+
+    if outdated.is_empty() {
         if json {
             println!("[]");
         } else {
@@ -77,18 +178,6 @@ pub async fn run(json: bool) -> Result<()> {
         }
         return Ok(());
     }
-
-    let mut outdated: Vec<OutdatedPackage> = updates
-        .into_iter()
-        .map(|u| OutdatedPackage {
-            update_type: classify_update(&u.old_version, &u.new_version),
-            name: u.name,
-            architecture: u.architecture,
-            current_version: u.old_version,
-            new_version: u.new_version,
-            repo: u.repo,
-        })
-        .collect();
 
     outdated.sort_by(|a, b| (&a.name, &a.architecture).cmp(&(&b.name, &b.architecture)));
 
@@ -200,20 +289,12 @@ pub async fn run(json: bool) -> Result<()> {
     if !groups.unknown.is_empty() {
         let unknown_shown = groups.unknown.len().min(15);
         commands.push(Cmd::card(
-            "Other Updates (unclassified versions)".to_string(),
+            "Other Updates".to_string(),
             groups
                 .unknown
                 .iter()
                 .take(unknown_shown)
-                .map(|package| {
-                    format!(
-                        "{} {} → {} ({})",
-                        package.package_label(),
-                        package.current_version,
-                        package.new_version,
-                        package.repo
-                    )
-                })
+                .map(|package| package.other_update_line())
                 .collect(),
         ));
         if groups.unknown.len() > 15 {
@@ -265,6 +346,8 @@ mod tests {
             new_version: "release-b".to_string(),
             update_type: UpdateType::Unknown,
             repo: "custom".to_string(),
+            #[cfg(feature = "fedora")]
+            replaces: Vec::new(),
         }];
 
         let groups = group_updates(&packages);
@@ -290,6 +373,8 @@ mod tests {
                 new_version: "2-1".into(),
                 update_type: UpdateType::Unknown,
                 repo: "updates".into(),
+                #[cfg(feature = "fedora")]
+                replaces: Vec::new(),
             };
             assert_eq!(package.package_label(), label);
             let row = serde_json::to_value(package).expect("multilib update row");

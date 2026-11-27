@@ -14,6 +14,11 @@ pub trait InstalledCatalogObservation: Send + Sync {
     fn is_current(&self) -> Result<bool>;
 
     #[cfg(feature = "fedora")]
+    fn rpm_inventory_fingerprint(&self) -> Option<[u8; 32]> {
+        None
+    }
+
+    #[cfg(feature = "fedora")]
     fn search_index_expired(&self) -> bool {
         false
     }

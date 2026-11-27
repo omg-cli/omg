@@ -213,6 +213,10 @@ impl super::InstalledCatalogObservation for RpmInstalledCatalogObservation {
         Ok(self.source.sqlite_path()?.as_ref() == Some(&self.path)
             && self.database.is_current(&self.path))
     }
+
+    fn rpm_inventory_fingerprint(&self) -> Option<[u8; 32]> {
+        Some(self.database.inventory_fingerprint)
+    }
 }
 
 impl RpmDatabaseObservation {
@@ -535,6 +539,20 @@ struct VersionedPackage {
     architecture: String,
     version: String,
     repository: String,
+}
+
+#[derive(Debug, Eq, Ord, PartialEq, PartialOrd, serde::Serialize)]
+pub(crate) struct ReplacedRpm {
+    pub(crate) name: String,
+    pub(crate) architecture: String,
+    pub(crate) version: String,
+}
+
+#[derive(Debug)]
+pub(crate) struct ReplacementCandidate {
+    pub(crate) new_version: String,
+    pub(crate) repo: String,
+    pub(crate) replaces: Vec<ReplacedRpm>,
 }
 
 struct PlannedDnfAdvisories;
@@ -1019,6 +1037,34 @@ impl DnfPackageManager {
     async fn load_installed_packages(&self) -> Result<Arc<Vec<InstalledPackage>>> {
         let manager = self.cache_handle();
         tokio::task::spawn_blocking(move || manager.load_installed_packages_blocking()).await?
+    }
+
+    pub(crate) async fn status_with_inventory(
+        &self,
+        fast: bool,
+    ) -> Result<(PackageStatus, Option<[u8; 32]>)> {
+        let installed = self.load_installed_packages().await?;
+        let inventory_fingerprint = self
+            .cache_read()
+            .as_ref()
+            .filter(|snapshot| Arc::ptr_eq(&snapshot.packages, &installed))
+            .map(|snapshot| snapshot.observation.inventory_fingerprint);
+        let reasons = Self::current_explicit_package_names(&installed);
+        let (explicit, maintenance) = if fast {
+            (reasons.await?, None)
+        } else {
+            let (explicit, orphans, updates) =
+                tokio::try_join!(reasons, Self::orphan_count(), Self::update_count())?;
+            (explicit, Some((orphans, updates)))
+        };
+        Ok((
+            PackageStatus {
+                total: installed.len(),
+                explicit: explicit.len(),
+                maintenance,
+            },
+            inventory_fingerprint,
+        ))
     }
 
     fn load_installed_packages_blocking(&self) -> Result<Arc<Vec<InstalledPackage>>> {
@@ -3191,23 +3237,138 @@ impl DnfPackageManager {
         };
         anyhow::ensure!(header == heading, "Invalid DNF package listing heading");
         lines
-            .map(|line| {
-                let fields: Vec<_> = line.split_ascii_whitespace().take(4).collect();
-                let &[name_arch, version, repository] = fields.as_slice() else {
-                    anyhow::bail!("DNF package listing row must have three fields");
-                };
-                let (name, architecture) = name_arch
-                    .rsplit_once('.')
-                    .context("DNF package listing row lacks architecture")?;
-                Self::validate_versioned_fields(&[name, architecture, version, repository])?;
-                Ok(VersionedPackage {
-                    name: name.to_owned(),
-                    architecture: architecture.to_owned(),
-                    version: version.to_owned(),
-                    repository: repository.to_owned(),
-                })
-            })
+            .map(|line| Self::parse_package_listing_row(line, None))
             .collect()
+    }
+
+    fn parse_package_listing_row(
+        line: &str,
+        default_repository: Option<&str>,
+    ) -> Result<VersionedPackage> {
+        let mut fields = line.split_ascii_whitespace();
+        let name_arch = fields
+            .next()
+            .context("DNF package listing row lacks a name")?;
+        let version = fields
+            .next()
+            .context("DNF package listing row lacks a version")?;
+        let repository = fields
+            .next()
+            .or(default_repository)
+            .context("DNF package listing row lacks a repository")?;
+        anyhow::ensure!(
+            fields.next().is_none(),
+            "DNF package listing row has extra fields"
+        );
+        let (name, architecture) = name_arch
+            .rsplit_once('.')
+            .context("DNF package listing row lacks architecture")?;
+        Self::validate_versioned_fields(&[name, architecture, version, repository])?;
+        Ok(VersionedPackage {
+            name: name.to_owned(),
+            architecture: architecture.to_owned(),
+            version: version.to_owned(),
+            repository: repository.to_owned(),
+        })
+    }
+
+    fn parse_replacement_listing(
+        output: &[u8],
+    ) -> Result<BTreeMap<(String, String), ReplacementCandidate>> {
+        let text = std::str::from_utf8(output).context("DNF replacement listing is not UTF-8")?;
+        let mut lines = text.lines().filter(|line| !line.trim().is_empty());
+        let Some(header) = lines.next() else {
+            return Ok(BTreeMap::new());
+        };
+        anyhow::ensure!(
+            header.trim() == "Obsoleting packages",
+            "Invalid DNF replacement heading"
+        );
+        let mut groups: Vec<(VersionedPackage, Vec<ReplacedRpm>)> = Vec::new();
+        for line in lines {
+            if let Some(row) = line.strip_prefix("    ") {
+                // DNF's text table indents the installed identities. Old
+                // packages can lack a recorded source repository.
+                let old = Self::parse_package_listing_row(row, Some("<unknown>"))?;
+                groups
+                    .last_mut()
+                    .context("DNF replacement row has no candidate")?
+                    .1
+                    .push(ReplacedRpm {
+                        name: old.name,
+                        architecture: old.architecture,
+                        version: old.version,
+                    });
+            } else {
+                anyhow::ensure!(
+                    !line.starts_with(char::is_whitespace),
+                    "Invalid DNF replacement indentation"
+                );
+                groups.push((Self::parse_package_listing_row(line, None)?, Vec::new()));
+            }
+        }
+        let mut candidates = BTreeMap::<_, ReplacementCandidate>::new();
+        for (candidate, mut replaces) in groups {
+            anyhow::ensure!(
+                !replaces.is_empty(),
+                "DNF replacement candidate has no installed identities"
+            );
+            replaces.sort_unstable();
+            replaces.dedup();
+            let key = (candidate.name, candidate.architecture);
+            // Native list output is sorted by NEVRA. Keep the newest
+            // candidate for each architecture and the first tied mirror.
+            if candidates
+                .get(&key)
+                .is_some_and(|prior| prior.new_version == candidate.version)
+            {
+                continue;
+            }
+            candidates.insert(
+                key,
+                ReplacementCandidate {
+                    new_version: candidate.version,
+                    repo: candidate.repository,
+                    replaces,
+                },
+            );
+        }
+        Ok(candidates)
+    }
+
+    async fn update_listing(args: &[&str]) -> Result<Vec<u8>> {
+        let mut command: tokio::process::Command = Self::native_package_command("dnf")?.into();
+        command.env("LC_ALL", "C").args(args);
+        Self::query_output(command).await
+    }
+
+    pub(crate) async fn replacement_candidates()
+    -> Result<BTreeMap<(String, String), ReplacementCandidate>> {
+        let mut args = UPGRADE_QUERY_ARGS;
+        args[5] = "--obsoletes";
+        Self::parse_replacement_listing(&Self::update_listing(&args).await?)
+    }
+
+    /// Count available upgrade and replacement candidates from the current cache.
+    ///
+    /// # Errors
+    /// Returns an error when any enabled repository or its listing is unavailable.
+    pub async fn update_count() -> Result<usize> {
+        let (upgrades, replacements) = tokio::try_join!(
+            Self::update_listing(&UPGRADE_QUERY_ARGS),
+            Self::replacement_candidates(),
+        )?;
+        let upgrades = Self::parse_package_listing(&upgrades, "Available upgrades")?;
+        Ok(upgrades
+            .iter()
+            .map(|candidate| (candidate.name.as_str(), candidate.architecture.as_str()))
+            .chain(
+                replacements
+                    .keys()
+                    .map(|(name, arch)| (name.as_str(), arch.as_str())),
+            )
+            .collect::<BTreeSet<_>>()
+            .len())
     }
 
     async fn match_updates(
@@ -3989,22 +4150,9 @@ impl PackageManager for DnfPackageManager {
         fast: bool,
     ) -> Pin<Box<dyn Future<Output = Result<PackageStatus>> + Send + '_>> {
         Box::pin(async move {
-            let installed = self.load_installed_packages().await?;
-            let total = installed.len();
-            let reasons = Self::current_explicit_package_names(&installed);
-            let (explicit, maintenance) = if fast {
-                (reasons.await?, None)
-            } else {
-                let (explicit, orphans, updates) =
-                    tokio::try_join!(reasons, Self::orphan_count(), self.list_updates())?;
-                (explicit, Some((orphans, updates.len())))
-            };
-
-            Ok(PackageStatus {
-                total,
-                explicit: explicit.len(),
-                maintenance,
-            })
+            self.status_with_inventory(fast)
+                .await
+                .map(|(status, _)| status)
         })
     }
 
@@ -4022,12 +4170,10 @@ impl PackageManager for DnfPackageManager {
 
     fn list_updates(&self) -> Pin<Box<dyn Future<Output = Result<Vec<UpdateInfo>>> + Send + '_>> {
         Box::pin(async move {
-            let mut command: tokio::process::Command = Self::native_package_command("dnf")?.into();
             // list honors repository priority. JSON for list requires DNF5 5.4.
-            command.env("LC_ALL", "C").args(UPGRADE_QUERY_ARGS);
             let (installed, upgrades) = tokio::try_join!(
                 Self::repository_output(RepositoryQuery::Installed),
-                Self::query_output(command)
+                Self::update_listing(&UPGRADE_QUERY_ARGS)
             )?;
             Self::match_updates(
                 &Self::parse_versioned_packages(&installed)?,
@@ -4811,6 +4957,52 @@ mod tests {
         assert!(UPGRADE_QUERY_ARGS.contains(&"--cacheonly"));
         assert!(UPGRADE_QUERY_ARGS.contains(&"--setopt=*.skip_if_unavailable=false"));
         assert!(!UPGRADE_QUERY_ARGS.contains(&"--setopt=disable_excludes=*"));
+    }
+
+    #[test]
+    fn replacement_listing_keeps_current_identities_and_deduplicates_candidates() -> Result<()> {
+        let output = concat!(
+            "Obsoleting packages\n",
+            "new.pkg.x86_64 2-8 preferred\n",
+            "    old.pkg.i686 1-1 <unknown>\n",
+            "new.pkg.x86_64 2-10 preferred\n",
+            "    old.pkg.x86_64 0:1-2 <unknown>\n",
+            "    old.pkg.i686 1-1\n",
+            "    old.pkg.i686 1-1 <unknown>\n",
+            "new.pkg.x86_64 2-10 tied\n",
+            "    other.pkg.noarch 1-1 <unknown>\n",
+        );
+        let candidates = DnfPackageManager::parse_replacement_listing(output.as_bytes())?;
+        let key = ("new.pkg".to_owned(), "x86_64".to_owned());
+        let candidate = candidates.get(&key).context("preferred replacement")?;
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidate.new_version, "2-10");
+        assert_eq!(candidate.repo, "preferred");
+        assert_eq!(
+            candidate.replaces,
+            [
+                ReplacedRpm {
+                    name: "old.pkg".into(),
+                    architecture: "i686".into(),
+                    version: "1-1".into(),
+                },
+                ReplacedRpm {
+                    name: "old.pkg".into(),
+                    architecture: "x86_64".into(),
+                    version: "0:1-2".into(),
+                },
+            ]
+        );
+        assert!(DnfPackageManager::parse_replacement_listing(b"\n")?.is_empty());
+        for invalid in [
+            "Available upgrades\nnew.x86_64 2-1 repo\n",
+            "Obsoleting packages\n    old.x86_64 1-1 @System\n",
+            "Obsoleting packages\nnew.x86_64 2-1 repo\n",
+            "Obsoleting packages\nnew.x86_64 2-1 repo\n  old.x86_64 1-1 @System\n",
+        ] {
+            assert!(DnfPackageManager::parse_replacement_listing(invalid.as_bytes()).is_err());
+        }
+        Ok(())
     }
 
     #[test]

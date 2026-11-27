@@ -11,6 +11,8 @@ use crate::core::client::DaemonClient;
 use crate::daemon::protocol::StatusMetadata;
 #[cfg(unix)]
 use crate::daemon::protocol::{Request, ResponseResult, StatusResult};
+#[cfg(all(unix, feature = "fedora"))]
+use crate::package_managers::DnfPackageManager;
 use crate::package_managers::get_package_manager;
 use crate::package_managers::types::PackageStatus;
 
@@ -139,24 +141,22 @@ async fn query_daemon_status_metadata() -> Option<StatusMetadata> {
 
 #[cfg(all(unix, feature = "fedora"))]
 pub(crate) async fn fedora_status_with_daemon() -> (bool, Result<StatusResult>) {
-    let manager = match get_package_manager() {
-        Ok(manager) => manager,
-        Err(error) => return (false, Err(error)),
-    };
-    // Package counts depend on the caller's DNF cache. Retain the daemon's
-    // separately validated advisory observation and runtime versions.
+    let manager = DnfPackageManager::new();
     let (counts, daemon) = tokio::join!(
-        manager.get_status_details(false),
+        manager.status_with_inventory(false),
         query_daemon_status_metadata()
     );
     let connected = daemon.is_some();
-    let status = counts.map(|counts| {
+    let status = counts.map(|(counts, inventory_fingerprint)| {
         let (total_packages, explicit_packages, orphan_packages, updates_available) =
             counts.into_counts();
         let advisories = daemon
             .as_ref()
             .and_then(|status| status.rpm_advisories.as_ref())
-            .filter(|advisories| advisories.installed_packages == total_packages);
+            .filter(|advisories| {
+                advisories.installed_packages == total_packages
+                    && inventory_fingerprint == Some(advisories.inventory_fingerprint)
+            });
         StatusResult {
             total_packages,
             explicit_packages,

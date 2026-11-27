@@ -784,7 +784,19 @@ mod dnf_integration {
             "native installed package query failed"
         );
         let installed_count = std::str::from_utf8(&rpm.stdout)?.lines().count();
-        for args in [&["status", "--json"][..], &["status"][..]] {
+        let observation = DnfPackageManager::new()
+            .installed_catalog_observation()?
+            .context("native RPM inventory could not be observed")?;
+        let fingerprint = observation
+            .rpm_inventory_fingerprint()
+            .context("native RPM inventory fingerprint is missing")?;
+        let mut mismatched_fingerprint = fingerprint;
+        mismatched_fingerprint[0] ^= 1;
+        for (args, inventory_fingerprint) in [
+            (&["status", "--json"][..], fingerprint),
+            (&["status"][..], fingerprint),
+            (&["status"][..], mismatched_fingerprint),
+        ] {
             let home = tempfile::Builder::new()
                 .permissions(std::fs::Permissions::from_mode(0o700))
                 .tempdir_in("/tmp")?;
@@ -850,6 +862,7 @@ mod dnf_integration {
                         runtime_versions: vec![("node".into(), "24.25.0".into())],
                         rpm_advisories: Some(StatusAdvisorySummary {
                             installed_packages: installed_count,
+                            inventory_fingerprint,
                             findings: 1,
                             unknown_packages: 2,
                         }),
@@ -868,7 +881,12 @@ mod dnf_integration {
             );
             let installed = format!("{installed_count} packages installed");
             assert!(stdout.contains(&installed), "{stdout}");
-            assert!(stdout.contains("1 findings"), "{stdout}");
+            if inventory_fingerprint == fingerprint {
+                assert!(stdout.contains("1 findings"), "{stdout}");
+            } else {
+                assert!(stdout.contains("Advisory coverage unreported"), "{stdout}");
+                assert!(!stdout.contains("1 findings"), "{stdout}");
+            }
             assert!(stdout.contains("24.25.0"), "{stdout}");
             assert!(stdout.contains("Running"), "{stdout}");
             sent.context("live daemon reply was discarded")?;
@@ -2121,8 +2139,29 @@ mod dnf_integration {
                 ))
             })
             .collect::<Result<Vec<_>>>()?;
+        for (row, entry) in rows.iter().zip(&cli) {
+            if !expected.contains(entry) {
+                assert!(
+                    row["replaces"]
+                        .as_array()
+                        .is_some_and(|replaces| !replaces.is_empty()),
+                    "extra update row without outgoing RPMs: {row}"
+                );
+            }
+        }
+        cli.retain(|entry| expected.contains(entry));
         cli.sort();
         assert_eq!(cli, expected, "CLI outdated JSON differs from native DNF");
+        let count = std::process::Command::new(assert_cmd::cargo::cargo_bin!("omg"))
+            .args(["uc", "--json"])
+            .output()?;
+        assert!(
+            count.status.success(),
+            "{}",
+            String::from_utf8_lossy(&count.stderr)
+        );
+        let count: serde_json::Value = serde_json::from_slice(&count.stdout)?;
+        assert_eq!(count["count"], rows.len());
 
         let native_preview = std::process::Command::new("dnf")
             .env("LC_ALL", "C")
