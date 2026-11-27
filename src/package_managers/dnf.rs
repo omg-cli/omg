@@ -3994,9 +3994,14 @@ impl PackageManager for DnfPackageManager {
     }
 
     fn list_explicit(&self) -> Pin<Box<dyn Future<Output = Result<Vec<String>>> + Send + '_>> {
-        Box::pin(async move {
-            let installed = self.load_installed_packages().await?;
-            Self::current_explicit_package_names(&installed).await
+        Box::pin(async {
+            let mut names: Vec<_> = Self::read_user_installed_names()
+                .await
+                .context("Could not load DNF install reasons")?
+                .into_iter()
+                .collect();
+            names.sort_unstable();
+            Ok(names)
         })
     }
 

@@ -315,6 +315,8 @@ jobs:
       OMG_CONTRACT_SOURCE_SHA: ${{ github.sha }}
       OMG_CONTRACT_PLATFORM: portable
       OMG_PORTABLE_CARGO_PROFILE: ${{ needs.quick-gate.outputs.mutation-baseline-required == 'true' && 'ci' || 'test' }}
+      # Use the same dependency settings as the tests. Cargo's test profile inherits dev.
+      OMG_PORTABLE_CLIPPY_PROFILE: ${{ needs.quick-gate.outputs.mutation-baseline-required == 'true' && 'ci' || 'dev' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -390,12 +392,12 @@ jobs:
       - name: Clippy
         run: |
           cargo clippy --all-targets --no-default-features --features pgp,license \
-            --locked -- -D warnings
+              --profile "$OMG_PORTABLE_CLIPPY_PROFILE" --locked -- -D warnings
 
       - name: Debian feature isolation clippy
         run: |
           cargo clippy --all-targets --no-default-features \
-            --features debian-pure --locked -- -D warnings
+              --features debian-pure --profile "$OMG_PORTABLE_CLIPPY_PROFILE" --locked -- -D warnings
 
       - name: Verify Node authentication fails closed without PGP
         # Share Cargo dependency artifacts with the portable test suite below.
