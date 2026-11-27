@@ -263,6 +263,15 @@ pub async fn restore(id: &str, dry_run: bool, yes: bool) -> Result<()> {
     let content = files::read_utf8(&snapshot_path, "snapshot file", Symlinks::Refuse)?;
     let snapshot: Snapshot = serde_json::from_str(&content)
         .with_context(|| format!("Failed to parse snapshot: {}", snapshot_path.display()))?;
+    anyhow::ensure!(
+        snapshot.state.schema_version <= EnvironmentState::SCHEMA_VERSION,
+        "Snapshot '{id}' uses schema {}, which requires a newer omg",
+        snapshot.state.schema_version
+    );
+    anyhow::ensure!(
+        snapshot.state.hash == snapshot.state.calculate_hash(),
+        "Snapshot '{id}' failed its integrity check because the saved checksum does not match"
+    );
 
     // Capture current state
     let current = EnvironmentState::capture().await?;

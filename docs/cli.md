@@ -1482,9 +1482,13 @@ omg snapshot delete abc123
 ```
 
 Creation and deletion share a persistent `.index.lock` in the snapshots directory.
-A competing mutation fails with a retry message. Both commands validate the index
-before changing snapshot files. This does not make the snapshot file and index a
-crash-atomic pair.
+A competing mutation fails with a retry message. If the index update fails after
+creation saves the file, OMG prints its restore command. Deletion commits the
+index update before removing the saved file. The file and index persist through
+separate writes.
+
+Restore checks the saved schema and content checksum before reading the current
+environment.
 
 A snapshot and its index each have a 16 MiB file limit.
 
