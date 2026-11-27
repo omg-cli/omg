@@ -81,7 +81,10 @@ verify_configured_installroot() {
   config_written=true
   install -m 0644 "$root/etc/dnf/dnf.conf" "$config"
   [[ $(rpm --root "$root" -qa --qf '%{NAME}\n') == "$package" ]]
-  ! rpm -q "$package" >/dev/null 2>&1
+  if rpm -q "$package" >/dev/null 2>&1; then
+    echo 'Alternate installroot fixture appeared in the host RPM database' >&2
+    return 1
+  fi
   rpm -q rpm >/dev/null
   # RPM installs the package payload. DNF owns its install reasons and state.
   if ! dnf --cacheonly --assumeyes mark user "$package" > "$base/alternate-mark.log" 2>&1; then
@@ -152,7 +155,7 @@ verify_installed_commands() {
   dnf -q history list --json > "$base/native-noop-after.json"
   cmp "$base/omg-noop-before.json" "$base/omg-noop-after.json"
   cmp "$base/native-noop-before.json" "$base/native-noop-after.json"
-  [[ $(rpm -q --qf '%{VERSION}\n' "$package") == 1 ]]
+  [[ $(rpm -q --qf '%{EPOCHNUM}:%{VERSION}-%{RELEASE}.%{ARCH}\n' "$package") == 0:1-1.noarch ]]
 }
 
 if [[ -e "$config" ]]; then cp -a "$config" "$base/original-dnf.conf"; had_config=true; fi
@@ -190,7 +193,7 @@ v1=$(build_rpm 1); v2=$(build_rpm 2); v3=$(build_rpm 3)
 verify_configured_installroot
 phase=setup
 rpm -Uvh --nosignature "$v1" > "$base/install-v1.log" 2>&1 || { cat "$base/install-v1.log" >&2; exit 120; }
-[[ $(rpm -q --qf '%{VERSION}\n' "$package") == 1 ]] || exit 120
+[[ $(rpm -q --qf '%{EPOCHNUM}:%{VERSION}-%{RELEASE}.%{ARCH}\n' "$package") == 0:1-1.noarch ]] || exit 120
 rpm -qa --qf '%{NAME}|%{EPOCHNUM}|%{VERSION}|%{RELEASE}|%{ARCH}\n' |
   grep -v "^$package|" | LC_ALL=C sort > "$base/system-before.tsv"
 snapshot_install_reasons "$base/reasons-before.tsv" ||
@@ -231,7 +234,7 @@ if [[ "$mode" == turbo ]]; then
   dnf upgrade -y --downloadonly "$package" > "$base/download.log" 2>&1 || {
     cat "$base/download.log" >&2; exit 120;
   }
-  [[ $(rpm -q --qf '%{VERSION}\n' "$package") == 1 ]] || exit 120
+  [[ $(rpm -q --qf '%{EPOCHNUM}:%{VERSION}-%{RELEASE}.%{ARCH}\n' "$package") == 0:1-1.noarch ]] || exit 120
   rm -f -- "$base/repo/$package-2-1.noarch.rpm"
   cp "$v3" "$base/repo/"
   createrepo_c --update "$base/repo" > "$base/createrepo-next.log" 2>&1 || { cat "$base/createrepo-next.log" >&2; exit 120; }
@@ -245,25 +248,53 @@ else
   cached=$(sudo -H -u "$guest_user" -- dnf --cacheonly repoquery --upgrades --qf '%{name}' "$package")
   [[ -z "$cached" ]] || { printf 'fast fixture cache refreshed before OMG: %s\n' "$cached" >&2; exit 120; }
 fi
+dnf history list --json > "$base/history-before-update.json"
 printf 'OMG_QEMU_UPDATE_FIXTURE:before:%s:1\n' "$mode"
 phase=product
 sudo -H -u "$guest_user" -- python3 "$consent" --native --accept-only --require-review --timeout 600 -- "$binary" update "--$mode" --yes
 phase=verification
-[[ $(rpm -q --qf '%{VERSION}\n' "$package") == 2 ]] || { echo 'OMG did not upgrade fixture to version 2' >&2; exit 1; }
+[[ $(rpm -q --qf '%{EPOCHNUM}:%{VERSION}-%{RELEASE}.%{ARCH}\n' "$package") == 0:2-1.noarch ]] || { echo 'OMG did not upgrade fixture to version 2' >&2; exit 1; }
 rpm -qa --qf '%{NAME}|%{EPOCHNUM}|%{VERSION}|%{RELEASE}|%{ARCH}\n' |
   grep -v "^$package|" | LC_ALL=C sort > "$base/system-after.tsv"
 cmp "$base/system-before.tsv" "$base/system-after.tsv" || { echo 'OMG changed packages outside bounded fixture' >&2; exit 1; }
 snapshot_install_reasons "$base/reasons-after.tsv" ||
   { echo 'native DNF install reasons unavailable after update' >&2; exit 1; }
 check_reason_delta "$base/reasons-before.tsv" "$base/reasons-after.tsv" || exit 1
+dnf history list --json > "$base/history-after-update.json"
 dnf history info --json last > "$base/history.json"
-jq -e --arg package "$package" '
-  type == "array" and length == 1 and .[0].status == "Ok" and
-  any(.[0].packages[];
-    .action == "Upgrade" and .repository == "@stored_transaction(omg-qa-update)" and
-    (.nevra | test("^" + $package + "-(?:[0-9]+:)?2-1[.]noarch$")))
+jq -e --arg package "$package" \
+  --slurpfile before "$base/history-before-update.json" \
+  --slurpfile after "$base/history-after-update.json" '
+  def valid_id: type == "number" and . > 0 and . == floor;
+  def history_ids:
+    if length == 1 and (.[0] | type == "array") and all(.[0][]; .id | valid_id)
+    then .[0] | map(.id) | sort
+    else error("Invalid DNF history list")
+    end;
+  def fixture_nevra($version):
+    . == ($package + "-0:" + $version + "-1.noarch") or
+    . == ($package + "-" + $version + "-1.noarch");
+
+  (type == "array" and length == 1) and
+  (.[0] as $transaction |
+    ($before | history_ids) as $prior |
+    ($after | history_ids) as $current |
+    $transaction.status == "Ok" and
+    ($transaction.id | valid_id) and
+    ($transaction.comment | type == "string" and
+      test("^omg-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")) and
+    ($prior | unique) == $prior and
+    all($prior[]; . < $transaction.id) and
+    $current == ($prior + [$transaction.id]) and
+    ($transaction.packages |
+      type == "array" and length == 2 and
+      any(.[];
+        .action == "Upgrade" and .repository == "@stored_transaction(omg-qa-update)" and
+        (.nevra | fixture_nevra("2"))) and
+      any(.[];
+        .action == "Replaced" and .repository == "@System" and (.nevra | fixture_nevra("1")))))
 ' "$base/history.json" > /dev/null || {
-  echo 'DNF native history did not record fixture upgrade' >&2
+  echo 'DNF native history did not prove exactly one stored fixture upgrade' >&2
   cat "$base/history.json" >&2
   exit 1
 }

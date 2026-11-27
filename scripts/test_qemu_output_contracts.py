@@ -22,36 +22,130 @@ ROOT = Path(__file__).resolve().parents[1]
 class NativeRemovalContracts(unittest.TestCase):
     def test_fedora_history_requires_the_exact_reviewed_stored_transaction(self):
         source = (ROOT / 'scripts/qemu-fedora-update-fixture.sh').read_text(encoding='utf-8')
-        body = re.search(r"jq -e --arg package \"\$package\" '(.*?)' \"\$base/history.json\"",
-                         source, re.S)
+        body = re.search(r"""^jq -e --arg package "\$package"[\s\S]*?^' "\$base/history.json" > /dev/null""",
+                         source, re.M)
         self.assertIsNotNone(body, 'The actual native history predicate must remain executable')
-        record = [{'status': 'Ok', 'packages': [
-            {'action': 'Upgrade', 'repository': '@stored_transaction(omg-qa-update)',
-             'nevra': 'omg-qemu-update-oracle-0:2-1.noarch'},
-            {'action': 'Replaced', 'repository': '@System',
-             'nevra': 'omg-qemu-update-oracle-0:1-1.noarch'},
-        ]}]
-        cases = [('actual stored replay', record, True)]
-        for field, value in [('repository', '@stored_transaction(other-repo)'),
-                             ('repository', 'omg-qa-update'),
-                             ('repository', '@stored_transaction(omg-qa-update)-other'),
-                             ('action', 'Install'),
-                             ('nevra', 'omg-qemu-update-oracle-0:3-1.noarch'),
-                             ('nevra', 'other-package-0:2-1.noarch'),
-                             ('nevra', 'omg-qemu-update-oracle-0:2-1.x86_64')]:
-            changed = json.loads(json.dumps(record))
-            changed[0]['packages'][0][field] = value
-            cases.append((field + '=' + value, changed, False))
-        failed = json.loads(json.dumps(record))
-        failed[0]['status'] = 'Error'
-        cases.extend([('failed transaction', failed, False),
-                      ('multiple transactions', record + record, False),
-                      ('empty transaction', [{'status': 'Ok', 'packages': []}], False)])
-        for label, data, expected in cases:
-            with self.subTest(label=label):
-                result = subprocess.run(['jq', '-e', '--arg', 'package', 'omg-qemu-update-oracle', body[1]],
-                                        input=json.dumps(data), text=True, capture_output=True, timeout=5)
-                self.assertEqual(result.returncode == 0, expected, result.stderr + result.stdout)
+        package = 'omg-qemu-update-oracle'
+        record = {'id': 15, 'status': 'Ok', 'comment': 'omg-550e8400-e29b-41d4-a716-446655440000',
+                  'packages': [
+                      {'action': 'Upgrade', 'repository': '@stored_transaction(omg-qa-update)',
+                       'nevra': package + '-0:2-1.noarch'},
+                      {'action': 'Replaced', 'repository': '@System', 'nevra': package + '-0:1-1.noarch'},
+                  ]}
+        before = [{'id': 14}, {'id': 11}]
+        after = [{'id': 15}, *before]
+        def changed(index, **fields):
+            rows = [dict(row) for row in record['packages']]
+            rows[index].update(fields)
+            return [dict(record, packages=rows)]
+        def with_packages(*rows):
+            return [dict(record, packages=list(rows))]
+
+        upgrade, replaced = record['packages']
+        cases = [
+            ('actual stored replay', [record], before, after, True),
+            ('reversed package order', with_packages(replaced, upgrade), before, after, True),
+            ('first transaction', [dict(record, id=1)], [], [{'id': 1}], True),
+            ('unordered history entries', [record], list(reversed(before)), list(reversed(after)), True),
+            ('default epoch spellings', with_packages(
+                dict(upgrade, nevra=package + '-2-1.noarch'), dict(replaced, nevra=package + '-1-1.noarch')),
+                before, after, True),
+            ('native additional package fields', with_packages(
+                dict(upgrade, reason='User'), dict(replaced, reason='External')), before, after, True),
+            ('failed transaction', [dict(record, status='Error')], before, after, False),
+            ('unfinished transaction', [dict(record, status='Started')], before, after, False),
+            ('multiple transactions', [record, record], before, after, False),
+            ('transaction without records', with_packages(), before, after, False),
+            ('only upgrade', with_packages(upgrade), before, after, False),
+            ('only replacement', with_packages(replaced), before, after, False),
+            ('two upgrades', with_packages(upgrade, upgrade), before, after, False),
+            ('extra upgrade', with_packages(upgrade, replaced, upgrade), before, after, False),
+            ('extra replacement', with_packages(upgrade, replaced, replaced), before, after, False),
+            ('unrelated reinstall', with_packages(upgrade, replaced,
+                {'action': 'Reinstall', 'repository': '@System', 'nevra': 'unrelated-0:1-1.noarch'}),
+                before, after, False),
+            ('unexpected packages object', [dict(record, packages={'copy': upgrade})], before, after, False),
+            ('other replay repository', changed(0, repository='@stored_transaction(other-repo)'), before, after, False),
+            ('live repository', changed(0, repository='omg-qa-update'), before, after, False),
+            ('repository suffix', changed(0, repository='@stored_transaction(omg-qa-update)-other'), before, after, False),
+            ('installation action', changed(0, action='Install'), before, after, False),
+            ('removal action', changed(1, action='Remove'), before, after, False),
+            ('non-system replaced package', changed(1, repository='other-repo'), before, after, False),
+            ('wrong target version', changed(0, nevra=package + '-0:3-1.noarch'), before, after, False),
+            ('wrong replaced version', changed(1, nevra=package + '-0:2-1.noarch'), before, after, False),
+            ('different new package', changed(0, nevra='other-package-0:2-1.noarch'), before, after, False),
+            ('different replaced package', changed(1, nevra='other-package-0:1-1.noarch'), before, after, False),
+            ('native arch substituted', changed(0, nevra=package + '-0:2-1.x86_64'), before, after, False),
+            ('wrong replaced architecture', changed(1, nevra=package + '-0:1-1.x86_64'), before, after, False),
+            ('wrong upgrade epoch', changed(0, nevra=package + '-1:2-1.noarch'), before, after, False),
+            ('wrong replaced epoch', changed(1, nevra=package + '-1:1-1.noarch'), before, after, False),
+            ('foreign transaction comment', [dict(record, comment='plain-dnf')], before, after, False),
+            ('missing transaction comment', [{k: v for k, v in record.items() if k != 'comment'}], before, after, False),
+            ('malformed OMG comment', [dict(record, comment='omg-550e8400')], before, after, False),
+            ('string transaction id', [dict(record, id='15')], before, after, False),
+            ('fractional transaction id', [dict(record, id=14.5)], before, after, False),
+            ('missing transaction id', [{k: v for k, v in record.items() if k != 'id'}], before, after, False),
+            ('stale transaction', [record], after, after, False),
+            ('existing history lost', [record], before, [{'id': 15}, {'id': 14}], False),
+            ('upgrade row missing from list', [record], before, before, False),
+            ('extra transaction', [record], before, [{'id': 16}, *after], False),
+            ('duplicate history id', [record], before, [*after, {'id': 15}], False),
+            ('invalid history witness', [record], {'id': 14}, after, False),
+        ]
+        for label, data, initial, final, expected in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                base = Path(directory)
+                for name, value in (('history.json', data), ('history-before-update.json', initial),
+                                    ('history-after-update.json', final)):
+                    (base / name).write_text(json.dumps(value), encoding='utf-8')
+                result = subprocess.run(
+                    [shutil.which('bash'), '-euo', 'pipefail', '-c',
+                     'package=$1\nbase=$2\n' + body[0],
+                     '_', package, str(base)],
+                    capture_output=True, text=True, timeout=5,
+                )
+                self.assertEqual(result.returncode == 0, expected, result.stderr)
+
+    def test_fedora_alternate_root_rejects_any_host_fixture_install(self):
+        source = (ROOT / 'scripts/qemu-fedora-update-fixture.sh').read_text(encoding='utf-8')
+        begin = source.index('  [[ $(rpm --root "$root" -qa')
+        end = source.index('  # RPM installs the package payload.', begin)
+        check = source[begin:end]
+        fixture = r"""
+package=omg-qemu-update-oracle
+root=/private-fixture
+rpm() {
+  if [[ $1 == --root ]]; then
+    [[ $2 == "$root" && $3 == -qa ]] || return 90
+    printf '%s\n' "$ALTERNATE_INVENTORY"
+  elif [[ $1 == -q && $2 == "$package" ]]; then
+    return "$HOST_FIXTURE_EXIT"
+  elif [[ $1 == -q && $2 == rpm ]]; then
+    return "$HOST_RPM_EXIT"
+  else
+    return 90
+  fi
+}
+"""
+        for inventory, host_fixture, host_rpm, expected in (
+            ('omg-qemu-update-oracle', '1', '0', True),
+            ('omg-qemu-update-oracle', '0', '0', False),
+            ('omg-qemu-update-oracle\nunexpected', '1', '0', False),
+            ('omg-qemu-update-oracle', '1', '2', False),
+        ):
+            with self.subTest(inventory=inventory, host_fixture=host_fixture, host_rpm=host_rpm):
+                result = subprocess.run(
+                    [shutil.which('bash'), '-euo', 'pipefail', '-c',
+                     fixture + '\nverify_isolation() {\n' + check +
+                     '}\nverify_isolation\nprintf "isolation proved\\n"'],
+                    env=dict(os.environ, ALTERNATE_INVENTORY=inventory,
+                             HOST_FIXTURE_EXIT=host_fixture, HOST_RPM_EXIT=host_rpm),
+                    capture_output=True, text=True, timeout=5,
+                )
+                self.assertEqual(result.returncode == 0, expected, result.stderr)
+                self.assertEqual('isolation proved' in result.stdout, expected)
+                if host_fixture == '0':
+                    self.assertIn('Alternate installroot fixture appeared in the host RPM database', result.stderr)
 
     def test_benchmark_search_smoke_accepts_only_exact_guest_package_identity(self):
         source = (ROOT / 'scripts/benchmark-qemu.sh').read_text(encoding='utf-8')
