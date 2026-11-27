@@ -897,6 +897,11 @@ mod snapshot_contracts {
         let path = project.data_dir.path().join(format!("snapshots/{id}.json"));
         let clean: serde_json::Value =
             serde_json::from_slice(&fs::read(&path).expect("snapshot bytes")).expect("snapshot");
+        fs::write(
+            project.data_dir.path().join("mock_state_pacman.json"),
+            b"invalid inventory",
+        )
+        .expect("make the current inventory unreadable");
 
         for (key, value, diagnostic) in [
             (
@@ -921,6 +926,43 @@ mod snapshot_contracts {
                 assert!(!result.stdout.contains("Applying changes"));
             }
         }
+
+        write_snapshot_with_checksum(&path, clean);
+        let result = project.run(&["snapshot", "restore", &id, "--dry-run"]);
+        result.assert_failure();
+        assert!(
+            result
+                .stderr
+                .contains("Failed to inspect the current environment for snapshot restore"),
+            "{}",
+            result.stderr
+        );
+        assert!(result.stderr.contains("failed to parse mock state"));
+    }
+
+    #[test]
+    fn restore_reports_install_failure_before_removing_packages() {
+        let project = TestProject::new();
+        let id = create_snapshot(&project, "missing install fixture");
+        let path = project.data_dir.path().join(format!("snapshots/{id}.json"));
+        let mut snapshot: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        snapshot["state"]["packages"] = serde_json::json!([FAKE_PKG]);
+        write_snapshot_with_checksum(&path, snapshot);
+        project.mock_install("extra-fixture", "1.0").unwrap();
+
+        let result = project.run(&["snapshot", "restore", &id, "--yes"]);
+        result.assert_failure();
+        assert!(
+            result
+                .stderr
+                .contains("Snapshot restore stopped while installing packages"),
+            "{}",
+            result.stderr
+        );
+        assert!(result.stderr.contains(FAKE_PKG));
+        assert!(!result.stdout.contains("Snapshot restore complete"));
+        assert!(read_mock_state(&project).0.contains_key("extra-fixture"));
     }
 
     /// Contract: a non-interactive restore with pending package changes
@@ -988,6 +1030,7 @@ mod snapshot_contracts {
         snap["state"]["packages"] = serde_json::json!([FAKE_PKG]);
         write_snapshot_with_checksum(&snap_path, snap);
 
+        project.mock_install("extra-fixture", "1.0").unwrap();
         let result = project.run(&["snapshot", "restore", &id, "--yes"]);
 
         result.assert_success();
@@ -1006,6 +1049,7 @@ mod snapshot_contracts {
         );
 
         let (installed, _) = read_mock_state(&project);
+        assert!(!installed.contains_key("extra-fixture"));
         let version = installed
             .get(FAKE_PKG)
             .unwrap_or_else(|| panic!("{FAKE_PKG} must be recorded installed, got {installed:?}"));

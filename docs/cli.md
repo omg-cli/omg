@@ -1487,8 +1487,8 @@ creation saves the file, OMG prints its restore command. Deletion commits the
 index update before removing the saved file. The file and index persist through
 separate writes.
 
-Restore checks the saved schema and content checksum before reading the current
-environment.
+Restore checks the saved schema, checksum, and requested targets before reading
+the current environment. If restore stops, the error identifies the failed step.
 
 A snapshot and its index each have a 16 MiB file limit.
 
