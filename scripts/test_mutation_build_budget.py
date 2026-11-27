@@ -48,7 +48,7 @@ class MutationBuildBudget(unittest.TestCase):
         quick_gate = ci.split('\n  quick-gate:', 1)[1].split('\n  workflow-checks:', 1)[0]
         self.assertIn('mutation-baseline-required: ${{ steps.changes.outputs.mutation_baseline_required }}', quick_gate)
         portable = ci.split('\n  portable:', 1)[1].split('\n  portable-release:', 1)[0]
-        self.assertIn("OMG_PORTABLE_CARGO_PROFILE: ${{ needs.quick-gate.outputs.mutation-baseline-required == 'true' && 'ci' || 'test' }}", portable)
+        self.assertIn("OMG_PORTABLE_CARGO_PROFILE: ci\n", portable)
         self.assertIn('run-native-contracts.py --features pgp,license --cargo-profile "$OMG_PORTABLE_CARGO_PROFILE"', portable)
         marker = '      - name: Validate portable mutation baseline\n'
         baseline = portable.split(marker, 1)[1].split('      - name:', 1)[0]

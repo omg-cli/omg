@@ -648,12 +648,13 @@ class CiDeduplicationTests(unittest.TestCase):
         self.assertIn("CARGO_TARGET_DIR: ${{ github.workspace }}/target", portable)
         self.assertIn("cargo clippy --all-targets", portable)
         self.assertIn("--features debian-pure", portable)
-        self.assertIn(
-            "OMG_PORTABLE_CLIPPY_PROFILE: ${{ needs.quick-gate.outputs."
-            "mutation-baseline-required == 'true' && 'ci' || 'dev' }}",
-            portable,
-        )
-        self.assertEqual(portable.count('--profile "$OMG_PORTABLE_CLIPPY_PROFILE"'), 2)
+        self.assertIn("OMG_PORTABLE_CARGO_PROFILE: ci\n", portable)
+        self.assertNotIn("OMG_PORTABLE_CLIPPY_PROFILE", portable)
+        lint = portable.split("- name: Clippy\n", 1)[1].split(
+            "- name: Verify Node authentication fails closed without PGP\n", 1
+        )[0]
+        self.assertEqual(lint.count('--profile "$OMG_PORTABLE_CARGO_PROFILE"'), 2)
+        self.assertEqual(lint.count("--locked -- -D warnings"), 2)
         self.assertIn("python3 scripts/run-native-contracts.py --features pgp,license", portable)
         makefile = (CI_YML.parents[2] / "Makefile").read_text(encoding="utf-8")
         self.assertIn(
@@ -848,20 +849,20 @@ class NormalPrOriginalOwners(unittest.TestCase):
             cargo.chmod(0o755)
             log = root / "rows.jsonl"
             bash = "C:/Program Files/Git/bin/bash.exe" if os.name == "nt" else "bash"
-            for job, profile in (("portable", "test"), ("portable", "ci"), ("portable-release", "test")):
+            for job in ("portable", "portable-release"):
                 commands = owners[job]
                 expected = [
-                    [profile if arg == "$OMG_PORTABLE_CARGO_PROFILE" else arg for arg in argv]
+                    ["ci" if arg == "$OMG_PORTABLE_CARGO_PROFILE" else arg for arg in argv]
                     for argv in self.EXPECTED[job]
                 ]
                 for failed in range(len(commands) + 1):
-                    with self.subTest(job=job, profile=profile, failed=failed):
+                    with self.subTest(job=job, failed=failed):
                         log.unlink(missing_ok=True)
                         result = subprocess.run(
                             [bash, "-e", "-c", "\n".join(x[1] for x in commands)],
                             env=dict(os.environ, PATH=str(root) + os.pathsep + os.environ["PATH"],
                                      OWNER_LOG=str(log), FAIL_OWNER=str(failed),
-                                     OMG_PORTABLE_CARGO_PROFILE=profile),
+                                     OMG_PORTABLE_CARGO_PROFILE="ci"),
                             capture_output=True, timeout=10,
                         )
                         self.assertEqual(result.returncode, 0 if failed == 0 else 23, result.stderr)
