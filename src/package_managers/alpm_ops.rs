@@ -2360,6 +2360,7 @@ struct UnknownArchiveAcknowledgement {
 fn confirm_advisory_prompt(
     details: &str,
     digest: &str,
+    kind: crate::core::security::advisory_review::AdvisoryReviewKind,
     invoking_uid: u32,
     signals: &AdmissionSignals,
 ) -> Result<()> {
@@ -2371,7 +2372,7 @@ fn confirm_advisory_prompt(
         "{details}\nArch advisory source: {}\n",
         crate::core::security::vulnerability::ARCH_UPSTREAM_URL
     );
-    crate::core::privilege::confirm_security_review(&details, digest, invoking_uid, &|| {
+    crate::core::privilege::confirm_security_review(&details, digest, kind, invoking_uid, &|| {
         signals.check()
     })
 }
@@ -2380,6 +2381,7 @@ fn confirm_advisory_prompt(
 fn confirm_advisory_prompt(
     _details: &str,
     _digest: &str,
+    _kind: crate::core::security::advisory_review::AdvisoryReviewKind,
     _invoking_uid: u32,
     _signals: &AdmissionSignals,
 ) -> Result<()> {
@@ -2429,7 +2431,13 @@ fn confirm_unknown_archives(
     signals: &AdmissionSignals,
 ) -> Result<UnknownArchiveAcknowledgement> {
     let prompt = unknown_archives_prompt(packages, digest, invoking_uid)?;
-    confirm_advisory_prompt(&prompt, digest, invoking_uid, signals)?;
+    confirm_advisory_prompt(
+        &prompt,
+        digest,
+        crate::core::security::advisory_review::AdvisoryReviewKind::CoverageUnknown,
+        invoking_uid,
+        signals,
+    )?;
     Ok(UnknownArchiveAcknowledgement {
         batch_digest: digest.to_owned(),
         invoking_uid,
@@ -2639,6 +2647,7 @@ impl PreparedAdvisoryAdmission {
             confirm_advisory_prompt(
                 review.details(),
                 review.id(),
+                review.kind(),
                 invoking_uid,
                 signals
                     .as_ref()
@@ -3019,6 +3028,7 @@ mod tests {
         let error = super::confirm_advisory_prompt(
             "SECURITY WARNING: fixture 1.0-1 CVE-2026-12345 https://www.cve.org/CVERecord?id=CVE-2026-12345",
             &"ab".repeat(32),
+            crate::core::security::advisory_review::AdvisoryReviewKind::Advisory,
             crate::core::privilege::invoking_uid()?,
             &signals,
         )

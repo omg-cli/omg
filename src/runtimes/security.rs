@@ -540,6 +540,7 @@ fn admit_tree(
             crate::core::privilege::confirm_security_review(
                 &details,
                 review.id(),
+                review.kind(),
                 uid,
                 &|| Ok(()),
             )?;

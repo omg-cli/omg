@@ -3,32 +3,15 @@
 //! Package database writes run as root inside this binary (sudo re-exec), never
 //! by spawning pacman or an AUR helper.
 
+use super::security::advisory_review::AdvisoryReviewKind;
 use std::sync::atomic::{AtomicBool, Ordering};
-
-fn is_critical_security_alert(details: &str) -> bool {
-    let lower = details.to_ascii_lowercase();
-    lower.contains("kev")
-        || lower.contains("0-day")
-        || lower.contains("zero-day")
-        || lower.contains("actively exploited")
-        || lower.contains("mal-")
-        || lower.contains("malware")
-        || lower.contains("critical")
-}
-
-fn security_confirmation_phrase(details: &str) -> &'static str {
-    if is_critical_security_alert(details) {
-        "install-unsafe"
-    } else {
-        "proceed"
-    }
-}
 
 /// Require an intentional, human-friendly decision from the owning foreground terminal.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) fn confirm_security_review(
     details: &str,
     digest: &str,
+    kind: AdvisoryReviewKind,
     invoking_uid: u32,
     check_cancelled: &dyn Fn() -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
@@ -43,10 +26,9 @@ pub(crate) fn confirm_security_review(
         "Security acknowledgement must run in the terminal foreground"
     );
     verify_review_terminal(&tty, invoking_uid)?;
-    let critical = is_critical_security_alert(details);
-    let phrase = security_confirmation_phrase(details);
+    let phrase = kind.confirmation_phrase();
     let short_id = &digest[..digest.len().min(8)];
-    let prompt = crate::cli::ui::render_security_review_card(details, short_id, critical, phrase);
+    let prompt = crate::cli::ui::render_security_review_card(details, short_id, kind);
     anyhow::ensure!(
         prompt.len() <= 64 * 1024,
         "Security acknowledgement display exceeds limit"
@@ -309,6 +291,7 @@ fn read_security_review(
 pub(crate) fn confirm_security_review(
     details: &str,
     _digest: &str,
+    _kind: AdvisoryReviewKind,
     _invoking_uid: u32,
     _check_cancelled: &dyn Fn() -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
@@ -1473,6 +1456,7 @@ mod tests {
         let result = super::confirm_security_review(
             "fixture-runtime 1.2.3 has CVE-2021-23337\nhttps://www.cve.org/CVERecord?id=CVE-2021-23337",
             &"a".repeat(64),
+            super::AdvisoryReviewKind::Advisory,
             nix::unistd::geteuid().as_raw(),
             &|| {
                 anyhow::ensure!(case != "cancelled", "fixture cancellation");
@@ -2618,18 +2602,18 @@ mod elevation_path_tests {
     }
 
     #[test]
-    fn security_confirmation_phrase_escalates_for_critical_alerts() {
+    fn security_confirmation_phrase_requires_explicit_acknowledgement() {
+        use super::AdvisoryReviewKind;
         assert_eq!(
-            super::security_confirmation_phrase("CVE-2026-0001 KEV actively exploited"),
-            "install-unsafe"
-        );
-        assert_eq!(
-            super::security_confirmation_phrase("MAL-2026-1234 malware package"),
-            "install-unsafe"
-        );
-        assert_eq!(
-            super::security_confirmation_phrase("CVE-2026-0002 moderate advisory"),
+            AdvisoryReviewKind::Advisory.confirmation_phrase(),
             "proceed"
         );
+        for kind in [
+            AdvisoryReviewKind::CriticalAdvisory,
+            AdvisoryReviewKind::AdvisoryWithUnknownCoverage,
+            AdvisoryReviewKind::CoverageUnknown,
+        ] {
+            assert_eq!(kind.confirmation_phrase(), "install-unsafe");
+        }
     }
 }
