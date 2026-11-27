@@ -168,7 +168,12 @@ pub async fn create(message: Option<String>) -> Result<()> {
         }
     }
 
-    save_index(&index_path, index_content)?;
+    save_index(&index_path, index_content).with_context(|| {
+        format!(
+            "Could not confirm the index update for snapshot '{id}'. \
+             Recover the saved snapshot with `omg snapshot restore {id}`"
+        )
+    })?;
 
     println!("  {} Snapshot created!", style::positive("✓"));
     println!("  ID: {}", style::accent(&id));

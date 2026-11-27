@@ -880,3 +880,107 @@ fn snapshot_delete_recovers_old_index_entries_and_unlisted_files() {
     assert_eq!(after["snapshots"], serde_json::json!([rows[1]]));
     project.close_checked();
 }
+
+#[test]
+#[cfg(all(target_os = "linux", feature = "arch"))]
+fn snapshot_create_reports_a_recoverable_id_on_index_write_failure() -> anyhow::Result<()> {
+    use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
+
+    const CHILD: &str = "OMG_TEST_SNAPSHOT_INDEX_WRITE_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new("bash")
+            .args([
+                "--noprofile",
+                "--norc",
+                "-c",
+                "trap '' XFSZ; exec \"$@\"",
+                "snapshot-limit",
+            ])
+            .arg(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "snapshot_create_reports_a_recoverable_id_on_index_write_failure",
+                "--nocapture",
+            ])
+            .env_remove("BASH_ENV")
+            .env(CHILD, "1")
+            .output()?;
+        print!("{}", String::from_utf8_lossy(&output.stdout));
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return Ok(());
+    }
+
+    const LIMIT: u64 = 2048;
+    let project = TestProject::new();
+    let directory = project.data_dir.path().join("snapshots");
+    std::fs::create_dir_all(&directory)?;
+    let index = directory.join("index.json");
+    let rows: Vec<_> = (0..32)
+        .map(|number| {
+            serde_json::json!({
+                "id": format!("older-{number}"),
+                "message": null,
+                "created_at": 1_700_000_000,
+                "hash": sample_state().hash,
+            })
+        })
+        .collect();
+    let original = serde_json::to_vec(&serde_json::json!({"snapshots": rows}))?;
+    assert!(original.len() as u64 > LIMIT);
+    std::fs::write(&index, &original)?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let result = temp_env::with_vars(
+        [
+            ("HOME", Some(project.home_dir.path().to_str().unwrap())),
+            (
+                "OMG_DATA_DIR",
+                Some(project.data_dir.path().to_str().unwrap()),
+            ),
+            ("OMG_TEST_DISTRO", Some("arch")),
+        ],
+        || -> anyhow::Result<_> {
+            let saved = getrlimit(Resource::Fsize);
+            setrlimit(
+                Resource::Fsize,
+                Rlimit {
+                    current: Some(LIMIT),
+                    maximum: saved.maximum,
+                },
+            )?;
+            let result = runtime.block_on(omg_lib::cli::snapshot::create(None));
+            setrlimit(Resource::Fsize, saved)?;
+            Ok(result)
+        },
+    )?;
+    let error = result.expect_err("the file limit must refuse the enlarged index");
+    assert_eq!(std::fs::read(&index)?, original);
+    let payloads: Vec<_> = std::fs::read_dir(&directory)?
+        .filter_map(|entry| {
+            let path = entry.unwrap().path();
+            path.file_name()?
+                .to_str()?
+                .starts_with("snap-")
+                .then_some(path)
+        })
+        .collect();
+    assert_eq!(payloads.len(), 1);
+    let snapshot: omg_lib::cli::snapshot::Snapshot =
+        serde_json::from_slice(&std::fs::read(&payloads[0])?)?;
+    let diagnostic = format!("{error:#}");
+    assert!(
+        diagnostic.contains("Failed to write snapshot index"),
+        "{diagnostic}"
+    );
+    assert!(
+        diagnostic.contains(&format!("omg snapshot restore {}", snapshot.id)),
+        "{diagnostic}"
+    );
+    project.close_checked();
+    Ok(())
+}
