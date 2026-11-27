@@ -71,7 +71,7 @@ pub async fn complete(_shell: &str, current: &str, last: &str, full: Option<&str
             results.truncate(limit);
             results
         }
-        "use" | "ls" | "list" | "which" => complete_runtime_names(&engine, current),
+        "use" | "sy" | "ls" | "list" | "which" => complete_runtime_names(&engine, current),
         "tool" => complete_static_candidates(&engine, current, TOOL_COMMANDS),
         "env" => complete_static_candidates(&engine, current, ENV_COMMANDS),
         "run" => complete_task_names(&engine, current)?,
@@ -237,7 +237,12 @@ fn get_installed_package_names() -> Result<Vec<String>> {
             | crate::package_managers::Backend::Mock
     ) {
         return crate::package_managers::list_installed_fast()
-            .map(|installed| installed.into_iter().map(|pkg| pkg.name).collect())
+            .map(|installed| {
+                catalog_completion_names(
+                    backend,
+                    installed.into_iter().map(|package| package.name).collect(),
+                )
+            })
             .context("Failed to list installed packages for completion");
     }
     #[cfg(any(feature = "debian", feature = "debian-pure"))]
@@ -1779,6 +1784,13 @@ mod tests {
         let config = directory.path().join("omg");
         std::fs::create_dir(&config).unwrap();
         std::fs::write(config.join("config.toml"), "telemetry_enabled = true\n").unwrap();
+        if case == "remove" {
+            std::fs::write(
+                data.join("mock_state_apt.json"),
+                br#"{"installed":["widget.i686","widget.x86_64"],"available":{"uninstalled":"1"}}"#,
+            )
+            .unwrap();
+        }
         let fixture = directory.path().to_str().unwrap();
         let config = config.to_str().unwrap();
         let data = data.to_str().unwrap();
@@ -1790,7 +1802,8 @@ mod tests {
                 ("XDG_DATA_HOME", Some(fixture)),
                 ("OMG_DATA_DIR", Some(data)),
                 ("OMG_NATIVE_TEST_DATA_DIR", Some("1")),
-                ("OMG_TEST_MODE", None),
+                ("OMG_TEST_MODE", (case == "remove").then_some("1")),
+                ("OMG_TEST_DISTRO", (case == "remove").then_some("debian")),
                 (
                     "OMG_DISABLE_TELEMETRY",
                     if case == "stats-stored" {
@@ -1835,7 +1848,7 @@ mod tests {
                         }
                         stats(false).unwrap();
                     }
-                    "env" | "new" | "tool" => {
+                    "env" | "new" | "tool" | "use" | "sy" | "remove" => {
                         println!("COMPLETIONS_BEGIN");
                         tokio::runtime::Builder::new_current_thread()
                             .enable_all()
@@ -1920,6 +1933,29 @@ mod tests {
             .lines()
             .map(str::to_string)
             .collect()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_selection_alias_completes_the_same_names() {
+        let runtimes = emitted_completion_words("use");
+        assert!(runtimes.iter().any(|runtime| runtime == "node"));
+        assert_eq!(emitted_completion_words("sy"), runtimes);
+    }
+
+    #[cfg(all(unix, debug_assertions))]
+    #[test]
+    fn remove_completion_uses_the_installed_catalog() {
+        let fixture_available = !crate::core::is_root();
+        let installed = fixture_available.then(|| {
+            let mut packages = emitted_completion_words("remove");
+            packages.sort_unstable();
+            packages
+        });
+        assert_eq!(
+            installed,
+            fixture_available.then(|| vec!["widget.i686".to_string(), "widget.x86_64".to_string()])
+        );
     }
 
     #[cfg(unix)]
