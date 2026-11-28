@@ -2481,16 +2481,16 @@ mod tests {
                 use tokio::io::{AsyncReadExt, AsyncWriteExt};
                 let shell = crate::core::privilege::root_controlled_program_path("sh").unwrap();
                 let mut child = Command::new(shell)
-                        .args([
-                            "-c",
-                            "trap '' TERM; read -r gate && test \"$gate\" = ready || exit 1; printf ready; sleep 30",
-                        ])
-                        .stdin(Stdio::piped())
-                        .stdout(Stdio::piped())
-                        .process_group(0)
-                        .kill_on_drop(true)
-                        .spawn()
-                        .unwrap();
+                    .args([
+                        "-c",
+                        "trap '' TERM; read -r gate && test \"$gate\" = ready || exit 1; printf ready; sleep 30",
+                    ])
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .process_group(0)
+                    .kill_on_drop(true)
+                    .spawn()
+                    .unwrap();
                 let mut gate = child.stdin.take().expect("private readiness input");
                 let mut readiness = child.stdout.take().expect("private readiness output");
                 let pid = nix::unistd::Pid::from_raw(i32::try_from(child.id().unwrap()).unwrap());
@@ -3695,58 +3695,58 @@ mod tests {
                 "1794518371.sh",
                 r#"echo "Install xrandr so Wine tray menus open at the pointer"
 
-    # omarchy-tray-context-menu reads Xwayland's monitor layout with xrandr to
-    # place a Wine app's own tray menu where it was right-clicked.
-    omarchy-pkg-add xorg-xrandr
-    "#,
+# omarchy-tray-context-menu reads Xwayland's monitor layout with xrandr to
+# place a Wine app's own tray menu where it was right-clicked.
+omarchy-pkg-add xorg-xrandr
+"#,
             ),
             (
                 "1794675791.sh",
                 r#"echo "Give the HP OmniBook 3 working speakers and microphones"
 
-    # See install/hardware/hp/fix-hp-omnibook-3-speakers.sh. The sound card comes
-    # with linux-omarchy-dtbs' OmniBook 3 tree, so it comes up from the next boot.
-    # Migrations run once per user, so a later user finds the package installed
-    # and leaves the machine as it is.
-    if ! omarchy-hw-aarch64-qualcomm || ! omarchy-hw-match "OmniBook 3 Laptop" || omarchy-pkg-present hp-omnibook-3-audio; then
-      exit 0
-    fi
+# See install/hardware/hp/fix-hp-omnibook-3-speakers.sh. The sound card comes
+# with linux-omarchy-dtbs' OmniBook 3 tree, so it comes up from the next boot.
+# Migrations run once per user, so a later user finds the package installed
+# and leaves the machine as it is.
+if ! omarchy-hw-aarch64-qualcomm || ! omarchy-hw-match "OmniBook 3 Laptop" || omarchy-pkg-present hp-omnibook-3-audio; then
+  exit 0
+fi
 
-    omarchy-pkg-add hp-omnibook-3-audio
-    omarchy-state set reboot-required
-    "#,
+omarchy-pkg-add hp-omnibook-3-audio
+omarchy-state set reboot-required
+"#,
             ),
             (
                 "1794774234.sh",
                 r#"echo "Replace imv and mpv with Omaview"
 
-    omarchy-pkg-add omaview
+omarchy-pkg-add omaview
 
-    # Omarchy's own Image Viewer (imv) and Media Player (mpv) launchers give way to
-    # Omaview's Media Viewer. Only a copy still as Omarchy shipped it goes, so one
-    # the user changed, or linked from their dotfiles, stays theirs.
-    applications="$HOME/.local/share/applications"
-    for entry in imv.desktop mpv.desktop; do
-      file="$applications/$entry"
-      [[ -f $file && ! -L $file ]] || continue
-      case $(sha256sum <"$file") in
-        120d30326a77e1f23d050e52293d0acf1aeb9499bf9cd47b93996d6e2be99480* | \
-          a7a75999f161c6a409ff4c5da26ad9c79fc1ffdd4e633aac87f972ad72fc85d4* | \
-          d105a16b60ecc1c67f6cc37e5bb7831ca8a08d0e602cb64dd4a1386703362385* | \
-          9844e9d22d1b4b9801965afea1eb250103cfc6f12e6e62e542ac47abd4b8094d*)
-          rm -f "$file"
-          ;;
-      esac
-    done
-    if [[ -d $applications ]]; then
-      update-desktop-database "$applications"
-    fi
+# Omarchy's own Image Viewer (imv) and Media Player (mpv) launchers give way to
+# Omaview's Media Viewer. Only a copy still as Omarchy shipped it goes, so one
+# the user changed, or linked from their dotfiles, stays theirs.
+applications="$HOME/.local/share/applications"
+for entry in imv.desktop mpv.desktop; do
+  file="$applications/$entry"
+  [[ -f $file && ! -L $file ]] || continue
+  case $(sha256sum <"$file") in
+    120d30326a77e1f23d050e52293d0acf1aeb9499bf9cd47b93996d6e2be99480* | \
+      a7a75999f161c6a409ff4c5da26ad9c79fc1ffdd4e633aac87f972ad72fc85d4* | \
+      d105a16b60ecc1c67f6cc37e5bb7831ca8a08d0e602cb64dd4a1386703362385* | \
+      9844e9d22d1b4b9801965afea1eb250103cfc6f12e6e62e542ac47abd4b8094d*)
+      rm -f "$file"
+      ;;
+  esac
+done
+if [[ -d $applications ]]; then
+  update-desktop-database "$applications"
+fi
 
-    # imv and mpv-mpris go. mpv stays, as Omarchy's wallpaper engine, owe, plays
-    # video wallpapers through it. A mimeapps.list line naming imv.desktop stops
-    # resolving, and Omarchy's default, Omaview, opens those files instead.
-    omarchy-pkg-drop imv mpv-mpris
-    "#,
+# imv and mpv-mpris go. mpv stays, as Omarchy's wallpaper engine, owe, plays
+# video wallpapers through it. A mimeapps.list line naming imv.desktop stops
+# resolving, and Omarchy's default, Omaview, opens those files instead.
+omarchy-pkg-drop imv mpv-mpris
+"#,
             ),
         ]
     }
@@ -3946,7 +3946,6 @@ mod tests {
             assert_eq!(
                 commands
                     .native_fixture
-                    .as_ref()
                     .expect("native fixture is retained")
                     .operations,
                 expected
@@ -4070,83 +4069,83 @@ mod tests {
                 "1794909082.sh",
                 r#"echo "Show the Samsung Galaxy Book4 Edge 14's disk unlock prompt and add its keyboard and Bluetooth support"
 
-    # See install/hardware/samsung/galaxy-book4-edge-14.sh. The initramfs hook and
-    # the kernel command line are in the boot image, so they take a rebuild. The
-    # marker records the rebuild as owed before the setup runs, so a retry rebuilds
-    # even when the files are already there.
-    if ! omarchy-hw-aarch64-qualcomm || ! omarchy-hw-match-device-tree samsung,galaxy-book4-edge-14; then
-      exit 0
-    fi
+# See install/hardware/samsung/galaxy-book4-edge-14.sh. The initramfs hook and
+# the kernel command line are in the boot image, so they take a rebuild. The
+# marker records the rebuild as owed before the setup runs, so a retry rebuilds
+# even when the files are already there.
+if ! omarchy-hw-aarch64-qualcomm || ! omarchy-hw-match-device-tree samsung,galaxy-book4-edge-14; then
+  exit 0
+fi
 
-    drop_in=/etc/limine-entry-tool.d/samsung-galaxy-book4-edge-14.conf
-    hook=/etc/initcpio/install/samsung-galaxy-book4-edge-14
-    rebuild_pending=/var/lib/omarchy/migrations/1794909082-rebuild-pending
-    if [[ -e $rebuild_pending ]] || [[ ! -f $hook ]] ||
-      ! grep -q 'usbcore.autosuspend=-1' "$drop_in" 2>/dev/null ||
-      omarchy-pkg-missing samsung-galaxy-book4-edge-14-support; then
-      sudo install -Dm644 /dev/null "$rebuild_pending" || exit 1
-      sudo env PATH="$PATH" OMARCHY_PATH="$OMARCHY_PATH" bash -euo pipefail -c '
-        source "$OMARCHY_PATH/install/hardware/samsung/galaxy-book4-edge-14.sh"
-      '
-    fi
+drop_in=/etc/limine-entry-tool.d/samsung-galaxy-book4-edge-14.conf
+hook=/etc/initcpio/install/samsung-galaxy-book4-edge-14
+rebuild_pending=/var/lib/omarchy/migrations/1794909082-rebuild-pending
+if [[ -e $rebuild_pending ]] || [[ ! -f $hook ]] ||
+  ! grep -q 'usbcore.autosuspend=-1' "$drop_in" 2>/dev/null ||
+  omarchy-pkg-missing samsung-galaxy-book4-edge-14-support; then
+  sudo install -Dm644 /dev/null "$rebuild_pending" || exit 1
+  sudo env PATH="$PATH" OMARCHY_PATH="$OMARCHY_PATH" bash -euo pipefail -c '
+    source "$OMARCHY_PATH/install/hardware/samsung/galaxy-book4-edge-14.sh"
+  '
+fi
 
-    if [[ -e $rebuild_pending ]]; then
-      rebuild_log=$(mktemp)
-      trap 'rm -f "$rebuild_log"' EXIT
-      sudo limine-mkinitcpio 2>&1 | tee "$rebuild_log"
+if [[ -e $rebuild_pending ]]; then
+  rebuild_log=$(mktemp)
+  trap 'rm -f "$rebuild_log"' EXIT
+  sudo limine-mkinitcpio 2>&1 | tee "$rebuild_log"
 
-      # limine-mkinitcpio reports a kernel it could not rebuild and still exits 0.
-      if grep -q 'mkinitcpio failed for kernel' "$rebuild_log"; then
-        echo "A boot image was not rebuilt. Fix the error above, then run omarchy-migrate again before rebooting." >&2
-        exit 1
-      fi
+  # limine-mkinitcpio reports a kernel it could not rebuild and still exits 0.
+  if grep -q 'mkinitcpio failed for kernel' "$rebuild_log"; then
+    echo "A boot image was not rebuilt. Fix the error above, then run omarchy-migrate again before rebooting." >&2
+    exit 1
+  fi
 
-      # Ask for the reboot before clearing the marker, so a run cut short in
-      # between still asks on the next one.
-      omarchy-state set reboot-required
-      sudo rm -f "$rebuild_pending"
-    fi
-    "#,
+  # Ask for the reboot before clearing the marker, so a run cut short in
+  # between still asks on the next one.
+  omarchy-state set reboot-required
+  sudo rm -f "$rebuild_pending"
+fi
+"#,
             ),
             (
                 "1795274792.sh",
                 r#"echo "Show the disk unlock prompt on Snapdragon X laptops"
 
-    # See install/hardware/qualcomm/hamoa-display.sh. The prompt needs the display
-    # chain in the boot image, so it takes a rebuild. The Surface Laptop 7 13.8"
-    # needs its keyboard there as well, which microsoft/surface-laptop-7.sh adds
-    # and no earlier migration ran for it. A machine-wide marker, written only
-    # after a rebuild, records that this one is done, and a retry after a failed
-    # rebuild runs the setup and the rebuild again.
-    if ! omarchy-hw-aarch64-qualcomm || ! omarchy-hw-match-device-tree qcom,x1e80100 qcom,x1p42100; then
-      exit 0
-    fi
+# See install/hardware/qualcomm/hamoa-display.sh. The prompt needs the display
+# chain in the boot image, so it takes a rebuild. The Surface Laptop 7 13.8"
+# needs its keyboard there as well, which microsoft/surface-laptop-7.sh adds
+# and no earlier migration ran for it. A machine-wide marker, written only
+# after a rebuild, records that this one is done, and a retry after a failed
+# rebuild runs the setup and the rebuild again.
+if ! omarchy-hw-aarch64-qualcomm || ! omarchy-hw-match-device-tree qcom,x1e80100 qcom,x1p42100; then
+  exit 0
+fi
 
-    done_marker=/var/lib/omarchy/migrations/1795274792-done
-    if [[ -e $done_marker ]]; then
-      exit 0
-    fi
+done_marker=/var/lib/omarchy/migrations/1795274792-done
+if [[ -e $done_marker ]]; then
+  exit 0
+fi
 
-    sudo env PATH="$PATH" OMARCHY_PATH="$OMARCHY_PATH" bash -euo pipefail -c '
-      source "$OMARCHY_PATH/install/hardware/qualcomm/hamoa-display.sh"
-      if omarchy-hw-match-device-tree microsoft,romulus13; then
-        source "$OMARCHY_PATH/install/hardware/microsoft/surface-laptop-7.sh"
-      fi
-    ' || exit 1
+sudo env PATH="$PATH" OMARCHY_PATH="$OMARCHY_PATH" bash -euo pipefail -c '
+  source "$OMARCHY_PATH/install/hardware/qualcomm/hamoa-display.sh"
+  if omarchy-hw-match-device-tree microsoft,romulus13; then
+    source "$OMARCHY_PATH/install/hardware/microsoft/surface-laptop-7.sh"
+  fi
+' || exit 1
 
-    rebuild_log=$(mktemp)
-    trap 'rm -f "$rebuild_log"' EXIT
-    sudo limine-mkinitcpio 2>&1 | tee "$rebuild_log"
+rebuild_log=$(mktemp)
+trap 'rm -f "$rebuild_log"' EXIT
+sudo limine-mkinitcpio 2>&1 | tee "$rebuild_log"
 
-    # limine-mkinitcpio reports a kernel it could not rebuild and still exits 0.
-    if grep -q 'mkinitcpio failed for kernel' "$rebuild_log"; then
-      echo "A boot image was not rebuilt. Fix the error above, then run omarchy-migrate again before rebooting." >&2
-      exit 1
-    fi
+# limine-mkinitcpio reports a kernel it could not rebuild and still exits 0.
+if grep -q 'mkinitcpio failed for kernel' "$rebuild_log"; then
+  echo "A boot image was not rebuilt. Fix the error above, then run omarchy-migrate again before rebooting." >&2
+  exit 1
+fi
 
-    sudo install -Dm644 /dev/null "$done_marker"
-    omarchy-state set reboot-required
-    "#,
+sudo install -Dm644 /dev/null "$done_marker"
+omarchy-state set reboot-required
+"#,
             ),
         ] {
             let path = migrations.join(name);
@@ -4752,10 +4751,10 @@ mod tests {
             return;
         }
         execute_logged(
-                &shell,
-                &["-c", "printf 'Enter value: '; IFS= read -r value; printf 'received:<%s>\\n' \"$value\"; if IFS= read -r extra; then exit 19; fi"],
-                &lock,
-                &log, &transport_runtime()).await.expect("pipe bytes and EOF reach the owned terminal");
+            &shell,
+            &["-c", "printf 'Enter value: '; IFS= read -r value; printf 'received:<%s>\\n' \"$value\"; if IFS= read -r extra; then exit 19; fi"],
+            &lock,
+            &log, &transport_runtime()).await.expect("pipe bytes and EOF reach the owned terminal");
         let transcript = std::fs::read_to_string(root.join("log")).expect("pipe transcript");
         assert!(
             transcript.contains("received:<literal; $(not-a-command) \\tail>"),
@@ -5657,10 +5656,10 @@ mod tests {
     ) -> Result<tokio::process::Child> {
         let mut coordinator = Command::new(shell);
         coordinator.args([
-                "-c",
-                "trap '' TERM; while test ! -f \"$1.armed\"; do sleep 0.01; done; printf ready > \"$1\"; while test ! -f \"$2\"; do sleep 0.01; done; printf cleaned > \"$3\"",
-                "fixture",
-            ]);
+            "-c",
+            "trap '' TERM; while test ! -f \"$1.armed\"; do sleep 0.01; done; printf ready > \"$1\"; while test ! -f \"$2\"; do sleep 0.01; done; printf cleaned > \"$3\"",
+            "fixture",
+        ]);
         coordinator.args([ready.as_os_str(), release.as_os_str(), complete.as_os_str()]);
         coordinator
             .stdin(Stdio::null())
@@ -6163,21 +6162,21 @@ mod tests {
         ready.wait();
         let mut launches = 0;
         let result = tokio::time::timeout(Duration::from_secs(10), async {
-                for _ in 0..32 {
-                    execute_logged(
-                        &program,
-                        &[
-                            "-c",
-                            "test -t 0 && test -t 1 && test -f \"/proc/self/fd/$OMG_OMARCHY_LOCK_FD\" && test -f \"/proc/self/fd/$OMG_OMARCHY_LOG_FD\"",
-                        ],
-                        &lock,
-                        &log, &transport_runtime())
-                    .await?;
-                    launches += 1;
-                }
-                Ok::<_, anyhow::Error>(())
-            })
-            .await;
+            for _ in 0..32 {
+                execute_logged(
+                    &program,
+                    &[
+                        "-c",
+                        "test -t 0 && test -t 1 && test -f \"/proc/self/fd/$OMG_OMARCHY_LOCK_FD\" && test -f \"/proc/self/fd/$OMG_OMARCHY_LOG_FD\"",
+                    ],
+                    &lock,
+                    &log, &transport_runtime())
+                .await?;
+                launches += 1;
+            }
+            Ok::<_, anyhow::Error>(())
+        })
+        .await;
         done.store(true, Ordering::Release);
         let observation = observer.join();
 
@@ -7302,94 +7301,94 @@ mod tests {
         let markers = owner.path().join("markers");
         std::fs::create_dir(&migrations).expect("create migrations dir");
         std::fs::write(
-                migrations.join("1794864665.sh"),
-                concat!(
-                    "echo \"Install the Surface Laptop 7 15\\\"'s support package on installs made before it existed\"\n\n",
-                    "# microsoft-surface-laptop-7-support reads the battery pack's cycle count from\n",
-                    "# the Surface controller (surface-laptop-7-battery) and keeps the infrared\n",
-                    "# camera out of camera pickers. Its timer checks for this laptop itself and\n",
-                    "# starts at the next boot.\n",
-                    "if ! omarchy-hw-aarch64-qualcomm || ! omarchy-hw-match-device-tree microsoft,romulus15; then\n",
-                    "  exit 0\n",
-                    "fi\n\n",
-                    "omarchy-pkg-add microsoft-surface-laptop-7-support\n",
-                ),
-            )
-            .expect("write 1794864665.sh");
+            migrations.join("1794864665.sh"),
+            concat!(
+                "echo \"Install the Surface Laptop 7 15\\\"'s support package on installs made before it existed\"\n\n",
+                "# microsoft-surface-laptop-7-support reads the battery pack's cycle count from\n",
+                "# the Surface controller (surface-laptop-7-battery) and keeps the infrared\n",
+                "# camera out of camera pickers. Its timer checks for this laptop itself and\n",
+                "# starts at the next boot.\n",
+                "if ! omarchy-hw-aarch64-qualcomm || ! omarchy-hw-match-device-tree microsoft,romulus15; then\n",
+                "  exit 0\n",
+                "fi\n\n",
+                "omarchy-pkg-add microsoft-surface-laptop-7-support\n",
+            ),
+        )
+        .expect("write 1794864665.sh");
         std::fs::write(
-                migrations.join("1795337583.sh"),
-                concat!(
-                    "echo \"Install the Surface Laptop 7 13.8\\\"'s Wi-Fi and Bluetooth addresses, iptsd and camera relay\"\n\n",
-                    "# See install/hardware/microsoft/surface-laptop-7.sh. Without the addresses\n",
-                    "# Bluetooth has no controller, iptsd gives the touchpad its gestures and runs\n",
-                    "# the touchscreen, and microsoft-surface-laptop-7-support relays the front\n",
-                    "# camera to a webcam device. Packages already installed are skipped.\n",
-                    "if ! omarchy-hw-aarch64-qualcomm || ! omarchy-hw-match-device-tree microsoft,romulus13; then\n",
-                    "  exit 0\n",
-                    "fi\n\n",
-                    "omarchy-pkg-add microsoft-surface-snapdragon-addresses iptsd microsoft-surface-laptop-7-support\n",
-                ),
-            )
-            .expect("write 1795337583.sh");
+            migrations.join("1795337583.sh"),
+            concat!(
+                "echo \"Install the Surface Laptop 7 13.8\\\"'s Wi-Fi and Bluetooth addresses, iptsd and camera relay\"\n\n",
+                "# See install/hardware/microsoft/surface-laptop-7.sh. Without the addresses\n",
+                "# Bluetooth has no controller, iptsd gives the touchpad its gestures and runs\n",
+                "# the touchscreen, and microsoft-surface-laptop-7-support relays the front\n",
+                "# camera to a webcam device. Packages already installed are skipped.\n",
+                "if ! omarchy-hw-aarch64-qualcomm || ! omarchy-hw-match-device-tree microsoft,romulus13; then\n",
+                "  exit 0\n",
+                "fi\n\n",
+                "omarchy-pkg-add microsoft-surface-snapdragon-addresses iptsd microsoft-surface-laptop-7-support\n",
+            ),
+        )
+        .expect("write 1795337583.sh");
         std::fs::write(
             migrations.join("1795284903.sh"),
             r#"echo "Install the FaceTime HD camera driver on Intel Macs that have one"
 
-    # Fresh installs get this from install/hardware/apple/fix-facetimehd.sh. Existing
-    # Macs only pick it up on omarchy update via this migration.
-    if omarchy-hw-facetimehd; then
-      source "$OMARCHY_PATH/install/hardware/apple/fix-facetimehd.sh"
+# Fresh installs get this from install/hardware/apple/fix-facetimehd.sh. Existing
+# Macs only pick it up on omarchy update via this migration.
+if omarchy-hw-facetimehd; then
+  source "$OMARCHY_PATH/install/hardware/apple/fix-facetimehd.sh"
 
-      # The module only loads at boot, so the camera stays missing until then.
-      (( ${#packages[@]} == 0 )) || omarchy-state set reboot-required
+  # The module only loads at boot, so the camera stays missing until then.
+  (( ${#packages[@]} == 0 )) || omarchy-state set reboot-required
 
-      # The leaf only enables the fetch for the next boot; on a running system it can start now.
-      if pacman -Q facetimehd-firmware-fetcher &>/dev/null; then
-        sudo systemctl start --no-block facetimehd-firmware-fetcher.service
-      fi
-    fi
-    "#,
+  # The leaf only enables the fetch for the next boot; on a running system it can start now.
+  if pacman -Q facetimehd-firmware-fetcher &>/dev/null; then
+    sudo systemctl start --no-block facetimehd-firmware-fetcher.service
+  fi
+fi
+"#,
         )
         .expect("write 1795284903.sh");
         std::fs::write(
             migrations.join("1795318856.sh"),
             r#"echo "Install Pi as a package instead of a mise tool"
 
-    # The settings package drops Pi's mise declaration. Until it has, stay pending:
-    # the declaration would only install Pi through mise again.
-    if omarchy-mise-default-tools list | grep -qx pi; then
-      echo "Waiting for the omarchy-settings package that drops Pi from the default mise tools" >&2
-      exit 75
-    fi
+# The settings package drops Pi's mise declaration. Until it has, stay pending:
+# the declaration would only install Pi through mise again.
+if omarchy-mise-default-tools list | grep -qx pi; then
+  echo "Waiting for the omarchy-settings package that drops Pi from the default mise tools" >&2
+  exit 75
+fi
 
-    omarchy-pkg-add pi-coding-agent
+omarchy-pkg-add pi-coding-agent
 
-    # mise's shims come before /usr/bin on PATH, and the shim left by the dropped
-    # declaration fails rather than falling through to the package. A Pi the user
-    # declared in a mise config of their own is theirs and stays.
-    if ! mise ls pi --json | jq -e 'any(.[]; .source)' >/dev/null; then
-      mise uninstall --all pi
-      mise reshim
-    fi
-    "#,
+# mise's shims come before /usr/bin on PATH, and the shim left by the dropped
+# declaration fails rather than falling through to the package. A Pi the user
+# declared in a mise config of their own is theirs and stays.
+if ! mise ls pi --json | jq -e 'any(.[]; .source)' >/dev/null; then
+  mise uninstall --all pi
+  mise reshim
+fi
+"#,
         )
         .expect("write 1795318856.sh");
         std::fs::write(
             migrations.join("1795354955.sh"),
             r#"echo "Install kmscon, which setup after a factory reset is drawn in"
 
-    omarchy-pkg-add kmscon
-    "#,
+omarchy-pkg-add kmscon
+"#,
         )
         .expect("write 1795354955.sh");
         std::fs::write(
-                migrations.join("1795354646.sh"),
-                concat!(
-                    "echo \"Install Podman and crun, which run local models, on machines installed before they were base packages\"\n\n",
-                    "omarchy-pkg-add podman crun\n",
-                ),
-            )
-            .expect("write 1795354646.sh");
+            migrations.join("1795354646.sh"),
+            concat!(
+                "echo \"Install Podman and crun, which run local models, on machines installed before they were base packages\"\n\n",
+                "omarchy-pkg-add podman crun\n",
+            ),
+        )
+        .expect("write 1795354646.sh");
 
         let pending =
             pending_migrations(&migrations, &markers).expect("resolve published migrations");
