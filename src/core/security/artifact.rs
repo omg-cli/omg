@@ -229,7 +229,14 @@ fn open_sealed(pid: u32, fd: u32, expected: &str) -> Result<File> {
         expected.len() == 64 && expected.bytes().all(|b| b.is_ascii_hexdigit()),
         "Invalid package digest"
     );
-    let mut file = File::open(format!("/proc/{pid}/fd/{fd}"))?;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(nix::libc::O_NONBLOCK);
+    }
+    let mut file = options.open(format!("/proc/{pid}/fd/{fd}"))?;
     #[cfg(target_os = "linux")]
     {
         use rustix::fs::{SealFlags, fcntl_get_seals};

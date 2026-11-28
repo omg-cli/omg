@@ -148,7 +148,9 @@ pub fn fchown_path_no_follow(path: &Path, uid: Option<u32>, gid: Option<u32>) ->
     use std::os::unix::fs::OpenOptionsExt as _;
 
     let mut options = std::fs::OpenOptions::new();
-    options.read(true).custom_flags(nix::libc::O_NOFOLLOW);
+    options
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK);
     let file = options.open(path).with_context(|| {
         format!(
             "Failed to open {} without following symlinks",
