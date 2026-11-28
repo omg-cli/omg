@@ -307,15 +307,19 @@ impl DriftReport {
         }
 
         // Check packages
+        let actual_packages: std::collections::HashSet<&str> =
+            actual.packages.iter().map(String::as_str).collect();
         for pkg in &expected.packages {
-            if !actual.packages.contains(pkg) {
+            if !actual_packages.contains(pkg.as_str()) {
                 report.missing_packages.push(pkg.clone());
                 report.has_drift = true;
             }
         }
 
+        let expected_packages: std::collections::HashSet<&str> =
+            expected.packages.iter().map(String::as_str).collect();
         for pkg in &actual.packages {
-            if !expected.packages.contains(pkg) {
+            if !expected_packages.contains(pkg.as_str()) {
                 report.extra_packages.push(pkg.clone());
                 report.has_drift = true;
             }

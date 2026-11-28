@@ -7,7 +7,7 @@ use std::io::{self, Read};
 use std::path::Path;
 use std::sync::LazyLock;
 
-use regex::Regex;
+use regex::{Regex, RegexSet};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -208,6 +208,11 @@ static PATTERNS: [SecretPattern; 21] = [
     secret_pattern!(GenericPassword, RE_GENERIC_PASSWORD, Medium),
 ];
 
+static PATTERN_SET: LazyLock<RegexSet> = LazyLock::new(|| {
+    RegexSet::new(PATTERNS.iter().map(|p| p.pattern.as_str()))
+        .expect("built-in secret patterns are valid")
+});
+
 /// Failures reading files or directories while scanning for secrets.
 #[derive(Debug, Error)]
 pub enum SecretError {
@@ -302,8 +307,9 @@ impl SecretScanner {
         let mut findings = Vec::new();
 
         for (line_num, line) in content.lines().enumerate() {
-            for pattern in &PATTERNS {
-                if let Some(captures) = pattern.pattern.captures(line) {
+            for pattern_idx in PATTERN_SET.matches(line) {
+                let pattern = &PATTERNS[pattern_idx];
+                for captures in pattern.pattern.captures_iter(line) {
                     let matched = captures.get(0).map_or("", |m| m.as_str());
 
                     // Skip only when the captured secret value itself is an
@@ -1003,5 +1009,16 @@ mod tests {
                 .iter()
                 .any(|f| matches!(f.secret_type, SecretType::PrivateKey))
         );
+    }
+
+    #[test]
+    fn scan_content_finds_multiple_same_type_secrets_on_one_line() {
+        let line = "k1=AKIA1234567890ABCDEF k2=AKIAFEDCBA0987654321";
+        let findings = SecretScanner::new().scan_content(line, "minified.env");
+        let aws_count = findings
+            .iter()
+            .filter(|f| matches!(f.secret_type, SecretType::AwsAccessKey))
+            .count();
+        assert_eq!(aws_count, 2, "both AWS keys on one line must be detected");
     }
 }
