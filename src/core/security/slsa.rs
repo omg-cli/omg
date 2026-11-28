@@ -2967,14 +2967,49 @@ mod required_signer_tests {
             .expect_err("missing file must fail");
         assert!(matches!(err, super::SlsaError::Read { .. }));
 
-        // Compile-time check that verify_provenance returns a Send future.
+        // Compile-time check that verify_provenance returns a Send future,
+        // and runtime check of the local provenance fallback path.
         fn assert_send<F: std::future::Future + Send>(_: F) {}
-        let verifier = super::SlsaVerifier::default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local rekor stub");
+        let addr = listener.local_addr().expect("stub addr");
+        let server = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf).await;
+                let _ = stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n[]")
+                    .await;
+            }
+        });
+        let prov = dir.path().join("prov.intoto.jsonl");
+        std::fs::write(
+            &prov,
+            r#"{"_type":"https://in-toto.io/Statement/v0.1","predicateType":"https://slsa.dev/provenance/v0.2","subject":[],"predicate":{}}"#,
+        )
+        .expect("write provenance");
+        let verifier = super::SlsaVerifier {
+            client: reqwest::Client::new(),
+            rekor_url: format!("http://{addr}"),
+        };
         assert_send(verifier.verify_provenance(
-            small,
-            None::<std::path::PathBuf>,
+            &small,
+            Some(&prov),
             "signer@example.invalid",
             "https://issuer.example.invalid",
         ));
+        let result = verifier
+            .verify_provenance(
+                &small,
+                Some(&prov),
+                "signer@example.invalid",
+                "https://issuer.example.invalid",
+            )
+            .await
+            .expect("local unsigned provenance should classify without error");
+        assert!(!result.verified);
+        let _ = server.await;
     }
 }
