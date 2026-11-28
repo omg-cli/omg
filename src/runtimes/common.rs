@@ -5825,19 +5825,36 @@ mod entry_budget_tests {
     }
 
     #[tokio::test]
-    async fn extract_zip_rejects_missing_and_corrupt_archives() {
-        let dir = tempfile::tempdir().expect("temp dir");
+    async fn extract_zip_handles_dirs_stripped_entries_and_rejects_symlinks() -> Result<()> {
+        let dir = tempfile::tempdir()?;
         let dest = dir.path().join("out");
-        let missing = dir.path().join("missing.zip");
-        assert!(
-            extract_zip(&missing, &dest, 0).await.is_err(),
-            "missing zip archive must return an error"
-        );
-        let corrupt = dir.path().join("corrupt.zip");
-        fs::write(&corrupt, b"not a valid zip archive").expect("write corrupt zip");
-        assert!(
-            extract_zip(&corrupt, &dest, 0).await.is_err(),
-            "corrupt zip archive must return an error"
-        );
+
+        let ok_zip = dir.path().join("ok.zip");
+        {
+            let mut archive = zip::ZipWriter::new(File::create(&ok_zip)?);
+            let opts = zip::write::SimpleFileOptions::default();
+            archive.add_directory("top/sub/", opts)?;
+            archive.start_file("top-only", opts)?;
+            archive.write_all(b"skipped")?;
+            archive.start_file("top/sub/file.txt", opts)?;
+            archive.write_all(b"ok")?;
+            archive.finish()?;
+        }
+        extract_zip(&ok_zip, &dest, 1).await?;
+        assert!(dest.join("sub").is_dir());
+        assert_eq!(fs::read(dest.join("sub/file.txt"))?, b"ok");
+        assert!(!dest.join("top-only").exists());
+
+        let sym_zip = dir.path().join("sym.zip");
+        {
+            let mut archive = zip::ZipWriter::new(File::create(&sym_zip)?);
+            let sym_opts =
+                zip::write::SimpleFileOptions::default().external_attributes(0o120_777 << 16);
+            archive.start_file("link", sym_opts)?;
+            archive.write_all(b"/etc/passwd")?;
+            archive.finish()?;
+        }
+        assert!(extract_zip(&sym_zip, &dest, 0).await.is_err());
+        Ok(())
     }
 }
