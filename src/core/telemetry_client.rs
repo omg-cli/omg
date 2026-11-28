@@ -126,69 +126,24 @@ pub struct BatchPayload {
 }
 
 impl TelemetryPayload {
-    fn with_shared_context(
-        event: TelemetryEvent,
-        timestamp: String,
-        machine_id: String,
-        platform: String,
-        license_key: Option<String>,
-    ) -> Self {
-        Self {
-            event,
-            timestamp,
-            machine_id,
-            version: env!("CARGO_PKG_VERSION").to_string(),
-            platform,
-            license_key,
-        }
-    }
-
-    fn hash_license_key(key: &str) -> String {
-        use sha2::Digest as _;
-        hex::encode(sha2::Sha256::digest(key.as_bytes()))[..16].to_string()
-    }
-
-    fn build_batch(events: Vec<TelemetryEvent>) -> BatchPayload {
-        let timestamp = jiff::Timestamp::now()
-            .strftime("%Y-%m-%dT%H:%M:%S%.3fZ")
-            .to_string();
-        let machine_id = get_machine_id();
-        let platform = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
-        let license_key =
-            crate::core::license::load_license().map(|l| Self::hash_license_key(&l.key));
-        let payloads = events
-            .into_iter()
-            .map(|event| {
-                Self::with_shared_context(
-                    event,
-                    timestamp.clone(),
-                    machine_id.clone(),
-                    platform.clone(),
-                    license_key.clone(),
-                )
-            })
-            .collect();
-        BatchPayload {
-            events: payloads,
-            batch_timestamp: timestamp,
-            machine_id,
-        }
-    }
-
     /// Create a new telemetry payload
     #[must_use]
     pub fn new(event: TelemetryEvent) -> Self {
         let license = crate::core::license::load_license();
 
-        Self::with_shared_context(
+        Self {
             event,
-            jiff::Timestamp::now()
+            timestamp: jiff::Timestamp::now()
                 .strftime("%Y-%m-%dT%H:%M:%S%.3fZ")
                 .to_string(),
-            get_machine_id(),
-            format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
-            license.map(|l| Self::hash_license_key(&l.key)),
-        )
+            machine_id: get_machine_id(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            platform: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
+            license_key: license.map(|l| {
+                use sha2::Digest as _;
+                hex::encode(sha2::Sha256::digest(l.key.as_bytes()))[..16].to_string()
+            }),
+        }
     }
 }
 
@@ -324,7 +279,15 @@ pub async fn send_batch(events: Vec<TelemetryEvent>) -> Result<()> {
     // the single-flight slot if this future is cancelled at the await point.
     let _probe_guard = probe_guard;
 
-    let batch = TelemetryPayload::build_batch(events);
+    let payloads: Vec<TelemetryPayload> = events.into_iter().map(TelemetryPayload::new).collect();
+
+    let batch = BatchPayload {
+        events: payloads,
+        batch_timestamp: jiff::Timestamp::now()
+            .strftime("%Y-%m-%dT%H:%M:%S%.3fZ")
+            .to_string(),
+        machine_id: get_machine_id(),
+    };
 
     let client = crate::core::http::shared_client();
 
@@ -498,25 +461,5 @@ mod tests {
         CIRCUIT_STATE.store(CircuitState::Closed as u32, Ordering::Relaxed);
         FAILURE_COUNT.store(0, Ordering::Relaxed);
         HALF_OPEN_PROBE_IN_FLIGHT.store(false, Ordering::Relaxed);
-    }
-
-    #[test]
-    fn build_batch_shares_context_across_events() {
-        let events = vec![
-            TelemetryEvent::Feature(FeatureEvent {
-                feature: "daemon".to_string(),
-                enabled: true,
-            }),
-            TelemetryEvent::Performance(PerformanceEvent {
-                metric_type: "search".to_string(),
-                duration_ms: 5,
-            }),
-        ];
-        let batch = TelemetryPayload::build_batch(events);
-        assert_eq!(batch.events.len(), 2);
-        assert_eq!(batch.events[0].machine_id, batch.machine_id);
-        assert_eq!(batch.events[1].machine_id, batch.machine_id);
-        assert_eq!(batch.events[0].timestamp, batch.batch_timestamp);
-        assert_eq!(TelemetryPayload::hash_license_key("test-key").len(), 16);
     }
 }
