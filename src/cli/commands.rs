@@ -1752,12 +1752,19 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         std::fs::create_dir_all(dir.path().join("versions/node/20.11.0"))
             .expect("create installed runtime dir");
-        temp_env::with_var("OMG_DATA_DIR", Some(dir.path()), || {
-            let engine = crate::core::completion::CompletionEngine::new();
-            let results =
-                complete_runtime_versions(&engine, "20", "node").expect("complete node versions");
-            assert!(results.iter().any(|version| version == "20.11.0"));
-        });
+        let data_dir = dir.path().to_path_buf();
+        temp_env::with_vars(
+            [
+                ("OMG_TEST_MODE", Some(std::ffi::OsStr::new("1"))),
+                ("OMG_DATA_DIR", Some(data_dir.as_os_str())),
+            ],
+            || {
+                let engine = crate::core::completion::CompletionEngine::new();
+                let results = complete_runtime_versions(&engine, "20", "node")
+                    .expect("complete node versions");
+                assert!(results.iter().any(|version| version == "20.11.0"));
+            },
+        );
     }
 
     #[cfg(unix)]
