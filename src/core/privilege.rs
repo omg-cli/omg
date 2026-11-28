@@ -972,9 +972,7 @@ pub fn elevate_if_needed(args: &[String]) -> anyhow::Result<()> {
             .collect();
 
         let run_elevation = |args_refs: &[&str]| -> anyhow::Result<()> {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
+            tokio::runtime::Runtime::new()
                 .context("Failed to create runtime")?
                 .block_on(run_self_sudo(args_refs))
         };

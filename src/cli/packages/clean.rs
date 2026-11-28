@@ -153,10 +153,8 @@ pub async fn clean(
             // Default: show what can be cleaned
             #[cfg(feature = "arch")]
             {
-                let orphan_list = tokio::task::spawn_blocking(list_orphans_direct)
-                    .await
-                    .context("Orphan listing task failed")?
-                    .context("Failed to list orphan packages")?;
+                let orphan_list =
+                    list_orphans_direct().context("Failed to list orphan packages")?;
                 if !orphan_list.is_empty() {
                     println!(
                         "  {} {} orphan packages can be removed",
@@ -196,10 +194,8 @@ pub async fn clean(
             #[cfg(feature = "arch")]
             {
                 if dry_run {
-                    let orphan_list = tokio::task::spawn_blocking(list_orphans_direct)
-                        .await
-                        .context("Orphan listing task failed")?
-                        .context("Failed to list orphan packages")?;
+                    let orphan_list =
+                        list_orphans_direct().context("Failed to list orphan packages")?;
                     println!(
                         "  {} Would remove {} orphan packages:",
                         style::accent("→"),
@@ -242,10 +238,7 @@ pub async fn clean(
             #[cfg(feature = "arch")]
             {
                 if dry_run {
-                    let preview = tokio::task::spawn_blocking(|| clean_cache_preview(1))
-                        .await
-                        .context("Cache preview task failed")?;
-                    match preview {
+                    match clean_cache_preview(1) {
                         Ok((removed, freed)) => {
                             let freed_mb = freed as f64 / 1024.0 / 1024.0;
                             println!(
