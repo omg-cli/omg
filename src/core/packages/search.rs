@@ -109,10 +109,7 @@ impl SearchRanker {
         };
         let target = exact_key.unwrap_or(name_lower);
         let haystack = Utf32Str::new(target, &mut self.utf32_buf);
-        let fuzzy = self
-            .pattern
-            .score(haystack, &mut self.matcher)
-            .unwrap_or(0);
+        let fuzzy = self.pattern.score(haystack, &mut self.matcher).unwrap_or(0);
         if tier == MatchTier::Substring && fuzzy > 0 {
             tier = MatchTier::Fuzzy;
         }

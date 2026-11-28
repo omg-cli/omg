@@ -154,7 +154,8 @@ impl TelemetryPayload {
             .to_string();
         let machine_id = get_machine_id();
         let platform = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
-        let license_key = crate::core::license::load_license().map(|l| Self::hash_license_key(&l.key));
+        let license_key =
+            crate::core::license::load_license().map(|l| Self::hash_license_key(&l.key));
         let payloads = events
             .into_iter()
             .map(|event| {
