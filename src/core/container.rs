@@ -698,7 +698,7 @@ impl ContainerManager {
                     "{runtime}: unsupported version request {version:?}: {error}; use a numeric pin or system"
                 ));
                 push_runtime_request_failure(&mut dockerfile, runtime);
-                continue;
+                String::new()
             } else {
                 version.to_string()
             };
