@@ -23,7 +23,7 @@ mod update;
 
 // Re-export all public functions
 pub use clean::clean;
-pub use explicit::{explicit, explicit_sync, explicit_sync_with_json};
+pub use explicit::{explicit_sync, explicit_sync_with_json};
 #[doc(hidden)]
 pub use info::info_after_fast_miss;
 pub use info::{info, info_sync, info_with_json};
@@ -79,7 +79,7 @@ fn mock_arch_backend() -> anyhow::Result<bool> {
 ///
 /// This provides a simple println-based execution for reliability
 /// in CI/non-TTY environments where the Elm UI might not be available.
-/// [`Cmd::Error`] is returned without printing so the process-level reporter
+/// [`View::Error`] is returned without printing so the process-level reporter
 /// remains the single owner of user-facing failures.
 pub(crate) fn execute_cmd(cmd: crate::cli::tea::Cmd<()>) -> anyhow::Result<()> {
     use crate::cli::tea::{Cmd, View};

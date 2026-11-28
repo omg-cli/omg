@@ -17,16 +17,16 @@ use crate::package_managers::{
 #[cfg(all(feature = "debian-pure", not(feature = "debian")))]
 use crate::package_managers::debian_db::{clean_package_cache, list_orphans_fast};
 
-/// Clean up orphans and caches
-#[allow(
-    clippy::needless_return,
-    reason = "additive backend feature branches return before compiled fallbacks"
-)]
 #[cfg(any(test, feature = "debian"))]
 fn apt_cleanup_requests_unsupported_work(cache: bool, aur: bool, all: bool) -> bool {
     cache || aur || all
 }
 
+/// Clean up orphans and caches.
+#[allow(
+    clippy::needless_return,
+    reason = "additive backend feature branches return before compiled fallbacks"
+)]
 pub async fn clean(
     orphans: bool,
     cache: bool,
@@ -153,8 +153,10 @@ pub async fn clean(
             // Default: show what can be cleaned
             #[cfg(feature = "arch")]
             {
-                let orphan_list =
-                    list_orphans_direct().context("Failed to list orphan packages")?;
+                let orphan_list = tokio::task::spawn_blocking(list_orphans_direct)
+                    .await
+                    .context("Orphan listing task failed")?
+                    .context("Failed to list orphan packages")?;
                 if !orphan_list.is_empty() {
                     println!(
                         "  {} {} orphan packages can be removed",
@@ -194,8 +196,10 @@ pub async fn clean(
             #[cfg(feature = "arch")]
             {
                 if dry_run {
-                    let orphan_list =
-                        list_orphans_direct().context("Failed to list orphan packages")?;
+                    let orphan_list = tokio::task::spawn_blocking(list_orphans_direct)
+                        .await
+                        .context("Orphan listing task failed")?
+                        .context("Failed to list orphan packages")?;
                     println!(
                         "  {} Would remove {} orphan packages:",
                         style::accent("→"),
@@ -227,7 +231,10 @@ pub async fn clean(
                 not(feature = "debian-pure")
             ))]
             {
-                crate::package_managers::apt_remove_orphans().await?;
+                anyhow::bail!(
+                    "Clean requires a Debian-like system (or an Arch-enabled build); \
+                     no supported package database was found"
+                );
             }
         }
 
@@ -235,7 +242,10 @@ pub async fn clean(
             #[cfg(feature = "arch")]
             {
                 if dry_run {
-                    match clean_cache_preview(1) {
+                    let preview = tokio::task::spawn_blocking(|| clean_cache_preview(1))
+                        .await
+                        .context("Cache preview task failed")?;
+                    match preview {
                         Ok((removed, freed)) => {
                             let freed_mb = freed as f64 / 1024.0 / 1024.0;
                             println!(

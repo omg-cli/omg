@@ -77,7 +77,6 @@ mod cmd;
 mod renderer;
 
 // Model implementations
-mod info_model;
 mod status_model;
 mod update_model;
 mod wrappers;
@@ -91,15 +90,12 @@ pub use renderer::Renderer;
 /// stack.
 const MAX_CMD_STEPS: usize = 100_000;
 
-// Re-export configuration types for convenience
-
 // Re-export models
-pub use info_model::{InfoModel, InfoMsg, InfoSource};
 pub use status_model::{StatusData, StatusModel, StatusMsg};
 pub use update_model::UpdateType;
 
 // Re-export wrappers for easy integration
-pub use wrappers::{run_info_elm, run_status_elm};
+pub use wrappers::run_status_elm;
 
 use std::io;
 
@@ -219,7 +215,7 @@ impl<M: Model> Program<M> {
 /// Execute the output-only variants of [`Cmd`] against a renderer.
 ///
 /// Control-flow variants (`None`/`Msg`/`Batch`/`Exec`) are left to the caller.
-/// `Cmd::Error` yields `Err` without printing. Process-level error reporting
+/// `View::Error` yields `Err` without printing. Process-level error reporting
 /// has one owner, so a failing command is never rendered twice.
 fn execute_output_cmd<M>(renderer: &mut Renderer, cmd: Cmd<M>) -> io::Result<()> {
     match cmd {
@@ -268,7 +264,7 @@ fn execute_view(renderer: &mut Renderer, view: View) -> io::Result<()> {
 /// Run a pre-built command tree against a fresh renderer without a model.
 ///
 /// Unlike the println-based fallback executor, this honors the Elm rendering
-/// path and treats `Cmd::Error` as program failure. The returned error reaches
+/// path and treats `View::Error` as program failure. The returned error reaches
 /// the process-level reporter, which prints it exactly once.
 /// Control-flow commands (`None`/`Msg`/`Batch`/`Exec`) carry no output here
 /// and are ignored, matching the fallback executor's contract.

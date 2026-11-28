@@ -419,9 +419,7 @@ fn dispatch_search(
     app.search_error = None;
     app.selected_index = 0;
 
-    *next_search_id = next_search_id
-        .checked_add(1)
-        .expect("search request identifier exhausted");
+    *next_search_id = next_search_id.wrapping_add(1);
     let request_id = SearchRequestId(*next_search_id);
     let query = query.to_string();
     let sender = sender.clone();

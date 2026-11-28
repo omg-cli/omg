@@ -1389,9 +1389,11 @@ fn ensure_node_runtime(version: &str) -> Result<String> {
 
     let prompt = format!("Node.js '{normalized}' is missing. Install now?");
     if confirm_interactively(&prompt)? {
-        let resolved = run_async(node_manager.resolve_alias(normalized))?;
-        run_async(node_manager.install(&resolved))?;
-        Ok(resolved)
+        run_async(async {
+            let resolved = node_manager.resolve_alias(normalized).await?;
+            node_manager.install(&resolved).await?;
+            Ok(resolved)
+        })
     } else {
         anyhow::bail!("Node.js setup cancelled");
     }
@@ -1420,9 +1422,11 @@ fn ensure_bun_runtime(version: &str) -> Result<String> {
 
     let prompt = format!("Bun '{normalized}' is missing. Install now?");
     if confirm_interactively(&prompt)? {
-        let resolved = run_async(bun_manager.resolve_alias(normalized))?;
-        run_async(bun_manager.install(&resolved))?;
-        Ok(resolved)
+        run_async(async {
+            let resolved = bun_manager.resolve_alias(normalized).await?;
+            bun_manager.install(&resolved).await?;
+            Ok(resolved)
+        })
     } else {
         anyhow::bail!("Bun setup cancelled");
     }

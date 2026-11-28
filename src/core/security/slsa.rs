@@ -1109,10 +1109,31 @@ impl SlsaVerifier {
         // Calculate artifact hash, keeping the bytes around: P-256 ECDSA
         // verification hashes the message itself, so the artifact content
         // must be available at verification time.
-        let artifact_bytes = std::fs::read(&blob_path).map_err(|source| SlsaError::Read {
-            path: blob_path.as_ref().display().to_string(),
-            source,
-        })?;
+        const MAX_SLSA_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024;
+        const MAX_SLSA_PROVENANCE_BYTES: u64 = 16 * 1024 * 1024;
+        let blob_meta = tokio::fs::metadata(&blob_path)
+            .await
+            .map_err(|source| SlsaError::Read {
+                path: blob_path.as_ref().display().to_string(),
+                source,
+            })?;
+        if blob_meta.len() > MAX_SLSA_ARTIFACT_BYTES {
+            return Err(SlsaError::Read {
+                path: blob_path.as_ref().display().to_string(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "artifact exceeds {MAX_SLSA_ARTIFACT_BYTES}-byte SLSA verification limit"
+                    ),
+                ),
+            });
+        }
+        let artifact_bytes = tokio::fs::read(&blob_path)
+            .await
+            .map_err(|source| SlsaError::Read {
+                path: blob_path.as_ref().display().to_string(),
+                source,
+            })?;
         let artifact_hash = {
             let mut hasher = sha2::Sha256::new();
             sha2::Digest::update(&mut hasher, &artifact_bytes);
@@ -1134,11 +1155,31 @@ impl SlsaVerifier {
         }
 
         if let Some(prov_path) = provenance_path
-            && prov_path.as_ref().exists()
+            && tokio::fs::try_exists(prov_path.as_ref())
+                .await
+                .unwrap_or(false)
         {
             let path_str = prov_path.as_ref().display().to_string();
-            let content =
-                std::fs::read_to_string(prov_path.as_ref()).map_err(|source| SlsaError::Read {
+            let prov_meta = tokio::fs::metadata(prov_path.as_ref())
+                .await
+                .map_err(|source| SlsaError::Read {
+                    path: path_str.clone(),
+                    source,
+                })?;
+            if prov_meta.len() > MAX_SLSA_PROVENANCE_BYTES {
+                return Err(SlsaError::Read {
+                    path: path_str,
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "provenance file exceeds {MAX_SLSA_PROVENANCE_BYTES}-byte limit"
+                        ),
+                    ),
+                });
+            }
+            let content = tokio::fs::read_to_string(prov_path.as_ref())
+                .await
+                .map_err(|source| SlsaError::Read {
                     path: path_str,
                     source,
                 })?;
