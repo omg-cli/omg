@@ -51,7 +51,7 @@ export function r2Raw(bucket: Pick<R2Bucket, "get" | "put">): RawStore {
             if (new TextEncoder().encode(text).length !== length)
                 throw new Error("packed raw range mismatch");
             if (await sha256(text) !== digest) throw new Error("packed raw digest mismatch");
-            return {text: async () => text};
+            return {text: async () => text, verifiedSha256: digest};
         },
     };
 }

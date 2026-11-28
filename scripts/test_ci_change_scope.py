@@ -111,7 +111,7 @@ class ScopeTests(unittest.TestCase):
             (root / 'src').mkdir()
             (root / 'src/lib.rs').write_text('pub const VALUE: u8 = 1;\n')
             base = commit('native source')
-            cloud = root / 'services/advisories/wrangler.pg.jsonc'
+            cloud = root / 'services/advisories/wrangler.jsonc'
             cloud.parent.mkdir(parents=True)
             cloud.write_text('{}\n')
             (root / 'README.md').write_text('Updated docs\n')

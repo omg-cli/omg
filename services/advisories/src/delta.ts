@@ -47,13 +47,29 @@ export async function deltaBatch(
             )
                 continue;
             count++;
-            candidates.push({ item, offset });
-            candidates.sort(
-                (a, b) =>
-                    a.item.event.localeCompare(b.item.event) ||
-                    a.item.id.localeCompare(b.item.id),
-            );
-            if (candidates.length > limit) candidates.pop();
+            const entry: Pending = { item, offset };
+            let low = 0;
+            let high = candidates.length;
+            while (low < high) {
+                const mid = (low + high) >>> 1;
+                const current = candidates[mid]!.item;
+                const cmp =
+                    item.event < current.event
+                        ? -1
+                        : item.event > current.event
+                          ? 1
+                          : item.id < current.id
+                            ? -1
+                            : item.id > current.id
+                              ? 1
+                              : 0;
+                if (cmp < 0) high = mid;
+                else low = mid + 1;
+            }
+            if (low < limit) {
+                candidates.splice(low, 0, entry);
+                if (candidates.length > limit) candidates.pop();
+            }
         }
     };
     const reader = body.getReader();
