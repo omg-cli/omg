@@ -206,8 +206,47 @@ impl RuntimeAdmission {
 
     fn verify_tree(&self, tree: &Path) -> Result<()> {
         self.verify_content(tree)?;
+        let policy_sha256 = policy_digest()?;
+        self.verify_policy_and_envelope(tree, &policy_sha256)
+    }
+
+    fn verify_content(&self, tree: &Path) -> Result<()> {
+        let canonical = canonical_destination(tree)?;
+        let content = tree_digest(tree)?;
+        let identity = read_identity(&self.record.destination)?;
+        let identity_sha256 = identity_digest(identity.as_ref())?;
+        self.verify_content_digests(&canonical, &content, &identity_sha256, principal())
+    }
+
+    fn verify_content_digests(
+        &self,
+        canonical: &Path,
+        content_sha256: &str,
+        identity_sha256: &str,
+        principal_ids: (u32, u32),
+    ) -> Result<()> {
         ensure!(
-            policy_digest()? == self.record.policy_sha256,
+            canonical == self.tree || canonical == self.record.destination,
+            "Runtime advisory execution names another tree"
+        );
+        ensure!(
+            principal_ids == (self.record.uid, self.record.euid),
+            "Runtime advisory principal changed"
+        );
+        ensure!(
+            content_sha256 == self.record.content_sha256,
+            "Runtime content changed after advisory review"
+        );
+        ensure!(
+            identity_sha256 == self.record.identity_sha256,
+            "Runtime identity or publisher changed after advisory review"
+        );
+        Ok(())
+    }
+
+    fn verify_policy_and_envelope(&self, tree: &Path, policy_sha256: &str) -> Result<()> {
+        ensure!(
+            policy_sha256 == self.record.policy_sha256,
             "Runtime advisory policy changed"
         );
         validate_envelope(
@@ -222,26 +261,17 @@ impl RuntimeAdmission {
         Ok(())
     }
 
-    fn verify_content(&self, tree: &Path) -> Result<()> {
-        let canonical = canonical_destination(tree)?;
-        ensure!(
-            canonical == self.tree || canonical == self.record.destination,
-            "Runtime advisory execution names another tree"
-        );
-        ensure!(
-            principal() == (self.record.uid, self.record.euid),
-            "Runtime advisory principal changed"
-        );
-        ensure!(
-            tree_digest(tree)? == self.record.content_sha256,
-            "Runtime content changed after advisory review"
-        );
-        let identity = read_identity(&self.record.destination)?;
-        ensure!(
-            identity_digest(identity.as_ref())? == self.record.identity_sha256,
-            "Runtime identity or publisher changed after advisory review"
-        );
-        Ok(())
+    fn verify_with_digests(
+        &self,
+        tree: &Path,
+        canonical: &Path,
+        content_sha256: &str,
+        identity_sha256: &str,
+        policy_sha256: &str,
+        principal_ids: (u32, u32),
+    ) -> Result<()> {
+        self.verify_content_digests(canonical, content_sha256, identity_sha256, principal_ids)?;
+        self.verify_policy_and_envelope(tree, policy_sha256)
     }
 }
 
@@ -446,12 +476,24 @@ fn admit_tree(
                         && record.policy_sha256 == policy_sha256,
                     "Runtime advisory evidence changed; run explicit omg use for a new review"
                 );
+                let canonical_tree = canonical_destination(tree)?;
+                ensure!(
+                    canonical_tree == record.destination,
+                    "Runtime advisory admission names another destination"
+                );
                 let admission = RuntimeAdmission {
                     record: record.clone(),
-                    tree: canonical_destination(tree)?,
+                    tree: canonical_tree.clone(),
                     _lease: None,
                 };
-                admission.verify(tree)?;
+                admission.verify_with_digests(
+                    tree,
+                    &canonical_tree,
+                    &content,
+                    &identity_sha256,
+                    &policy_sha256,
+                    (uid, euid),
+                )?;
                 Ok(admission)
             })
             .transpose();
