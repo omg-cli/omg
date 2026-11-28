@@ -461,6 +461,9 @@ impl ErlangManager {
             ));
         }
 
+        let _finished =
+            self.security
+                .prepare_staged("erlang", version, &version_dir, &version_dir)?;
         fs::remove_file(version_dir.join(super::common::INSTALL_PENDING_MARKER))?;
         Ok(())
     }
