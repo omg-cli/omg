@@ -2,7 +2,6 @@ import { parseCve, sha256, cveUrl } from "./domain";
 import { packRecords } from "./raw-pack";
 export type Command = { sql: string; values: (string | number | null)[] };
 export interface Sql {
-    readonly inlinePayloads?: boolean;
     first<T>(
         sql: string,
         values?: (string | number | null)[],
@@ -12,9 +11,13 @@ export interface Sql {
 }
 export interface RawStore {
     put(key: string, value: string): Promise<unknown>;
-    get(key: string): Promise<{ text(): Promise<string> } | null>;
+    get(key: string): Promise<{ text(): Promise<string>; verifiedSha256?: string } | null>;
 }
-export function d1Sql(db: Pick<D1Database, "prepare" | "batch">): Sql {
+type D1Executor = Pick<D1Database, "prepare" | "batch">;
+type D1SessionCapable = D1Executor & {
+    withSession?: (constraintOrBookmark?: string) => D1Executor;
+};
+export function d1Sql(db: D1Executor): Sql {
     return {
         first: (sql, values = []) =>
             db
@@ -34,6 +37,12 @@ export function d1Sql(db: Pick<D1Database, "prepare" | "batch">): Sql {
             );
         },
     };
+}
+export function d1ReadSql(db: D1SessionCapable): Sql {
+    return d1Sql(db.withSession ? db.withSession("first-unconstrained") : db);
+}
+export function d1WriteSql(db: D1SessionCapable): Sql {
+    return d1Sql(db.withSession ? db.withSession("first-primary") : db);
 }
 export type Checkpoint = {
     source: string;
@@ -72,61 +81,34 @@ function cveChanged(record:CveRecord,hash:string,old:RecordRow|undefined|null):b
     if(old && old.modified_at===record.modified)throw new Error("conflicting equal CVE revision");
     return true;
 }
-const MAX_INLINE_PAYLOAD_BYTES = 256 * 1024;
 function cveCommands(
     record: CveRecord,
     hash: string,
     key: string,
     fetchedAt: string,
-    inlineRaw?: string | null,
 ): Command[] {
-    const useInline = inlineRaw !== undefined;
-    const inlineValue =
-        useInline && inlineRaw !== null && inlineRaw.length <= MAX_INLINE_PAYLOAD_BYTES
-            ? inlineRaw
-            : null;
     return [
-            useInline
-                ? {
-                    sql: "INSERT INTO source_record(id,source,source_url,schema_version,state,published_at,modified_at,fetched_at,payload_sha256,object_key,normalization_version,supported,payload_raw,payload_jsonb) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?::jsonb) ON CONFLICT(id) DO UPDATE SET source_url=excluded.source_url,schema_version=excluded.schema_version,state=excluded.state,published_at=excluded.published_at,modified_at=excluded.modified_at,fetched_at=excluded.fetched_at,payload_sha256=excluded.payload_sha256,object_key=excluded.object_key,normalization_version=excluded.normalization_version,supported=excluded.supported,payload_raw=excluded.payload_raw,payload_jsonb=excluded.payload_jsonb WHERE excluded.modified_at > source_record.modified_at",
-                    values: [
-                        record.id,
-                        "cve",
-                        cveUrl(record.id),
-                        record.schema,
-                        record.state,
-                        record.published,
-                        record.modified,
-                        fetchedAt,
-                        hash,
-                        key,
-                        1,
-                        Number(record.supported),
-                        inlineValue,
-                        inlineValue,
-                    ],
-                }
-                : {
-                    sql: "INSERT INTO source_record(id,source,source_url,schema_version,state,published_at,modified_at,fetched_at,payload_sha256,object_key,normalization_version,supported) VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET source_url=excluded.source_url,schema_version=excluded.schema_version,state=excluded.state,published_at=excluded.published_at,modified_at=excluded.modified_at,fetched_at=excluded.fetched_at,payload_sha256=excluded.payload_sha256,object_key=excluded.object_key,normalization_version=excluded.normalization_version,supported=excluded.supported WHERE excluded.modified_at > source_record.modified_at",
-                    values: [
-                        record.id,
-                        "cve",
-                        cveUrl(record.id),
-                        record.schema,
-                        record.state,
-                        record.published,
-                        record.modified,
-                        fetchedAt,
-                        hash,
-                        key,
-                        1,
-                        Number(record.supported),
-                    ],
-                },
-            {
-                sql: "INSERT INTO cve(id,state,modified_at,payload_sha256) VALUES(?,?,?,?) ON CONFLICT(id) DO UPDATE SET state=excluded.state,modified_at=excluded.modified_at,payload_sha256=excluded.payload_sha256 WHERE excluded.modified_at > cve.modified_at",
-                values: [record.id, record.state, record.modified, hash],
-            },
+        {
+            sql: "INSERT INTO source_record(id,source,source_url,schema_version,state,published_at,modified_at,fetched_at,payload_sha256,object_key,normalization_version,supported) VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET source_url=excluded.source_url,schema_version=excluded.schema_version,state=excluded.state,published_at=excluded.published_at,modified_at=excluded.modified_at,fetched_at=excluded.fetched_at,payload_sha256=excluded.payload_sha256,object_key=excluded.object_key,normalization_version=excluded.normalization_version,supported=excluded.supported WHERE excluded.modified_at > source_record.modified_at",
+            values: [
+                record.id,
+                "cve",
+                cveUrl(record.id),
+                record.schema,
+                record.state,
+                record.published,
+                record.modified,
+                fetchedAt,
+                hash,
+                key,
+                1,
+                Number(record.supported),
+            ],
+        },
+        {
+            sql: "INSERT INTO cve(id,state,modified_at,payload_sha256) VALUES(?,?,?,?) ON CONFLICT(id) DO UPDATE SET state=excluded.state,modified_at=excluded.modified_at,payload_sha256=excluded.payload_sha256 WHERE excluded.modified_at > cve.modified_at",
+            values: [record.id, record.state, record.modified, hash],
+        },
     ];
 }
 export class Store {
@@ -139,7 +121,6 @@ export class Store {
         const sql = this.sql;
         return new Store(
             {
-                inlinePayloads: sql.inlinePayloads,
                 first: sql.first.bind(sql),
                 all: sql.all.bind(sql),
                 batch: (commands) => sql.batch([
@@ -228,7 +209,7 @@ export class Store {
             if(failures.length)throw failures[0];
         }
         const rawAt=performance.now();
-        const commands=changed.flatMap(({record,raw,hash,key})=>cveCommands(record,hash,key,fetchedAt,this.sql.inlinePayloads ? raw : undefined));
+        const commands=changed.flatMap(({record,hash,key})=>cveCommands(record,hash,key,fetchedAt));
         if(commands.length || after.length)await this.sql.batch([...commands,...after]);
         console.info(JSON.stringify({event:"baseline_write_phases",records:records.length,changed:changed.length,
             prepare_ms:preparedAt-started,read_ms:readAt-preparedAt,raw_ms:rawAt-readAt,metadata_ms:performance.now()-rawAt}));
@@ -247,7 +228,7 @@ export class Store {
         if(!cveChanged(record,hash,old))return;
         const key = `cve/${record.id}/${hash}.json`;
         await this.raw.put(key, raw);
-        await this.sql.batch(cveCommands(record,hash,key,fetchedAt,this.sql.inlinePayloads ? raw : undefined));
+        await this.sql.batch(cveCommands(record,hash,key,fetchedAt));
         if (!record.supported) {
             await this.sql.batch([
                 {
