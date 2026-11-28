@@ -3,7 +3,7 @@ use std::cmp::Reverse;
 
 use crate::package_managers::SearchNameKind;
 use nucleo_matcher::{
-    Config, Matcher, Utf32String,
+    Config, Matcher, Utf32Str,
     pattern::{CaseMatching, Normalization, Pattern},
 };
 
@@ -58,8 +58,7 @@ pub(crate) enum MatchTier {
 /// Language packs flood generic queries (`firefox` matches hundreds of
 /// `firefox-*-i18n-*`). They sort after real packages in every tier and
 /// collapse into one group row unless the query names them directly.
-pub(crate) fn is_langpack(name: &str) -> bool {
-    let lower = name.to_lowercase();
+fn is_langpack_lower(lower: &str) -> bool {
     lower.contains("-i18n-")
         || lower.ends_with("-i18n")
         || lower.ends_with("-l10n")
@@ -86,6 +85,7 @@ pub(crate) struct SearchRanker {
     query_lower: String,
     pattern: Pattern,
     matcher: Matcher,
+    utf32_buf: Vec<char>,
 }
 
 impl SearchRanker {
@@ -96,6 +96,7 @@ impl SearchRanker {
             query_lower,
             pattern,
             matcher: Matcher::new(Config::DEFAULT),
+            utf32_buf: Vec::new(),
         }
     }
 
@@ -106,14 +107,12 @@ impl SearchRanker {
         } else {
             match_tier(&self.query_lower, name_lower)
         };
-        let haystack = Utf32String::from(exact_key.unwrap_or(name_lower));
-        let fuzzy = self
-            .pattern
-            .score(haystack.slice(..), &mut self.matcher)
-            .unwrap_or(0);
+        let target = exact_key.unwrap_or(name_lower);
+        let haystack = Utf32Str::new(target, &mut self.utf32_buf);
+        let fuzzy = self.pattern.score(haystack, &mut self.matcher).unwrap_or(0);
         if tier == MatchTier::Substring && fuzzy > 0 {
             tier = MatchTier::Fuzzy;
         }
-        (tier, is_langpack(name_lower), Reverse(fuzzy))
+        (tier, is_langpack_lower(name_lower), Reverse(fuzzy))
     }
 }

@@ -64,28 +64,7 @@ pub fn is_private_or_local_host(host: Option<&str>) -> bool {
     let Ok(ip) = host.parse::<std::net::IpAddr>() else {
         return false;
     };
-    match ip {
-        std::net::IpAddr::V4(v4) => {
-            v4.is_loopback()
-                || v4.is_private()
-                || v4.is_link_local()
-                || v4.is_unspecified()
-                || v4.is_broadcast()
-        }
-        std::net::IpAddr::V6(v6) => {
-            if let Some(mapped) = v6.to_ipv4_mapped() {
-                return mapped.is_loopback()
-                    || mapped.is_private()
-                    || mapped.is_link_local()
-                    || mapped.is_unspecified();
-            }
-            let first = u16::from_be_bytes([v6.octets()[0], v6.octets()[1]]);
-            v6.is_loopback()
-                || v6.is_unspecified()
-                || (first & 0xfe00) == 0xfc00 // unique local fc00::/7
-                || (first & 0xffc0) == 0xfe80 // link-local fe80::/10
-        }
-    }
+    !is_public_address(ip)
 }
 
 /// Require a globally routable address after DNS resolution, not just a
@@ -711,10 +690,13 @@ mod tests {
             "172.31.255.255",
             "192.168.1.1",
             "169.254.169.254",
+            "100.64.0.1",
+            "224.0.0.1",
             "0.0.0.0",
             "::1",
             "fe80::1",
             "fc00::1",
+            "ff02::1",
             "::ffff:192.168.1.1",
             "localhost",
             "foo.localhost",

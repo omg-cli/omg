@@ -218,13 +218,14 @@ struct HalfOpenProbeGuard;
 
 impl Drop for HalfOpenProbeGuard {
     fn drop(&mut self) {
-        HALF_OPEN_PROBE_IN_FLIGHT.store(false, Ordering::Relaxed);
         // If the probe is still unresolved (cancelled at an await point),
-        // return the breaker to Open so the cooldown restarts. When the
-        // probe completed first, record_success/record_failure already set
-        // the final state; dropping the guard afterwards must not clobber it.
+        // return the breaker to Open and release the single-flight slot.
+        // When the probe completed first, record_success/record_failure
+        // already updated the state and released the slot; dropping the
+        // guard afterwards must not clobber a subsequent probe's claim.
         if CircuitState::from(CIRCUIT_STATE.load(Ordering::Relaxed)) == CircuitState::HalfOpen {
             CIRCUIT_STATE.store(CircuitState::Open as u32, Ordering::Relaxed);
+            HALF_OPEN_PROBE_IN_FLIGHT.store(false, Ordering::Relaxed);
         }
     }
 }
