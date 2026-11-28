@@ -284,6 +284,9 @@ async fn update_packages(
 ) -> Result<()> {
     let pm = get_package_manager()?;
 
+    let needs_deferred_sync =
+        !aur_only && !check_only && !dry_run && !crate::core::caps::can_write_pacman_db();
+
     modern_ui::print_phase_header(
         "🔄",
         "Update",
@@ -455,20 +458,28 @@ async fn update_packages(
 
     let operation_result: Result<()> = async {
         if official_count > 0 {
-            if crate::core::caps::can_write_pacman_db() {
+            if needs_deferred_sync {
+                // Databases were refreshed before the prompt (or skipped via
+                // `--no-sync`). The child only commits the upgrade. `fullupdate`
+                // would download every repository again.
+                println!(
+                    "  {} Upgrading {official_count} official packages...",
+                    style::community("→")
+                );
+                crate::package_managers::arch::run_privileged_operation(
+                    "update",
+                    &[],
+                    &[],
+                    || async { Ok(()) },
+                )
+                .await?;
+            } else {
                 let pb = modern_ui::modern_spinner(
                     "Upgrading",
                     &format!("{official_count} official packages"),
                 );
                 pm.update().await?;
                 modern_ui::finish_success(&pb, "Upgraded", &format!("{official_count} packages"));
-            } else {
-                // Avoid a parent spinner when `pm.update()` will elevate via sudo.
-                println!(
-                    "  {} Upgrading {official_count} official packages...",
-                    style::community("→")
-                );
-                pm.update().await?;
             }
             installed_count += official_count;
         }
