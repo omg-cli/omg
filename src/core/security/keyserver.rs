@@ -379,27 +379,28 @@ fn validate_gnupg_home(gnupg_home: &Path) -> Result<(), KeyserverError> {
     Ok(())
 }
 
+fn ensure_gnupg_home(gnupg_home: &Path) -> Result<(), KeyserverError> {
+    use std::os::unix::fs::DirBuilderExt as _;
+
+    match std::fs::DirBuilder::new().mode(0o700).create(gnupg_home) {
+        Ok(()) => Ok(()),
+        Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {
+            validate_gnupg_home(gnupg_home)
+        }
+        Err(source) => Err(KeyserverError::GnuPgLaunch {
+            operation: "creating the GnuPG home",
+            source,
+        }),
+    }
+}
+
 /// Import a verified certificate through GnuPG so it updates `pubring.kbx`
 /// using the keybox format GnuPG owns.
 pub fn import_key_into_gnupg(cert: &Cert, gnupg_home: &Path) -> Result<(), KeyserverError> {
     use sequoia_openpgp::serialize::Serialize;
     use std::io::Write as _;
-    use std::os::unix::fs::PermissionsExt as _;
 
-    if gnupg_home.exists() {
-        validate_gnupg_home(gnupg_home)?;
-    } else {
-        std::fs::create_dir(gnupg_home).map_err(|source| KeyserverError::GnuPgLaunch {
-            operation: "creating the GnuPG home",
-            source,
-        })?;
-        std::fs::set_permissions(gnupg_home, std::fs::Permissions::from_mode(0o700)).map_err(
-            |source| KeyserverError::GnuPgLaunch {
-                operation: "securing the GnuPG home",
-                source,
-            },
-        )?;
-    }
+    ensure_gnupg_home(gnupg_home)?;
 
     // Trust-on-first-use: this key has no fingerprint pinning. Say so on
     // stderr so a silent import never surprises the operator.
@@ -634,5 +635,28 @@ mod tests {
                       pub:::::::::00112233445566778899AABBCCDDEEFF00112233:\n\
                       fpr:::::::::AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA:\n";
         assert!(!gnupg_listing_contains_key(decoys, "CCDDEEFF00112233"));
+    }
+
+    #[test]
+    fn ensure_gnupg_home_creates_private_dir_and_rejects_missing_parent() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = tempfile::TempDir::new().expect("temp dir");
+        let gnupg = root.path().join("gnupg");
+        ensure_gnupg_home(&gnupg).expect("create private gnupg home");
+        assert_eq!(
+            std::fs::symlink_metadata(&gnupg)
+                .expect("stat gnupg")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        ensure_gnupg_home(&gnupg).expect("existing private gnupg home validates");
+        let missing = root.path().join("no-such-parent/gnupg");
+        assert!(matches!(
+            ensure_gnupg_home(&missing),
+            Err(KeyserverError::GnuPgLaunch { .. })
+        ));
     }
 }

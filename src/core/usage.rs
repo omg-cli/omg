@@ -221,7 +221,7 @@ impl UsageStats {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::OpenOptionsExt as _;
-                options.custom_flags(nix::libc::O_NONBLOCK);
+                options.custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK);
             }
             let mut file = options.open(path)?;
             if !file.metadata()?.is_file() {
