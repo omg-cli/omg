@@ -2976,13 +2976,12 @@ mod required_signer_tests {
         let addr = listener.local_addr().expect("stub addr");
         let server = tokio::spawn(async move {
             use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-            if let Ok((mut stream, _)) = listener.accept().await {
-                let mut buf = [0u8; 1024];
-                let _ = stream.read(&mut buf).await;
-                let _ = stream
-                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n[]")
-                    .await;
-            }
+            let (mut stream, _) = listener.accept().await.expect("accept stub connection");
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf).await;
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n[]")
+                .await;
         });
         let prov = dir.path().join("prov.intoto.jsonl");
         std::fs::write(
