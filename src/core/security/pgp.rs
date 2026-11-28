@@ -372,24 +372,32 @@ impl PgpVerifier {
             }
         })?;
 
+        let mut hash_error: Option<PgpError> = None;
+
         while let PacketParserResult::Some(pp) = ppr {
             if let Packet::Signature(sig) = &pp.packet {
-                let mut hasher = Self::signature_hasher(sig)?;
-                data_file
-                    .seek(io::SeekFrom::Start(0))
-                    .map_err(|source| PgpError::PackageRead {
-                        path: path.clone(),
-                        source,
-                    })?;
-                std::io::copy(&mut data_file, &mut hasher).map_err(|source| {
-                    PgpError::PackageRead {
-                        path: path.clone(),
-                        source,
-                    }
-                })?;
+                match Self::signature_hasher(sig) {
+                    Ok(mut hasher) => {
+                        data_file.seek(io::SeekFrom::Start(0)).map_err(|source| {
+                            PgpError::PackageRead {
+                                path: path.clone(),
+                                source,
+                            }
+                        })?;
+                        std::io::copy(&mut data_file, &mut hasher).map_err(|source| {
+                            PgpError::PackageRead {
+                                path: path.clone(),
+                                source,
+                            }
+                        })?;
 
-                if self.matches_any_trusted_cert(sig, &hasher) {
-                    return Ok(());
+                        if self.matches_any_trusted_cert(sig, &hasher) {
+                            return Ok(());
+                        }
+                    }
+                    Err(error) => {
+                        hash_error.get_or_insert(error);
+                    }
                 }
             }
             ppr = pp
@@ -401,7 +409,7 @@ impl PgpVerifier {
                 .1;
         }
 
-        Err(PgpError::NoValidSignature)
+        Err(hash_error.unwrap_or(PgpError::NoValidSignature))
     }
 
     /// Verify data against a detached signature (memory-based)
@@ -411,14 +419,21 @@ impl PgpVerifier {
                 source: source.into(),
             }
         })?;
+        let mut hash_error: Option<PgpError> = None;
 
         while let PacketParserResult::Some(pp) = ppr {
             if let Packet::Signature(sig) = &pp.packet {
-                let mut hasher = Self::signature_hasher(sig)?;
-                hasher.update(data);
+                match Self::signature_hasher(sig) {
+                    Ok(mut hasher) => {
+                        hasher.update(data);
 
-                if self.matches_any_trusted_cert(sig, &hasher) {
-                    return Ok(());
+                        if self.matches_any_trusted_cert(sig, &hasher) {
+                            return Ok(());
+                        }
+                    }
+                    Err(error) => {
+                        hash_error.get_or_insert(error);
+                    }
                 }
             }
             ppr = pp
@@ -429,7 +444,7 @@ impl PgpVerifier {
                 .1;
         }
 
-        Err(PgpError::NoValidSignature)
+        Err(hash_error.unwrap_or(PgpError::NoValidSignature))
     }
 
     /// Build the hash context for one signature packet.
@@ -1369,5 +1384,41 @@ pub(crate) mod tests {
         writeln!(sig, "sig").unwrap();
         sig.flush().unwrap();
         assert!(require_detached_signature_files("vim", pkg.path(), sig.path()).is_ok());
+    }
+
+    #[test]
+    fn multi_signature_continues_past_unsupported_hash_packet() {
+        let (verifier, valid_sig) = signed_fixture(openpgp::types::HashAlgorithm::SHA256);
+        // Clone the valid v4 EdDSA SHA-256 signature packet and replace its
+        // hash algorithm byte (8 = SHA-256) with Unknown(99).
+        let mut bad_packet = valid_sig.clone();
+        let header_pos = bad_packet
+            .windows(4)
+            .position(|window| window == [4, 0, 22, 8])
+            .expect("v4 EdDSA SHA-256 signature header");
+        bad_packet[header_pos + 3] = 99;
+
+        // Standalone unsupported-hash signature still returns HashContext error.
+        assert!(matches!(
+            verifier.verify_memory(b"test data", &bad_packet),
+            Err(PgpError::HashContext { .. })
+        ));
+
+        // Combined with a valid SHA-256 signature, both verify_memory and verify_detached succeed.
+        let mut combined = bad_packet;
+        combined.extend_from_slice(&valid_sig);
+        verifier
+            .verify_memory(b"test data", &combined)
+            .expect("valid second signature must verify in memory");
+
+        let mut pkg = NamedTempFile::new().unwrap();
+        pkg.write_all(b"test data").unwrap();
+        pkg.flush().unwrap();
+        let mut sig = NamedTempFile::new().unwrap();
+        sig.write_all(&combined).unwrap();
+        sig.flush().unwrap();
+        verifier
+            .verify_detached(pkg.path(), sig.path())
+            .expect("valid second signature must verify from file");
     }
 }

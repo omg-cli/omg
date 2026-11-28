@@ -1042,11 +1042,10 @@ async fn handle_debian_search(
     GLOBAL_METRICS.inc_search_requests();
 
     if query.len() > MAX_QUERY_LENGTH {
-        return Response::Error {
+        return validation_error(
             id,
-            code: error_codes::INVALID_PARAMS,
-            message: format!("Query too long (max {MAX_QUERY_LENGTH} characters)"),
-        };
+            format!("Query too long (max {MAX_QUERY_LENGTH} characters)"),
+        );
     }
 
     let limit = limit.unwrap_or(DEFAULT_SEARCH_LIMIT).min(MAX_SEARCH_LIMIT);
@@ -1156,11 +1155,7 @@ async fn handle_suggest(
 ) -> Response {
     // SECURITY: Validate query length
     if query.len() > MAX_QUERY_LENGTH {
-        return Response::Error {
-            id,
-            code: error_codes::INVALID_PARAMS,
-            message: "Query too long".to_string(),
-        };
+        return validation_error(id, "Query too long");
     }
 
     let limit = limit
@@ -4467,6 +4462,54 @@ pub(super) mod tests {
             assert_eq!(result.packages[0].source, WirePackageSource::Official);
             assert_eq!(state.cache.get("tree").unwrap().len(), MAX_SEARCH_LIMIT);
         }
+    }
+
+    #[tokio::test]
+    async fn oversized_suggest_and_debian_search_record_validation_errors() {
+        let directory = tempfile::tempdir().unwrap();
+        let manager: Arc<dyn PackageManager> = Arc::new(
+            crate::package_managers::mock::MockPackageManager::new_in("debian", directory.path()),
+        );
+        let state = Arc::new(
+            DaemonState::new_isolated(directory.path(), PackageIndex::empty(), manager).unwrap(),
+        );
+        let oversized = "x".repeat(MAX_QUERY_LENGTH + 1);
+        let before = GLOBAL_METRICS.snapshot().validation_failures;
+
+        let suggest_resp = handle_request(
+            Arc::clone(&state),
+            Request::Suggest {
+                id: 10,
+                query: oversized.clone(),
+                limit: None,
+            },
+        )
+        .await;
+        assert!(matches!(
+            suggest_resp,
+            Response::Error {
+                code: error_codes::INVALID_PARAMS,
+                ..
+            }
+        ));
+
+        let debian_resp = handle_request(
+            state,
+            Request::DebianSearch {
+                id: 11,
+                query: oversized,
+                limit: None,
+            },
+        )
+        .await;
+        assert!(matches!(
+            debian_resp,
+            Response::Error {
+                code: error_codes::INVALID_PARAMS,
+                ..
+            }
+        ));
+        assert!(GLOBAL_METRICS.snapshot().validation_failures >= before + 2);
     }
 }
 
