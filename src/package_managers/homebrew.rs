@@ -1,15 +1,14 @@
-//! macOS Homebrew package manager backend.
+//! Pure Rust macOS Homebrew package manager backend
 //!
-//! Uses direct Cellar/Caskroom filesystem reads and cached Homebrew JSON API
-//! metadata for queries, and delegates mutating operations (`install`, `remove`,
-//! `update`) to the `brew` CLI.
+//! This implementation uses DIRECT filesystem access and JSON APIs with NO CLI wrappers.
+//! Performance targets: search <50ms (vs brew's 2s), `list_installed` <20ms (vs brew's 500ms).
 //!
 //! ## Architecture
 //!
 //! - Installed packages: Direct read from `/opt/homebrew/Cellar/` (ARM) or `/usr/local/Cellar/` (Intel)
 //! - Metadata: Parse `INSTALL_RECEIPT.json` in each package version directory
 //! - Search: Fetch and cache `formula.json` (~3.4MB, ~7000 packages) from Homebrew API
-//! - Binary cache: rkyv-serialized snapshot for fast disk reload
+//! - Binary cache: Use rkyv for zero-copy deserialization on subsequent loads
 //! - Fuzzy matching: nucleo-matcher for intelligent search ranking
 
 use std::cmp::Ordering;
@@ -1305,7 +1304,10 @@ impl PackageManager for HomebrewPackageManager {
             self.ensure_cache().await?;
 
             let installed = self.read_installed_packages().await?;
-            let cache = crate::core::sync::read_cache(&self.cache);
+            let cache = self
+                .cache
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let cache = cache.as_ref().context("Cache not loaded")?;
 
             let mut updates = Vec::new();
@@ -1321,17 +1323,19 @@ impl PackageManager for HomebrewPackageManager {
                             .get(&pkg.name)
                             .and_then(|&idx| cache.casks[idx].version.clone())
                     });
-                if let Some(available_version) = available_version
-                    && Self::compare_homebrew_versions(&available_version, &pkg.version)
-                        == std::cmp::Ordering::Greater
-                {
-                    updates.push(UpdateInfo {
-                        architecture: None,
-                        name: pkg.name.clone(),
-                        old_version: pkg.version.clone(),
-                        new_version: available_version,
-                        repo: "homebrew".to_string(),
-                    });
+                if let Some(available_version) = available_version {
+                    let current = parse_version_or_zero(&pkg.version);
+                    let available = parse_version_or_zero(&available_version);
+
+                    if available > current {
+                        updates.push(UpdateInfo {
+                            architecture: None,
+                            name: pkg.name.clone(),
+                            old_version: pkg.version.clone(),
+                            new_version: available_version,
+                            repo: "homebrew".to_string(),
+                        });
+                    }
                 }
             }
 

@@ -123,38 +123,23 @@ impl TrigramIndex {
             return None;
         }
 
-        let mut postings: Vec<&[u32]> = Vec::with_capacity(bytes.len() - 2);
+        let mut result: Option<Vec<u32>> = None;
         for window in bytes.windows(3) {
             let trigram = [window[0], window[1], window[2]];
             match self.postings.get(&trigram) {
-                Some(posting) => postings.push(posting.as_slice()),
+                Some(posting) => {
+                    result = Some(match result {
+                        None => posting.clone(),
+                        Some(prev) => {
+                            let set: ahash::AHashSet<u32> = posting.iter().copied().collect();
+                            prev.into_iter().filter(|idx| set.contains(idx)).collect()
+                        }
+                    });
+                }
                 None => return Some(Vec::new()),
             }
         }
-        postings.sort_unstable_by_key(|p| p.len());
-
-        let mut result = postings[0].to_vec();
-        let mut next = Vec::with_capacity(result.len());
-        for posting in &postings[1..] {
-            next.clear();
-            let (mut i, mut j) = (0, 0);
-            while i < result.len() && j < posting.len() {
-                match result[i].cmp(&posting[j]) {
-                    std::cmp::Ordering::Less => i += 1,
-                    std::cmp::Ordering::Greater => j += 1,
-                    std::cmp::Ordering::Equal => {
-                        next.push(result[i]);
-                        i += 1;
-                        j += 1;
-                    }
-                }
-            }
-            std::mem::swap(&mut result, &mut next);
-            if result.is_empty() {
-                break;
-            }
-        }
-        Some(result)
+        result
     }
 }
 

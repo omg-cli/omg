@@ -180,7 +180,10 @@ pub fn execute_native_omarchy_operation(
         }
     };
     if operation == NativeOmarchyOperation::RefreshKeyrings {
-        super::block_on_live(super::sync_databases_parallel())?;
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(super::sync_databases_parallel())?;
     }
     if operation != NativeOmarchyOperation::UpgradeRepositories && targets.is_empty() {
         return Ok(());
@@ -442,10 +445,7 @@ fn combine_write_results(
 }
 
 async fn after_privileged_alpm_write() -> AnyhowResult<()> {
-    let invalidation = tokio::task::spawn_blocking(invalidate_caches)
-        .await
-        .map_err(anyhow::Error::from)
-        .and_then(|res| res);
+    let invalidation = invalidate_caches();
     let refresh = crate::core::client::refresh_daemon_after_catalog_write().await;
     combine_write_results(invalidation, refresh)
 }
@@ -487,16 +487,15 @@ impl PackageManager for ArchPackageManager {
                     operation.assessments().to_vec(),
                 );
                 let mut after = self.security_inventory().await?;
-                let cmp_identity =
-                    |a: &super::types::SecurityPackage, b: &super::types::SecurityPackage| {
-                        (&a.name, &a.version, &a.architecture).cmp(&(
-                            &b.name,
-                            &b.version,
-                            &b.architecture,
-                        ))
-                    };
-                before.sort_by(cmp_identity);
-                after.sort_by(cmp_identity);
+                let identity = |package: &super::types::SecurityPackage| {
+                    (
+                        package.name.clone(),
+                        package.version.clone(),
+                        package.architecture.clone(),
+                    )
+                };
+                before.sort_by_key(identity);
+                after.sort_by_key(identity);
                 anyhow::ensure!(
                     before == after,
                     "Installed packages changed during native security audit"
@@ -527,13 +526,16 @@ impl PackageManager for ArchPackageManager {
         "pacman"
     }
 
+    #[inline]
     fn search(
         &self,
         query: &str,
     ) -> Pin<Box<dyn Future<Output = AnyhowResult<Vec<Package>>> + Send + '_>> {
         let query = query.to_string();
         Box::pin(async move {
+            // Offload ALPM search to blocking thread
             tokio::task::spawn_blocking(move || {
+                // Direct ALPM search is handled by search_sync in alpm_direct.rs
                 let results = crate::package_managers::search_sync(&query)?;
                 Ok(results
                     .into_iter()
@@ -630,13 +632,10 @@ impl PackageManager for ArchPackageManager {
                 Ok(())
             })
             .await?;
-            let repo_count = tokio::task::spawn_blocking(|| {
-                crate::core::pacman_conf::PacmanConfig::parse(
-                    crate::core::paths::pacman_conf_path(),
-                )
-                .map_or(0, |config| config.repos.len())
-            })
-            .await?;
+            let repo_count = crate::core::pacman_conf::PacmanConfig::parse(
+                crate::core::paths::pacman_conf_path(),
+            )
+            .map_or(0, |config| config.repos.len());
             let sync_elapsed = sync_start.elapsed();
             let detail = if repo_count > 0 {
                 format!(
@@ -651,14 +650,17 @@ impl PackageManager for ArchPackageManager {
         })
     }
 
+    #[inline]
     fn info(
         &self,
         package: &str,
     ) -> Pin<Box<dyn Future<Output = AnyhowResult<Option<Package>>> + Send + '_>> {
         let package = package.to_string();
         Box::pin(async move {
+            // SECURITY: Validate package name
             crate::core::security::validate_package_name(&package)?;
 
+            // Try direct ALPM info
             let info = tokio::task::spawn_blocking(move || {
                 crate::package_managers::get_package_info(&package)
             })
@@ -677,10 +679,13 @@ impl PackageManager for ArchPackageManager {
         })
     }
 
+    #[inline]
     fn list_installed(
         &self,
     ) -> Pin<Box<dyn Future<Output = AnyhowResult<Vec<Package>>> + Send + '_>> {
         Box::pin(async move {
+            // Direct ALPM list
+            // Offload to blocking thread
             tokio::task::spawn_blocking(move || {
                 let pkgs = crate::package_managers::list_installed_fast()?;
                 Ok(pkgs
@@ -715,6 +720,7 @@ impl PackageManager for ArchPackageManager {
         })
     }
 
+    #[inline]
     fn list_explicit(
         &self,
     ) -> Pin<Box<dyn Future<Output = AnyhowResult<Vec<String>>> + Send + '_>> {
@@ -723,6 +729,7 @@ impl PackageManager for ArchPackageManager {
         })
     }
 
+    #[inline]
     fn list_updates(
         &self,
     ) -> Pin<
@@ -753,7 +760,7 @@ impl PackageManager for ArchPackageManager {
 }
 
 pub async fn list_orphans() -> AnyhowResult<Vec<String>> {
-    tokio::task::spawn_blocking(crate::package_managers::list_orphans_direct).await?
+    crate::package_managers::list_orphans_direct()
 }
 
 fn orphan_history_change(
@@ -822,6 +829,16 @@ pub async fn remove_orphans() -> AnyhowResult<()> {
         changes,
         operation_result,
     )
+}
+
+pub async fn list_explicit() -> AnyhowResult<Vec<String>> {
+    tokio::task::spawn_blocking(crate::package_managers::list_explicit_fast).await?
+}
+
+pub async fn is_installed(package: &str) -> AnyhowResult<bool> {
+    let package = package.to_string();
+    tokio::task::spawn_blocking(move || crate::package_managers::is_installed_fast(&package))
+        .await?
 }
 
 #[cfg(test)]

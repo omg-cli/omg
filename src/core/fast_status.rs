@@ -128,7 +128,7 @@ impl FastStatus {
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt as _;
-            if metadata.uid() != rustix::process::geteuid().as_raw() || metadata.mode() & 0o022 != 0
+            if metadata.uid() != rustix::process::getuid().as_raw() || metadata.mode() & 0o022 != 0
             {
                 return None;
             }

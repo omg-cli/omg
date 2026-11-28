@@ -1296,11 +1296,6 @@ pub(crate) fn validate_java_release(tree: &Path, destination: &Path) -> Result<(
 }
 
 pub(crate) fn file_digest(path: &Path, limit: u64) -> Result<(String, u64)> {
-    let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
-    file_digest_with_buffer(path, limit, &mut buffer)
-}
-
-fn file_digest_with_buffer(path: &Path, limit: u64, buffer: &mut [u8]) -> Result<(String, u64)> {
     use std::os::unix::fs::OpenOptionsExt as _;
     let mut file = fs::OpenOptions::new()
         .read(true)
@@ -1312,9 +1307,10 @@ fn file_digest_with_buffer(path: &Path, limit: u64, buffer: &mut [u8]) -> Result
         "Runtime content is not a bounded regular file"
     );
     let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
     let mut count = 0_u64;
     loop {
-        let read = file.read(buffer)?;
+        let read = file.read(&mut buffer)?;
         if read == 0 {
             break;
         }
@@ -1344,7 +1340,6 @@ fn tree_digest(root: &Path) -> Result<String> {
     let mut rows = BTreeMap::new();
     let mut bytes = 0_u64;
     let mut entries = 0_usize;
-    let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
     while let Some(directory) = pending.pop() {
         for entry in fs::read_dir(directory)? {
             let path = entry?.path();
@@ -1384,11 +1379,7 @@ fn tree_digest(root: &Path) -> Result<String> {
                         semantic.len() as u64,
                     )
                 } else {
-                    file_digest_with_buffer(
-                        &path,
-                        MAX_TREE_BYTES.saturating_sub(bytes),
-                        &mut buffer,
-                    )?
+                    file_digest(&path, MAX_TREE_BYTES.saturating_sub(bytes))?
                 };
                 bytes += size;
                 rows.insert(relative, ("file", mode, hash, size));

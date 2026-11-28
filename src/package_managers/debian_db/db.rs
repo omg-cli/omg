@@ -564,21 +564,8 @@ impl DebianPackageIndex {
         }
 
         let name_arch_component_key = format!("{name}:{arch}:{component}");
-        if let Some(existing_idx) = self
-            .name_arch_component_to_idx
-            .get(&name_arch_component_key)
-            .copied()
-        {
-            if let Some(existing_pkg) = self.packages.get(existing_idx)
-                && is_better_arch_candidate(&pkg, existing_pkg)
-            {
-                self.name_arch_component_to_idx
-                    .insert(name_arch_component_key, idx);
-            }
-        } else {
-            self.name_arch_component_to_idx
-                .insert(name_arch_component_key, idx);
-        }
+        self.name_arch_component_to_idx
+            .insert(name_arch_component_key, idx);
         self.packages.push(pkg);
     }
 
@@ -807,8 +794,7 @@ pub fn ensure_index_loaded() -> Result<()> {
 
     *crate::core::sync::write_cache(&DEBIAN_MMAP_INDEX) = None;
     *crate::core::sync::write_cache(&DEBIAN_FST_INDEX) = None;
-    let mut all_files: Vec<PathBuf> = current_files.keys().cloned().collect();
-    all_files.sort();
+    let all_files: Vec<PathBuf> = current_files.keys().cloned().collect();
     let index = rebuild_package_index(&all_files)?;
     // Release serialization buffers before hydrating in-memory search state.
     {
@@ -1818,8 +1804,9 @@ fn fst_search(
     substring_matches
 }
 
-/// FST + rkyv snapshot search: bypasses `ensure_index_loaded()`.
-/// Re-resolves package names against `mmap` rather than trusting FST row indices.
+/// FST+mmap search: completely bypasses `ensure_index_loaded()`
+/// Uses FST for name matching and mmap for zero-copy package details
+#[inline]
 fn fst_mmap_search(
     fst_map: &Map<AlignedVec>,
     mmap: &DebianMmapIndex,
@@ -1884,6 +1871,7 @@ fn fst_mmap_search(
     results
 }
 
+#[inline]
 fn simd_search_fallback(
     index: &DebianPackageIndex,
     query_lower: &str,

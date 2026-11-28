@@ -667,7 +667,9 @@ enum BuildOutputStream {
     Stderr,
 }
 
-/// Route auxiliary command output to inherited stdio in verbose mode or `/dev/null` otherwise.
+/// Drain one child stream completely so a quiet build can never block on a
+/// full pipe. Log failures are remembered while draining continues; otherwise
+/// a compiler could deadlock before omg has a chance to report the I/O error.
 fn configure_auxiliary_output(command: &mut Command) {
     if crate::cli::modern_ui::output_mode() == crate::cli::modern_ui::OutputMode::Verbose {
         command.stdout(Stdio::inherit()).stderr(Stdio::inherit());
@@ -876,12 +878,9 @@ fn assignment_name(line: &str) -> Option<&str> {
 fn pkgbuild_maintainer(text: &str) -> Option<String> {
     for line in text.lines().take(30) {
         let trimmed = line.trim();
-        let Some(rest) = trimmed
+        let rest = trimmed
             .strip_prefix("# Maintainer:")
-            .or_else(|| trimmed.strip_prefix("# Contributor:"))
-        else {
-            continue;
-        };
+            .or_else(|| trimmed.strip_prefix("# Contributor:"))?;
         let cleaned = crate::cli::style::sanitize_terminal_text(rest.trim());
         if !cleaned.is_empty() {
             return Some(cleaned);
@@ -1793,6 +1792,7 @@ impl AurClient {
             .await
     }
 
+    /// Query AUR RPC for package updates (parallel chunked requests)
     /// Query the AUR RPC `type=info` endpoint for one chunk of package names,
     /// retrying transient failures with exponential backoff.
     async fn rpc_info_chunk(chunk: &[String]) -> Result<AurResponse> {
@@ -4202,13 +4202,16 @@ impl AurClient {
             }
         };
         build.child = None;
-        let capture_result = log
-            .lock()
-            .await
-            .file
-            .flush()
-            .await
-            .context("Failed to flush AUR build log");
+        let capture_result: Result<()> = async {
+            log.lock()
+                .await
+                .file
+                .flush()
+                .await
+                .context("Failed to flush AUR build log")?;
+            Ok(())
+        }
+        .await;
 
         progress.finish(status.success() && capture_result.is_ok());
         capture_result?;
@@ -4223,7 +4226,7 @@ impl AurClient {
         args
     }
 
-    /// Makepkg args for sandboxed builds (omits `--needed` for clean sandbox rebuilds).
+    /// Makepkg args for sandboxed builds (no -s since deps are pre-installed)
     fn makepkg_args_sandbox(&self) -> Vec<&'static str> {
         let mut args = vec!["--noconfirm", "-f"];
         if self.settings.aur.secure_makepkg {
@@ -4642,10 +4645,17 @@ impl AurClient {
                 if !status.success() {
                     anyhow::bail!("Failed to clean directory as user '{user}'");
                 }
+                let status = sudo_as_user_program(&user, "mkdir")?
+                    .args(["-p", "--"])
+                    .arg(&self.build_dir)
+                    .status()?;
+                if !status.success() {
+                    anyhow::bail!("Failed to recreate directory as user '{user}'");
+                }
             } else {
                 std::fs::remove_dir_all(&self.build_dir)?;
+                std::fs::create_dir_all(&self.build_dir)?;
             }
-            create_dir_as_user_sync(&self.build_dir)?;
             println!(
                 "{} Cleaned all AUR build directories",
                 crate::cli::style::positive("✓")
@@ -4683,9 +4693,8 @@ pub async fn search_detailed(query: &str) -> Result<Vec<AurPackageDetail>> {
         .map_err(redact_aur_transport_error)?;
     let response: AurDetailedResponse = decode_aur_rpc_response(response).await?;
 
-    // SECURITY: Validate all names in response and precompute match tier once.
-    let query_lower = query.to_ascii_lowercase();
-    let mut ranked: Vec<(u8, AurPackageDetail)> = response
+    // SECURITY: Validate all names in response
+    let mut results = response
         .results
         .into_iter()
         .filter(|p| {
@@ -4700,28 +4709,40 @@ pub async fn search_detailed(query: &str) -> Result<Vec<AurPackageDetail>> {
                 true
             }
         })
-        .map(|pkg| {
-            let name_lower = pkg.name.to_ascii_lowercase();
-            let tier = if name_lower == query_lower {
-                0
-            } else if name_lower.starts_with(&query_lower) {
-                1
-            } else if has_word_boundary_match(&name_lower, &query_lower) {
-                2
-            } else {
-                3
-            };
-            (tier, pkg)
-        })
-        .collect();
-    ranked.sort_by(|(a_tier, a), (b_tier, b)| {
-        a_tier.cmp(b_tier).then_with(|| {
-            b.popularity
-                .partial_cmp(&a.popularity)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
+        .collect::<Vec<_>>();
+
+    // Rank exact, prefix, and word-boundary matches before popularity.
+    let query_lower = query.to_ascii_lowercase();
+    results.sort_by(|a, b| {
+        let a_name_lower = a.name.to_ascii_lowercase();
+        let b_name_lower = b.name.to_ascii_lowercase();
+
+        // Exact match check
+        let a_exact = a_name_lower == query_lower;
+        let b_exact = b_name_lower == query_lower;
+        if a_exact != b_exact {
+            return b_exact.cmp(&a_exact);
+        }
+
+        // Prefix match check
+        let a_prefix = a_name_lower.starts_with(&query_lower);
+        let b_prefix = b_name_lower.starts_with(&query_lower);
+        if a_prefix != b_prefix {
+            return b_prefix.cmp(&a_prefix);
+        }
+
+        // Word boundary match check (uses module-level helper)
+        let a_word = has_word_boundary_match(&a_name_lower, &query_lower);
+        let b_word = has_word_boundary_match(&b_name_lower, &query_lower);
+        if a_word != b_word {
+            return b_word.cmp(&a_word);
+        }
+
+        // Final tiebreaker: popularity (more popular first)
+        b.popularity
+            .partial_cmp(&a.popularity)
+            .unwrap_or(std::cmp::Ordering::Equal)
     });
-    let results: Vec<AurPackageDetail> = ranked.into_iter().map(|(_, pkg)| pkg).collect();
 
     Ok(results)
 }
@@ -5841,17 +5862,17 @@ mod tests {
         std::fs::write(directory.path().join("PKGBUILD"), "pkgname=demo\n")?;
         let srcinfo = directory.path().join(".SRCINFO");
         std::fs::write(
-                &srcinfo,
-                "pkgbase = demo\npkgver = 1\npkgrel = 1\narch = any\nsource = https://example.org/reviewed.tar.gz\nsource = git+https://example.org/reviewed.git\npkgname = demo\n",
-            )
-            .expect("write the original reviewed source manifest");
+            &srcinfo,
+            "pkgbase = demo\npkgver = 1\npkgrel = 1\narch = any\nsource = https://example.org/reviewed.tar.gz\nsource = git+https://example.org/reviewed.git\npkgname = demo\n",
+        )
+        .expect("write the original reviewed source manifest");
         let reviewed = ReviewedSource::capture(directory.path())?;
         tokio::task::yield_now().await;
         std::fs::write(
-                &srcinfo,
-                "pkgbase = demo\npkgver = 1\npkgrel = 1\narch = any\nsource = https://example.org/replacement.tar.gz\nsource = git+https://example.org/replacement.git\npkgname = demo\n",
-            )
-            .expect("write the replacement checkout manifest");
+            &srcinfo,
+            "pkgbase = demo\npkgver = 1\npkgrel = 1\narch = any\nsource = https://example.org/replacement.tar.gz\nsource = git+https://example.org/replacement.git\npkgname = demo\n",
+        )
+        .expect("write the replacement checkout manifest");
 
         Ok((directory, reviewed))
     }
@@ -6523,11 +6544,11 @@ mod tests {
         ]);
         command.arg(
             r#"/bin/bash -c '
-                    exec 3<>/dev/tcp/127.0.0.1/"$1" || exit 1
-                    read -r host_pid rest < /proc/self/stat
-                    printf "%s\n" "$host_pid" >&3
-                    read -r -t 30 finish <&3
-                ' child "$1" & wait"#,
+                exec 3<>/dev/tcp/127.0.0.1/"$1" || exit 1
+                read -r host_pid rest < /proc/self/stat
+                printf "%s\n" "$host_pid" >&3
+                read -r -t 30 finish <&3
+            ' child "$1" & wait"#,
         );
         command.arg("build").arg(port).stdin(Stdio::null());
         let mut runner = spawn_logged_sandbox_fixture(client, command, "fixture");
@@ -7319,10 +7340,10 @@ mod tests {
         // inherited process group after the isolation subprocess is launched.
         const EXPECT_PARENT_GROUP: &str = "OMG_NATIVE_BUILD_EXPECT_PARENT_PGRP";
         let probe_pid = std::process::id();
-        let probe_owner = nix::unistd::getuid().as_raw();
+        let probe_uid = nix::unistd::getuid().as_raw();
         let probe_group = nix::unistd::getpgrp().as_raw();
         println!(
-            "[native-build-probe-context] mode={mode} pid={probe_pid} uid={probe_owner} pgrp={probe_group}"
+            "[native-build-probe-context] mode={mode} pid={probe_pid} uid={probe_uid} pgrp={probe_group}"
         );
         if let Some(expected) = std::env::var_os(EXPECT_PARENT_GROUP) {
             match expected.to_str() {
@@ -8583,11 +8604,11 @@ mod tests {
     #[test]
     fn srcinfo_version_extracts_pkgver_pkgrel() {
         let srcinfo = "pkgbase = postgresql18\n\
-                 pkgver = 18.4\n\
-                 pkgrel = 1\n\
-                 pkgdesc = PostgreSQL\n\
-                 \n\
-                 pkgname = postgresql18\n";
+             pkgver = 18.4\n\
+             pkgrel = 1\n\
+             pkgdesc = PostgreSQL\n\
+             \n\
+             pkgname = postgresql18\n";
         assert_eq!(srcinfo_version(srcinfo).as_deref(), Some("18.4-1"));
         // First occurrences win over later split-package duplicates.
         let dup = "pkgver = 1.0\npkgrel = 2\npkgname = a\npkgver = 9.9\n";
@@ -9130,20 +9151,20 @@ mod tests {
         // install only the requested output, never its unrequested siblings.
         let response: AurResponse = serde_json::from_str(
             r#"{
-                    "results": [
-                        {
-                            "Name": "postgresql18-libs",
-                            "Version": "18.4-1",
-                            "PackageBase": "postgresql18"
-                        },
-                        {
-                            "Name": "postgresql18",
-                            "Version": "18.4-1",
-                            "PackageBase": "postgresql18",
-                            "Depends": ["postgresql18-libs>=18.4"]
-                        }
-                    ]
-                }"#,
+                "results": [
+                    {
+                        "Name": "postgresql18-libs",
+                        "Version": "18.4-1",
+                        "PackageBase": "postgresql18"
+                    },
+                    {
+                        "Name": "postgresql18",
+                        "Version": "18.4-1",
+                        "PackageBase": "postgresql18",
+                        "Depends": ["postgresql18-libs>=18.4"]
+                    }
+                ]
+            }"#,
         )
         .expect("valid AUR RPC fixture");
         let requested = vec!["postgresql18-libs".to_string()];
@@ -9160,20 +9181,20 @@ mod tests {
     fn update_build_jobs_include_cross_base_build_dependencies() {
         let response: AurResponse = serde_json::from_str(
             r#"{
-                    "results": [
-                        {
-                            "Name": "compiler-git",
-                            "Version": "1.0-1",
-                            "PackageBase": "compiler-git"
-                        },
-                        {
-                            "Name": "application-git",
-                            "Version": "1.0-1",
-                            "PackageBase": "application-git",
-                            "MakeDepends": ["compiler-git>=1.0"]
-                        }
-                    ]
-                }"#,
+                "results": [
+                    {
+                        "Name": "compiler-git",
+                        "Version": "1.0-1",
+                        "PackageBase": "compiler-git"
+                    },
+                    {
+                        "Name": "application-git",
+                        "Version": "1.0-1",
+                        "PackageBase": "application-git",
+                        "MakeDepends": ["compiler-git>=1.0"]
+                    }
+                ]
+            }"#,
         )
         .expect("valid AUR RPC fixture");
         let requested = vec!["application-git".to_string(), "compiler-git".to_string()];
@@ -9194,21 +9215,21 @@ mod tests {
         // the shared package base must be built once and both installed outputs selected.
         let response: AurResponse = serde_json::from_str(
             r#"{
-                    "results": [
-                        {
-                            "Name": "postgresql18-libs",
-                            "Version": "18.4-1",
-                            "PackageBase": "postgresql18",
-                            "Depends": ["krb5"]
-                        },
-                        {
-                            "Name": "postgresql18",
-                            "Version": "18.4-1",
-                            "PackageBase": "postgresql18",
-                            "Depends": ["postgresql18-libs>=18.4"]
-                        }
-                    ]
-                }"#,
+                "results": [
+                    {
+                        "Name": "postgresql18-libs",
+                        "Version": "18.4-1",
+                        "PackageBase": "postgresql18",
+                        "Depends": ["krb5"]
+                    },
+                    {
+                        "Name": "postgresql18",
+                        "Version": "18.4-1",
+                        "PackageBase": "postgresql18",
+                        "Depends": ["postgresql18-libs>=18.4"]
+                    }
+                ]
+            }"#,
         )
         .expect("valid AUR RPC fixture");
         let requested = vec!["postgresql18-libs".to_string(), "postgresql18".to_string()];
@@ -10034,181 +10055,181 @@ mod tests {
             ],
             || {
                 tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()?
-                        .block_on(async {
-                            let build_dir = directory.path().join("aur");
-                            let checkout = build_dir.join("omg-coverage-fixture");
-                            std::fs::create_dir_all(&checkout)?;
-                            std::fs::write(
-                                checkout.join("PKGBUILD"),
-                                "pkgname=omg-coverage-fixture\npkgver=1\npkgrel=1\npkgdesc='Inert OMG coverage fixture'\narch=('any')\nlicense=('MIT')\npackage() { install -Dm644 /dev/null \"$pkgdir/usr/share/omg-coverage-fixture/empty\"; }\n",
-                            ).expect("write fixture file");
-                            std::fs::write(
-                                checkout.join(".SRCINFO"),
-                                "pkgbase = omg-coverage-fixture\n\tpkgdesc = Inert OMG coverage fixture\n\tpkgver = 1\n\tpkgrel = 1\n\tarch = any\n\tlicense = MIT\n\npkgname = omg-coverage-fixture\n",
-                            ).expect("write fixture file");
-                            let outputs = vec!["omg-coverage-fixture".to_owned()];
+                    .enable_all()
+                    .build()?
+                    .block_on(async {
+                        let build_dir = directory.path().join("aur");
+                        let checkout = build_dir.join("omg-coverage-fixture");
+                        std::fs::create_dir_all(&checkout)?;
+                        std::fs::write(
+                            checkout.join("PKGBUILD"),
+                            "pkgname=omg-coverage-fixture\npkgver=1\npkgrel=1\npkgdesc='Inert OMG coverage fixture'\narch=('any')\nlicense=('MIT')\npackage() { install -Dm644 /dev/null \"$pkgdir/usr/share/omg-coverage-fixture/empty\"; }\n",
+                        ).expect("write fixture file");
+                        std::fs::write(
+                            checkout.join(".SRCINFO"),
+                            "pkgbase = omg-coverage-fixture\n\tpkgdesc = Inert OMG coverage fixture\n\tpkgver = 1\n\tpkgrel = 1\n\tarch = any\n\tlicense = MIT\n\npkgname = omg-coverage-fixture\n",
+                        ).expect("write fixture file");
+                        let outputs = vec!["omg-coverage-fixture".to_owned()];
+                        let source = ReviewedSource::capture(&checkout)?;
+                        let dependencies = check_dependencies_from_metadata(source.required_srcinfo("fixture")?.as_ref(), &outputs)?;
+                        anyhow::ensure!(
+                            dependencies.missing.is_empty() && dependencies.package_outputs == outputs,
+                            "fixture must never require dependency installation"
+                        );
+                        let mut settings = Settings::default();
+                        settings.aur.security_profile = crate::config::AurSecurityProfile::Hardened;
+                        let client = AurClient {
+                            build_dir,
+                            settings,
+                            package_base_locks: Arc::new(dashmap::DashMap::new()),
+                        };
+                        let mut hashes = Vec::new();
+                        for _ in 0..2 {
+                            let authorized = AuthorizedBuild {
+                                lifecycle_guard: client.acquire_build_lifecycle().await?,
+                                package: "omg-coverage-fixture".to_owned(),
+                                requested_outputs: outputs.clone(),
+                                reviewed_digest: ReviewedSource::capture(&checkout)?,
+                            };
+                            let result = client
+                                .install_authorized_package_outputs(authorized, None)
+                                .await;
+                            let log_path = client.build_log_path("omg-coverage-fixture");
+                            let log = std::fs::read_to_string(&log_path);
+                            let diagnostic = format!(
+                                "Native fixture build log ({}):\n{log:?}",
+                                log_path.display()
+                            );
+                            let archives = result.context(diagnostic)?;
+                            assert_eq!(archives.len(), 1);
+                            let inspected = artifact_inspector::inspect_archive(&archives.archives[0].path())?.into_inspection();
+                            assert_eq!(inspected.package_name, "omg-coverage-fixture");
+                            assert!(inspected.install_hook.is_none());
+                            hashes.push(inspected.archive_sha256);
+                        }
+                        assert_eq!(
+                            hashes[0], hashes[1],
+                            "repeated admission preserves archive identity"
+                        );
+                        std::fs::write(
+                            checkout.join("PKGBUILD"),
+                            "pkgname=omg-coverage-fixture\npkgver=1\npkgrel=1\narch=('any')\npackage() { printf 'intentional-fixture-failure\\n' >&2; return 1; }\n",
+                        ).expect("write fixture file");
+                        let authorized = AuthorizedBuild {
+                            lifecycle_guard: client.acquire_build_lifecycle().await?,
+                            package: "omg-coverage-fixture".to_owned(),
+                            requested_outputs: outputs,
+                            reviewed_digest: ReviewedSource::capture(&checkout)?,
+                        };
+                        let error = client
+                            .install_authorized_package_outputs(authorized, None)
+                            .await
+                            .expect_err("a failed recipe must not reuse previously accepted archives");
+                        let diagnostic = format!("{error:#}");
+                        let error_kind = error.downcast_ref::<AurError>();
+                        let build_failed = matches!(error_kind, Some(AurError::BuildFailed { .. }));
+                        assert!(build_failed, "{diagnostic}");
+                        let log = std::fs::read_to_string(client.build_log_path("omg-coverage-fixture"))?;
+                        assert!(log.contains("intentional-fixture-failure"), "{log}");
+
+                        let success = "omg-coverage-wave-fixture";
+                        let failure = "omg-coverage-fixture";
+                        let success_checkout = client.build_dir.join(success);
+                        std::fs::create_dir_all(&success_checkout)?;
+                        std::fs::write(
+                            success_checkout.join("PKGBUILD"),
+                            "pkgname=omg-coverage-wave-fixture\npkgver=1\npkgrel=1\npkgdesc='Inert OMG parallel wave fixture'\narch=('any')\nlicense=('MIT')\npackage() { install -Dm644 /dev/null \"$pkgdir/usr/share/omg-coverage-wave-fixture/empty\"; printf 'wave-success-complete\\n' >&2; }\n",
+                        )
+                        .expect("write the successful parallel-wave fixture recipe");
+                        std::fs::write(
+                            success_checkout.join(".SRCINFO"),
+                            "pkgbase = omg-coverage-wave-fixture\n\tpkgdesc = Inert OMG parallel wave fixture\n\tpkgver = 1\n\tpkgrel = 1\n\tarch = any\n\tlicense = MIT\n\npkgname = omg-coverage-wave-fixture\n",
+                        )
+                        .expect("write the successful parallel-wave fixture metadata");
+                        let client = Arc::new(client);
+                        let builder = ParallelBuilder::new(Arc::clone(&client), 2);
+                        let empty = builder
+                            .build_level(1, 1, &[], &HashMap::new(), &mut HashMap::new())
+                            .await?;
+                        assert_eq!(empty.succeeded_output_count(), 0);
+                        assert_eq!(empty.failed_output_count(), 0);
+                        assert_eq!(empty.skipped_output_count(), 0);
+                        assert!(empty.failures().next().is_none());
+                        assert!(empty.skipped_outputs().is_empty());
+
+                        let packages = vec![failure.to_owned(), success.to_owned()];
+                        let mut jobs = HashMap::new();
+                        let mut authorizations = HashMap::new();
+                        let success_source = ReviewedSource::capture(&success_checkout)?.digest;
+                        for package in &packages {
+                            let checkout = client.build_dir.join(package);
+                            let outputs = vec![package.clone()];
                             let source = ReviewedSource::capture(&checkout)?;
                             let dependencies = check_dependencies_from_metadata(source.required_srcinfo("fixture")?.as_ref(), &outputs)?;
                             anyhow::ensure!(
                                 dependencies.missing.is_empty() && dependencies.package_outputs == outputs,
-                                "fixture must never require dependency installation"
+                                "parallel fixture must never require dependency installation"
                             );
-                            let mut settings = Settings::default();
-                            settings.aur.security_profile = crate::config::AurSecurityProfile::Hardened;
-                            let client = AurClient {
-                                build_dir,
-                                settings,
-                                package_base_locks: Arc::new(dashmap::DashMap::new()),
-                            };
-                            let mut hashes = Vec::new();
-                            for _ in 0..2 {
-                                let authorized = AuthorizedBuild {
+                            jobs.insert(package.clone(), BuildJob::new(package.clone(), Vec::new()));
+                            authorizations.insert(
+                                package.clone(),
+                                AuthorizedBuild {
                                     lifecycle_guard: client.acquire_build_lifecycle().await?,
-                                    package: "omg-coverage-fixture".to_owned(),
-                                    requested_outputs: outputs.clone(),
+                                    package: package.clone(),
+                                    requested_outputs: outputs,
                                     reviewed_digest: ReviewedSource::capture(&checkout)?,
-                                };
-                                let result = client
-                                    .install_authorized_package_outputs(authorized, None)
-                                    .await;
-                                let log_path = client.build_log_path("omg-coverage-fixture");
-                                let log = std::fs::read_to_string(&log_path);
-                                let diagnostic = format!(
-                                    "Native fixture build log ({}):\n{log:?}",
-                                    log_path.display()
-                                );
-                                let archives = result.context(diagnostic)?;
-                                assert_eq!(archives.len(), 1);
-                                let inspected = artifact_inspector::inspect_archive(&archives.archives[0].path())?.into_inspection();
-                                assert_eq!(inspected.package_name, "omg-coverage-fixture");
-                                assert!(inspected.install_hook.is_none());
-                                hashes.push(inspected.archive_sha256);
-                            }
-                            assert_eq!(
-                                hashes[0], hashes[1],
-                                "repeated admission preserves archive identity"
+                                },
                             );
-                            std::fs::write(
-                                checkout.join("PKGBUILD"),
-                                "pkgname=omg-coverage-fixture\npkgver=1\npkgrel=1\narch=('any')\npackage() { printf 'intentional-fixture-failure\\n' >&2; return 1; }\n",
-                            ).expect("write fixture file");
-                            let authorized = AuthorizedBuild {
-                                lifecycle_guard: client.acquire_build_lifecycle().await?,
-                                package: "omg-coverage-fixture".to_owned(),
-                                requested_outputs: outputs,
-                                reviewed_digest: ReviewedSource::capture(&checkout)?,
-                            };
-                            let error = client
-                                .install_authorized_package_outputs(authorized, None)
-                                .await
-                                .expect_err("a failed recipe must not reuse previously accepted archives");
-                            let diagnostic = format!("{error:#}");
-                            let error_kind = error.downcast_ref::<AurError>();
-                            let build_failed = matches!(error_kind, Some(AurError::BuildFailed { .. }));
-                            assert!(build_failed, "{diagnostic}");
-                            let log = std::fs::read_to_string(client.build_log_path("omg-coverage-fixture"))?;
-                            assert!(log.contains("intentional-fixture-failure"), "{log}");
-
-                            let success = "omg-coverage-wave-fixture";
-                            let failure = "omg-coverage-fixture";
-                            let success_checkout = client.build_dir.join(success);
-                            std::fs::create_dir_all(&success_checkout)?;
-                            std::fs::write(
-                                success_checkout.join("PKGBUILD"),
-                                "pkgname=omg-coverage-wave-fixture\npkgver=1\npkgrel=1\npkgdesc='Inert OMG parallel wave fixture'\narch=('any')\nlicense=('MIT')\npackage() { install -Dm644 /dev/null \"$pkgdir/usr/share/omg-coverage-wave-fixture/empty\"; printf 'wave-success-complete\\n' >&2; }\n",
-                            )
-                            .expect("write the successful parallel-wave fixture recipe");
-                            std::fs::write(
-                                success_checkout.join(".SRCINFO"),
-                                "pkgbase = omg-coverage-wave-fixture\n\tpkgdesc = Inert OMG parallel wave fixture\n\tpkgver = 1\n\tpkgrel = 1\n\tarch = any\n\tlicense = MIT\n\npkgname = omg-coverage-wave-fixture\n",
-                            )
-                            .expect("write the successful parallel-wave fixture metadata");
-                            let client = Arc::new(client);
-                            let builder = ParallelBuilder::new(Arc::clone(&client), 2);
-                            let empty = builder
-                                .build_level(1, 1, &[], &HashMap::new(), &mut HashMap::new())
-                                .await?;
-                            assert_eq!(empty.succeeded_output_count(), 0);
-                            assert_eq!(empty.failed_output_count(), 0);
-                            assert_eq!(empty.skipped_output_count(), 0);
-                            assert!(empty.failures().next().is_none());
-                            assert!(empty.skipped_outputs().is_empty());
-
-                            let packages = vec![failure.to_owned(), success.to_owned()];
-                            let mut jobs = HashMap::new();
-                            let mut authorizations = HashMap::new();
-                            let success_source = ReviewedSource::capture(&success_checkout)?.digest;
-                            for package in &packages {
-                                let checkout = client.build_dir.join(package);
-                                let outputs = vec![package.clone()];
-                                let source = ReviewedSource::capture(&checkout)?;
-                                let dependencies = check_dependencies_from_metadata(source.required_srcinfo("fixture")?.as_ref(), &outputs)?;
-                                anyhow::ensure!(
-                                    dependencies.missing.is_empty() && dependencies.package_outputs == outputs,
-                                    "parallel fixture must never require dependency installation"
-                                );
-                                jobs.insert(package.clone(), BuildJob::new(package.clone(), Vec::new()));
-                                authorizations.insert(
-                                    package.clone(),
-                                    AuthorizedBuild {
-                                        lifecycle_guard: client.acquire_build_lifecycle().await?,
-                                        package: package.clone(),
-                                        requested_outputs: outputs,
-                                        reviewed_digest: ReviewedSource::capture(&checkout)?,
-                                    },
-                                );
-                            }
-                            std::fs::remove_file(client.build_log_path(failure))?;
-                            let audit_path = paths::data_dir().join("audit/audit.jsonl");
-                            let before = std::fs::read_to_string(&audit_path)?;
-                            let error = builder
-                                .build_level(1, 1, &packages, &jobs, &mut authorizations)
-                                .await
-                                .expect_err("a collected native archive must reach inert installation refusal");
-                            assert!(authorizations.is_empty(), "both native jobs must be consumed");
-                            assert!(
-                                error.chain().any(|cause| {
-                                    cause.to_string().lines().next()
-                                        == Some("Privilege elevation not supported in development mode.")
-                                }),
-                                "{error:#}"
-                            );
-                            let success_log = std::fs::read_to_string(client.build_log_path(success))?;
-                            assert!(success_log.contains("wave-success-complete"), "{success_log}");
-                            let failure_log = std::fs::read_to_string(client.build_log_path(failure))?;
-                            assert!(
-                                failure_log.contains("intentional-fixture-failure"),
-                                "{failure_log}"
-                            );
-                            let after = std::fs::read_to_string(audit_path)?;
-                            let entries = after
-                                .strip_prefix(&before)
-                                .context("native fixture audit must retain the pre-wave prefix")?
-                                .lines()
-                                .map(serde_json::from_str::<crate::core::security::audit::AuditEntry>)
-                                .collect::<std::result::Result<Vec<_>, _>>()?;
-                            assert_eq!(
-                                entries.iter().filter(|entry| {
-                                    entry.description.starts_with("Package operation aur_inspection: succeeded;")
-                                        && entry.resource.contains(&format!("source_manifest_sha256={success_source}"))
-                                        && entry.resource.contains(&format!("{success} 1-1 archive_sha256="))
-                                }).count(),
-                                2,
-                                "both native archives must be inspected for the new wave source: {entries:?}"
-                            );
-                            assert!(
-                                entries.iter().any(|entry| {
-                                    entry.description.starts_with("Package operation aur_paired_build: succeeded;")
-                                        && entry.resource.contains(&format!("source_manifest_sha256={success_source}"))
-                                        && entry.resource.contains(&format!("outputs={success}"))
-                                        && entry.resource.contains("result=exact-match")
-                                }),
-                                "successful wave fixture must complete independent exact-match verification: {entries:?}"
-                            );
-                            Ok(())
-                        })
+                        }
+                        std::fs::remove_file(client.build_log_path(failure))?;
+                        let audit_path = paths::data_dir().join("audit/audit.jsonl");
+                        let before = std::fs::read_to_string(&audit_path)?;
+                        let error = builder
+                            .build_level(1, 1, &packages, &jobs, &mut authorizations)
+                            .await
+                            .expect_err("a collected native archive must reach inert installation refusal");
+                        assert!(authorizations.is_empty(), "both native jobs must be consumed");
+                        assert!(
+                            error.chain().any(|cause| {
+                                cause.to_string().lines().next()
+                                    == Some("Privilege elevation not supported in development mode.")
+                            }),
+                            "{error:#}"
+                        );
+                        let success_log = std::fs::read_to_string(client.build_log_path(success))?;
+                        assert!(success_log.contains("wave-success-complete"), "{success_log}");
+                        let failure_log = std::fs::read_to_string(client.build_log_path(failure))?;
+                        assert!(
+                            failure_log.contains("intentional-fixture-failure"),
+                            "{failure_log}"
+                        );
+                        let after = std::fs::read_to_string(audit_path)?;
+                        let entries = after
+                            .strip_prefix(&before)
+                            .context("native fixture audit must retain the pre-wave prefix")?
+                            .lines()
+                            .map(serde_json::from_str::<crate::core::security::audit::AuditEntry>)
+                            .collect::<std::result::Result<Vec<_>, _>>()?;
+                        assert_eq!(
+                            entries.iter().filter(|entry| {
+                                entry.description.starts_with("Package operation aur_inspection: succeeded;")
+                                    && entry.resource.contains(&format!("source_manifest_sha256={success_source}"))
+                                    && entry.resource.contains(&format!("{success} 1-1 archive_sha256="))
+                            }).count(),
+                            2,
+                            "both native archives must be inspected for the new wave source: {entries:?}"
+                        );
+                        assert!(
+                            entries.iter().any(|entry| {
+                                entry.description.starts_with("Package operation aur_paired_build: succeeded;")
+                                    && entry.resource.contains(&format!("source_manifest_sha256={success_source}"))
+                                    && entry.resource.contains(&format!("outputs={success}"))
+                                    && entry.resource.contains("result=exact-match")
+                            }),
+                            "successful wave fixture must complete independent exact-match verification: {entries:?}"
+                        );
+                        Ok(())
+                    })
             },
         )
     }
@@ -10222,13 +10243,13 @@ mod tests {
             "history fixture requires the unprivileged isolated container"
         );
         let output = std::process::Command::new(std::env::current_exe()?)
-                .args([
-                    "--exact",
-                    "package_managers::aur::client::tests::attended_review_requires_hardened_confirmation_even_with_yes",
-                    "--nocapture",
-                ])
-                .env("OMG_AUR_HISTORY_FIXTURE", "1")
-                .output()?;
+            .args([
+                "--exact",
+                "package_managers::aur::client::tests::attended_review_requires_hardened_confirmation_even_with_yes",
+                "--nocapture",
+            ])
+            .env("OMG_AUR_HISTORY_FIXTURE", "1")
+            .output()?;
         let diagnostic = format!(
             "history fixture failed:\n{}\n{}",
             String::from_utf8_lossy(&output.stdout),
@@ -10365,146 +10386,146 @@ mod tests {
         // The child owns its terminal and global --yes flag. Input is sent only
         // after the prompt appears, so an unexpected skipped prompt fails.
         let driver = r#"
-    import errno, os, pty, select, shutil, signal, subprocess, sys, tempfile, time
-    mode, executable, test_name = sys.argv[1:]
-    os.environ['OMG_AUR_REVIEW_PTY_MODE'] = mode
-    fixture = tempfile.mkdtemp(prefix='omg-review-pty-')
-    with open(os.path.join(fixture, 'git'), 'w') as script:
-        script.write('''#!/bin/sh
-    set -eu
-    sha=0123456789abcdef0123456789abcdef01234567
-    if [ "$1" = clone ] && [ "$#" -eq 5 ] && [ "$2" = --filter=blob:none ] && [ "$3" = -- ] && [ "$4" = https://aur.archlinux.org/demo.git ]; then
-        case "$5" in */_rollback/demo-*) exit 0;; *) exit 1;; esac
+import errno, os, pty, select, shutil, signal, subprocess, sys, tempfile, time
+mode, executable, test_name = sys.argv[1:]
+os.environ['OMG_AUR_REVIEW_PTY_MODE'] = mode
+fixture = tempfile.mkdtemp(prefix='omg-review-pty-')
+with open(os.path.join(fixture, 'git'), 'w') as script:
+    script.write('''#!/bin/sh
+set -eu
+sha=0123456789abcdef0123456789abcdef01234567
+if [ "$1" = clone ] && [ "$#" -eq 5 ] && [ "$2" = --filter=blob:none ] && [ "$3" = -- ] && [ "$4" = https://aur.archlinux.org/demo.git ]; then
+    case "$5" in */_rollback/demo-*) exit 0;; *) exit 1;; esac
+fi
+if [ "$#" -ge 4 ] && [ "$1" = -C ]; then
+    case "$2" in */_rollback/demo-*) ;; *) exit 1;; esac
+    if [ "$#" -eq 6 ] && [ "$3" = log ] && [ "$4" = --no-show-signature ] && [ "$5" = --format=%H ] && [ "$6" = --max-count=10001 ]; then
+        printf '%s\\n' "$sha"
+        exit 0
     fi
-    if [ "$#" -ge 4 ] && [ "$1" = -C ]; then
-        case "$2" in */_rollback/demo-*) ;; *) exit 1;; esac
-        if [ "$#" -eq 6 ] && [ "$3" = log ] && [ "$4" = --no-show-signature ] && [ "$5" = --format=%H ] && [ "$6" = --max-count=10001 ]; then
-            printf '%s\\n' "$sha"
-            exit 0
-        fi
-        if [ "$#" -eq 4 ] && [ "$3" = show ] && [ "$4" = "${sha}:.SRCINFO" ]; then
-            printf 'pkgbase = demo\\npkgver = 1\\npkgrel = 1\\narch = any\\npkgname = demo\\n'
-            exit 0
-        fi
-        if [ "$#" -eq 5 ] && [ "$3" = checkout ] && [ "$4" = --detach ] && [ "$5" = "$sha" ]; then
-            printf 'pkgname=demo\\npkgver=1\\npkgrel=1\\narch=(any)\\n' > "$2/PKGBUILD"
-            if [ "$OMG_AUR_REVIEW_PTY_MODE" = history-accept-rebuilt-archive ]; then
-                printf 'pkgdesc="Inert historical release fixture"\\nlicense=(MIT)\\npackage() { install -Dm644 /dev/null "$pkgdir/usr/share/demo/empty"; }\\n' >> "$2/PKGBUILD"
-            else
-                printf 'package() { printf "intentional-history-fixture-failure\\\\n" >&2; return 1; }\\n' >> "$2/PKGBUILD"
-            fi
-            printf 'pkgbase = demo\\npkgver = 1\\npkgrel = 1\\narch = any\\npkgname = demo\\n' > "$2/.SRCINFO"
-            exit 0
-        fi
-        exit 1
+    if [ "$#" -eq 4 ] && [ "$3" = show ] && [ "$4" = "${sha}:.SRCINFO" ]; then
+        printf 'pkgbase = demo\\npkgver = 1\\npkgrel = 1\\narch = any\\npkgname = demo\\n'
+        exit 0
     fi
-    [ "$#" -eq 6 ] && [ "$1" = clone ] && [ "$2" = --depth=1 ] && [ "$3" = --filter=blob:none ] && [ "$4" = -- ] && [ "$5" = https://aur.archlinux.org/demo.git ]
-    mkdir "$6"
-    printf 'pkgname=demo\\n' > "$6/PKGBUILD"
-    printf 'pkgbase = demo\\n' > "$6/.SRCINFO"
-    ''')
-    os.chmod(os.path.join(fixture, 'git'), 0o700)
-    if mode == 'git-contract':
-        try:
-            checkout = os.path.join(fixture, '_rollback', 'demo-contract')
-            os.makedirs(checkout)
-            git = os.path.join(fixture, 'git')
-            sha = '0123456789abcdef0123456789abcdef01234567'
-            bounded_log = ['log', '--no-show-signature', '--format=%H', '--max-count=10001']
-            commands = [
-                (bounded_log, True),
-                (['log', '--format=%H'], False),
-                (bounded_log[:-1], False),
-                (['log', '--format=%H', '--max-count=10001'], False),
-                (bounded_log[:-1] + ['--max-count=10002'], False),
-                (['show', sha + ':.SRCINFO'], True),
-                (['show', 'fixture-commit:.SRCINFO'], False),
-                (['checkout', '--detach', sha], True),
-                (['checkout', '--detach', 'fixture-commit'], False),
-            ]
-            for arguments, accepted in commands:
-                result = subprocess.run([git, '-C', checkout] + arguments,
-                                        capture_output=True, timeout=5)
-                if (result.returncode == 0) != accepted:
-                    raise RuntimeError('Git fixture contract mismatch for ' + repr(arguments) +
-                                       ': status=' + str(result.returncode) +
-                                       ' stderr=' + repr(result.stderr))
-                if arguments == bounded_log and result.stdout != (sha + '\n').encode():
-                    raise RuntimeError('Git fixture must emit one full commit ID: ' + repr(result.stdout))
-                if arguments == ['show', sha + ':.SRCINFO'] and b'pkgver = 1\n' not in result.stdout:
-                    raise RuntimeError('Git fixture must emit historical metadata: ' + repr(result.stdout))
-            with open(os.path.join(checkout, 'PKGBUILD')) as recipe:
-                if 'intentional-history-fixture-failure' not in recipe.read():
-                    raise RuntimeError('Git fixture must preserve the intentional build failure')
-            print('GIT_FIXTURE_CONTRACT_PASSED ' + str(len(commands)) + ' commands')
-        finally:
-            shutil.rmtree(fixture)
-        sys.exit(0)
-    pid, fd = pty.fork()
-    if pid == 0:
-        os.environ['PATH'] = fixture + ':/usr/bin:/bin'
-        if mode == 'history-accept-rebuilt-archive':
-            os.environ['CARGO_PRIMARY_PACKAGE'] = '1'
-            os.environ['OMG_DATA_DIR'] = fixture
-            os.environ['OMG_SOCKET_PATH'] = os.path.join(fixture, 'absent.sock')
-        os.execv(executable, [executable, '--exact', test_name, '--nocapture'])
-    approval = {
-        'hardened': (b'n\n', b'REVIEW_DECLINED'),
-        'history': (b'n\n', b'REVIEW_DECLINED'),
-        'history-accept-failing-build': (b'y\n', b'HISTORY_BUILD_FAILED'),
-        'history-accept-rebuilt-archive': (b'y\n', b'HISTORY_ARCHIVE_VERIFIED'),
-    }.get(mode)
-    output = bytearray()
-    sent = False
-    deadline = time.monotonic() + 45
-    status = None
+    if [ "$#" -eq 5 ] && [ "$3" = checkout ] && [ "$4" = --detach ] && [ "$5" = "$sha" ]; then
+        printf 'pkgname=demo\\npkgver=1\\npkgrel=1\\narch=(any)\\n' > "$2/PKGBUILD"
+        if [ "$OMG_AUR_REVIEW_PTY_MODE" = history-accept-rebuilt-archive ]; then
+            printf 'pkgdesc="Inert historical release fixture"\\nlicense=(MIT)\\npackage() { install -Dm644 /dev/null "$pkgdir/usr/share/demo/empty"; }\\n' >> "$2/PKGBUILD"
+        else
+            printf 'package() { printf "intentional-history-fixture-failure\\\\n" >&2; return 1; }\\n' >> "$2/PKGBUILD"
+        fi
+        printf 'pkgbase = demo\\npkgver = 1\\npkgrel = 1\\narch = any\\npkgname = demo\\n' > "$2/.SRCINFO"
+        exit 0
+    fi
+    exit 1
+fi
+[ "$#" -eq 6 ] && [ "$1" = clone ] && [ "$2" = --depth=1 ] && [ "$3" = --filter=blob:none ] && [ "$4" = -- ] && [ "$5" = https://aur.archlinux.org/demo.git ]
+mkdir "$6"
+printf 'pkgname=demo\\n' > "$6/PKGBUILD"
+printf 'pkgbase = demo\\n' > "$6/.SRCINFO"
+''')
+os.chmod(os.path.join(fixture, 'git'), 0o700)
+if mode == 'git-contract':
     try:
-        while time.monotonic() < deadline:
-            readable, _, _ = select.select([fd], [], [], 0.1)
-            if readable:
+        checkout = os.path.join(fixture, '_rollback', 'demo-contract')
+        os.makedirs(checkout)
+        git = os.path.join(fixture, 'git')
+        sha = '0123456789abcdef0123456789abcdef01234567'
+        bounded_log = ['log', '--no-show-signature', '--format=%H', '--max-count=10001']
+        commands = [
+            (bounded_log, True),
+            (['log', '--format=%H'], False),
+            (bounded_log[:-1], False),
+            (['log', '--format=%H', '--max-count=10001'], False),
+            (bounded_log[:-1] + ['--max-count=10002'], False),
+            (['show', sha + ':.SRCINFO'], True),
+            (['show', 'fixture-commit:.SRCINFO'], False),
+            (['checkout', '--detach', sha], True),
+            (['checkout', '--detach', 'fixture-commit'], False),
+        ]
+        for arguments, accepted in commands:
+            result = subprocess.run([git, '-C', checkout] + arguments,
+                                    capture_output=True, timeout=5)
+            if (result.returncode == 0) != accepted:
+                raise RuntimeError('Git fixture contract mismatch for ' + repr(arguments) +
+                                   ': status=' + str(result.returncode) +
+                                   ' stderr=' + repr(result.stderr))
+            if arguments == bounded_log and result.stdout != (sha + '\n').encode():
+                raise RuntimeError('Git fixture must emit one full commit ID: ' + repr(result.stdout))
+            if arguments == ['show', sha + ':.SRCINFO'] and b'pkgver = 1\n' not in result.stdout:
+                raise RuntimeError('Git fixture must emit historical metadata: ' + repr(result.stdout))
+        with open(os.path.join(checkout, 'PKGBUILD')) as recipe:
+            if 'intentional-history-fixture-failure' not in recipe.read():
+                raise RuntimeError('Git fixture must preserve the intentional build failure')
+        print('GIT_FIXTURE_CONTRACT_PASSED ' + str(len(commands)) + ' commands')
+    finally:
+        shutil.rmtree(fixture)
+    sys.exit(0)
+pid, fd = pty.fork()
+if pid == 0:
+    os.environ['PATH'] = fixture + ':/usr/bin:/bin'
+    if mode == 'history-accept-rebuilt-archive':
+        os.environ['CARGO_PRIMARY_PACKAGE'] = '1'
+        os.environ['OMG_DATA_DIR'] = fixture
+        os.environ['OMG_SOCKET_PATH'] = os.path.join(fixture, 'absent.sock')
+    os.execv(executable, [executable, '--exact', test_name, '--nocapture'])
+approval = {
+    'hardened': (b'n\n', b'REVIEW_DECLINED'),
+    'history': (b'n\n', b'REVIEW_DECLINED'),
+    'history-accept-failing-build': (b'y\n', b'HISTORY_BUILD_FAILED'),
+    'history-accept-rebuilt-archive': (b'y\n', b'HISTORY_ARCHIVE_VERIFIED'),
+}.get(mode)
+output = bytearray()
+sent = False
+deadline = time.monotonic() + 45
+status = None
+try:
+    while time.monotonic() < deadline:
+        readable, _, _ = select.select([fd], [], [], 0.1)
+        if readable:
+            try:
+                chunk = os.read(fd, 4096)
+            except OSError as error:
+                if error.errno != errno.EIO:
+                    raise
+                chunk = b''
+            output.extend(chunk)
+            if len(output) > 1024 * 1024:
+                raise RuntimeError('review output exceeded limit')
+            if approval and not sent and b'Build demo from this PKGBUILD?' in output:
+                os.write(fd, approval[0])
+                sent = True
+        done, child_status = os.waitpid(pid, os.WNOHANG)
+        if done:
+            status = child_status
+            while True:
                 try:
                     chunk = os.read(fd, 4096)
                 except OSError as error:
                     if error.errno != errno.EIO:
                         raise
-                    chunk = b''
+                    break
+                if not chunk:
+                    break
                 output.extend(chunk)
                 if len(output) > 1024 * 1024:
                     raise RuntimeError('review output exceeded limit')
-                if approval and not sent and b'Build demo from this PKGBUILD?' in output:
-                    os.write(fd, approval[0])
-                    sent = True
-            done, child_status = os.waitpid(pid, os.WNOHANG)
-            if done:
-                status = child_status
-                while True:
-                    try:
-                        chunk = os.read(fd, 4096)
-                    except OSError as error:
-                        if error.errno != errno.EIO:
-                            raise
-                        break
-                    if not chunk:
-                        break
-                    output.extend(chunk)
-                    if len(output) > 1024 * 1024:
-                        raise RuntimeError('review output exceeded limit')
-                break
-        else:
-            raise RuntimeError('review child timed out')
-        expected = approval[1] if approval else b'REVIEW_ACCEPTED'
-        if (os.waitstatus_to_exitcode(status) != 0 or expected not in output or
-                (approval and not sent) or
-                (expected != b'REVIEW_DECLINED' and b'REVIEW_DECLINED' in output)):
-            raise RuntimeError('review child failed or did not show the expected prompt')
-    finally:
-        if status is None:
-            os.kill(pid, signal.SIGKILL)
-            os.waitpid(pid, 0)
-        os.close(fd)
-        shutil.rmtree(fixture)
-        sys.stdout.buffer.write(output)
-    "#;
+            break
+    else:
+        raise RuntimeError('review child timed out')
+    expected = approval[1] if approval else b'REVIEW_ACCEPTED'
+    if (os.waitstatus_to_exitcode(status) != 0 or expected not in output or
+            (approval and not sent) or
+            (expected != b'REVIEW_DECLINED' and b'REVIEW_DECLINED' in output)):
+        raise RuntimeError('review child failed or did not show the expected prompt')
+finally:
+    if status is None:
+        os.kill(pid, signal.SIGKILL)
+        os.waitpid(pid, 0)
+    os.close(fd)
+    shutil.rmtree(fixture)
+    sys.stdout.buffer.write(output)
+"#;
         let mut modes = vec!["git-contract", "standard", "hardened", "authorize"];
         if std::env::var("OMG_AUR_HISTORY_FIXTURE").as_deref() == Ok("1") {
             modes.extend([
@@ -10515,10 +10536,10 @@ mod tests {
         }
         for mode in modes {
             let output = std::process::Command::new("python3")
-                    .args(["-c", driver, mode])
-                    .arg(std::env::current_exe()?)
-                    .arg("package_managers::aur::client::tests::attended_review_requires_hardened_confirmation_even_with_yes")
-                    .output()?;
+                .args(["-c", driver, mode])
+                .arg(std::env::current_exe()?)
+                .arg("package_managers::aur::client::tests::attended_review_requires_hardened_confirmation_even_with_yes")
+                .output()?;
             let diagnostic = format!(
                 "{mode} review fixture failed:\n{}\n{}",
                 String::from_utf8_lossy(&output.stdout),
@@ -10602,49 +10623,49 @@ mod tests {
         std::fs::write(&git_config_path, git_config)?;
 
         let terminal_driver = r"
-    import errno, os, pty, select, signal, sys, time
+import errno, os, pty, select, signal, sys, time
 
-    pid, fd = pty.fork()
-    if pid == 0:
-        os.execv(sys.argv[1], sys.argv[1:])
+pid, fd = pty.fork()
+if pid == 0:
+    os.execv(sys.argv[1], sys.argv[1:])
 
-    output = bytearray()
-    approved = False
-    reaped = False
-    deadline = time.monotonic() + 25
-    try:
-        while time.monotonic() < deadline:
-            if not select.select([fd], [], [], 0.1)[0]:
-                continue
-            try:
-                data = os.read(fd, 4096)
-            except OSError as error:
-                if error.errno != errno.EIO:
-                    raise
-                break
-            if not data:
-                break
-            output.extend(data)
-            if len(output) > 1024 * 1024:
-                raise RuntimeError('dynamic history fixture output exceeded limit')
-            if not approved and b'Build demo from this PKGBUILD?' in output:
-                os.write(fd, b'y\n')
-                approved = True
-        else:
-            raise RuntimeError('dynamic history review timed out')
-        _, status = os.waitpid(pid, 0)
-        reaped = True
-        if (os.waitstatus_to_exitcode(status) != 0 or not approved
-                or b'Installing demo 2-1' not in output
-                or b'HISTORY_DYNAMIC_VERSION_VERIFIED' not in output):
-            raise RuntimeError('dynamic history review did not reach the approved install boundary')
-    finally:
-        if not reaped:
-            os.kill(pid, signal.SIGKILL)
-            os.waitpid(pid, 0)
-        os.close(fd)
-        sys.stdout.buffer.write(output)
-    ";
+output = bytearray()
+approved = False
+reaped = False
+deadline = time.monotonic() + 25
+try:
+    while time.monotonic() < deadline:
+        if not select.select([fd], [], [], 0.1)[0]:
+            continue
+        try:
+            data = os.read(fd, 4096)
+        except OSError as error:
+            if error.errno != errno.EIO:
+                raise
+            break
+        if not data:
+            break
+        output.extend(data)
+        if len(output) > 1024 * 1024:
+            raise RuntimeError('dynamic history fixture output exceeded limit')
+        if not approved and b'Build demo from this PKGBUILD?' in output:
+            os.write(fd, b'y\n')
+            approved = True
+    else:
+        raise RuntimeError('dynamic history review timed out')
+    _, status = os.waitpid(pid, 0)
+    reaped = True
+    if (os.waitstatus_to_exitcode(status) != 0 or not approved
+            or b'Installing demo 2-1' not in output
+            or b'HISTORY_DYNAMIC_VERSION_VERIFIED' not in output):
+        raise RuntimeError('dynamic history review did not reach the approved install boundary')
+finally:
+    if not reaped:
+        os.kill(pid, signal.SIGKILL)
+        os.waitpid(pid, 0)
+    os.close(fd)
+    sys.stdout.buffer.write(output)
+";
         let output = std::process::Command::new("python3")
             .args(["-c", terminal_driver])
             .arg(std::env::current_exe()?)
@@ -10709,86 +10730,86 @@ mod tests {
         const TEST: &str = "package_managers::aur::client::tests::archive_admission_enforces_profile_and_binds_paired_cache_to_it";
         with_private_admission_fixture(TEST, |runtime, fixture| {
             runtime.block_on(async {
-                    let checkout = tempfile::tempdir_in(fixture)?;
-                    std::fs::write(checkout.path().join("PKGBUILD"), "pkgname=demo\n")
-                        .expect("write fixture file");
-                    std::fs::write(
-                        checkout.path().join(".SRCINFO"),
-                        "pkgbase = demo\npkgver = 1\npkgrel = 1\narch = any\ninstall = demo.install\npkgname = demo\n",
-                    )
+                let checkout = tempfile::tempdir_in(fixture)?;
+                std::fs::write(checkout.path().join("PKGBUILD"), "pkgname=demo\n")
                     .expect("write fixture file");
-                    let hook = "post_install() { :; }\n";
-                    std::fs::write(checkout.path().join("demo.install"), hook).expect("write fixture file");
-                    let source = ReviewedSource::capture(checkout.path())?;
-                    let archives = tempfile::Builder::new()
-                        .permissions(std::fs::Permissions::from_mode(0o700))
-                        .tempdir_in(fixture)?;
-                    let archive = archives.path().join("demo-1-1-any.pkg.tar.gz");
-                    let info = "pkgname = demo\npkgbase = demo\npkgver = 1-1\n";
-                    write_pkg_archive(&archive, info, Some(hook));
-                    let invocation = tempfile::tempdir_in(fixture)?;
-                    let env = MakepkgEnv {
-                        pkgdest: invocation.path().join("pkg"),
-                        srcdest: invocation.path().join("src"),
-                        builddir: invocation.path().join("build"),
-                        _invocation: invocation,
-                        makeflags: String::new(),
-                        compiler_cache_dirs: Vec::new(),
-                        extra_env: Vec::new(),
-                        pgp_home: None,
-                    };
-                    let mut client = AurClient {
-                        build_dir: checkout.path().to_path_buf(),
-                        settings: Settings::default(),
-                        package_base_locks: Arc::new(dashmap::DashMap::new()),
-                    };
-                    let inspection = artifact_inspector::inspect_archive(&archive)?.into_inspection();
-                    for old_version in [3, 4, 5] {
-                        let mut old_policy = inspection.clone();
-                        old_policy.policy_version = old_version;
-                        assert_ne!(
-                            client.paired_build_cache_key(&source, &env, std::slice::from_ref(&old_policy)),
-                            client.paired_build_cache_key(&source, &env, std::slice::from_ref(&inspection)),
-                            "a policy-{old_version} paired-build proof must not authorize the current archive policy"
-                        );
-                    }
-                    let standard_key =
-                        client.paired_build_cache_key(&source, &env, std::slice::from_ref(&inspection));
-                    client.settings.aur.security_profile = crate::config::AurSecurityProfile::Hardened;
-                    let hardened_key =
-                        client.paired_build_cache_key(&source, &env, std::slice::from_ref(&inspection));
+                std::fs::write(
+                    checkout.path().join(".SRCINFO"),
+                    "pkgbase = demo\npkgver = 1\npkgrel = 1\narch = any\ninstall = demo.install\npkgname = demo\n",
+                )
+                .expect("write fixture file");
+                let hook = "post_install() { :; }\n";
+                std::fs::write(checkout.path().join("demo.install"), hook).expect("write fixture file");
+                let source = ReviewedSource::capture(checkout.path())?;
+                let archives = tempfile::Builder::new()
+                    .permissions(std::fs::Permissions::from_mode(0o700))
+                    .tempdir_in(fixture)?;
+                let archive = archives.path().join("demo-1-1-any.pkg.tar.gz");
+                let info = "pkgname = demo\npkgbase = demo\npkgver = 1-1\n";
+                write_pkg_archive(&archive, info, Some(hook));
+                let invocation = tempfile::tempdir_in(fixture)?;
+                let env = MakepkgEnv {
+                    pkgdest: invocation.path().join("pkg"),
+                    srcdest: invocation.path().join("src"),
+                    builddir: invocation.path().join("build"),
+                    _invocation: invocation,
+                    makeflags: String::new(),
+                    compiler_cache_dirs: Vec::new(),
+                    extra_env: Vec::new(),
+                    pgp_home: None,
+                };
+                let mut client = AurClient {
+                    build_dir: checkout.path().to_path_buf(),
+                    settings: Settings::default(),
+                    package_base_locks: Arc::new(dashmap::DashMap::new()),
+                };
+                let inspection = artifact_inspector::inspect_archive(&archive)?.into_inspection();
+                for old_version in [3, 4, 5] {
+                    let mut old_policy = inspection.clone();
+                    old_policy.policy_version = old_version;
                     assert_ne!(
-                        standard_key, hardened_key,
-                        "a proof under one profile must not authorize another"
+                        client.paired_build_cache_key(&source, &env, std::slice::from_ref(&old_policy)),
+                        client.paired_build_cache_key(&source, &env, std::slice::from_ref(&inspection)),
+                        "a policy-{old_version} paired-build proof must not authorize the current archive policy"
                     );
-                    let error = client
-                        .authorize_with_paired_build(
-                            std::slice::from_ref(&archive),
-                            &source,
-                            "demo",
-                            &["demo".to_owned()],
-                            &["demo".to_owned()],
-                            true,
-                            checkout.path(),
-                            &env,
-                        )
-                        .await
-                        .expect_err("hardened admission must reject an install hook before rebuilding");
-                    assert!(
-                        error.to_string().contains("Hardened AUR profile rejects"),
-                        "{error:#}"
-                    );
-                    client.settings.aur.review_pkgbuild = false;
-                    let error = client
-                        .run_build(checkout.path(), &env, "demo", &source)
-                        .await
-                        .expect_err("an invalid hardened configuration must fail before running a build");
-                    assert!(
-                        error.to_string().contains("requires build_method"),
-                        "{error:#}"
-                    );
-                    Ok(())
-                })
+                }
+                let standard_key =
+                    client.paired_build_cache_key(&source, &env, std::slice::from_ref(&inspection));
+                client.settings.aur.security_profile = crate::config::AurSecurityProfile::Hardened;
+                let hardened_key =
+                    client.paired_build_cache_key(&source, &env, std::slice::from_ref(&inspection));
+                assert_ne!(
+                    standard_key, hardened_key,
+                    "a proof under one profile must not authorize another"
+                );
+                let error = client
+                    .authorize_with_paired_build(
+                        std::slice::from_ref(&archive),
+                        &source,
+                        "demo",
+                        &["demo".to_owned()],
+                        &["demo".to_owned()],
+                        true,
+                        checkout.path(),
+                        &env,
+                    )
+                    .await
+                    .expect_err("hardened admission must reject an install hook before rebuilding");
+                assert!(
+                    error.to_string().contains("Hardened AUR profile rejects"),
+                    "{error:#}"
+                );
+                client.settings.aur.review_pkgbuild = false;
+                let error = client
+                    .run_build(checkout.path(), &env, "demo", &source)
+                    .await
+                    .expect_err("an invalid hardened configuration must fail before running a build");
+                assert!(
+                    error.to_string().contains("requires build_method"),
+                    "{error:#}"
+                );
+                Ok(())
+            })
         })
     }
 
@@ -11068,15 +11089,15 @@ mod tests {
         .expect("write the fixture with an unavailable first-priority repository");
         std::fs::write(fixture.directory.path().join("PKGBUILD"), "pkgname=demo\n")?;
         fixture.with_environment(async {
-                S72Fixture::index(&["aur-helper"])?;
-                let client = fixture.client();
-                assert!(client.info("aur-helper").await?.is_some(), "same-named AUR candidate exists");
-                std::fs::write(fixture.directory.path().join(".SRCINFO"), "pkgbase = demo\npkgver = 1\npkgrel = 1\narch = any\npkgname = demo\ndepends = aur-helper\n")?;
-                let error = client.aur_dependency_plan(&ReviewedSource::capture(fixture.directory.path())?, "demo", &["demo".to_owned()]).await
-                    .expect_err("incomplete official classification must fail before accepting the AUR candidate");
-                assert!(format!("{error:#}").contains("missing"), "{error:#}");
-                Ok(())
-            })
+            S72Fixture::index(&["aur-helper"])?;
+            let client = fixture.client();
+            assert!(client.info("aur-helper").await?.is_some(), "same-named AUR candidate exists");
+            std::fs::write(fixture.directory.path().join(".SRCINFO"), "pkgbase = demo\npkgver = 1\npkgrel = 1\narch = any\npkgname = demo\ndepends = aur-helper\n")?;
+            let error = client.aur_dependency_plan(&ReviewedSource::capture(fixture.directory.path())?, "demo", &["demo".to_owned()]).await
+                .expect_err("incomplete official classification must fail before accepting the AUR candidate");
+            assert!(format!("{error:#}").contains("missing"), "{error:#}");
+            Ok(())
+        })
     }
 
     #[test]
@@ -11100,31 +11121,31 @@ mod tests {
         .expect("write the isolated repository usage order");
         std::fs::write(fixture.directory.path().join("PKGBUILD"), "pkgname=demo\n")?;
         fixture.with_environment(async {
-                let client = fixture.client();
-                for relations in [["helper>=1", "helper>=2"], ["helper>=2", "virtual-helper>=10"], ["virtual-helper>=1", "virtual-helper>=10"]] {
-                    std::fs::write(fixture.directory.path().join(".SRCINFO"), format!("pkgbase = demo\npkgver = 1\npkgrel = 1\narch = any\npkgname = demo\ndepends = {}\ndepends = {}\n", relations[0], relations[1]))?;
-                    let plan = client.aur_dependency_plan(&ReviewedSource::capture(fixture.directory.path())?, "demo", &["demo".to_owned()]).await?;
-                    assert!(plan.aur_dependencies.is_empty(), "official relations must not fall back to AUR");
-                    assert_eq!(plan.official_dependencies, vec![OfficialTarget {
-                        repository: "low".to_owned(),
-                        name: "helper".to_owned(),
-                        relations: relations.map(str::to_owned).to_vec(),
-                    }], "all constraints must select one coherent package for {relations:?}");
-                    InstallRequest::new(plan.official_dependencies.into_iter().map(|selected| InstallItem {
-                        target: InstallTarget::Resolved(selected),
-                        intent: InstallIntent::Automatic,
-                    }).collect())?;
-                }
-                S72Fixture::index(&["aur-helper"])?;
-                std::fs::write(fixture.directory.path().join(".SRCINFO"), "pkgbase = demo\npkgver = 1\npkgrel = 1\narch = any\npkgname = demo\ndepends = aur-helper\n")?;
+            let client = fixture.client();
+            for relations in [["helper>=1", "helper>=2"], ["helper>=2", "virtual-helper>=10"], ["virtual-helper>=1", "virtual-helper>=10"]] {
+                std::fs::write(fixture.directory.path().join(".SRCINFO"), format!("pkgbase = demo\npkgver = 1\npkgrel = 1\narch = any\npkgname = demo\ndepends = {}\ndepends = {}\n", relations[0], relations[1]))?;
                 let plan = client.aur_dependency_plan(&ReviewedSource::capture(fixture.directory.path())?, "demo", &["demo".to_owned()]).await?;
-                assert!(plan.official_dependencies.is_empty());
-                assert_eq!(plan.aur_dependencies, ["aur-helper"]);
-                std::fs::write(fixture.directory.path().join(".SRCINFO"), "pkgbase = demo\npkgver = 1\npkgrel = 1\narch = any\npkgname = demo\ndepends = helper<2\ndepends = helper>=2\n")?;
-                client.aur_dependency_plan(&ReviewedSource::capture(fixture.directory.path())?, "demo", &["demo".to_owned()]).await
-                    .expect_err("contradictory constraints must fail closed before installation");
-                Ok(())
-            })
+                assert!(plan.aur_dependencies.is_empty(), "official relations must not fall back to AUR");
+                assert_eq!(plan.official_dependencies, vec![OfficialTarget {
+                    repository: "low".to_owned(),
+                    name: "helper".to_owned(),
+                    relations: relations.map(str::to_owned).to_vec(),
+                }], "all constraints must select one coherent package for {relations:?}");
+                InstallRequest::new(plan.official_dependencies.into_iter().map(|selected| InstallItem {
+                    target: InstallTarget::Resolved(selected),
+                    intent: InstallIntent::Automatic,
+                }).collect())?;
+            }
+            S72Fixture::index(&["aur-helper"])?;
+            std::fs::write(fixture.directory.path().join(".SRCINFO"), "pkgbase = demo\npkgver = 1\npkgrel = 1\narch = any\npkgname = demo\ndepends = aur-helper\n")?;
+            let plan = client.aur_dependency_plan(&ReviewedSource::capture(fixture.directory.path())?, "demo", &["demo".to_owned()]).await?;
+            assert!(plan.official_dependencies.is_empty());
+            assert_eq!(plan.aur_dependencies, ["aur-helper"]);
+            std::fs::write(fixture.directory.path().join(".SRCINFO"), "pkgbase = demo\npkgver = 1\npkgrel = 1\narch = any\npkgname = demo\ndepends = helper<2\ndepends = helper>=2\n")?;
+            client.aur_dependency_plan(&ReviewedSource::capture(fixture.directory.path())?, "demo", &["demo".to_owned()]).await
+                .expect_err("contradictory constraints must fail closed before installation");
+            Ok(())
+        })
     }
 
     #[test]
@@ -11306,13 +11327,13 @@ mod tests {
         );
         let configuration = directory.path().join("pacman.conf");
         std::fs::write(
-                &configuration,
-                format!(
-                    "[options]\nArchitecture = auto\nSigLevel = Never\n[omg-fixture]\nSigLevel = Never\nServer = file://{}\n",
-                    cache.display()
-                ),
-            )
-            .expect("write the isolated official-dependency configuration");
+            &configuration,
+            format!(
+                "[options]\nArchitecture = auto\nSigLevel = Never\n[omg-fixture]\nSigLevel = Never\nServer = file://{}\n",
+                cache.display()
+            ),
+        )
+        .expect("write the isolated official-dependency configuration");
         nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWNS)?;
         assert!(
             std::process::Command::new("mount")
@@ -11431,7 +11452,7 @@ mod tests {
         let archive = directory.path().join("demo-1-1-any.pkg.tar.gz");
         write_pkg_archive(
             &archive,
-            "pkgname = demo\npkgbase = demo\npkgver = 1-1\n",
+            "pkgname = demo\npkgbase = demo\npkgver = 1-1\narch = any\n",
             Some("post_install() { :; }\n"),
         );
         let snapshot = ArchiveSnapshot::capture(&archive)?;
@@ -11655,11 +11676,9 @@ mod update_error_tests {
 
     #[tokio::test]
     async fn failed_update_http_status_does_not_invent_network_guidance() -> Result<()> {
-        let error = update_error_from_reply(
-            Some(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"),
-            3,
-        )
-        .await?;
+        let error = update_error_from_reply(Some(
+            b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        ), 3).await?;
         assert!(update_source_unavailable(&error));
         assert!(format!("{error:#}").contains("HTTP 503"), "{error:#}");
         assert_eq!(crate::core::error::suggest_for_anyhow(&error), None);

@@ -239,42 +239,50 @@ async fn sync_aur_metadata_at(
     }
 
     let root = location.path();
-    let ttl = Duration::from_secs(settings.aur.metadata_cache_ttl_secs);
-    let root_for_probe = root.clone();
-    let (publication_lock, current, already_fresh) = tokio::task::spawn_blocking(move || {
-        let lock = lock_metadata(&location, MetadataAccess::Exclusive)?;
-        let current = current_generation(&root_for_probe).unwrap_or_else(|error| {
-            tracing::warn!("Ignoring incomplete AUR metadata generation: {error}");
-            None
-        });
-        if !force && current.is_some() {
-            let fresh = std::fs::metadata(root_for_probe.join("manifest.json"))
-                .and_then(|metadata| metadata.modified())
-                .is_ok_and(|modified| modified_within_ttl(modified, ttl));
-            if fresh {
-                return Ok::<_, anyhow::Error>((lock, current, true));
-            }
+    let publication_lock =
+        tokio::task::spawn_blocking(move || lock_metadata(&location, MetadataAccess::Exclusive))
+            .await??;
+    let current = current_generation(&root).unwrap_or_else(|error| {
+        tracing::warn!("Ignoring incomplete AUR metadata generation: {error}");
+        None
+    });
+    if !force && current.is_some() {
+        let fresh = std::fs::metadata(root.join("manifest.json"))
+            .and_then(|metadata| metadata.modified())
+            .is_ok_and(|modified| {
+                modified_within_ttl(
+                    modified,
+                    Duration::from_secs(settings.aur.metadata_cache_ttl_secs),
+                )
+            });
+        if fresh {
+            return Ok(());
         }
-        if current.is_none() && !force {
-            let legacy = root_for_probe.join("packages-meta-ext-v1.json.gz");
-            let fresh = std::fs::metadata(&legacy)
-                .and_then(|m| m.modified())
-                .is_ok_and(|modified| modified_within_ttl(modified, ttl));
-            if fresh {
+    }
+    if current.is_none() && !force {
+        let legacy = root.join("packages-meta-ext-v1.json.gz");
+        let fresh = std::fs::metadata(&legacy)
+            .and_then(|m| m.modified())
+            .is_ok_and(|modified| {
+                modified_within_ttl(
+                    modified,
+                    Duration::from_secs(settings.aur.metadata_cache_ttl_secs),
+                )
+            });
+        if fresh {
+            let root = root.clone();
+            tokio::task::spawn_blocking(move || {
+                let _publication_lock = publication_lock;
                 anyhow::ensure!(
                     std::fs::metadata(&legacy)?.len() <= MAX_AUR_METADATA_BYTES,
                     "legacy AUR metadata exceeds size limit"
                 );
                 let bytes = std::fs::read(legacy)?;
-                publish_generation(&root_for_probe, &bytes, AurMetaCache::default())?;
-                return Ok((lock, current, true));
-            }
+                publish_generation(&root, &bytes, AurMetaCache::default())
+            })
+            .await??;
+            return Ok(());
         }
-        Ok((lock, current, false))
-    })
-    .await??;
-    if already_fresh {
-        return Ok(());
     }
     let validators = current.as_ref().map(|(manifest, _)| &manifest.validators);
     let empty = AurMetaCache::default();
@@ -402,33 +410,11 @@ fn publish_generation(root: &Path, bytes: &[u8], validators: AurMetaCache) -> Re
     let _persisted = generation.keep();
     File::open(root)?.sync_all()?;
     let manifest = Manifest {
-        generation: name.clone(),
+        generation: name,
         validators,
     };
     commit_manifest(root, &manifest).context("Failed to publish AUR metadata generation")?;
-    prune_old_generations(root, &name);
     Ok(())
-}
-
-fn prune_old_generations(root: &Path, active: &str) {
-    let Ok(entries) = std::fs::read_dir(root) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let file_name = entry.file_name();
-        let Some(name) = file_name.to_str() else {
-            continue;
-        };
-        if !name.starts_with("gen-") || name == active {
-            continue;
-        }
-        if let Err(error) = std::fs::remove_dir_all(entry.path()) {
-            tracing::debug!(
-                "Failed to prune superseded AUR metadata generation {}: {error}",
-                entry.path().display()
-            );
-        }
-    }
 }
 
 #[cfg(test)]
@@ -443,8 +429,26 @@ pub(crate) fn publish_test_metadata(archive: &Path) -> Result<()> {
 }
 
 fn persist_file_atomically(dest: &Path, data: &[u8]) -> Result<()> {
-    crate::core::safe_ops::atomic_write_file_sync(dest, data)
-        .with_context(|| format!("Failed to persist AUR metadata at {}", dest.display()))
+    let parent = dest.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent).with_context(|| {
+        format!(
+            "Failed to create AUR metadata directory: {}",
+            parent.display()
+        )
+    })?;
+    let mut file = tempfile::NamedTempFile::new_in(parent).with_context(|| {
+        format!(
+            "Failed to create temporary AUR metadata in {}",
+            parent.display()
+        )
+    })?;
+    file.write_all(data)?;
+    file.as_file_mut().sync_all()?;
+    file.persist(dest)
+        .map_err(|error| error.error)
+        .with_context(|| format!("Failed to persist AUR metadata at {}", dest.display()))?;
+    crate::core::safe_ops::sync_parent_directory_sync(dest)?;
+    Ok(())
 }
 
 #[cfg(test)]

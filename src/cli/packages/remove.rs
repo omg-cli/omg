@@ -158,17 +158,28 @@ async fn remove_packages(packages: &[String], recursive: bool) -> Result<()> {
     }
 }
 
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "backend feature dispatch may select fallible implementations"
+)]
+#[cfg_attr(
+    feature = "arch",
+    allow(
+        clippy::unused_async,
+        reason = "the Arch backend previews synchronously"
+    )
+)]
 async fn remove_dry_run(
     packages: &[String],
     #[cfg(feature = "arch")] recursive: bool,
 ) -> Result<()> {
     #[cfg(feature = "arch")]
     if super::mock_arch_backend()? {
-        return arch::remove_dry_run(packages, recursive).await;
+        return arch::remove_dry_run(packages, recursive);
     }
     dispatch_backend! {
         debian: { debian::remove_dry_run(packages).await },
-        arch: { arch::remove_dry_run(packages, recursive).await },
+        arch: { arch::remove_dry_run(packages, recursive) },
         generic: { generic::remove_dry_run(packages).await },
     }
 }

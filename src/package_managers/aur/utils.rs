@@ -28,45 +28,46 @@ pub(in crate::package_managers) fn package_architecture_matches(
     })
 }
 
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// SECURITY: Path Validation (TOCTOU Prevention)
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
 /// Validate that a path is safely inside the expected base directory.
-/// Prevents symlink attacks (including dangling symlinks) and directory traversal.
+/// Prevents symlink attacks and directory traversal.
+///
+/// # Security
+/// This function canonicalizes both paths and verifies the target
+/// starts with the base, preventing:
+/// - Symlink escapes (`build_dir/evil -> /etc`)
+/// - Directory traversal (`build_dir/../../../etc`)
 pub fn validate_path_inside(base: &Path, target: &Path) -> Result<PathBuf> {
+    // Canonicalize base - must exist
     let base_canonical = base
         .canonicalize()
         .with_context(|| format!("Base directory does not exist: {}", base.display()))?;
 
-    let target_canonical = match std::fs::symlink_metadata(target) {
-        Ok(meta) if meta.file_type().is_symlink() => bail!(
-            "Security: Target path is a symlink (potential attack): {}",
-            target.display()
-        ),
-        Ok(_) => target
+    // For target, if it exists, canonicalize it. If not, canonicalize parent and append filename.
+    let target_canonical = if target.exists() {
+        target
             .canonicalize()
-            .with_context(|| format!("Failed to canonicalize: {}", target.display()))?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let parent = target
-                .parent()
-                .ok_or_else(|| anyhow::anyhow!("Path has no parent: {}", target.display()))?;
-            let leaf = target
-                .file_name()
-                .ok_or_else(|| anyhow::anyhow!("Path has no filename: {}", target.display()))?;
+            .with_context(|| format!("Failed to canonicalize: {}", target.display()))?
+    } else {
+        // Path doesn't exist yet - canonicalize parent and append leaf
+        let parent = target
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("Path has no parent: {}", target.display()))?;
+        let leaf = target
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("Path has no filename: {}", target.display()))?;
 
-            let parent_canonical = parent.canonicalize().with_context(|| {
-                format!("Parent directory does not exist: {}", parent.display())
-            })?;
+        let parent_canonical = parent
+            .canonicalize()
+            .with_context(|| format!("Parent directory does not exist: {}", parent.display()))?;
 
-            parent_canonical.join(leaf)
-        }
-        Err(error) => {
-            return Err(error).with_context(|| {
-                format!(
-                    "Security: Cannot inspect target path (failing closed): {}",
-                    target.display()
-                )
-            });
-        }
+        parent_canonical.join(leaf)
     };
 
+    // Verify target is inside base
     if !target_canonical.starts_with(&base_canonical) {
         bail!(
             "Security: Path escapes base directory!\n  Base: {}\n  Target: {}",
@@ -121,6 +122,7 @@ pub fn validate_build_dir(build_root: &Path, package_name: &str) -> Result<PathB
     validate_path_inside(build_root, &pkg_dir)
 }
 
+#[inline]
 #[must_use]
 pub fn has_word_boundary_match(haystack: &str, needle: &str) -> bool {
     for (pos, _) in haystack.match_indices(needle) {

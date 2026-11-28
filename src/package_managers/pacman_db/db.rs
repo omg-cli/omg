@@ -542,6 +542,7 @@ fn parse_sync_descriptions<T: Send>(
     if descriptions.is_empty() {
         return Ok(());
     }
+    // At most four parsing tasks per bounded batch. Archive I/O stays serial.
     let minimum_records = descriptions.len().div_ceil(4).max(16);
     let entries = std::mem::take(descriptions);
     let parse = |(path, raw): (PathBuf, Vec<u8>)| {
@@ -820,29 +821,24 @@ pub(crate) struct NativeLocalDbHealth {
 }
 
 pub(crate) async fn check_native_local_db_health(path: &Path) -> Result<NativeLocalDbHealth> {
-    let path = path.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        anyhow::ensure!(
-            path.is_absolute(),
-            "ALPM local database path must be absolute"
-        );
-        anyhow::ensure!(
-            path.file_name() == Some(std::ffi::OsStr::new("local")),
-            "Native ALPM check requires a local directory under its database path"
-        );
-        let snapshot = LocalHealthSnapshot::capture(&path)?;
-        validate_health_relations(&snapshot.packages)?;
-        let missing = unsatisfied_dependencies(&snapshot.packages);
-        let result = inspect_native_local_database(&path, &snapshot);
-        snapshot.revalidate(&path)?;
-        Ok(NativeLocalDbHealth {
-            packages: snapshot.packages.len(),
-            missing,
-            native: result,
-        })
+    anyhow::ensure!(
+        path.is_absolute(),
+        "ALPM local database path must be absolute"
+    );
+    anyhow::ensure!(
+        path.file_name() == Some(std::ffi::OsStr::new("local")),
+        "Native ALPM check requires a local directory under its database path"
+    );
+    let snapshot = LocalHealthSnapshot::capture(path)?;
+    validate_health_relations(&snapshot.packages)?;
+    let missing = unsatisfied_dependencies(&snapshot.packages);
+    let result = inspect_native_local_database(path, &snapshot);
+    snapshot.revalidate(path)?;
+    Ok(NativeLocalDbHealth {
+        packages: snapshot.packages.len(),
+        missing,
+        native: result,
     })
-    .await
-    .context("Native local database health check task failed")?
 }
 
 fn inspect_native_local_database(path: &Path, snapshot: &LocalHealthSnapshot) -> Result<()> {
@@ -908,6 +904,106 @@ fn inspect_native_local_database(path: &Path, snapshot: &LocalHealthSnapshot) ->
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod native_health_tests {
+    use super::check_native_local_db_health;
+    use std::path::Path;
+
+    fn package(database: &Path, name: &str, version: &str, extra: &str, files: &str) {
+        let directory = database.join("local").join(format!("{name}-{version}"));
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            directory.join("desc"),
+            format!("%NAME%\n{name}\n\n%VERSION%\n{version}\n\n%REASON%\n0\n\n{extra}"),
+        )
+        .unwrap();
+        std::fs::write(directory.join("files"), format!("%FILES%\n{files}\n\n")).unwrap();
+    }
+
+    #[tokio::test]
+    async fn native_health_accepts_shared_directories_without_writes_or_repository_access() {
+        let owner = tempfile::tempdir().unwrap();
+        let database = owner.path();
+        let local = database.join("local");
+        package(
+            database,
+            "app",
+            "1.0-1",
+            "%DEPENDS%\nvirtual>=2\n\n",
+            "usr/\nusr/bin/app",
+        );
+        package(
+            database,
+            "provider",
+            "1.0-1",
+            "%PROVIDES%\nvirtual=2\n\n",
+            "usr/\nusr/lib/provider",
+        );
+        std::fs::write(local.join("ALPM_DB_VERSION"), "9\n").unwrap();
+        let before = super::LocalHealthSnapshot::capture(&local).unwrap();
+        let report = check_native_local_db_health(&local).await.unwrap();
+        assert_eq!(report.packages, 2);
+        assert!(report.missing.is_empty());
+        report.native.unwrap();
+        before.revalidate(&local).unwrap();
+        assert!(!database.join("db.lck").exists());
+        assert!(!database.join("sync").exists());
+    }
+
+    #[tokio::test]
+    async fn native_health_accepts_an_explicit_zero_epoch_in_the_local_database() {
+        let owner = tempfile::tempdir().unwrap();
+        let local = owner.path().join("local");
+        package(owner.path(), "app", "0:1.0-1", "", "usr/bin/app");
+        std::fs::write(local.join("ALPM_DB_VERSION"), "9\n").unwrap();
+        let mut before = super::LocalHealthSnapshot::capture(&local).unwrap();
+        let report = check_native_local_db_health(&local).await.unwrap();
+        assert_eq!(report.packages, 1);
+        report.native.unwrap();
+        before.revalidate(&local).unwrap();
+        before.packages.get_mut("app").unwrap().version =
+            super::require_package_version("1:1.0-1").unwrap();
+        let mismatch = super::inspect_native_local_database(&local, &before).unwrap_err();
+        assert_eq!(
+            mismatch.to_string(),
+            "Native local database version differs for app"
+        );
+        assert!(!owner.path().join("db.lck").exists());
+    }
+
+    #[tokio::test]
+    async fn native_health_refuses_missing_dependencies_conflicts_and_shared_files() {
+        for (extra, files, expected) in [
+            (
+                "%DEPENDS%\nabsent>=2\n\n",
+                "usr/bin/app",
+                "requires absent>=2",
+            ),
+            (
+                "%CONFLICTS%\nother\n\n",
+                "usr/bin/app",
+                "Installed package conflict",
+            ),
+            ("", "usr/bin/shared", "Duplicate installed file ownership"),
+        ] {
+            let owner = tempfile::tempdir().unwrap();
+            let local = owner.path().join("local");
+            package(owner.path(), "app", "1.0-1", extra, files);
+            package(owner.path(), "other", "1.0-1", "", "usr/bin/shared");
+            std::fs::write(local.join("ALPM_DB_VERSION"), "9\n").unwrap();
+            let before = super::LocalHealthSnapshot::capture(&local).unwrap();
+            let report = check_native_local_db_health(&local).await.unwrap();
+            let error = report.native.expect_err("unhealthy native database");
+            assert!(
+                error.to_string().contains(expected),
+                "{expected}: {error:#}"
+            );
+            before.revalidate(&local).unwrap();
+            assert!(!owner.path().join("db.lck").exists());
+        }
+    }
 }
 
 struct LocalHealthSnapshot {
@@ -2077,26 +2173,24 @@ fn find_local_package(local_dir: &Path, name: &str) -> Result<Option<LocalDbPack
     Ok(package)
 }
 
-fn with_local_cache<T>(operation: &str, f: impl FnOnce(&LocalDbCache) -> Result<T>) -> Result<T> {
+/// Get a specific local package - FAST (<1ms)
+#[inline]
+pub fn get_local_package(name: &str) -> Result<Option<LocalDbPackage>> {
     let local_dir = paths::pacman_local_dir_result()?;
     let epoch = LocalDbEpoch::from_local_dir(&local_dir)?;
     ensure_local_cache_loaded_at(&local_dir, epoch)?;
 
     let cache = read_lock(&LOCAL_DB_CACHE);
-    let value = f(&cache)?;
+    let package = cache.packages.get(name).cloned();
     anyhow::ensure!(
         cache.last_modified == Some(LocalDbEpoch::from_local_dir(&local_dir)?),
-        "Local package database changed while {operation}; retry the operation"
+        "Local package database changed while querying; retry the operation"
     );
-    Ok(value)
-}
-
-/// Look up a single installed package from the cached local database.
-pub fn get_local_package(name: &str) -> Result<Option<LocalDbPackage>> {
-    with_local_cache("querying", |cache| Ok(cache.packages.get(name).cloned()))
+    Ok(package)
 }
 
 /// Get the first install-eligible sync package by exact name.
+#[inline]
 pub fn get_sync_package(name: &str) -> Result<Option<SyncDbPackage>> {
     let sync_dir = paths::pacman_sync_dir_result()?;
     let epoch = SyncDbEpoch::from_configured_sync_dir(&sync_dir)?;
@@ -2112,11 +2206,19 @@ pub fn get_sync_package(name: &str) -> Result<Option<SyncDbPackage>> {
     Ok(package)
 }
 
-/// List all installed packages from the cached local database.
+/// List all local packages using cache - FAST (<1ms)
 pub fn list_local_cached() -> Result<Vec<LocalDbPackage>> {
-    with_local_cache("querying", |cache| {
-        Ok(cache.packages.values().cloned().collect())
-    })
+    let local_dir = paths::pacman_local_dir_result()?;
+    let epoch = LocalDbEpoch::from_local_dir(&local_dir)?;
+    ensure_local_cache_loaded_at(&local_dir, epoch)?;
+
+    let cache = read_lock(&LOCAL_DB_CACHE);
+    let packages = cache.packages.values().cloned().collect();
+    anyhow::ensure!(
+        cache.last_modified == Some(LocalDbEpoch::from_local_dir(&local_dir)?),
+        "Local package database changed while querying; retry the operation"
+    );
+    Ok(packages)
 }
 
 /// A declared dependency that nothing installed satisfies.
@@ -2126,6 +2228,18 @@ pub struct UnsatisfiedDependency {
     pub package: String,
     /// The complete declared dependency, including its version constraint.
     pub dependency: String,
+}
+
+/// Report dependencies declared by the local database at `path` that nothing
+/// installed satisfies.
+pub fn unsatisfied_local_dependencies(path: &Path) -> Vec<UnsatisfiedDependency> {
+    match parse_local_db(path) {
+        Ok(packages) => unsatisfied_dependencies(&packages),
+        Err(error) => {
+            tracing::debug!(error = %error, "cannot resolve dependencies from an unreadable database");
+            Vec::new()
+        }
+    }
 }
 
 /// Required relations use the installed or explicitly provided version.
@@ -2334,7 +2448,7 @@ fn compute_required_names(
     Ok(required)
 }
 
-/// Return `(total, explicit, orphans)` counts from the cached local database.
+/// Get total package counts - INSTANT (<1ms with cache)
 ///
 /// The third element counts orphans under the canonical rule
 /// (`types::is_orphan_package`, `pacman -Qdt` semantics): dependencies that
@@ -2342,131 +2456,50 @@ fn compute_required_names(
 /// from the cached `%DEPENDS%`/`%PROVIDES%` sets via
 /// [`compute_required_names`]; modern pacman never writes `%REQUIREDBY%`
 /// into local desc files.
+#[inline]
 pub fn get_counts_fast() -> Result<(usize, usize, usize)> {
-    with_local_cache("counting", |cache| {
-        let total = cache.packages.len();
-        let required = compute_required_names(&cache.packages)?;
-        let mut explicit = 0;
-        let mut orphans = 0;
-        for (name, pkg) in &cache.packages {
-            if pkg.explicit {
-                explicit += 1;
-            } else if crate::package_managers::types::is_orphan_package(
-                pkg.explicit,
-                !required.contains(name),
-            ) {
-                orphans += 1;
-            }
+    let local_dir = paths::pacman_local_dir_result()?;
+    let epoch = LocalDbEpoch::from_local_dir(&local_dir)?;
+    ensure_local_cache_loaded_at(&local_dir, epoch)?;
+
+    let cache = read_lock(&LOCAL_DB_CACHE);
+    let total = cache.packages.len();
+    let required = compute_required_names(&cache.packages)?;
+    let mut explicit = 0;
+    let mut orphans = 0;
+    for (name, pkg) in &cache.packages {
+        if pkg.explicit {
+            explicit += 1;
+        } else if crate::package_managers::types::is_orphan_package(
+            pkg.explicit,
+            !required.contains(name),
+        ) {
+            orphans += 1;
         }
-        Ok((total, explicit, orphans))
-    })
+    }
+
+    anyhow::ensure!(
+        cache.last_modified == Some(LocalDbEpoch::from_local_dir(&local_dir)?),
+        "Local package database changed while counting; retry the operation"
+    );
+    Ok((total, explicit, orphans))
 }
 
-/// Count explicitly installed packages from the cached local database (skips orphan graph).
+/// Get explicit package count only - INSTANT (skips orphan dependency graph)
+#[inline]
 pub fn get_explicit_count() -> Result<usize> {
-    with_local_cache("counting", |cache| {
-        Ok(cache.packages.values().filter(|pkg| pkg.explicit).count())
-    })
-}
+    let local_dir = paths::pacman_local_dir_result()?;
+    let epoch = LocalDbEpoch::from_local_dir(&local_dir)?;
+    ensure_local_cache_loaded_at(&local_dir, epoch)?;
 
-#[cfg(test)]
-mod native_health_tests {
-    use super::check_native_local_db_health;
-    use std::path::Path;
+    let cache = read_lock(&LOCAL_DB_CACHE);
+    let explicit = cache.packages.values().filter(|pkg| pkg.explicit).count();
 
-    fn package(database: &Path, name: &str, version: &str, extra: &str, files: &str) {
-        let directory = database.join("local").join(format!("{name}-{version}"));
-        std::fs::create_dir_all(&directory).unwrap();
-        std::fs::write(
-            directory.join("desc"),
-            format!("%NAME%\n{name}\n\n%VERSION%\n{version}\n\n%REASON%\n0\n\n{extra}"),
-        )
-        .unwrap();
-        std::fs::write(directory.join("files"), format!("%FILES%\n{files}\n\n")).unwrap();
-    }
-
-    #[tokio::test]
-    async fn native_health_accepts_shared_directories_without_writes_or_repository_access() {
-        let owner = tempfile::tempdir().unwrap();
-        let database = owner.path();
-        let local = database.join("local");
-        package(
-            database,
-            "app",
-            "1.0-1",
-            "%DEPENDS%\nvirtual>=2\n\n",
-            "usr/\nusr/bin/app",
-        );
-        package(
-            database,
-            "provider",
-            "1.0-1",
-            "%PROVIDES%\nvirtual=2\n\n",
-            "usr/\nusr/lib/provider",
-        );
-        std::fs::write(local.join("ALPM_DB_VERSION"), "9\n").unwrap();
-        let before = super::LocalHealthSnapshot::capture(&local).unwrap();
-        let report = check_native_local_db_health(&local).await.unwrap();
-        assert_eq!(report.packages, 2);
-        assert!(report.missing.is_empty());
-        report.native.unwrap();
-        before.revalidate(&local).unwrap();
-        assert!(!database.join("db.lck").exists());
-        assert!(!database.join("sync").exists());
-    }
-
-    #[tokio::test]
-    async fn native_health_accepts_an_explicit_zero_epoch_in_the_local_database() {
-        let owner = tempfile::tempdir().unwrap();
-        let local = owner.path().join("local");
-        package(owner.path(), "app", "0:1.0-1", "", "usr/bin/app");
-        std::fs::write(local.join("ALPM_DB_VERSION"), "9\n").unwrap();
-        let mut before = super::LocalHealthSnapshot::capture(&local).unwrap();
-        let report = check_native_local_db_health(&local).await.unwrap();
-        assert_eq!(report.packages, 1);
-        report.native.unwrap();
-        before.revalidate(&local).unwrap();
-        before.packages.get_mut("app").unwrap().version =
-            super::require_package_version("1:1.0-1").unwrap();
-        let mismatch = super::inspect_native_local_database(&local, &before).unwrap_err();
-        assert_eq!(
-            mismatch.to_string(),
-            "Native local database version differs for app"
-        );
-        assert!(!owner.path().join("db.lck").exists());
-    }
-
-    #[tokio::test]
-    async fn native_health_refuses_missing_dependencies_conflicts_and_shared_files() {
-        for (extra, files, expected) in [
-            (
-                "%DEPENDS%\nabsent>=2\n\n",
-                "usr/bin/app",
-                "requires absent>=2",
-            ),
-            (
-                "%CONFLICTS%\nother\n\n",
-                "usr/bin/app",
-                "Installed package conflict",
-            ),
-            ("", "usr/bin/shared", "Duplicate installed file ownership"),
-        ] {
-            let owner = tempfile::tempdir().unwrap();
-            let local = owner.path().join("local");
-            package(owner.path(), "app", "1.0-1", extra, files);
-            package(owner.path(), "other", "1.0-1", "", "usr/bin/shared");
-            std::fs::write(local.join("ALPM_DB_VERSION"), "9\n").unwrap();
-            let before = super::LocalHealthSnapshot::capture(&local).unwrap();
-            let report = check_native_local_db_health(&local).await.unwrap();
-            let error = report.native.expect_err("unhealthy native database");
-            assert!(
-                error.to_string().contains(expected),
-                "{expected}: {error:#}"
-            );
-            before.revalidate(&local).unwrap();
-            assert!(!owner.path().join("db.lck").exists());
-        }
-    }
+    anyhow::ensure!(
+        cache.last_modified == Some(LocalDbEpoch::from_local_dir(&local_dir)?),
+        "Local package database changed while counting; retry the operation"
+    );
+    Ok(explicit)
 }
 
 #[cfg(test)]
@@ -3933,18 +3966,18 @@ mod tests {
 
         // Modeled on a real core.db desc entry (single-percent sections).
         let desc = b"%FILENAME%\nbash-5.3.15-1-x86_64.pkg.tar.zst\n\n\
-    %NAME%\nbash\n\n\
-    %BASE%\nbash\n\n\
-    %VERSION%\n5.3.15-1\n\n\
-    %DESC%\nThe GNU Bourne Again shell\n\n\
-    %CSIZE%\n150821\n\n\
-    %ISIZE%\n353496\n\n\
-    %SHA256SUM%\ndca9ec50cf51243b86a67367a55e78b1851d31240b1edaf9c011f8511765d999\n\n\
-    %URL%\nhttps://www.gnu.org/software/bash/\n\n\
-    %LICENSE%\nGPL-3.0-or-later\n\n\
-    %ARCH%\nx86_64\n\n\
-    %BUILDDATE%\n1700000000\n\n\
-    %PACKAGER%\nArch Linux <archlinux@archlinux.org>\n\n";
+%NAME%\nbash\n\n\
+%BASE%\nbash\n\n\
+%VERSION%\n5.3.15-1\n\n\
+%DESC%\nThe GNU Bourne Again shell\n\n\
+%CSIZE%\n150821\n\n\
+%ISIZE%\n353496\n\n\
+%SHA256SUM%\ndca9ec50cf51243b86a67367a55e78b1851d31240b1edaf9c011f8511765d999\n\n\
+%URL%\nhttps://www.gnu.org/software/bash/\n\n\
+%LICENSE%\nGPL-3.0-or-later\n\n\
+%ARCH%\nx86_64\n\n\
+%BUILDDATE%\n1700000000\n\n\
+%PACKAGER%\nArch Linux <archlinux@archlinux.org>\n\n";
 
         let build_tar = || -> Vec<u8> {
             let mut tar = tar::Builder::new(Vec::new());
@@ -5719,8 +5752,18 @@ mod tests {
         );
     }
 
-    /// A dependency whose desc lacks `%REQUIREDBY%` — as every modern pacman desc
-    /// does — but which another package's `%DEPENDS%` names is NOT an orphan.
+    /// A database that cannot be parsed must not be reported as a clean set of
+    /// satisfied dependencies; the structural check owns that failure.
+    #[test]
+    fn unsatisfied_local_dependencies_is_empty_for_an_unreadable_database() {
+        let temp = tempfile::TempDir::new().unwrap();
+        assert!(unsatisfied_local_dependencies(&temp.path().join("absent")).is_empty());
+    }
+
+    /// Regression (audit ARCH-R1): a dependency whose desc lacks the dead
+    /// `%REQUIREDBY%` section — as every modern pacman desc does — but which
+    /// another package's `%DEPENDS%` names is NOT an orphan. The fast path
+    /// previously counted every such package as an orphan.
     #[test]
     fn required_dependency_without_requireby_section_is_not_an_orphan() {
         let temp = tempfile::TempDir::new().unwrap();

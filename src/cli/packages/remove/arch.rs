@@ -5,21 +5,16 @@ use crate::cli::{style, ui};
 /// Preview explicitly requested packages. Recursive dependency cleanup is
 /// disclosed separately because calculating libalpm's complete removal set
 /// requires preparing the privileged transaction.
-pub async fn remove_dry_run(packages: &[String], recursive: bool) -> Result<()> {
-    let targets = packages.to_vec();
-    let package_info = tokio::task::spawn_blocking(move || {
-        targets
-            .iter()
-            .map(|package| {
-                crate::package_managers::get_package_info(package)
-                    .with_context(|| format!("Failed to look up installed package {package}"))?
-                    .filter(|info| info.installed)
-                    .ok_or_else(|| anyhow::anyhow!("Package '{package}' is not installed"))
-            })
-            .collect::<Result<Vec<_>>>()
-    })
-    .await
-    .context("Remove preview task failed")??;
+pub fn remove_dry_run(packages: &[String], recursive: bool) -> Result<()> {
+    let package_info = packages
+        .iter()
+        .map(|package| {
+            crate::package_managers::get_package_info(package)
+                .with_context(|| format!("Failed to look up installed package {package}"))?
+                .filter(|info| info.installed)
+                .ok_or_else(|| anyhow::anyhow!("Package '{package}' is not installed"))
+        })
+        .collect::<Result<Vec<_>>>()?;
 
     crate::cli::modern_ui::print_phase_header("🗑️", "Remove Preview", "dry run");
     println!();
@@ -31,7 +26,7 @@ pub async fn remove_dry_run(packages: &[String], recursive: bool) -> Result<()> 
     let mut total_size: u64 = 0;
     for info in package_info {
         let size_mb = info.size as f64 / 1024.0 / 1024.0;
-        total_size = total_size.saturating_add(info.size);
+        total_size += info.size;
         println!(
             "    {} {} {} ({:.2} MB)",
             style::error("✗"),
@@ -60,14 +55,7 @@ pub async fn remove_dry_run(packages: &[String], recursive: bool) -> Result<()> 
 
 #[cfg(test)]
 mod tests {
-    use super::remove_dry_run as remove_dry_run_async;
-
-    fn remove_dry_run(packages: &[String], recursive: bool) -> anyhow::Result<()> {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?
-            .block_on(remove_dry_run_async(packages, recursive))
-    }
+    use super::remove_dry_run;
 
     fn with_native_removal_fixture(test: impl FnOnce()) {
         temp_env::with_vars(

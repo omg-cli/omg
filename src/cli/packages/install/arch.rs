@@ -34,64 +34,57 @@ pub async fn install(packages: &[String], yes: bool, replacement_hops: u32) -> R
     let pb = modern_ui::modern_spinner("Resolving", "package sources");
 
     let mut missing_packages = Vec::new();
-    let mut local_count = 0usize;
-    let resolve_result: Result<()> = async {
-        for pkg in packages {
-            if is_local_package_file(pkg) {
-                // A local archive has no repository-signature evidence at this
-                // boundary. Keep it Community so require_pgp/minimum-grade policy
-                // cannot mistake a path for a verified official package.
-                policy.check_package(
-                    pkg,
-                    false,
-                    None,
-                    crate::core::security::SecurityGrade::Community,
-                )?;
-                local_count += 1;
-                continue;
-            }
-
-            let official_info = lookup_official_package(pkg).await?;
-
-            if let Some(info) = official_info {
-                enforce_install_policy(
-                    &policy,
-                    &vulnerability_scanner,
-                    pkg,
-                    &info.version,
-                    policy.arch_repository_origin(&info.repo),
-                    crate::core::security::policy::combined_license_expression(
-                        info.licenses.iter().map(String::as_str),
-                    )
-                    .as_deref(),
-                )
-                .await?;
-            } else {
-                missing_packages.push(pkg.clone());
-            }
+    for pkg in packages {
+        if is_local_package_file(pkg) {
+            // A local archive has no repository-signature evidence at this
+            // boundary. Keep it Community so require_pgp/minimum-grade policy
+            // cannot mistake a path for a verified official package.
+            policy.check_package(
+                pkg,
+                false,
+                None,
+                crate::core::security::SecurityGrade::Community,
+            )?;
+            modern_ui::finish_info(
+                &pb,
+                &format!(
+                    "Local package: {}",
+                    crate::core::security::artifact::display_target(pkg)
+                ),
+            );
+            continue;
         }
-        Ok(())
-    }
-    .await;
-    if let Err(error) = resolve_result {
-        modern_ui::finish_clear(&pb);
-        return Err(error);
+
+        let official_info = lookup_official_package(pkg).await?;
+
+        if let Some(info) = official_info {
+            enforce_install_policy(
+                &policy,
+                &vulnerability_scanner,
+                pkg,
+                &info.version,
+                policy.arch_repository_origin(&info.repo),
+                crate::core::security::policy::combined_license_expression(
+                    info.licenses.iter().map(String::as_str),
+                )
+                .as_deref(),
+            )
+            .await?;
+        } else {
+            missing_packages.push(pkg.clone());
+        }
     }
 
     let official = packages_excluding(packages, &missing_packages);
-    let official_repo_count = official.len().saturating_sub(local_count);
-    let summary = if local_count > 0 {
-        format!(
-            "{official_repo_count} official · {local_count} local · {} AUR",
+    modern_ui::finish_success(
+        &pb,
+        "Resolved",
+        &format!(
+            "{} official · {} AUR",
+            official.len(),
             missing_packages.len()
-        )
-    } else {
-        format!(
-            "{official_repo_count} official · {} AUR",
-            missing_packages.len()
-        )
-    };
-    modern_ui::finish_success(&pb, "Resolved", &summary);
+        ),
+    );
 
     // Officially-resolvable packages must be installed even when other
     // requested names need the AUR fallback. Previously a request with
@@ -244,10 +237,11 @@ pub async fn install_dry_run(packages: &[String]) -> Result<()> {
     let mut total_size: u64 = 0;
     for pkg_name in packages {
         if let Some(info) = local_archive_preview(pkg_name)? {
+            let size_mb = info.installed_size as f64 / 1024.0 / 1024.0;
             table.add_row(vec![
                 style::emphasis(&info.name),
                 style::accent(&info.version.to_string()),
-                format!("{} installed", style::size(info.installed_size)),
+                format!("{size_mb:.2} MB installed"),
                 format!("{} Local archive", style::positive("✓")),
             ]);
             continue;
@@ -255,13 +249,13 @@ pub async fn install_dry_run(packages: &[String]) -> Result<()> {
 
         match lookup_official_package(pkg_name).await {
             Ok(Some(info)) => {
-                let dl = info.download_size.unwrap_or(0);
-                total_size = total_size.saturating_add(dl);
+                let size_mb = info.download_size.unwrap_or(0) as f64 / 1024.0 / 1024.0;
+                total_size += info.download_size.unwrap_or(0);
 
                 table.add_row(vec![
                     style::emphasis(&info.name),
                     style::accent(&info.version.to_string()),
-                    style::size(dl),
+                    format!("{size_mb:.2} MB"),
                     format!("{} Official", style::positive("✓")),
                 ]);
             }
@@ -288,7 +282,7 @@ pub async fn install_dry_run(packages: &[String]) -> Result<()> {
     println!(
         "  {} Total download size: {}",
         style::accent("→"),
-        style::emphasis(&style::size(total_size))
+        style::emphasis(&format!("{:.2} MB", total_size as f64 / 1024.0 / 1024.0))
     );
     println!();
     println!(
@@ -1269,6 +1263,10 @@ mod tests {
             assert_eq!(file_state(&archive_path)?, before_archive);
             assert_eq!(file_state(&index_path)?, before_index);
             assert_eq!(file_state(&config_path)?, before_config);
+            eprintln!(
+                "[aur-cap-fixture] uid={} source={source_version:?} binary={binary_version:?} expected={expected:?} metadata_unchanged=true",
+                nix::unistd::geteuid()
+            );
             directory.close()?;
         }
         Ok(())

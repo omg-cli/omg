@@ -6,7 +6,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use crate::core::license::get_machine_id;
@@ -129,27 +129,20 @@ impl TelemetryPayload {
     /// Create a new telemetry payload
     #[must_use]
     pub fn new(event: TelemetryEvent) -> Self {
-        let license_key = crate::core::license::load_license().map(|l| {
-            use sha2::Digest as _;
-            hex::encode(sha2::Sha256::digest(l.key.as_bytes()))[..16].to_string()
-        });
-        Self::with_metadata(event, get_machine_id(), license_key)
-    }
+        let license = crate::core::license::load_license();
 
-    fn with_metadata(
-        event: TelemetryEvent,
-        machine_id: String,
-        license_key: Option<String>,
-    ) -> Self {
         Self {
             event,
             timestamp: jiff::Timestamp::now()
                 .strftime("%Y-%m-%dT%H:%M:%S%.3fZ")
                 .to_string(),
-            machine_id,
+            machine_id: get_machine_id(),
             version: env!("CARGO_PKG_VERSION").to_string(),
             platform: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
-            license_key,
+            license_key: license.map(|l| {
+                use sha2::Digest as _;
+                hex::encode(sha2::Sha256::digest(l.key.as_bytes()))[..16].to_string()
+            }),
         }
     }
 }
@@ -188,7 +181,7 @@ fn check_circuit_breaker() -> (CircuitState, Option<HalfOpenProbeGuard>) {
         CircuitState::Open => {
             // Check if enough time has passed to try again (half-open)
             let last_failure = LAST_FAILURE.load(Ordering::Relaxed);
-            let now = u64::try_from(jiff::Timestamp::now().as_second()).unwrap_or(0);
+            let now = jiff::Timestamp::now().as_second() as u64;
 
             if now.saturating_sub(last_failure) >= CIRCUIT_OPEN_DURATION_SECS {
                 // Transition to half-open with single-flight semantics: the
@@ -204,10 +197,7 @@ fn check_circuit_breaker() -> (CircuitState, Option<HalfOpenProbeGuard>) {
                     // exclusion); no other data is published through it.
                     CIRCUIT_STATE.store(CircuitState::HalfOpen as u32, Ordering::Relaxed);
                     tracing::debug!("Circuit breaker transitioning to half-open state");
-                    (
-                        CircuitState::HalfOpen,
-                        Some(HalfOpenProbeGuard { active: true }),
-                    )
+                    (CircuitState::HalfOpen, Some(HalfOpenProbeGuard))
                 } else {
                     (CircuitState::Open, None)
                 }
@@ -223,25 +213,16 @@ fn check_circuit_breaker() -> (CircuitState, Option<HalfOpenProbeGuard>) {
 ///
 /// Releasing via `Drop` guarantees the slot frees even when the probe future
 /// is cancelled or times out, which previously left the breaker latched Open
-/// until process exit. Once `record_success`/`record_failure` resolves the
-/// probe, `disarm()` prevents `Drop` from clobbering a concurrent caller's
-/// newly acquired probe slot.
-struct HalfOpenProbeGuard {
-    active: bool,
-}
-
-impl HalfOpenProbeGuard {
-    const fn disarm(&mut self) {
-        self.active = false;
-    }
-}
+/// until process exit.
+struct HalfOpenProbeGuard;
 
 impl Drop for HalfOpenProbeGuard {
     fn drop(&mut self) {
-        if !self.active {
-            return;
-        }
         HALF_OPEN_PROBE_IN_FLIGHT.store(false, Ordering::Relaxed);
+        // If the probe is still unresolved (cancelled at an await point),
+        // return the breaker to Open so the cooldown restarts. When the
+        // probe completed first, record_success/record_failure already set
+        // the final state; dropping the guard afterwards must not clobber it.
         if CircuitState::from(CIRCUIT_STATE.load(Ordering::Relaxed)) == CircuitState::HalfOpen {
             CIRCUIT_STATE.store(CircuitState::Open as u32, Ordering::Relaxed);
         }
@@ -267,7 +248,7 @@ fn record_success() {
 /// Record a failed request (increment failure count, possibly open circuit)
 fn record_failure() {
     let failures = FAILURE_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-    let now = u64::try_from(jiff::Timestamp::now().as_second()).unwrap_or(0);
+    let now = jiff::Timestamp::now().as_second() as u64;
     LAST_FAILURE.store(now, Ordering::Relaxed);
     // Any in-flight half-open probe has now resolved (as a failure).
     HALF_OPEN_PROBE_IN_FLIGHT.store(false, Ordering::Relaxed);
@@ -288,36 +269,23 @@ pub async fn send_batch(events: Vec<TelemetryEvent>) -> Result<()> {
 
     // Check circuit breaker state; hold any won probe-slot guard across the
     // batch request so cancellation cannot leak the latch.
-    let (circuit_state, mut probe_guard) = check_circuit_breaker();
+    let (circuit_state, probe_guard) = check_circuit_breaker();
 
     if !circuit_allows_request(circuit_state, probe_guard.is_some()) {
         anyhow::bail!("Telemetry circuit breaker is {circuit_state:?}");
     }
+    // Keep the half-open claim alive across the request. Its Drop releases
+    // the single-flight slot if this future is cancelled at the await point.
+    let _probe_guard = probe_guard;
 
-    let (machine_id, license_key) = tokio::task::spawn_blocking(|| {
-        let machine_id = get_machine_id();
-        let license_key = crate::core::license::load_license().map(|l| {
-            use sha2::Digest as _;
-            hex::encode(sha2::Sha256::digest(l.key.as_bytes()))[..16].to_string()
-        });
-        (machine_id, license_key)
-    })
-    .await
-    .context("Failed to collect telemetry metadata")?;
-
-    let payloads: Vec<TelemetryPayload> = events
-        .into_iter()
-        .map(|event| {
-            TelemetryPayload::with_metadata(event, machine_id.clone(), license_key.clone())
-        })
-        .collect();
+    let payloads: Vec<TelemetryPayload> = events.into_iter().map(TelemetryPayload::new).collect();
 
     let batch = BatchPayload {
         events: payloads,
         batch_timestamp: jiff::Timestamp::now()
             .strftime("%Y-%m-%dT%H:%M:%S%.3fZ")
             .to_string(),
-        machine_id,
+        machine_id: get_machine_id(),
     };
 
     let client = crate::core::http::shared_client();
@@ -328,10 +296,6 @@ pub async fn send_batch(events: Vec<TelemetryEvent>) -> Result<()> {
         .timeout(REQUEST_TIMEOUT)
         .send()
         .await;
-
-    if let Some(guard) = probe_guard.as_mut() {
-        guard.disarm();
-    }
 
     match response {
         Ok(resp) if resp.status().is_success() => {

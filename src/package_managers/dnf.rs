@@ -3037,7 +3037,6 @@ impl DnfPackageManager {
                 files.insert(path.strip_prefix(root)?.to_owned(), (path, metadata.len()));
             }
         }
-        let mut buffer = vec![0u8; 64 * 1024];
         for (relative, (path, length)) in files {
             let encoded = serde_json::to_vec(&relative)?;
             hash.update((encoded.len() as u64).to_be_bytes());
@@ -3045,6 +3044,7 @@ impl DnfPackageManager {
             hash.update(length.to_be_bytes());
             let mut file = std::fs::File::open(path)?;
             let mut read = 0u64;
+            let mut buffer = vec![0u8; 64 * 1024];
             loop {
                 let length = file.read(&mut buffer)?;
                 if length == 0 {
@@ -3425,8 +3425,7 @@ impl DnfPackageManager {
 
     fn run_dnf(&self, args: &[&str]) -> Result<()> {
         if args
-            .iter()
-            .find(|arg| !arg.starts_with('-'))
+            .first()
             .is_some_and(|arg| matches!(*arg, "install" | "upgrade"))
         {
             crate::core::security::policy::require_native_plan_support("DNF")?;
@@ -3773,16 +3772,15 @@ impl PackageManager for DnfPackageManager {
                 });
                 let mut after = self.security_inventory().await?;
                 let mut before = installed;
-                let cmp_identity =
-                    |a: &super::types::SecurityPackage, b: &super::types::SecurityPackage| {
-                        (&a.name, &a.version, &a.architecture).cmp(&(
-                            &b.name,
-                            &b.version,
-                            &b.architecture,
-                        ))
-                    };
-                before.sort_by(cmp_identity);
-                after.sort_by(cmp_identity);
+                let identity = |package: &super::types::SecurityPackage| {
+                    (
+                        package.name.clone(),
+                        package.version.clone(),
+                        package.architecture.clone(),
+                    )
+                };
+                before.sort_by_key(identity);
+                after.sort_by_key(identity);
                 anyhow::ensure!(
                     before == after,
                     "Installed packages changed during native security audit"
@@ -4878,10 +4876,7 @@ mod tests {
 
     #[test]
     fn installed_reasons_preserve_native_classifications() {
-        let rows = DnfPackageManager::parse_installed_reasons(
-            b"a-0:1-1.noarch\tGroup\nb-1:2-1.x86_64\tExternal User\nc-0:3-1.i686\tWeak Dependency\n",
-        )
-        .expect("native reason rows");
+        let rows = DnfPackageManager::parse_installed_reasons(b"a-0:1-1.noarch\tGroup\nb-1:2-1.x86_64\tExternal User\nc-0:3-1.i686\tWeak Dependency\n").expect("native reason rows");
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[1].identity, "b-1:2-1.x86_64");
         assert_eq!(rows[1].reason, "External User");
@@ -7291,12 +7286,10 @@ mod tests {
             assert!(message.contains(needle), "missing {needle:?} in: {message}");
         }
     }
-
-    #[test]
-    fn ordinary_rpm_inventory_preserves_epoch() {
-        let package =
-            DnfPackageManager::parse_rpm_qa_line("example\t1.0\t1.fc44\t2\tx86_64\tsummary")
-                .unwrap();
-        assert_eq!(package.version, "2:1.0");
-    }
+}
+#[test]
+fn ordinary_rpm_inventory_preserves_epoch() {
+    let package =
+        DnfPackageManager::parse_rpm_qa_line("example\t1.0\t1.fc44\t2\tx86_64\tsummary").unwrap();
+    assert_eq!(package.version, "2:1.0");
 }

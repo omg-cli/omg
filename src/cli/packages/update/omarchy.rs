@@ -519,17 +519,6 @@ struct Commands {
     migration_overrides: Option<MigrationTestOverrides>,
 }
 
-impl Drop for Commands {
-    fn drop(&mut self) {
-        if let Some(task) = self.authorization.take() {
-            task.abort();
-        }
-        if let Some(group) = self.foreground.take() {
-            let _ = set_foreground(group);
-        }
-    }
-}
-
 #[cfg(test)]
 struct NativeMigrationFixture {
     operations: Vec<NativeOmarchyOperation>,
@@ -933,41 +922,25 @@ impl StageExecutor for Commands {
     async fn execute(&mut self, stage: Stage) -> Result<Outcome> {
         match stage {
             Stage::Preflight => {
-                tokio::task::spawn_blocking(native_preflight_free_space)
-                    .await
-                    .context("Omarchy preflight check panicked")??;
+                native_preflight_free_space()?;
                 return Ok(Outcome::Success);
             }
-            Stage::Confirm => {
-                let attended = self.attended;
-                return tokio::task::spawn_blocking(move || native_confirm_update(attended))
-                    .await
-                    .context("Omarchy confirmation prompt panicked")?;
-            }
+            Stage::Confirm => return native_confirm_update(self.attended),
             Stage::NativePackage(operation) => {
                 self.run_native_package(operation).await?;
                 return Ok(Outcome::Success);
             }
             Stage::RebootPrompt => {
-                if let Some(reason) = tokio::task::spawn_blocking(native_reboot_reason)
-                    .await
-                    .context("Omarchy reboot check panicked")??
-                {
+                if let Some(reason) = native_reboot_reason()? {
                     if self.yes || !self.attended {
                         println!("{reason} Run omarchy-system reboot when ready.");
                     } else {
-                        let confirmed = tokio::task::spawn_blocking(move || -> Result<bool> {
-                            let _quiesce = crate::cli::modern_ui::quiesce_terminal();
-                            Ok(
-                                dialoguer::Confirm::with_theme(&crate::cli::ui::prompt_theme())
-                                    .with_prompt(format!("{reason} Reboot now?"))
-                                    .default(false)
-                                    .interact()?,
-                            )
-                        })
-                        .await
-                        .context("Omarchy reboot prompt panicked")??;
-                        if confirmed {
+                        let _quiesce = crate::cli::modern_ui::quiesce_terminal();
+                        if dialoguer::Confirm::with_theme(&crate::cli::ui::prompt_theme())
+                            .with_prompt(format!("{reason} Reboot now?"))
+                            .default(false)
+                            .interact()?
+                        {
                             let executable = crate::core::privilege::root_controlled_program_path(
                                 "omarchy-system",
                             )?;
@@ -1049,9 +1022,6 @@ impl StageExecutor for Commands {
         }
         if status.success() {
             if stage == Stage::Authorize {
-                if let Some(previous) = self.authorization.take() {
-                    previous.abort();
-                }
                 self.authorization = Some(tokio::spawn(async {
                     loop {
                         tokio::time::sleep(AUTHORIZATION_INTERVAL).await;
@@ -1361,7 +1331,8 @@ impl Commands {
                     ("omarchy-hw-aarch64-qualcomm", &[][..]),
                     ("omarchy-hw-match", &["OmniBook 3 Laptop"][..]),
                 ] {
-                    let helper = self.resolve_migration_helper(name)?;
+                    let helper = crate::core::privilege::root_controlled_program_path(name)?;
+                    self.runtime.check_helper_layout(name, &helper)?;
                     let status = self.run_program(&helper, args).await?;
                     if status.code() == Some(1)
                         || name == "omarchy-hw-match" && status.code() == Some(2)
@@ -1373,7 +1344,7 @@ impl Commands {
                         "Omarchy hardware detection {name} failed: {status}"
                     );
                 }
-                if self.is_package_installed("hp-omnibook-3-audio")? {
+                if crate::package_managers::is_installed_fast("hp-omnibook-3-audio")? {
                     return Ok(());
                 }
                 NativeOmarchyOperation::InstallOmnibookAudio
@@ -2059,7 +2030,6 @@ async fn drain_interrupted_coordinator(
     let interruption = interrupt_coordinator(child);
     let mut output = vec![0_u8; 4096];
     let mut output_open = true;
-    let deadline = tokio::time::Instant::now() + TERMINATION_GRACE;
     loop {
         tokio::select! {
             status = child.wait() => {
@@ -2077,16 +2047,6 @@ async fn drain_interrupted_coordinator(
                         return Err(error).context("Cannot drain interrupted Omarchy terminal");
                     }
                 }
-            }
-            () = tokio::time::sleep_until(deadline) => {
-                let _ = child.start_kill();
-                drop(master);
-                let status = child
-                    .wait()
-                    .await
-                    .context("Cannot reap killed Omarchy coordinator")?;
-                interruption?;
-                return Ok(status);
             }
         }
     }
@@ -2205,7 +2165,6 @@ async fn execute_logged(
     let mut queued = vec![0_u8; 4096];
     let mut pending = (0, 0);
     let mut output_open = true;
-    let mut stdout_connected = true;
     let mut cancellation = None;
     let relay = async {
         loop {
@@ -2221,16 +2180,13 @@ async fn execute_logged(
                         output_open = false;
                     } else {
                         transcript.write_all(&output[..count])?;
-                        if stdout_connected
-                            && let Err(error) = std::io::stdout()
-                                .write_all(&output[..count])
-                                .and_then(|()| std::io::stdout().flush())
+                        if let Err(error) = std::io::stdout()
+                            .write_all(&output[..count])
+                            .and_then(|()| std::io::stdout().flush())
+                            && cancellation.is_none()
                         {
-                            stdout_connected = false;
-                            if cancellation.is_none() {
-                                cancellation = Some(anyhow::Error::new(error).context("Update output disconnected"));
-                                interrupt_coordinator(&child)?;
-                            }
+                            cancellation = Some(anyhow::Error::new(error).context("Update output disconnected"));
+                            interrupt_coordinator(&child)?;
                         }
                     }
                 }
@@ -2248,13 +2204,9 @@ async fn execute_logged(
                 result = write_pty(&master, &queued[pending.0..pending.1]), if pending.0 < pending.1 && output_open => {
                     pending.0 += result?;
                 }
-                () = interruptions.receive() => {
-                    if cancellation.is_none() {
-                        cancellation = Some(anyhow::anyhow!("Omarchy update interrupted; inspect the update log before retrying"));
-                        interrupt_coordinator(&child)?;
-                    } else {
-                        let _ = child.start_kill();
-                    }
+                () = interruptions.receive(), if cancellation.is_none() => {
+                    cancellation = Some(anyhow::anyhow!("Omarchy update interrupted; inspect the update log before retrying"));
+                    interrupt_coordinator(&child)?;
                 }
                 Some(terminal) = async { resized.recv().await.and(resize_terminal.as_ref()) }, if resize_terminal.is_some() => {
                     rustix::termios::tcsetwinsize(master.get_ref(), rustix::termios::tcgetwinsize(terminal)?)?;
@@ -3946,7 +3898,6 @@ omarchy-pkg-drop imv mpv-mpris
             assert_eq!(
                 commands
                     .native_fixture
-                    .as_ref()
                     .expect("native fixture is retained")
                     .operations,
                 expected

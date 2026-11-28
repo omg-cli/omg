@@ -9,19 +9,23 @@ use anyhow::{Context, Result};
 
 use crate::cli::progress::{Accent, Outcome, ProgressTask, TaskKind, TaskSpec};
 use crate::core::paths;
-use crate::package_managers::types::{PackageInfo, UpdateInfo, contains_ignore_case};
 
 /// Stable cross-layer marker for a requested package absent from every sync repository.
 pub const MISSING_FROM_REPOS_MARKER: &str = "not found in any configured repository";
 const PARALLEL_DOWNLOADS: u32 = 5;
+use crate::package_managers::types::{PackageInfo, UpdateInfo, contains_ignore_case};
 
-/// Return `(total, explicit, orphans, updates)` system package counts.
+/// Get comprehensive system status (counts + updates) in a single pass - FAST
 pub fn get_system_status() -> Result<(usize, usize, usize, usize)> {
     let (total, explicit, orphans) = crate::package_managers::get_counts()?;
     let updates = crate::package_managers::check_updates_cached()?.len();
     Ok((total, explicit, orphans, updates))
 }
 
+/// Get detailed list of updates - FAST
+/// Open a libalpm handle against the configured pacman root/db with a
+/// canonical error context (audit typ01 C1: seven divergent inline copies).
+#[cfg(feature = "arch")]
 #[derive(Debug)]
 pub(crate) struct LocalPackageMetadata {
     pub(crate) name: String,
@@ -30,6 +34,7 @@ pub(crate) struct LocalPackageMetadata {
     pub(crate) license: Option<String>,
 }
 
+#[cfg(feature = "arch")]
 pub(crate) fn load_local_package_metadata(path: &str) -> Result<LocalPackageMetadata> {
     let snapshot =
         crate::core::security::artifact::ArchiveSnapshot::capture(std::path::Path::new(path))?;
@@ -49,7 +54,9 @@ pub(crate) fn load_local_package_metadata(path: &str) -> Result<LocalPackageMeta
 
     Ok(LocalPackageMetadata {
         name: package.name().to_string(),
-        // Reject unparseable versions at this untrusted boundary instead of fabricating 0.
+        // Package-file metadata is an untrusted boundary: a version that
+        // fails the strict parser must fail the load with a typed error
+        // instead of comparing as a fabricated 0 (ARCH-R14).
         version: crate::package_managers::parse_version(package.version().as_str()).with_context(
             || {
                 format!(
@@ -66,13 +73,14 @@ pub(crate) fn load_local_package_metadata(path: &str) -> Result<LocalPackageMeta
     })
 }
 
-/// Open a libalpm handle against the configured pacman root and database paths.
+#[cfg(feature = "arch")]
 pub fn open_default_alpm() -> anyhow::Result<alpm::Alpm> {
     let root = crate::core::paths::pacman_root_result()?;
     let db_path = crate::core::paths::pacman_db_dir_result()?;
     open_alpm_at(&root, &db_path)
 }
 
+#[cfg(feature = "arch")]
 pub(crate) fn open_alpm_at(
     root: &std::path::Path,
     db_path: &std::path::Path,
@@ -454,7 +462,7 @@ fn clean_cache_internal(keep_versions: usize, dry_run: bool) -> Result<(usize, u
                 // Only credit bytes that were actually freed; failures are
                 // logged with their cause so callers are not told space was
                 // reclaimed when it was not.
-                freed = freed.saturating_add(remove_cache_file_and_signature(&old, &mut removed));
+                freed += remove_cache_file_and_signature(&old, &mut removed);
             }
         }
     }
@@ -491,19 +499,19 @@ fn remove_cache_file_and_signature(archive: &std::path::Path, removed: &mut usiz
             *removed += 1;
             freed = freed.saturating_add(sig_len.unwrap_or(0));
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => {
+        Err(error) if signature.exists() => {
             tracing::warn!(
                 "Failed to remove cache signature {}: {error}",
                 signature.display()
             );
         }
+        Err(_) => {}
     }
 
     freed
 }
 
-/// List orphaned packages.
+/// List orphaned packages - INSTANT
 pub use crate::package_managers::alpm_direct::list_orphans_fast as list_orphans_direct;
 
 /// Display package info through the shared key-value renderer.
@@ -951,12 +959,15 @@ fn forward_alpm_log(level: alpm::LogLevel, message: &str) {
     }
 }
 
-/// Package mutations declined by the ALPM question callback (either because
-/// the user declined an interactive prompt or because the session is
-/// non-interactive without `--yes`).
+/// Package mutations the ALPM question callback refused because they need
+/// explicit consent that the synchronous, ALPM-thread callback cannot collect
+/// (the CLI's `confirm_package_mutation` consent covers the requested targets,
+/// not collateral mutations of other installed packages, and there is no
+/// channel to forward it into libalpm callbacks).
 ///
-/// Recorded refusals are surfaced as an explicit error naming each conflict
-/// instead of silently mutating or dropping installed packages.
+/// Replace and RemovePkgs questions are answered with pacman's fail-closed
+/// default and recorded here, then the transaction is failed with an explicit
+/// error naming each conflict instead of silently mutating installed packages.
 #[derive(Debug, Default)]
 struct AlpmQuestionRefusals {
     /// Declined replacements, as "oldpkg with newdb/newpkg" descriptions.
@@ -1081,15 +1092,6 @@ const fn is_post_download_progress(op: alpm::Progress) -> bool {
 }
 
 /// Setup ALPM callbacks for progress lanes
-fn prompt_alpm_confirm(prompt: String, default: bool) -> bool {
-    let _quiesce = crate::cli::modern_ui::quiesce_terminal();
-    dialoguer::Confirm::with_theme(&crate::cli::ui::prompt_theme())
-        .with_prompt(prompt)
-        .default(default)
-        .interact()
-        .unwrap_or(false)
-}
-
 #[cfg(test)]
 fn setup_alpm_callbacks(
     alpm: &alpm::Alpm,
@@ -1131,8 +1133,13 @@ fn setup_alpm_callbacks_in(
                     || crate::core::privilege::get_yes_flag();
                 let confirmed = if auto_accept {
                     true
-                } else if console::user_attended() {
-                    prompt_alpm_confirm(format!("Replace {description} with {newdb}/{newpkg}?"), true)
+                } else if console::user_attended() && !crate::core::privilege::get_yes_flag() {
+                    let _quiesce = crate::cli::modern_ui::quiesce_terminal();
+                    dialoguer::Confirm::with_theme(&crate::cli::ui::prompt_theme())
+                        .with_prompt(format!("Replace {description} with {newdb}/{newpkg}?"))
+                        .default(true)
+                        .interact()
+                        .unwrap_or(false)
                 } else {
                     false
                 };
@@ -1159,11 +1166,13 @@ fn setup_alpm_callbacks_in(
                     && crate::core::privilege::get_yes_flag();
                 let confirmed = if auto_accept {
                     true
-                } else if console::user_attended() {
-                    prompt_alpm_confirm(
-                        format!("{pkg1} conflicts with {pkg2} ({reason}). Remove {pkg2}?"),
-                        false,
-                    )
+                } else if console::user_attended() && !crate::core::privilege::get_yes_flag() {
+                    let _quiesce = crate::cli::modern_ui::quiesce_terminal();
+                    dialoguer::Confirm::with_theme(&crate::cli::ui::prompt_theme())
+                        .with_prompt(format!("{pkg1} conflicts with {pkg2} ({reason}). Remove {pkg2}?"))
+                        .default(false)
+                        .interact()
+                        .unwrap_or(false)
                 } else {
                     false
                 };
@@ -1233,8 +1242,12 @@ fn setup_alpm_callbacks_in(
                     && !crate::core::privilege::get_yes_flag()
                 {
                     let fingerprint = crate::cli::style::sanitize_terminal_text(q.fingerprint());
-                    let confirmed =
-                        prompt_alpm_confirm(format!("Import PGP key {fingerprint}?"), false);
+                    let _quiesce = crate::cli::modern_ui::quiesce_terminal();
+                    let confirmed = dialoguer::Confirm::with_theme(&crate::cli::ui::prompt_theme())
+                        .with_prompt(format!("Import PGP key {fingerprint}?"))
+                        .default(false)
+                        .interact()
+                        .unwrap_or(false);
                     q.set_import(confirmed);
                     if !confirmed { refusals.record_refused_key_import(); }
                 } else {
@@ -1358,6 +1371,19 @@ pub(crate) struct SignaturePolicy {
 struct ParsedSignatureLevel {
     level: alpm::SigLevel,
     mask: alpm::SigLevel,
+}
+
+#[test]
+fn explicit_pgp_requirement_overrides_optional_and_disabled_package_signatures() {
+    for level in [
+        alpm::SigLevel::NONE,
+        alpm::SigLevel::PACKAGE | alpm::SigLevel::PACKAGE_OPTIONAL,
+    ] {
+        let enforced = enforce_required_package_signature(level, true);
+        assert!(enforced.contains(alpm::SigLevel::PACKAGE));
+        assert!(!enforced.contains(alpm::SigLevel::PACKAGE_OPTIONAL));
+        assert_eq!(enforce_required_package_signature(level, false), level);
+    }
 }
 
 fn set_signature_flags(parsed: &mut ParsedSignatureLevel, flags: alpm::SigLevel) {
@@ -1710,7 +1736,6 @@ fn prepare_alpm_transaction_in<'a>(
             .sync_sysupgrade(false)
             .context("Failed to setup sysupgrade")?;
     } else {
-        let mut local_siglevel = None;
         for pkg_name in packages {
             if matches!(kind, TransactionKind::Remove { .. }) {
                 ensure_removals_not_held(
@@ -1737,20 +1762,17 @@ fn prepare_alpm_transaction_in<'a>(
                         .context("Package path contains invalid UTF-8")?;
 
                     let admission = admissions.remove(&canonical_path);
-                    let siglevel = if let Some(siglevel) = local_siglevel {
-                        siglevel
-                    } else {
-                        let computed = local_package_siglevel(
-                            kind,
-                            signature_policy(pacman_config)?.local_file,
-                        );
-                        local_siglevel = Some(computed);
-                        computed
-                    };
 
                     let pkg = tx_guard
                         .0
-                        .pkg_load(canonical_str.to_string(), true, siglevel)
+                        .pkg_load(
+                            canonical_str.to_string(),
+                            true,
+                            local_package_siglevel(
+                                kind,
+                                signature_policy(pacman_config)?.local_file,
+                            ),
+                        )
                         .map_err(|e| {
                             anyhow::anyhow!("Failed to load local package {pkg_name}: {e}")
                         })?;
@@ -1804,6 +1826,7 @@ fn prepare_alpm_transaction_in<'a>(
     Ok(tx_guard)
 }
 
+/// Commit an ALPM transaction
 fn pacman_option_path(
     root: &std::path::Path,
     configured: Option<&str>,
@@ -2536,13 +2559,12 @@ impl PreparedAdvisoryAdmission {
                 SecurityPolicy::source_grade(&item.package.origin),
             )?;
         }
-        let digest = advisory_batch_digest(&packages, &policy, &profile, invoking_uid)?;
         let acknowledgement = if policy.advisory_requirement == AdvisoryRequirement::FreshSnapshot
             && packages.iter().any(|item| item.archive.is_some())
         {
             Some(confirm_unknown_archives(
                 &packages,
-                &digest,
+                &advisory_batch_digest(&packages, &policy, &profile, invoking_uid)?,
                 invoking_uid,
                 signals
                     .as_ref()
@@ -2618,6 +2640,7 @@ impl PreparedAdvisoryAdmission {
             },
             |operation| operation.assessments().to_vec(),
         );
+        let digest = advisory_batch_digest(&packages, &policy, &profile, invoking_uid)?;
         let review = prepared_risk_review(&assessments, &digest, policy.advisory_requirement)?;
         if let Some(review) = review {
             ensure_prepared_review_signals(signals, review.details())?;
@@ -2670,17 +2693,18 @@ impl PreparedAdvisoryAdmission {
             current == self.packages,
             "Prepared package identity or archive changed after advisory admission"
         );
-        let digest = advisory_batch_digest(&current, &policy, &profile, invoking_uid)?;
         if let Some(acknowledgement) = &self.acknowledgement {
             anyhow::ensure!(
                 acknowledgement.invoking_uid == invoking_uid
-                    && acknowledgement.batch_digest == digest,
+                    && acknowledgement.batch_digest
+                        == advisory_batch_digest(&current, &policy, &profile, invoking_uid)?,
                 "FreshSnapshot archive acknowledgement no longer matches the prepared batch"
             );
         }
         if let Some(operation) = &self.operation {
             operation.validate_now()?;
         }
+        let digest = advisory_batch_digest(&current, &policy, &profile, invoking_uid)?;
         let review = prepared_risk_review(&self.assessments, &digest, policy.advisory_requirement)?;
         if let Some(review) = review {
             anyhow::ensure!(
@@ -2871,22 +2895,6 @@ fn ensure_mirror_servers(alpm: &alpm::Alpm) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn explicit_pgp_requirement_overrides_optional_and_disabled_package_signatures() {
-        for level in [
-            alpm::SigLevel::NONE,
-            alpm::SigLevel::PACKAGE | alpm::SigLevel::PACKAGE_OPTIONAL,
-        ] {
-            let enforced = super::enforce_required_package_signature(level, true);
-            assert!(enforced.contains(alpm::SigLevel::PACKAGE));
-            assert!(!enforced.contains(alpm::SigLevel::PACKAGE_OPTIONAL));
-            assert_eq!(
-                super::enforce_required_package_signature(level, false),
-                level
-            );
-        }
-    }
-
     #[test]
     fn archive_acknowledgement_lists_only_private_archives_and_bounds_the_batch() {
         use crate::package_managers::types::{SecurityOrigin, SecurityPackage};

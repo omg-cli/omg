@@ -116,11 +116,8 @@ pub struct PgpVerifier {
 
 fn system_keyring_path() -> Option<&'static str> {
     match crate::core::env::distro::detect_distro() {
-        crate::core::env::distro::Distro::Debian => {
+        crate::core::env::distro::Distro::Debian | crate::core::env::distro::Distro::Ubuntu => {
             Some("/usr/share/keyrings/debian-archive-keyring.gpg")
-        }
-        crate::core::env::distro::Distro::Ubuntu => {
-            Some("/usr/share/keyrings/ubuntu-archive-keyring.gpg")
         }
         crate::core::env::distro::Distro::Fedora => Some("/etc/pki/rpm-gpg/RPM-GPG-KEY-fedora"),
         crate::core::env::distro::Distro::Arch | crate::core::env::distro::Distro::Unknown => {
@@ -154,17 +151,13 @@ impl PgpVerifier {
     pub fn from_keyring(path: impl AsRef<Path>) -> Result<Self, PgpError> {
         let path = path.as_ref();
         let path_str = path.display().to_string();
-        let mut file = std::fs::File::open(path).map_err(|source| {
-            if source.kind() == std::io::ErrorKind::NotFound {
-                PgpError::KeyringMissing {
-                    path: path_str.clone(),
-                }
-            } else {
-                PgpError::KeyringOpen {
-                    path: path_str.clone(),
-                    source,
-                }
-            }
+        if !path.exists() {
+            return Err(PgpError::KeyringMissing { path: path_str });
+        }
+
+        let mut file = std::fs::File::open(path).map_err(|source| PgpError::KeyringOpen {
+            path: path_str.clone(),
+            source,
         })?;
         let parser =
             CertParser::from_reader(&mut file).map_err(|source| PgpError::KeyringParse {

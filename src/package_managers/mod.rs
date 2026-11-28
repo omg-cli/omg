@@ -62,7 +62,7 @@ pub use types::{parse_version, parse_version_or_zero, zero_version};
 /// Synchronous CLI readers still need Tokio when a selected backend performs
 /// async subprocess or blocking-worker work. Run it on a separate thread so
 /// callers inside an existing runtime cannot nest a second runtime.
-pub(crate) fn block_on_live<T: Send>(
+fn block_on_live<T: Send>(
     future: impl std::future::Future<Output = anyhow::Result<T>> + Send,
 ) -> anyhow::Result<T> {
     std::thread::scope(|scope| {
@@ -497,7 +497,7 @@ pub use alpm_ops::{
     get_sync_pkg_info, get_update_list, list_orphans_direct,
 };
 #[cfg(feature = "arch")]
-pub use arch::{ArchPackageManager, list_orphans, remove_orphans};
+pub use arch::{ArchPackageManager, is_installed, list_explicit, list_orphans, remove_orphans};
 #[cfg(feature = "arch")]
 pub use aur::{AurClient, AurPackageDetail, search_detailed};
 #[cfg(feature = "arch")]
