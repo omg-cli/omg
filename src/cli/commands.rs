@@ -1750,8 +1750,10 @@ mod tests {
     #[test]
     fn complete_runtime_versions_returns_installed_versions() {
         let dir = tempfile::tempdir().expect("temp dir");
-        std::fs::create_dir_all(dir.path().join("versions/node/20.11.0"))
-            .expect("create installed runtime dir");
+        let version_dir = dir.path().join("versions/node/20.11.0");
+        std::fs::create_dir_all(&version_dir).expect("create installed runtime dir");
+        std::fs::write(version_dir.join(".omg-install-complete"), b"")
+            .expect("write install marker");
         let data_dir = dir.path().to_path_buf();
         temp_env::with_vars(
             [
