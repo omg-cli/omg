@@ -23,7 +23,10 @@ fn prompt(message: &str) -> String {
 /// Returns an error when the token format is invalid or the link
 /// request fails (network, server rejection, or persistence failure).
 pub async fn activate(key: &str) -> Result<()> {
-    if key.len() > 128 || key.chars().any(|c| !c.is_ascii_alphanumeric() && c != '-') {
+    if key.is_empty()
+        || key.len() > 128
+        || key.chars().any(|c| !c.is_ascii_alphanumeric() && c != '-')
+    {
         anyhow::bail!("Invalid dashboard token format");
     }
 
@@ -265,5 +268,17 @@ mod tests {
                 .contains("Invalid license: revoked"),
             "original activation error must be preserved"
         );
+    }
+
+    #[tokio::test]
+    async fn activate_rejects_empty_and_malformed_tokens() {
+        let empty_err = activate("")
+            .await
+            .expect_err("empty dashboard token must be rejected");
+        assert!(empty_err.to_string().contains("Invalid dashboard token"));
+        let bad_err = activate("bad token!")
+            .await
+            .expect_err("malformed dashboard token must be rejected");
+        assert!(bad_err.to_string().contains("Invalid dashboard token"));
     }
 }

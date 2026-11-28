@@ -32,13 +32,6 @@ pub(crate) fn resolve_active_version_in(
     Ok(None)
 }
 
-pub fn ensure_active_version(runtime: &str) -> Result<Option<String>> {
-    if let Some(version) = resolve_active_version(runtime)? {
-        return Ok(Some(version));
-    }
-    Ok(None)
-}
-
 /// Resolve one fresh configuration snapshot for all known runtimes.
 pub(crate) fn active_versions_in(data_dir: &std::path::Path) -> Result<Vec<(String, String)>> {
     let cwd = std::env::current_dir().context("Failed to get current directory")?;
@@ -506,7 +499,7 @@ pub async fn list_versions(runtime: Option<&str>, available: bool, json: bool) -
 
     // `!available` already returned above, so all arms here list remote versions
     match canonical_runtime_name(rt).as_str() {
-        "node" | "nodejs" => {
+        "node" => {
             let mgr = NodeManager::new();
             println!("{} Available remote versions:", style::informative("→"));
             for v in mgr.list_available().await?.iter().take(20) {
@@ -534,7 +527,7 @@ pub async fn list_versions(runtime: Option<&str>, available: bool, json: bool) -
                 ui::print_list_item(&v.version, Some(&v.channel));
             }
         }
-        "go" | "golang" => {
+        "go" => {
             let mgr = GoManager::new();
             println!("{} Available remote versions:", style::informative("→"));
             for v in mgr.list_available().await?.iter().take(20) {
@@ -552,7 +545,7 @@ pub async fn list_versions(runtime: Option<&str>, available: bool, json: bool) -
                 ui::print_list_item(&v.version, None);
             }
         }
-        "java" | "jdk" => {
+        "java" => {
             let mgr = JavaManager::new();
             println!(
                 "{} Available remote versions (Adoptium):",
@@ -563,7 +556,7 @@ pub async fn list_versions(runtime: Option<&str>, available: bool, json: bool) -
                 ui::print_list_item(&v.version, Some(lts));
             }
         }
-        "bun" | "bunjs" => {
+        "bun" => {
             let mgr = BunManager::new();
             println!("{} Available remote versions:", style::informative("→"));
             for v in mgr.list_available().await?.iter().take(20) {

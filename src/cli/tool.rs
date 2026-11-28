@@ -1364,6 +1364,9 @@ pub async fn remove(name: &str) -> Result<()> {
                 .into_iter()
                 .map(|manager| (manager, tools_dir.join(manager).join(name))),
         );
+        if name.contains('/') {
+            candidates.push(("npm", tools_dir.join("npm").join(name.replace('/', "__"))));
+        }
     }
 
     let mut found = false;
@@ -3396,5 +3399,30 @@ esac
                 output.stdout
             );
         }
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn remove_handles_scoped_npm_package_storage_dir() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let scoped_dir = dir.path().join("tools/npm/@acme__cli");
+        fs::create_dir_all(&scoped_dir).expect("create scoped npm dir");
+        let data_dir = dir.path().to_path_buf();
+        temp_env::with_vars(
+            [
+                ("OMG_TEST_MODE", Some(std::ffi::OsStr::new("1"))),
+                ("OMG_DATA_DIR", Some(data_dir.as_os_str())),
+            ],
+            || {
+                tokio::runtime::Runtime::new()
+                    .expect("tokio runtime")
+                    .block_on(remove("@acme/cli"))
+                    .expect("scoped npm tool stored as @acme__cli must be removable");
+            },
+        );
+        assert!(
+            !scoped_dir.exists(),
+            "scoped npm install directory must be deleted"
+        );
     }
 }

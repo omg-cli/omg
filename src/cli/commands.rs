@@ -427,8 +427,7 @@ fn complete_runtime_versions(
     let installed_versions = crate::runtimes::common::list_installed_versions(&runtime_dir)
         .with_context(|| format!("Failed to list installed {runtime} versions for completion"))?;
 
-    let fuzzy_installed = engine.fuzzy_match(current, installed_versions);
-    suggestions.extend(fuzzy_installed);
+    suggestions.extend(installed_versions);
     let mut seen = std::collections::HashSet::new();
     suggestions.retain(|suggestion| seen.insert(suggestion.clone()));
     Ok(engine.fuzzy_match(current, suggestions))
@@ -1744,6 +1743,29 @@ mod tests {
         assert_eq!(
             catalog_completion_names(Backend::Fedora, Vec::from(candidates)),
             ["widget.lib.i686", "widget.lib.x86_64"]
+        );
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn complete_runtime_versions_returns_installed_versions() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let version_dir = dir.path().join("versions/node/20.11.0");
+        std::fs::create_dir_all(&version_dir).expect("create installed runtime dir");
+        std::fs::write(version_dir.join(".omg-install-complete"), b"")
+            .expect("write install marker");
+        let data_dir = dir.path().to_path_buf();
+        temp_env::with_vars(
+            [
+                ("OMG_TEST_MODE", Some(std::ffi::OsStr::new("1"))),
+                ("OMG_DATA_DIR", Some(data_dir.as_os_str())),
+            ],
+            || {
+                let engine = crate::core::completion::CompletionEngine::new();
+                let results = complete_runtime_versions(&engine, "20", "node")
+                    .expect("complete node versions");
+                assert!(results.iter().any(|version| version == "20.11.0"));
+            },
         );
     }
 
