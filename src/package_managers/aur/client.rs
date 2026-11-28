@@ -4857,11 +4857,13 @@ mod tests {
             (vec![row("x"), row("x")], Some("duplicate package")),
         ] {
             let has_rows = !rows.is_empty();
-            let body = serde_json::to_vec(&serde_json::json!({"type": "multiinfo", "results": rows}))?;
+            let body =
+                serde_json::to_vec(&serde_json::json!({"type": "multiinfo", "results": rows}))?;
             let (endpoint, server) =
                 rpc_body_server_with_path(body, false, Some("/rpc?v=5&type=info&arg[]=x")).await?;
             let result =
-                tokio::time::timeout(Duration::from_secs(5), info_detailed_at(&endpoint, "x")).await?;
+                tokio::time::timeout(Duration::from_secs(5), info_detailed_at(&endpoint, "x"))
+                    .await?;
             match expected {
                 Some(message) => assert!(result.expect_err(message).to_string().contains(message)),
                 None if has_rows => {
@@ -5040,7 +5042,8 @@ mod tests {
         use crate::package_managers::{Backend, mock::MockPackageManager};
 
         const CASE: &str = "package_managers::aur::client::tests::cached_aur_upgrade_reaches_service_and_cli_update_views";
-        if crate::core::testing::run_isolated_test(CASE) || Settings::rerun_test_unprivileged(CASE) {
+        if crate::core::testing::run_isolated_test(CASE) || Settings::rerun_test_unprivileged(CASE)
+        {
             return Ok(());
         }
         let fixture = S72Fixture::new(&["aur-update-demo"])?;
@@ -5076,7 +5079,8 @@ mod tests {
     #[test]
     fn aur_metadata_reader_lock_failure_preserves_generation() -> Result<()> {
         const TEST: &str = "package_managers::aur::client::tests::aur_metadata_reader_lock_failure_preserves_generation";
-        if crate::core::testing::run_isolated_test(TEST) || Settings::rerun_test_unprivileged(TEST) {
+        if crate::core::testing::run_isolated_test(TEST) || Settings::rerun_test_unprivileged(TEST)
+        {
             return Ok(());
         }
         let fixture = S72Fixture::new(&["installed-demo"])?;
@@ -5158,7 +5162,8 @@ mod tests {
     #[test]
     fn aur_metadata_task_completion_preserves_snapshots_and_falls_back() -> Result<()> {
         const TEST: &str = "package_managers::aur::client::tests::aur_metadata_task_completion_preserves_snapshots_and_falls_back";
-        if crate::core::testing::run_isolated_test(TEST) || Settings::rerun_test_unprivileged(TEST) {
+        if crate::core::testing::run_isolated_test(TEST) || Settings::rerun_test_unprivileged(TEST)
+        {
             return Ok(());
         }
         let fixture = S72Fixture::new(&[])?;
@@ -5236,7 +5241,8 @@ mod tests {
     #[test]
     fn aur_official_dependencies_reject_oversized_install_request_before_mutation() -> Result<()> {
         const TEST: &str = "package_managers::aur::client::tests::aur_official_dependencies_reject_oversized_install_request_before_mutation";
-        if crate::core::testing::run_isolated_test(TEST) || Settings::rerun_test_unprivileged(TEST) {
+        if crate::core::testing::run_isolated_test(TEST) || Settings::rerun_test_unprivileged(TEST)
+        {
             return Ok(());
         }
         let fixture = S72Fixture::new(&["installed-demo"])?;
@@ -5337,7 +5343,8 @@ mod tests {
     #[test]
     fn aur_updates_empty_local_catalog_does_not_require_index_or_rpc() -> Result<()> {
         const TEST: &str = "package_managers::aur::client::tests::aur_updates_empty_local_catalog_does_not_require_index_or_rpc";
-        if crate::core::testing::run_isolated_test(TEST) || Settings::rerun_test_unprivileged(TEST) {
+        if crate::core::testing::run_isolated_test(TEST) || Settings::rerun_test_unprivileged(TEST)
+        {
             return Ok(());
         }
         let fixture = S72Fixture::new(&[])?;
@@ -5374,7 +5381,8 @@ mod tests {
             assert!(!metadata_path().exists() && !index_path().exists());
             let before = fixture.local_bytes()?;
             let result =
-                tokio::time::timeout(Duration::from_secs(2), fixture.client().get_update_list()).await;
+                tokio::time::timeout(Duration::from_secs(2), fixture.client().get_update_list())
+                    .await;
             let updates = result.expect("ignored-only update check must complete without RPC")?;
             assert!(updates.is_empty());
             assert_eq!(fixture.local_bytes()?, before);
@@ -5384,8 +5392,10 @@ mod tests {
 
     #[test]
     fn aur_rpc_updates_use_one_installed_snapshot() -> Result<()> {
-        let test = "package_managers::aur::client::tests::aur_rpc_updates_use_one_installed_snapshot";
-        if crate::core::testing::run_isolated_test(test) || Settings::rerun_test_unprivileged(test) {
+        let test =
+            "package_managers::aur::client::tests::aur_rpc_updates_use_one_installed_snapshot";
+        if crate::core::testing::run_isolated_test(test) || Settings::rerun_test_unprivileged(test)
+        {
             return Ok(());
         }
         let fixture = S72Fixture::new(&["aur-demo"])?;
@@ -5420,9 +5430,11 @@ mod tests {
             });
             let updates = tokio::time::timeout(
                 Duration::from_secs(5),
-                fixture
-                    .client()
-                    .query_aur_updates_at(&endpoint, &["aur-demo".to_owned()], installed),
+                fixture.client().query_aur_updates_at(
+                    &endpoint,
+                    &["aur-demo".to_owned()],
+                    installed,
+                ),
             )
             .await??;
             tokio::time::timeout(Duration::from_secs(5), server).await???;
@@ -5498,7 +5510,8 @@ mod tests {
             )
             .await?;
             tokio::time::timeout(Duration::from_secs(5), server).await???;
-            let error = result.expect_err("RPC must not relabel an installed official package as AUR");
+            let error =
+                result.expect_err("RPC must not relabel an installed official package as AUR");
             assert!(
                 format!("{error:#}").contains("AUR RPC response was invalid"),
                 "{error:#}"
@@ -5536,7 +5549,8 @@ mod tests {
                 anyhow::ensure!(stream.read(&mut request).await? > 0, "empty request");
             }
             let mut wire = if chunked {
-                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n".to_vec()
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+                    .to_vec()
             } else {
                 format!(
                     "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -5612,7 +5626,8 @@ mod tests {
 
     #[tokio::test]
     async fn aur_rpc_body_limit_rejects_chunked_json_without_content_length() -> Result<()> {
-        let (endpoint, server) = rpc_body_server(rpc_json_of_size(16 * 1024 * 1024 + 1), true).await?;
+        let (endpoint, server) =
+            rpc_body_server(rpc_json_of_size(16 * 1024 * 1024 + 1), true).await?;
         let response = reqwest::Client::builder()
             .no_proxy()
             .build()?
@@ -5874,8 +5889,8 @@ mod tests {
 
     #[test]
     fn live_antigravity_checkout_is_reviewable_when_present() -> Result<()> {
-        let path =
-            PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".cache/omg/aur/antigravity");
+        let path = PathBuf::from(std::env::var("HOME").unwrap_or_default())
+            .join(".cache/omg/aur/antigravity");
         if !path.join("PKGBUILD").is_file() {
             return Ok(());
         }
@@ -5944,8 +5959,8 @@ mod tests {
 
     #[test]
     fn historical_rebuild_version_must_predate_the_installed_package() -> Result<()> {
-        let installed =
-            crate::package_managers::types::parse_version("2:3-1").expect("fixture package version");
+        let installed = crate::package_managers::types::parse_version("2:3-1")
+            .expect("fixture package version");
         let validate =
             |version| AurClient::check_rebuilt_rollback_version("demo", version, Some(&installed));
         validate("2:2-1")?;
@@ -5998,7 +6013,8 @@ mod tests {
             .is_err()
         );
         // The previously approved snapshot still carries the original bytes.
-        let identity = AurClient::cached_archive_identity(Path::new(&accepted[0].handoff()))?.unwrap();
+        let identity =
+            AurClient::cached_archive_identity(Path::new(&accepted[0].handoff()))?.unwrap();
         assert_eq!(
             identity.install_script.as_deref(),
             Some("post_install() { :; }\n")
@@ -6006,7 +6022,8 @@ mod tests {
         std::fs::write(directory.path().join("demo.install"), "changed")?;
         assert!(source.verify(directory.path()).is_err());
         assert!(
-            AurClient::authorize_archives(&[], &source, "demo", &["demo".to_owned()], true).is_err()
+            AurClient::authorize_archives(&[], &source, "demo", &["demo".to_owned()], true)
+                .is_err()
         );
         Ok(())
     }
@@ -6100,9 +6117,10 @@ mod tests {
 
     #[test]
     fn aur_rpc_success_envelope_still_decodes() {
-        let response =
-            decode_aur_rpc_body::<AurResponse>(br#"{"type":"search","resultcount":0,"results":[]}"#)
-                .expect("valid AUR RPC response");
+        let response = decode_aur_rpc_body::<AurResponse>(
+            br#"{"type":"search","resultcount":0,"results":[]}"#,
+        )
+        .expect("valid AUR RPC response");
 
         assert!(response.results.is_empty());
         let response = decode_aur_rpc_body::<AurResponse>(&s72_rpc_json(&[("aur-demo", "2.0-1")]))
@@ -6209,9 +6227,13 @@ mod tests {
         for name in ["docker-debug", "docker-debug-tools"] {
             let archive = write_discovery_archive(directory.path(), name, name);
             assert_eq!(
-                AurClient::find_built_packages(directory.path(), directory.path(), &[name.to_string()])
-                    .await
-                    .unwrap(),
+                AurClient::find_built_packages(
+                    directory.path(),
+                    directory.path(),
+                    &[name.to_string()]
+                )
+                .await
+                .unwrap(),
                 vec![archive]
             );
         }
@@ -6578,7 +6600,8 @@ mod tests {
 
         // Same for a dangling symlink (e.g. points into an unmounted /run).
         let dangling = temp.path().join("dangling");
-        std::os::unix::fs::symlink(temp.path().join("unmounted/run/resolv.conf"), &dangling).unwrap();
+        std::os::unix::fs::symlink(temp.path().join("unmounted/run/resolv.conf"), &dangling)
+            .unwrap();
         let mut command = Command::new("bwrap");
         configure_sandbox_resolver_at(&mut command, &dangling).unwrap();
         assert_eq!(command.as_std().get_args().count(), 0);
@@ -6972,7 +6995,8 @@ mod tests {
             .join("\n");
         let digest = pkgbuild_digest(review.as_bytes());
         let path = std::path::Path::new("/cache/aur/chatgpt-desktop/PKGBUILD");
-        let panel = pkgbuild_review_panel("chatgpt-desktop", &digest, &review, path, &[], &[], false);
+        let panel =
+            pkgbuild_review_panel("chatgpt-desktop", &digest, &review, path, &[], &[], false);
 
         assert!(panel.contains("line0=value"));
         assert!(panel.contains("line7=value"));
@@ -7267,7 +7291,9 @@ mod tests {
                 "timeout" => "native_build_timeout_terminates_descendants",
                 "capture" => "native_build_capture_failure_terminates_descendants",
                 "cancel" => "native_build_cancellation_terminates_descendants",
-                "cancel-delayed" => "native_build_delayed_startup_cancellation_terminates_descendants",
+                "cancel-delayed" => {
+                    "native_build_delayed_startup_cancellation_terminates_descendants"
+                }
                 "startup-failure" => "native_build_startup_failure_reports_exit_status",
                 "status" => "native_build_preserves_exit_status",
                 _ => anyhow::bail!("unknown native probe mode: {mode}"),
@@ -7308,7 +7334,9 @@ mod tests {
                     probe_group > 0,
                     "native {mode} probe expected a visible inherited group; actual PID {probe_pid}, PGID {probe_group}"
                 ),
-                _ => anyhow::bail!("{EXPECT_PARENT_GROUP} must be 'zero' or 'nonzero' when configured"),
+                _ => anyhow::bail!(
+                    "{EXPECT_PARENT_GROUP} must be 'zero' or 'nonzero' when configured"
+                ),
             }
         }
         nix::sys::prctl::set_child_subreaper(true)?;
@@ -7677,7 +7705,8 @@ mod tests {
     #[test]
     fn reviewed_dependency_consumers_use_captured_metadata_after_checkout_changes() -> Result<()> {
         const TEST: &str = "package_managers::aur::client::tests::reviewed_dependency_consumers_use_captured_metadata_after_checkout_changes";
-        if crate::core::testing::run_isolated_test(TEST) || Settings::rerun_test_unprivileged(TEST) {
+        if crate::core::testing::run_isolated_test(TEST) || Settings::rerun_test_unprivileged(TEST)
+        {
             return Ok(());
         }
         let fixture = S72Fixture::new(&[])?;
@@ -7768,7 +7797,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn build_only_inner_refuses_an_invalid_package_before_creating_a_checkout() -> Result<()> {
+    async fn build_only_inner_refuses_an_invalid_package_before_creating_a_checkout() -> Result<()>
+    {
         const TEST: &str = "package_managers::aur::client::tests::build_only_inner_refuses_an_invalid_package_before_creating_a_checkout";
         if Settings::rerun_test_unprivileged(TEST) {
             return Ok(());
@@ -8279,7 +8309,8 @@ mod tests {
         };
         let source_and_key = || {
             let source = ReviewedSource::capture(dir.path()).unwrap();
-            let key = client.paired_build_cache_key(&source, &env, std::slice::from_ref(&inspection));
+            let key =
+                client.paired_build_cache_key(&source, &env, std::slice::from_ref(&inspection));
             (source.digest, key)
         };
         let before = source_and_key();
@@ -8449,7 +8480,8 @@ mod tests {
                 .await
                 .is_err()
         );
-        std::os::unix::fs::symlink(&poison, second.pkgdest.join(poison.file_name().unwrap())).unwrap();
+        std::os::unix::fs::symlink(&poison, second.pkgdest.join(poison.file_name().unwrap()))
+            .unwrap();
         assert!(
             AurClient::find_built_packages(checkout.path(), &second.pkgdest, &names)
                 .await
@@ -8573,8 +8605,9 @@ mod tests {
     /// Build an architecture-independent fixture so provenance tests exercise
     /// the selected identity/hook defect rather than missing architecture.
     fn write_pkg_archive(path: &Path, pkginfo: &str, install: Option<&str>) {
-        let pkginfo =
-            format!("arch = any\npackager = Fixture Maintainer <fixture@example.invalid>\n{pkginfo}");
+        let pkginfo = format!(
+            "arch = any\npackager = Fixture Maintainer <fixture@example.invalid>\n{pkginfo}"
+        );
         let field = |name: &str| {
             pkginfo
                 .lines()
@@ -8600,7 +8633,11 @@ mod tests {
 
     /// A reviewed checkout: `.SRCINFO` matching the PKGBUILD plus the
     /// install script it declares.
-    fn provenance_pkg_dir(dir: &Path, srcinfo: &str, install_file: Option<(&str, &str)>) -> PathBuf {
+    fn provenance_pkg_dir(
+        dir: &Path,
+        srcinfo: &str,
+        install_file: Option<(&str, &str)>,
+    ) -> PathBuf {
         let pkg_dir = dir.join("mypkg");
         std::fs::create_dir(&pkg_dir).expect("pkg dir");
         let (base, rest) = srcinfo
@@ -8666,28 +8703,35 @@ mod tests {
                 .map(|(name, _)| (*name).to_owned())
                 .collect::<Vec<_>>();
             // This is the production final authorization boundary, before install.
-            let authorized = AurClient::authorize_archives(&paths, &source, "split", &outputs, true);
+            let authorized =
+                AurClient::authorize_archives(&paths, &source, "split", &outputs, true);
             if accepted {
                 let authorized = authorized?;
                 assert_eq!(authorized.len(), requested.len());
                 for (snapshot, (name, architecture)) in authorized.iter().zip(requested) {
-                    let identity = AurClient::cached_archive_identity(Path::new(&snapshot.handoff()))?
-                        .expect("sealed accepted archive must retain its actual metadata");
+                    let identity =
+                        AurClient::cached_archive_identity(Path::new(&snapshot.handoff()))?
+                            .expect("sealed accepted archive must retain its actual metadata");
                     assert_eq!(identity.name, *name);
                     assert_eq!(identity.base, "split");
                     assert_eq!(identity.version, "1.0-1");
                     assert_eq!(identity.architecture.as_deref(), Some(*architecture));
                 }
             } else {
-                let error = authorized.expect_err("wrong selected-output architecture must be refused");
+                let error =
+                    authorized.expect_err("wrong selected-output architecture must be refused");
                 assert_eq!(
                     error.to_string(),
                     "AUR archive architecture is not approved for this host"
                 );
             }
             // Retained legacy metadata check is cfg(test), not production reuse.
-            let cached =
-                AurClient::select_cached_artifacts(paths.clone(), &outputs, source_dir.path(), "split");
+            let cached = AurClient::select_cached_artifacts(
+                paths.clone(),
+                &outputs,
+                source_dir.path(),
+                "split",
+            );
             if accepted {
                 assert_eq!(cached, Some(paths.clone()));
             } else {
@@ -8774,7 +8818,11 @@ mod tests {
         let srcinfo = format!(
             "pkgbase = split\n\tpkgver = 1.0\n\tpkgrel = 1\n\tarch = {host}\npkgname = app\npkgname = docs\n\tarch = any\n"
         );
-        assert_split_architecture_authorization(&srcinfo, &[("app", &host), ("docs", "any")], true)?;
+        assert_split_architecture_authorization(
+            &srcinfo,
+            &[("app", &host), ("docs", "any")],
+            true,
+        )?;
         assert_split_architecture_authorization(&srcinfo, &[("app", &host), ("docs", &host)], false)
     }
 
@@ -8951,8 +8999,13 @@ mod tests {
             None,
         );
         assert!(
-            AurClient::select_cached_artifacts(vec![libs.clone(), app], &outputs, &pkg_dir, "shared")
-                .is_none(),
+            AurClient::select_cached_artifacts(
+                vec![libs.clone(), app],
+                &outputs,
+                &pkg_dir,
+                "shared"
+            )
+            .is_none(),
             "archives must correspond to their requested outputs in order",
         );
         assert!(
@@ -9404,13 +9457,14 @@ mod tests {
     #[test]
     fn require_fetchable_pgp_key_id_accepts_long_and_fingerprint() {
         require_fetchable_pgp_key_id("ABCDEF1234567890").expect("long key id");
-        require_fetchable_pgp_key_id("ABCDEF1234567890ABCDEF1234567890ABCDEF12").expect("fingerprint");
+        require_fetchable_pgp_key_id("ABCDEF1234567890ABCDEF1234567890ABCDEF12")
+            .expect("fingerprint");
     }
 
     #[test]
     fn require_fetchable_pgp_key_id_rejects_short_and_invalid() {
-        let short =
-            require_fetchable_pgp_key_id("ABCDEF12").expect_err("short key ids must not be skipped");
+        let short = require_fetchable_pgp_key_id("ABCDEF12")
+            .expect_err("short key ids must not be skipped");
         assert!(
             short.to_string().contains("short PGP key ID"),
             "got: {short}"
@@ -9869,8 +9923,8 @@ mod tests {
     #[test]
     fn aur_builds_reject_root_and_accept_an_unprivileged_user() {
         require_unprivileged_builder("example", false).expect("regular user");
-        let error =
-            require_unprivileged_builder("example", true).expect_err("root builds must be rejected");
+        let error = require_unprivileged_builder("example", true)
+            .expect_err("root builds must be rejected");
         assert!(error.to_string().contains("must not be built as root"));
         assert!(error.to_string().contains("omg install example"));
     }
@@ -10258,8 +10312,9 @@ mod tests {
                         }),
                         "rebuilt archive must reach the installation boundary: {error:#}"
                     );
-                    let audit = std::fs::read_to_string(paths::data_dir().join("audit/audit.jsonl"))
-                        .expect("read the isolated rollback audit log");
+                    let audit =
+                        std::fs::read_to_string(paths::data_dir().join("audit/audit.jsonl"))
+                            .expect("read the isolated rollback audit log");
                     let entries = audit
                         .lines()
                         .map(serde_json::from_str::<crate::core::security::audit::AuditEntry>)
@@ -10508,7 +10563,8 @@ mod tests {
         let repo = fixture.path().join("source");
         std::fs::create_dir(&repo)?;
         let pkgbuild = "pkgname=demo\npkgver=1\npkgrel=1\narch=(any)\npkgdesc='Historical release fixture'\nlicense=(MIT)\npkgver() { echo 2; }\npackage() { install -Dm644 /dev/null \"$pkgdir/usr/share/demo/empty\"; }\n";
-        let srcinfo = "pkgbase = demo\n\tpkgver = 1\n\tpkgrel = 1\n\tarch = any\n\npkgname = demo\n";
+        let srcinfo =
+            "pkgbase = demo\n\tpkgver = 1\n\tpkgrel = 1\n\tarch = any\n\npkgname = demo\n";
         std::fs::write(repo.join("PKGBUILD"), pkgbuild)?;
         std::fs::write(repo.join(".SRCINFO"), srcinfo)?;
         let git = crate::core::privilege::root_controlled_program_path("git")?;
@@ -10614,7 +10670,8 @@ mod tests {
         test: &str,
         body: impl FnOnce(&tokio::runtime::Runtime, &Path) -> Result<()>,
     ) -> Result<()> {
-        if Settings::rerun_test_unprivileged(test) || crate::core::testing::run_isolated_test(test) {
+        if Settings::rerun_test_unprivileged(test) || crate::core::testing::run_isolated_test(test)
+        {
             return Ok(());
         }
         let fixture = private_fixture_dir()?;
@@ -10870,9 +10927,12 @@ mod tests {
                     "[aur]\nsecurity_profile = 'hardened'\n",
                 )
                 .expect("switch the isolated fixture to the Hardened AUR profile");
-                let error = AurClient::install_built_packages(std::slice::from_ref(&accepted), None)
-                    .await
-                    .expect_err("standard build evidence must not satisfy the newly hardened profile");
+                let error =
+                    AurClient::install_built_packages(std::slice::from_ref(&accepted), None)
+                        .await
+                        .expect_err(
+                            "standard build evidence must not satisfy the newly hardened profile",
+                        );
                 assert!(
                     error
                         .to_string()
@@ -10889,7 +10949,9 @@ mod tests {
                 ];
                 let error = AurClient::install_built_packages(&wave, None)
                     .await
-                    .expect_err("a hardened first batch must not authorize a standard second batch");
+                    .expect_err(
+                        "a hardened first batch must not authorize a standard second batch",
+                    );
                 assert!(
                     error
                         .to_string()
@@ -10945,8 +11007,9 @@ mod tests {
                 .expect("a missing candidate allows lookup in the next repository"),
             None
         );
-        let error = optional_official_package::<()>("core", "helper", Err(alpm::Error::DbInvalidSig))
-            .expect_err("invalid repository signatures must stop reconciliation");
+        let error =
+            optional_official_package::<()>("core", "helper", Err(alpm::Error::DbInvalidSig))
+                .expect_err("invalid repository signatures must stop reconciliation");
         assert_eq!(error.to_string(), "Failed to inspect 'core/helper'");
         assert_eq!(
             error.downcast_ref::<alpm::Error>(),
@@ -10957,7 +11020,8 @@ mod tests {
     #[test]
     fn review_official_classification_requires_complete_install_catalog() -> Result<()> {
         const TEST: &str = "package_managers::aur::client::tests::review_official_classification_requires_complete_install_catalog";
-        if crate::core::testing::run_isolated_test(TEST) || Settings::rerun_test_unprivileged(TEST) {
+        if crate::core::testing::run_isolated_test(TEST) || Settings::rerun_test_unprivileged(TEST)
+        {
             return Ok(());
         }
         let fixture = S72Fixture::new(&[])?;
@@ -11018,7 +11082,8 @@ mod tests {
     #[test]
     fn review_official_plan_combines_constraints_for_one_selected_identity() -> Result<()> {
         const TEST: &str = "package_managers::aur::client::tests::review_official_plan_combines_constraints_for_one_selected_identity";
-        if crate::core::testing::run_isolated_test(TEST) || Settings::rerun_test_unprivileged(TEST) {
+        if crate::core::testing::run_isolated_test(TEST) || Settings::rerun_test_unprivileged(TEST)
+        {
             return Ok(());
         }
         let fixture = S72Fixture::new(&[])?;
@@ -11065,7 +11130,8 @@ mod tests {
     #[test]
     fn review_queued_install_rechecks_current_profile_before_elevation() -> Result<()> {
         const TEST: &str = "package_managers::aur::client::tests::review_queued_install_rechecks_current_profile_before_elevation";
-        if crate::core::testing::run_isolated_test(TEST) || Settings::rerun_test_unprivileged(TEST) {
+        if crate::core::testing::run_isolated_test(TEST) || Settings::rerun_test_unprivileged(TEST)
+        {
             return Ok(());
         }
         let directory = private_fixture_dir()?;
@@ -11095,10 +11161,12 @@ mod tests {
                     .enable_all()
                     .build()?
                     .block_on(async {
-                        let control =
-                            AurClient::install_built_packages(std::slice::from_ref(&standard), None)
-                                .await
-                                .expect_err("the admitted Standard control reaches inert elevation");
+                        let control = AurClient::install_built_packages(
+                            std::slice::from_ref(&standard),
+                            None,
+                        )
+                        .await
+                        .expect_err("the admitted Standard control reaches inert elevation");
                         assert!(
                             format!("{control:#}")
                                 .contains("Privilege elevation not supported in development mode"),
@@ -11355,7 +11423,8 @@ mod tests {
     #[test]
     fn final_install_rechecks_current_hardened_profile_before_elevation() -> Result<()> {
         const TEST: &str = "package_managers::aur::client::tests::final_install_rechecks_current_hardened_profile_before_elevation";
-        if Settings::rerun_test_unprivileged(TEST) || crate::core::testing::run_isolated_test(TEST) {
+        if Settings::rerun_test_unprivileged(TEST) || crate::core::testing::run_isolated_test(TEST)
+        {
             return Ok(());
         }
         let directory = private_fixture_dir()?;
@@ -11504,7 +11573,10 @@ mod update_error_tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    async fn update_error_from_reply(reply: Option<&[u8]>, attempts: usize) -> Result<anyhow::Error> {
+    async fn update_error_from_reply(
+        reply: Option<&[u8]>,
+        attempts: usize,
+    ) -> Result<anyhow::Error> {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let endpoint = format!("http://{}/rpc", listener.local_addr()?);
         let reply = reply.map(<[u8]>::to_vec);

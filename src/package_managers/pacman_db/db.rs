@@ -2486,7 +2486,8 @@ mod tests {
             "1.2.3.r45.gabcdef-2.1",
             "42:1.0+git.20261113-3",
         ] {
-            let full = alpm_types::FullVersion::from_str(text).expect("valid official version fixture");
+            let full =
+                alpm_types::FullVersion::from_str(text).expect("valid official version fixture");
             let round_trip = require_package_version(&full.to_string()).unwrap();
             let converted = Version::from(full);
             assert!(
@@ -2911,7 +2912,10 @@ mod tests {
             |db| {
                 let sync_dir = db.join("sync");
                 let sync = "%NAME%\nwidget\n\n%VERSION%\n2-1\n\n%NAME%\nwidget\n\n";
-                write_sync_identity_fixture(&sync_dir.join("core.db"), &[("widget-2-1/desc", sync)]);
+                write_sync_identity_fixture(
+                    &sync_dir.join("core.db"),
+                    &[("widget-2-1/desc", sync)],
+                );
                 let old_sync = DbCache {
                     packages: vec![RepositoryPackages {
                         name: "core".into(),
@@ -2930,7 +2934,8 @@ mod tests {
                     ..DbCache::default()
                 };
                 save_cache_to_disk(&old_sync, "sync_db_source_v4").unwrap();
-                let error = check_updates_cached().expect_err("validate source before showing updates");
+                let error =
+                    check_updates_cached().expect_err("validate source before showing updates");
                 assert!(format!("{error:#}").contains("Duplicate descriptor section %NAME%"));
 
                 let local_dir = db.join("local");
@@ -3420,7 +3425,8 @@ mod tests {
     #[test]
     fn local_fallback_rejects_repeated_descriptor_sections_and_values() {
         let descriptor = "%NAME%\nwidget\n\n%VERSION%\n1-1\n\n%LICENSE%\nMIT\nBSD-2-Clause\n\n";
-        let ordinary = parse_local_desc_content(descriptor).expect("valid sparse installed metadata");
+        let ordinary =
+            parse_local_desc_content(descriptor).expect("valid sparse installed metadata");
         assert_eq!(ordinary.licenses, ["MIT", "BSD-2-Clause"]);
         for (malformed, expected) in [
             (
@@ -3804,8 +3810,10 @@ mod tests {
     #[test]
     fn sync_database_fifo_is_refused_without_waiting_for_a_writer() {
         const TEST: &str = "package_managers::pacman_db::db::tests::sync_database_fifo_is_refused_without_waiting_for_a_writer";
-        if crate::core::testing::run_isolated_test_with_timeout(TEST, std::time::Duration::from_secs(1))
-        {
+        if crate::core::testing::run_isolated_test_with_timeout(
+            TEST,
+            std::time::Duration::from_secs(1),
+        ) {
             return;
         }
         let directory = tempfile::tempdir().unwrap();
@@ -3829,18 +3837,18 @@ mod tests {
         fs::create_dir(database.join("sync"))?;
         fs::write(database.join("local/ALPM_DB_VERSION"), "9\n")?;
         let compressed = [
-            66, 90, 104, 57, 49, 65, 89, 38, 83, 89, 55, 125, 43, 15, 0, 0, 177, 95, 128, 204, 144, 66,
-            3, 255, 3, 47, 103, 221, 16, 127, 173, 94, 114, 4, 8, 48, 0, 185, 33, 170, 102, 166, 147,
-            212, 211, 212, 0, 61, 65, 163, 65, 181, 27, 77, 70, 77, 27, 72, 208, 195, 67, 64, 0, 0,
-            104, 0, 0, 0, 1, 37, 33, 161, 26, 100, 104, 208, 3, 65, 160, 0, 13, 3, 77, 177, 85, 11, 1,
-            4, 45, 16, 33, 235, 80, 12, 172, 235, 200, 16, 192, 109, 20, 252, 130, 94, 87, 6, 64, 5,
-            164, 18, 83, 97, 250, 39, 89, 231, 112, 219, 93, 42, 153, 28, 99, 21, 158, 209, 187, 38,
-            73, 146, 91, 165, 67, 113, 196, 192, 107, 142, 231, 245, 150, 84, 44, 96, 228, 184, 213,
-            206, 93, 163, 114, 216, 210, 130, 23, 4, 52, 55, 95, 25, 220, 107, 228, 138, 19, 10, 78,
-            20, 84, 13, 78, 46, 176, 35, 57, 226, 50, 141, 147, 46, 43, 193, 38, 9, 143, 131, 5, 100,
-            255, 84, 204, 5, 108, 136, 93, 97, 223, 117, 160, 78, 235, 70, 55, 156, 126, 3, 188, 46,
-            91, 27, 80, 76, 31, 171, 5, 69, 231, 240, 36, 131, 248, 187, 146, 41, 194, 132, 129, 187,
-            233, 88, 120,
+            66, 90, 104, 57, 49, 65, 89, 38, 83, 89, 55, 125, 43, 15, 0, 0, 177, 95, 128, 204, 144,
+            66, 3, 255, 3, 47, 103, 221, 16, 127, 173, 94, 114, 4, 8, 48, 0, 185, 33, 170, 102,
+            166, 147, 212, 211, 212, 0, 61, 65, 163, 65, 181, 27, 77, 70, 77, 27, 72, 208, 195, 67,
+            64, 0, 0, 104, 0, 0, 0, 1, 37, 33, 161, 26, 100, 104, 208, 3, 65, 160, 0, 13, 3, 77,
+            177, 85, 11, 1, 4, 45, 16, 33, 235, 80, 12, 172, 235, 200, 16, 192, 109, 20, 252, 130,
+            94, 87, 6, 64, 5, 164, 18, 83, 97, 250, 39, 89, 231, 112, 219, 93, 42, 153, 28, 99, 21,
+            158, 209, 187, 38, 73, 146, 91, 165, 67, 113, 196, 192, 107, 142, 231, 245, 150, 84,
+            44, 96, 228, 184, 213, 206, 93, 163, 114, 216, 210, 130, 23, 4, 52, 55, 95, 25, 220,
+            107, 228, 138, 19, 10, 78, 20, 84, 13, 78, 46, 176, 35, 57, 226, 50, 141, 147, 46, 43,
+            193, 38, 9, 143, 131, 5, 100, 255, 84, 204, 5, 108, 136, 93, 97, 223, 117, 160, 78,
+            235, 70, 55, 156, 126, 3, 188, 46, 91, 27, 80, 76, 31, 171, 5, 69, 231, 240, 36, 131,
+            248, 187, 146, 41, 194, 132, 129, 187, 233, 88, 120,
         ];
         let source = database.join("sync/core.db");
         fs::write(&source, compressed)?;
@@ -4190,7 +4198,9 @@ mod tests {
 
         let local_path = temp.path().join("desc");
         std::fs::write(&local_path, oversized).unwrap();
-        assert!(format!("{:#}", parse_local_desc(&local_path).unwrap_err()).contains("desc exceeds"));
+        assert!(
+            format!("{:#}", parse_local_desc(&local_path).unwrap_err()).contains("desc exceeds")
+        );
     }
 
     #[test]
@@ -4592,7 +4602,8 @@ mod tests {
             (&marker, "Literal %XDATA% marker", false),
             (&explicit, "Offline metadata fixture", true),
         ] {
-            let parsed = parse_local_desc_content(body).expect("official local metadata must parse");
+            let parsed =
+                parse_local_desc_content(body).expect("official local metadata must parse");
             assert_eq!(parsed.name, "widget");
             assert_eq!(parsed.desc, description);
             assert_eq!(parsed.version.to_string(), "1:2.3-1");
@@ -4783,7 +4794,8 @@ mod tests {
         fs::write(&future, b"future")?;
         fs::write(&changed, b"before")?;
         File::open(&future)?.set_times(
-            fs::FileTimes::new().set_modified(SystemTime::now() + std::time::Duration::from_hours(24)),
+            fs::FileTimes::new()
+                .set_modified(SystemTime::now() + std::time::Duration::from_hours(24)),
         )?;
         File::open(&changed)?.set_times(
             fs::FileTimes::new()
@@ -5014,7 +5026,8 @@ mod tests {
         let conf = temp.path().join("pacman.conf");
         let repos = temp.path().join("repositories.conf");
         let first = "[first]\nServer = file:///no-network\n[second]\nServer = file:///no-network\n";
-        let second = "[second]\nServer = file:///no-network\n[first]\nServer = file:///no-network\n";
+        let second =
+            "[second]\nServer = file:///no-network\n[first]\nServer = file:///no-network\n";
         let options = "[options]\nSigLevel = Never\nArchitecture = x86_64\n";
         let changed = if included {
             std::fs::write(&conf, format!("{options}Include = repositories.conf\n")).unwrap();
@@ -5455,7 +5468,9 @@ mod tests {
                 "{provided}"
             );
         }
-        assert!(health_relation_missing("libfoo.so=libfoo.so-64", "libfoo.so=libfoo.so-64").is_empty());
+        assert!(
+            health_relation_missing("libfoo.so=libfoo.so-64", "libfoo.so=libfoo.so-64").is_empty()
+        );
         assert_eq!(
             health_relation_missing("libfoo.so=libfoo.so-64", "libfoo.so=libfoo.so-32").len(),
             1
@@ -5633,21 +5648,25 @@ mod tests {
                     (
                         "provider",
                         "1",
-                        provision.map_or_else(String::new, |value| format!("%PROVIDES%\n{value}\n\n")),
+                        provision
+                            .map_or_else(String::new, |value| format!("%PROVIDES%\n{value}\n\n")),
                     ),
                 ] {
                     let entry = local.join(format!("{name}-1.0-1"));
                     std::fs::create_dir(&entry).unwrap();
                     std::fs::write(
                         entry.join("desc"),
-                        format!("%NAME%\n{name}\n\n%VERSION%\n1.0-1\n\n%REASON%\n{reason}\n\n{extra}"),
+                        format!(
+                            "%NAME%\n{name}\n\n%VERSION%\n1.0-1\n\n%REASON%\n{reason}\n\n{extra}"
+                        ),
                     )
                     .unwrap();
                 }
                 let packages = parse_local_db(&local).unwrap();
                 let required = compute_required_names(&packages).unwrap();
-                let alpm = alpm::Alpm::new(root.to_str().unwrap(), directory.path().to_str().unwrap())
-                    .unwrap();
+                let alpm =
+                    alpm::Alpm::new(root.to_str().unwrap(), directory.path().to_str().unwrap())
+                        .unwrap();
                 let provider = alpm.localdb().pkg("provider").unwrap();
                 let native_required =
                     !provider.required_by().is_empty() || !provider.optional_for().is_empty();
@@ -5899,8 +5918,8 @@ mod tests {
                 let fast = get_counts_fast().expect("fast-path counts must succeed");
                 let ffi = crate::package_managers::alpm_direct::get_counts()
                     .expect("libalpm counts must succeed");
-                let public =
-                    crate::package_managers::get_counts().expect("public package counts must succeed");
+                let public = crate::package_managers::get_counts()
+                    .expect("public package counts must succeed");
                 assert_eq!(fast, expected, "fast path diverged on fixture");
                 assert_eq!(ffi, expected, "libalpm path diverged on fixture");
                 assert_eq!(public, expected, "public count routing diverged on fixture");
@@ -6033,8 +6052,8 @@ mod tests {
                 );
                 assert_eq!(crate::core::paths::cache_dir(), cache_dir);
                 assert_eq!(crate::core::paths::config_dir(), config_dir);
-                let native =
-                    crate::package_managers::alpm_direct::get_counts().expect("real libalpm counts");
+                let native = crate::package_managers::alpm_direct::get_counts()
+                    .expect("real libalpm counts");
                 assert_eq!(
                     soname_fixture_catalog(&db_dir),
                     database_before,
@@ -6187,7 +6206,8 @@ mod tests {
     }
 
     #[test]
-    fn failed_cache_publication_keeps_the_existing_entry_and_cleans_the_temporary_file() -> Result<()> {
+    fn failed_cache_publication_keeps_the_existing_entry_and_cleans_the_temporary_file()
+    -> Result<()> {
         let directory = tempfile::tempdir()?;
         let existing = directory.path().join("fixture.bin");
         fs::create_dir(&existing)?;
@@ -6274,8 +6294,10 @@ mod tests {
     #[test]
     fn package_cache_refuses_fifo_without_waiting_for_its_writer() -> Result<()> {
         const TEST: &str = "package_managers::pacman_db::db::tests::package_cache_refuses_fifo_without_waiting_for_its_writer";
-        if crate::core::testing::run_isolated_test_with_timeout(TEST, std::time::Duration::from_secs(5))
-        {
+        if crate::core::testing::run_isolated_test_with_timeout(
+            TEST,
+            std::time::Duration::from_secs(5),
+        ) {
             return Ok(());
         }
         let owner = tempfile::tempdir()?;

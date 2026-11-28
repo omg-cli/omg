@@ -4255,7 +4255,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn native_admission_evr_comparisons_preserve_rpm_order_and_batch_association() -> Result<()> {
+    async fn native_admission_evr_comparisons_preserve_rpm_order_and_batch_association()
+    -> Result<()> {
         let mut pairs = vec![("1.0-1.fc44".to_owned(), "1.0-1.fc44".to_owned()); 129];
         pairs[0] = ("2:1.0-1.fc44".into(), "1:9.9-9.fc44".into());
         pairs[1] = ("1.0~rc1-1.fc44".into(), "1.0-1.fc44".into());
@@ -4290,7 +4291,8 @@ mod tests {
     }
 
     #[test]
-    fn proposed_admission_inventory_preserves_solver_dependencies_epochs_and_multilib() -> Result<()> {
+    fn proposed_admission_inventory_preserves_solver_dependencies_epochs_and_multilib() -> Result<()>
+    {
         let inventory = DnfPackageManager::proposed_inventory(
             br#"{"version":"1.0","rpms":[
             {"nevra":"app-2:1.0-1.fc44.x86_64","action":"Upgrade"},
@@ -4445,7 +4447,8 @@ mod tests {
     }
 
     #[test]
-    fn installed_catalog_observation_survives_readonly_wal_permission_reapplication() -> Result<()> {
+    fn installed_catalog_observation_survives_readonly_wal_permission_reapplication() -> Result<()>
+    {
         let native = include_bytes!("../../tests/data/fedora-publicsuffix.rpmhdr");
         let directory = write_packages_db(&[native.as_slice()]);
         let rpm_db_path = directory.path().join("rpmdb.sqlite");
@@ -4530,7 +4533,8 @@ mod tests {
                 observed.is_current(&path),
                 "unchanged package bytes in {mode}"
             );
-            let busy: i64 = database.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| r.get(0))?;
+            let busy: i64 =
+                database.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| r.get(0))?;
             assert_eq!(busy, 0, "observer must release its transaction in {mode}");
         }
         Ok(())
@@ -4910,10 +4914,11 @@ mod tests {
 
     #[tokio::test]
     async fn reverse_reason_query_rejects_option_injection() {
-        let error =
-            DnfPackageManager::installed_package_reasons(InstalledReasonQuery::RequiredBy("--help"))
-                .await
-                .expect_err("invalid package operand");
+        let error = DnfPackageManager::installed_package_reasons(InstalledReasonQuery::RequiredBy(
+            "--help",
+        ))
+        .await
+        .expect_err("invalid package operand");
         assert!(error.to_string().contains("cannot start with '-'"));
     }
 
@@ -5125,7 +5130,9 @@ mod tests {
                 "--config=untrusted",
             )),
             RepositoryQuery::InstalledReasons(InstalledReasonQuery::Package("--config=untrusted")),
-            RepositoryQuery::InstalledReasons(InstalledReasonQuery::RequiredBy("--config=untrusted")),
+            RepositoryQuery::InstalledReasons(InstalledReasonQuery::RequiredBy(
+                "--config=untrusted",
+            )),
             RepositoryQuery::InstalledDetails("--config=untrusted"),
         ] {
             let error = DnfPackageManager::repository_output(query)
@@ -5191,8 +5198,9 @@ mod tests {
     #[test]
     fn available_info_passes_the_exact_selector_without_an_architecture_override() -> Result<()> {
         for selector in ["widget.lib.i686", "widget.lib-0:1.2-3.fc44.i686"] {
-            let args =
-                DnfPackageManager::repository_query_args(RepositoryQuery::Available(Some(selector)))?;
+            let args = DnfPackageManager::repository_query_args(RepositoryQuery::Available(Some(
+                selector,
+            )))?;
             assert_eq!(args.last().map(String::as_str), Some(selector));
             assert!(
                 !args.iter().any(|arg| arg.starts_with("--arch=")),
@@ -5251,8 +5259,10 @@ mod tests {
             DnfPackageManager::prefer_available_info("widget.lib-2:1-1.noarch", rows)
         };
         let native = "Available packages\nwidget.lib.noarch 2:1-1 updates\n";
-        let resolved =
-            DnfPackageManager::available_info_from_native_selection(candidates()?, native.as_bytes())?;
+        let resolved = DnfPackageManager::available_info_from_native_selection(
+            candidates()?,
+            native.as_bytes(),
+        )?;
         assert_eq!(resolved.name, "widget.lib.noarch");
         assert_eq!(resolved.version.to_string(), "2:1-1");
         assert_eq!(resolved.description, "Preferred\tsummary");
@@ -5313,8 +5323,9 @@ mod tests {
             "widget-name-1:2.0~rc1-1^a.noarch",
             "widget-2.0^a-1_git.x86_64",
         ] {
-            let args =
-                DnfPackageManager::repository_query_args(RepositoryQuery::Available(Some(selector)))?;
+            let args = DnfPackageManager::repository_query_args(RepositoryQuery::Available(Some(
+                selector,
+            )))?;
             assert_eq!(args.last().map(String::as_str), Some(selector));
         }
         Ok(())
@@ -5326,8 +5337,9 @@ mod tests {
             "widget-2147483648:2.0^a-1_git.x86_64",
             "widget-4294967295:2.0~rc1-1.fc44.noarch",
         ] {
-            let args =
-                DnfPackageManager::repository_query_args(RepositoryQuery::Available(Some(selector)))?;
+            let args = DnfPackageManager::repository_query_args(RepositoryQuery::Available(Some(
+                selector,
+            )))?;
             assert_eq!(args.last().map(String::as_str), Some(selector));
         }
         Ok(())
@@ -5355,9 +5367,10 @@ mod tests {
 
     #[test]
     fn available_repository_rows_preserve_epoch_and_uninstalled_state() {
-        let packages =
-            DnfPackageManager::parse_available_packages(b"tree\t2:2.2.1-4.fc44\tDirectory listing\n")
-                .expect("valid repository row");
+        let packages = DnfPackageManager::parse_available_packages(
+            b"tree\t2:2.2.1-4.fc44\tDirectory listing\n",
+        )
+        .expect("valid repository row");
         assert_eq!(packages.len(), 1);
         assert_eq!(packages[0].name, "tree");
         assert_eq!(packages[0].version.to_string(), "2:2.2.1-4.fc44");
@@ -5477,8 +5490,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn search_prefers_the_latest_installed_build_without_losing_older_descriptions() -> Result<()>
-    {
+    async fn search_prefers_the_latest_installed_build_without_losing_older_descriptions()
+    -> Result<()> {
         let installed: Vec<_> = [
             ("x86_64", "1", "2", "Older kernel"),
             ("i686", "2:1", "1", "Higher epoch kernel"),
@@ -5510,7 +5523,8 @@ mod tests {
                 ("kernel-test.x86_64", "1-10".into())
             ]
         );
-        let results = DnfPackageManager::search_results(ordered.iter().copied(), b"", "older kernel")?;
+        let results =
+            DnfPackageManager::search_results(ordered.iter().copied(), b"", "older kernel")?;
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].version.to_string(), "1-10");
         let candidates = DnfPackageManager::search_candidates(ordered, Vec::new());
@@ -5633,7 +5647,8 @@ mod tests {
         let entry = (8..8 + entries * 16)
             .step_by(16)
             .find(|&offset| {
-                u32::from_be_bytes(native[offset..offset + 4].try_into().unwrap()) == rpm_tags::EPOCH
+                u32::from_be_bytes(native[offset..offset + 4].try_into().unwrap())
+                    == rpm_tags::EPOCH
             })
             .expect("native fixture contains EPOCH");
         assert_eq!(
@@ -5673,9 +5688,12 @@ mod tests {
             let data_start = 8 + count * 16;
             let entry = (8..data_start)
                 .step_by(16)
-                .find(|&offset| u32::from_be_bytes(blob[offset..offset + 4].try_into().unwrap()) == tag)
+                .find(|&offset| {
+                    u32::from_be_bytes(blob[offset..offset + 4].try_into().unwrap()) == tag
+                })
                 .expect("native fixture contains identity tag");
-            let offset = u32::from_be_bytes(blob[entry + 8..entry + 12].try_into().unwrap()) as usize;
+            let offset =
+                u32::from_be_bytes(blob[entry + 8..entry + 12].try_into().unwrap()) as usize;
             let length = blob[data_start + offset..]
                 .iter()
                 .position(|&byte| byte == 0)
@@ -6104,7 +6122,9 @@ mod tests {
             .arg(&pid_file);
         let status = tokio::time::timeout(
             std::time::Duration::from_secs(4),
-            tokio::task::spawn_blocking(move || DnfPackageManager::run_native_command(command, false)),
+            tokio::task::spawn_blocking(move || {
+                DnfPackageManager::run_native_command(command, false)
+            }),
         )
         .await;
         let child_pid: i32 = std::fs::read_to_string(pid_file)?.trim().parse()?;
@@ -6148,7 +6168,8 @@ mod tests {
         assert_eq!(run(&format!("{repository}; exit 7"), true)?.code(), Some(7));
 
         let incomplete = "(sleep 2) & exit 0";
-        let error = run(incomplete, true).expect_err("cleanup requires complete native diagnostics");
+        let error =
+            run(incomplete, true).expect_err("cleanup requires complete native diagnostics");
         assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
         Ok(())
     }
@@ -6181,7 +6202,8 @@ mod tests {
              yes 'Loading repositories' | head -n 4000 >&2; \
              printf 'Operation aborted by the user.\n' >&2; exit 1",
         ]);
-        let preview = DnfPackageManager::capture_query("DNF", preview, deadline, None, false).await?;
+        let preview =
+            DnfPackageManager::capture_query("DNF", preview, deadline, None, false).await?;
         assert!(preview.stderr.len() <= 64 * 1024);
         let preview = DnfPackageManager::transaction_preview_output(&preview)?;
         assert!(preview.has_changes);
@@ -6272,7 +6294,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stored_query_cancellation_reaps_child_before_removing_private_namespace() -> Result<()> {
+    async fn stored_query_cancellation_reaps_child_before_removing_private_namespace() -> Result<()>
+    {
         let control = tempfile::tempdir()?;
         let directory = tempfile::Builder::new()
             .prefix("owned-store-")
@@ -6379,7 +6402,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stored_query_returns_owned_namespace_and_exact_manifest_after_child_exit() -> Result<()> {
+    async fn stored_query_returns_owned_namespace_and_exact_manifest_after_child_exit() -> Result<()>
+    {
         let directory = tempfile::tempdir()?;
         let path = directory.path().to_owned();
         let mut command = tokio::process::Command::new("/bin/sh");
@@ -6408,9 +6432,11 @@ mod tests {
     async fn native_history_query_rejects_output_larger_than_64_mib() -> Result<()> {
         let mut command = tokio::process::Command::new("/usr/bin/head");
         command.args(["-c", "67108864", "/dev/zero"]);
-        let bytes =
-            DnfPackageManager::query_output_with_deadline(command, std::time::Duration::from_secs(30))
-                .await?;
+        let bytes = DnfPackageManager::query_output_with_deadline(
+            command,
+            std::time::Duration::from_secs(30),
+        )
+        .await?;
         assert_eq!(bytes.len(), 67_108_864);
         assert!(
             bytes.iter().all(|byte| *byte == 0),
@@ -6420,8 +6446,11 @@ mod tests {
 
         let mut command = tokio::process::Command::new("/usr/bin/head");
         command.args(["-c", "67108865", "/dev/zero"]);
-        match DnfPackageManager::query_output_with_deadline(command, std::time::Duration::from_secs(30))
-            .await
+        match DnfPackageManager::query_output_with_deadline(
+            command,
+            std::time::Duration::from_secs(30),
+        )
+        .await
         {
             Ok(bytes) => panic!(
                 "DNF query accepted oversized output: received {} bytes",
@@ -6648,8 +6677,8 @@ mod tests {
 
     #[test]
     fn user_installed_output_is_parsed_as_a_name_set() {
-        let names =
-            DnfPackageManager::parse_user_installed_names(b"bash\n\nvim\n").expect("valid dnf output");
+        let names = DnfPackageManager::parse_user_installed_names(b"bash\n\nvim\n")
+            .expect("valid dnf output");
         assert!(names.contains("bash"));
         assert!(names.contains("vim"));
         assert_eq!(names.len(), 2);
@@ -6669,7 +6698,9 @@ mod tests {
             &packages,
             Err(anyhow::anyhow!("repoquery unavailable")),
         )
-        .expect_err("unavailable install reasons must not become successful zero explicit packages");
+        .expect_err(
+            "unavailable install reasons must not become successful zero explicit packages",
+        );
         assert!(format!("{error:#}").contains("repoquery unavailable"));
 
         assert_eq!(packages.len(), 1);
@@ -6921,7 +6952,11 @@ mod tests {
             .collect();
 
         let packages = Arc::new(packages);
-        manager.publish_installed_packages(Some(&rpm_db_path), Arc::clone(&packages), identity.clone());
+        manager.publish_installed_packages(
+            Some(&rpm_db_path),
+            Arc::clone(&packages),
+            identity.clone(),
+        );
         manager.publish_installed_packages(Some(&rpm_db_path), packages, identity);
 
         let cached = manager
@@ -7147,7 +7182,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn installed_lookup_reads_one_package_when_an_unrelated_header_is_unreadable() -> Result<()> {
+    async fn installed_lookup_reads_one_package_when_an_unrelated_header_is_unreadable()
+    -> Result<()> {
         let header = named_rpm_header("omg-indexed-read-fixture");
         let directory = write_packages_db(&[header.as_slice(), &[0; 32]]);
         let rpm_db_path = directory.path().join("rpmdb.sqlite");
@@ -7259,7 +7295,8 @@ mod tests {
     #[test]
     fn ordinary_rpm_inventory_preserves_epoch() {
         let package =
-            DnfPackageManager::parse_rpm_qa_line("example\t1.0\t1.fc44\t2\tx86_64\tsummary").unwrap();
+            DnfPackageManager::parse_rpm_qa_line("example\t1.0\t1.fc44\t2\tx86_64\tsummary")
+                .unwrap();
         assert_eq!(package.version, "2:1.0");
     }
 }

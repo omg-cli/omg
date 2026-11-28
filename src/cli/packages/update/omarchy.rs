@@ -2522,7 +2522,11 @@ mod tests {
                 } else {
                     libc::LOCK_UN
                 };
-                deny_fixture_syscall_argument(libc::SYS_flock, 1, u32::try_from(operation).unwrap());
+                deny_fixture_syscall_argument(
+                    libc::SYS_flock,
+                    1,
+                    u32::try_from(operation).unwrap(),
+                );
                 let error = inherited_lock(probe.as_raw_fd(), &owner.path().join("probe"))
                     .expect_err("kernel lock denial must propagate through inherited handoff");
                 let expected = if case == "lock-probe-denied" {
@@ -2571,7 +2575,11 @@ mod tests {
             "terminal-restore" => {
                 let (_input, restoration) = terminal_input().unwrap();
                 let restoration = restoration.expect("private terminal restoration guard");
-                deny_fixture_syscall_argument(libc::SYS_ioctl, 1, u32::try_from(libc::TCSETS).unwrap());
+                deny_fixture_syscall_argument(
+                    libc::SYS_ioctl,
+                    1,
+                    u32::try_from(libc::TCSETS).unwrap(),
+                );
                 // glibc 2.42 and later use the termios2 ioctl ABI.
                 deny_fixture_syscall_argument(
                     libc::SYS_ioctl,
@@ -2639,7 +2647,8 @@ mod tests {
                 assert!(fcntl(file.as_ref(), FcntlArg::F_GETFL).is_ok());
             }
             "coordinator-interrupt" | "stage-stop" => {
-                let program = crate::core::privilege::root_controlled_program_path("sleep").unwrap();
+                let program =
+                    crate::core::privilege::root_controlled_program_path("sleep").unwrap();
                 let mut unrelated = Command::new(&program)
                     .arg("30")
                     .process_group(0)
@@ -2901,7 +2910,10 @@ mod tests {
         }
     }
 
-    fn fixture_success(output: &std::process::Output, context: std::fmt::Arguments<'_>) -> Result<()> {
+    fn fixture_success(
+        output: &std::process::Output,
+        context: std::fmt::Arguments<'_>,
+    ) -> Result<()> {
         if output.status.success() {
             return Ok(());
         }
@@ -3186,7 +3198,8 @@ mod tests {
     fn transport_runtime() -> OmarchyRuntime {
         OmarchyRuntime {
             root: PathBuf::from("/usr/share/omarchy"),
-            migration_state: std::path::absolute("markers").expect("private transport migration state"),
+            migration_state: std::path::absolute("markers")
+                .expect("private transport migration state"),
         }
     }
 
@@ -3653,7 +3666,8 @@ mod tests {
         .expect("inert known external helper payload");
         std::fs::write(
             config.join("config.toml"),
-            toml::to_string(&crate::config::Settings::default()).expect("serialize Standard config"),
+            toml::to_string(&crate::config::Settings::default())
+                .expect("serialize Standard config"),
         )
         .expect("private Standard config");
         let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
@@ -3853,7 +3867,8 @@ mod tests {
 
         let owner = private_directory();
         let policy = "require_pgp = 'not-a-boolean'\n";
-        std::fs::write(owner.path().join("policy.toml"), policy).expect("write invalid policy fixture");
+        std::fs::write(owner.path().join("policy.toml"), policy)
+            .expect("write invalid policy fixture");
         let runtime = OmarchyRuntime {
             root: owner.path().to_path_buf(),
             migration_state: owner.path().join("markers"),
@@ -3863,7 +3878,8 @@ mod tests {
             .build()?;
         let mut commands = Commands::new(false, runtime);
         let result = temp_env::with_var("OMG_CONFIG_DIR", Some(owner.path()), || {
-            executor.block_on(commands.run_native_package(NativeOmarchyOperation::InstallMediaViewer))
+            executor
+                .block_on(commands.run_native_package(NativeOmarchyOperation::InstallMediaViewer))
         });
         let error = result.expect_err("malformed policy must refuse the native package stage");
         assert!(
@@ -3962,7 +3978,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn native_migration_plan_preserves_order_and_retries_only_unfinished_actions() -> Result<()> {
+    async fn native_migration_plan_preserves_order_and_retries_only_unfinished_actions()
+    -> Result<()> {
         struct Recorder {
             calls: Vec<String>,
             fail: bool,
@@ -4496,7 +4513,8 @@ mod tests {
             .cleanup()
             .await
             .expect("cleanup remains idempotent");
-        let shell = crate::core::privilege::root_controlled_program_path("sh").expect("system shell");
+        let shell =
+            crate::core::privilege::root_controlled_program_path("sh").expect("system shell");
         assert!(
             commands
                 .run_program(&shell, &["-c", "exit 0"])
@@ -4516,8 +4534,10 @@ mod tests {
         }
         let owner = private_directory();
         let marker = owner.path().join("stage-pid");
-        let program = crate::core::privilege::root_controlled_program_path("sh").expect("system shell");
-        let primer = crate::core::privilege::root_controlled_program_path("true").expect("system true");
+        let program =
+            crate::core::privilege::root_controlled_program_path("sh").expect("system shell");
+        let primer =
+            crate::core::privilege::root_controlled_program_path("true").expect("system true");
         assert!(
             Command::new(primer)
                 .status()
@@ -4648,7 +4668,8 @@ mod tests {
     #[tokio::test]
     async fn concurrent_stage_rejection_preserves_the_owned_child() {
         let owner = private_directory();
-        let shell = crate::core::privilege::root_controlled_program_path("sh").expect("system shell");
+        let shell =
+            crate::core::privilege::root_controlled_program_path("sh").expect("system shell");
         let mut commands = Commands::new(false, transport_runtime());
         let mut first = Command::new(&shell);
         first
@@ -4702,10 +4723,12 @@ mod tests {
         let lock = open_owned_file(&root.join("lock")).expect("private pipe lock");
         lock.try_lock().expect("private pipe lease");
         let log = open_owned_file(&root.join("log")).expect("private pipe transcript");
-        let shell = crate::core::privilege::root_controlled_program_path("sh").expect("system shell");
+        let shell =
+            crate::core::privilege::root_controlled_program_path("sh").expect("system shell");
         if std::env::var_os("OMG_OMARCHY_MISSING_STDIN_FIXTURE").is_some() {
             let _signals = Interruptions::new().expect("register signals before closing stdin");
-            nix::unistd::close(nix::libc::STDIN_FILENO).expect("close input only in isolated fixture");
+            nix::unistd::close(nix::libc::STDIN_FILENO)
+                .expect("close input only in isolated fixture");
             tokio::time::timeout(
                 Duration::from_secs(3),
                 execute_logged(
@@ -4820,7 +4843,8 @@ mod tests {
             "fixture rejected its literal answer"
         );
         assert!(
-            String::from_utf8_lossy(&observed).contains("received:<literal; $(not-a-command) \\tail>")
+            String::from_utf8_lossy(&observed)
+                .contains("received:<literal; $(not-a-command) \\tail>")
         );
         Ok(())
     }
@@ -5110,7 +5134,9 @@ mod tests {
             (Some("0"), Some("4")),
             (Some("3"), Some("-1")),
         ] {
-            assert!(inherited_transport(lock.map(OsString::from), log.map(OsString::from)).is_err());
+            assert!(
+                inherited_transport(lock.map(OsString::from), log.map(OsString::from)).is_err()
+            );
         }
         for (lock, log) in [
             (OsString::from_vec(vec![0xff]), "4".into()),
@@ -5192,8 +5218,10 @@ mod tests {
             .try_lock()
             .expect("duplicated open description owns the same lock");
         assert!(
-            FdFlag::from_bits_truncate(fcntl(&duplicate, FcntlArg::F_GETFD).expect("duplicate flags"))
-                .contains(FdFlag::FD_CLOEXEC)
+            FdFlag::from_bits_truncate(
+                fcntl(&duplicate, FcntlArg::F_GETFD).expect("duplicate flags")
+            )
+            .contains(FdFlag::FD_CLOEXEC)
         );
         for invalid in ["garbage", "-1", "0", "1", "2", "2147483647"] {
             assert!(
@@ -5323,7 +5351,8 @@ mod tests {
     #[tokio::test]
     async fn private_commands_preserve_status_and_cancelled_children_are_reaped() {
         let mut commands = Commands::new(false, transport_runtime());
-        let program = crate::core::privilege::root_controlled_program_path("sh").expect("system shell");
+        let program =
+            crate::core::privilege::root_controlled_program_path("sh").expect("system shell");
         assert_eq!(
             commands
                 .run_program(&program, &["-c", "exit 7"])
@@ -5390,7 +5419,8 @@ mod tests {
     async fn cancellation_terminates_surviving_descendants() {
         let owner = private_directory();
         let ready = owner.path().join("descendant");
-        let program = crate::core::privilege::root_controlled_program_path("sh").expect("system shell");
+        let program =
+            crate::core::privilege::root_controlled_program_path("sh").expect("system shell");
         let mut commands = Commands::new(false, transport_runtime());
         let arguments = [
             "-c",
@@ -5528,7 +5558,8 @@ mod tests {
             commands.authorization.is_none(),
             "disconnect stops authorization refresh"
         );
-        std::fs::write(root.join("complete"), b"cleaned").expect("private disconnect cleanup receipt");
+        std::fs::write(root.join("complete"), b"cleaned")
+            .expect("private disconnect cleanup receipt");
     }
 
     #[tokio::test]
@@ -5828,8 +5859,11 @@ mod tests {
                 .await
                 .expect("inner became ready");
                 if std::env::var_os("OMG_OMARCHY_OUTER_DISCONNECT_FIXTURE").is_none() {
-                    nix::sys::signal::kill(nix::unistd::getpid(), nix::sys::signal::Signal::SIGTERM)
-                        .expect("interrupt isolated outer coordinator");
+                    nix::sys::signal::kill(
+                        nix::unistd::getpid(),
+                        nix::sys::signal::Signal::SIGTERM,
+                    )
+                    .expect("interrupt isolated outer coordinator");
                 }
             }
         });
@@ -5958,7 +5992,8 @@ mod tests {
         lock.try_lock().expect("private PTY lease");
         let log = open_owned_file(&owner.path().join("log")).expect("private PTY log");
         let executable = std::env::current_exe().expect("test executable");
-        let program = crate::core::privilege::root_controlled_program_path("env").expect("system env");
+        let program =
+            crate::core::privilege::root_controlled_program_path("env").expect("system env");
         execute_logged(
             &program,
             &[
@@ -5989,8 +6024,8 @@ mod tests {
             }
         }
         let owner = private_directory();
-        let transcript =
-            open_owned_file(&owner.path().join("transcript")).expect("private pending-tail transcript");
+        let transcript = open_owned_file(&owner.path().join("transcript"))
+            .expect("private pending-tail transcript");
         let (master, slave) = open_transport_pty(None).expect("private pending-tail PTY");
         let sleep =
             crate::core::privilege::root_controlled_program_path("sleep").expect("system sleeper");
@@ -6044,7 +6079,8 @@ mod tests {
     #[tokio::test]
     async fn completed_coordinator_preserves_all_pty_tail_bytes() {
         let owner = private_directory();
-        let transcript = open_owned_file(&owner.path().join("transcript")).expect("private transcript");
+        let transcript =
+            open_owned_file(&owner.path().join("transcript")).expect("private transcript");
         let program =
             crate::core::privilege::root_controlled_program_path("printf").expect("system printf");
         let payload = "x".repeat(257);
@@ -6096,7 +6132,8 @@ mod tests {
         let lock = Arc::new(open_owned_file(&owner.path().join("lock")).expect("private lease"));
         lock.try_lock().expect("exclusive fixture lease");
         let log = Arc::new(open_owned_file(&owner.path().join("log")).expect("private transcript"));
-        let program = crate::core::privilege::root_controlled_program_path("sh").expect("system shell");
+        let program =
+            crate::core::privilege::root_controlled_program_path("sh").expect("system shell");
         for file in [&lock, &log] {
             assert!(
                 FdFlag::from_bits_truncate(
@@ -6179,7 +6216,8 @@ mod tests {
         let lock = open_owned_file(&owner.path().join("lock")).expect("private transcript lock");
         lock.try_lock().expect("transcript ownership");
         let log = open_owned_file(&owner.path().join("log")).expect("private transcript file");
-        let program = crate::core::privilege::root_controlled_program_path("sh").expect("system shell");
+        let program =
+            crate::core::privilege::root_controlled_program_path("sh").expect("system shell");
         let literal = "value; $(printf must-not-execute) 'quoted'";
         execute_logged(
             &program,
@@ -6199,8 +6237,10 @@ mod tests {
             std::fs::read_to_string(owner.path().join("log")).expect("real current-run transcript");
         assert!(text.contains(literal), "{text}");
         assert!(
-            FdFlag::from_bits_truncate(fcntl(&lock, FcntlArg::F_GETFD).expect("restored lock flags"))
-                .contains(FdFlag::FD_CLOEXEC)
+            FdFlag::from_bits_truncate(
+                fcntl(&lock, FcntlArg::F_GETFD).expect("restored lock flags")
+            )
+            .contains(FdFlag::FD_CLOEXEC)
         );
         log.set_len(0).expect("new private transcript");
         let error = execute_logged(
@@ -6228,7 +6268,8 @@ mod tests {
         let initial = foreground_group()
             .expect("fixture terminal")
             .expect("PTY foreground");
-        let program = crate::core::privilege::root_controlled_program_path("sh").expect("system shell");
+        let program =
+            crate::core::privilege::root_controlled_program_path("sh").expect("system shell");
         let mut commands = Commands::new(false, transport_runtime());
         let status = commands
             .run_program(
@@ -6276,7 +6317,8 @@ mod tests {
         lock.try_lock().expect("PTY fixture lease");
         let log = open_owned_file(&owner.path().join("log")).expect("PTY fixture transcript");
         let executable = std::env::current_exe().expect("test executable");
-        let program = crate::core::privilege::root_controlled_program_path("env").expect("system env");
+        let program =
+            crate::core::privilege::root_controlled_program_path("env").expect("system env");
         execute_logged(
             &program,
             &[
@@ -6342,7 +6384,8 @@ mod tests {
                 "normal Arch must retain its existing behavior for {intent:?}"
             );
         }
-        require_native_scope(ArchFlavor::Arch).expect("fast and turbo stay native on ordinary Arch");
+        require_native_scope(ArchFlavor::Arch)
+            .expect("fast and turbo stay native on ordinary Arch");
     }
 
     #[test]
@@ -6458,7 +6501,8 @@ mod tests {
                 "transport is contained before any helper exec"
             );
         }
-        let program = crate::core::privilege::root_controlled_program_path("sh").expect("system shell");
+        let program =
+            crate::core::privilege::root_controlled_program_path("sh").expect("system shell");
         let status = std::process::Command::new(program)
             .args([
                 "-c",
@@ -6589,7 +6633,8 @@ mod tests {
         saved
             .local_flags
             .remove(nix::sys::termios::LocalFlags::ECHO);
-        let (master, slave) = open_transport_pty(Some(&saved)).expect("configured private terminal");
+        let (master, slave) =
+            open_transport_pty(Some(&saved)).expect("configured private terminal");
         for file in [&master, &slave] {
             assert!(
                 FdFlag::from_bits_truncate(
@@ -6903,7 +6948,8 @@ mod tests {
             };
             std::fs::write(selected.join("migrations/0001.sh"), selected_text)
                 .expect("selected runtime migration");
-            std::fs::write(caller.join("migrations/0001.sh"), caller_text).expect("caller migration");
+            std::fs::write(caller.join("migrations/0001.sh"), caller_text)
+                .expect("caller migration");
             std::fs::write(
                 caller.join("bin/omarchy-migrate"),
                 "#!/bin/sh\nprintf executed > \"$OMARCHY_PATH/executed\"\nexit 88\n",
@@ -7049,7 +7095,10 @@ mod tests {
         let mut unmatched = Commands::new(false, runtime.clone());
         unmatched.native_fixture = Some(empty_fixture());
         unmatched.migration_overrides = Some(MigrationTestOverrides {
-            helper_overrides: std::collections::BTreeMap::from([("omarchy-hw-facetimehd", hw_miss)]),
+            helper_overrides: std::collections::BTreeMap::from([(
+                "omarchy-hw-facetimehd",
+                hw_miss,
+            )]),
             ..Default::default()
         });
         unmatched
@@ -7342,7 +7391,8 @@ mod tests {
             )
             .expect("write 1795354646.sh");
 
-        let pending = pending_migrations(&migrations, &markers).expect("resolve published migrations");
+        let pending =
+            pending_migrations(&migrations, &markers).expect("resolve published migrations");
         assert_eq!(pending.len(), 6);
         assert_eq!(
             pending[0].native,
