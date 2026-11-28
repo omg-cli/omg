@@ -1464,6 +1464,14 @@ pub async fn export_compliance(
 ) -> Result<()> {
     validate_compliance_export_inputs(framework, period.as_deref(), output)?;
 
+    if !framework.eq_ignore_ascii_case("soc2") {
+        anyhow::bail!(
+            "{} compliance evidence export is not implemented in this build; \
+             only 'soc2' generates evidence files",
+            framework.to_uppercase()
+        );
+    }
+
     println!(
         "{} Generating {} compliance evidence...\n",
         style::runtime("OMG"),
@@ -2695,6 +2703,20 @@ mod tests {
                     assert!(!format_finding_severity(sev).is_empty());
                 }
             },
+        );
+    }
+
+    #[tokio::test]
+    async fn export_compliance_rejects_unimplemented_framework_without_creating_dir() {
+        let rel = format!("target/tmp-compliance-test-{}", std::process::id());
+        let ctx = crate::cli::CliContext { json: false };
+        let err = export_compliance("iso27001", None, &rel, &ctx)
+            .await
+            .expect_err("unimplemented framework must fail");
+        assert!(err.to_string().contains("not implemented"));
+        assert!(
+            !std::path::Path::new(&rel).exists(),
+            "output directory must not be created for unimplemented frameworks"
         );
     }
 }

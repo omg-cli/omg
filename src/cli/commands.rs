@@ -427,8 +427,7 @@ fn complete_runtime_versions(
     let installed_versions = crate::runtimes::common::list_installed_versions(&runtime_dir)
         .with_context(|| format!("Failed to list installed {runtime} versions for completion"))?;
 
-    let fuzzy_installed = engine.fuzzy_match(current, installed_versions);
-    suggestions.extend(fuzzy_installed);
+    suggestions.extend(installed_versions);
     let mut seen = std::collections::HashSet::new();
     suggestions.retain(|suggestion| seen.insert(suggestion.clone()));
     Ok(engine.fuzzy_match(current, suggestions))
