@@ -619,9 +619,6 @@ pub const ELEVATED_MARKER: &str = "__omg_elevated";
 pub const FLOW_PARENT_RECORDS: &str = "__omg_parent_records";
 
 #[cfg(not(test))]
-use std::sync::LazyLock;
-
-#[cfg(not(test))]
 use anyhow::Context;
 #[cfg(not(test))]
 use std::sync::Mutex;
@@ -629,7 +626,7 @@ use std::sync::Mutex;
 /// Global mutex to serialize privilege elevation attempts
 /// Prevents deadlocks when multiple threads try to elevate simultaneously
 #[cfg(not(test))]
-static ELEVATION_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+static ELEVATION_MUTEX: Mutex<()> = Mutex::new(());
 
 /// Global flag to track if --yes was specified for non-interactive mode
 static YES_FLAG: AtomicBool = AtomicBool::new(false);

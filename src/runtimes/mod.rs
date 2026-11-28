@@ -63,7 +63,7 @@ pub(crate) const SUPPORTED_RUNTIMES: &[&str] = NATIVE_RUNTIMES;
 
 /// Resolve a partial version request (`20`, `20.1`) against known release
 /// names. Exact and non-numeric requests pass through unchanged. One shared
-/// shape so the five managers cannot drift apart.
+/// shape so all runtime managers stay consistent.
 #[must_use]
 pub(crate) fn resolve_version_request(names: &[String], requested: &str) -> String {
     if !common::is_partial_version(requested) {
@@ -77,7 +77,7 @@ pub(crate) fn resolve_version_request(names: &[String], requested: &str) -> Stri
 /// missing or external targets are not reported as active.
 #[must_use]
 pub(crate) fn probe_version(runtime: &str) -> Option<String> {
-    probe_version_in(runtime, &DATA_DIR)
+    probe_version_in(runtime, &paths::data_dir())
 }
 
 #[must_use]
@@ -88,7 +88,7 @@ pub(crate) fn probe_version_in(runtime: &str, data_dir: &std::path::Path) -> Opt
 pub(crate) fn installed_version_info(
     runtime: &str,
 ) -> (anyhow::Result<Vec<String>>, Option<String>) {
-    let versions_dir = DATA_DIR.join("versions").join(runtime);
+    let versions_dir = paths::data_dir().join("versions").join(runtime);
     (
         common::list_installed_versions(&versions_dir),
         common::get_current_version(&versions_dir),

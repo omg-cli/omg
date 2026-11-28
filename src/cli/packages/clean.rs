@@ -17,16 +17,16 @@ use crate::package_managers::{
 #[cfg(all(feature = "debian-pure", not(feature = "debian")))]
 use crate::package_managers::debian_db::{clean_package_cache, list_orphans_fast};
 
-/// Clean up orphans and caches
-#[allow(
-    clippy::needless_return,
-    reason = "additive backend feature branches return before compiled fallbacks"
-)]
 #[cfg(any(test, feature = "debian"))]
 fn apt_cleanup_requests_unsupported_work(cache: bool, aur: bool, all: bool) -> bool {
     cache || aur || all
 }
 
+/// Clean up orphans and caches.
+#[allow(
+    clippy::needless_return,
+    reason = "additive backend feature branches return before compiled fallbacks"
+)]
 pub async fn clean(
     orphans: bool,
     cache: bool,
@@ -227,7 +227,10 @@ pub async fn clean(
                 not(feature = "debian-pure")
             ))]
             {
-                crate::package_managers::apt_remove_orphans().await?;
+                anyhow::bail!(
+                    "Clean requires a Debian-like system (or an Arch-enabled build); \
+                     no supported package database was found"
+                );
             }
         }
 

@@ -937,12 +937,10 @@ impl AuditIntegrityReport {
 }
 
 /// Global audit logger instance
-static AUDIT_LOGGER: std::sync::LazyLock<std::sync::Mutex<Option<AuditLogger>>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+static AUDIT_LOGGER: std::sync::Mutex<Option<AuditLogger>> = std::sync::Mutex::new(None);
 // Queue overflow must find the active collection without waiting for the
 // writer's logger mutex, which can be held through file locking and fsync.
-static AUDIT_INCOMPLETE_MARKER: std::sync::LazyLock<std::sync::RwLock<Option<PathBuf>>> =
-    std::sync::LazyLock::new(|| std::sync::RwLock::new(None));
+static AUDIT_INCOMPLETE_MARKER: std::sync::RwLock<Option<PathBuf>> = std::sync::RwLock::new(None);
 
 const AUDIT_QUEUE_CAPACITY: usize = 1024;
 

@@ -96,7 +96,9 @@ impl Drop for TerminalQuiesceGuard {
         let mut count = lock_quiesce_count();
         *count -= 1;
         if *count == 0 {
-            progress_registry().set_draw_target(ProgressDrawTarget::stderr());
+            if output_mode() == OutputMode::Interactive {
+                progress_registry().set_draw_target(ProgressDrawTarget::stderr());
+            }
             let mut deferred = lock_deferred_lines();
             for line in deferred.drain(..) {
                 println!("{line}");

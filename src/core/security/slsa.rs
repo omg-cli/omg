@@ -1087,6 +1087,42 @@ impl SlsaVerifier {
     ///
     /// Queries the Rekor transparency log and verifies each `hashedrekord`
     /// entry's embedded signature over the artifact digest (RSA or P-256).
+    async fn read_bounded(path: &Path, max_bytes: u64, label: &str) -> Result<Vec<u8>, SlsaError> {
+        let meta = tokio::fs::metadata(path)
+            .await
+            .map_err(|source| SlsaError::Read {
+                path: path.display().to_string(),
+                source,
+            })?;
+        if meta.len() > max_bytes {
+            return Err(SlsaError::Read {
+                path: path.display().to_string(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("{label} exceeds {max_bytes}-byte SLSA verification limit"),
+                ),
+            });
+        }
+        tokio::fs::read(path)
+            .await
+            .map_err(|source| SlsaError::Read {
+                path: path.display().to_string(),
+                source,
+            })
+    }
+
+    async fn read_bounded_string(
+        path: &Path,
+        max_bytes: u64,
+        label: &str,
+    ) -> Result<String, SlsaError> {
+        let raw = Self::read_bounded(path, max_bytes, label).await?;
+        String::from_utf8(raw).map_err(|err| SlsaError::Read {
+            path: path.display().to_string(),
+            source: std::io::Error::new(std::io::ErrorKind::InvalidData, err),
+        })
+    }
+
     /// Local provenance files contribute descriptive evidence. Callers use
     /// `VerificationResult::verified` to require a trusted signature.
     pub async fn verify_provenance(
@@ -1096,6 +1132,8 @@ impl SlsaVerifier {
         required_identity: &str,
         required_issuer: &str,
     ) -> Result<VerificationResult, SlsaError> {
+        let blob_path = blob_path.as_ref().to_path_buf();
+        let provenance_path = provenance_path.map(|path| path.as_ref().to_path_buf());
         if required_identity.trim().is_empty() {
             return Err(SlsaError::IdentityRequired);
         }
@@ -1109,10 +1147,10 @@ impl SlsaVerifier {
         // Calculate artifact hash, keeping the bytes around: P-256 ECDSA
         // verification hashes the message itself, so the artifact content
         // must be available at verification time.
-        let artifact_bytes = std::fs::read(&blob_path).map_err(|source| SlsaError::Read {
-            path: blob_path.as_ref().display().to_string(),
-            source,
-        })?;
+        const MAX_SLSA_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024;
+        const MAX_SLSA_PROVENANCE_BYTES: u64 = 16 * 1024 * 1024;
+        let artifact_bytes =
+            Self::read_bounded(&blob_path, MAX_SLSA_ARTIFACT_BYTES, "artifact").await?;
         let artifact_hash = {
             let mut hasher = sha2::Sha256::new();
             sha2::Digest::update(&mut hasher, &artifact_bytes);
@@ -1134,14 +1172,11 @@ impl SlsaVerifier {
         }
 
         if let Some(prov_path) = provenance_path
-            && prov_path.as_ref().exists()
+            && tokio::fs::try_exists(&prov_path).await.unwrap_or(false)
         {
-            let path_str = prov_path.as_ref().display().to_string();
             let content =
-                std::fs::read_to_string(prov_path.as_ref()).map_err(|source| SlsaError::Read {
-                    path: path_str,
-                    source,
-                })?;
+                Self::read_bounded_string(&prov_path, MAX_SLSA_PROVENANCE_BYTES, "provenance file")
+                    .await?;
             let _: SlsaProvenance = serde_json::from_str(&content)
                 .map_err(|source| SlsaError::ProvenanceParse { source })?;
             return Ok(classify_slsa_evidence(SlsaEvidence::UnsignedLocalJson));
@@ -2898,5 +2933,82 @@ mod required_signer_tests {
                 .unwrap_err();
             assert!(matches!(error, super::SlsaError::IssuerRequired));
         }
+    }
+
+    #[tokio::test]
+    async fn read_bounded_enforces_size_limit_and_handles_missing_files() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let small = dir.path().join("small.bin");
+        std::fs::write(&small, b"hello").expect("write small file");
+        let bytes = super::SlsaVerifier::read_bounded(&small, 10, "artifact")
+            .await
+            .expect("small file within bound");
+        assert_eq!(bytes, b"hello");
+        let text = super::SlsaVerifier::read_bounded_string(&small, 10, "provenance file")
+            .await
+            .expect("valid utf-8 provenance");
+        assert_eq!(text, "hello");
+
+        let bad_utf8 = dir.path().join("bad.bin");
+        std::fs::write(&bad_utf8, [0xff, 0xfe]).expect("write invalid utf-8");
+        let err = super::SlsaVerifier::read_bounded_string(&bad_utf8, 10, "provenance file")
+            .await
+            .expect_err("invalid utf-8 must fail");
+        assert!(matches!(err, super::SlsaError::Read { .. }));
+
+        let err = super::SlsaVerifier::read_bounded(&small, 4, "artifact")
+            .await
+            .expect_err("oversized file must fail");
+        assert!(matches!(err, super::SlsaError::Read { .. }));
+
+        let missing = dir.path().join("missing.bin");
+        let err = super::SlsaVerifier::read_bounded(&missing, 10, "artifact")
+            .await
+            .expect_err("missing file must fail");
+        assert!(matches!(err, super::SlsaError::Read { .. }));
+
+        // Compile-time check that verify_provenance returns a Send future,
+        // and runtime check of the local provenance fallback path.
+        fn assert_send<F: std::future::Future + Send>(_: F) {}
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local rekor stub");
+        let addr = listener.local_addr().expect("stub addr");
+        let server = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+            let (mut stream, _) = listener.accept().await.expect("accept stub connection");
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf).await;
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n[]")
+                .await;
+        });
+        let prov = dir.path().join("prov.intoto.jsonl");
+        std::fs::write(
+            &prov,
+            r#"{"buildType":"https://example.com/test","builder":{"id":"https://example.com/builder"},"materials":[]}"#,
+        )
+        .expect("write provenance");
+        let verifier = super::SlsaVerifier {
+            client: reqwest::Client::new(),
+            rekor_url: format!("http://{addr}"),
+        };
+        assert_send(verifier.verify_provenance(
+            &small,
+            Some(&prov),
+            "signer@example.invalid",
+            "https://issuer.example.invalid",
+        ));
+        let result = verifier
+            .verify_provenance(
+                &small,
+                Some(&prov),
+                "signer@example.invalid",
+                "https://issuer.example.invalid",
+            )
+            .await
+            .expect("local unsigned provenance should classify without error");
+        assert!(!result.verified);
+        let _ = server.await;
     }
 }

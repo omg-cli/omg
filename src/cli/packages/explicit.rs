@@ -241,13 +241,6 @@ fn display_explicit_list(mut packages: Vec<String>, json: bool) -> Result<()> {
     Ok(())
 }
 
-/// List explicitly installed packages (async wrapper preserving the
-/// asynchronous command interface)
-#[allow(clippy::unused_async, reason = "preserves the async command interface")]
-pub async fn explicit(count: bool) -> Result<()> {
-    explicit_sync(count)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
