@@ -1111,12 +1111,13 @@ impl SlsaVerifier {
         // must be available at verification time.
         const MAX_SLSA_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024;
         const MAX_SLSA_PROVENANCE_BYTES: u64 = 16 * 1024 * 1024;
-        let blob_meta = tokio::fs::metadata(&blob_path)
-            .await
-            .map_err(|source| SlsaError::Read {
-                path: blob_path.as_ref().display().to_string(),
-                source,
-            })?;
+        let blob_meta =
+            tokio::fs::metadata(&blob_path)
+                .await
+                .map_err(|source| SlsaError::Read {
+                    path: blob_path.as_ref().display().to_string(),
+                    source,
+                })?;
         if blob_meta.len() > MAX_SLSA_ARTIFACT_BYTES {
             return Err(SlsaError::Read {
                 path: blob_path.as_ref().display().to_string(),
@@ -1128,12 +1129,13 @@ impl SlsaVerifier {
                 ),
             });
         }
-        let artifact_bytes = tokio::fs::read(&blob_path)
-            .await
-            .map_err(|source| SlsaError::Read {
-                path: blob_path.as_ref().display().to_string(),
-                source,
-            })?;
+        let artifact_bytes =
+            tokio::fs::read(&blob_path)
+                .await
+                .map_err(|source| SlsaError::Read {
+                    path: blob_path.as_ref().display().to_string(),
+                    source,
+                })?;
         let artifact_hash = {
             let mut hasher = sha2::Sha256::new();
             sha2::Digest::update(&mut hasher, &artifact_bytes);
@@ -1171,9 +1173,7 @@ impl SlsaVerifier {
                     path: path_str,
                     source: std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
-                        format!(
-                            "provenance file exceeds {MAX_SLSA_PROVENANCE_BYTES}-byte limit"
-                        ),
+                        format!("provenance file exceeds {MAX_SLSA_PROVENANCE_BYTES}-byte limit"),
                     ),
                 });
             }
