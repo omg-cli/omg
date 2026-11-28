@@ -173,7 +173,7 @@ async fn prewarm_caches(state: &Arc<DaemonState>, shutdown: &CancellationToken) 
     }
 
     let index = state.index_snapshot();
-    for query in ["linux", "python", "node", "firefox", "git"] {
+    for query in ["", "linux", "python", "node", "firefox", "git"] {
         if shutdown.is_cancelled() {
             return;
         }
@@ -1993,7 +1993,7 @@ mod tests {
                 Some(["git".to_string()].as_slice())
             );
             assert_eq!(state.cache.get_explicit_count(), Some(1));
-            for query in ["linux", "python", "node", "firefox", "git"] {
+            for query in ["", "linux", "python", "node", "firefox", "git"] {
                 if cancel_after_inventory {
                     assert!(
                         state.cache.get(query).is_none(),
@@ -2037,7 +2037,7 @@ mod tests {
         cancellation.cancel();
         prewarm_caches(&state, &cancellation).await;
         assert!(state.cache.get_explicit().is_none());
-        for query in ["linux", "python", "node", "firefox", "git"] {
+        for query in ["", "linux", "python", "node", "firefox", "git"] {
             assert!(
                 state.cache.get(query).is_none(),
                 "cancelled query {query} warmed"
