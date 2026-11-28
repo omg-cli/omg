@@ -1403,7 +1403,7 @@ pub(crate) mod tests {
         ));
 
         // Combined with a valid SHA-256 signature, both verify_memory and verify_detached succeed.
-        let mut combined = bad_packet;
+        let mut combined = bad_packet.clone();
         combined.extend_from_slice(&valid_sig);
         verifier
             .verify_memory(b"test data", &combined)
@@ -1418,5 +1418,16 @@ pub(crate) mod tests {
         verifier
             .verify_detached(pkg.path(), sig.path())
             .expect("valid second signature must verify from file");
+
+        // A truncated trailing packet after a valid first packet surfaces SignatureParse.
+        let mut truncated_tail = bad_packet;
+        truncated_tail.extend_from_slice(&[0xC2, 0xFF]);
+        let mut truncated_sig = NamedTempFile::new().unwrap();
+        truncated_sig.write_all(&truncated_tail).unwrap();
+        truncated_sig.flush().unwrap();
+        assert!(matches!(
+            verifier.verify_detached(pkg.path(), truncated_sig.path()),
+            Err(PgpError::SignatureParse { .. })
+        ));
     }
 }
