@@ -5823,4 +5823,21 @@ mod entry_budget_tests {
         assert!(pathname_budget.charge(Path::new("abc")).is_ok());
         assert!(pathname_budget.charge(Path::new("d")).is_err());
     }
+
+    #[tokio::test]
+    async fn extract_zip_rejects_missing_and_corrupt_archives() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let dest = dir.path().join("out");
+        let missing = dir.path().join("missing.zip");
+        assert!(
+            extract_zip(&missing, &dest, 0).await.is_err(),
+            "missing zip archive must return an error"
+        );
+        let corrupt = dir.path().join("corrupt.zip");
+        fs::write(&corrupt, b"not a valid zip archive").expect("write corrupt zip");
+        assert!(
+            extract_zip(&corrupt, &dest, 0).await.is_err(),
+            "corrupt zip archive must return an error"
+        );
+    }
 }
