@@ -1111,6 +1111,18 @@ impl SlsaVerifier {
             })
     }
 
+    async fn read_bounded_string(
+        path: &Path,
+        max_bytes: u64,
+        label: &str,
+    ) -> Result<String, SlsaError> {
+        let raw = Self::read_bounded(path, max_bytes, label).await?;
+        String::from_utf8(raw).map_err(|err| SlsaError::Read {
+            path: path.display().to_string(),
+            source: std::io::Error::new(std::io::ErrorKind::InvalidData, err),
+        })
+    }
+
     /// Local provenance files contribute descriptive evidence. Callers use
     /// `VerificationResult::verified` to require a trusted signature.
     pub async fn verify_provenance(
@@ -1162,12 +1174,9 @@ impl SlsaVerifier {
         if let Some(prov_path) = provenance_path
             && tokio::fs::try_exists(&prov_path).await.unwrap_or(false)
         {
-            let raw = Self::read_bounded(&prov_path, MAX_SLSA_PROVENANCE_BYTES, "provenance file")
-                .await?;
-            let content = String::from_utf8(raw).map_err(|err| SlsaError::Read {
-                path: prov_path.display().to_string(),
-                source: std::io::Error::new(std::io::ErrorKind::InvalidData, err),
-            })?;
+            let content =
+                Self::read_bounded_string(&prov_path, MAX_SLSA_PROVENANCE_BYTES, "provenance file")
+                    .await?;
             let _: SlsaProvenance = serde_json::from_str(&content)
                 .map_err(|source| SlsaError::ProvenanceParse { source })?;
             return Ok(classify_slsa_evidence(SlsaEvidence::UnsignedLocalJson));
@@ -2935,6 +2944,17 @@ mod required_signer_tests {
             .await
             .expect("small file within bound");
         assert_eq!(bytes, b"hello");
+        let text = super::SlsaVerifier::read_bounded_string(&small, 10, "provenance file")
+            .await
+            .expect("valid utf-8 provenance");
+        assert_eq!(text, "hello");
+
+        let bad_utf8 = dir.path().join("bad.bin");
+        std::fs::write(&bad_utf8, [0xff, 0xfe]).expect("write invalid utf-8");
+        let err = super::SlsaVerifier::read_bounded_string(&bad_utf8, 10, "provenance file")
+            .await
+            .expect_err("invalid utf-8 must fail");
+        assert!(matches!(err, super::SlsaError::Read { .. }));
 
         let err = super::SlsaVerifier::read_bounded(&small, 4, "artifact")
             .await
