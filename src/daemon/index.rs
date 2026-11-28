@@ -467,7 +467,8 @@ impl PackageIndex {
 
         let desc_finder = memchr::memmem::Finder::new(query_bytes);
 
-        let mut scored_matches: Vec<(RelevanceScore, u32)> = Vec::with_capacity(limit * 2);
+        let mut scored_matches: Vec<(RelevanceScore, u32)> =
+            Vec::with_capacity(limit.saturating_mul(2).min(self.items.len()));
         let mut name_match_count: usize = 0;
 
         // Use trigram index for queries >= 3 chars to narrow candidates
@@ -489,7 +490,7 @@ impl PackageIndex {
             // Fall through to description scan if we need more results
             if name_match_count < limit {
                 for (idx, item) in self.items.iter().enumerate() {
-                    if name_match_count + scored_matches.len() >= limit * 4 {
+                    if scored_matches.len() >= limit.saturating_mul(4) {
                         break;
                     }
                     let desc_lower = self.pool.get(item.description_lower_offset);
@@ -1664,5 +1665,15 @@ mod tests {
                 assert_eq!(row.name, format!("zzztree-i18n-aa{i:04}.noarch"));
             }
         }
+    }
+
+    #[test]
+    fn search_handles_huge_limit_without_overflow() {
+        let index = PackageIndex::from_records(&[
+            ("alpha", "1.0", "widget tool"),
+            ("beta", "1.0", "another widget"),
+        ]);
+        let results = index.search("widget", usize::MAX);
+        assert_eq!(results.len(), 2);
     }
 }

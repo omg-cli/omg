@@ -1083,7 +1083,7 @@ async fn async_main(args: Vec<String>, info_fast_missed: bool) -> Result<()> {
     validate_package_security(&cli.command)?;
 
     // Configure terminal rendering before any long-running command starts.
-    omg_lib::cli::modern_ui::configure_output(cli.verbose, cli.quiet);
+    omg_lib::cli::modern_ui::configure_output(cli.verbose, cli.quiet || cli.json);
 
     // Initialize logging. JSON mode implies quiet logging: the
     // advertised contract (tests/arch_cli_contracts.rs
@@ -1638,7 +1638,7 @@ async fn dispatch_command(
     // of silently emitting human-readable output.
     if ctx.json && !command_supports_json(command) {
         anyhow::bail!(
-            "--json is not supported for `{}`; supported: search, info, explicit, list, status, history, stats, outdated",
+            "--json is not supported for `{}`; supported: search, info, explicit, list, status, history, stats, outdated, ec, tc, oc, uc",
             command_name(command)
         );
     }

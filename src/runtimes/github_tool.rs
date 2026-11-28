@@ -704,13 +704,18 @@ impl GenericToolManager {
     /// Switch to an installed version.
     pub fn use_version(&self, version: &str) -> Result<()> {
         let version = normalize_version(version);
+        crate::core::security::validate_runtime_version(&version)?;
+        let expected = Path::new("bin").join(self.spec.binary);
+        super::common::require_internal_runtime_binary(
+            &self.versions_dir.join(&version),
+            &expected,
+        )?;
         let admission = self.security.installed(
             self.spec.name,
             &self.versions_dir.join(&version),
             super::security::ReviewMode::FreshAttended,
         )?;
         admission.verify(&self.versions_dir.join(&version))?;
-        let expected = Path::new("bin").join(self.spec.binary);
         activate_version_with_linked_binary(&self.versions_dir, &version, &expected)?;
         print_using(
             &self.display(),
@@ -1502,5 +1507,16 @@ mod tests {
             pathdiff_relative(target, base),
             PathBuf::from("../tool-1.0/bin/rg")
         );
+    }
+
+    #[test]
+    fn use_version_rejects_traversal_before_security_lookup() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut manager = GenericToolManager::for_name("ripgrep").expect("ripgrep spec");
+        manager.versions_dir = dir.path().join("versions");
+        let err = manager
+            .use_version("../node/20.0.0")
+            .expect_err("path traversal version must be rejected");
+        assert!(!err.to_string().is_empty());
     }
 }

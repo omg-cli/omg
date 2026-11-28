@@ -270,6 +270,14 @@ fn expand_dollar(value: &str, lookup: &dyn Fn(&str) -> Option<String>) -> String
     output
 }
 
+fn opt_bool(table: &toml::Table, key: &str, context: &str) -> Result<bool> {
+    match table.get(key) {
+        None => Ok(false),
+        Some(toml::Value::Boolean(value)) => Ok(*value),
+        Some(other) => anyhow::bail!("Option `{key}` in {context} must be a boolean, got {other}"),
+    }
+}
+
 /// Parse one `[env]` variable spec into an [`EnvEntry`].
 ///
 /// `false` unsets; `{ default = … }` fills gaps; `{ required = true }`
@@ -291,14 +299,9 @@ fn parse_entry(name: &str, spec: &toml::Value) -> Result<EnvEntry> {
                     other => anyhow::bail!("Unknown option {other:?} in [env] {name}"),
                 }
             }
-            tools_phase = table
-                .get("tools")
-                .and_then(toml::Value::as_bool)
-                .unwrap_or(false);
-            redact = table
-                .get("redact")
-                .and_then(toml::Value::as_bool)
-                .unwrap_or(false);
+            let ctx = format!("[env] {name}");
+            tools_phase = opt_bool(table, "tools", &ctx)?;
+            redact = opt_bool(table, "redact", &ctx)?;
             if let Some(default) = table.get("default") {
                 let fallback = match default {
                     toml::Value::String(value) => value.clone(),
@@ -308,11 +311,7 @@ fn parse_entry(name: &str, spec: &toml::Value) -> Result<EnvEntry> {
                     ),
                 };
                 EnvAction::Default(fallback)
-            } else if table
-                .get("required")
-                .and_then(toml::Value::as_bool)
-                .unwrap_or(false)
-            {
+            } else if opt_bool(table, "required", &ctx)? {
                 EnvAction::Required { redact }
             } else if let Some(value) = table.get("value") {
                 let assigned = match value {
@@ -362,10 +361,7 @@ pub(crate) fn directive_paths(spec: &toml::Value, directive: &str) -> Result<Vec
                         .collect::<Result<Vec<_>>>()?,
                     _ => anyhow::bail!("{directive} entry needs a `path` string"),
                 };
-                let tools_phase = table
-                    .get("tools")
-                    .and_then(toml::Value::as_bool)
-                    .unwrap_or(false);
+                let tools_phase = opt_bool(table, "tools", &format!("{directive} entry"))?;
                 Ok(paths.into_iter().map(|path| (path, tools_phase)).collect())
             }
             other => anyhow::bail!("Unsupported {directive} entry: {other}"),
@@ -402,23 +398,18 @@ pub(crate) fn parse_file_directive(item: &toml::Value) -> Result<EnvFileDirectiv
                     other => anyhow::bail!("Unknown option {other:?} in _.file entry"),
                 }
             }
-            let tools_phase = table
-                .get("tools")
-                .and_then(toml::Value::as_bool)
-                .unwrap_or(false);
+            let tools_phase = opt_bool(table, "tools", "_.file entry")?;
             (PathBuf::from(path), tools_phase)
         }
         other => anyhow::bail!("Unsupported _.file entry: {other}"),
     };
-    let table = item.as_table();
-    let redact = table
-        .and_then(|table| table.get("redact"))
-        .and_then(toml::Value::as_bool)
-        .unwrap_or(false);
-    let expand = table
-        .and_then(|table| table.get("expand"))
-        .and_then(toml::Value::as_bool)
-        .unwrap_or(false);
+    let (redact, expand) = match item.as_table() {
+        Some(table) => (
+            opt_bool(table, "redact", "_.file entry")?,
+            opt_bool(table, "expand", "_.file entry")?,
+        ),
+        None => (false, false),
+    };
     Ok(EnvFileDirective {
         path,
         redact,
@@ -1590,5 +1581,22 @@ mod tests {
         // can be asserted deterministically.
         let vars = eval_sourced_file(&script, &std::env::vars().collect()).expect("eval succeeds");
         assert_eq!(get(&vars, "OMG_FIXED_PROBE").as_deref(), Some("yes"));
+    }
+
+    #[test]
+    fn non_boolean_env_options_are_rejected() {
+        let mut table = toml::Table::new();
+        table.insert("value".into(), toml::Value::String("secret".into()));
+        table.insert("redact".into(), toml::Value::String("true".into()));
+        let err = parse_entry("API_KEY", &toml::Value::Table(table))
+            .expect_err("string redact option must fail instead of silently disabling redaction");
+        assert!(err.to_string().contains("must be a boolean"));
+
+        let mut file_table = toml::Table::new();
+        file_table.insert("path".into(), toml::Value::String(".env".into()));
+        file_table.insert("expand".into(), toml::Value::Integer(1));
+        let err = parse_file_directive(&toml::Value::Table(file_table))
+            .expect_err("non-boolean expand option must fail");
+        assert!(err.to_string().contains("must be a boolean"));
     }
 }
