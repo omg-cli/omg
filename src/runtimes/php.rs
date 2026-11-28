@@ -540,7 +540,7 @@ impl PhpManager {
         )?;
         admission.verify(&self.versions_dir.join(&version))?;
         activate_version_with_linked_binary(&self.versions_dir, &version, Path::new("bin/php"))?;
-        print_using("PHP", &version, &self.versions_dir.join("current"));
+        print_using("PHP", &version, &self.versions_dir.join("current/bin"));
         Ok(())
     }
 

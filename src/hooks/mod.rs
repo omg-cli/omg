@@ -298,6 +298,7 @@ fn parse_tool_versions_file(
         return Ok(());
     };
     for line in content.lines() {
+        let line = line.split('#').next().unwrap_or("");
         let parts: Vec<&str> = line.split_whitespace().collect();
         let (Some(rt_part), Some(ver_part)) = (parts.first(), parts.get(1)) else {
             continue;
@@ -337,11 +338,12 @@ fn parse_go_mod_file(
         return Ok(());
     };
     for line in content.lines() {
-        let line = line.trim();
-        if let Some(version) = line.strip_prefix("go ")
-            && !version.trim().is_empty()
+        let line = line.split("//").next().unwrap_or("").trim();
+        let mut parts = line.split_whitespace();
+        if parts.next() == Some("go")
+            && let Some(version) = parts.next()
         {
-            versions.insert(runtime.to_string(), version.trim().to_string());
+            versions.insert(runtime.to_string(), version.to_string());
             break;
         }
     }
@@ -569,10 +571,11 @@ pub(crate) fn selected_runtime_paths<S: std::hash::BuildHasher>(
                 let Some(toolchain) = RustToolchainSpec::parse(version).ok() else {
                     continue;
                 };
-                data_dir
-                    .join("versions/rust")
-                    .join(toolchain.name())
-                    .join("bin")
+                let version_dir = data_dir.join("versions/rust").join(toolchain.name());
+                if !crate::runtimes::common::is_valid_version_dir(&version_dir) {
+                    continue;
+                }
+                version_dir.join("bin")
             }
             // Registry tools share the generic `<versions>/<tool>/<version>/bin`
             // layout; resolution is validation-gated inside, like the
@@ -986,6 +989,9 @@ _omg_status_file_valid() {
 
 _omg_refresh_cache() {
   local f=__OMG_STATUS_FILE__
+  local now=$EPOCHSECONDS
+  # Only refresh every 60 seconds when we already have a cached reading
+  (( _OMG_CACHE_TIME > 0 && now - _OMG_CACHE_TIME < 60 )) && [[ -f "$f" ]] && return
   _omg_status_file_valid || {
     _OMG_TOTAL=0
     _OMG_EXPLICIT=0
@@ -994,9 +1000,6 @@ _omg_refresh_cache() {
     _OMG_CACHE_TIME=0
     return 0
   }
-  local now=$EPOCHSECONDS
-  # Only refresh every 60 seconds
-  (( now - _OMG_CACHE_TIME < 60 )) && return
   _OMG_CACHE_TIME=$now
   # Read all values at once
   local data=$(od -An -j8 -N16 -tu4 "$f" 2>/dev/null)
@@ -2641,5 +2644,37 @@ path = "hostile"
         fs::write(dir.path().join("mise.toml"), "[tools]\nripgrep = \"14\"\n").unwrap();
         let detected = detect_versions(dir.path()).unwrap();
         assert_eq!(detected.get("ripgrep").map(String::as_str), Some("14"));
+    }
+
+    #[test]
+    fn tool_versions_and_go_mod_ignore_comments_and_tabs() {
+        let dir = tempdir().unwrap();
+        let tv = dir.path().join(".tool-versions");
+        fs::write(&tv, "# node 18.0.0\nnodejs 22.1.0 # lts\n").unwrap();
+        let mut versions = HashMap::new();
+        parse_tool_versions_file(&tv, &mut versions).unwrap();
+        assert_eq!(versions.get("node").map(String::as_str), Some("22.1.0"));
+        assert!(!versions.contains_key("#"));
+
+        let gomod = dir.path().join("go.mod");
+        fs::write(&gomod, "module example.com/app\n\ngo\t1.23.4 // pinned\n").unwrap();
+        let mut go_versions = HashMap::new();
+        parse_go_mod_file(&gomod, "go", &mut go_versions).unwrap();
+        assert_eq!(go_versions.get("go").map(String::as_str), Some("1.23.4"));
+    }
+
+    #[test]
+    fn rust_pin_skips_incomplete_or_missing_version_dir() {
+        let data = tempdir().unwrap();
+        let incomplete = data.path().join("versions/rust/1.80.0/bin");
+        fs::create_dir_all(&incomplete).unwrap();
+        temp_env::with_var("OMG_DATA_DIR", Some(data.path()), || {
+            let versions = HashMap::from([("rust".to_string(), "1.80.0".to_string())]);
+            let additions = build_path_additions(&versions).unwrap();
+            assert!(
+                additions.is_empty(),
+                "incomplete rust version dir must be skipped: {additions:?}"
+            );
+        });
     }
 }

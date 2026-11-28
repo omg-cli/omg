@@ -447,6 +447,7 @@ impl ErlangManager {
                 return Err(error);
             }
         }
+        make_staged_executable(&version_dir.join("bin/erl"))?;
         let after_setup =
             self.security
                 .prepare_staged("erlang", version, &version_dir, &version_dir)?;
@@ -460,7 +461,6 @@ impl ErlangManager {
             ));
         }
 
-        make_staged_executable(&version_dir.join("bin/erl"))?;
         let _finished =
             self.security
                 .prepare_staged("erlang", version, &version_dir, &version_dir)?;
@@ -483,7 +483,11 @@ impl ErlangManager {
         )?;
         admission.verify(&self.versions_dir.join(&version))?;
         activate_version_with_linked_binary(&self.versions_dir, &version, Path::new("bin/erl"))?;
-        print_using("Erlang/OTP", &version, &self.versions_dir.join("current"));
+        print_using(
+            "Erlang/OTP",
+            &version,
+            &self.versions_dir.join("current/bin"),
+        );
         Ok(())
     }
 

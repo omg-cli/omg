@@ -22,8 +22,9 @@ end
 
 function __omg_needs_dynamic_suggestions
     set -l words (string match -rv -- '^-' (commandline -opc))
+    test (count $words) -ge 2; or return 1
     switch "$words[2]"
-        case install i remove r info use sy ls list which tool env run new completions
+        case install i remove r info use sy ls list which tool env run new create completions
             return 0
     end
 
