@@ -23,6 +23,7 @@ import {
   diagnosticFailureMetadata,
   diagnosticHistory,
   diagnosticNeedsReport,
+  redactDiagnosticText,
 } from "./runtime.js";
 
 export class Coder extends DurableObject<Env> {
@@ -188,7 +189,7 @@ export class Coder extends DurableObject<Env> {
     const failureMetadata = request.diagnosisTask && initialOutcome.status === "unanswered"
       ? (await this.harness.messages({session: initialOutcome.session}))
           .filter(message => message.type === "assistant" || message.type === "idle")
-          .slice(-8).map(message => diagnosticFailureMetadata(message, [this.env.CI_API_TOKEN]))
+          .slice(-8).map(message => diagnosticFailureMetadata(message, [this.env.CI_API_TOKEN, this.env.CODER_API_TOKEN]))
       : undefined;
     let outcome = initialOutcome;
     if (request.diagnosisTask && ((initialOutcome.status === "done" && diagnosticNeedsReport(initialOutcome.text)) ||
@@ -249,7 +250,10 @@ export class Coder extends DurableObject<Env> {
       runtime,
       skillsDelivery: await this.ctx.storage.get("skills-delivery"),
       ...(request.diagnosisTask ? {
-        diagnosis: outcome.text ?? null,
+        diagnosis:
+          outcome.text != null
+            ? redactDiagnosticText(outcome.text, [this.env.CI_API_TOKEN, this.env.CODER_API_TOKEN])
+            : null,
         failureMetadata,
       } : {}),
     };

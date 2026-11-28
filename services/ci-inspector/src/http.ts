@@ -61,7 +61,16 @@ export async function readBoundedJson(
       chunks.push(chunk.value);
     }
   } catch {
+    try {
+      await reader.cancel();
+    } catch (cancelError) {
+      console.warn("ci-inspector: reader.cancel failed", cancelError);
+    }
     return { kind: "error", status: 400, error: "Invalid body" };
+  } finally {
+    if ("releaseLock" in reader && typeof reader.releaseLock === "function") {
+      reader.releaseLock();
+    }
   }
 
   const bytes = new Uint8Array(size);

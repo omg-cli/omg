@@ -124,7 +124,13 @@ async function retainFile(
 
       return "saved";
     } finally {
-      await reader.cancel().catch(() => {});
+      try {
+        await reader.cancel();
+      } catch (cancelError) {
+        console.warn("unit-report-retention: reader.cancel failed", cancelError);
+      } finally {
+        reader.releaseLock();
+      }
     }
   } catch {
     return "unavailable";
