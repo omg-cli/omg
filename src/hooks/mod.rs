@@ -2662,4 +2662,19 @@ path = "hostile"
         parse_go_mod_file(&gomod, "go", &mut go_versions).unwrap();
         assert_eq!(go_versions.get("go").map(String::as_str), Some("1.23.4"));
     }
+
+    #[test]
+    fn rust_pin_skips_incomplete_or_missing_version_dir() {
+        let data = tempdir().unwrap();
+        let incomplete = data.path().join("versions/rust/1.80.0/bin");
+        fs::create_dir_all(&incomplete).unwrap();
+        temp_env::with_var("OMG_DATA_DIR", Some(data.path()), || {
+            let versions = HashMap::from([("rust".to_string(), "1.80.0".to_string())]);
+            let additions = build_path_additions(&versions).unwrap();
+            assert!(
+                additions.is_empty(),
+                "incomplete rust version dir must be skipped: {additions:?}"
+            );
+        });
+    }
 }

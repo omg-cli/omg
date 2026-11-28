@@ -1518,5 +1518,9 @@ mod tests {
             .use_version("../node/20.0.0")
             .expect_err("path traversal version must be rejected");
         assert!(!err.to_string().is_empty());
+        let missing_err = manager
+            .use_version("1.2.3")
+            .expect_err("missing tool binary must be rejected");
+        assert!(!missing_err.to_string().is_empty());
     }
 }
