@@ -1252,76 +1252,80 @@ pub(crate) async fn extract_zip(
 
         let mut archive = zip::ZipArchive::new(file).context("Failed to read ZIP archive")?;
 
-        let task = extract_task(&archive_path);
-        task.set_message("Extracting...");
-
-        let outcome = (|| -> Result<()> {
-            fs::create_dir_all(&dest_dir)?;
-            let mut remaining_budget = MAX_DECOMPRESSED_BYTES;
-
-            let mut entry_budget = ArchiveEntryBudget::default();
-            anyhow::ensure!(
-                archive.len() <= MAX_ARCHIVE_ENTRIES,
-                "Archive contains too many entries"
-            );
-            for i in 0..archive.len() {
-                let mut file = archive.by_index(i)?;
-                let entry_name = file.name()?;
-                let path = file.enclosed_name().ok_or_else(|| {
-                    anyhow::anyhow!("Unsafe path in runtime ZIP archive: {entry_name}")
-                })?;
-                entry_budget.charge(&path)?;
-                let Some(stripped) = stripped_archive_path(&path, strip_components)? else {
-                    continue;
-                };
-                if file.is_symlink() {
-                    anyhow::bail!(
-                        "Unsupported symlink entry in runtime ZIP archive: {}",
-                        path.display()
-                    );
-                }
-
-                let dest_path = dest_dir.join(&stripped);
-                task.set_message(&format!("Extracting: {}", stripped.display()));
-
-                if file.is_dir() {
-                    fs::create_dir_all(&dest_path)?;
-                } else {
-                    if let Some(parent) = dest_path.parent() {
-                        fs::create_dir_all(parent)?;
-                    }
-                    anyhow::ensure!(
-                        file.size() <= remaining_budget,
-                        "decompressed ZIP data exceeds the maximum supported size of {MAX_DECOMPRESSED_BYTES} bytes"
-                    );
-                    let mut outfile = File::create(&dest_path)?;
-                    if let Err(error) =
-                        copy_with_budget(&mut file, &mut outfile, &mut remaining_budget)
-                    {
-                        drop(outfile);
-                        let _ = fs::remove_file(&dest_path);
-                        return Err(error).context("Runtime ZIP exceeded decompression budget");
-                    }
-
-                    // Preserve ordinary permission bits on Unix; never restore
-                    // setuid, setgid, or sticky bits from an untrusted archive.
-                    #[cfg(unix)]
-                    if let Some(mode) = file.unix_mode() {
-                        use std::os::unix::fs::PermissionsExt;
-                        fs::set_permissions(&dest_path, fs::Permissions::from_mode(mode & 0o777))?;
-                    }
+        struct ExtractTaskGuard(Option<ProgressTask>);
+        impl Drop for ExtractTaskGuard {
+            fn drop(&mut self) {
+                if let Some(task) = self.0.take() {
+                    task.finish(Outcome::Failed);
                 }
             }
+        }
+        let mut task_guard = ExtractTaskGuard(Some(extract_task(&archive_path)));
+        let task = task_guard.0.as_ref().expect("task guard initialized");
+        task.set_message("Extracting...");
 
-            Ok(())
-        })();
+        fs::create_dir_all(&dest_dir)?;
+        let mut remaining_budget = MAX_DECOMPRESSED_BYTES;
 
-        task.finish(if outcome.is_ok() {
-            Outcome::Done
-        } else {
-            Outcome::Failed
-        });
-        outcome
+        let mut entry_budget = ArchiveEntryBudget::default();
+        anyhow::ensure!(
+            archive.len() <= MAX_ARCHIVE_ENTRIES,
+            "Archive contains too many entries"
+        );
+        for i in 0..archive.len() {
+            let mut file = archive.by_index(i)?;
+            let entry_name = file.name()?;
+            let path = file.enclosed_name().ok_or_else(|| {
+                anyhow::anyhow!("Unsafe path in runtime ZIP archive: {entry_name}")
+            })?;
+            entry_budget.charge(&path)?;
+            let Some(stripped) = stripped_archive_path(&path, strip_components)? else {
+                continue;
+            };
+            if file.is_symlink() {
+                anyhow::bail!(
+                    "Unsupported symlink entry in runtime ZIP archive: {}",
+                    path.display()
+                );
+            }
+
+            let dest_path = dest_dir.join(&stripped);
+            task.set_message(&format!("Extracting: {}", stripped.display()));
+
+            if file.is_dir() {
+                fs::create_dir_all(&dest_path)?;
+            } else {
+                if let Some(parent) = dest_path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                anyhow::ensure!(
+                    file.size() <= remaining_budget,
+                    "decompressed ZIP data exceeds the maximum supported size of {MAX_DECOMPRESSED_BYTES} bytes"
+                );
+                let mut outfile = File::create(&dest_path)?;
+                if let Err(error) = copy_with_budget(&mut file, &mut outfile, &mut remaining_budget)
+                {
+                    drop(outfile);
+                    let _ = fs::remove_file(&dest_path);
+                    return Err(error).context("Runtime ZIP exceeded decompression budget");
+                }
+
+                // Preserve ordinary permission bits on Unix; never restore
+                // setuid, setgid, or sticky bits from an untrusted archive.
+                #[cfg(unix)]
+                if let Some(mode) = file.unix_mode() {
+                    use std::os::unix::fs::PermissionsExt;
+                    fs::set_permissions(&dest_path, fs::Permissions::from_mode(mode & 0o777))?;
+                }
+            }
+        }
+
+        task_guard
+            .0
+            .take()
+            .expect("task guard active")
+            .finish(Outcome::Done);
+        Ok(())
     })
     .await?
 }
