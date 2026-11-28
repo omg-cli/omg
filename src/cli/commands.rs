@@ -1746,6 +1746,20 @@ mod tests {
         );
     }
 
+    #[serial_test::serial]
+    #[test]
+    fn complete_runtime_versions_returns_installed_versions() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::create_dir_all(dir.path().join("versions/node/20.11.0"))
+            .expect("create installed runtime dir");
+        temp_env::with_var("OMG_DATA_DIR", Some(dir.path()), || {
+            let engine = crate::core::completion::CompletionEngine::new();
+            let results =
+                complete_runtime_versions(&engine, "20", "node").expect("complete node versions");
+            assert!(results.iter().any(|version| version == "20.11.0"));
+        });
+    }
+
     #[cfg(unix)]
     fn presentation_fixture_output(case: &str) -> String {
         let output = Command::new(std::env::current_exe().unwrap())

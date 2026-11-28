@@ -3404,9 +3404,6 @@ esac
     #[serial_test::serial]
     #[test]
     fn remove_handles_scoped_npm_package_storage_dir() {
-        if crate::core::is_root() {
-            return;
-        }
         let dir = tempfile::tempdir().expect("temp dir");
         let scoped_dir = dir.path().join("tools/npm/@acme__cli");
         fs::create_dir_all(&scoped_dir).expect("create scoped npm dir");
