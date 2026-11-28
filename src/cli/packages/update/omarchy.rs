@@ -1568,7 +1568,6 @@ fn remove_shipped_media_launchers(applications: &Path, shipped_digests: &[&str])
     if !directory.is_dir() {
         return Ok(false);
     }
-    let mut removed = false;
     for name in ["imv.desktop", "mpv.desktop"] {
         let path = applications.join(name);
         let file = match File::options()
@@ -1609,10 +1608,9 @@ fn remove_shipped_media_launchers(applications: &Path, shipped_digests: &[&str])
             );
             std::fs::remove_file(path)
                 .with_context(|| format!("Cannot remove the old Omarchy launcher {name}"))?;
-            removed = true;
         }
     }
-    Ok(removed)
+    Ok(true)
 }
 
 fn native_reboot_reason() -> Result<Option<&'static str>> {

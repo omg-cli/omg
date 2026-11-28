@@ -2483,10 +2483,10 @@ async fn native_build_cleanup_probe(mode: &'static str) -> Result<()> {
     // inherited process group after the isolation subprocess is launched.
     const EXPECT_PARENT_GROUP: &str = "OMG_NATIVE_BUILD_EXPECT_PARENT_PGRP";
     let probe_pid = std::process::id();
-    let probe_uid = nix::unistd::getuid().as_raw();
+    let probe_owner = nix::unistd::getuid().as_raw();
     let probe_group = nix::unistd::getpgrp().as_raw();
     println!(
-        "[native-build-probe-context] mode={mode} pid={probe_pid} uid={probe_uid} pgrp={probe_group}"
+        "[native-build-probe-context] mode={mode} pid={probe_pid} uid={probe_owner} pgrp={probe_group}"
     );
     if let Some(expected) = std::env::var_os(EXPECT_PARENT_GROUP) {
         match expected.to_str() {
@@ -6552,7 +6552,7 @@ fn final_install_rechecks_current_hardened_profile_before_elevation() -> Result<
     let archive = directory.path().join("demo-1-1-any.pkg.tar.gz");
     write_pkg_archive(
         &archive,
-        "pkgname = demo\npkgbase = demo\npkgver = 1-1\narch = any\n",
+        "pkgname = demo\npkgbase = demo\npkgver = 1-1\n",
         Some("post_install() { :; }\n"),
     );
     let snapshot = ArchiveSnapshot::capture(&archive)?;

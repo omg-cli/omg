@@ -340,7 +340,6 @@ pub fn is_installed_fast(name: &str) -> Result<bool> {
 }
 
 /// Count `(total, explicit, orphans)` packages directly via libalpm.
-#[cfg(test)]
 pub fn get_counts() -> Result<(usize, usize, usize)> {
     with_handle(|handle| {
         let pkgs = handle.localdb().pkgs();
@@ -360,6 +359,19 @@ pub fn get_counts() -> Result<(usize, usize, usize)> {
         });
 
         Ok((total, explicit, orphans))
+    })
+}
+
+/// Count explicitly installed packages directly via libalpm.
+#[inline]
+pub fn get_explicit_count_fast() -> Result<usize> {
+    with_handle(|handle| {
+        Ok(handle
+            .localdb()
+            .pkgs()
+            .iter()
+            .filter(|p| p.reason() == PackageReason::Explicit)
+            .count())
     })
 }
 

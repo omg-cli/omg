@@ -30,13 +30,14 @@ pub async fn remove_dry_run(packages: &[String], recursive: bool) -> Result<()> 
 
     let mut total_size: u64 = 0;
     for info in package_info {
+        let size_mb = info.size as f64 / 1024.0 / 1024.0;
         total_size = total_size.saturating_add(info.size);
         println!(
-            "    {} {} {} ({})",
+            "    {} {} {} ({:.2} MB)",
             style::error("✗"),
             style::package(&info.name),
             style::version(&info.version.to_string()),
-            style::size(info.size)
+            size_mb
         );
     }
 
@@ -49,9 +50,9 @@ pub async fn remove_dry_run(packages: &[String], recursive: bool) -> Result<()> 
 
     ui::print_spacer();
     println!(
-        "  {} Requested-package space that would be freed: {}",
+        "  {} Requested-package space that would be freed: {:.2} MB",
         style::info("→"),
-        style::size(total_size)
+        total_size as f64 / 1024.0 / 1024.0
     );
     ui::print_dry_run_footer();
     Ok(())
