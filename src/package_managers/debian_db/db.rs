@@ -564,8 +564,21 @@ impl DebianPackageIndex {
         }
 
         let name_arch_component_key = format!("{name}:{arch}:{component}");
-        self.name_arch_component_to_idx
-            .insert(name_arch_component_key, idx);
+        if let Some(existing_idx) = self
+            .name_arch_component_to_idx
+            .get(&name_arch_component_key)
+            .copied()
+        {
+            if let Some(existing_pkg) = self.packages.get(existing_idx)
+                && is_better_arch_candidate(&pkg, existing_pkg)
+            {
+                self.name_arch_component_to_idx
+                    .insert(name_arch_component_key, idx);
+            }
+        } else {
+            self.name_arch_component_to_idx
+                .insert(name_arch_component_key, idx);
+        }
         self.packages.push(pkg);
     }
 
@@ -794,7 +807,8 @@ pub fn ensure_index_loaded() -> Result<()> {
 
     *crate::core::sync::write_cache(&DEBIAN_MMAP_INDEX) = None;
     *crate::core::sync::write_cache(&DEBIAN_FST_INDEX) = None;
-    let all_files: Vec<PathBuf> = current_files.keys().cloned().collect();
+    let mut all_files: Vec<PathBuf> = current_files.keys().cloned().collect();
+    all_files.sort();
     let index = rebuild_package_index(&all_files)?;
     // Release serialization buffers before hydrating in-memory search state.
     {
@@ -1804,20 +1818,21 @@ fn fst_search(
     substring_matches
 }
 
-/// FST+mmap search: completely bypasses `ensure_index_loaded()`
-/// Uses FST for name matching and mmap for zero-copy package details
-#[inline]
+/// FST + rkyv snapshot search: bypasses `ensure_index_loaded()`.
 fn fst_mmap_search(
     fst_map: &Map<AlignedVec>,
     mmap: &DebianMmapIndex,
     query_lower: &str,
     installed_set: &AHashSet<String>,
 ) -> Vec<Package> {
+    let Ok(packages) = mmap.packages() else {
+        return Vec::new();
+    };
     let query_bytes = query_lower.as_bytes();
 
     // 1. Try exact match first
-    if let Some(_idx) = fst_map.get(query_bytes)
-        && let Ok(Some(pkg)) = mmap.get(query_lower)
+    if let Some(idx) = fst_map.get(query_bytes)
+        && let Some(pkg) = usize::try_from(idx).ok().and_then(|i| packages.get(i))
     {
         return vec![archived_package_to_package(
             pkg,
@@ -1829,13 +1844,11 @@ fn fst_mmap_search(
     let mut results = Vec::with_capacity(100);
     let mut stream = fst_map.range().ge(query_bytes).into_stream();
 
-    while let Some((name_bytes, _idx)) = stream.next() {
+    while let Some((name_bytes, idx)) = stream.next() {
         if !name_bytes.starts_with(query_bytes) {
             break;
         }
-        if let Ok(name_str) = std::str::from_utf8(name_bytes)
-            && let Ok(Some(pkg)) = mmap.get(name_str)
-        {
+        if let Some(pkg) = usize::try_from(idx).ok().and_then(|i| packages.get(i)) {
             results.push(archived_package_to_package(
                 pkg,
                 installed_set.contains(pkg.name.as_str()),
@@ -1853,10 +1866,9 @@ fn fst_mmap_search(
     // 3. Substring search fallback
     let finder = memmem::Finder::new(query_bytes);
     let mut stream = fst_map.stream().into_stream();
-    while let Some((name_bytes, _idx)) = stream.next() {
+    while let Some((name_bytes, idx)) = stream.next() {
         if finder.find(name_bytes).is_some()
-            && let Ok(name_str) = std::str::from_utf8(name_bytes)
-            && let Ok(Some(pkg)) = mmap.get(name_str)
+            && let Some(pkg) = usize::try_from(idx).ok().and_then(|i| packages.get(i))
         {
             results.push(archived_package_to_package(
                 pkg,
@@ -1871,7 +1883,6 @@ fn fst_mmap_search(
     results
 }
 
-#[inline]
 fn simd_search_fallback(
     index: &DebianPackageIndex,
     query_lower: &str,

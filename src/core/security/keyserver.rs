@@ -366,7 +366,7 @@ fn validate_gnupg_home(gnupg_home: &Path) -> Result<(), KeyserverError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt as _;
-        if meta.uid() != nix::unistd::getuid().as_raw() || meta.mode() & 0o077 != 0 {
+        if meta.uid() != nix::unistd::geteuid().as_raw() || meta.mode() & 0o077 != 0 {
             return Err(KeyserverError::GnuPgLaunch {
                 operation: "refusing weakly-permissioned GnuPG home",
                 source: std::io::Error::new(
@@ -384,21 +384,24 @@ fn validate_gnupg_home(gnupg_home: &Path) -> Result<(), KeyserverError> {
 pub fn import_key_into_gnupg(cert: &Cert, gnupg_home: &Path) -> Result<(), KeyserverError> {
     use sequoia_openpgp::serialize::Serialize;
     use std::io::Write as _;
-    use std::os::unix::fs::PermissionsExt as _;
 
-    if gnupg_home.exists() {
-        validate_gnupg_home(gnupg_home)?;
-    } else {
-        std::fs::create_dir(gnupg_home).map_err(|source| KeyserverError::GnuPgLaunch {
-            operation: "creating the GnuPG home",
-            source,
-        })?;
-        std::fs::set_permissions(gnupg_home, std::fs::Permissions::from_mode(0o700)).map_err(
-            |source| KeyserverError::GnuPgLaunch {
-                operation: "securing the GnuPG home",
+    let mut dir_builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        dir_builder.mode(0o700);
+    }
+    match dir_builder.create(gnupg_home) {
+        Ok(()) => {}
+        Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {
+            validate_gnupg_home(gnupg_home)?;
+        }
+        Err(source) => {
+            return Err(KeyserverError::GnuPgLaunch {
+                operation: "creating the GnuPG home",
                 source,
-            },
-        )?;
+            });
+        }
     }
 
     // Trust-on-first-use: this key has no fingerprint pinning. Say so on

@@ -154,11 +154,9 @@ impl ParallelBuilder {
             authorized_jobs.insert(package.clone(), authorized);
         }
 
-        if !crate::core::caps::can_write_pacman_db() {
-            let package = jobs_by_package
-                .values()
-                .next()
-                .expect("invariant: jobs checked non-empty above");
+        if !crate::core::caps::can_write_pacman_db()
+            && let Some(package) = jobs_by_package.values().next()
+        {
             AurClient::preacquire_install_privileges(&package.package, "parallel AUR build")
                 .await?;
         }
@@ -224,13 +222,13 @@ impl ParallelBuilder {
     pub fn build_dependency_graph(jobs: &[BuildJob]) -> HashMap<String, HashSet<String>> {
         let mut graph: HashMap<String, HashSet<String>> = HashMap::new();
 
-        let all_packages: HashSet<String> = jobs.iter().map(|j| j.package.clone()).collect();
+        let all_packages: HashSet<&str> = jobs.iter().map(|j| j.package.as_str()).collect();
 
         for job in jobs {
             let deps: HashSet<String> = job
                 .dependencies
                 .iter()
-                .filter(|dep| all_packages.contains(*dep))
+                .filter(|dep| all_packages.contains(dep.as_str()))
                 .cloned()
                 .collect();
 

@@ -282,16 +282,22 @@ fn validate_relative_link(member: &str, target: &Path, hard_link: bool) -> Resul
 }
 
 fn parse_pkginfo(content: &str) -> Result<(String, String, String, String)> {
-    let field = |name: &str| {
-        content.lines().find_map(|line| {
+    let unique_field = |name: &str| -> Result<Option<String>> {
+        let mut values = content.lines().filter_map(|line| {
             let (key, value) = line.split_once('=')?;
             (key.trim() == name).then(|| value.trim().to_owned())
-        })
+        });
+        let first = values.next();
+        anyhow::ensure!(
+            values.next().is_none(),
+            "AUR archive .PKGINFO contains duplicate {name}"
+        );
+        Ok(first)
     };
-    let name = field("pkgname").context("AUR archive .PKGINFO is missing pkgname")?;
-    let version = field("pkgver").context("AUR archive .PKGINFO is missing pkgver")?;
-    let base = field("pkgbase").unwrap_or_else(|| name.clone());
-    let architecture = field("arch").context("AUR archive .PKGINFO is missing arch")?;
+    let name = unique_field("pkgname")?.context("AUR archive .PKGINFO is missing pkgname")?;
+    let version = unique_field("pkgver")?.context("AUR archive .PKGINFO is missing pkgver")?;
+    let base = unique_field("pkgbase")?.unwrap_or_else(|| name.clone());
+    let architecture = unique_field("arch")?.context("AUR archive .PKGINFO is missing arch")?;
     crate::core::security::validate_package_name(&name)?;
     crate::core::security::validate_package_name(&base)?;
     crate::core::security::validate_version(&version)?;
@@ -301,18 +307,18 @@ fn parse_pkginfo(content: &str) -> Result<(String, String, String, String)> {
 
 fn parse_buildinfo(content: &str) -> Result<(String, String, String, String)> {
     let exactly_one = |name: &str| -> Result<String> {
-        let values = content
-            .lines()
-            .filter_map(|line| {
-                let (key, value) = line.split_once('=')?;
-                (key.trim() == name).then(|| value.trim().to_owned())
-            })
-            .collect::<Vec<_>>();
+        let mut values = content.lines().filter_map(|line| {
+            let (key, value) = line.split_once('=')?;
+            (key.trim() == name).then(|| value.trim().to_owned())
+        });
+        let first = values
+            .next()
+            .with_context(|| format!("AUR archive .BUILDINFO must contain one {name}"))?;
         anyhow::ensure!(
-            values.len() == 1,
+            values.next().is_none(),
             "AUR archive .BUILDINFO must contain one {name}"
         );
-        Ok(values.into_iter().next().expect("length checked"))
+        Ok(first)
     };
     let format = exactly_one("format")?;
     anyhow::ensure!(
@@ -501,15 +507,11 @@ pub(crate) fn inspect_archive(path: &Path) -> Result<ArchiveAdmission> {
 
     let (package_name, package_version, package_base, architecture) =
         pkginfo.context("AUR archive is missing .PKGINFO")?;
-    let buildinfo = buildinfo.context("AUR archive is missing .BUILDINFO")?;
+    let (build_name, build_version, build_base, build_arch) =
+        buildinfo.context("AUR archive is missing .BUILDINFO")?;
     anyhow::ensure!(
-        buildinfo
-            == (
-                package_name.clone(),
-                package_version.clone(),
-                package_base.clone(),
-                architecture.clone(),
-            ),
+        (&build_name, &build_version, &build_base, &build_arch)
+            == (&package_name, &package_version, &package_base, &architecture),
         "AUR archive .BUILDINFO identity differs from .PKGINFO"
     );
     let inventory = inventory.agree(&mtree_bytes.context("AUR archive is missing .MTREE")?)?;

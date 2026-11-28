@@ -298,15 +298,12 @@ export class CI extends CIWorkflow<CloudflareArtifacts, Env> {
                 const outcomes = await Promise.allSettled(
                     pending.slice(index, index + 2).map(async (name) => {
                         const env: NonNullable<RunnerOptions["env"]> = {
+                            ...executionEnv,
                             OMG_EXPECTED_SHA: request.sha,
                             OMG_RUN_ID: request.runId,
                             OMG_RUN_ATTEMPT: request.attempt,
                             OMG_CI_LEAF_STEP: name,
-                            ...executionEnv,
                         };
-
-                        env.OMG_RUN_ID = request.runId;
-                        env.OMG_RUN_ATTEMPT = request.attempt;
 
                         const result: CheckResult = await deps.runner({
                             name,

@@ -501,24 +501,12 @@ pub fn pacman_cache_dirs_result() -> anyhow::Result<Vec<PathBuf>> {
     Ok(vec![root.join("var/cache/pacman/pkg")])
 }
 
-/// Pacman cache root directory (default: /var/cache/pacman).
-#[must_use]
-pub fn pacman_cache_root_dir() -> PathBuf {
-    env_path("OMG_PACMAN_CACHE_ROOT_DIR").unwrap_or_else(|| pacman_root().join("var/cache/pacman"))
-}
-
 #[cfg(feature = "arch")]
 pub fn pacman_cache_root_dir_result() -> anyhow::Result<PathBuf> {
     if let Some(root) = env_path("OMG_PACMAN_CACHE_ROOT_DIR") {
         return require_absolute_pacman_path(root, "OMG_PACMAN_CACHE_ROOT_DIR");
     }
     Ok(pacman_root_result()?.join("var/cache/pacman"))
-}
-
-/// Pacman mirrorlist path (default: /etc/pacman.d/mirrorlist).
-#[must_use]
-pub fn pacman_mirrorlist_path() -> PathBuf {
-    env_path("OMG_PACMAN_MIRRORLIST").unwrap_or_else(|| PathBuf::from("/etc/pacman.d/mirrorlist"))
 }
 
 /// Pacman configuration file path (default: /etc/pacman.conf).

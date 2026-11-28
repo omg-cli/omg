@@ -331,7 +331,7 @@ async fn apply_fedora_upgrade(cached: bool, detail: &str) -> Result<()> {
     Ok(())
 }
 
-async fn confirm_proceed_with_upgrade(yes: bool) -> Result<bool> {
+pub(super) async fn confirm_proceed_with_upgrade(yes: bool) -> Result<bool> {
     if yes {
         return Ok(true);
     }

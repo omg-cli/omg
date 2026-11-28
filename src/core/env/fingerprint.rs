@@ -118,22 +118,20 @@ impl EnvironmentState {
 
     /// Parse and verify lockfile content before it is persisted.
     pub fn parse_lockfile(content: &str) -> Result<Self> {
-        // Reject files written by a newer schema BEFORE parsing, so unknown
-        // future fields produce an actionable message instead of accidental
-        // best-effort deserialization.
-        if let Ok(raw) = toml::from_str::<toml::Value>(content) {
-            let file_version = raw
-                .get("schema_version")
-                .and_then(toml::Value::as_integer)
-                .unwrap_or_else(|| i64::from(Self::SCHEMA_VERSION));
-            if file_version > i64::from(Self::SCHEMA_VERSION) {
-                anyhow::bail!(
-                    "Lockfile was written by a newer omg (schema version {file_version}). \
-                     Upgrade omg to read it."
-                );
-            }
+        // Parse once into `toml::Value` so newer schema versions produce an
+        // actionable message before typed deserialization.
+        let raw: toml::Value = toml::from_str(content).context("Failed to parse lockfile")?;
+        let file_version = raw
+            .get("schema_version")
+            .and_then(toml::Value::as_integer)
+            .unwrap_or_else(|| i64::from(Self::SCHEMA_VERSION));
+        if file_version > i64::from(Self::SCHEMA_VERSION) {
+            anyhow::bail!(
+                "Lockfile was written by a newer omg (schema version {file_version}). \
+                 Upgrade omg to read it."
+            );
         }
-        let mut state: Self = toml::from_str(content).context("Failed to parse lockfile")?;
+        let mut state: Self = raw.try_into().context("Failed to parse lockfile")?;
         // Corruption check, not authentication: the hash is recomputed from
         // the same content, so anyone who can write the file can forge it.
         // Trust comes from the transport (gist ownership, file ownership),

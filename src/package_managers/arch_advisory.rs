@@ -109,9 +109,8 @@ pub(crate) fn assess_packages(
             "Unknown Arch advisory status for {}",
             advisory.name
         );
-        if advisory.status == "Not affected" {
-            continue;
-        }
+        // Validate independently of status and installed matches: candidate cache
+        // admission calls this with an empty inventory before retaining the feed.
         let severity = match advisory.severity.as_str() {
             "Critical" => AdvisorySeverity::Critical,
             "High" => AdvisorySeverity::Important,
@@ -120,14 +119,15 @@ pub(crate) fn assess_packages(
             "Unknown" => AdvisorySeverity::Unspecified,
             _ => anyhow::bail!("Unknown Arch advisory severity for {}", advisory.name),
         };
-        // Validate independently of installed matches: candidate cache admission
-        // calls this with an empty inventory before retaining the whole feed.
         let fixed = advisory
             .fixed
             .as_deref()
             .filter(|value| !value.is_empty())
             .map(|value| parse_version(value).context("Invalid Arch advisory fixed version"))
             .transpose()?;
+        if advisory.status == "Not affected" {
+            continue;
+        }
         let mut matched_indices = HashSet::new();
         for pkg_name in &advisory.packages {
             let Some(indices) = assessments_by_name.get(pkg_name.as_str()) else {
@@ -225,7 +225,7 @@ mod tests {
     }
 
     #[test]
-    fn coverage17_unknown_installed_origin_is_reported_even_without_matches() {
+    fn unknown_installed_origin_is_reported_even_without_matches() {
         let package = SecurityPackage {
             origin: SecurityOrigin::Unknown,
             name: "omg-unmapped-audit-fixture".into(),

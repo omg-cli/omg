@@ -7,7 +7,6 @@
 /// Check if this process is the root child created by OMG's sudo delegation.
 ///
 /// The marker alone is not authority: effective root identity is mandatory.
-#[inline]
 #[must_use]
 pub fn is_elevated() -> bool {
     std::env::var_os("OMG_ELEVATED").is_some() && crate::core::privilege::is_root()
@@ -30,11 +29,19 @@ pub fn maybe_show_turbo_hint() -> bool {
         return false;
     }
 
+    if let Err(error) = crate::core::paths::ensure_data_dir() {
+        tracing::debug!("Skipping turbo hint: could not ensure data dir: {error:#}");
+        return false;
+    }
+
     let hint_file = crate::core::paths::data_dir().join(".turbo_hint_shown");
-    #[cfg(unix)]
     match crate::core::safe_ops::create_private_marker(&hint_file, b"1") {
         Ok(true) => {}
-        Ok(false) | Err(_) => return false,
+        Ok(false) => return false,
+        Err(error) => {
+            tracing::debug!("Skipping turbo hint: marker creation failed: {error:#}");
+            return false;
+        }
     }
 
     eprintln!();

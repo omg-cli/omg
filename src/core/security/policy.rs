@@ -1,7 +1,7 @@
 //! Security policy enforcement and package security grading
 //!
 //! Defines security policies for package approval/rejection based on
-//! vulnerabilities, licenses, and trust levels with A-F grading.
+//! vulnerabilities, licenses, and trust levels (`Risk`, `Community`, `Verified`, `Locked`).
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;

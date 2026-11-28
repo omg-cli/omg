@@ -1,6 +1,6 @@
-//! Parallel source downloading for AUR packages
+//! Parallel source downloading for AUR packages.
 //!
-//! Parses `.SRCINFO` and downloads HTTP sources concurrently before makepkg runs.
+//! Parses `.SRCINFO` and downloads public HTTPS sources concurrently before makepkg runs.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -32,24 +32,24 @@ pub struct SourceFile {
     pub filename: String,
 }
 
-/// Acquires a bounded regular .SRCINFO file and extracts its HTTP/HTTPS sources.
+/// Acquires a bounded regular .SRCINFO file and extracts its HTTPS sources.
 pub fn parse_sources(pkg_dir: &Path) -> Result<Vec<SourceFile>> {
     Ok(super::aur::source_file::read_srcinfo(pkg_dir)?
         .as_ref()
         .map_or_else(Vec::new, http_sources))
 }
 
-/// Extract HTTP/HTTPS source URLs from captured, parsed metadata.
+/// Extract HTTPS source URLs from captured, parsed metadata.
 ///
 /// Returns a list of downloadable sources that makepkg would normally fetch.
-/// Only includes http:// and https:// URLs, skipping local files and git repos.
+/// Only includes `https://` URLs, skipping plaintext `http://`, local files, and git repos.
 pub(crate) fn http_sources(srcinfo: &SourceInfoV1) -> Vec<SourceFile> {
     let sources = source_entries(srcinfo)
         .iter()
         .filter_map(|source| extract_http_source(source))
         .collect::<Vec<_>>();
 
-    debug!("Parsed {} HTTP/HTTPS sources from .SRCINFO", sources.len());
+    debug!("Parsed {} HTTPS sources from .SRCINFO", sources.len());
     sources
 }
 
@@ -274,9 +274,10 @@ pub async fn prefetch_vcs_sources(sources: &[VcsSource], srcdest: &Path) -> VcsP
 /// symlink must never be treated as a valid cache.
 async fn is_populated_directory(path: &Path) -> bool {
     match tokio::fs::symlink_metadata(path).await {
-        Ok(metadata) if metadata.is_dir() => {
-            std::fs::read_dir(path).is_ok_and(|mut entries| entries.next().is_some())
-        }
+        Ok(metadata) if metadata.is_dir() => match tokio::fs::read_dir(path).await {
+            Ok(mut entries) => entries.next_entry().await.ok().flatten().is_some(),
+            Err(_) => false,
+        },
         _ => false,
     }
 }
@@ -328,7 +329,9 @@ async fn mirror_git_repository(url: &str, destination: &Path) -> Result<()> {
     };
     let pinned_address = format!("{host}:{port}:{address}");
     let parent = destination.parent().unwrap_or_else(|| Path::new("."));
-    tokio::fs::create_dir_all(parent).await.ok();
+    tokio::fs::create_dir_all(parent)
+        .await
+        .with_context(|| format!("Failed to create VCS cache directory {}", parent.display()))?;
 
     // Clear a stale non-directory or empty-directory occupant, but never a
     // symlink: a planted link could redirect the mirror outside SRCDEST.

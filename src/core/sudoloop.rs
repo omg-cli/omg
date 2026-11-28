@@ -143,10 +143,11 @@ impl SudoLoop {
         let result = async {
             let output = crate::core::privilege::sudo_command()?
                 .arg("-v")
-                .stdin(std::process::Stdio::inherit())
+                .arg("-n")
+                .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::inherit())
-                .arg("-n")
+                .kill_on_drop(true)
                 .status()
                 .await?;
             Ok::<_, anyhow::Error>(output)

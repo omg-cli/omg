@@ -712,19 +712,29 @@ fn ensure_fetch_dirs(dirs: &[&str]) {
     }
 }
 
-fn install_blocking(packages: &[String]) -> Result<()> {
-    crate::core::security::audit::record_operation("install_blocking", packages, "attempt")?;
-    let result = install_blocking_inner(packages);
-    crate::core::security::audit::record_operation(
-        "install_blocking",
-        packages,
+fn run_audited_apt_op(
+    operation: &str,
+    packages: &[String],
+    action: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    crate::core::security::audit::record_operation(operation, packages, "attempt")?;
+    let result = action();
+    let status = if result.is_ok() { "succeeded" } else { "failed" };
+    if let Err(audit_err) =
+        crate::core::security::audit::record_operation(operation, packages, status)
+    {
         if result.is_ok() {
-            "succeeded"
-        } else {
-            "failed"
-        },
-    )?;
+            return Err(audit_err);
+        }
+        tracing::warn!("Failed to record failed {operation} audit event: {audit_err:#}");
+    }
     result
+}
+
+fn install_blocking(packages: &[String]) -> Result<()> {
+    run_audited_apt_op("install_blocking", packages, || {
+        install_blocking_inner(packages)
+    })
 }
 
 fn install_blocking_inner(packages: &[String]) -> Result<()> {
@@ -861,22 +871,13 @@ fn apt_install_error(output: &std::process::Output) -> anyhow::Error {
 }
 
 fn remove_blocking(packages: &[String]) -> Result<()> {
-    crate::core::security::audit::record_operation("remove_blocking", packages, "attempt")?;
-    let result = remove_blocking_inner(packages);
-    crate::core::security::audit::record_operation(
-        "remove_blocking",
-        packages,
-        if result.is_ok() {
-            "succeeded"
-        } else {
-            "failed"
-        },
-    )?;
-    result
+    run_audited_apt_op("remove_blocking", packages, || {
+        remove_blocking_inner(packages)
+    })
 }
 
 fn remove_blocking_inner(packages: &[String]) -> Result<()> {
-    let (_apt_guard, cache) = open_cache(&[])?;
+    let (_apt_guard, _native_lock, cache) = open_transaction_cache()?;
     plan_removal_in_cache(&cache, packages)?;
 
     let mut acquire_progress = AcquireProgress::apt();
@@ -928,18 +929,7 @@ fn plan_removal_in_cache(
 }
 
 fn update_blocking() -> Result<()> {
-    crate::core::security::audit::record_operation("update_blocking", &[], "attempt")?;
-    let result = update_blocking_inner();
-    crate::core::security::audit::record_operation(
-        "update_blocking",
-        &[],
-        if result.is_ok() {
-            "succeeded"
-        } else {
-            "failed"
-        },
-    )?;
-    result
+    run_audited_apt_op("update_blocking", &[], update_blocking_inner)
 }
 
 fn update_blocking_inner() -> Result<()> {

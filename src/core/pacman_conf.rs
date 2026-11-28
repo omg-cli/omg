@@ -277,17 +277,17 @@ impl PacmanConfig {
         }
     }
 
+    fn extend_words(target: &mut Vec<String>, value: Option<&str>) {
+        if let Some(value) = value {
+            target.extend(value.split_whitespace().map(String::from));
+        }
+    }
+
     fn parse_option(config: &mut PacmanConfig, key: &str, value: Option<&str>) -> Result<()> {
         match key {
             "RootDir" => config.root_dir = value.map(String::from),
             "DBPath" => config.db_path = value.map(String::from),
-            "CacheDir" => {
-                if let Some(value) = value {
-                    config
-                        .cache_dirs
-                        .extend(value.split_whitespace().map(String::from));
-                }
-            }
+            "CacheDir" => Self::extend_words(&mut config.cache_dirs, value),
             "LogFile" => config.log_file = value.map(String::from),
             "GPGDir" => config.gpg_dir = value.map(String::from),
             "DownloadUser" => {
@@ -299,13 +299,7 @@ impl PacmanConfig {
                 );
                 config.download_user = Some(username.to_owned());
             }
-            "HookDir" => {
-                if let Some(value) = value {
-                    config
-                        .hook_dirs
-                        .extend(value.split_whitespace().map(String::from));
-                }
-            }
+            "HookDir" => Self::extend_words(&mut config.hook_dirs, value),
             "Architecture" => config.architecture = value.map(String::from),
             "SigLevel" => Self::append_signature_option(&mut config.sig_level, value),
             "LocalFileSigLevel" => {
@@ -314,41 +308,11 @@ impl PacmanConfig {
             "RemoteFileSigLevel" => {
                 Self::append_signature_option(&mut config.remote_file_sig_level, value);
             }
-            "HoldPkg" => {
-                if let Some(v) = value {
-                    config
-                        .hold_pkg
-                        .extend(v.split_whitespace().map(String::from));
-                }
-            }
-            "IgnorePkg" => {
-                if let Some(v) = value {
-                    config
-                        .ignore_pkg
-                        .extend(v.split_whitespace().map(String::from));
-                }
-            }
-            "IgnoreGroup" => {
-                if let Some(v) = value {
-                    config
-                        .ignore_group
-                        .extend(v.split_whitespace().map(String::from));
-                }
-            }
-            "NoUpgrade" => {
-                if let Some(v) = value {
-                    config
-                        .no_upgrade
-                        .extend(v.split_whitespace().map(String::from));
-                }
-            }
-            "NoExtract" => {
-                if let Some(v) = value {
-                    config
-                        .no_extract
-                        .extend(v.split_whitespace().map(String::from));
-                }
-            }
+            "HoldPkg" => Self::extend_words(&mut config.hold_pkg, value),
+            "IgnorePkg" => Self::extend_words(&mut config.ignore_pkg, value),
+            "IgnoreGroup" => Self::extend_words(&mut config.ignore_group, value),
+            "NoUpgrade" => Self::extend_words(&mut config.no_upgrade, value),
+            "NoExtract" => Self::extend_words(&mut config.no_extract, value),
             "ParallelDownloads" => {
                 let value = value.context("ParallelDownloads requires a value")?;
                 let count: u32 = value
@@ -546,7 +510,7 @@ mod tests {
     }
 
     #[test]
-    fn batch2_rejects_invalid_repository_usage() {
+    fn rejects_invalid_repository_usage() {
         for usage in ["Upgarde", "", "Search Unknown"] {
             let result = PacmanConfig::parse_str(&format!("[core]\nUsage = {usage}\n"));
             assert!(

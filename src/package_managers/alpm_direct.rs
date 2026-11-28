@@ -95,26 +95,6 @@ where
     })
 }
 
-/// Get a mutable cached ALPM handle.
-pub fn with_handle_mut<F, R>(f: F) -> Result<R>
-where
-    F: FnOnce(&mut Alpm) -> Result<R>,
-{
-    ALPM_HANDLE.with(|cell| {
-        let current_epoch = CACHE_EPOCH.load(Ordering::Acquire);
-        let mut maybe_handle = cell
-            .try_borrow_mut()
-            .context("Nested ALPM handle access is not supported")?;
-        refresh_cached_handle(&mut maybe_handle, current_epoch)?;
-
-        let handle = &mut maybe_handle
-            .as_mut()
-            .context("ALPM handle initialization failed")?
-            .handle;
-        f(handle)
-    })
-}
-
 /// Invalidate ALPM handles across all threads.
 ///
 /// Increments the global cache epoch, causing all threads to create fresh
@@ -124,7 +104,7 @@ pub fn clear_alpm_cache() {
     CACHE_EPOCH.fetch_add(1, Ordering::Release);
 }
 
-/// Search sync databases (available packages) - FAST (<10ms)
+/// Search sync databases for available packages matching `query`.
 pub fn search_sync(query: &str) -> Result<Vec<SyncPackage>> {
     with_handle(|handle| {
         let mut results = Vec::with_capacity(64);
@@ -140,8 +120,7 @@ pub fn search_sync(query: &str) -> Result<Vec<SyncPackage>> {
                 {
                     let installed = handle.localdb().pkg(pkg.name()).is_ok();
 
-                    // A version that fails the strict parser must not compare
-                    // as a fabricated 0 (ARCH-R14); skip the entry visibly.
+                    // Skip entries whose version fails strict parsing rather than fabricating 0.
                     let Some(version) = parse_version(pkg.version()) else {
                         tracing::warn!(
                             "Skipping sync package '{}' with unparseable version '{}'",
@@ -233,7 +212,7 @@ pub fn security_inventory() -> Result<Vec<crate::package_managers::types::Securi
     })
 }
 
-/// List all installed packages - INSTANT
+/// List all installed packages from the local ALPM database.
 pub fn list_installed_fast() -> Result<Vec<LocalPackage>> {
     with_handle(|handle| {
         let localdb = handle.localdb();
@@ -241,8 +220,7 @@ pub fn list_installed_fast() -> Result<Vec<LocalPackage>> {
 
         let mut results = Vec::with_capacity(pkg_count);
         results.extend(localdb.pkgs().iter().filter_map(|pkg| {
-            // A version that fails the strict parser must not compare as a
-            // fabricated 0 (ARCH-R14); skip the entry visibly.
+            // Skip entries whose version fails strict parsing rather than fabricating 0.
             let Some(version) = parse_version(pkg.version()) else {
                 tracing::warn!(
                     "Skipping installed package '{}' with unparseable version '{}'",
@@ -268,16 +246,20 @@ pub fn list_installed_fast() -> Result<Vec<LocalPackage>> {
     })
 }
 
-/// List explicitly installed packages - INSTANT
+/// List explicitly installed packages.
 pub fn list_explicit_fast() -> Result<Vec<String>> {
-    // Prefer cached local DB parsing for speed (works in normal mode too)
-    if let Ok(packages) = pacman_db::list_local_cached() {
-        let results: Vec<String> = packages
-            .into_iter()
-            .filter(|pkg| pkg.explicit)
-            .map(|pkg| pkg.name)
-            .collect();
-        return Ok(results);
+    match pacman_db::list_local_cached() {
+        Ok(packages) => {
+            let results: Vec<String> = packages
+                .into_iter()
+                .filter(|pkg| pkg.explicit)
+                .map(|pkg| pkg.name)
+                .collect();
+            return Ok(results);
+        }
+        Err(error) => {
+            tracing::debug!("Local DB cache unavailable for explicit list, falling back to libalpm: {error:#}");
+        }
     }
 
     with_handle(|handle| {
@@ -293,7 +275,7 @@ pub fn list_explicit_fast() -> Result<Vec<String>> {
     })
 }
 
-/// List orphan packages - INSTANT
+/// List orphan packages (`pacman -Qdt` semantics).
 pub fn list_orphans_fast() -> Result<Vec<String>> {
     with_handle(|handle| {
         let results = handle
@@ -350,20 +332,19 @@ pub fn has_update(package: &str) -> Result<bool> {
         .any(|update| update.name == package))
 }
 
-/// Check if package is installed - FAST (cached local db, no libalpm init)
-#[inline]
+/// Check whether a package is installed using the cached local DB.
 pub fn is_installed_fast(name: &str) -> Result<bool> {
     pacman_db::get_local_package(name).map(|package| package.is_some())
 }
 
-/// Get counts - INSTANT (<1ms, single pass over packages)
+/// Count `(total, explicit, orphans)` packages directly via libalpm.
+#[cfg(test)]
 pub fn get_counts() -> Result<(usize, usize, usize)> {
     with_handle(|handle| {
         let pkgs = handle.localdb().pkgs();
         let total = pkgs.len();
 
-        // Single-pass counting for cache efficiency; orphans follow the
-        // canonical rule (`types::is_orphan_package`, `pacman -Qdt` semantics).
+        // Orphans follow `types::is_orphan_package` (`pacman -Qdt` semantics).
         let (explicit, orphans) = pkgs.iter().fold((0, 0), |(mut exp, mut orp), pkg| {
             if pkg.reason() == PackageReason::Explicit {
                 exp += 1;
@@ -380,22 +361,7 @@ pub fn get_counts() -> Result<(usize, usize, usize)> {
     })
 }
 
-/// Get explicit count only - INSTANT (<500µs, optimized for count-only queries)
-/// This is faster than `list_explicit_fast` when you only need the count
-#[inline]
-pub fn get_explicit_count_fast() -> Result<usize> {
-    with_handle(|handle| {
-        Ok(handle
-            .localdb()
-            .pkgs()
-            .iter()
-            .filter(|p| p.reason() == PackageReason::Explicit)
-            .count())
-    })
-}
-
-/// List all known package names (local + sync) for completion - FAST
-#[inline]
+/// List all known package names (local + sync) for shell completion.
 pub fn list_all_package_names() -> Result<Vec<String>> {
     with_handle(|handle| {
         let localdb = handle.localdb();

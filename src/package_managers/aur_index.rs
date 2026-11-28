@@ -4,16 +4,14 @@
 //! reading the cache into an owned, aligned snapshot before accessing entries.
 
 use std::fs::File;
-use std::io::{BufReader, Read, Write as _};
+use std::io::{BufReader, Read};
 use std::path::Path;
 
 use anyhow::{Context, Result};
 use flate2::read::GzDecoder;
 use rkyv::util::AlignedVec;
 use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
-use tempfile::NamedTempFile;
 
-use crate::package_managers::aur_metadata::AurJsonPackage;
 use crate::package_managers::parse_version;
 use crate::package_managers::types::compare_versions;
 
@@ -197,8 +195,8 @@ pub fn build_index(json_path: &Path, output_path: &Path) -> Result<()> {
     let reader = BufReader::new(file);
     let decoder = GzDecoder::new(reader);
 
-    // Parse the JSON array. AUR's metadata is a large array of objects.
-    let mut raw_entries: Vec<AurJsonPackage> = serde_json::from_reader::<_, BoundedPackages>(
+    // Parse the JSON array into a slim index-only struct (skipping dependency arrays).
+    let mut raw_entries: Vec<AurIndexJsonPackage> = serde_json::from_reader::<_, BoundedPackages>(
         crate::runtimes::common::BudgetedReader::new(decoder, 256 * 1024 * 1024),
     )
     .context("Failed to parse bounded AUR JSON metadata")?
@@ -227,23 +225,33 @@ pub fn build_index(json_path: &Path, output_path: &Path) -> Result<()> {
     let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&archive)
         .map_err(|e| anyhow::anyhow!("Serialization error: {e}"))?;
 
-    // Use a temporary file for atomic update to avoid corrupting the index
-    let parent = output_path.parent().unwrap_or_else(|| Path::new("."));
-    let mut temp =
-        NamedTempFile::new_in(parent).context("Failed to create temporary index file")?;
-    temp.write_all(&bytes)
-        .context("Failed to write index data")?;
-    temp.as_file_mut()
-        .sync_all()
-        .context("Failed to sync AUR index")?;
-    temp.persist(output_path)
-        .map_err(|error| error.error)
-        .context("Failed to persist index file")?;
+    crate::core::safe_ops::atomic_write_file_sync(output_path, &bytes)
+        .context("Failed to persist AUR index file")?;
 
     Ok(())
 }
 
-struct BoundedPackages(Vec<AurJsonPackage>);
+#[derive(serde::Deserialize)]
+struct AurIndexJsonPackage {
+    #[serde(rename = "Name")]
+    name: String,
+    #[serde(rename = "Version")]
+    version: String,
+    #[serde(rename = "Description")]
+    description: Option<String>,
+    #[serde(rename = "Maintainer")]
+    maintainer: Option<String>,
+    #[serde(rename = "LastModified")]
+    last_modified: Option<i64>,
+    #[serde(rename = "NumVotes")]
+    num_votes: Option<i32>,
+    #[serde(rename = "Popularity")]
+    popularity: Option<f64>,
+    #[serde(rename = "OutOfDate")]
+    out_of_date: Option<i64>,
+}
+
+struct BoundedPackages(Vec<AurIndexJsonPackage>);
 impl<'de> serde::Deserialize<'de> for BoundedPackages {
     fn deserialize<D: serde::Deserializer<'de>>(
         deserializer: D,
@@ -259,7 +267,7 @@ impl<'de> serde::Deserialize<'de> for BoundedPackages {
                 mut seq: A,
             ) -> std::result::Result<Self::Value, A::Error> {
                 let mut packages = Vec::new();
-                while let Some(package) = seq.next_element::<AurJsonPackage>()? {
+                while let Some(package) = seq.next_element::<AurIndexJsonPackage>()? {
                     if packages.len() == 250_000
                         || package.name.len() > 256
                         || package
@@ -282,6 +290,7 @@ impl<'de> serde::Deserialize<'de> for BoundedPackages {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write as _;
     use super::*;
 
     /// Strict-parse helper for fixtures: every test version is expected to

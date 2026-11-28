@@ -190,8 +190,12 @@ fn pause_native_retirement() {
 }
 
 #[cfg(feature = "arch")]
+const MAX_ALPM_RETIREMENT_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+#[cfg(feature = "arch")]
 fn retire_alpm_worker(alpm_worker: Arc<AlpmWorker>, mut wait_for_lease: impl FnMut()) {
     let mut retained = alpm_worker;
+    let started = std::time::Instant::now();
     loop {
         match Arc::try_unwrap(retained) {
             Ok(worker) => {
@@ -199,6 +203,14 @@ fn retire_alpm_worker(alpm_worker: Arc<AlpmWorker>, mut wait_for_lease: impl FnM
                 break;
             }
             Err(shared) => {
+                if started.elapsed() >= MAX_ALPM_RETIREMENT_WAIT {
+                    tracing::warn!(
+                        strong_count = Arc::strong_count(&shared),
+                        "Timed out waiting for in-flight ALPM worker leases during retirement"
+                    );
+                    drop(shared);
+                    break;
+                }
                 // Retain the final owner so an async request releasing its
                 // lease cannot inherit the native thread's blocking join.
                 retained = shared;
@@ -304,18 +316,20 @@ impl DaemonState {
         #[cfg(feature = "arch")] epoch: crate::package_managers::pacman_db::AlpmCatalogEpoch,
     ) -> usize {
         let package_count = index.len();
-        let mut current = self
-            .index
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *current = PublishedIndex {
-            index: Arc::new(index),
-            installed_observation,
-            #[cfg(feature = "arch")]
-            epoch,
-        };
-        self.index_generation.fetch_add(1, Ordering::Release);
-        self.cache.clear();
+        {
+            let mut current = self
+                .index
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *current = PublishedIndex {
+                index: Arc::new(index),
+                installed_observation,
+                #[cfg(feature = "arch")]
+                epoch,
+            };
+            self.index_generation.fetch_add(1, Ordering::Release);
+            self.cache.clear();
+        }
         self.persistent.invalidate_status();
         if let Some(path) = self.fast_status_path.get()
             && let Err(error) = std::fs::remove_file(path)

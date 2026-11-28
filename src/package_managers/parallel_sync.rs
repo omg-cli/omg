@@ -56,14 +56,11 @@ const MAX_SYNC_SIGNATURE_BYTES: u64 = 1024 * 1024;
 const MIRROR_RACE_TIMEOUT_MS: u64 = 2000;
 const MAX_MIRRORS_PER_REPO: usize = 5;
 const MAX_PARALLEL_REPO_SYNCS: usize = 4;
-async fn race_mirrors(client: &Client, urls: &[String]) -> Option<usize> {
+async fn race_mirrors(client: &Client, urls: &[String]) -> usize {
     use futures::future::select_all;
 
-    if urls.is_empty() {
-        return None;
-    }
-    if urls.len() == 1 {
-        return Some(0);
+    if urls.len() <= 1 {
+        return 0;
     }
 
     let futures: Vec<_> = urls
@@ -95,12 +92,12 @@ async fn race_mirrors(client: &Client, urls: &[String]) -> Option<usize> {
     while !remaining.is_empty() {
         let (result, _idx, rest) = select_all(remaining).await;
         if let Some(winner_idx) = result {
-            return Some(winner_idx);
+            return winner_idx;
         }
         remaining = rest;
     }
 
-    Some(0)
+    0
 }
 
 async fn download_response_to_dest(
@@ -108,6 +105,7 @@ async fn download_response_to_dest(
     dest: &Path,
     byte_limit: u64,
     artifact: &str,
+    progress: Option<&ProgressTask>,
 ) -> Result<()> {
     if let Some(length) = response.content_length() {
         anyhow::ensure!(
@@ -120,8 +118,9 @@ async fn download_response_to_dest(
     let mut file = File::from_std(std_file);
     let mut downloaded = 0_u64;
     while let Some(chunk) = response.chunk().await? {
+        let chunk_len = u64::try_from(chunk.len()).context("Download chunk is too large")?;
         downloaded = downloaded
-            .checked_add(u64::try_from(chunk.len()).context("Download chunk is too large")?)
+            .checked_add(chunk_len)
             .with_context(|| format!("{artifact} byte count overflowed"))?;
         anyhow::ensure!(
             downloaded <= byte_limit,
@@ -130,6 +129,9 @@ async fn download_response_to_dest(
         file.write_all(&chunk)
             .await
             .context("Write error during download")?;
+        if let Some(task) = progress {
+            task.inc(chunk_len);
+        }
     }
     persist_same_dir_temp(file, temporary_path, dest).await
 }
@@ -167,8 +169,9 @@ async fn download_database_signature(
         // database (csf sync signature-downgrade class). Treating it as a
         // mirror failure makes the retry loop try the next mirror, and fails
         // closed when every mirror omits the signature.
+        let live_sig_exists = tokio::fs::try_exists(live_signature).await.unwrap_or(true);
         anyhow::ensure!(
-            !live_signature.exists(),
+            !live_sig_exists,
             "Mirror {safe_url} served no database signature, but {} already exists; \
              refusing to downgrade this repository to an unsigned database. \
              Fix the mirror, or delete that signature file to accept unsigned databases.",
@@ -186,6 +189,7 @@ async fn download_database_signature(
         staged_signature,
         MAX_SYNC_SIGNATURE_BYTES,
         "Package database signature",
+        None,
     )
     .await
 }
@@ -207,36 +211,29 @@ async fn download_db(
         PathBuf::from(path)
     };
 
-    let existing_mtime = if live_dest.exists() {
-        tokio::fs::metadata(live_dest)
-            .await
-            .ok()
-            .and_then(|m| m.modified().ok())
-            .and_then(|t| {
-                t.duration_since(std::time::UNIX_EPOCH)
-                    .ok()
-                    .map(|d| httpdate::fmt_http_date(std::time::UNIX_EPOCH + d))
-            })
-    } else {
-        None
-    };
+    let existing_mtime = tokio::fs::metadata(live_dest)
+        .await
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| {
+            t.duration_since(std::time::UNIX_EPOCH)
+                .ok()
+                .map(|d| httpdate::fmt_http_date(std::time::UNIX_EPOCH + d))
+        });
 
     let urls = if existing_mtime.is_some() || urls.len() <= 1 {
         urls
     } else {
         task.set_message("racing mirrors...");
-        if let Some(fastest_idx) = race_mirrors(client, &urls).await {
-            let mut reordered = Vec::with_capacity(urls.len());
-            reordered.push(urls[fastest_idx].clone());
-            for (i, url) in urls.iter().enumerate() {
-                if i != fastest_idx {
-                    reordered.push(url.clone());
-                }
+        let fastest_idx = race_mirrors(client, &urls).await;
+        let mut reordered = Vec::with_capacity(urls.len());
+        reordered.push(urls[fastest_idx].clone());
+        for (i, url) in urls.iter().enumerate() {
+            if i != fastest_idx {
+                reordered.push(url.clone());
             }
-            reordered
-        } else {
-            urls
         }
+        reordered
     };
 
     let mut last_error = None;
@@ -319,6 +316,7 @@ async fn download_db(
                 staged_dest,
                 MAX_SYNC_DB_BYTES,
                 "Package database",
+                Some(task),
             )
             .await
             {
@@ -440,6 +438,15 @@ fn commit_staged_databases(
     commit_staged_files(&files, failed_downloads, database_root, staging)
 }
 
+fn rollback_and_bail(
+    publications: &mut [DatabasePublication],
+    staging: &mut tempfile::TempDir,
+    context: String,
+) -> anyhow::Error {
+    let rollback_errors = rollback_database_publication(publications, staging);
+    anyhow::anyhow!("{context}; rollback errors: {}", rollback_errors.join("; "))
+}
+
 fn commit_staged_files(
     files: &[StagedFile],
     failed_downloads: usize,
@@ -452,13 +459,8 @@ fn commit_staged_files(
     );
 
     let root = paths::pacman_root_result()?;
-    let mut alpm = alpm::Alpm::new(
-        root.to_str().context("Pacman root must be valid UTF-8")?,
-        database_root
-            .to_str()
-            .context("Pacman database path must be valid UTF-8")?,
-    )
-    .context("Failed to initialize package database writer")?;
+    let mut alpm = crate::package_managers::alpm_ops::open_alpm_at(&root, database_root)
+        .context("Failed to initialize package database writer")?;
     crate::package_managers::alpm_ops::check_database_lock(database_root)?;
     alpm.trans_init(alpm::TransFlag::empty()).with_context(|| {
         format!(
@@ -504,21 +506,21 @@ fn commit_staged_files(
         match std::fs::symlink_metadata(&publications[index].destination) {
             Ok(metadata) if metadata.is_file() || metadata.file_type().is_symlink() => {}
             Ok(_) => {
-                let rollback_errors = rollback_database_publication(&mut publications, staging);
-                anyhow::bail!(
-                    "Refusing to replace database path that is not a file or symlink: {}; rollback errors: {}",
-                    publications[index].destination.display(),
-                    rollback_errors.join("; ")
-                );
+                let dest = publications[index].destination.display().to_string();
+                return Err(rollback_and_bail(
+                    &mut publications,
+                    staging,
+                    format!("Refusing to replace database path that is not a file or symlink: {dest}"),
+                ));
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => {
-                let rollback_errors = rollback_database_publication(&mut publications, staging);
-                anyhow::bail!(
-                    "Failed to inspect live database {}: {error}; rollback errors: {}",
-                    publications[index].destination.display(),
-                    rollback_errors.join("; ")
-                );
+                let dest = publications[index].destination.display().to_string();
+                return Err(rollback_and_bail(
+                    &mut publications,
+                    staging,
+                    format!("Failed to inspect live database {dest}: {error}"),
+                ));
             }
         }
         let backup = publications[index]
@@ -537,12 +539,12 @@ fn commit_staged_files(
             &backup,
             rustix::fs::AtFlags::empty(),
         ) {
-            let rollback_errors = rollback_database_publication(&mut publications, staging);
-            anyhow::bail!(
-                "Failed to stage live database {} for replacement: {error}; rollback errors: {}",
-                publications[index].destination.display(),
-                rollback_errors.join("; ")
-            );
+            let dest = publications[index].destination.display().to_string();
+            return Err(rollback_and_bail(
+                &mut publications,
+                staging,
+                format!("Failed to stage live database {dest} for replacement: {error}"),
+            ));
         }
         publications[index].backup = Some(backup);
     }
@@ -558,11 +560,11 @@ fn commit_staged_files(
         };
         if let Err(error) = result {
             let failed_destination = publications[index].destination.display().to_string();
-            let rollback_errors = rollback_database_publication(&mut publications, staging);
-            anyhow::bail!(
-                "Failed to publish staged package database to {failed_destination}: {error}; rollback errors: {}",
-                rollback_errors.join("; ")
-            );
+            return Err(rollback_and_bail(
+                &mut publications,
+                staging,
+                format!("Failed to publish staged package database to {failed_destination}: {error}"),
+            ));
         }
         publications[index].published = true;
     }
@@ -584,11 +586,11 @@ fn commit_staged_files(
             crate::core::safe_ops::sync_parent_directory_sync(&publications[index].destination)
         {
             let failed_destination = publications[index].destination.display().to_string();
-            let rollback_errors = rollback_database_publication(&mut publications, staging);
-            anyhow::bail!(
-                "Failed to sync published package database {failed_destination}: {error}; rollback errors: {}",
-                rollback_errors.join("; ")
-            );
+            return Err(rollback_and_bail(
+                &mut publications,
+                staging,
+                format!("Failed to sync published package database {failed_destination}: {error}"),
+            ));
         }
     }
 
@@ -649,13 +651,10 @@ pub async fn sync_databases_parallel() -> Result<()> {
         .context("Failed to load repository servers from pacman.conf")?;
     let repository_urls = repository_database_urls(&config)?;
 
-    // Sync directory (we should already be root at this point)
     let sync_dir = paths::pacman_sync_dir_result()?;
-    if !sync_dir.exists() {
-        tokio::fs::create_dir_all(&sync_dir)
-            .await
-            .with_context(|| format!("Failed to create {}", sync_dir.display()))?;
-    }
+    tokio::fs::create_dir_all(&sync_dir)
+        .await
+        .with_context(|| format!("Failed to create {}", sync_dir.display()))?;
 
     // Download the complete repository set into a same-filesystem staging
     // directory. A failed mirror must not leave a mix of old and new live DBs.
@@ -774,30 +773,30 @@ pub async fn sync_databases_parallel() -> Result<()> {
     for error in &errors {
         tracing::error!("Sync error: {error}");
     }
-    let staged_files = staged_repositories
-        .into_iter()
-        .flat_map(|repo| {
-            let signature_present = repo.signature.is_file();
-            [
-                StagedFile {
-                    staged: repo.database,
-                    destination: repo.database_destination,
-                    publish: true,
-                },
-                StagedFile {
-                    staged: repo.signature,
-                    destination: repo.signature_destination,
-                    publish: signature_present,
-                },
-            ]
-        })
-        .collect::<Vec<_>>();
     let database_root = sync_dir
         .parent()
         .context("Package sync directory has no database root")?
         .to_path_buf();
     let failed_downloads = errors.len();
     tokio::task::spawn_blocking(move || {
+        let staged_files = staged_repositories
+            .into_iter()
+            .flat_map(|repo| {
+                let signature_present = repo.signature.is_file();
+                [
+                    StagedFile {
+                        staged: repo.database,
+                        destination: repo.database_destination,
+                        publish: true,
+                    },
+                    StagedFile {
+                        staged: repo.signature,
+                        destination: repo.signature_destination,
+                        publish: signature_present,
+                    },
+                ]
+            })
+            .collect::<Vec<_>>();
         let mut staging = staging;
         let result = commit_staged_files(
             &staged_files,
@@ -806,6 +805,9 @@ pub async fn sync_databases_parallel() -> Result<()> {
             &mut staging,
         );
         crate::package_managers::alpm_direct::clear_alpm_cache();
+        if let Err(error) = crate::package_managers::pacman_db::invalidate_caches() {
+            tracing::debug!("Failed to invalidate pacman_db caches after sync: {error:#}");
+        }
         result
     })
     .await

@@ -63,7 +63,10 @@ export async function readOutput(process: Pick<ExecProcess, 'stdout' | 'stderr'>
         if (item.done) return join(parts, size);
         if (!(item.value instanceof Uint8Array)) throw new Error('invalid output chunk');
         used += item.value.byteLength;
-        if (used > limit) throw new Error('combined output limit exceeded');
+        if (used > limit) {
+          await reader.cancel();
+          throw new Error('combined output limit exceeded');
+        }
         parts.push(item.value);
         size += item.value.byteLength;
       }
@@ -265,9 +268,22 @@ export class NativeCIWorkflow extends WorkflowEntrypoint<Env, Job> {
   }
 }
 
+async function tokenMatches(header: string | null, expected: string | undefined): Promise<boolean> {
+  if (!expected || !header) return false;
+  const [left, right] = await Promise.all([
+    crypto.subtle.digest('SHA-256', encoder.encode(header)),
+    crypto.subtle.digest('SHA-256', encoder.encode(`Bearer ${expected}`)),
+  ]);
+  const a = new Uint8Array(left);
+  const b = new Uint8Array(right);
+  let diff = a.byteLength ^ b.byteLength;
+  for (let i = 0; i < a.byteLength; i++) diff |= a[i]! ^ b[i]!;
+  return diff === 0;
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
-    if (!env.CI_TOKEN || request.headers.get('Authorization') !== `Bearer ${env.CI_TOKEN}`) return Response.json({ error: 'unauthorized' }, { status: 401 });
+    if (!(await tokenMatches(request.headers.get('Authorization'), env.CI_TOKEN))) return Response.json({ error: 'unauthorized' }, { status: 401 });
     const path = new URL(request.url).pathname;
     try {
       if (request.method === 'GET' && path === '/health') return Response.json({ service: 'omg-native-ci', imageDigest: env.CI_IMAGE_DIGEST });

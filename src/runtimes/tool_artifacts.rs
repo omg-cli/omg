@@ -259,6 +259,7 @@ pub(crate) fn tree(root: &Path) -> Result<String> {
     let mut rows = BTreeMap::new();
     let mut total = 0u64;
     let mut entries = 0usize;
+    let mut buffer = vec![0u8; 65536].into_boxed_slice();
     while let Some(directory) = pending.pop() {
         ensure!(
             fs::symlink_metadata(&directory)?.is_dir(),
@@ -324,7 +325,6 @@ pub(crate) fn tree(root: &Path) -> Result<String> {
                 }
                 let mut digest = Sha256::new();
                 let mut count = 0u64;
-                let mut buffer = vec![0u8; 65536].into_boxed_slice();
                 loop {
                     let size = file.read(&mut buffer)?;
                     if size == 0 {

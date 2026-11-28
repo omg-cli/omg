@@ -246,8 +246,8 @@ impl CompletionEngine {
             .get("aur_last_refresh")
             .and_then(|value| value.parse::<Timestamp>().ok())
         {
-            let hours_since = Timestamp::now().as_second() - last_refresh.as_second();
-            if hours_since < 24 * 3600
+            let seconds_since = Timestamp::now().as_second() - last_refresh.as_second();
+            if (0..24 * 3600).contains(&seconds_since)
                 && let Some(data) = cache.entries.get("aur_packages")
             {
                 let names: Vec<_> = data

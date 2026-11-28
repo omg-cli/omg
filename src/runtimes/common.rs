@@ -1085,13 +1085,20 @@ pub(crate) fn extract_component_tar_gz(
 
     let task = extract_task(archive_path);
 
-    fs::create_dir_all(dest_dir)?;
-    extract_tar_entries(&mut archive, dest_dir, select, &task)?;
-    std::io::copy(&mut archive.into_inner(), &mut std::io::sink())
-        .context("Failed to finalize gzip archive")?;
+    let outcome = (|| -> Result<()> {
+        fs::create_dir_all(dest_dir)?;
+        extract_tar_entries(&mut archive, dest_dir, select, &task)?;
+        std::io::copy(&mut archive.into_inner(), &mut std::io::sink())
+            .context("Failed to finalize gzip archive")?;
+        Ok(())
+    })();
 
-    task.finish(Outcome::Done);
-    Ok(())
+    task.finish(if outcome.is_ok() {
+        Outcome::Done
+    } else {
+        Outcome::Failed
+    });
+    outcome
 }
 
 /// Extract a .tar.gz archive with progress
@@ -1124,10 +1131,7 @@ pub(crate) async fn extract_tar_gz_with_budget(
         let select = |path: &Path| -> Result<Option<PathBuf>> {
             stripped_archive_path(path, strip_components)
         };
-        let task = extract_task(&archive_path);
-        let result = extract_component_tar_gz(&archive_path, &dest_dir, max_bytes, &select);
-        task.finish(Outcome::Done);
-        result
+        extract_component_tar_gz(&archive_path, &dest_dir, max_bytes, &select)
     })
     .await?
 }
@@ -1184,34 +1188,41 @@ pub(crate) fn extract_component_tar_xz(
     let task = extract_task(archive_path);
     task.set_message("Decompressing XZ...");
 
-    fs::create_dir_all(dest_dir)?;
-    let output = tempfile::tempfile_in(dest_dir).with_context(|| {
-        format!(
-            "Failed to create temporary XZ output in {}",
-            dest_dir.display()
-        )
-    })?;
-    let mut output = BudgetedWriter::new(output, budget);
-    if let Err(error) = decode_xz_to(BufReader::new(file), &mut output) {
-        // A digest-verified archive that later fails to decode means either the
-        // bytes changed after verification or the decoder hit input it cannot
-        // represent. Sizes and digests make that decidable from the log alone;
-        // see the intermittent Fedora runtime-node-install failure where the
-        // download verified but the decode reported a bogus LZ distance.
-        let (bytes, digest) = archive_identity(archive_path);
-        return Err(anyhow::Error::new(error).context(format!(
-            "Failed to decompress XZ archive (archive={} bytes={bytes} sha256={digest})",
-            archive_path.display()
-        )));
-    }
-    let mut output = output.into_inner();
-    output.seek(SeekFrom::Start(0))?;
+    let outcome = (|| -> Result<()> {
+        fs::create_dir_all(dest_dir)?;
+        let output = tempfile::tempfile_in(dest_dir).with_context(|| {
+            format!(
+                "Failed to create temporary XZ output in {}",
+                dest_dir.display()
+            )
+        })?;
+        let mut output = BudgetedWriter::new(output, budget);
+        if let Err(error) = decode_xz_to(BufReader::new(file), &mut output) {
+            // A digest-verified archive that later fails to decode means either the
+            // bytes changed after verification or the decoder hit input it cannot
+            // represent. Sizes and digests make that decidable from the log alone;
+            // see the intermittent Fedora runtime-node-install failure where the
+            // download verified but the decode reported a bogus LZ distance.
+            let (bytes, digest) = archive_identity(archive_path);
+            return Err(anyhow::Error::new(error).context(format!(
+                "Failed to decompress XZ archive (archive={} bytes={bytes} sha256={digest})",
+                archive_path.display()
+            )));
+        }
+        let mut output = output.into_inner();
+        output.seek(SeekFrom::Start(0))?;
 
-    let mut archive = tar::Archive::new(output);
-    extract_tar_entries(&mut archive, dest_dir, select, &task)?;
+        let mut archive = tar::Archive::new(output);
+        extract_tar_entries(&mut archive, dest_dir, select, &task)?;
+        Ok(())
+    })();
 
-    task.finish(Outcome::Done);
-    Ok(())
+    task.finish(if outcome.is_ok() {
+        Outcome::Done
+    } else {
+        Outcome::Failed
+    });
+    outcome
 }
 
 /// Extract a .tar.xz archive with progress (pure Rust)
@@ -1227,12 +1238,7 @@ pub(crate) async fn extract_tar_xz(
         let select = |path: &Path| -> Result<Option<PathBuf>> {
             stripped_archive_path(path, strip_components)
         };
-        let task = extract_task(&archive_path);
-        task.set_message("Decompressing XZ...");
-        let result =
-            extract_component_tar_xz(&archive_path, &dest_dir, MAX_DECOMPRESSED_BYTES, &select);
-        task.finish(Outcome::Done);
-        result
+        extract_component_tar_xz(&archive_path, &dest_dir, MAX_DECOMPRESSED_BYTES, &select)
     })
     .await?
 }

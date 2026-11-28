@@ -51,10 +51,12 @@ pub fn wait_for_daemon_ready(
     attempts: u32,
     interval: Duration,
 ) -> bool {
+    let probe_timeout = interval.max(Duration::from_millis(500));
     for _ in 0..attempts {
         std::thread::sleep(interval);
         if socket_path.exists()
-            && let Ok(mut client) = SyncDaemonClient::acquire()
+            && let Ok(mut client) =
+                SyncDaemonClient::acquire_at_with_timeout(socket_path, probe_timeout)
             && client.ping().is_ok()
         {
             return true;
@@ -63,13 +65,15 @@ pub fn wait_for_daemon_ready(
     false
 }
 
-/// Create a new sync connection to the daemon.
-fn connect_sync_stream_with_timeout(timeout: Duration) -> Result<SyncUnixStream> {
+/// Create a new sync connection to the daemon at `socket_path`.
+fn connect_sync_stream_at_with_timeout(
+    socket_path: &std::path::Path,
+    timeout: Duration,
+) -> Result<SyncUnixStream> {
     tracing::debug!("Connecting to daemon...");
 
-    let socket_path = default_socket_path();
-    validate_socket_with_context(&socket_path)?;
-    let stream = SyncUnixStream::connect(&socket_path)
+    validate_socket_with_context(socket_path)?;
+    let stream = SyncUnixStream::connect(socket_path)
         .with_context(|| format!("Failed to connect to daemon at {}", socket_path.display()))?;
 
     stream
@@ -434,11 +438,20 @@ impl SyncDaemonClient {
 
     /// Connect synchronously with caller-specific socket read and write timeouts.
     pub fn acquire_with_timeout(timeout: Duration) -> Result<Self> {
+        let socket_path = default_socket_path();
+        Self::acquire_at_with_timeout(&socket_path, timeout)
+    }
+
+    /// Connect synchronously to `socket_path` with caller-specific timeouts.
+    pub fn acquire_at_with_timeout(
+        socket_path: &std::path::Path,
+        timeout: Duration,
+    ) -> Result<Self> {
         if DaemonClient::daemon_disabled() {
             anyhow::bail!("Daemon disabled by environment");
         }
         Ok(Self {
-            stream: Some(connect_sync_stream_with_timeout(timeout)?),
+            stream: Some(connect_sync_stream_at_with_timeout(socket_path, timeout)?),
             request_id: AtomicU64::new(1),
         })
     }

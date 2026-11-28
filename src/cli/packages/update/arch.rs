@@ -17,17 +17,8 @@ const MAX_AUR_BUILD_CONCURRENCY: usize = 8;
 /// Parse the `OMG_AUR_PARALLEL` override, clamping to `[1, 8]` and warning on
 /// invalid input instead of silently substituting the default.
 fn aur_build_concurrency(raw: Option<&str>, configured_default: usize) -> usize {
-    const fn clamp(value: usize) -> usize {
-        if value < MIN_AUR_BUILD_CONCURRENCY {
-            MIN_AUR_BUILD_CONCURRENCY
-        } else if value > MAX_AUR_BUILD_CONCURRENCY {
-            MAX_AUR_BUILD_CONCURRENCY
-        } else {
-            value
-        }
-    }
-
-    let configured_default = configured_default.max(MIN_AUR_BUILD_CONCURRENCY);
+    let configured_default =
+        configured_default.clamp(MIN_AUR_BUILD_CONCURRENCY, MAX_AUR_BUILD_CONCURRENCY);
     let Some(raw) = raw else {
         return configured_default;
     };
@@ -36,7 +27,7 @@ fn aur_build_concurrency(raw: Option<&str>, configured_default: usize) -> usize 
             parsed
         }
         Ok(parsed) => {
-            let clamped = clamp(parsed);
+            let clamped = parsed.clamp(MIN_AUR_BUILD_CONCURRENCY, MAX_AUR_BUILD_CONCURRENCY);
             tracing::warn!(
                 "OMG_AUR_PARALLEL={parsed} is outside {MIN_AUR_BUILD_CONCURRENCY}..={MAX_AUR_BUILD_CONCURRENCY}; clamping to {clamped}"
             );
@@ -198,9 +189,7 @@ pub async fn update_turbo() -> Result<()> {
 
     let updates = crate::package_managers::get_update_list()?;
     if updates.is_empty() {
-        println!();
-        println!("  {} System is up to date!", style::positive("✓"));
-        println!();
+        modern_ui::print_up_to_date();
         return Ok(());
     }
 
@@ -295,9 +284,6 @@ async fn update_packages(
 ) -> Result<()> {
     let pm = get_package_manager()?;
 
-    let needs_deferred_sync =
-        !aur_only && !check_only && !dry_run && !crate::core::caps::can_write_pacman_db();
-
     modern_ui::print_phase_header(
         "🔄",
         "Update",
@@ -314,7 +300,7 @@ async fn update_packages(
     }
 
     let mut all_updates: Vec<UpdateInfo> = Vec::with_capacity(32);
-    let skip_aur = crate::core::paths::test_mode() || crate::core::env::distro::is_debian_like();
+    let skip_aur = crate::core::paths::test_mode();
     let check_detail = if aur_only {
         "AUR"
     } else if skip_aur {
@@ -453,24 +439,8 @@ async fn update_packages(
         return Ok(());
     }
 
-    if !yes && console::user_attended() {
-        println!();
-        if !tokio::task::spawn_blocking(|| {
-            dialoguer::Confirm::with_theme(&ui::prompt_theme())
-                .with_prompt("Proceed with upgrade?")
-                .default(true)
-                .interact()
-        })
-        .await
-        .map_err(|error| anyhow::anyhow!("Confirmation prompt task failed: {error}"))??
-        {
-            println!();
-            println!("  {} Upgrade cancelled", style::caution("✗"));
-            println!();
-            return Ok(());
-        }
-    } else if !yes {
-        anyhow::bail!("Use --yes for non-interactive updates");
+    if !crate::cli::packages::common::confirm_proceed_with_upgrade(yes).await? {
+        return Ok(());
     }
 
     println!();
@@ -485,21 +455,13 @@ async fn update_packages(
 
     let operation_result: Result<()> = async {
         if official_count > 0 {
-            if needs_deferred_sync {
-                // Databases were refreshed before the prompt (or skipped via
-                // `--no-sync`). The child only commits the upgrade. `fullupdate`
-                // would download every repository again.
+            if !crate::core::caps::can_write_pacman_db() {
+                // Avoid a parent spinner when `pm.update()` will elevate via sudo.
                 println!(
                     "  {} Upgrading {official_count} official packages...",
                     style::community("→")
                 );
-                crate::package_managers::arch::run_privileged_operation(
-                    "update",
-                    &[],
-                    &[],
-                    || async { Ok(()) },
-                )
-                .await?;
+                pm.update().await?;
             } else {
                 let pb = modern_ui::modern_spinner(
                     "Upgrading",
@@ -587,7 +549,6 @@ async fn update_packages(
 }
 
 fn update_dry_run(updates: &[UpdateInfo]) {
-    modern_ui::print_phase_header("", "Update", "dry run");
     modern_ui::print_update_summary(updates);
     ui::print_dry_run_footer();
 }

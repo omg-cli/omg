@@ -343,12 +343,20 @@ async fn run_with_status_path(
                 return;
             }
             // The in-memory cache is authoritative, so persistence is best-effort.
-            state.with_current_index(&index, || {
-                if let Err(error) = state.persistent.set_status(&res_arc) {
-                    tracing::warn!("Failed to persist status cache: {error}");
-                }
-                state.cache.update_status(res_arc);
+            let published = state.with_current_index(&index, || {
+                state.cache.update_status(Arc::clone(&res_arc));
             });
+            if published {
+                let state_for_persist = Arc::clone(state);
+                let status_for_persist = Arc::clone(&res_arc);
+                let _ = tokio::task::spawn_blocking(move || {
+                    if let Err(error) = state_for_persist.persistent.set_status(&status_for_persist)
+                    {
+                        tracing::warn!("Failed to persist status cache: {error}");
+                    }
+                })
+                .await;
+            }
         }
 
         async fn maintain(
@@ -380,7 +388,7 @@ async fn run_with_status_path(
                     }
                 }
                 BackgroundEvent::SocketHealth => {
-                    if !socket_path.exists() {
+                    if !tokio::fs::try_exists(&socket_path).await.unwrap_or(false) {
                         let failure = format!(
                             "Daemon socket {} was removed externally",
                             socket_path.display()
