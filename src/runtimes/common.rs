@@ -1252,14 +1252,26 @@ pub(crate) async fn extract_zip(
 
         let mut archive = zip::ZipArchive::new(file).context("Failed to read ZIP archive")?;
 
-        let task = extract_task(&archive_path);
+        struct ExtractTaskGuard(Option<ProgressTask>);
+        impl Drop for ExtractTaskGuard {
+            fn drop(&mut self) {
+                if let Some(task) = self.0.take() {
+                    task.finish(Outcome::Failed);
+                }
+            }
+        }
+        let mut task_guard = ExtractTaskGuard(Some(extract_task(&archive_path)));
+        let task = task_guard.0.as_ref().expect("task guard initialized");
         task.set_message("Extracting...");
 
         fs::create_dir_all(&dest_dir)?;
         let mut remaining_budget = MAX_DECOMPRESSED_BYTES;
 
         let mut entry_budget = ArchiveEntryBudget::default();
-        anyhow::ensure!(archive.len() <= MAX_ARCHIVE_ENTRIES, "Archive contains too many entries");
+        anyhow::ensure!(
+            archive.len() <= MAX_ARCHIVE_ENTRIES,
+            "Archive contains too many entries"
+        );
         for i in 0..archive.len() {
             let mut file = archive.by_index(i)?;
             let entry_name = file.name()?;
@@ -1291,7 +1303,8 @@ pub(crate) async fn extract_zip(
                     "decompressed ZIP data exceeds the maximum supported size of {MAX_DECOMPRESSED_BYTES} bytes"
                 );
                 let mut outfile = File::create(&dest_path)?;
-                if let Err(error) = copy_with_budget(&mut file, &mut outfile, &mut remaining_budget) {
+                if let Err(error) = copy_with_budget(&mut file, &mut outfile, &mut remaining_budget)
+                {
                     drop(outfile);
                     let _ = fs::remove_file(&dest_path);
                     return Err(error).context("Runtime ZIP exceeded decompression budget");
@@ -1307,7 +1320,11 @@ pub(crate) async fn extract_zip(
             }
         }
 
-        task.finish(Outcome::Done);
+        task_guard
+            .0
+            .take()
+            .expect("task guard active")
+            .finish(Outcome::Done);
         Ok(())
     })
     .await?
@@ -5809,5 +5826,39 @@ mod entry_budget_tests {
         };
         assert!(pathname_budget.charge(Path::new("abc")).is_ok());
         assert!(pathname_budget.charge(Path::new("d")).is_err());
+    }
+
+    #[tokio::test]
+    async fn extract_zip_handles_dirs_stripped_entries_and_rejects_symlinks() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let dest = dir.path().join("out");
+
+        let ok_zip = dir.path().join("ok.zip");
+        {
+            let mut archive = zip::ZipWriter::new(File::create(&ok_zip)?);
+            let opts = zip::write::SimpleFileOptions::default();
+            archive.add_directory("top/sub/", opts)?;
+            archive.start_file("top-only", opts)?;
+            archive.write_all(b"skipped")?;
+            archive.start_file("top/sub/file.txt", opts)?;
+            archive.write_all(b"ok")?;
+            archive.finish()?;
+        }
+        extract_zip(&ok_zip, &dest, 1).await?;
+        assert!(dest.join("sub").is_dir());
+        assert_eq!(fs::read(dest.join("sub/file.txt"))?, b"ok");
+        assert!(!dest.join("top-only").exists());
+
+        let sym_zip = dir.path().join("sym.zip");
+        {
+            let mut archive = zip::ZipWriter::new(File::create(&sym_zip)?);
+            let sym_opts =
+                zip::write::SimpleFileOptions::default().external_attributes(0o120_777 << 16);
+            archive.start_file("link", sym_opts)?;
+            archive.write_all(b"/etc/passwd")?;
+            archive.finish()?;
+        }
+        assert!(extract_zip(&sym_zip, &dest, 0).await.is_err());
+        Ok(())
     }
 }
