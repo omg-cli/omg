@@ -3946,6 +3946,7 @@ omarchy-pkg-drop imv mpv-mpris
             assert_eq!(
                 commands
                     .native_fixture
+                    .as_ref()
                     .expect("native fixture is retained")
                     .operations,
                 expected
