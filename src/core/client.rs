@@ -51,10 +51,12 @@ pub fn wait_for_daemon_ready(
     attempts: u32,
     interval: Duration,
 ) -> bool {
-    for _ in 0..attempts {
-        std::thread::sleep(interval);
+    for attempt in 0..attempts {
+        if attempt > 0 {
+            std::thread::sleep(interval);
+        }
         if socket_path.exists()
-            && let Ok(mut client) = SyncDaemonClient::acquire()
+            && let Ok(mut client) = SyncDaemonClient::acquire_at(socket_path, REQUEST_TIMEOUT)
             && client.ping().is_ok()
         {
             return true;
@@ -63,13 +65,15 @@ pub fn wait_for_daemon_ready(
     false
 }
 
-/// Create a new sync connection to the daemon.
-fn connect_sync_stream_with_timeout(timeout: Duration) -> Result<SyncUnixStream> {
+/// Create a new sync connection to the daemon at a specific socket path.
+fn connect_sync_stream_at(
+    socket_path: &std::path::Path,
+    timeout: Duration,
+) -> Result<SyncUnixStream> {
     tracing::debug!("Connecting to daemon...");
 
-    let socket_path = default_socket_path();
-    validate_socket_with_context(&socket_path)?;
-    let stream = SyncUnixStream::connect(&socket_path)
+    validate_socket_with_context(socket_path)?;
+    let stream = SyncUnixStream::connect(socket_path)
         .with_context(|| format!("Failed to connect to daemon at {}", socket_path.display()))?;
 
     stream
@@ -434,11 +438,16 @@ impl SyncDaemonClient {
 
     /// Connect synchronously with caller-specific socket read and write timeouts.
     pub fn acquire_with_timeout(timeout: Duration) -> Result<Self> {
+        Self::acquire_at(&default_socket_path(), timeout)
+    }
+
+    /// Connect synchronously to a specific daemon socket path.
+    pub(crate) fn acquire_at(socket_path: &std::path::Path, timeout: Duration) -> Result<Self> {
         if DaemonClient::daemon_disabled() {
             anyhow::bail!("Daemon disabled by environment");
         }
         Ok(Self {
-            stream: Some(connect_sync_stream_with_timeout(timeout)?),
+            stream: Some(connect_sync_stream_at(socket_path, timeout)?),
             request_id: AtomicU64::new(1),
         })
     }
@@ -847,5 +856,56 @@ mod tests {
                 "{value:?} should not disable daemon use"
             );
         }
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn wait_for_daemon_ready_honors_socket_path_and_returns_immediately() {
+        use std::io::{Read, Write};
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::net::UnixListener;
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("restrict socket dir");
+        let missing = dir.path().join("missing.sock");
+        assert!(!super::wait_for_daemon_ready(
+            &missing,
+            2,
+            Duration::from_millis(1)
+        ));
+
+        let socket_path = dir.path().join("ready.sock");
+        let listener = UnixListener::bind(&socket_path).expect("bind unix socket");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept client");
+            let mut len_buf = [0u8; 4];
+            stream.read_exact(&mut len_buf).expect("read frame len");
+            let len = u32::from_be_bytes(len_buf) as usize;
+            let mut req_buf = vec![0u8; len];
+            stream.read_exact(&mut req_buf).expect("read request");
+            let payload = reply(1);
+            let resp_len = u32::try_from(payload.len()).expect("frame fits u32");
+            stream
+                .write_all(&resp_len.to_be_bytes())
+                .expect("write resp len");
+            stream.write_all(&payload).expect("write resp payload");
+        });
+
+        temp_env::with_vars(
+            [
+                ("OMG_TEST_MODE", None::<&str>),
+                ("OMG_DISABLE_DAEMON", None::<&str>),
+            ],
+            || {
+                assert!(super::wait_for_daemon_ready(
+                    &socket_path,
+                    2,
+                    Duration::from_millis(50)
+                ));
+            },
+        );
+        server.join().expect("server thread");
     }
 }

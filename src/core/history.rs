@@ -319,6 +319,10 @@ impl HistoryManager {
 
     /// Atomically replaces the whole history with `history`.
     pub fn save(&self, history: &[Transaction]) -> Result<()> {
+        self.with_history_lock(|| self.save_locked(history))
+    }
+
+    fn save_locked(&self, history: &[Transaction]) -> Result<()> {
         let mut content =
             serde_json::to_vec_pretty(history).context("Failed to serialize history")?;
         content.push(b'\n');
@@ -421,7 +425,7 @@ impl HistoryManager {
             self.archive_drained(&history[..retiring])?;
             drop(history.drain(..retiring));
         }
-        self.save(&history)
+        self.save_locked(&history)
     }
 
     /// Append retired transactions to the `<log>.archive.jsonl` file, one
