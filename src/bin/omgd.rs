@@ -117,7 +117,7 @@ async fn main() -> Result<()> {
     // Check if daemon is already responding on the socket. The ping is kept
     // for compatibility with daemons from versions that did not take the lock;
     // once every daemon holds the claim, the lock alone decides.
-    if socket_path.exists() {
+    if std::fs::symlink_metadata(&socket_path).is_ok() {
         if let Ok(mut client) =
             omg_lib::core::client::DaemonClient::connect_to(socket_path.clone()).await
             && client.ping().await.is_ok()

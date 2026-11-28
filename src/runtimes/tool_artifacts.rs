@@ -240,7 +240,6 @@ fn run_owned(
             !exceeded.load(Ordering::Acquire),
             "{phase} exceeded the bounded output allowance"
         );
-        ensure!(Instant::now() < deadline, "{phase} exceeded its deadline");
         ensure!(
             status?.success(),
             "{phase} failed: {}",
