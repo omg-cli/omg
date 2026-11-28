@@ -2987,7 +2987,7 @@ mod required_signer_tests {
         let prov = dir.path().join("prov.intoto.jsonl");
         std::fs::write(
             &prov,
-            r#"{"_type":"https://in-toto.io/Statement/v0.1","predicateType":"https://slsa.dev/provenance/v0.2","subject":[],"predicate":{}}"#,
+            r#"{"_type":"https://in-toto.io/Statement/v0.1","predicateType":"https://slsa.dev/provenance/v0.2","subject":[],"predicate":{"buildType":"https://example.com/test","builder":{"id":"https://example.com/builder"},"materials":[]}}"#,
         )
         .expect("write provenance");
         let verifier = super::SlsaVerifier {
