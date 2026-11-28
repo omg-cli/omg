@@ -1153,11 +1153,6 @@ async fn handle_suggest(
     query: String,
     limit: Option<usize>,
 ) -> Response {
-    // SECURITY: Validate query length
-    if query.len() > MAX_QUERY_LENGTH {
-        return validation_error(id, "Query too long");
-    }
-
     let limit = limit
         .unwrap_or(DEFAULT_SUGGEST_LIMIT)
         .min(MAX_SUGGEST_LIMIT);

@@ -375,38 +375,36 @@ impl PgpVerifier {
         let mut hash_error: Option<PgpError> = None;
 
         while let PacketParserResult::Some(pp) = ppr {
-            if let Packet::Signature(sig) = &pp.packet {
-                match Self::signature_hasher(sig) {
-                    Ok(mut hasher) => {
-                        data_file.seek(io::SeekFrom::Start(0)).map_err(|source| {
-                            PgpError::PackageRead {
-                                path: path.clone(),
-                                source,
-                            }
-                        })?;
-                        std::io::copy(&mut data_file, &mut hasher).map_err(|source| {
-                            PgpError::PackageRead {
-                                path: path.clone(),
-                                source,
-                            }
-                        })?;
-
-                        if self.matches_any_trusted_cert(sig, &hasher) {
-                            return Ok(());
-                        }
-                    }
+            let (packet, next) = pp.next().map_err(|source| PgpError::SignatureParse {
+                path: sig_path.display().to_string(),
+                source: source.into(),
+            })?;
+            ppr = next;
+            if let Packet::Signature(sig) = &packet {
+                let mut hasher = match Self::signature_hasher(sig) {
+                    Ok(hasher) => hasher,
                     Err(error) => {
                         hash_error.get_or_insert(error);
+                        continue;
                     }
+                };
+                data_file
+                    .seek(io::SeekFrom::Start(0))
+                    .map_err(|source| PgpError::PackageRead {
+                        path: path.clone(),
+                        source,
+                    })?;
+                std::io::copy(&mut data_file, &mut hasher).map_err(|source| {
+                    PgpError::PackageRead {
+                        path: path.clone(),
+                        source,
+                    }
+                })?;
+
+                if self.matches_any_trusted_cert(sig, &hasher) {
+                    return Ok(());
                 }
             }
-            ppr = pp
-                .next()
-                .map_err(|source| PgpError::SignatureParse {
-                    path: sig_path.display().to_string(),
-                    source: source.into(),
-                })?
-                .1;
         }
 
         Err(hash_error.unwrap_or(PgpError::NoValidSignature))
