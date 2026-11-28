@@ -68,7 +68,9 @@ export async function readBoundedJson(
     }
     return { kind: "error", status: 400, error: "Invalid body" };
   } finally {
-    reader.releaseLock();
+    if ("releaseLock" in reader && typeof reader.releaseLock === "function") {
+      reader.releaseLock();
+    }
   }
 
   const bytes = new Uint8Array(size);

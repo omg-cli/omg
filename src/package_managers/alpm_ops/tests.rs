@@ -7,7 +7,10 @@ fn explicit_pgp_requirement_overrides_optional_and_disabled_package_signatures()
         let enforced = super::enforce_required_package_signature(level, true);
         assert!(enforced.contains(alpm::SigLevel::PACKAGE));
         assert!(!enforced.contains(alpm::SigLevel::PACKAGE_OPTIONAL));
-        assert_eq!(super::enforce_required_package_signature(level, false), level);
+        assert_eq!(
+            super::enforce_required_package_signature(level, false),
+            level
+        );
     }
 }
 
@@ -37,12 +40,9 @@ fn archive_acknowledgement_lists_only_private_archives_and_bounds_the_batch() {
         },
         "c",
     );
-    let prompt = super::unknown_archives_prompt(
-        &[aur.clone(), repository, local],
-        "prepared-batch",
-        1000,
-    )
-    .expect("mixed batch with two private archives requires acknowledgement");
+    let prompt =
+        super::unknown_archives_prompt(&[aur.clone(), repository, local], "prepared-batch", 1000)
+            .expect("mixed batch with two private archives requires acknowledgement");
     assert!(prompt.contains("Invoking UID: 1000"));
     assert!(prompt.contains("Full prepared batch SHA-256: prepared-batch"));
     assert!(prompt.contains("aur-fixture") && prompt.contains(&"a".repeat(64)));
@@ -165,8 +165,8 @@ fn advisory_risk_refuses_an_unattended_session() -> anyhow::Result<()> {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn fresh_admission_signal_ownership_is_scoped_and_refuses_handler_conflicts()
--> anyhow::Result<()> {
+fn fresh_admission_signal_ownership_is_scoped_and_refuses_handler_conflicts() -> anyhow::Result<()>
+{
     const NAME: &str = "package_managers::alpm_ops::tests::fresh_admission_signal_ownership_is_scoped_and_refuses_handler_conflicts";
     if crate::core::testing::run_isolated_test(NAME) {
         return Ok(());
@@ -183,8 +183,7 @@ fn fresh_admission_signal_ownership_is_scoped_and_refuses_handler_conflicts()
     assert!(format!("{error:#}").contains("owns signal cancellation"));
     super::ensure_prepared_review_signals(&mut owned, "same transaction")?;
     assert!(
-        !nix::sys::signal::SigSet::thread_get_mask()?
-            .contains(nix::sys::signal::Signal::SIGINT),
+        !nix::sys::signal::SigSet::thread_get_mask()?.contains(nix::sys::signal::Signal::SIGINT),
         "the isolated signal fixture requires SIGINT unblocked on its receiving thread"
     );
     nix::sys::signal::raise(nix::sys::signal::Signal::SIGINT)?;
@@ -240,8 +239,8 @@ fn fresh_admission_signal_ownership_is_scoped_and_refuses_handler_conflicts()
 
 #[cfg(target_os = "linux")]
 #[test]
-fn native_admission_setup_error_keeps_signal_owner_until_transaction_release()
--> anyhow::Result<()> {
+fn native_admission_setup_error_keeps_signal_owner_until_transaction_release() -> anyhow::Result<()>
+{
     const NAME: &str = "package_managers::alpm_ops::tests::native_admission_setup_error_keeps_signal_owner_until_transaction_release";
     if crate::core::testing::run_isolated_test(NAME) {
         return Ok(());
@@ -285,8 +284,7 @@ fn native_admission_setup_error_keeps_signal_owner_until_transaction_release()
 }
 
 #[test]
-fn prepared_repository_without_coordinates_does_not_gain_verified_grade() -> anyhow::Result<()>
-{
+fn prepared_repository_without_coordinates_does_not_gain_verified_grade() -> anyhow::Result<()> {
     use crate::core::security::policy::{AdvisoryRequirement, SecurityGrade, SecurityPolicy};
     use crate::package_managers::types::SecurityOrigin;
     let mut policy = SecurityPolicy {
@@ -305,8 +303,7 @@ fn prepared_repository_without_coordinates_does_not_gain_verified_grade() -> any
 }
 
 #[test]
-fn fresh_admission_requires_declared_repository_coordinates_even_for_core() -> anyhow::Result<()>
-{
+fn fresh_admission_requires_declared_repository_coordinates_even_for_core() -> anyhow::Result<()> {
     use crate::core::security::policy::{AdvisoryRequirement, SecurityPolicy};
     use crate::package_managers::types::SecurityOrigin;
     let mut policy = SecurityPolicy::default();
@@ -373,13 +370,8 @@ fn archive_acknowledgement_digest_binds_every_prepared_authority_axis() -> anyho
     changed.advisory_requirement =
         crate::core::security::policy::AdvisoryRequirement::FreshSnapshot;
     assert_ne!(
-        super::advisory_batch_digest(
-            std::slice::from_ref(&package),
-            &changed,
-            b"profile",
-            1000
-        )
-        .expect("digest the updated advisory requirement"),
+        super::advisory_batch_digest(std::slice::from_ref(&package), &changed, b"profile", 1000)
+            .expect("digest the updated advisory requirement"),
         digest
     );
     assert_ne!(
@@ -656,13 +648,8 @@ impl RepositoryFixture {
         self.directory.path().join("db")
     }
 
-    fn write_sync(
-        &self,
-        repository: &str,
-        packages: &[(&str, &str, &str)],
-    ) -> anyhow::Result<()> {
-        let file =
-            std::fs::File::create(self.database().join(format!("sync/{repository}.db")))?;
+    fn write_sync(&self, repository: &str, packages: &[(&str, &str, &str)]) -> anyhow::Result<()> {
+        let file = std::fs::File::create(self.database().join(format!("sync/{repository}.db")))?;
         let mut archive = tar::Builder::new(flate2::write::GzEncoder::new(
             file,
             flate2::Compression::fast(),
@@ -1215,8 +1202,7 @@ fn scoped_info_reads_current_metadata_after_native_cache_is_primed() -> anyhow::
 }
 
 #[test]
-fn scoped_info_reads_current_installed_state_after_native_cache_is_primed() -> anyhow::Result<()>
-{
+fn scoped_info_reads_current_installed_state_after_native_cache_is_primed() -> anyhow::Result<()> {
     let fixture = RepositoryFixture::new()?;
     fixture.write_sync("core", &[("helper", "2-1", "")])?;
     let alpm = fixture.open();
@@ -1243,8 +1229,7 @@ fn scoped_info_reads_current_installed_state_after_native_cache_is_primed() -> a
 }
 
 #[test]
-fn scoped_info_revalidates_present_signatures_after_native_cache_is_primed()
--> anyhow::Result<()> {
+fn scoped_info_revalidates_present_signatures_after_native_cache_is_primed() -> anyhow::Result<()> {
     let fixture = RepositoryFixture::new()?;
     let keyring = fixture.directory.path().join("keyring");
     std::fs::create_dir(&keyring)?;
@@ -1411,8 +1396,7 @@ fn selected_dependency_uses_installed_state_only_when_present() -> anyhow::Resul
                 alpm::PackageReason::Explicit
             );
         } else {
-            let error =
-                result.expect_err("a selected dependency must be prepared or installed");
+            let error = result.expect_err("a selected dependency must be prepared or installed");
             assert!(
                 error
                     .to_string()
@@ -1707,8 +1691,8 @@ fn database_lock_check_preserves_an_unheld_file() {
 #[test]
 fn database_lock_check_keeps_a_live_lease() {
     let directory = tempfile::tempdir().expect("database root");
-    let lease = alpm::Alpm::new("/", directory.path().to_str().expect("utf-8 path"))
-        .expect("ALPM handle");
+    let lease =
+        alpm::Alpm::new("/", directory.path().to_str().expect("utf-8 path")).expect("ALPM handle");
     lease
         .trans_init(alpm::TransFlag::empty())
         .expect("live lease");
@@ -1755,8 +1739,8 @@ fn refused_replacements_fail_the_transaction_naming_the_conflict() {
         .lock()
         .expect("unpoisoned")
         .record_refused_replacement("bar", "core", "foo");
-    let error = question_refusal_error(&refusals)
-        .expect("a recorded refusal must fail the transaction");
+    let error =
+        question_refusal_error(&refusals).expect("a recorded refusal must fail the transaction");
     let message = error.to_string();
     assert!(message.contains("replace bar with core/foo"), "{message}");
     assert!(
@@ -1817,8 +1801,7 @@ fn replace_question_is_declined_instead_of_auto_accepted() {
     std::fs::create_dir_all(&root).expect("root dir");
     std::fs::create_dir_all(db_path.join("local/bar-1.0-1")).expect("local pkg dir");
     std::fs::create_dir_all(db_path.join("sync")).expect("sync db dir");
-    std::fs::write(db_path.join("local/ALPM_DB_VERSION"), "9\n")
-        .expect("write ALPM_DB_VERSION");
+    std::fs::write(db_path.join("local/ALPM_DB_VERSION"), "9\n").expect("write ALPM_DB_VERSION");
 
     std::fs::write(
         db_path.join("local/bar-1.0-1/desc"),
@@ -1869,8 +1852,8 @@ fn replace_question_is_declined_instead_of_auto_accepted() {
         alpm.trans_add().is_empty(),
         "declined replacement must not add the replacing package"
     );
-    let error = question_refusal_error(&refusals)
-        .expect("replace question must be recorded as refused");
+    let error =
+        question_refusal_error(&refusals).expect("replace question must be recorded as refused");
     assert!(error.to_string().contains("replace bar with core/foo"));
 }
 
@@ -2500,8 +2483,8 @@ fn installable_repository_fixture_passes_native_metadata_admission() -> anyhow::
 }
 
 #[test]
-fn prepared_repository_metadata_requires_a_packager_before_native_key_import()
--> anyhow::Result<()> {
+fn prepared_repository_metadata_requires_a_packager_before_native_key_import() -> anyhow::Result<()>
+{
     for packager in [None, Some("Fixture Maintainer <fixture@example.invalid>")] {
         let owner = tempfile::tempdir()?;
         let root = owner.path().join("root");
@@ -2543,8 +2526,7 @@ fn prepared_repository_metadata_requires_a_packager_before_native_key_import()
         if packager.is_some() {
             assert_eq!(result?.len(), 1, "complete repository record is accepted");
         } else {
-            let error =
-                result.expect_err("Missing PACKAGER must fail before C key-import code");
+            let error = result.expect_err("Missing PACKAGER must fail before C key-import code");
             assert!(error.to_string().contains("PACKAGER"), "{error:#}");
         }
         assert!(
@@ -2693,8 +2675,7 @@ fn clean_cache_keeps_two_distinct_versions_per_architecture_across_cache_copies(
             (&second, "1.0.0-1", "xz", "spare"),
             (&second, "0.9.0-1", "zst", "obsolete"),
         ] {
-            let path =
-                directory.join(format!("testpkg-{version}-{architecture}.pkg.tar.{suffix}"));
+            let path = directory.join(format!("testpkg-{version}-{architecture}.pkg.tar.{suffix}"));
             let data = format!("inert {architecture} {version} {suffix}").into_bytes();
             let signature =
                 format!("inert signature {architecture} {version} {suffix}").into_bytes();
@@ -2783,8 +2764,7 @@ fn clean_cache_keeps_two_distinct_versions_per_architecture_across_cache_copies(
 }
 
 #[test]
-fn native_factory_rejects_non_utf8_paths_instead_of_opening_lossy_aliases() -> anyhow::Result<()>
-{
+fn native_factory_rejects_non_utf8_paths_instead_of_opening_lossy_aliases() -> anyhow::Result<()> {
     use std::os::unix::ffi::OsStringExt;
 
     const NAME: &str = "package_managers::alpm_ops::tests::native_factory_rejects_non_utf8_paths_instead_of_opening_lossy_aliases";
@@ -2839,9 +2819,7 @@ fn native_factory_rejects_non_utf8_paths_instead_of_opening_lossy_aliases() -> a
                     ],
                     || super::open_default_alpm().err(),
                 )
-                .expect(
-                    "non-UTF-8 paths must refuse before opening a replacement-character alias",
-                );
+                .expect("non-UTF-8 paths must refuse before opening a replacement-character alias");
                 let diagnostic = format!("{error:#}");
                 assert!(
                     diagnostic.to_ascii_lowercase().contains("utf-8"),
@@ -3040,17 +3018,15 @@ fn clean_cache_distinguishes_missing_and_inaccessible_directories() {
             )
             .expect("inaccessible cache configuration");
             let restore = scopeguard::guard(blocked.clone(), |path| {
-                let result =
-                    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
+                let result = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
                 eprintln!("Private cache permission restoration: {result:?}");
             });
             std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o0))
                 .expect("private permission fault");
             let result = clean_cache(1);
             drop(restore);
-            let error = result.expect_err(
-                "an unreadable configured cache must abort before deleting archives",
-            );
+            let error = result
+                .expect_err("an unreadable configured cache must abort before deleting archives");
             assert!(
                 error.chain().any(|cause| cause
                     .downcast_ref::<std::io::Error>()
@@ -3197,8 +3173,7 @@ fn clean_cache_sorts_by_alpm_vercmp_and_keeps_newest_version() {
 
         paths::set_test_overrides(Some(temp.path().to_path_buf()), None);
 
-        let (preview_removed, preview_freed) =
-            clean_cache_preview(1).expect("preview succeeds");
+        let (preview_removed, preview_freed) = clean_cache_preview(1).expect("preview succeeds");
         assert_eq!(
             preview_removed, 2,
             "preview should identify 2 older versions"
@@ -3273,9 +3248,8 @@ fn aur_transactions_require_sealed_handoff_targets() {
         vec![sealed.clone(), unsealed.clone()],
         vec![unsealed, sealed.clone()],
     ] {
-        let error =
-            validate_aur_artifact_handoffs(TransactionKind::InstallAurArtifact, &packages)
-                .expect_err("every artifact must use a sealed handoff");
+        let error = validate_aur_artifact_handoffs(TransactionKind::InstallAurArtifact, &packages)
+            .expect_err("every artifact must use a sealed handoff");
         assert_eq!(
             error.to_string(),
             "AUR artifacts must arrive through an immutable sealed handoff"
@@ -3335,8 +3309,7 @@ fn aur_archive_preparation_refuses_repository_targets_before_opening_a_transacti
 }
 
 #[test]
-fn removal_refuses_missing_targets_and_releases_the_private_transaction() -> anyhow::Result<()>
-{
+fn removal_refuses_missing_targets_and_releases_the_private_transaction() -> anyhow::Result<()> {
     let fixture = RepositoryFixture::new()?;
     fixture.write_local("omg-fixture-kept", "1-1")?;
     let mut alpm = fixture.open();

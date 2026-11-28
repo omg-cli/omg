@@ -455,20 +455,20 @@ async fn update_packages(
 
     let operation_result: Result<()> = async {
         if official_count > 0 {
-            if !crate::core::caps::can_write_pacman_db() {
-                // Avoid a parent spinner when `pm.update()` will elevate via sudo.
-                println!(
-                    "  {} Upgrading {official_count} official packages...",
-                    style::community("→")
-                );
-                pm.update().await?;
-            } else {
+            if crate::core::caps::can_write_pacman_db() {
                 let pb = modern_ui::modern_spinner(
                     "Upgrading",
                     &format!("{official_count} official packages"),
                 );
                 pm.update().await?;
                 modern_ui::finish_success(&pb, "Upgraded", &format!("{official_count} packages"));
+            } else {
+                // Avoid a parent spinner when `pm.update()` will elevate via sudo.
+                println!(
+                    "  {} Upgrading {official_count} official packages...",
+                    style::community("→")
+                );
+                pm.update().await?;
             }
             installed_count += official_count;
         }

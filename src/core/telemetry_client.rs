@@ -204,7 +204,10 @@ fn check_circuit_breaker() -> (CircuitState, Option<HalfOpenProbeGuard>) {
                     // exclusion); no other data is published through it.
                     CIRCUIT_STATE.store(CircuitState::HalfOpen as u32, Ordering::Relaxed);
                     tracing::debug!("Circuit breaker transitioning to half-open state");
-                    (CircuitState::HalfOpen, Some(HalfOpenProbeGuard { active: true }))
+                    (
+                        CircuitState::HalfOpen,
+                        Some(HalfOpenProbeGuard { active: true }),
+                    )
                 } else {
                     (CircuitState::Open, None)
                 }
@@ -304,7 +307,9 @@ pub async fn send_batch(events: Vec<TelemetryEvent>) -> Result<()> {
 
     let payloads: Vec<TelemetryPayload> = events
         .into_iter()
-        .map(|event| TelemetryPayload::with_metadata(event, machine_id.clone(), license_key.clone()))
+        .map(|event| {
+            TelemetryPayload::with_metadata(event, machine_id.clone(), license_key.clone())
+        })
         .collect();
 
     let batch = BatchPayload {

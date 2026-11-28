@@ -290,8 +290,8 @@ impl<'de> serde::Deserialize<'de> for BoundedPackages {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write as _;
     use super::*;
+    use std::io::Write as _;
 
     /// Strict-parse helper for fixtures: every test version is expected to
     /// parse; failures must never fall back to a fabricated zero.

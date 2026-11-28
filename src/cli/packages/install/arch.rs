@@ -290,7 +290,13 @@ pub async fn install_dry_run(packages: &[String]) -> Result<()> {
         style::accent("→"),
         style::emphasis(&style::size(total_size))
     );
-    ui::print_dry_run_footer();
+    println!();
+    println!(
+        "  {} {} No changes will be made (dry run)",
+        style::info("ℹ"),
+        style::dim("•")
+    );
+    println!();
 
     Ok(())
 }

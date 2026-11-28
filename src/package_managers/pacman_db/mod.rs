@@ -10,10 +10,10 @@ pub(crate) use db::{
     read_local_package, read_local_package_at,
 };
 
+pub use db::UnsatisfiedDependency;
 #[cfg(test)]
 pub(crate) use db::check_local_db_health;
 pub(crate) use db::{NativeLocalDbHealth, check_native_local_db_health};
-pub use db::UnsatisfiedDependency;
 
 pub use db::{
     AlpmCatalogEpoch, CachedUpdate, LocalDbEpoch, LocalDbPackage, SyncDbEpoch, SyncDbPackage,

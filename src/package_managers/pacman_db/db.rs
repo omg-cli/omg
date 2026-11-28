@@ -527,6 +527,18 @@ fn parse_sync_descriptions<T: Send>(
     project: &(impl Fn(ParsedSyncDesc) -> T + Sync),
     collect: &mut impl FnMut(&Path, T) -> Result<()>,
 ) -> Result<()> {
+    static POOL: std::sync::LazyLock<Option<rayon::ThreadPool>> = std::sync::LazyLock::new(|| {
+        let workers = std::thread::available_parallelism().map_or(1, |count| count.get().min(4));
+        match rayon::ThreadPoolBuilder::new().num_threads(workers).build() {
+            Ok(pool) => Some(pool),
+            Err(error) => {
+                tracing::warn!(
+                    "Cannot start repository parsing workers; parsing serially: {error}"
+                );
+                None
+            }
+        }
+    });
     if descriptions.is_empty() {
         return Ok(());
     }
@@ -536,11 +548,16 @@ fn parse_sync_descriptions<T: Send>(
         let package = parse_sync_desc(&path, raw, repo_name).map(project);
         (path, package)
     };
-    let parsed: Vec<_> = entries
-        .into_par_iter()
-        .with_min_len(minimum_records)
-        .map(parse)
-        .collect();
+    let parsed: Vec<_> = match &*POOL {
+        Some(pool) => pool.install(|| {
+            entries
+                .into_par_iter()
+                .with_min_len(minimum_records)
+                .map(parse)
+                .collect()
+        }),
+        None => entries.into_iter().map(parse).collect(),
+    };
     for (path, package) in parsed {
         collect(&path, package?)?;
     }
@@ -2360,4 +2377,3 @@ mod native_health_tests;
 #[expect(clippy::unwrap_used, clippy::expect_used)] // Idiomatic in tests: panics on failure with clear error context
 #[path = "db_tests.rs"]
 mod tests;
-

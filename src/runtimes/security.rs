@@ -1384,7 +1384,11 @@ fn tree_digest(root: &Path) -> Result<String> {
                         semantic.len() as u64,
                     )
                 } else {
-                    file_digest_with_buffer(&path, MAX_TREE_BYTES.saturating_sub(bytes), &mut buffer)?
+                    file_digest_with_buffer(
+                        &path,
+                        MAX_TREE_BYTES.saturating_sub(bytes),
+                        &mut buffer,
+                    )?
                 };
                 bytes += size;
                 rows.insert(relative, ("file", mode, hash, size));

@@ -51,9 +51,9 @@ pub fn validate_path_inside(base: &Path, target: &Path) -> Result<PathBuf> {
                 .file_name()
                 .ok_or_else(|| anyhow::anyhow!("Path has no filename: {}", target.display()))?;
 
-            let parent_canonical = parent
-                .canonicalize()
-                .with_context(|| format!("Parent directory does not exist: {}", parent.display()))?;
+            let parent_canonical = parent.canonicalize().with_context(|| {
+                format!("Parent directory does not exist: {}", parent.display())
+            })?;
 
             parent_canonical.join(leaf)
         }

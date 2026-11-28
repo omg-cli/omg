@@ -719,7 +719,11 @@ fn run_audited_apt_op(
 ) -> Result<()> {
     crate::core::security::audit::record_operation(operation, packages, "attempt")?;
     let result = action();
-    let status = if result.is_ok() { "succeeded" } else { "failed" };
+    let status = if result.is_ok() {
+        "succeeded"
+    } else {
+        "failed"
+    };
     if let Err(audit_err) =
         crate::core::security::audit::record_operation(operation, packages, status)
     {

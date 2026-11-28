@@ -441,7 +441,7 @@ fn commit_staged_databases(
 fn rollback_and_bail(
     publications: &mut [DatabasePublication],
     staging: &mut tempfile::TempDir,
-    context: String,
+    context: &str,
 ) -> anyhow::Error {
     let rollback_errors = rollback_database_publication(publications, staging);
     anyhow::anyhow!("{context}; rollback errors: {}", rollback_errors.join("; "))
@@ -510,7 +510,9 @@ fn commit_staged_files(
                 return Err(rollback_and_bail(
                     &mut publications,
                     staging,
-                    format!("Refusing to replace database path that is not a file or symlink: {dest}"),
+                    &format!(
+                        "Refusing to replace database path that is not a file or symlink: {dest}"
+                    ),
                 ));
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
@@ -519,7 +521,7 @@ fn commit_staged_files(
                 return Err(rollback_and_bail(
                     &mut publications,
                     staging,
-                    format!("Failed to inspect live database {dest}: {error}"),
+                    &format!("Failed to inspect live database {dest}: {error}"),
                 ));
             }
         }
@@ -543,7 +545,7 @@ fn commit_staged_files(
             return Err(rollback_and_bail(
                 &mut publications,
                 staging,
-                format!("Failed to stage live database {dest} for replacement: {error}"),
+                &format!("Failed to stage live database {dest} for replacement: {error}"),
             ));
         }
         publications[index].backup = Some(backup);
@@ -563,7 +565,9 @@ fn commit_staged_files(
             return Err(rollback_and_bail(
                 &mut publications,
                 staging,
-                format!("Failed to publish staged package database to {failed_destination}: {error}"),
+                &format!(
+                    "Failed to publish staged package database to {failed_destination}: {error}"
+                ),
             ));
         }
         publications[index].published = true;
@@ -589,7 +593,7 @@ fn commit_staged_files(
             return Err(rollback_and_bail(
                 &mut publications,
                 staging,
-                format!("Failed to sync published package database {failed_destination}: {error}"),
+                &format!("Failed to sync published package database {failed_destination}: {error}"),
             ));
         }
     }

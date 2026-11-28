@@ -4683,8 +4683,9 @@ pub async fn search_detailed(query: &str) -> Result<Vec<AurPackageDetail>> {
         .map_err(redact_aur_transport_error)?;
     let response: AurDetailedResponse = decode_aur_rpc_response(response).await?;
 
-    // SECURITY: Validate all names in response
-    let results = response
+    // SECURITY: Validate all names in response and precompute match tier once.
+    let query_lower = query.to_ascii_lowercase();
+    let mut ranked: Vec<(u8, AurPackageDetail)> = response
         .results
         .into_iter()
         .filter(|p| {
@@ -4699,12 +4700,6 @@ pub async fn search_detailed(query: &str) -> Result<Vec<AurPackageDetail>> {
                 true
             }
         })
-        .collect::<Vec<_>>();
-
-    // Rank exact, prefix, and word-boundary matches before popularity (precompute match tier once).
-    let query_lower = query.to_ascii_lowercase();
-    let mut ranked: Vec<(u8, AurPackageDetail)> = results
-        .into_iter()
         .map(|pkg| {
             let name_lower = pkg.name.to_ascii_lowercase();
             let tier = if name_lower == query_lower {
@@ -4819,4 +4814,3 @@ mod empty_rpc_result_tests;
 
 #[cfg(test)]
 mod update_error_tests;
-

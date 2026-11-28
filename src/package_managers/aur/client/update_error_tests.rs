@@ -1,10 +1,7 @@
 use super::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-async fn update_error_from_reply(
-    reply: Option<&[u8]>,
-    attempts: usize,
-) -> Result<anyhow::Error> {
+async fn update_error_from_reply(reply: Option<&[u8]>, attempts: usize) -> Result<anyhow::Error> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let endpoint = format!("http://{}/rpc", listener.local_addr()?);
     let reply = reply.map(<[u8]>::to_vec);
@@ -83,9 +80,11 @@ async fn failed_update_transport_preserves_redaction_and_network_guidance() -> R
 
 #[tokio::test]
 async fn failed_update_http_status_does_not_invent_network_guidance() -> Result<()> {
-    let error = update_error_from_reply(Some(
-        b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-    ), 3).await?;
+    let error = update_error_from_reply(
+        Some(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"),
+        3,
+    )
+    .await?;
     assert!(update_source_unavailable(&error));
     assert!(format!("{error:#}").contains("HTTP 503"), "{error:#}");
     assert_eq!(crate::core::error::suggest_for_anyhow(&error), None);

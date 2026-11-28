@@ -1737,16 +1737,15 @@ fn prepare_alpm_transaction_in<'a>(
                         .context("Package path contains invalid UTF-8")?;
 
                     let admission = admissions.remove(&canonical_path);
-                    let siglevel = match local_siglevel {
-                        Some(siglevel) => siglevel,
-                        None => {
-                            let computed = local_package_siglevel(
-                                kind,
-                                signature_policy(pacman_config)?.local_file,
-                            );
-                            local_siglevel = Some(computed);
-                            computed
-                        }
+                    let siglevel = if let Some(siglevel) = local_siglevel {
+                        siglevel
+                    } else {
+                        let computed = local_package_siglevel(
+                            kind,
+                            signature_policy(pacman_config)?.local_file,
+                        );
+                        local_siglevel = Some(computed);
+                        computed
                     };
 
                     let pkg = tx_guard
@@ -2872,4 +2871,3 @@ fn ensure_mirror_servers(alpm: &alpm::Alpm) -> Result<()> {
 
 #[cfg(test)]
 mod tests;
-

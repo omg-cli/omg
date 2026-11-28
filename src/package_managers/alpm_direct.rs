@@ -258,7 +258,9 @@ pub fn list_explicit_fast() -> Result<Vec<String>> {
             return Ok(results);
         }
         Err(error) => {
-            tracing::debug!("Local DB cache unavailable for explicit list, falling back to libalpm: {error:#}");
+            tracing::debug!(
+                "Local DB cache unavailable for explicit list, falling back to libalpm: {error:#}"
+            );
         }
     }
 

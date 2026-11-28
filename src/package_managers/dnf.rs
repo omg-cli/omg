@@ -4070,4 +4070,3 @@ fn reject_unsealed_local_rpm_targets(packages: &[String]) -> Result<()> {
 
 #[cfg(test)]
 mod tests;
-

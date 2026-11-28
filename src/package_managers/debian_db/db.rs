@@ -1819,20 +1819,18 @@ fn fst_search(
 }
 
 /// FST + rkyv snapshot search: bypasses `ensure_index_loaded()`.
+/// Re-resolves package names against `mmap` rather than trusting FST row indices.
 fn fst_mmap_search(
     fst_map: &Map<AlignedVec>,
     mmap: &DebianMmapIndex,
     query_lower: &str,
     installed_set: &AHashSet<String>,
 ) -> Vec<Package> {
-    let Ok(packages) = mmap.packages() else {
-        return Vec::new();
-    };
     let query_bytes = query_lower.as_bytes();
 
     // 1. Try exact match first
-    if let Some(idx) = fst_map.get(query_bytes)
-        && let Some(pkg) = usize::try_from(idx).ok().and_then(|i| packages.get(i))
+    if let Some(_idx) = fst_map.get(query_bytes)
+        && let Ok(Some(pkg)) = mmap.get(query_lower)
     {
         return vec![archived_package_to_package(
             pkg,
@@ -1844,11 +1842,13 @@ fn fst_mmap_search(
     let mut results = Vec::with_capacity(100);
     let mut stream = fst_map.range().ge(query_bytes).into_stream();
 
-    while let Some((name_bytes, idx)) = stream.next() {
+    while let Some((name_bytes, _idx)) = stream.next() {
         if !name_bytes.starts_with(query_bytes) {
             break;
         }
-        if let Some(pkg) = usize::try_from(idx).ok().and_then(|i| packages.get(i)) {
+        if let Ok(name_str) = std::str::from_utf8(name_bytes)
+            && let Ok(Some(pkg)) = mmap.get(name_str)
+        {
             results.push(archived_package_to_package(
                 pkg,
                 installed_set.contains(pkg.name.as_str()),
@@ -1866,9 +1866,10 @@ fn fst_mmap_search(
     // 3. Substring search fallback
     let finder = memmem::Finder::new(query_bytes);
     let mut stream = fst_map.stream().into_stream();
-    while let Some((name_bytes, idx)) = stream.next() {
+    while let Some((name_bytes, _idx)) = stream.next() {
         if finder.find(name_bytes).is_some()
-            && let Some(pkg) = usize::try_from(idx).ok().and_then(|i| packages.get(i))
+            && let Ok(name_str) = std::str::from_utf8(name_bytes)
+            && let Ok(Some(pkg)) = mmap.get(name_str)
         {
             results.push(archived_package_to_package(
                 pkg,

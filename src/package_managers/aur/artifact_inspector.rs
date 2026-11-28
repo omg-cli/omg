@@ -511,7 +511,12 @@ pub(crate) fn inspect_archive(path: &Path) -> Result<ArchiveAdmission> {
         buildinfo.context("AUR archive is missing .BUILDINFO")?;
     anyhow::ensure!(
         (&build_name, &build_version, &build_base, &build_arch)
-            == (&package_name, &package_version, &package_base, &architecture),
+            == (
+                &package_name,
+                &package_version,
+                &package_base,
+                &architecture
+            ),
         "AUR archive .BUILDINFO identity differs from .PKGINFO"
     );
     let inventory = inventory.agree(&mtree_bytes.context("AUR archive is missing .MTREE")?)?;

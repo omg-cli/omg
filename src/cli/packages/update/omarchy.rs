@@ -2377,4 +2377,3 @@ pub(super) async fn maybe_coordinate(intent: UpdateIntent) -> Result<bool> {
 
 #[cfg(test)]
 mod tests;
-
